@@ -34,7 +34,7 @@ use crate::routes::{
     CreateGroupRouteRequest, GroupRouteEnvironment, GroupRouteResponse, GroupRouteService,
 };
 use crate::service::{
-    CreateProjectGroupRequest, ProjectGroupService, ProjectGroupWithMembers,
+    CreateProjectGroupRequest, LateMemberAuthorizer, ProjectGroupService, ProjectGroupWithMembers,
     UpdateProjectGroupRequest,
 };
 
@@ -419,10 +419,18 @@ pub(crate) async fn hidden_projects(
     state: &ProjectGroupsAppState,
     auth: &temps_authz::context::AuthContext,
 ) -> Result<HashSet<i32>, Problem> {
+    hidden_projects_for(&state.project_access_checker, auth).await
+}
+
+/// [`hidden_projects`] given only the access checker.
+async fn hidden_projects_for(
+    project_access_checker: &Option<Arc<dyn ProjectAccessChecker>>,
+    auth: &temps_authz::context::AuthContext,
+) -> Result<HashSet<i32>, Problem> {
     if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
         return Ok(HashSet::new());
     }
-    let Some(checker) = state.project_access_checker.as_ref() else {
+    let Some(checker) = project_access_checker.as_ref() else {
         return Ok(HashSet::new());
     };
     let Some(user_id) = auth.user_id_opt() else {
@@ -506,6 +514,47 @@ enum MemberPermission {
     EnvironmentsRead,
     EnvironmentsWrite,
     ProjectsWrite,
+}
+
+/// [`LateMemberAuthorizer`] for a placement: a project that joined the
+/// destination after the caller was authorized needs what every other member
+/// needed (visible to the caller, and `EnvironmentsWrite` on it).
+pub(crate) struct EnvWriteOnLateMembers<'a> {
+    pub(crate) project_access_checker: &'a Option<Arc<dyn ProjectAccessChecker>>,
+    pub(crate) auth: &'a temps_authz::context::AuthContext,
+}
+
+#[async_trait::async_trait]
+impl LateMemberAuthorizer for EnvWriteOnLateMembers<'_> {
+    async fn unauthorized(&self, group_id: i32, project_ids: &[i32]) -> Vec<i32> {
+        let hidden = match hidden_projects_for(self.project_access_checker, self.auth).await {
+            Ok(hidden) => hidden,
+            Err(_) => {
+                tracing::warn!(
+                    group_id,
+                    ?project_ids,
+                    "project groups: could not re-check access to late group members; refusing"
+                );
+                return project_ids.to_vec();
+            }
+        };
+        let mut denied = Vec::new();
+        for &project_id in project_ids {
+            let allowed = !hidden.contains(&project_id)
+                && require_on_projects(
+                    self.auth,
+                    self.project_access_checker,
+                    &[project_id],
+                    MemberPermission::EnvironmentsWrite,
+                )
+                .await
+                .is_ok();
+            if !allowed {
+                denied.push(project_id);
+            }
+        }
+        denied
+    }
 }
 
 /// `permission` on every project in `project_ids`: the instance-wide
@@ -955,7 +1004,7 @@ pub async fn delete_project_group(
         (status = 200, description = "Project placed in the group (moved out of any other group)", body = ProjectGroupResponse),
         (status = 403, description = "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them; or no ProjectsWrite on a service whose route to or from the project is dropped by leaving its previous group"),
         (status = 404, description = "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"),
-        (status = 409, description = "A route involving the project appeared, the project changed group, or a project joined the destination group, while the request was being authorized; retry"),
+        (status = 409, description = "A route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -997,9 +1046,22 @@ pub async fn add_project_to_group(
     let authorized =
         authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
 
+    // A project that joined the group while this request was being authorized
+    // (typically a concurrent placement) is checked again under the group
+    // lock, so only a real lack of access to it refuses the placement.
+    let late_members = EnvWriteOnLateMembers {
+        project_access_checker: &state.project_access_checker,
+        auth: &auth,
+    };
     let placement = state
         .service
-        .add_project_checked(group_id, project_id, &authorized, &authorized_members)
+        .add_project_reauthorizing(
+            group_id,
+            project_id,
+            &authorized,
+            &authorized_members,
+            &late_members,
+        )
         .await?;
     let previous = placement.previous_group_id;
     let group = state.service.get_group(group_id).await?;
@@ -2018,6 +2080,34 @@ mod tests {
 
     fn checker(allowed: &[i32]) -> Option<Arc<dyn ProjectAccessChecker>> {
         Some(Arc::new(Allow(allowed.to_vec())))
+    }
+
+    /// A project that joined during a placement is re-checked like any other
+    /// member: an admin, or a user with write access to it, is not refused;
+    /// a user who cannot see it or only reads it is.
+    #[tokio::test]
+    async fn late_members_are_reauthorized_with_the_members_permission() {
+        let admin = user_auth(Role::Admin);
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &checker(&[]),
+            auth: &admin,
+        };
+        assert!(late.unauthorized(1, &[4, 5]).await.is_empty());
+
+        let user = user_auth(Role::User);
+        let team = checker(&[4]);
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &team,
+            auth: &user,
+        };
+        assert_eq!(late.unauthorized(1, &[4, 5]).await, vec![5]);
+
+        let reader = user_auth(Role::Reader);
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &team,
+            auth: &reader,
+        };
+        assert_eq!(late.unauthorized(1, &[4]).await, vec![4]);
     }
 
     #[tokio::test]

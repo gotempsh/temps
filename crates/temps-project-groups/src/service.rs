@@ -104,6 +104,21 @@ struct LeavingState {
     dropped_routes: Vec<project_group_routes::Model>,
 }
 
+/// Re-checks, under the group lock, the caller's access to projects that
+/// joined a group after the caller's access to its members was checked.
+///
+/// Concurrent placements into one group each see the other's project as a
+/// late joiner. A caller that may manage that project anyway (an admin, or a
+/// user with access to every member) must not be refused for it, so the
+/// placement asks this instead of failing outright.
+#[async_trait::async_trait]
+pub trait LateMemberAuthorizer: Send + Sync {
+    /// The projects among `project_ids` the caller may not manage; empty
+    /// when it may manage all of them. Implementations fail closed: a check
+    /// that cannot complete reports the project as not authorized.
+    async fn unauthorized(&self, group_id: i32, project_ids: &[i32]) -> Vec<i32>;
+}
+
 /// # Lock order
 ///
 /// Every transaction that changes who is in which group takes its locks in
@@ -631,7 +646,7 @@ impl ProjectGroupService {
                         "starting transaction to update project group {group_id}"
                     )))?;
                 let result = async {
-                    Self::lock_group_members(&txn, group_id, authorized, None).await?;
+                    Self::lock_group_members(&txn, group_id, authorized, None, None).await?;
                     active.update(&txn).await.map_err(write_error)
                 }
                 .await;
@@ -924,11 +939,15 @@ impl ProjectGroupService {
     /// Takes no project or membership row locks, so it can follow step 1 of
     /// a transaction that took it (the placement) or stand alone (the
     /// writers that do not move projects); either way the order holds.
+    ///
+    /// With `late_members` set, a member that joined since is checked again
+    /// (still under the lock) and only one the caller may not manage fails.
     pub(crate) async fn lock_group_members<C: ConnectionTrait>(
         conn: &C,
         group_id: i32,
         authorized_member_ids: &HashSet<i32>,
         joining_project_id: Option<i32>,
+        late_members: Option<&dyn LateMemberAuthorizer>,
     ) -> Result<project_groups::Model, ProjectGroupError> {
         let group = project_groups::Entity::find_by_id(group_id)
             .lock_exclusive()
@@ -938,7 +957,23 @@ impl ProjectGroupService {
                 "locking project group {group_id}"
             )))?
             .ok_or(ProjectGroupError::NotFound { group_id })?;
-        let members = Self::live_member_ids(conn, group_id).await?;
+        let mut members = Self::live_member_ids(conn, group_id).await?;
+        if let Some(authorizer) = late_members {
+            let late: Vec<i32> = members
+                .iter()
+                .copied()
+                .filter(|id| !authorized_member_ids.contains(id) && Some(*id) != joining_project_id)
+                .collect();
+            if !late.is_empty() {
+                let denied: HashSet<i32> = authorizer
+                    .unauthorized(group_id, &late)
+                    .await
+                    .into_iter()
+                    .collect();
+                // Late members the caller may manage count as authorized.
+                members.retain(|id| !late.contains(id) || denied.contains(id));
+            }
+        }
         Self::ensure_members_authorized(
             group_id,
             members,
@@ -1080,7 +1115,7 @@ impl ProjectGroupService {
         project_id: i32,
     ) -> Result<Option<i32>, ProjectGroupError> {
         Ok(self
-            .place_project(group_id, project_id, None, None)
+            .place_project(group_id, project_id, None, None, None)
             .await?
             .previous_group_id)
     }
@@ -1109,6 +1144,30 @@ impl ProjectGroupService {
             project_id,
             Some(authorized_route_ids),
             Some(authorized_member_ids),
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::add_project_checked`] that asks `late_members` about a member
+    /// that joined since the check instead of failing outright, so
+    /// concurrent placements into one group by a caller that may manage all
+    /// of them succeed. Only a late member `late_members` refuses fails with
+    /// [`ProjectGroupError::MembersChanged`].
+    pub async fn add_project_reauthorizing(
+        &self,
+        group_id: i32,
+        project_id: i32,
+        authorized_route_ids: &HashSet<i32>,
+        authorized_member_ids: &HashSet<i32>,
+        late_members: &dyn LateMemberAuthorizer,
+    ) -> Result<ProjectPlacement, ProjectGroupError> {
+        self.place_project(
+            group_id,
+            project_id,
+            Some(authorized_route_ids),
+            Some(authorized_member_ids),
+            Some(late_members),
         )
         .await
     }
@@ -1119,6 +1178,7 @@ impl ProjectGroupService {
         project_id: i32,
         authorized_route_ids: Option<&HashSet<i32>>,
         authorized_member_ids: Option<&HashSet<i32>>,
+        late_members: Option<&dyn LateMemberAuthorizer>,
     ) -> Result<ProjectPlacement, ProjectGroupError> {
         let txn = self
             .db
@@ -1140,7 +1200,14 @@ impl ProjectGroupService {
             // placement reaches.
             match authorized_member_ids {
                 Some(authorized) => {
-                    Self::lock_group_members(&txn, group_id, authorized, Some(project_id)).await?;
+                    Self::lock_group_members(
+                        &txn,
+                        group_id,
+                        authorized,
+                        Some(project_id),
+                        late_members,
+                    )
+                    .await?;
                 }
                 None => {
                     let group_exists = project_groups::Entity::find_by_id(group_id)
@@ -2543,6 +2610,134 @@ mod tests {
             Ok(Err(e)) => panic!("task failed: {e}"),
             Err(_) => panic!("task still blocked 20s after the other transaction committed"),
         }
+    }
+
+    /// Answers every late-member check the same way and records the asks.
+    struct FixedLateMembers {
+        allow: bool,
+        asked: std::sync::Mutex<Vec<Vec<i32>>>,
+    }
+
+    impl FixedLateMembers {
+        fn new(allow: bool) -> Self {
+            Self {
+                allow,
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LateMemberAuthorizer for FixedLateMembers {
+        async fn unauthorized(&self, _group_id: i32, project_ids: &[i32]) -> Vec<i32> {
+            self.asked.lock().unwrap().push(project_ids.to_vec());
+            if self.allow {
+                Vec::new()
+            } else {
+                project_ids.to_vec()
+            }
+        }
+    }
+
+    /// Two placements into one empty group, each authorized before the other
+    /// committed: the second sees the first's project as a late member. A
+    /// caller that may manage it gets through; one that may not changes nothing.
+    #[tokio::test]
+    async fn concurrent_placements_reauthorize_the_other_placement_under_the_lock() {
+        use sea_orm::TransactionTrait;
+        let Some(db) = try_test_db().await else {
+            return;
+        };
+        let conn = db.connection_arc();
+        let (first, second, third) = (9861, 9862, 9863);
+        for (id, name) in [(first, "first"), (second, "second"), (third, "third")] {
+            insert_project(conn.as_ref(), id, name).await;
+        }
+        let svc = Arc::new(ProjectGroupService::new(conn.clone()));
+        let group = svc
+            .create_group(create_req("Busy 9861", vec![]))
+            .await
+            .unwrap()
+            .group
+            .id;
+        let checked = HashSet::new(); // both callers saw an empty group
+
+        // The first placement holds the group lock, not committed yet.
+        let txn = conn.begin().await.unwrap();
+        ProjectGroupService::lock_projects(&txn, &[first])
+            .await
+            .unwrap();
+        ProjectGroupService::lock_group_members(&txn, group, &checked, Some(first), None)
+            .await
+            .unwrap();
+        ProjectGroupService::place_membership(&txn, group, first, None, None)
+            .await
+            .unwrap();
+
+        let allow = Arc::new(FixedLateMembers::new(true));
+        let placing = {
+            let (svc, allow, checked) = (svc.clone(), allow.clone(), checked.clone());
+            spawn_expecting_block("a concurrent placement", async move {
+                svc.add_project_reauthorizing(
+                    group,
+                    second,
+                    &HashSet::new(),
+                    &checked,
+                    allow.as_ref(),
+                )
+                .await
+            })
+            .await
+        };
+        txn.commit().await.unwrap();
+        finished(placing)
+            .await
+            .expect("a caller that may manage the late member is not refused");
+        assert_eq!(*allow.asked.lock().unwrap(), vec![vec![first]]);
+        let members = ids(&svc.get_group(group).await.unwrap());
+        assert_eq!(members.len(), 2, "both placements landed: {members:?}");
+
+        // Without access to the members that joined, nothing changes.
+        let deny = FixedLateMembers::new(false);
+        let err = svc
+            .add_project_reauthorizing(group, third, &HashSet::new(), &checked, &deny)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::MembersChanged { ref project_ids, .. } if *project_ids == vec![first, second]),
+            "got {err:?}"
+        );
+        assert!(svc.group_for_project(third).await.unwrap().is_none());
+    }
+
+    /// The reported race, end to end: two placements sent at once.
+    #[tokio::test]
+    async fn two_simultaneous_placements_into_one_group_both_succeed() {
+        let Some(db) = try_test_db().await else {
+            return;
+        };
+        let conn = db.connection_arc();
+        let (a, b) = (9871, 9872);
+        insert_project(conn.as_ref(), a, "a").await;
+        insert_project(conn.as_ref(), b, "b").await;
+        let svc = ProjectGroupService::new(conn.clone());
+        let group = svc
+            .create_group(create_req("Pair 9871", vec![]))
+            .await
+            .unwrap()
+            .group
+            .id;
+        let (checked, routes) = (HashSet::new(), HashSet::new());
+        let allow = FixedLateMembers::new(true);
+        let (ra, rb) = tokio::join!(
+            svc.add_project_reauthorizing(group, a, &routes, &checked, &allow),
+            svc.add_project_reauthorizing(group, b, &routes, &checked, &allow),
+        );
+        ra.expect("placing a");
+        rb.expect("placing b");
+        let mut members = ids(&svc.get_group(group).await.unwrap());
+        members.sort_unstable();
+        assert_eq!(members, vec![a, b]);
     }
 
     /// The reported interleaving: P is in no group when request A looks, so
