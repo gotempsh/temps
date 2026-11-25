@@ -77,7 +77,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md); amended by [099](./099-worker-backups-run-the-local-engines.md) |
 | [056](./056-compute-pool-that-avoids-collisions.md) | A Compute Pool That Avoids Collisions and Can Be Changed | Accepted |  |
 | [057](./057-removing-a-node-that-is-gone.md) | Removing a worker node that is gone | Accepted |  |
-| [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed | amended by [107](./107-control-plane-tunnel-connectors.md) |
+| [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed | superseded by [116](./116-ingress-provider-trait.md); amended by [107](./107-control-plane-tunnel-connectors.md) |
 | [059](./059-configurable-overlay-network-name.md) | A configurable overlay network name, and a join that looks first | Accepted |  |
 | [060](./060-rejoining-the-same-control-plane.md) | Re-joining the same control plane, and removing an empty node | Accepted |  |
 | [061](./061-worker-metrics.md) | Worker proxy and host metrics, pulled by the control plane | Accepted |  |
@@ -134,6 +134,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [113](./113-runtime-model-catalog-and-coding-agent-updates.md) | New models and coding-agent releases without a Temps release | Accepted |  |
 | [114](./114-the-control-plane-serves-private-addresses.md) | The control plane serves private addresses | Proposed | amends [064](./064-making-a-project-reachable.md) |
 | [115](./115-agents-run-on-the-ai-gateway-only.md) | Agents run on the AI gateway only | Proposed | supersedes [037](./037-subscription-agent-cli-providers.md) |
+| [116](./116-ingress-provider-trait.md) | An ingress provider is one trait implementation | Proposed | supersedes [058](./058-ingress-modes-and-a-shared-app-domain.md) |
 
 ## Supporting documents
 
