@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Recording every outbound connection the sandbox makes, as OpenTelemetry
- * logs of its project. Off by default. When it cannot work here (no
- * project, or the sandbox's node cannot record), the card stays visible in
- * an onboarding state that shows what a record looks like and says exactly
- * what is missing, with a link to where it is fixed.
+ * Recording every outbound connection a workload makes, as OpenTelemetry
+ * logs. One card for every kind of workload: the page says which one
+ * (`sandboxEgress(id)`, `environmentEgress(projectId, environmentId)`). Off
+ * by default. When it cannot work here (no node the workload runs on can
+ * record), the card stays visible in an onboarding state that shows what a
+ * record looks like and says exactly what is missing, with a link to where
+ * it is fixed.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Radar } from 'lucide-react'
@@ -14,44 +16,48 @@ import { Link } from 'react-router'
 import { toast } from 'sonner'
 
 import type { EgressRecordingStatus } from '@/api/client'
-import {
-  getEgressRecordingOptions,
-  getEgressRecordingQueryKey,
-  getSandboxQueryKey,
-  setEgressRecordingMutation,
-} from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { problemDetail } from '@/lib/api-problem'
 
-import { canToggle, EXAMPLE_RECORDS } from './egress-recording'
+import {
+  blockingNodeName,
+  canToggle,
+  egressRecordsKey,
+  egressStatusKey,
+  EXAMPLE_RECORDS,
+  type EgressWorkload,
+} from './egress-recording'
 
-export function SandboxEgressRecordingCard({
-  sandboxId,
+export function OutboundRecordingCard({
+  workload,
   disabled = false,
+  disabledNote,
 }: {
-  sandboxId: string
-  /** Destroyed sandboxes freeze the control. */
+  workload: EgressWorkload
+  /** A workload that is gone freezes the control. */
   disabled?: boolean
+  /** Why it is frozen, e.g. "A destroyed sandbox makes no connections." */
+  disabledNote?: string
 }) {
   const queryClient = useQueryClient()
+  const statusKey = egressStatusKey(workload)
   const status = useQuery({
-    ...getEgressRecordingOptions({ path: { id: sandboxId } }),
+    queryKey: statusKey,
+    queryFn: ({ signal }) => workload.status(signal),
     enabled: !disabled,
   })
   const save = useMutation({
-    ...setEgressRecordingMutation(),
+    mutationFn: (enabled: boolean) => workload.setEnabled(enabled),
     meta: { errorTitle: 'Could not change outbound connection recording' },
     onSuccess: (next) => {
-      queryClient.setQueryData(
-        getEgressRecordingQueryKey({ path: { id: sandboxId } }),
-        next
-      )
-      queryClient.invalidateQueries({
-        queryKey: getSandboxQueryKey({ path: { id: sandboxId } }),
-      })
+      queryClient.setQueryData(statusKey, next)
+      queryClient.invalidateQueries({ queryKey: egressRecordsKey(workload) })
+      for (const queryKey of workload.invalidates ?? []) {
+        queryClient.invalidateQueries({ queryKey })
+      }
       toast.success(
         next.enabled
           ? 'Outbound connections are now recorded'
@@ -71,14 +77,14 @@ export function SandboxEgressRecordingCard({
       <CardContent className="space-y-3">
         {disabled ? (
           <p className="text-sm text-muted-foreground">
-            A destroyed sandbox makes no connections.
+            {disabledNote ?? `This ${workload.noun} makes no connections.`}
           </p>
         ) : status.isError ? (
           <ErrorAlert
             title="Could not load outbound connection recording"
             description={problemDetail(
               status.error,
-              'Whether this sandbox records its connections could not be loaded.'
+              `Whether this ${workload.noun} records its connections could not be loaded.`
             )}
             retry={() => status.refetch()}
             retrying={status.isFetching}
@@ -90,11 +96,10 @@ export function SandboxEgressRecordingCard({
           </div>
         ) : (
           <RecordingBody
+            workload={workload}
             status={status.data}
             pending={save.isPending}
-            onToggle={(enabled) =>
-              save.mutate({ path: { id: sandboxId }, body: { enabled } })
-            }
+            onToggle={(enabled) => save.mutate(enabled)}
           />
         )}
       </CardContent>
@@ -103,15 +108,21 @@ export function SandboxEgressRecordingCard({
 }
 
 function RecordingBody({
+  workload,
   status,
   pending,
   onToggle,
 }: {
+  workload: EgressWorkload
   status: EgressRecordingStatus
   pending: boolean
   onToggle: (enabled: boolean) => void
 }) {
   const toggleable = canToggle(status, false) && !pending
+  // A workload on several nodes records where a node can; say where not.
+  const unrecorded = status.configured
+    ? status.nodes.filter((node) => !node.recording)
+    : []
   return (
     <>
       <div className="flex items-start justify-between gap-3">
@@ -119,8 +130,8 @@ function RecordingBody({
           htmlFor="egress-recording-switch"
           className="text-sm [overflow-wrap:anywhere]"
         >
-          Log every connection this sandbox opens, allowed or refused, as seen
-          by the egress proxy
+          Log every connection this {workload.noun} opens, allowed or refused,
+          as seen by the egress proxy
         </label>
         <Switch
           id="egress-recording-switch"
@@ -138,7 +149,7 @@ function RecordingBody({
           <p className="font-medium">
             {status.enabled
               ? 'Recording is on, but nothing is being recorded'
-              : 'Recording is not available for this sandbox'}
+              : `Recording is not available for this ${workload.noun}`}
           </p>
           <p className="text-muted-foreground [overflow-wrap:anywhere]">
             {status.reason}
@@ -148,7 +159,7 @@ function RecordingBody({
               to={status.setup_path}
               className="inline-block text-xs underline underline-offset-4"
             >
-              Open {status.node_name} in Nodes
+              Open {blockingNodeName(status)} in Nodes
             </Link>
           )}
           <p className="text-xs text-muted-foreground">
@@ -162,6 +173,25 @@ function RecordingBody({
             ))}
           </ul>
         </div>
+      )}
+
+      {workload.appliesNote && status.configured && (
+        <p className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+          {workload.appliesNote}
+        </p>
+      )}
+
+      {unrecorded.length > 0 && (
+        <ul
+          aria-label="Nodes that do not record"
+          className="space-y-1 text-xs text-muted-foreground"
+        >
+          {unrecorded.map((node) => (
+            <li key={node.node_id} className="[overflow-wrap:anywhere]">
+              Not recorded on {node.node_name}: {node.reason}
+            </li>
+          ))}
+        </ul>
       )}
 
       {status.configured && (

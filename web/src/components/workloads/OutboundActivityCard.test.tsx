@@ -15,11 +15,13 @@ import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
   describeDestination,
+  environmentEgress,
   EXAMPLE_RECORDS,
   formatDuration,
   outcomeVariant,
+  sandboxEgress,
 } from './egress-recording'
-import { SandboxEgressActivityCard } from './SandboxEgressActivityCard'
+import { OutboundActivityCard } from './OutboundActivityCard'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -28,14 +30,23 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 100))
 
 function status(enabled: boolean): EgressRecordingStatus {
   return {
-    sandbox_id: 'sbx_1',
+    workload_kind: 'sandbox',
+    workload_id: 'sbx_1',
     enabled,
     configured: true,
     reason_code: null,
     reason: null,
     setup_path: null,
-    node_id: null,
-    node_name: 'control-plane',
+    nodes: [
+      {
+        node_id: 0,
+        node_name: 'control-plane',
+        recording: true,
+        reason_code: null,
+        reason: null,
+        setup_path: null,
+      },
+    ],
     project_id: 7,
     logs_path: null,
   }
@@ -70,7 +81,8 @@ function page(
   total = records.length
 ): EgressActivityPage {
   return {
-    sandbox_id: 'sbx_1',
+    workload_kind: 'sandbox',
+    workload_id: 'sbx_1',
     records,
     page: 1,
     per_page: 20,
@@ -107,7 +119,7 @@ test('lists the sandbox own recorded connections', async () => {
         ])
       ),
   })
-  const card = view(<SandboxEgressActivityCard sandboxId="sbx_1" />)
+  const card = view(<OutboundActivityCard workload={sandboxEgress('sbx_1')} />)
   await settle()
   expect(card.getByText('CONNECT api.example.com:443')).toBeTruthy()
   expect(card.getByText('CONNECT blocked.example.com:443')).toBeTruthy()
@@ -123,7 +135,7 @@ test('with recording off and nothing recorded, it onboards', async () => {
       jsonResponse(status(false)),
     'GET /v1/sandboxes/sbx_1/egress-records': () => jsonResponse(page([])),
   })
-  const card = view(<SandboxEgressActivityCard sandboxId="sbx_1" />)
+  const card = view(<OutboundActivityCard workload={sandboxEgress('sbx_1')} />)
   await settle()
   const notice = card.getByRole('status')
   expect(notice.textContent).toContain('Recording is off')
@@ -146,13 +158,50 @@ test('a failed load says what failed', async () => {
         503
       ),
   })
-  const card = view(<SandboxEgressActivityCard sandboxId="sbx_1" />)
+  const card = view(<OutboundActivityCard workload={sandboxEgress('sbx_1')} />)
   await settle()
   expect(card.getByText('Could not load outbound activity')).toBeTruthy()
   api.restore()
 })
 
-test('destinations read as the sandbox asked for them', () => {
+test('an environment lists its records from its own endpoint', async () => {
+  let asked = ''
+  const api = mockApi({
+    'GET /projects/7/environments/21/egress-recording': () =>
+      jsonResponse(status(false)),
+    'GET /projects/7/environments/21/egress-records': (request) => {
+      asked = new URL(request.url).search
+      return jsonResponse(page([record({ node_name: 'control-plane' })]))
+    },
+  })
+  const card = view(
+    <OutboundActivityCard workload={environmentEgress(7, 21)} />
+  )
+  await settle()
+  expect(card.getByText('CONNECT api.example.com:443')).toBeTruthy()
+  expect(asked).toContain('page=1')
+  expect(asked).toContain('per_page=20')
+  api.restore()
+})
+
+test('an environment with recording off onboards in its own words', async () => {
+  const api = mockApi({
+    'GET /projects/7/environments/21/egress-recording': () =>
+      jsonResponse(status(false)),
+    'GET /projects/7/environments/21/egress-records': () =>
+      jsonResponse(page([])),
+  })
+  const card = view(
+    <OutboundActivityCard workload={environmentEgress(7, 21)} />
+  )
+  await settle()
+  expect(card.getByRole('status').textContent).toContain(
+    'every connection this environment opens'
+  )
+  api.restore()
+})
+
+test('destinations read as the workload asked for them', () => {
   expect(describeDestination(record({}))).toBe('CONNECT api.example.com:443')
   expect(
     describeDestination(

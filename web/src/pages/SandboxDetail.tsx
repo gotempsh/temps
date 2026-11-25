@@ -103,8 +103,9 @@ import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
 import { SandboxPreviewAccessCard } from '@/components/sandboxes/SandboxPreviewAccessCard'
 import { SandboxEgressCard } from '@/components/sandboxes/SandboxEgressCard'
-import { SandboxEgressActivityCard } from '@/components/sandboxes/SandboxEgressActivityCard'
-import { SandboxEgressRecordingCard } from '@/components/sandboxes/SandboxEgressRecordingCard'
+import { sandboxEgress } from '@/components/workloads/egress-recording'
+import { OutboundActivityCard } from '@/components/workloads/OutboundActivityCard'
+import { OutboundRecordingCard } from '@/components/workloads/OutboundRecordingCard'
 import { SandboxFilesCard } from '@/components/sandboxes/SandboxFilesCard'
 import {
   PREVIEW_ACCESS_ANCHOR,
@@ -1083,12 +1084,13 @@ export default function SandboxDetail() {
                       backend={sandbox.backend}
                       disabled={destroyed}
                     />
-                    <SandboxEgressRecordingCard
-                      sandboxId={sandbox.id}
+                    <OutboundRecordingCard
+                      workload={sandboxEgress(sandbox.id)}
                       disabled={destroyed}
+                      disabledNote="A destroyed sandbox makes no connections."
                     />
-                    <SandboxEgressActivityCard
-                      sandboxId={sandbox.id}
+                    <OutboundActivityCard
+                      workload={sandboxEgress(sandbox.id)}
                       disabled={destroyed}
                     />
                     <SandboxInternalAddressesCard

@@ -14205,7 +14205,7 @@ export type EffectivePolicyResponse = {
 };
 
 /**
- * A page of a sandbox's recorded connections, newest first.
+ * A page of a workload's recorded connections, newest first.
  */
 export type EgressActivityPage = {
     /**
@@ -14216,13 +14216,18 @@ export type EgressActivityPage = {
     per_page: number;
     records: Array<EgressActivityRecord>;
     /**
-     * The sandbox's public id.
-     */
-    sandbox_id: string;
-    /**
      * How many records match, across all pages.
      */
     total: number;
+    /**
+     * The workload's id in its own API (`sbx_...`, an environment id).
+     */
+    workload_id: string;
+    /**
+     * What the workload is: `sandbox`, or `deployment` for an
+     * environment's deployments.
+     */
+    workload_kind: string;
 };
 
 /**
@@ -14239,7 +14244,7 @@ export type EgressActivityRecord = {
     count: number;
     duration_ms: number;
     /**
-     * The destination host the sandbox asked for (`server.address`).
+     * The destination host the workload asked for (`server.address`).
      */
     host?: string | null;
     /**
@@ -14306,13 +14311,42 @@ export type EgressMode = 'internet' | 'restricted';
 export type EgressOutcomeFilter = 'allowed' | 'refused' | 'failed';
 
 /**
- * Whether a sandbox records its outbound connections, and whether it can.
+ * Whether one node the workload runs on can record.
+ */
+export type EgressRecordingNode = {
+    /**
+     * `0` is the control plane.
+     */
+    node_id: number;
+    node_name: string;
+    /**
+     * The same, in a sentence that names what is missing.
+     */
+    reason?: string | null;
+    /**
+     * Why it cannot, when `recording` is false: one of
+     * `unsupported_platform`, `proxy_not_serving`, `node_not_reporting`,
+     * `agent_predates_recording`.
+     */
+    reason_code?: string | null;
+    /**
+     * The node reports that it can record.
+     */
+    recording: boolean;
+    /**
+     * Console path that fixes it, when one does.
+     */
+    setup_path?: string | null;
+};
+
+/**
+ * Whether a workload records its outbound connections, and whether it can.
  */
 export type EgressRecordingStatus = {
     /**
-     * Recording can work for this sandbox now: it has a project, OTel
-     * storage is enabled and its node reports that it can record. When
-     * `enabled` is true and this is false, nothing is being recorded.
+     * Recording can work for this workload now: OTel storage is enabled
+     * and a node it runs on reports that it can record. When `enabled` is
+     * true and this is false, nothing is being recorded.
      */
     configured: boolean;
     /**
@@ -14320,34 +14354,43 @@ export type EgressRecordingStatus = {
      */
     enabled: boolean;
     /**
-     * Console path of the project's logs, filtered to this sandbox's
-     * records. `None` without a project.
+     * Console path of the project's logs, filtered to this workload's
+     * records. `None` without a project: the records are then read only
+     * from the workload itself.
      */
     logs_path?: string | null;
     /**
-     * The sandbox's node; `None` is the control plane.
+     * The nodes the workload runs on, and whether each can record. Empty
+     * when nothing of it is running.
      */
-    node_id?: number | null;
-    node_name: string;
+    nodes: Array<EgressRecordingNode>;
+    /**
+     * The project that owns the workload, when one does.
+     */
     project_id?: number | null;
     /**
      * The same, in a sentence that names what is missing.
      */
     reason?: string | null;
     /**
-     * Why recording cannot work, when `configured` is false: one of
-     * `no_project`, `otel_unavailable`, `unsupported_platform`,
-     * `proxy_not_serving`, `node_not_reporting`, `agent_predates_recording`.
+     * Why recording cannot work, when `configured` is false:
+     * `otel_unavailable`, or the `reason_code` of the node that cannot
+     * record.
      */
     reason_code?: string | null;
-    /**
-     * The sandbox's public id.
-     */
-    sandbox_id: string;
     /**
      * Console path that fixes it, when one does.
      */
     setup_path?: string | null;
+    /**
+     * The workload's id in its own API (`sbx_...`, an environment id).
+     */
+    workload_id: string;
+    /**
+     * What the workload is: `sandbox`, or `deployment` for an
+     * environment's deployments.
+     */
+    workload_kind: string;
 };
 
 /**
@@ -22498,7 +22541,12 @@ export type LogRecord = {
     body: string;
     deployment_id?: number | null;
     observed_timestamp: string;
-    project_id: number;
+    /**
+     * The project that owns the record. `None` only for a record the
+     * platform observed about a workload that belongs to no project (see
+     * `workload`); everything a workload sends about itself has a project.
+     */
+    project_id?: number | null;
     resource: ResourceInfo;
     severity: LogSeverity;
     severity_text: string;
@@ -35890,7 +35938,7 @@ export type SetConnectorNodesRequest = {
 };
 
 /**
- * Turn recording of the sandbox's outbound connections on or off.
+ * Turn recording of the workload's outbound connections on or off.
  */
 export type SetEgressRecordingBody = {
     enabled: boolean;
@@ -88013,6 +88061,177 @@ export type DeployFromStaticResponses = {
 
 export type DeployFromStaticResponse = DeployFromStaticResponses[keyof DeployFromStaticResponses];
 
+export type GetEnvironmentEgressRecordingData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/egress-recording';
+};
+
+export type GetEnvironmentEgressRecordingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetEnvironmentEgressRecordingError = GetEnvironmentEgressRecordingErrors[keyof GetEnvironmentEgressRecordingErrors];
+
+export type GetEnvironmentEgressRecordingResponses = {
+    /**
+     * Recording status
+     */
+    200: EgressRecordingStatus;
+};
+
+export type GetEnvironmentEgressRecordingResponse = GetEnvironmentEgressRecordingResponses[keyof GetEnvironmentEgressRecordingResponses];
+
+export type SetEnvironmentEgressRecordingData = {
+    body: SetEgressRecordingBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/egress-recording';
+};
+
+export type SetEnvironmentEgressRecordingErrors = {
+    /**
+     * Invalid body
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Recording cannot work for this environment: no node it runs on can record
+     */
+    422: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * OpenTelemetry storage is not enabled
+     */
+    503: ProblemDetails;
+};
+
+export type SetEnvironmentEgressRecordingError = SetEnvironmentEgressRecordingErrors[keyof SetEnvironmentEgressRecordingErrors];
+
+export type SetEnvironmentEgressRecordingResponses = {
+    /**
+     * Recording updated
+     */
+    200: EgressRecordingStatus;
+};
+
+export type SetEnvironmentEgressRecordingResponse = SetEnvironmentEgressRecordingResponses[keyof SetEnvironmentEgressRecordingResponses];
+
+export type ListEnvironmentEgressRecordsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: {
+        /**
+         * Page number, from 1. Default 1.
+         */
+        page?: number;
+        /**
+         * Records per page. Default 20, at most 100.
+         */
+        per_page?: number;
+        /**
+         * Only connections that ended this way.
+         */
+        outcome?: EgressOutcomeFilter;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/egress-records';
+};
+
+export type ListEnvironmentEgressRecordsErrors = {
+    /**
+     * Invalid query
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * OpenTelemetry storage is not enabled or cannot be read
+     */
+    503: ProblemDetails;
+};
+
+export type ListEnvironmentEgressRecordsError = ListEnvironmentEgressRecordsErrors[keyof ListEnvironmentEgressRecordsErrors];
+
+export type ListEnvironmentEgressRecordsResponses = {
+    /**
+     * A page of recorded connections
+     */
+    200: EgressActivityPage;
+};
+
+export type ListEnvironmentEgressRecordsResponse = ListEnvironmentEgressRecordsResponses[keyof ListEnvironmentEgressRecordsResponses];
+
 export type DeleteEnvironmentIpAccessData = {
     body?: never;
     path: {
@@ -108148,7 +108367,7 @@ export type SetEgressRecordingErrors = {
      */
     404: ProblemDetails;
     /**
-     * Recording cannot work for this sandbox: no project, or its node cannot record
+     * Recording cannot work for this sandbox: its node cannot record
      */
     422: ProblemDetails;
     /**

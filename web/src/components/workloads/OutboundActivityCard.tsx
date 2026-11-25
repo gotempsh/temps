@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * The sandbox's own recorded outbound connections, newest first, read by
- * sandbox rather than through its project's logs. While recording is off
- * the card stays visible in an onboarding state showing what a record looks
- * like and where to turn it on.
+ * A workload's own recorded outbound connections, newest first, read by
+ * workload rather than through its project's logs. One card for every kind
+ * of workload: the page says which one. While recording is off the card
+ * stays visible in an onboarding state showing what a record looks like
+ * and where to turn it on.
  */
 import { useQuery } from '@tanstack/react-query'
 import { Activity } from 'lucide-react'
@@ -16,10 +17,6 @@ import type {
   EgressOutcomeFilter,
   EgressRecordingStatus,
 } from '@/api/client'
-import {
-  getEgressRecordingOptions,
-  listEgressRecordsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
@@ -45,9 +42,13 @@ import { formatBytes } from '@/lib/utils'
 
 import {
   describeDestination,
+  egressRecordsKey,
+  egressStatusKey,
   EXAMPLE_RECORDS,
   formatDuration,
   outcomeVariant,
+  type EgressRecordsQuery,
+  type EgressWorkload,
 } from './egress-recording'
 
 const PAGE_SIZE = 20
@@ -56,29 +57,29 @@ const REFRESH_MS = 10_000
 
 type OutcomeChoice = 'all' | EgressOutcomeFilter
 
-export function SandboxEgressActivityCard({
-  sandboxId,
+export function OutboundActivityCard({
+  workload,
   disabled = false,
 }: {
-  sandboxId: string
-  /** Destroyed sandboxes still show what they recorded. */
+  workload: EgressWorkload
+  /** A workload that is gone still shows what it recorded. */
   disabled?: boolean
 }) {
   const [page, setPage] = useState(1)
   const [outcome, setOutcome] = useState<OutcomeChoice>('all')
-  const status = useQuery(
-    getEgressRecordingOptions({ path: { id: sandboxId } })
-  )
+  const status = useQuery({
+    queryKey: egressStatusKey(workload),
+    queryFn: ({ signal }) => workload.status(signal),
+  })
   const recording = status.data?.enabled === true
+  const query: EgressRecordsQuery = {
+    page,
+    per_page: PAGE_SIZE,
+    outcome: outcome === 'all' ? undefined : outcome,
+  }
   const records = useQuery({
-    ...listEgressRecordsOptions({
-      path: { id: sandboxId },
-      query: {
-        page,
-        per_page: PAGE_SIZE,
-        outcome: outcome === 'all' ? undefined : outcome,
-      },
-    }),
+    queryKey: egressRecordsKey(workload, query),
+    queryFn: ({ signal }) => workload.records(query, signal),
     refetchInterval: recording && page === 1 && !disabled ? REFRESH_MS : false,
   })
   const total = records.data?.total ?? 0
@@ -118,7 +119,7 @@ export function SandboxEgressActivityCard({
             title="Could not load outbound activity"
             description={problemDetail(
               records.error,
-              "This sandbox's recorded connections could not be loaded."
+              `This ${workload.noun}'s recorded connections could not be loaded.`
             )}
             retry={() => records.refetch()}
             retrying={records.isFetching}
@@ -131,6 +132,7 @@ export function SandboxEgressActivityCard({
           </div>
         ) : records.data.records.length === 0 ? (
           <EmptyActivity
+            noun={workload.noun}
             status={status.data}
             filtered={outcome !== 'all'}
             disabled={disabled}
@@ -156,10 +158,12 @@ export function SandboxEgressActivityCard({
 }
 
 function EmptyActivity({
+  noun,
   status,
   filtered,
   disabled,
 }: {
+  noun: string
   status: EgressRecordingStatus | undefined
   filtered: boolean
   disabled: boolean
@@ -185,8 +189,8 @@ function EmptyActivity({
     >
       <p className="font-medium">Recording is off</p>
       <p className="text-muted-foreground">
-        Turn on “Record outbound connections” to list every connection this
-        sandbox opens here, e.g.
+        Turn on “Record outbound connections” to list every connection this{' '}
+        {noun} opens here, e.g.
       </p>
       <ul className="space-y-1 font-mono text-xs text-muted-foreground">
         {EXAMPLE_RECORDS.map((line) => (
