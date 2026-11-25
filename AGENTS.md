@@ -13,6 +13,7 @@ cleanup, resource limits, migrations) and a pre-PR checklist.
 |---|---|
 | What each crate does, its layer and consumers | [`docs/architecture/crates.md`](./docs/architecture/crates.md) (generated) |
 | A crate that follows the rules below end to end | [`crates/temps-flags`](./crates/temps-flags): `error.rs`, `services/flag_service.rs`, `handlers/{handler,types,audit}.rs`, `plugin.rs` |
+| Adding something a sandbox, an environment, a managed service, a function or a job could all have | [`docs/architecture/workload-capabilities.md`](./docs/architecture/workload-capabilities.md): write it once against `WorkloadRef`, with one adapter per kind |
 | Step-by-step recipes (skills) | [`temps-add-migration-and-entity`](./.agents/skills/temps-add-migration-and-entity/SKILL.md), [`temps-add-handler`](./.agents/skills/temps-add-handler/SKILL.md), [`temps-add-plugin`](./.agents/skills/temps-add-plugin/SKILL.md), [`temps-split-module`](./.agents/skills/temps-split-module/SKILL.md), [`temps-design-system`](./.agents/skills/temps-design-system/SKILL.md), [`start-temps`](./.agents/skills/start-temps/SKILL.md) |
 | Environment variables the binary reads, and why | [`docs/reference/environment-variables.md`](./docs/reference/environment-variables.md) |
 | Architecture decisions | [`docs/adr/README.md`](./docs/adr/README.md); a new ADR takes `python3 scripts/adr_index.py --next` |
@@ -99,6 +100,7 @@ narrowest item. Existing variables and their justification:
 - **Use `require_service`** in plugins for dependencies the app cannot function without.
 - **Let the user configure and control their setup**: show status and give instructions; never do things silently on their behalf.
 - **Design new features for a small footprint** ([Scalability & Efficiency](#scalability--efficiency)) and **give every feature a visible surface that onboards when unconfigured** ([Feature Discoverability](#feature-discoverability)).
+- **Write a workload capability once.** Products keep their own entities, data, permissions and URLs; what several kinds of workload can do (record outbound connections, send telemetry, apply a network policy) is implemented once against `temps_workload::WorkloadRef` in a `temps-workload-*` crate, and each product adds only an adapter and thin handlers ([`docs/architecture/workload-capabilities.md`](./docs/architecture/workload-capabilities.md), [ADR-115](./docs/adr/115-workload-capabilities-written-once.md)). Logic in a product crate that would read the same for another product with the table name changed is in the wrong crate.
 - **Use Conventional Commits and sign off every commit** ([Commits and pull requests](#commits-and-pull-requests)).
 
 ## Errors

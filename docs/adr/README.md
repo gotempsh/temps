@@ -71,7 +71,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [049](./049-automatic-expiry-checks-for-structured-credentials.md) | Automatic expiry checks for structured credentials | Accepted |  |
 | [050](./050-microsandbox-sandbox-backend.md) | microsandbox (libkrun) MicroVM Sandbox Backend | Proposed |  |
 | [051](./051-public-ingress-surface.md) | Public Ingress Surface for Third-Party Callbacks | Accepted |  |
-| [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md) |
+| [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md); amended by [115](./115-workload-capabilities-written-once.md) |
 | [053](./053-distributed-runtime-health-and-worker-uptime.md) | Distributed Runtime Health and Worker Uptime | Implemented for process/HTTP/TCP |  |
 | [054](./054-plugin-builds-on-worker-nodes.md) | Plugin builds run on a worker node when the control plane has no Docker | Proposed |  |
 | [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md); amended by [099](./099-worker-backups-run-the-local-engines.md) |
@@ -133,6 +133,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [112](./112-project-focused-console.md) | A project-focused console | Proposed |  |
 | [113](./113-runtime-model-catalog-and-coding-agent-updates.md) | New models and coding-agent releases without a Temps release | Accepted |  |
 | [114](./114-identical-build-coordination.md) | Coordinating identical builds | Accepted |  |
+| [115](./115-workload-capabilities-written-once.md) | A workload capability is written once; each kind keeps its own entities | Accepted | amends [052](./052-common-workload-model.md) |
 
 ## Supporting documents
 
