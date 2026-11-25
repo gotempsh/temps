@@ -1090,12 +1090,18 @@ fn store_workspace_files_fd_relative(
             for name in names {
                 let name = std::ffi::OsStr::from_bytes(name.to_bytes());
                 let relative = parent_path.join(name);
-                if relative.to_str().is_some_and(is_sensitive_workspace_path) {
-                    continue;
-                }
                 let stat = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
                 let file_type = FileType::from_raw_mode(stat.st_mode);
+                // Only generated directories are free; credential files are
+                // hidden and refused on import, but they still take up space.
+                if file_type.is_dir()
+                    && name.to_str().is_some_and(|name| {
+                        is_generated_workspace_dir_name(&name.to_ascii_lowercase())
+                    })
+                {
+                    continue;
+                }
                 existing_paths.insert(relative.clone());
                 if file_type.is_dir() {
                     // Queue the relative directory name, not its descriptor.
@@ -1264,6 +1270,11 @@ fn validate_workspace_relative_path(
     Ok(())
 }
 
+/// Whether a workspace path is kept out of file listings, imports and sandbox
+/// deploys: version-control and tool state, build folders, `.env` files, and
+/// a fixed list of key, certificate and credential file names and
+/// extensions. It matches names only and never reads contents, so a secret in
+/// a file with any other name is not caught; the sandbox deploy card says so.
 pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
     if path.starts_with('/') || path.contains("../") {
         return true;
@@ -1279,26 +1290,10 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
     }
     components.iter().any(|lower| {
         let lower = lower.as_str();
-        lower == ".git"
-            || lower == ".temps"
+        is_generated_workspace_dir_name(lower)
             || matches!(
                 lower,
-                ".aws"
-                    | ".azure"
-                    | ".docker"
-                    | ".gnupg"
-                    | ".kube"
-                    | ".next"
-                    | ".pulumi"
-                    | ".ssh"
-                    | ".terraform"
-                    | ".turbo"
-                    | ".vercel"
-                    | "build"
-                    | "coverage"
-                    | "dist"
-                    | "node_modules"
-                    | "target"
+                ".aws" | ".azure" | ".docker" | ".gnupg" | ".kube" | ".ssh"
             )
             || lower == ".env"
             || (lower.starts_with(".env.") && lower != ".env.example")
@@ -1311,20 +1306,61 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
             || lower == ".yarnrc"
             || lower == "credentials"
             || lower == "credentials.json"
-            || lower == "id_dsa"
-            || lower == "id_rsa"
-            || lower == "id_ed25519"
+            || is_ssh_private_key_name(lower)
+            // Database, web-server and cloud-tool credential files.
+            || matches!(
+                lower,
+                ".pgpass"
+                    | ".my.cnf"
+                    | ".htpasswd"
+                    | ".dockercfg"
+                    | ".boto"
+                    | ".s3cfg"
+                    | "kubeconfig"
+            )
+            || lower.ends_with(".kubeconfig")
             || lower.ends_with(".credentials.json")
             || (lower.contains("service-account") && lower.ends_with(".json"))
             || lower.ends_with(".pem")
             || lower.ends_with(".key")
+            || lower.ends_with(".p8")
             || lower.ends_with(".p12")
             || lower.ends_with(".pfx")
             || lower.ends_with(".jks")
             || lower.ends_with(".keystore")
             || lower.ends_with(".tfstate")
             || lower.ends_with(".tfstate.backup")
+            // Terraform variable files hold the secrets passed to a plan.
+            || lower.ends_with(".tfvars")
+            || lower.ends_with(".tfvars.json")
     })
+}
+
+/// Version-control and tool state and build output: regenerated, not authored,
+/// so never listed, imported, deployed or counted against the quota.
+fn is_generated_workspace_dir_name(lower: &str) -> bool {
+    matches!(
+        lower,
+        ".git"
+            | ".temps"
+            | ".next"
+            | ".pulumi"
+            | ".terraform"
+            | ".turbo"
+            | ".vercel"
+            | "build"
+            | "coverage"
+            | "dist"
+            | "node_modules"
+            | "target"
+    )
+}
+
+/// The default names `ssh-keygen` gives a private key, including the
+/// security-key (`_sk`) variants. Public keys (`.pub`) are not secret.
+fn is_ssh_private_key_name(lower: &str) -> bool {
+    let base = lower.strip_suffix("_sk").unwrap_or(lower);
+    matches!(base, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519")
 }
 
 fn map_workspace_read_error(path: String, source: std::io::Error) -> ApplicationError {
@@ -4118,6 +4154,51 @@ mod tests {
             .expect_err("files in another project must consume the application quota");
         assert!(matches!(error, ApplicationError::WorkspaceQuota { .. }));
         assert!(!projects.join("web/new.bin").exists());
+    }
+
+    /// Credential files are hidden from listings and refused on import, but
+    /// they still take up space: one already in the workspace counts against
+    /// the aggregate quota, so it cannot be used to exceed it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_credential_files_count_against_the_workspace_quota() {
+        for existing in ["projects/api/.pgpass", "projects/api/.env", ".ssh/id_rsa"] {
+            let data_dir = tempfile::tempdir().expect("temporary data directory");
+            let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+            let workspace = service
+                .ensure("app_safe_123", &[])
+                .await
+                .expect("managed workspace");
+            tokio::fs::create_dir_all(workspace.host_work_dir.join("projects/web"))
+                .await
+                .expect("web project");
+            let existing_path = workspace.host_work_dir.join(existing);
+            tokio::fs::create_dir_all(existing_path.parent().expect("parent"))
+                .await
+                .expect("credential file parent");
+            tokio::fs::write(&existing_path, vec![0; 6])
+                .await
+                .expect("existing credential file");
+
+            let error = service
+                .store_project_files_bounded(
+                    "app_safe_123",
+                    "web",
+                    vec![(PathBuf::from("new.bin"), vec![0; 3], None)],
+                    8,
+                    100,
+                )
+                .await
+                .expect_err("an existing credential file consumes the quota");
+            assert!(
+                matches!(error, ApplicationError::WorkspaceQuota { .. }),
+                "{existing}: {error:?}"
+            );
+            assert!(!workspace
+                .host_work_dir
+                .join("projects/web/new.bin")
+                .exists());
+        }
     }
 
     #[cfg(unix)]
