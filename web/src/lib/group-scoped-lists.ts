@@ -155,7 +155,10 @@ export function mergeGroupDeployments(
         ? (deployments ?? []).map((deployment) => ({ ...deployment, service }))
         : []
     })
-    .sort((a, b) => b.created_at - a.created_at || b.id - a.id)
+    .sort(
+      (a, b) =>
+        Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id
+    )
 }
 
 export interface GroupBackup extends ServiceBackupEntryResponse {

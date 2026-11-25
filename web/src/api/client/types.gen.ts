@@ -244,18 +244,18 @@ export type AcmeOrderResponse = {
     authorizations?: unknown;
     certificate_url?: string | null;
     challenge_validation?: ChallengeValidationStatus | null;
-    created_at: number;
+    created_at: string;
     domain_id: number;
     email: string;
     error?: string | null;
     error_type?: string | null;
-    expires_at?: number | null;
+    expires_at?: string | null;
     finalize_url?: string | null;
     id: number;
     identifiers: unknown;
     order_url: string;
     status: string;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type ActionKind = 'make_reachable' | 'deploy' | 'set_dns_record' | 'open_ingress' | 'open_worker' | 'wait' | 'run_command';
@@ -2074,6 +2074,28 @@ export type AnalyticsIngestKey = {
     updated_at: string;
 };
 
+/**
+ * One page of a project's analytics ingest keys, newest first.
+ */
+export type AnalyticsIngestKeyList = {
+    /**
+     * The items on this page.
+     */
+    items: Array<AnalyticsIngestKey>;
+    /**
+     * The page served, starting at 1.
+     */
+    page: number;
+    /**
+     * The page size served (at most 100).
+     */
+    page_size: number;
+    /**
+     * Items across all pages.
+     */
+    total: number;
+};
+
 export type AnalyticsProjectOption = {
     project_id: number;
     project_name: string;
@@ -3078,7 +3100,10 @@ export type ApplicationGitConnectionsResponse = {
 };
 
 export type ApplicationPreviewLinkResponse = {
-    expires_at: number;
+    /**
+     * When the link stops working, ISO 8601 in UTC.
+     */
+    expires_at: string;
     /**
      * A short-lived authenticated URL. Its fragment carries the grant and
      * never reaches the development server or referrer headers.
@@ -3672,9 +3697,9 @@ export type AuditLogIpInfo = {
  */
 export type AuditLogResponse = {
     /**
-     * When the action occurred
+     * When the action occurred, ISO 8601 in UTC
      */
-    audit_date: number;
+    audit_date: string;
     /**
      * Additional context about the action
      */
@@ -3753,7 +3778,7 @@ export type AuthStatusResponse = {
 
 export type AuthTokenResponse = {
     access_token: string;
-    expires_at: number;
+    expires_at: string;
     refresh_token: string;
 };
 
@@ -4138,6 +4163,28 @@ export type BackupExecutorSettings = {
 };
 
 /**
+ * One page of a schedule's backups, newest first.
+ */
+export type BackupList = {
+    /**
+     * The items on this page.
+     */
+    items: Array<BackupResponse>;
+    /**
+     * The page served, starting at 1.
+     */
+    page: number;
+    /**
+     * The page size served (at most 100).
+     */
+    page_size: number;
+    /**
+     * Items across all pages.
+     */
+    total: number;
+};
+
+/**
  * Response type for backup
  */
 export type BackupResponse = {
@@ -4149,7 +4196,7 @@ export type BackupResponse = {
     backup_id: string;
     backup_type: string;
     checksum?: string | null;
-    completed_at?: number | null;
+    completed_at?: string | null;
     compression_type: string;
     created_by: number;
     /**
@@ -4159,7 +4206,7 @@ export type BackupResponse = {
      */
     current_step?: string | null;
     error_message?: string | null;
-    expires_at?: number | null;
+    expires_at?: string | null;
     external_service?: ExternalServiceSummary | null;
     file_count?: number | null;
     id: number;
@@ -4189,7 +4236,7 @@ export type BackupResponse = {
      * Final size of the backup once completed. Null while running.
      */
     size_bytes?: number | null;
-    started_at: number;
+    started_at: string;
     state: string;
     tags: Array<string>;
 };
@@ -4199,7 +4246,7 @@ export type BackupResponse = {
  */
 export type BackupScheduleResponse = {
     backup_type: string;
-    created_at: number;
+    created_at: string;
     description?: string | null;
     enabled: boolean;
     id: number;
@@ -4209,14 +4256,14 @@ export type BackupScheduleResponse = {
      * fan-out happens.
      */
     include_control_plane: boolean;
-    last_run?: number | null;
+    last_run?: string | null;
     /**
      * Per-schedule wall-clock timeout override for backup jobs (seconds).
      * `null` means the default of four hours (14400 seconds) is used.
      */
     max_runtime_secs?: number | null;
     name: string;
-    next_run?: number | null;
+    next_run?: string | null;
     retention_period: number;
     s3_source_id: number;
     schedule_expression: string;
@@ -4227,7 +4274,7 @@ export type BackupScheduleResponse = {
      * targets services attached via `backup_schedule_services`.
      */
     target_all_services: boolean;
-    updated_at: number;
+    updated_at: string;
 };
 
 /**
@@ -5097,9 +5144,9 @@ export type CertFailureCause = 'dns_lookup' | 'unreachable' | 'upstream_answered
  */
 export type CertStatusResponse = {
     /**
-     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     * On-demand negative-cache deadline (ISO 8601, UTC), when in backoff.
      */
-    backoff_until?: number | null;
+    backoff_until?: string | null;
     /**
      * SNI hostname.
      */
@@ -9204,11 +9251,6 @@ export type CreateFunnelRequest = {
     steps: Array<CreateFunnelStep>;
 };
 
-export type CreateFunnelResponse = {
-    funnel_id: number;
-    message: string;
-};
-
 export type CreateFunnelStep = {
     event_filter?: Array<SmartFilter>;
     event_name: string;
@@ -10412,6 +10454,11 @@ export type CreateStatusPageRequest = {
 
 export type CreateStatusPageWebhookRequest = {
     /**
+     * Whether events are posted to it (default `true`). A webhook created
+     * switched off receives nothing until it is enabled.
+     */
+    enabled?: boolean;
+    /**
      * `https://` URL with a public address, at most 2048 characters.
      */
     url: string;
@@ -10896,13 +10943,13 @@ export type CustomDomainRequest = {
 
 export type CustomDomainResponse = {
     branch?: string | null;
-    created_at: number;
+    created_at: string;
     domain: string;
     domain_id?: number | null;
     environment?: DomainEnvironmentResponse | null;
-    expiration_time?: number | null;
+    expiration_time?: string | null;
     id: number;
-    last_renewed?: number | null;
+    last_renewed?: string | null;
     message?: string | null;
     project_id: number;
     redirect_to?: string | null;
@@ -10912,7 +10959,7 @@ export type CustomDomainResponse = {
     service_name?: string | null;
     status: string;
     status_code?: number | null;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type CustomerMovementResponse = {
@@ -11853,7 +11900,7 @@ export type DeploymentConfiguration = {
  * A single captured container-log dump, including its full text content.
  */
 export type DeploymentContainerLogContentResponse = {
-    captured_at: number;
+    captured_at: string;
     container_name: string;
     /**
      * The captured plain-text log content.
@@ -11871,10 +11918,9 @@ export type DeploymentContainerLogContentResponse = {
  */
 export type DeploymentContainerLogResponse = {
     /**
-     * Unix epoch milliseconds of when the logs were captured (just before
-     * teardown). Matches the timestamp convention used by `DeploymentResponse`.
+     * When the logs were captured (just before teardown), ISO 8601 in UTC.
      */
-    captured_at: number;
+    captured_at: string;
     container_id: string;
     container_name: string;
     deployment_id: number;
@@ -11969,13 +12015,13 @@ export type DeploymentFailureInfo = {
 export type DeploymentFailureStage = 'source' | 'configuration' | 'dependency_install' | 'build' | 'image' | 'deploy' | 'runtime' | 'health_check' | 'resource' | 'platform' | 'unknown';
 
 export type DeploymentJobResponse = {
-    created_at: number;
+    created_at: string;
     dependencies?: unknown;
     deployment_id: number;
     description?: string | null;
     error_message?: string | null;
     execution_order?: number | null;
-    finished_at?: number | null;
+    finished_at?: string | null;
     id: number;
     /**
      * Internal workflow configuration is intentionally redacted. It can
@@ -11987,9 +12033,9 @@ export type DeploymentJobResponse = {
     log_id: string;
     name: string;
     outputs?: unknown;
-    started_at?: number | null;
+    started_at?: string | null;
     status: string;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type DeploymentJobsResponse = {
@@ -12177,15 +12223,15 @@ export type DeploymentResponse = {
     branch?: string | null;
     cancelled_reason?: string | null;
     commit_author?: string | null;
-    commit_date?: number | null;
+    commit_date?: string | null;
     commit_hash?: string | null;
     commit_message?: string | null;
-    created_at: number;
+    created_at: string;
     deployment_config?: DeploymentConfigSnapshot | null;
     environment: DeploymentEnvironmentResponse;
     environment_id: number;
     failure?: DeploymentFailureInfo | null;
-    finished_at?: number | null;
+    finished_at?: string | null;
     id: number;
     /**
      * The `USER` the image declares, as written (`nodejs`, `10001:10001`).
@@ -12206,7 +12252,7 @@ export type DeploymentResponse = {
      */
     runs_as_root?: boolean;
     screenshot_location?: string | null;
-    started_at?: number | null;
+    started_at?: string | null;
     status: string;
     tag?: string | null;
     url: string;
@@ -13777,25 +13823,25 @@ export type DomainResponse = {
      * The PEM-encoded certificate chain (can be displayed in browser or downloaded)
      */
     certificate?: string | null;
-    created_at: number;
+    created_at: string;
     dns_challenge_token?: string | null;
     dns_challenge_value?: string | null;
     domain: string;
-    expiration_time?: number | null;
+    expiration_time?: string | null;
     failure_cause?: CertFailureCause | null;
     id: number;
     is_wildcard: boolean;
     last_error?: string | null;
     last_error_type?: string | null;
-    last_renewed?: number | null;
+    last_renewed?: string | null;
     /**
-     * On-demand TLS negative-cache deadline (epoch millis), when this hostname's
+     * On-demand TLS negative-cache deadline (ISO 8601, UTC), when this hostname's
      * on-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).
      * `None` means no active backoff.
      */
-    on_demand_backoff_until?: number | null;
+    on_demand_backoff_until?: string | null;
     status: string;
-    updated_at: number;
+    updated_at: string;
     verification_method: string;
 };
 
@@ -14883,7 +14929,7 @@ export type EnvironmentDeliveryOverride = {
 };
 
 export type EnvironmentDomainResponse = {
-    created_at: number;
+    created_at: string;
     domain: string;
     environment_id: number;
     id: number;
@@ -15009,14 +15055,14 @@ export type EnvironmentResponse = {
      */
     attack_mode?: boolean | null;
     branch?: string | null;
-    created_at: number;
+    created_at: string;
     current_deployment_id?: number | null;
     deployment_config?: DeploymentConfig | null;
     /**
-     * Estimated time (epoch millis) when the environment will go to sleep
+     * Estimated time (ISO 8601, UTC) when the environment will go to sleep
      * based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
      */
-    estimated_sleep_at?: number | null;
+    estimated_sleep_at?: string | null;
     /**
      * Per-environment HTTP→HTTPS redirect override.
      * `null` means inherit the proxy default (redirect only when the host has
@@ -15032,10 +15078,10 @@ export type EnvironmentResponse = {
      */
     is_preview: boolean;
     /**
-     * Last proxied request timestamp (epoch millis) for on-demand environments.
+     * Last proxied request time (ISO 8601, UTC) for on-demand environments.
      * NULL when on-demand is disabled or no traffic has been received yet.
      */
-    last_activity_at?: number | null;
+    last_activity_at?: string | null;
     main_url: string;
     name: string;
     /**
@@ -15071,7 +15117,7 @@ export type EnvironmentResponse = {
      * this via the rename-subdomain endpoint, not the full URL.
      */
     subdomain: string;
-    updated_at: number;
+    updated_at: string;
 };
 
 /**
@@ -15106,7 +15152,7 @@ export type EnvironmentVariableInfo = {
 };
 
 export type EnvironmentVariableResponse = {
-    created_at: number;
+    created_at: string;
     environments: Array<EnvironmentInfo>;
     id: number;
     /**
@@ -15120,7 +15166,7 @@ export type EnvironmentVariableResponse = {
     is_secret: boolean;
     key: string;
     secret_suggestion?: SecretSuggestionResponse | null;
-    updated_at: number;
+    updated_at: string;
     /**
      * Plaintext for regular variables in create/update responses, or `"***"`
      * in list responses. Always `None` for marked secrets. Only regular
@@ -17144,7 +17190,29 @@ export type FullRequest = {
 };
 
 /**
- * Acknowledges a funnel update or delete.
+ * One page of a project's active funnels, newest first.
+ */
+export type FunnelList = {
+    /**
+     * The items on this page.
+     */
+    items: Array<FunnelResponse>;
+    /**
+     * The page served, starting at 1.
+     */
+    page: number;
+    /**
+     * The page size served (at most 100).
+     */
+    page_size: number;
+    /**
+     * Items across all pages.
+     */
+    total: number;
+};
+
+/**
+ * Acknowledges a funnel delete.
  */
 export type FunnelMessageResponse = {
     message: string;
@@ -17159,13 +17227,38 @@ export type FunnelMetricsResponse = {
     total_entries: number;
 };
 
+/**
+ * A funnel and its steps.
+ */
 export type FunnelResponse = {
     created_at: string;
     description?: string | null;
     id: number;
     is_active: boolean;
     name: string;
+    project_id: number;
+    /**
+     * The steps a visitor goes through, in order.
+     */
+    steps: Array<FunnelStepResponse>;
     updated_at: string;
+};
+
+/**
+ * One step of a funnel, as it was written.
+ */
+export type FunnelStepResponse = {
+    /**
+     * The filters the step matches events with (empty: every event of
+     * `event_name`).
+     */
+    event_filter: Array<SmartFilter>;
+    event_name: string;
+    id: number;
+    /**
+     * Position of the step in the funnel, starting at 1.
+     */
+    order: number;
 };
 
 /**
@@ -17926,6 +18019,14 @@ export type GetOrCreateDsnRequest = {
 
 export type GetProjectSecretsQuery = {
     environment_id?: number | null;
+    /**
+     * Page number, starting at 1 (default 1).
+     */
+    page?: number | null;
+    /**
+     * Items per page (default 20, max 100).
+     */
+    page_size?: number | null;
 };
 
 export type GetProjectSessionReplaysQuery = {
@@ -20485,6 +20586,28 @@ export type IncidentResponse = {
      */
     title: string;
     updated_at: string;
+};
+
+/**
+ * One page of an incident's updates, newest first.
+ */
+export type IncidentUpdateList = {
+    /**
+     * The items on this page.
+     */
+    items: Array<IncidentUpdateResponse>;
+    /**
+     * The page served, starting at 1.
+     */
+    page: number;
+    /**
+     * The page size served (at most 100).
+     */
+    page_size: number;
+    /**
+     * Items across all pages.
+     */
+    total: number;
 };
 
 export type IncidentUpdateResponse = {
@@ -25066,23 +25189,23 @@ export type NotificationPreferencesResponse = {
 
 export type NotificationProviderResponse = {
     config: unknown;
-    created_at: number;
+    created_at: string;
     enabled: boolean;
     id: number;
     name: string;
     provider_type: string;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type NotificationRoute = {
-    created_at: number;
+    created_at: string;
     enabled: boolean;
     id: number;
     max_severity: string;
     min_severity: string;
     name: string;
     provider_ids: Array<number>;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type NotificationRoutePage = {
@@ -25327,6 +25450,29 @@ export type OidcProviderSummary = {
 };
 
 /**
+ * One page of the users who sign in through an OIDC provider, newest
+ * first.
+ */
+export type OidcProviderUserList = {
+    /**
+     * The items on this page.
+     */
+    items: Array<OidcProviderUserResponse>;
+    /**
+     * The page served, starting at 1.
+     */
+    page: number;
+    /**
+     * The page size served (at most 100).
+     */
+    page_size: number;
+    /**
+     * Items across all pages.
+     */
+    total: number;
+};
+
+/**
  * A user that has logged in via a given OIDC provider. Used by the
  * admin "Users for provider" panel — the `oidc_subject` is the
  * IdP-side identifier we matched on, useful when diagnosing why a
@@ -25382,9 +25528,9 @@ export type OnDemandCertAttemptResponse = {
      */
     challenge_served?: boolean | null;
     /**
-     * When the attempt was recorded (epoch millis).
+     * When the attempt was recorded (ISO 8601, UTC).
      */
-    created_at: number;
+    created_at: string;
     /**
      * End-to-end issuance duration in milliseconds (0/None for skipped).
      */
@@ -25425,13 +25571,13 @@ export type OnDemandCertRow = {
      */
     attempt: OnDemandCertAttemptResponse;
     /**
-     * On-demand negative-cache deadline (epoch millis), when in backoff.
+     * On-demand negative-cache deadline (ISO 8601, UTC), when in backoff.
      */
-    backoff_until?: number | null;
+    backoff_until?: string | null;
     /**
-     * Certificate expiration (epoch millis), when an active cert exists.
+     * Certificate expiration (ISO 8601, UTC), when an active cert exists.
      */
-    expiration_time?: number | null;
+    expiration_time?: string | null;
     /**
      * SNI hostname.
      */
@@ -28251,9 +28397,9 @@ export type PreviewShareLinkBody = {
 
 export type PreviewShareLinkResponse = {
     /**
-     * Unix seconds after which the link stops working.
+     * When the link stops working, ISO 8601 in UTC.
      */
-    expires_at: number;
+    expires_at: string;
     /**
      * The full link. Its fragment contains the grant and must be treated as a
      * credential; URL fragments are not sent to servers or in Referer headers.
@@ -28960,7 +29106,7 @@ export type ProjectResponse = {
      * true exactly when `shield_mode` is `attack`.
      */
     attack_mode: boolean;
-    created_at: number;
+    created_at: string;
     /**
      * ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed
      * from cross-project discovery results. Default true (consistent with the
@@ -29035,7 +29181,7 @@ export type ProjectResponse = {
      * not imply that an incompletely configured repository is public.
      */
     is_public_repo: boolean;
-    last_deployment?: number | null;
+    last_deployment?: string | null;
     /**
      * This project's container log ingestion budget in KiB/s. Absent = the
      * platform default; 0 = unlimited.
@@ -29107,7 +29253,7 @@ export type ProjectResponse = {
      * source-build controls.
      */
     template_slug?: string | null;
-    updated_at: number;
+    updated_at: string;
     /**
      * Opt-in Trivy vulnerability scanning of this project's deployed Docker
      * images. Off by default — project owners explicitly enable it.
@@ -29122,6 +29268,28 @@ export type ProjectSecretEnvironmentInfo = {
 };
 
 /**
+ * One page of a project's secrets (metadata only), newest first.
+ */
+export type ProjectSecretList = {
+    /**
+     * The items on this page.
+     */
+    items: Array<ProjectSecretResponse>;
+    /**
+     * The page served, starting at 1.
+     */
+    page: number;
+    /**
+     * The page size served (at most 100).
+     */
+    page_size: number;
+    /**
+     * Items across all pages.
+     */
+    total: number;
+};
+
+/**
  * Project secret metadata. There is deliberately no `value` field — secret
  * plaintext is never returned after creation. Callers that need the value
  * must read it from the mounted file inside the container.
@@ -29132,13 +29300,13 @@ export type ProjectSecretResponse = {
      * service in the stack.
      */
     compose_services: Array<string>;
-    created_at: number;
+    created_at: string;
     environments: Array<ProjectSecretEnvironmentInfo>;
     id: number;
     include_in_preview: boolean;
     key: string;
     project_id: number;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type ProjectServiceInfo = {
@@ -31555,9 +31723,9 @@ export type RenameConversationRequest = {
  */
 export type RenewalAttemptResponse = {
     /**
-     * When the attempt was recorded (epoch millis).
+     * When the attempt was recorded (ISO 8601, UTC).
      */
-    created_at: number;
+    created_at: string;
     error?: string | null;
     error_type?: string | null;
     id: number;
@@ -32604,7 +32772,7 @@ export type RouteRefreshResponse = {
 };
 
 export type RouteResponse = {
-    created_at: number;
+    created_at: string;
     domain: string;
     enabled: boolean;
     host: string;
@@ -32614,14 +32782,14 @@ export type RouteResponse = {
      * Route type: "http" or "tls"
      */
     route_type: string;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type RouteRole = {
-    created_at: number;
+    created_at: string;
     id: number;
     name: string;
-    updated_at: number;
+    updated_at: string;
 };
 
 export type RouteTestDelivery = {
@@ -32638,8 +32806,8 @@ export type RouteTestDelivery = {
 export type RouteTestDeliveryStatus = 'sent' | 'failed' | 'skipped_disabled';
 
 export type RouteUser = {
-    created_at: number;
-    deleted_at?: number | null;
+    created_at: string;
+    deleted_at?: string | null;
     email: string;
     email_verified: boolean;
     id: number;
@@ -32647,7 +32815,7 @@ export type RouteUser = {
     mfa_enabled: boolean;
     must_change_password: boolean;
     name: string;
-    updated_at: number;
+    updated_at: string;
     username: string;
 };
 
@@ -33021,7 +33189,7 @@ export type S3SourceResponse = {
     access_key_id: string;
     bucket_name: string;
     bucket_path: string;
-    created_at: number;
+    created_at: string;
     /**
      * The endpoint every client (WAL-G, restore and worker jobs) receives,
      * always with an explicit scheme. `None` for AWS S3 itself.
@@ -33049,7 +33217,7 @@ export type S3SourceResponse = {
      */
     path_style_reason: PathStyleReason;
     region: string;
-    updated_at: number;
+    updated_at: string;
     /**
      * What a worker node receives from this source (ADR-102).
      */
@@ -41340,11 +41508,26 @@ export type UpdateManagedDomainApiRequest = {
     sync_generated_records?: boolean | null;
 };
 
+/**
+ * Partial update of an MCP server: omitted or `null` fields keep their
+ * current value.
+ */
 export type UpdateMcpRequest = {
+    /**
+     * Replacement server config. Omit or send `null` to keep the current
+     * config; masked (`***`) credential values keep the stored secret.
+     */
     config: {
         [key: string]: unknown;
-    };
+    } | null;
+    /**
+     * New description. Omit or send `null` to keep the current description;
+     * an empty string clears it (stored and returned as `null`).
+     */
     description?: string | null;
+    /**
+     * New display name. Omit or send `null` to keep the current name.
+     */
     name?: string | null;
 };
 
@@ -41858,9 +42041,22 @@ export type UpdateShieldEntryRequest = {
     verdict: ShieldEntryVerdict;
 };
 
+/**
+ * Partial update of a skill: omitted or `null` fields keep their current value.
+ */
 export type UpdateSkillRequest = {
+    /**
+     * New SKILL.md content. Omit or send `null` to keep the current content.
+     */
     content?: string | null;
+    /**
+     * New description. Omit or send `null` to keep the current description;
+     * an empty string clears it (stored and returned as `null`).
+     */
     description?: string | null;
+    /**
+     * New display name. Omit or send `null` to keep the current name.
+     */
     name?: string | null;
 };
 
@@ -44799,7 +44995,7 @@ export type S3SourceResponseWritable = {
     access_key_id: string;
     bucket_name: string;
     bucket_path: string;
-    created_at: number;
+    created_at: string;
     /**
      * The endpoint every client (WAL-G, restore and worker jobs) receives,
      * always with an explicit scheme. `None` for AWS S3 itself.
@@ -44828,7 +45024,7 @@ export type S3SourceResponseWritable = {
     path_style_reason: PathStyleReason;
     region: string;
     secret_key: string;
-    updated_at: number;
+    updated_at: string;
     /**
      * What a worker node receives from this source (ADR-102).
      */
@@ -46522,6 +46718,48 @@ export type DeleteOidcProviderResponses = {
 
 export type DeleteOidcProviderResponse = DeleteOidcProviderResponses[keyof DeleteOidcProviderResponses];
 
+export type GetOidcProviderData = {
+    body?: never;
+    path: {
+        /**
+         * OIDC provider ID
+         */
+        provider_id: number;
+    };
+    query?: never;
+    url: '/admin/oidc/providers/{provider_id}';
+};
+
+export type GetOidcProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * OIDC provider not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetOidcProviderError = GetOidcProviderErrors[keyof GetOidcProviderErrors];
+
+export type GetOidcProviderResponses = {
+    /**
+     * The OIDC provider
+     */
+    200: OidcProviderResponse;
+};
+
+export type GetOidcProviderResponse = GetOidcProviderResponses[keyof GetOidcProviderResponses];
+
 export type UpdateOidcProviderData = {
     body: UpdateOidcProviderRequest;
     path: {
@@ -46602,11 +46840,28 @@ export type ListOidcProviderUsersData = {
          */
         provider_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number;
+    };
     url: '/admin/oidc/providers/{provider_id}/users';
 };
 
 export type ListOidcProviderUsersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Provider not found
      */
@@ -46615,9 +46870,9 @@ export type ListOidcProviderUsersErrors = {
 
 export type ListOidcProviderUsersResponses = {
     /**
-     * Users authenticated via this OIDC provider
+     * One page of the users who sign in through this OIDC provider, newest first
      */
-    200: Array<OidcProviderUserResponse>;
+    200: OidcProviderUserList;
 };
 
 export type ListOidcProviderUsersResponse = ListOidcProviderUsersResponses[keyof ListOidcProviderUsersResponses];
@@ -55677,9 +55932,21 @@ export type UpdateBackupScheduleResponse = UpdateBackupScheduleResponses[keyof U
 export type ListBackupsForScheduleData = {
     body?: never;
     path: {
+        /**
+         * Backup schedule ID
+         */
         id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number;
+    };
     url: '/backups/schedules/{id}/backups';
 };
 
@@ -55706,9 +55973,9 @@ export type ListBackupsForScheduleError = ListBackupsForScheduleErrors[keyof Lis
 
 export type ListBackupsForScheduleResponses = {
     /**
-     * List of backups for the schedule
+     * One page of the schedule's backups, newest first
      */
-    200: Array<BackupResponse>;
+    200: BackupList;
 };
 
 export type ListBackupsForScheduleResponse = ListBackupsForScheduleResponses[keyof ListBackupsForScheduleResponses];
@@ -63067,7 +63334,7 @@ export type ListRestoreRunsForServiceError = ListRestoreRunsForServiceErrors[key
 
 export type ListRestoreRunsForServiceResponses = {
     /**
-     * Recent restore runs for the service
+     * The service's 50 most recent restore runs, newest first. Not paginated: bounded by design to recent history; older runs are not returned
      */
     200: Array<RestoreRunView>;
 };
@@ -64296,7 +64563,7 @@ export type ListPgUpgradesError = ListPgUpgradesErrors[keyof ListPgUpgradesError
 
 export type ListPgUpgradesResponses = {
     /**
-     * Recent upgrades
+     * The service's 50 most recent upgrades, newest first. Not paginated: bounded by design to recent history; older upgrades are not returned
      */
     200: Array<PgUpgradeResponse>;
 };
@@ -66914,7 +67181,16 @@ export type GetIncidentUpdatesData = {
          */
         incident_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number;
+    };
     url: '/incidents/{incident_id}/updates';
 };
 
@@ -66939,9 +67215,9 @@ export type GetIncidentUpdatesErrors = {
 
 export type GetIncidentUpdatesResponses = {
     /**
-     * Successfully retrieved incident updates
+     * One page of the incident's updates, newest first
      */
-    200: Array<IncidentUpdateResponse>;
+    200: IncidentUpdateList;
 };
 
 export type GetIncidentUpdatesResponse = GetIncidentUpdatesResponses[keyof GetIncidentUpdatesResponses];
@@ -72221,6 +72497,50 @@ export type NodeMetricsDeleteAlertRuleResponses = {
 
 export type NodeMetricsDeleteAlertRuleResponse = NodeMetricsDeleteAlertRuleResponses[keyof NodeMetricsDeleteAlertRuleResponses];
 
+export type NodeMetricsGetAlertRuleData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type NodeMetricsGetAlertRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found on this node
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsGetAlertRuleResponses = {
+    /**
+     * The alert rule
+     */
+    200: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsGetAlertRuleResponse = NodeMetricsGetAlertRuleResponses[keyof NodeMetricsGetAlertRuleResponses];
+
 export type NodeMetricsUpdateAlertRuleData = {
     body: ServiceUpdateAlertRuleRequest;
     path: {
@@ -77259,6 +77579,50 @@ export type DeleteGroupEnvVarResponses = {
 
 export type DeleteGroupEnvVarResponse = DeleteGroupEnvVarResponses[keyof DeleteGroupEnvVarResponses];
 
+export type GetGroupEnvVarData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/env-vars/{var_id}';
+};
+
+export type GetGroupEnvVarErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions on a member project
+     */
+    403: unknown;
+    /**
+     * Project group or variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetGroupEnvVarResponses = {
+    /**
+     * The variable (value masked)
+     */
+    200: GroupEnvVarResponse;
+};
+
+export type GetGroupEnvVarResponse = GetGroupEnvVarResponses[keyof GetGroupEnvVarResponses];
+
 export type UpdateGroupEnvVarData = {
     body: UpdateGroupEnvVarRequest;
     path: {
@@ -77413,7 +77777,7 @@ export type AddProjectToGroupErrors = {
      */
     404: unknown;
     /**
-     * A route involving the project appeared, the project changed group, or a project joined the destination group, while the request was being authorized; retry
+     * A route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict
      */
     409: unknown;
 };
@@ -81598,7 +81962,16 @@ export type ListAnalyticsIngestKeysData = {
          */
         project_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number;
+    };
     url: '/projects/{project_id}/analytics/ingest-keys';
 };
 
@@ -81619,9 +81992,9 @@ export type ListAnalyticsIngestKeysErrors = {
 
 export type ListAnalyticsIngestKeysResponses = {
     /**
-     * Ingest keys, active and revoked, newest first
+     * One page of ingest keys, active and revoked, newest first
      */
-    200: Array<AnalyticsIngestKey>;
+    200: AnalyticsIngestKeyList;
 };
 
 export type ListAnalyticsIngestKeysResponse = ListAnalyticsIngestKeysResponses[keyof ListAnalyticsIngestKeysResponses];
@@ -81669,6 +82042,50 @@ export type CreateAnalyticsIngestKeyResponses = {
 };
 
 export type CreateAnalyticsIngestKeyResponse = CreateAnalyticsIngestKeyResponses[keyof CreateAnalyticsIngestKeyResponses];
+
+export type GetAnalyticsIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}';
+};
+
+export type GetAnalyticsIngestKeyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsIngestKeyResponses = {
+    /**
+     * The ingest key
+     */
+    200: AnalyticsIngestKey;
+};
+
+export type GetAnalyticsIngestKeyResponse = GetAnalyticsIngestKeyResponses[keyof GetAnalyticsIngestKeyResponses];
 
 export type UpdateAnalyticsIngestKeyData = {
     body: UpdateAnalyticsIngestKeyRequest;
@@ -88680,7 +89097,7 @@ export type ListShieldTokensError = ListShieldTokensErrors[keyof ListShieldToken
 
 export type ListShieldTokensResponses = {
     /**
-     * Active bypass tokens
+     * Every active bypass token valid here (at most 100, newest first)
      */
     200: Array<ShieldTokenResponse>;
 };
@@ -91514,7 +91931,7 @@ export type ListErrorInboundFiltersErrors = {
 
 export type ListErrorInboundFiltersResponses = {
     /**
-     * The project's inbound filters
+     * The project's inbound filters, oldest first. Not paginated: bounded by design to 50 rules per project
      */
     200: InboundFiltersResponse;
 };
@@ -91608,6 +92025,50 @@ export type DeleteErrorInboundFilterResponses = {
 };
 
 export type DeleteErrorInboundFilterResponse = DeleteErrorInboundFilterResponses[keyof DeleteErrorInboundFilterResponses];
+
+export type GetErrorInboundFilterData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Inbound filter ID
+         */
+        filter_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/error-inbound-filters/{filter_id}';
+};
+
+export type GetErrorInboundFilterErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such filter in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetErrorInboundFilterResponses = {
+    /**
+     * The filter, as listed
+     */
+    200: InboundFilterResponse;
+};
+
+export type GetErrorInboundFilterResponse = GetErrorInboundFilterResponses[keyof GetErrorInboundFilterResponses];
 
 export type UpdateErrorInboundFilterData = {
     body: UpdateInboundFilterRequest;
@@ -93299,7 +93760,16 @@ export type ListFunnelsData = {
          */
         project_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Page number, starting at 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number;
+    };
     url: '/projects/{project_id}/funnels';
 };
 
@@ -93309,6 +93779,10 @@ export type ListFunnelsErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -93316,9 +93790,9 @@ export type ListFunnelsErrors = {
 
 export type ListFunnelsResponses = {
     /**
-     * Funnels retrieved successfully
+     * One page of funnels, newest first
      */
-    200: Array<FunnelResponse>;
+    200: FunnelList;
 };
 
 export type ListFunnelsResponse = ListFunnelsResponses[keyof ListFunnelsResponses];
@@ -93345,6 +93819,10 @@ export type CreateFunnelErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -93352,12 +93830,12 @@ export type CreateFunnelErrors = {
 
 export type CreateFunnelResponses = {
     /**
-     * Funnel created successfully
+     * Funnel created; the body is the funnel with its steps
      */
-    201: CreateFunnelResponse;
+    201: FunnelResponse;
 };
 
-export type CreateFunnelResponse2 = CreateFunnelResponses[keyof CreateFunnelResponses];
+export type CreateFunnelResponse = CreateFunnelResponses[keyof CreateFunnelResponses];
 
 export type PreviewFunnelMetricsData = {
     body: CreateFunnelRequest;
@@ -93421,6 +93899,10 @@ export type DeleteFunnelErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Funnel not found
      */
     404: unknown;
@@ -93438,6 +93920,50 @@ export type DeleteFunnelResponses = {
 };
 
 export type DeleteFunnelResponse = DeleteFunnelResponses[keyof DeleteFunnelResponses];
+
+export type GetFunnelData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Funnel ID
+         */
+        funnel_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/funnels/{funnel_id}';
+};
+
+export type GetFunnelErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No active funnel with this ID in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetFunnelResponses = {
+    /**
+     * The funnel with its steps
+     */
+    200: FunnelResponse;
+};
+
+export type GetFunnelResponse = GetFunnelResponses[keyof GetFunnelResponses];
 
 export type UpdateFunnelData = {
     body: CreateFunnelRequest;
@@ -93465,6 +93991,10 @@ export type UpdateFunnelErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Funnel not found
      */
     404: unknown;
@@ -93476,9 +94006,9 @@ export type UpdateFunnelErrors = {
 
 export type UpdateFunnelResponses = {
     /**
-     * Funnel updated successfully
+     * Funnel updated; the body is the funnel with its steps
      */
-    200: FunnelMessageResponse;
+    200: FunnelResponse;
 };
 
 export type UpdateFunnelResponse = UpdateFunnelResponses[keyof UpdateFunnelResponses];
@@ -94090,6 +94620,50 @@ export type DeleteHttpCheckResponses = {
      */
     200: unknown;
 };
+
+export type GetHttpCheckData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Check ID
+         */
+        check_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/http-checks/{check_id}';
+};
+
+export type GetHttpCheckErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * No check with this ID in the project
+     */
+    404: unknown;
+    /**
+     * Internal error
+     */
+    500: unknown;
+};
+
+export type GetHttpCheckResponses = {
+    /**
+     * The check, as listed (credentials are never returned)
+     */
+    200: HttpCheckView;
+};
+
+export type GetHttpCheckResponse = GetHttpCheckResponses[keyof GetHttpCheckResponses];
 
 export type SetHttpCheckEnabledData = {
     body: SetHttpCheckEnabled;
@@ -95710,16 +96284,71 @@ export type UpdateMcpErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * MCP server not found
      */
     404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type UpdateMcpResponses = {
+    /**
+     * Updated definition
+     */
     200: McpDefinitionResponse;
 };
 
 export type UpdateMcpResponse = UpdateMcpResponses[keyof UpdateMcpResponses];
+
+export type UpdateMcpPutData = {
+    body: UpdateMcpRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * MCP server slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/mcp-servers/{slug}';
+};
+
+export type UpdateMcpPutErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * MCP server not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateMcpPutResponses = {
+    /**
+     * Updated definition
+     */
+    200: McpDefinitionResponse;
+};
+
+export type UpdateMcpPutResponse = UpdateMcpPutResponses[keyof UpdateMcpPutResponses];
 
 export type RevealMcpConfigData = {
     body?: never;
@@ -97214,14 +97843,30 @@ export type ListProjectSecretsData = {
     };
     query?: {
         /**
-         * Optional environment filter
+         * Only secrets attached to this environment
          */
         environment_id?: number;
+        /**
+         * Page number, starting at 1 (default 1)
+         */
+        page?: number;
+        /**
+         * Items per page (default 20, max 100)
+         */
+        page_size?: number;
     };
     url: '/projects/{project_id}/secrets';
 };
 
 export type ListProjectSecretsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
     /**
      * Project not found
      */
@@ -97234,9 +97879,9 @@ export type ListProjectSecretsErrors = {
 
 export type ListProjectSecretsResponses = {
     /**
-     * List of secrets (metadata only, no values)
+     * One page of secrets (metadata only, no values), newest first
      */
-    200: Array<ProjectSecretResponse>;
+    200: ProjectSecretList;
 };
 
 export type ListProjectSecretsResponse = ListProjectSecretsResponses[keyof ListProjectSecretsResponses];
@@ -97312,6 +97957,50 @@ export type DeleteProjectSecretResponses = {
 };
 
 export type DeleteProjectSecretResponse = DeleteProjectSecretResponses[keyof DeleteProjectSecretResponses];
+
+export type GetProjectSecretData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Secret ID
+         */
+        secret_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/secrets/{secret_id}';
+};
+
+export type GetProjectSecretErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No secret with this ID in the project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetProjectSecretResponses = {
+    /**
+     * The secret's metadata, without its value
+     */
+    200: ProjectSecretResponse;
+};
+
+export type GetProjectSecretResponse = GetProjectSecretResponses[keyof GetProjectSecretResponses];
 
 export type UpdateProjectSecretData = {
     body: UpdateProjectSecretRequest;
@@ -97689,7 +98378,7 @@ export type ListProjectShieldEntriesError = ListProjectShieldEntriesErrors[keyof
 
 export type ListProjectShieldEntriesResponses = {
     /**
-     * The project's entries, newest first
+     * Every entry of the project (at most 500, newest first)
      */
     200: Array<ShieldEntryResponse>;
 };
@@ -97791,6 +98480,52 @@ export type DeleteProjectShieldEntryResponses = {
 };
 
 export type DeleteProjectShieldEntryResponse = DeleteProjectShieldEntryResponses[keyof DeleteProjectShieldEntryResponses];
+
+export type GetProjectShieldEntryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Entry ID
+         */
+        entry_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/shield/entries/{entry_id}';
+};
+
+export type GetProjectShieldEntryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Entry not found in this project
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectShieldEntryError = GetProjectShieldEntryErrors[keyof GetProjectShieldEntryErrors];
+
+export type GetProjectShieldEntryResponses = {
+    /**
+     * The entry, as listed
+     */
+    200: ShieldEntryResponse;
+};
+
+export type GetProjectShieldEntryResponse = GetProjectShieldEntryResponses[keyof GetProjectShieldEntryResponses];
 
 export type UpdateProjectShieldEntryData = {
     body: UpdateShieldEntryRequest;
@@ -98008,16 +98743,71 @@ export type UpdateSkillErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Skill not found
      */
     404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type UpdateSkillResponses = {
+    /**
+     * Updated definition
+     */
     200: SkillDefinitionResponse;
 };
 
 export type UpdateSkillResponse = UpdateSkillResponses[keyof UpdateSkillResponses];
+
+export type UpdateSkillPutData = {
+    body: UpdateSkillRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Skill slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/skills/{slug}';
+};
+
+export type UpdateSkillPutErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Skill not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateSkillPutResponses = {
+    /**
+     * Updated definition
+     */
+    200: SkillDefinitionResponse;
+};
+
+export type UpdateSkillPutResponse = UpdateSkillPutResponses[keyof UpdateSkillPutResponses];
 
 export type DownloadSkillArchiveData = {
     body?: never;
@@ -102756,16 +103546,67 @@ export type UpdateGlobalMcpErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * MCP server not found
      */
     404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type UpdateGlobalMcpResponses = {
+    /**
+     * Updated definition
+     */
     200: McpDefinitionResponse;
 };
 
 export type UpdateGlobalMcpResponse = UpdateGlobalMcpResponses[keyof UpdateGlobalMcpResponses];
+
+export type UpdateGlobalMcpPutData = {
+    body: UpdateMcpRequest;
+    path: {
+        /**
+         * MCP server slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/settings/mcp-servers/{slug}';
+};
+
+export type UpdateGlobalMcpPutErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * MCP server not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateGlobalMcpPutResponses = {
+    /**
+     * Updated definition
+     */
+    200: McpDefinitionResponse;
+};
+
+export type UpdateGlobalMcpPutResponse = UpdateGlobalMcpPutResponses[keyof UpdateGlobalMcpPutResponses];
 
 export type RevealGlobalMcpConfigData = {
     body?: never;
@@ -103124,7 +103965,7 @@ export type ListPlatformShieldEntriesError = ListPlatformShieldEntriesErrors[key
 
 export type ListPlatformShieldEntriesResponses = {
     /**
-     * Platform entries, newest first
+     * Every platform entry (at most 500, newest first)
      */
     200: Array<ShieldEntryResponse>;
 };
@@ -103213,6 +104054,48 @@ export type DeletePlatformShieldEntryResponses = {
 };
 
 export type DeletePlatformShieldEntryResponse = DeletePlatformShieldEntryResponses[keyof DeletePlatformShieldEntryResponses];
+
+export type GetPlatformShieldEntryData = {
+    body?: never;
+    path: {
+        /**
+         * Entry ID
+         */
+        entry_id: number;
+    };
+    query?: never;
+    url: '/settings/shield/entries/{entry_id}';
+};
+
+export type GetPlatformShieldEntryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Entry not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetPlatformShieldEntryError = GetPlatformShieldEntryErrors[keyof GetPlatformShieldEntryErrors];
+
+export type GetPlatformShieldEntryResponses = {
+    /**
+     * The entry, as listed
+     */
+    200: ShieldEntryResponse;
+};
+
+export type GetPlatformShieldEntryResponse = GetPlatformShieldEntryResponses[keyof GetPlatformShieldEntryResponses];
 
 export type UpdatePlatformShieldEntryData = {
     body: UpdateShieldEntryRequest;
@@ -103538,16 +104421,67 @@ export type UpdateGlobalSkillErrors = {
      */
     401: unknown;
     /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
      * Skill not found
      */
     404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
 };
 
 export type UpdateGlobalSkillResponses = {
+    /**
+     * Updated definition
+     */
     200: SkillDefinitionResponse;
 };
 
 export type UpdateGlobalSkillResponse = UpdateGlobalSkillResponses[keyof UpdateGlobalSkillResponses];
+
+export type UpdateGlobalSkillPutData = {
+    body: UpdateSkillRequest;
+    path: {
+        /**
+         * Skill slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/settings/skills/{slug}';
+};
+
+export type UpdateGlobalSkillPutErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Skill not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateGlobalSkillPutResponses = {
+    /**
+     * Updated definition
+     */
+    200: SkillDefinitionResponse;
+};
+
+export type UpdateGlobalSkillPutResponse = UpdateGlobalSkillPutResponses[keyof UpdateGlobalSkillPutResponses];
 
 export type DownloadGlobalSkillArchiveData = {
     body?: never;
@@ -105081,6 +106015,50 @@ export type DeleteStatusPageWebhookResponses = {
 
 export type DeleteStatusPageWebhookResponse = DeleteStatusPageWebhookResponses[keyof DeleteStatusPageWebhookResponses];
 
+export type GetStatusPageWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Status page ID
+         */
+        status_page_id: number;
+        /**
+         * Webhook ID
+         */
+        webhook_id: number;
+    };
+    query?: never;
+    url: '/status-pages/{status_page_id}/webhooks/{webhook_id}';
+};
+
+export type GetStatusPageWebhookErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Status page or webhook not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetStatusPageWebhookResponses = {
+    /**
+     * The webhook
+     */
+    200: StatusPageWebhookResponse;
+};
+
+export type GetStatusPageWebhookResponse = GetStatusPageWebhookResponses[keyof GetStatusPageWebhookResponses];
+
 export type UpdateStatusPageWebhookData = {
     body: UpdateStatusPageWebhookRequest;
     path: {
@@ -105985,6 +106963,44 @@ export type RemoveTeamMemberResponses = {
 
 export type RemoveTeamMemberResponse = RemoveTeamMemberResponses[keyof RemoveTeamMemberResponses];
 
+export type GetTeamMemberData = {
+    body?: never;
+    path: {
+        team_id: number;
+        user_id: number;
+    };
+    query?: never;
+    url: '/teams/{team_id}/members/{user_id}';
+};
+
+export type GetTeamMemberErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The user is not a member of the team
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetTeamMemberResponses = {
+    /**
+     * The membership
+     */
+    200: TeamMemberResponse;
+};
+
+export type GetTeamMemberResponse = GetTeamMemberResponses[keyof GetTeamMemberResponses];
+
 export type UpdateTeamMemberRoleData = {
     body: UpdateMemberRoleRequest;
     path: {
@@ -106763,6 +107779,46 @@ export type DeleteUserResponses = {
 };
 
 export type DeleteUserResponse = DeleteUserResponses[keyof DeleteUserResponses];
+
+export type GetUserData = {
+    body?: never;
+    path: {
+        /**
+         * User ID
+         */
+        user_id: number;
+    };
+    query?: never;
+    url: '/users/{user_id}';
+};
+
+export type GetUserErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * User not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetUserResponses = {
+    /**
+     * The user and their roles
+     */
+    200: RouteUserWithRoles;
+};
+
+export type GetUserResponse = GetUserResponses[keyof GetUserResponses];
 
 export type UpdateUserData = {
     body: UpdateUserRequest;

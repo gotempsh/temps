@@ -117,17 +117,25 @@ export function lastSuccessfulDeployment(
   deployments: DeploymentResponse[] | undefined,
   failed: Pick<DeploymentResponse, 'id' | 'environment_id' | 'created_at'>
 ): DeploymentResponse | undefined {
+  // ISO 8601 strings do not order as text (fractional seconds vary in
+  // length), so compare instants.
+  const failedAt = Date.parse(failed.created_at)
   let best: DeploymentResponse | undefined
+  let bestAt = -Infinity
   for (const deployment of deployments ?? []) {
+    const at = Date.parse(deployment.created_at)
     if (
       deployment.id === failed.id ||
       deployment.environment_id !== failed.environment_id ||
-      deployment.created_at > failed.created_at ||
+      at > failedAt ||
       !isRollbackTargetStatus(deployment.status)
     ) {
       continue
     }
-    if (!best || deployment.created_at > best.created_at) best = deployment
+    if (!best || at > bestAt) {
+      best = deployment
+      bestAt = at
+    }
   }
   return best
 }

@@ -4,8 +4,9 @@
 import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { FunnelForm, FunnelFormData } from '@/components/funnel/FunnelForm'
+import { funnelFormData } from '@/components/funnel/funnel-form-data'
 import {
-  listFunnelsOptions,
+  getFunnelOptions,
   updateFunnelMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -39,19 +40,15 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
 
   usePageTitle(`Edit Funnel - ${project.slug}`)
 
-  // Fetch all funnels to get the specific one
-  const { data: funnels, isLoading } = useQuery({
-    ...listFunnelsOptions({
+  const { data: funnel, isLoading } = useQuery({
+    ...getFunnelOptions({
       path: {
         project_id: project.id,
+        funnel_id: funnelId,
       },
     }),
+    enabled: !!funnelId,
   })
-
-  const funnel = React.useMemo(() => {
-    if (!funnels || !funnelId) return null
-    return funnels.find((f) => f.id === funnelId)
-  }, [funnels, funnelId])
 
   React.useEffect(() => {
     setBreadcrumbs([
@@ -69,6 +66,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
+      queryClient.invalidateQueries({ queryKey: ['getFunnel'] })
       queryClient.invalidateQueries({ queryKey: ['getFunnelMetrics'] })
       setFeedback({ type: 'success', message: 'Funnel updated successfully!' })
     },
@@ -174,19 +172,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
     )
   }
 
-  // Note: The API doesn't return funnel steps in the list endpoint
-  // So we can only edit name and description, not the steps
-  const initialData: FunnelFormData = {
-    name: funnel.name,
-    description: funnel.description || '',
-    steps: [
-      {
-        event_name: 'page_view',
-        event_filter: [],
-        showFilters: false,
-      },
-    ],
-  }
+  const initialData = funnelFormData(funnel)
 
   return (
     <div className="relative">

@@ -6,7 +6,7 @@ import { summarizeActivity } from './UserDetail.activity'
 
 const entry = (id: number, call_id?: string, succeeded?: boolean) => ({
   id,
-  audit_date: id,
+  audit_date: new Date(id).toISOString(),
   operation_type: 'EXTERNAL_PLUGIN_AI_WRITE',
   data: { call_id, succeeded },
 })

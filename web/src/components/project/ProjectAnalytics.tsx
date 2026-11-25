@@ -1743,6 +1743,9 @@ function renderBaseUrlNote(source: IngestBaseUrlSource, readFailed: boolean) {
   return null
 }
 
+/** The most keys one request returns (the API's maximum page size). */
+const INGEST_KEYS_SHOWN = 100
+
 function IngestKeySetup({ project }: ProjectAnalyticsProps) {
   const queryClient = useQueryClient()
   const [revokeTarget, setRevokeTarget] =
@@ -1766,14 +1769,21 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     path: { project_id: project.id },
   }).queryKey
 
+  // The newest keys, as many as one page holds: a project keeps a handful
+  // of active keys, and older revoked ones past this page do not matter here.
   const {
-    data: keys,
+    data: keyPage,
     isLoading: isLoadingKeys,
     isError: isErrorKeys,
     refetch: refetchKeys,
   } = useQuery({
-    ...listAnalyticsIngestKeysOptions({ path: { project_id: project.id } }),
+    ...listAnalyticsIngestKeysOptions({
+      path: { project_id: project.id },
+      query: { page: 1, page_size: INGEST_KEYS_SHOWN },
+    }),
   })
+  const keys = keyPage?.items
+  const olderKeys = Math.max(0, (keyPage?.total ?? 0) - (keys?.length ?? 0))
 
   const invalidateKeys = () => {
     void queryClient.invalidateQueries({ queryKey: keysQueryKey })
@@ -1985,6 +1995,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
           <summary className="cursor-pointer font-medium text-muted-foreground">
             {revokedKeys.length} revoked key
             {revokedKeys.length === 1 ? '' : 's'}
+            {olderKeys > 0 && ` (${olderKeys} older not shown)`}
           </summary>
           <div className="mt-3 space-y-2">
             {revokedKeys.map((k: AnalyticsIngestKey) => (

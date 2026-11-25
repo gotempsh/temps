@@ -582,7 +582,7 @@ function DomainRowMenu({
 function DomainExpiration({ domain }: { domain: DomainResponse }) {
   if (
     domain.expiration_time == null ||
-    !Number.isFinite(domain.expiration_time)
+    !Number.isFinite(Date.parse(domain.expiration_time))
   ) {
     return <span className="text-muted-foreground">Not available</span>
   }

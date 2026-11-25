@@ -62,9 +62,9 @@ interface LinkCertOptions {
   certificateId: string
 }
 
-/** Custom-domain API timestamps are epoch milliseconds. */
-export function customDomainTimestamp(timestampMillis: number): Date {
-  return new Date(timestampMillis)
+/** Custom-domain API timestamps are ISO 8601 strings in UTC. */
+export function customDomainTimestamp(timestamp: string): Date {
+  return new Date(timestamp)
 }
 
 export function registerCustomDomainsCommands(program: Command): void {

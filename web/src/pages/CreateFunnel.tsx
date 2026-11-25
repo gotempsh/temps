@@ -62,7 +62,7 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
 
   // The success message stays up briefly before opening the new funnel. The
   // form stays disabled until then: a second click used to create a duplicate.
-  const createdFunnelId = createFunnel.data?.funnel_id
+  const createdFunnelId = createFunnel.data?.id
   React.useEffect(() => {
     if (createdFunnelId === undefined) return
     const timer = setTimeout(() => {

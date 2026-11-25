@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-23
+> Generated on: 2026-11-25
 
 ## Installation
 
@@ -267,6 +267,8 @@ List secrets for a project (values are never returned)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Filter to one environment | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `projects secrets create` (alias: `add`)
@@ -1905,6 +1907,8 @@ List backups for a schedule
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--schedule-id <id>` | Schedule ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `backups show`
@@ -4160,6 +4164,8 @@ List analytics ingest keys for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `analytics keys create` (alias: `add`)

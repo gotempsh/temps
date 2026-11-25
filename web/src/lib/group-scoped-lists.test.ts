@@ -160,11 +160,18 @@ describe('merging', () => {
   })
 
   test('deployments are newest first across services', () => {
-    const deployment = (id: number, created_at: number) =>
+    const deployment = (id: number, created_at: string) =>
       ({ id, created_at }) as DeploymentResponse
     const merged = mergeGroupDeployments(
       [web, api],
-      [[deployment(1, 100), deployment(2, 300)], [deployment(3, 200)]]
+      [
+        [
+          deployment(1, '2026-01-01T00:00:01Z'),
+          deployment(2, '2026-01-01T00:00:03Z'),
+        ],
+        // Orders by instant: as text, ".5Z" would sort before "1Z".
+        [deployment(3, '2026-01-01T00:00:02.5Z')],
+      ]
     )
     expect(merged.map((d) => [d.id, d.service.slug])).toEqual([
       [2, 'web'],
