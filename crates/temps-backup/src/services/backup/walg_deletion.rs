@@ -349,6 +349,21 @@ fn stream_walg_target_name(
     Ok(found)
 }
 
+/// A WAL-G command could not be run in `container` at all (as opposed to
+/// running and failing): the container is missing, stopped or restarting,
+/// typically because its service is being stopped or deleted right now.
+fn service_container_unavailable(
+    service_name: &str,
+    container: &str,
+    error: impl std::fmt::Display,
+) -> BackupError {
+    BackupError::ServiceContainerUnavailable {
+        service_name: service_name.to_string(),
+        container: container.to_string(),
+        reason: error.to_string(),
+    }
+}
+
 impl BackupService {
     pub(super) async fn delete_walg_target_with_optional_service(
         &self,
@@ -587,7 +602,7 @@ impl BackupService {
                     &cancellation,
                 )
                 .await
-                .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+                .map_err(|error| service_container_unavailable(service_name, container, error))?;
                 if inventory.exit_code != 0 {
                     return Err(BackupError::ExternalService(format!(
                         "Backup {} WAL-G stream inventory failed before deletion: {}",
@@ -608,7 +623,7 @@ impl BackupService {
                     &cancellation,
                 )
                 .await
-                .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+                .map_err(|error| service_container_unavailable(service_name, container, error))?;
                 if recheck.exit_code != 0
                     || stream_walg_target_name(
                         &serde_json::from_str::<serde_json::Value>(&recheck.stdout)?,
@@ -628,7 +643,7 @@ impl BackupService {
                 &cancellation,
             )
             .await
-            .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+            .map_err(|error| service_container_unavailable(service_name, container, error))?;
             last_delete_detail = format!(
                 "attempt {} exited {}: {}",
                 attempt,
@@ -652,7 +667,7 @@ impl BackupService {
                 &cancellation,
             )
             .await
-            .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+            .map_err(|error| service_container_unavailable(service_name, container, error))?;
             if list.exit_code != 0 {
                 return Err(BackupError::PartialDeletion {
                     backup_id: backup.backup_id.clone(),
@@ -716,7 +731,7 @@ impl BackupService {
             &cancellation,
         )
         .await
-        .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+        .map_err(|error| service_container_unavailable(service_name, container, error))?;
         if garbage.exit_code != 0 {
             return Err(BackupError::PartialDeletion {
                 backup_id: backup.backup_id.clone(),

@@ -1145,8 +1145,16 @@ pub async fn create_project(
         repo_owner: project.repo_owner,
         directory: project.directory,
         main_branch: project.main_branch,
+        preset_config: crate::services::fold_top_level_build_settings(
+            &project.preset,
+            project.preset_config,
+            crate::services::TopLevelBuildSettings {
+                build_command: project.build_command,
+                install_command: project.install_command,
+                output_dir: project.output_dir,
+            },
+        )?,
         preset: project.preset,
-        preset_config: project.preset_config,
         environment_variables: project.environment_variables,
         // Temps never deploys a project whose app runs elsewhere.
         automatic_deploy: project.hosting == temps_entities::types::Hosting::Hosted
@@ -1529,9 +1537,14 @@ pub async fn update_project(
     };
     let updated_project = state
         .project_service
-        .update_project(
+        .update_project_with_build_settings(
             id,
             project_req,
+            crate::services::TopLevelBuildSettings {
+                build_command: project.build_command.clone(),
+                install_command: project.install_command.clone(),
+                output_dir: project.output_dir.clone(),
+            },
             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
                 auth.is_instance_admin(),
             ),

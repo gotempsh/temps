@@ -12,6 +12,7 @@
 )]
 pub mod admin_gate;
 pub mod ai_tool_call;
+pub mod api_problems;
 pub mod audit;
 mod clickhouse_compression;
 pub mod client_ip;

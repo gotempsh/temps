@@ -1698,19 +1698,15 @@ fn with_console_security_headers(mut response: Response) -> Response {
     response
 }
 
-/// Detail text for a request path that must never fall through to the SPA,
-/// or `None` when the console may serve it.
-///
-/// The returned text is a fixed literal (no request data), so it is safe to
-/// embed in the JSON body verbatim.
-fn unmatched_api_detail(path: &str) -> Option<&'static str> {
-    if path.starts_with("/api/") {
-        Some("No API route matched")
+/// Whether a request path must never fall through to the SPA, and if so the
+/// hint to add to its route-not-found problem (`Some(None)` for none).
+fn unmatched_api_hint(path: &str) -> Option<Option<&'static str>> {
+    if path == "/api" || path.starts_with("/api/") {
+        Some(None)
     } else if path == "/ai/v1" || path.starts_with("/ai/v1/") {
-        Some(
-            "No API route matched. The AI gateway is served under /api/ai/v1, \
-             for example /api/ai/v1/chat/completions",
-        )
+        Some(Some(
+            "The AI gateway is served under /api/ai/v1, for example /api/ai/v1/chat/completions",
+        ))
     } else {
         None
     }
@@ -1725,14 +1721,15 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     // client that dropped the `/api` prefix with the console HTML (200) makes
     // every OpenAI SDK fail with an unparsable body instead of a pointer to
     // the right URL.
-    if let Some(detail) = unmatched_api_detail(raw_path) {
-        let body = format!(r#"{{"status":404,"title":"Not Found","detail":"{detail}"}}"#);
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "application/json")],
-            Body::from(body),
-        )
-            .into_response();
+    if let Some(hint) = unmatched_api_hint(raw_path) {
+        let mut response =
+            temps_core::api_problems::route_not_found_with_hint(req.method(), raw_path, hint)
+                .into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+        return response;
     }
 
     // Remove leading slash
@@ -2343,7 +2340,28 @@ fn public_only_app(health: Router, public_router: Router) -> Router {
         .merge(health)
         .nest("/api", public_router)
         .fallback(public_only_not_found)
+        .layer(axum::middleware::from_fn(public_only_problem_details))
         .layer(axum::middleware::from_fn(track_server_errors))
+}
+
+/// Whether this listener hides which platform serves it (the default), read
+/// from the settings the request carries.
+fn hides_platform_identity(req: &Request) -> bool {
+    req.extensions()
+        .get::<Arc<temps_config::ConfigService>>()
+        .is_none_or(|settings| !settings.expose_platform_identity())
+}
+
+/// [`temps_core::api_problems::problem_details_for_unhandled`] when the
+/// operator exposes the platform identity. Its problem types name the
+/// platform (`https://temps.sh/probs/method-not-allowed`), so a hidden
+/// listener answers an unsupported method or a malformed body with the
+/// framework's bare response instead, as it answers an unknown path.
+async fn public_only_problem_details(req: Request, next: axum::middleware::Next) -> Response {
+    if hides_platform_identity(&req) {
+        return next.run(req).await;
+    }
+    temps_core::api_problems::problem_details_for_unhandled(req, next).await
 }
 
 /// Serve the public-only app until shutdown. Resolves immediately when this
@@ -2368,15 +2386,13 @@ async fn serve_public_only(
 
 /// 404 for everything that is not a public route. A browser gets the same
 /// branded page the proxy renders for an unknown host, so a non-allowlisted
-/// visitor sees exactly what they saw before this listener existed; an API
-/// client gets an empty body.
+/// visitor sees exactly what they saw before this listener existed. An API
+/// client gets the route-not-found problem every other listener answers with
+/// when the platform identity is exposed, and an empty body otherwise.
 async fn public_only_not_found(req: Request) -> Response {
     use axum::response::IntoResponse;
 
-    let hide_identity = req
-        .extensions()
-        .get::<Arc<temps_config::ConfigService>>()
-        .is_none_or(|settings| !settings.expose_platform_identity());
+    let hide_identity = hides_platform_identity(&req);
     let headers = req.headers();
     let wants_html = !req.uri().path().starts_with("/api/")
         && headers
@@ -2384,7 +2400,12 @@ async fn public_only_not_found(req: Request) -> Response {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|accept| accept.contains("text/html"));
     if !wants_html {
-        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
+        // The route-not-found problem names the platform, which this
+        // listener hides unless the operator chose to expose it.
+        if hide_identity {
+            return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
+        }
+        return temps_core::api_problems::api_route_not_found(req).await;
     }
     let host = headers
         .get(header::HOST)
@@ -2583,30 +2604,7 @@ mod public_only_app_tests {
     #[tokio::test]
     async fn public_ingress_exposes_platform_identity_only_when_enabled() {
         for expose in [None, Some(false), Some(true)] {
-            let now = chrono::Utc::now();
-            let settings = temps_config::AppSettings {
-                expose_platform_identity: expose,
-                ..Default::default()
-            };
-            let db = Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-                    .append_query_results(vec![vec![temps_entities::settings::Model {
-                        id: 1,
-                        data: settings.to_json(),
-                        created_at: now,
-                        updated_at: now,
-                    }]])
-                    .into_connection(),
-            );
-            let config = temps_config::ServerConfig::new(
-                "127.0.0.1:3000".into(),
-                "postgresql://test".into(),
-                None,
-                None,
-            )
-            .unwrap();
-            let service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
-            service.get_settings().await.unwrap();
+            let service = identity_settings(expose).await;
             let request = Request::builder()
                 .uri("/dashboard")
                 .header(header::HOST, "hooks.example.test")
@@ -2623,6 +2621,74 @@ mod public_only_app_tests {
                     .to_lowercase()
                     .contains("temps"),
                 expose == Some(true)
+            );
+        }
+    }
+
+    /// Settings with `expose_platform_identity` as given, loaded.
+    async fn identity_settings(expose: Option<bool>) -> Arc<temps_config::ConfigService> {
+        let now = chrono::Utc::now();
+        let settings = temps_config::AppSettings {
+            expose_platform_identity: expose,
+            ..Default::default()
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![temps_entities::settings::Model {
+                    id: 1,
+                    data: settings.to_json(),
+                    created_at: now,
+                    updated_at: now,
+                }]])
+                .into_connection(),
+        );
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".into(),
+            "postgresql://test".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
+        service.get_settings().await.unwrap();
+        service
+    }
+
+    /// An unsupported method on a public route is answered by the method
+    /// fallback, not `public_only_not_found`, so the problem rewrite must
+    /// follow the identity setting itself: the method-not-allowed problem
+    /// type names the platform.
+    #[tokio::test]
+    async fn a_wrong_method_names_the_platform_only_when_identity_is_exposed() {
+        for expose in [None, Some(false), Some(true)] {
+            let service = identity_settings(expose).await;
+            let response = send(
+                app().layer(axum::Extension(service)),
+                request("POST", "/healthz"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ALLOW)
+                    .and_then(|value| value.to_str().ok()),
+                Some("GET,HEAD"),
+                "{expose:?}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(
+                body.contains(temps_core::api_problems::METHOD_NOT_ALLOWED_PROBLEM_TYPE),
+                expose == Some(true),
+                "{expose:?}: {body}"
+            );
+            assert_eq!(
+                body.to_lowercase().contains("temps"),
+                expose == Some(true),
+                "{expose:?}: {body}"
             );
         }
     }
@@ -4018,16 +4084,15 @@ mod spa_fallback_tests {
 
     #[test]
     fn api_paths_never_fall_through_to_the_spa() {
-        assert_eq!(
-            unmatched_api_detail("/api/does-not-exist"),
-            Some("No API route matched")
-        );
+        assert_eq!(unmatched_api_hint("/api/does-not-exist"), Some(None));
+        assert_eq!(unmatched_api_hint("/api"), Some(None));
     }
 
     #[test]
     fn ai_gateway_path_without_api_prefix_points_to_the_real_base_url() {
         for path in ["/ai/v1", "/ai/v1/models", "/ai/v1/chat/completions"] {
-            let detail = unmatched_api_detail(path)
+            let detail = unmatched_api_hint(path)
+                .flatten()
                 .unwrap_or_else(|| panic!("{path} must not be answered with the console HTML"));
             assert!(
                 detail.contains("/api/ai/v1"),
@@ -4040,7 +4105,7 @@ mod spa_fallback_tests {
     fn console_routes_are_still_served_by_the_spa() {
         for path in ["/", "/ai", "/ai-first", "/ai/v1x", "/projects/1/ai/v1"] {
             assert_eq!(
-                unmatched_api_detail(path),
+                unmatched_api_hint(path),
                 None,
                 "{path} is a console route and must keep the SPA fallback"
             );
@@ -4122,8 +4187,8 @@ mod spa_fallback_tests {
         );
     }
 
-    #[test]
-    fn fallback_answers_ai_gateway_prefix_with_a_json_404() {
+    #[tokio::test]
+    async fn fallback_answers_ai_gateway_prefix_with_a_route_not_found_problem() {
         let request = axum::http::Request::builder()
             .uri("/ai/v1/models")
             .body(Body::empty())
@@ -4135,8 +4200,43 @@ mod spa_fallback_tests {
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .map(|v| v.as_bytes()),
-            Some(b"application/json".as_slice())
+            Some(b"application/problem+json".as_slice())
         );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(
+            problem["type"],
+            temps_core::api_problems::ROUTE_NOT_FOUND_PROBLEM_TYPE
+        );
+        assert!(problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("/api/ai/v1/chat/completions")));
+    }
+
+    /// An unknown API route answers with a problem a client can tell apart
+    /// from a missing object, instead of a bare 404.
+    #[tokio::test]
+    async fn fallback_answers_unknown_api_route_with_a_route_not_found_problem() {
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/status-pages/7/password")
+            .body(Body::empty())
+            .expect("request builds");
+        let response = serve_static_from(&WEBSITE, request);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(
+            problem["type"],
+            temps_core::api_problems::ROUTE_NOT_FOUND_PROBLEM_TYPE
+        );
+        assert!(problem["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("PUT /api/status-pages/7/password")));
     }
 }
 

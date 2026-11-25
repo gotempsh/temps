@@ -20633,6 +20633,7 @@
             ]
           },
           "build_command": {
+            "description": "Build command; the same setting as `preset_config.buildCommand`.\nRejected when the preset has no such setting or `preset_config` sets\na different value.",
             "type": [
               "string",
               "null"
@@ -20705,6 +20706,7 @@
             "description": "`external` for an app that runs elsewhere and only sends Temps its\ntelemetry. Temps never deploys an external project. Defaults to\n`hosted`."
           },
           "install_command": {
+            "description": "Install command; the same setting as `preset_config.installCommand`.\nRejected when the preset has no such setting or `preset_config` sets\na different value.",
             "type": [
               "string",
               "null"
@@ -20735,6 +20737,7 @@
             "type": "string"
           },
           "output_dir": {
+            "description": "Build output directory; the same setting as `preset_config.outputDir`.\nRejected when the preset has no such setting or `preset_config` sets\na different value.",
             "type": [
               "string",
               "null"
@@ -21434,6 +21437,7 @@
             "items": {
               "$ref": "#/components/schemas/StatusPageMonitorInput"
             },
+            "minItems": 1,
             "type": "array"
           },
           "title": {
@@ -80642,12 +80646,22 @@
               "null"
             ]
           },
+          "public_json_path": {
+            "description": "Path of the machine-readable form (`/api/status/{slug}/summary.json`);\nalways present, like `public_path`.",
+            "example": "/api/status/3f9c1a7e2b/summary.json",
+            "type": "string"
+          },
           "public_json_url": {
             "description": "Machine-readable form of the public page. `None` exactly when\n`public_url` is.",
             "type": [
               "string",
               "null"
             ]
+          },
+          "public_path": {
+            "description": "Path of the public HTML page (`/api/status/{slug}`), on any address\nthis install's public listener is reachable at. Always present, so a\nclient can build the link itself when `public_url` is `None` because\nno public URL is configured.",
+            "example": "/api/status/3f9c1a7e2b",
+            "type": "string"
           },
           "public_url": {
             "description": "Public HTML page. Serves 404 while the page is unpublished. `None`\nwhen this install has no public address to build it from; see\n`public_url_status` for why and where to fix it. Temps never invents a\nhost for it.",
@@ -80685,6 +80699,8 @@
           "title",
           "slug",
           "is_published",
+          "public_path",
+          "public_json_path",
           "public_url_status",
           "monitors",
           "appearance",
@@ -88062,14 +88078,36 @@
         "type": "object"
       },
       "UpdateMonitorRequest": {
+        "description": "Fields to change on a monitor. Every field is optional, a field left out\nkeeps its stored value, and at least one must be present. The monitor's ID\nand uptime history are kept.",
         "properties": {
+          "check_interval_seconds": {
+            "description": "How often to probe, in seconds. **Clamped, not rejected**, exactly\nlike on create: values below 30 are stored as 30 and non-positive\nvalues as 60, and the response reports the stored value.",
+            "example": 60,
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "check_path": {
-            "type": "string"
+            "description": "Path probed on the monitored environment; must start with `/`.",
+            "example": "/health",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Display name; 1 to 255 characters after trimming.",
+            "example": "API health",
+            "maxLength": 255,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
-        "required": [
-          "check_path"
-        ],
         "type": "object"
       },
       "UpdateNotificationEmailProviderRequest": {
@@ -89271,6 +89309,7 @@
             "items": {
               "$ref": "#/components/schemas/StatusPageMonitorInput"
             },
+            "minItems": 1,
             "type": [
               "array",
               "null"
@@ -113969,6 +114008,16 @@
             },
             "description": "Insufficient permissions"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Another request changed the default source at the same time; nothing was saved, retry"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -114069,6 +114118,7 @@
     },
     "/backups/s3-sources/{id}": {
       "delete": {
+        "description": "Delete an S3 source. A source still referenced by a backup schedule or by backup records is refused with 400 (delete those first). Deleting the default source while others exist makes the oldest remaining source the default, in the same transaction; the change is recorded in the audit log.",
         "operationId": "delete_s3_source",
         "parameters": [
           {
@@ -115761,7 +115811,7 @@
         "operationId": "delete_backup",
         "parameters": [
           {
-            "description": "Backup UUID",
+            "description": "Backup UUID (`backup_id`), or its integer `id` as returned by the backup lists",
             "in": "path",
             "name": "id",
             "required": true,
@@ -115832,7 +115882,17 @@
                 }
               }
             },
-            "description": "Object storage or database error"
+            "description": "Object storage or database error; the `failure` field says which"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Transient failure (the backup's service is restarting or being deleted, or the database is unavailable); retry after the `Retry-After` header"
           }
         },
         "security": [
@@ -125964,6 +126024,7 @@
     },
     "/external-services/{id}/projects/{project_id}/environment": {
       "get": {
+        "description": "Returns an object mapping each variable name the service provides to the\nproject to `***`: this bulk read never returns values. Read one value\nthrough `GET /external-services/{id}/projects/{project_id}/environment/{var_name}`,\nwhich is audit-logged and says whether the variable is sensitive.",
         "operationId": "get_service_environment_variables",
         "parameters": [
           {
@@ -125991,15 +126052,22 @@
           "200": {
             "content": {
               "application/json": {
+                "example": {
+                  "POSTGRES_HOST": "***",
+                  "POSTGRES_PASSWORD": "***"
+                },
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/EnvironmentVariableInfo"
+                  "additionalProperties": {
+                    "type": "string"
                   },
-                  "type": "array"
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
                 }
               }
             },
-            "description": "List of environment variables"
+            "description": "Map of variable name to its masked value (`***`)"
           },
           "400": {
             "description": "The service's stored configuration cannot be used to build its variables"
@@ -139056,6 +139124,7 @@
         ]
       },
       "patch": {
+        "description": "Fields left out keep their stored value; at least one is required. The\nmonitor keeps its ID and uptime history. `check_interval_seconds` is\nclamped like on create (minimum 30). Changing `check_path` discards probe\nresults still in flight for the old path.",
         "operationId": "update_monitor",
         "parameters": [
           {
@@ -139111,7 +139180,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Update a monitor's check path",
+        "summary": "Update a monitor's name, check interval or check path",
         "tags": [
           "Status Page"
         ]
@@ -164401,6 +164470,65 @@
           }
         },
         "summary": "Delete an environment variable",
+        "tags": [
+          "Projects"
+        ]
+      },
+      "get": {
+        "description": "Returns the variable exactly as the list does: a regular variable's value\nis masked as `***` and a secret's is `null`. Read a regular value with\n`GET /projects/{project_id}/env-vars/{key}/value?var_id={var_id}`, which\nneeds the reveal permission and is audit-logged.",
+        "operationId": "get_environment_variable",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment variable ID",
+            "in": "path",
+            "name": "var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentVariableResponse"
+                }
+              }
+            },
+            "description": "The environment variable, value masked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project or variable not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one environment variable of a project by its ID",
         "tags": [
           "Projects"
         ]

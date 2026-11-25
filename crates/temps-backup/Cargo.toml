@@ -86,6 +86,8 @@ temps-migrations = { path = "../temps-migrations" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 tracing-subscriber = { workspace = true }
+# `ServiceExt::oneshot` for the route tests that drive the real router.
+tower = { workspace = true }
 
 [lints]
 workspace = true
