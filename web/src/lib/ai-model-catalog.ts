@@ -149,8 +149,11 @@ export function newestVersion(
  * The latest release by the most recent of the two checks: the workspace's
  * own (cached for hours) and the registry's. A release "Check for releases"
  * just found is not hidden behind a stale workspace answer, and a workspace
- * just updated is not told about a release npm has since withdrawn. Without
- * both timestamps, the newer version.
+ * just updated is not told about a release npm has since withdrawn. A failed
+ * registry lookup keeps the last version it knew but is stamped with the
+ * time of the failure, so its timestamp says nothing about that version:
+ * it never outranks the workspace. Without both timestamps, the newer
+ * version.
  */
 export function latestReleaseVersion(
   release: AgentReleaseLike,
@@ -160,7 +163,7 @@ export function latestReleaseVersion(
   const fromRegistry = release.latest_version ?? null
   if (!fromWorkspace || !fromRegistry) return fromWorkspace ?? fromRegistry
   const workspaceAt = Date.parse(workspace?.checked_at ?? '')
-  const registryAt = Date.parse(release.checked_at ?? '')
+  const registryAt = release.error ? NaN : Date.parse(release.checked_at ?? '')
   if (Number.isFinite(workspaceAt) && Number.isFinite(registryAt)) {
     return workspaceAt >= registryAt ? fromWorkspace : fromRegistry
   }

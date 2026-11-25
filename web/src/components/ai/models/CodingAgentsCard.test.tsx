@@ -248,3 +248,47 @@ test('a cached read started during a check cannot undo it', async () => {
   expect(view.getByText('1.1.0 available')).toBeTruthy()
   expect(view.queryByText(/Not checked yet/)).toBeNull()
 })
+
+test('a failed check before the first read finishes still shows the row', async () => {
+  let cachedReads = 0
+  client.setConfig({
+    baseUrl: 'http://temps.test',
+    fetch: (async (input: Request) => {
+      const url = new URL(input.url)
+      if (!url.pathname.endsWith('/harness-update')) return json(overview)
+      if (url.searchParams.get('refresh') === 'true') {
+        return new Response(
+          JSON.stringify({
+            title: 'Harness Update Unavailable',
+            detail: 'the workspace could not be started',
+            status: 503,
+          }),
+          {
+            status: 503,
+            headers: { 'Content-Type': 'application/problem+json' },
+          }
+        )
+      }
+      cachedReads += 1
+      // The first visit's read never answers before the check is clicked.
+      if (cachedReads === 1) return new Promise<Response>(() => {})
+      return json(notChecked)
+    }) as typeof fetch,
+  })
+  const queries = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = render(
+    <QueryClientProvider client={queries}>
+      <CodingAgentsCard />
+    </QueryClientProvider>
+  )
+
+  const check = await view.findByRole('button', { name: 'Check workspace' })
+  await waitFor(() => expect(cachedReads).toBe(1))
+  fireEvent.click(check)
+
+  // The check failed and cancelled the first read; the cache is read again.
+  await view.findByText(/Not checked yet/)
+  expect(cachedReads).toBe(2)
+})

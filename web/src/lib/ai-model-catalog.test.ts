@@ -261,6 +261,30 @@ describe('agentVersionState after a withdrawn release', () => {
       )
     ).toEqual({ kind: 'current', installed: '1.0.0' })
   })
+
+  it('never takes a failed registry lookup for a newer check', () => {
+    // The registry last found 1.0.0; the workspace since found 1.1.0. A
+    // lookup that times out at 11:00 keeps 1.0.0 with the failure's time:
+    // that is no evidence 1.1.0 was withdrawn.
+    const workspace = {
+      installed_version: '1.0.0',
+      latest_version: '1.1.0',
+      update_available: true,
+      updating: false,
+      checked_at: '2026-11-24T10:00:00Z',
+    }
+    const failed = {
+      latest_version: '1.0.0',
+      checked_at: '2026-11-24T11:00:00Z',
+      error: 'registry request timed out',
+    }
+    expect(agentVersionState(failed, workspace)).toEqual({
+      kind: 'behind',
+      installed: '1.0.0',
+      latest: '1.1.0',
+    })
+    expect(latestReleaseVersion(failed, workspace)).toBe('1.1.0')
+  })
 })
 
 describe('agentVersionState before the workspace was read', () => {

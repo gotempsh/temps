@@ -239,6 +239,11 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
     await cancelPendingRead()
     queryClient.setQueryData(workspaceKey, status)
   }
+  // A failed action wrote nothing, but it cancelled the cached read (on a
+  // first visit, the only one), and a failed update discards what was
+  // known: read the cache again so the row never stays on a placeholder.
+  const rereadCached = () =>
+    queryClient.invalidateQueries({ queryKey: workspaceKey })
 
   const inspect = useMutation({
     onMutate: cancelPendingRead,
@@ -251,13 +256,15 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
       return data
     },
     onSuccess: (status) => writeStatus(status),
-    onError: (error) =>
+    onError: (error) => {
       toast.error(
         problemMessage(
           error,
           `Your ${agent.name} workspace could not be checked`
         )
-      ),
+      )
+      void rereadCached()
+    },
   })
 
   const update = useMutation({
@@ -273,8 +280,10 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
       await writeStatus(status)
       announce(updateOutcome(agent.name, agent, status))
     },
-    onError: (error) =>
-      toast.error(problemMessage(error, `${agent.name} could not be updated`)),
+    onError: (error) => {
+      toast.error(problemMessage(error, `${agent.name} could not be updated`))
+      void rereadCached()
+    },
   })
 
   const workspaceError = workspace.isError
