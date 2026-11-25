@@ -361,7 +361,7 @@ _ANYHOW = re.compile(r"\banyhow\b")
 # ADR-116 D1: an ingress provider lives in its own module, and the rest of
 # temps-ingress reaches it only through the registry and the traits.
 _PROVIDER_CRATE = "temps-ingress"
-_PROVIDER_MODULES = ("src/cloudflare.rs", "src/tailscale.rs", "src/providers/")
+_PROVIDER_MODULES = ("src/cloudflare.rs", "src/cloudflare/", "src/tailscale.rs", "src/tailscale/", "src/providers/")
 _PROVIDER_PATH = re.compile(r"\b(?:cloudflare|tailscale)::")
 _PROVIDER_KIND_LITERAL = re.compile(r'"(?:cloudflare_tunnel|tailscale)"')
 

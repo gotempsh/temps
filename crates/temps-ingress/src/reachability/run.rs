@@ -43,7 +43,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::access::{AccessApp, AccessPolicyAnswer};
-use super::edge_rules::{same_rule, EdgeRuleError, EdgeRulePurpose, EdgeRuleSeen, HttpPolicy};
+use super::edge_rules::HttpPolicy;
 use super::model::{
     AccessBinding, AddressAudience, AddressReachability, Audience, Decision, DnsRecordState,
     Intent, JournalEntry, JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord,
@@ -464,66 +464,10 @@ pub trait RunOps: Send + Sync {
     async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String>;
     /// Turns it on or off; off withdraws every host it generated.
     async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String>;
-    /// Add `purpose`'s Cloudflare rule for `host` (ADR 070), with the token
-    /// of `connector_id`'s DNS provider (else the one managing the zone), or
-    /// find one doing the same already.
-    async fn create_edge_rule(
-        &self,
-        run_id: i32,
-        connector_id: Option<i32>,
-        host: &str,
-        purpose: EdgeRulePurpose,
-    ) -> Result<EdgeRuleMade, EdgeRuleError>;
-    /// The rule run `run_id` added for `host`, found by its reference.
-    async fn find_edge_rule(
-        &self,
-        run_id: i32,
-        connector_id: Option<i32>,
-        host: &str,
-        purpose: EdgeRulePurpose,
-    ) -> Result<Option<RunResource>, String>;
-    /// The rule `rule` names as Cloudflare has it now; `None` when gone.
-    async fn edge_rule(&self, rule: &EdgeRuleAt) -> Result<Option<EdgeRuleSeen>, String>;
-    async fn delete_edge_rule(&self, rule: &EdgeRuleAt) -> Result<(), String>;
     async fn sleep(&self, duration: Duration);
-}
-
-/// Where a rule a run added lives at Cloudflare (ADR 070).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeRuleAt {
-    pub provider_id: i32,
-    pub zone_id: String,
-    pub ruleset_id: String,
-    pub rule_id: String,
-}
-
-impl EdgeRuleAt {
-    pub fn of(resource: &RunResource) -> Option<Self> {
-        match resource {
-            RunResource::EdgeRule {
-                provider_id,
-                zone_id,
-                ruleset_id,
-                rule_id,
-                ..
-            } => Some(Self {
-                provider_id: *provider_id,
-                zone_id: zone_id.clone(),
-                ruleset_id: ruleset_id.clone(),
-                rule_id: rule_id.clone(),
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// What adding a rule did (ADR 070 D1).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeRuleMade {
-    /// Added: a [`RunResource::EdgeRule`].
-    Created(Box<RunResource>),
-    /// A rule doing the same was there already; used as found.
-    AlreadyThere(String),
+    /// The providers whose steps and journal entries this run hands over
+    /// (ADR-116 D3), over this same set of effects.
+    fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>>;
 }
 
 /// A write that failed.
@@ -556,6 +500,86 @@ impl WriteError {
 pub fn lookup_backoff(failures: u32) -> Duration {
     let base = 30u64.saturating_mul(1u64 << failures.saturating_sub(1).min(5));
     Duration::from_secs(base.min(15 * 60))
+}
+
+/// A provider's part of a run (ADR-116 D3): the steps only it has, and the
+/// journal entries they write, which only it can find again and undo. The
+/// engine keeps the journal, its order and its rules (ADR 064 D4); a provider
+/// step writes to the journal only through [`StepRun`], so it cannot skip the
+/// pending entry before a creating call.
+#[async_trait]
+pub trait ProviderRun: Send + Sync {
+    /// Whether steps of `kind` are this provider's.
+    fn runs(&self, kind: StepKind) -> bool;
+    /// Run one of its steps.
+    async fn step(&self, run: &mut dyn StepRun, kind: StepKind) -> Outcome;
+    /// Whether journal entries for `intent` are this provider's.
+    fn owns(&self, intent: &Intent) -> bool;
+    /// Whether `resource` is this provider's.
+    fn owns_resource(&self, resource: &RunResource) -> bool;
+    /// Find what `intent` made, by the provider's own authority.
+    async fn look(&self, run_id: i32, intent: &Intent) -> Result<Found, String>;
+    /// Before undo removes `resource`: whether it is still what the run
+    /// made. `checked`: the user said to remove it whatever it holds now.
+    async fn check_undo(&self, resource: &RunResource, checked: bool) -> UndoCheck;
+    /// Remove `resource`.
+    async fn remove(&self, resource: &RunResource) -> Result<(), String>;
+}
+
+/// What a provider found before undo removes one of its resources.
+pub enum UndoCheck {
+    /// Still what the run made: remove it.
+    Remove,
+    /// Already gone: nothing to remove.
+    Gone,
+    /// Someone changed it since; undo pauses on it, saying what it is now.
+    Changed(String),
+    /// It could not be read; undo stops, touching nothing from there on.
+    Unreadable(String),
+}
+
+/// What a provider step may use of the run (ADR-116 D3).
+#[async_trait]
+pub trait StepRun: Send {
+    fn input(&self) -> &RunInput;
+    /// The tunnel an earlier step of this run made or chose.
+    fn connector_id(&self) -> Option<i32>;
+    /// The journal entry under `key`, as it is now.
+    fn entry(&self, key: &str) -> Option<JournalEntry>;
+    /// Before a creating call: reuse what an earlier attempt made, else
+    /// store a pending entry first.
+    async fn begin(&mut self, intent: &Intent) -> Result<Begin, Hold>;
+    /// After the call: `Some` what it made, `None` nothing.
+    async fn finish(&mut self, key: &str, resource: Option<RunResource>);
+    /// After a failed call that may have made something anyway.
+    async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool);
+}
+
+#[async_trait]
+impl StepRun for Runner<'_> {
+    fn input(&self) -> &RunInput {
+        self.input
+    }
+
+    fn connector_id(&self) -> Option<i32> {
+        self.ctx.connector_id
+    }
+
+    fn entry(&self, key: &str) -> Option<JournalEntry> {
+        self.record.journal.iter().find(|e| e.key == key).cloned()
+    }
+
+    async fn begin(&mut self, intent: &Intent) -> Result<Begin, Hold> {
+        Runner::begin(self, intent).await
+    }
+
+    async fn finish(&mut self, key: &str, resource: Option<RunResource>) {
+        Runner::finish(self, key, resource).await
+    }
+
+    async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool) {
+        Runner::finish_failed(self, intent, maybe_applied).await
+    }
 }
 
 /// After this long an entry Temps still cannot resolve is shown with what
@@ -781,7 +805,7 @@ pub fn created(journal: &[JournalEntry]) -> Vec<RunResource> {
 
 /// What looking an intent up found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Found {
+pub enum Found {
     Made(Box<RunResource>),
     Missing,
     /// It holds something neither the run nor what it replaced had.
@@ -809,6 +833,9 @@ fn holds_this_run(record: &DnsRecordState, content: &str, run_id: i32) -> bool {
 }
 
 async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, String> {
+    if let Some(provider) = ops.providers().into_iter().find(|p| p.owns(intent)) {
+        return provider.look(run_id, intent).await;
+    }
     match intent {
         Intent::DnsRecord {
             hostname,
@@ -887,20 +914,6 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
                 definition.comment
             )),
         }),
-        // Found by this run's reference at Cloudflare (ADR 070 D2).
-        Intent::EdgeRule {
-            hostname,
-            purpose,
-            connector_id,
-        } => Ok(
-            match ops
-                .find_edge_rule(run_id, *connector_id, hostname, *purpose)
-                .await?
-            {
-                Some(resource) => Found::Made(Box::new(resource)),
-                None => Found::Missing,
-            },
-        ),
         // The address's own column (ADR 070 D1): set when it holds the
         // choice, not set while it still holds what it held before.
         Intent::HttpPolicy {
@@ -1250,7 +1263,7 @@ pub fn decide(
     Ok(())
 }
 
-enum Outcome {
+pub enum Outcome {
     Done(Option<String>),
     Skipped(String),
     Failed(String),
@@ -1262,7 +1275,7 @@ enum Outcome {
 }
 
 /// Whether a journaled step has to make its call.
-enum Begin {
+pub enum Begin {
     /// An earlier attempt created it already.
     Have(Box<RunResource>),
     /// The pending entry is stored; make the call.
@@ -1270,7 +1283,7 @@ enum Begin {
 }
 
 /// Why a journaled step cannot make its call.
-enum Hold {
+pub enum Hold {
     Failed(String),
     /// An earlier attempt may have made it; Temps cannot tell yet.
     Wait(String),
@@ -1304,7 +1317,7 @@ struct Runner<'a> {
 }
 
 /// Why a step waits for an earlier attempt's outcome.
-fn wait_message(entry: &JournalEntry, now: temps_core::DBDateTime) -> String {
+pub fn wait_message(entry: &JournalEntry, now: temps_core::DBDateTime) -> String {
     format!(
         "An earlier attempt may have made {} already, and Temps cannot tell yet{}. It never \
          makes it twice: it checks again every minute; resume once it has.{}",
@@ -1329,30 +1342,6 @@ fn conflict_message(entry: &JournalEntry) -> String {
         entry.intent.describe(),
         entry.conflict.as_deref().unwrap_or("something else")
     )
-}
-
-/// What a skipped edge rule step says (ADR 070 D3): what is missing,
-/// whose token, what stays exposed, and the fix.
-pub fn degraded_message(host: &str, purpose: EdgeRulePurpose, error: &EdgeRuleError) -> String {
-    let whose = error
-        .provider
-        .as_deref()
-        .map(|p| format!("The API token of DNS provider `{p}`"))
-        .unwrap_or_else(|| "The Cloudflare API token".to_string());
-    match error.missing_permission {
-        Some(permission) => format!(
-            "Not set up: {whose} lacks {permission}, so {}. {host} is published anyway. Add \
-             {permission} to the token in Cloudflare (My Profile → API Tokens), then make the \
-             address reachable again to add the rule.",
-            purpose.exposure(host)
-        ),
-        None => format!(
-            "Not set up: {} {host} is published anyway, but {}. Fix that in Cloudflare, then \
-             make the address reachable again to add the rule.",
-            error.message.trim_end_matches('.').to_string() + ".",
-            purpose.exposure(host)
-        ),
-    }
 }
 
 fn record_type(ip: IpAddr) -> &'static str {
@@ -1687,77 +1676,6 @@ impl Runner<'_> {
     /// Add `purpose`'s Cloudflare rule for `host` (ADR 070 D1). A token
     /// without the permission, or any refusal, publishes anyway: the step
     /// is skipped and says what is missing and what stays exposed (D3).
-    async fn edge_rule(&mut self, host: &str, purpose: EdgeRulePurpose) -> Outcome {
-        let input = self.input;
-        let connector_id = input
-            .tunnel
-            .as_ref()
-            .map(|t| t.id)
-            .or(self.ctx.connector_id);
-        let intent = Intent::EdgeRule {
-            hostname: host.to_string(),
-            purpose,
-            connector_id,
-        };
-        match self.begin(&intent).await {
-            Err(hold) => hold.into(),
-            Ok(Begin::Have(resource)) => {
-                Outcome::Done(Some(format!("{} is in place.", resource.describe())))
-            }
-            Ok(Begin::Go) => match self
-                .ops
-                .create_edge_rule(input.run_id, connector_id, host, purpose)
-                .await
-            {
-                Ok(EdgeRuleMade::Created(resource)) => {
-                    let detail = format!("Added the {}.", resource.describe());
-                    self.finish(&intent.key(input.run_id), Some(*resource))
-                        .await;
-                    Outcome::Done(Some(detail))
-                }
-                Ok(EdgeRuleMade::AlreadyThere(found)) => {
-                    self.finish(&intent.key(input.run_id), None).await;
-                    Outcome::Skipped(format!(
-                        "The zone already has a rule doing this ({found}); used as it is, and \
-                         undo leaves it."
-                    ))
-                }
-                Err(error) if error.maybe_applied => {
-                    self.finish_failed(&intent, true).await;
-                    let key = intent.key(input.run_id);
-                    let entry = self.record.journal.iter().find(|e| e.key == key).cloned();
-                    match entry {
-                        Some(entry) if entry.state == JournalState::Done => Outcome::Done(
-                            entry
-                                .resource
-                                .map(|r| format!("Added the {}.", r.describe())),
-                        ),
-                        Some(entry) if entry.state == JournalState::Absent => {
-                            Outcome::Skipped(degraded_message(host, purpose, &error))
-                        }
-                        Some(entry) => Outcome::Stalled(format!(
-                            "{} {}",
-                            error.message,
-                            wait_message(&entry, chrono::Utc::now())
-                        )),
-                        None => Outcome::Failed(error.message),
-                    }
-                }
-                Err(error) => {
-                    self.finish(&intent.key(input.run_id), None).await;
-                    tracing::warn!(
-                        run = input.run_id,
-                        host,
-                        missing_permission = error.missing_permission,
-                        "could not add a Cloudflare edge rule; publishing without it: {}",
-                        error.message
-                    );
-                    Outcome::Skipped(degraded_message(host, purpose, &error))
-                }
-            },
-        }
-    }
-
     /// Point `host` at `ip` (ADR 064 D4): read the record just before
     /// writing, write nothing when it is not what the plan saw, journal a
     /// change with the value it replaces.
@@ -2564,6 +2482,10 @@ impl Runner<'_> {
     }
 
     async fn step(&mut self, index: usize, kind: StepKind) -> Outcome {
+        let ops = self.ops;
+        if let Some(provider) = ops.providers().into_iter().find(|p| p.runs(kind)) {
+            return provider.step(self, kind).await;
+        }
         let input = self.input;
         let address = input.address.clone();
         match kind {
@@ -3254,13 +3176,8 @@ impl Runner<'_> {
                 }
             }
             StepKind::AccessApp => self.access_app(&address).await,
-            StepKind::RedirectToHttps => {
-                self.edge_rule(&address, EdgeRulePurpose::HttpsRedirect)
-                    .await
-            }
-            StepKind::StandardPortsOnly => {
-                self.edge_rule(&address, EdgeRulePurpose::StandardPorts)
-                    .await
+            StepKind::RedirectToHttps | StepKind::StandardPortsOnly => {
+                Outcome::Failed(format!("No provider runs {kind:?} steps here."))
             }
             StepKind::SetHttpPolicy => self.record_http_policy(&address).await,
             StepKind::ConfigureTailscaleServe => {
@@ -3983,6 +3900,23 @@ pub async fn undo(
             });
             continue;
         }
+        // A provider's own resource is checked by the provider (ADR-116 D3).
+        let provider = ops
+            .providers()
+            .into_iter()
+            .find(|p| p.owns_resource(&resource));
+        if let Some(provider) = &provider {
+            match provider.check_undo(&resource, checked).await {
+                UndoCheck::Remove => {}
+                UndoCheck::Gone => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                UndoCheck::Changed(now_is) => return stop(results, pause(entry, now_is, now)),
+                UndoCheck::Unreadable(why) => return stop(results, Stop::Failed(why)),
+            }
+        }
         match &resource {
             // The choice goes with the address this undo removes.
             RunResource::HttpPolicy {
@@ -4261,42 +4195,6 @@ pub async fn undo(
                     )
                 }
             },
-            // A rule goes only while it still does what the run wrote
-            // (ADR 070 D2): its expression and action, and for the
-            // redirect its target, status and query string. Unless the
-            // user said to delete it anyway.
-            RunResource::EdgeRule {
-                hostname, purpose, ..
-            } => {
-                let Some(at) = EdgeRuleAt::of(&resource) else {
-                    continue;
-                };
-                match ops.edge_rule(&at).await {
-                    Ok(None) => {
-                        entry.state = JournalState::Absent;
-                        entry.at = now;
-                        continue;
-                    }
-                    Ok(Some(rule)) if !checked && !same_rule(&rule, *purpose, hostname) => {
-                        return stop(
-                            results,
-                            pause(entry, format!("it is now {}", rule.summary()), now),
-                        );
-                    }
-                    Ok(Some(_)) => {}
-                    Err(error) => {
-                        return stop(
-                            results,
-                            Stop::Failed(format!(
-                                "Temps could not read the {} to check it is still the one this \
-                                 run added, so it touched nothing from there on: {error} Undo \
-                                 again to retry.",
-                                purpose.describe(hostname)
-                            )),
-                        )
-                    }
-                }
-            }
             // A tunnel is checked for what else it serves, then marked
             // `deleting`, and that journaled, before any provider call:
             // sync then never brings it back, and an interrupted undo
@@ -4356,68 +4254,69 @@ pub async fn undo(
             _ => {}
         }
         let entry = &mut journal[index];
-        let outcome = match &resource {
-            RunResource::DnsProvider { id, .. } => ops.delete_dns_provider(*id).await,
-            RunResource::ManagedDomain {
-                provider_id,
-                domain,
-            } => ops.remove_managed_zone(*provider_id, domain).await,
-            RunResource::AutoManageEnabled {
-                provider_id,
-                domain,
-            } => ops.set_auto_manage(*provider_id, domain, false).await,
-            RunResource::Connector { id, .. } => {
-                ops.delete_tunnel(*id, entry.tunnel_id.as_deref()).await
-            }
-            RunResource::CustomDomain { id, .. } => ops.detach_domain(*id).await,
-            RunResource::HostnameChoice {
-                hostname, previous, ..
-            } => ops.restore_hostname_choice(hostname, *previous).await,
-            RunResource::DnsRecord {
-                hostname,
-                label,
-                record_type,
-                ..
-            } => ops.remove_dns_record(hostname, label, record_type).await,
-            RunResource::DnsChange {
-                hostname,
-                record_type,
-                before,
-                ..
-            } => ops
-                .write_dns_record(
+        let outcome = match (&provider, &resource) {
+            (Some(provider), resource) => provider.remove(resource).await,
+            (None, resource) => match resource {
+                RunResource::DnsProvider { id, .. } => ops.delete_dns_provider(*id).await,
+                RunResource::ManagedDomain {
+                    provider_id,
+                    domain,
+                } => ops.remove_managed_zone(*provider_id, domain).await,
+                RunResource::AutoManageEnabled {
+                    provider_id,
+                    domain,
+                } => ops.set_auto_manage(*provider_id, domain, false).await,
+                RunResource::Connector { id, .. } => {
+                    ops.delete_tunnel(*id, entry.tunnel_id.as_deref()).await
+                }
+                RunResource::CustomDomain { id, .. } => ops.detach_domain(*id).await,
+                RunResource::HostnameChoice {
+                    hostname, previous, ..
+                } => ops.restore_hostname_choice(hostname, *previous).await,
+                RunResource::DnsRecord {
+                    hostname,
+                    label,
+                    record_type,
+                    ..
+                } => ops.remove_dns_record(hostname, label, record_type).await,
+                RunResource::DnsChange {
                     hostname,
                     record_type,
-                    &before.content,
-                    before.run_id,
-                    // Put back exactly what was there, its proxy flag
-                    // included; one read before this was kept was DNS
-                    // only, as every run wrote then.
-                    Some(before.proxied.unwrap_or(false)),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| e.message),
-            RunResource::AddressAudience {
-                hostname, before, ..
-            } => ops.set_address_audience(hostname, before).await,
-            RunResource::HttpPolicy {
-                hostname, before, ..
-            } => ops.set_http_policy(hostname, *before).await,
-            RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
-            RunResource::AccessApp {
-                provider_id, id, ..
-            } => ops.delete_access_app(*provider_id, id).await,
-            // Handled above, before anything is removed.
-            RunResource::TailscaleServe { .. }
-            | RunResource::TailscaleService { .. }
-            | RunResource::TailscaleCredential { .. } => Ok(()),
-            RunResource::EnvironmentHosts { connector_id, .. } => {
-                ops.set_environment_hosts(*connector_id, false).await
-            }
-            RunResource::EdgeRule { .. } => match EdgeRuleAt::of(&resource) {
-                Some(at) => ops.delete_edge_rule(&at).await,
-                None => Ok(()),
+                    before,
+                    ..
+                } => ops
+                    .write_dns_record(
+                        hostname,
+                        record_type,
+                        &before.content,
+                        before.run_id,
+                        // Put back exactly what was there, its proxy flag
+                        // included; one read before this was kept was DNS
+                        // only, as every run wrote then.
+                        Some(before.proxied.unwrap_or(false)),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.message),
+                RunResource::AddressAudience {
+                    hostname, before, ..
+                } => ops.set_address_audience(hostname, before).await,
+                RunResource::HttpPolicy {
+                    hostname, before, ..
+                } => ops.set_http_policy(hostname, *before).await,
+                RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
+                RunResource::AccessApp {
+                    provider_id, id, ..
+                } => ops.delete_access_app(*provider_id, id).await,
+                // Handled above, before anything is removed.
+                RunResource::TailscaleServe { .. }
+                | RunResource::TailscaleService { .. }
+                | RunResource::TailscaleCredential { .. } => Ok(()),
+                RunResource::EnvironmentHosts { connector_id, .. } => {
+                    ops.set_environment_hosts(*connector_id, false).await
+                }
+                // Only a provider removes its own resources.
+                RunResource::EdgeRule { .. } => Ok(()),
             },
         };
         let label = match &resource {
@@ -4521,6 +4420,10 @@ mod tests {
         }
     }
     use std::sync::Mutex;
+
+    use crate::cloudflare::edge_rules::{same_rule, EdgeRuleError, EdgeRuleSeen};
+    use crate::cloudflare::run::{EdgeRuleAt, EdgeRuleMade};
+    use crate::reachability::edge_rules::EdgeRulePurpose;
 
     /// Records every call; fails the ones named in `fail`.
     #[derive(Default)]
@@ -5101,6 +5004,15 @@ mod tests {
             *self.environment_hosts.lock().expect("lock") = on;
             Ok(())
         }
+        async fn sleep(&self, _duration: Duration) {}
+
+        fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>> {
+            vec![Box::new(crate::cloudflare::run::CloudflareRun::new(self))]
+        }
+    }
+
+    #[async_trait]
+    impl crate::cloudflare::run::CloudflareOps for Fake {
         async fn create_edge_rule(
             &self,
             run_id: i32,
@@ -5123,11 +5035,11 @@ mod tests {
                     rule.description.clone().unwrap_or_default(),
                 ));
             }
-            let reference = super::super::edge_rules::rule_ref("abcd", run_id, purpose);
+            let reference = crate::cloudflare::edge_rules::rule_ref("abcd", run_id, purpose);
             // The rule as Cloudflare would return it: Temps' body, with an id.
-            let mut body = super::super::edge_rules::rule_body(purpose, host, &reference);
+            let mut body = crate::cloudflare::edge_rules::rule_body(purpose, host, &reference);
             body["id"] = serde_json::json!(format!("rule-{}", rules.len() + 1));
-            let rule = super::super::edge_rules::parse_rule(&body).expect("rule");
+            let rule = crate::cloudflare::edge_rules::parse_rule(&body).expect("rule");
             rules.push((purpose, rule.clone()));
             Ok(EdgeRuleMade::Created(Box::new(RunResource::EdgeRule {
                 hostname: host.to_string(),
@@ -5172,7 +5084,6 @@ mod tests {
                 .retain(|(_, r)| r.id != rule.rule_id);
             Ok(())
         }
-        async fn sleep(&self, _duration: Duration) {}
     }
 
     fn access_app_named(id: &str, name: &str, host: &str, policies: &str) -> AccessApp {
@@ -7311,12 +7222,12 @@ mod tests {
                 id: "user-https".into(),
                 reference: None,
                 description: Some("mine".into()),
-                expression: super::super::edge_rules::expression(
+                expression: crate::cloudflare::edge_rules::expression(
                     EdgeRulePurpose::HttpsRedirect,
                     "myapp.example.com",
                 ),
                 action: "redirect".into(),
-                action_parameters: super::super::edge_rules::action_parameters(
+                action_parameters: crate::cloudflare::edge_rules::action_parameters(
                     EdgeRulePurpose::HttpsRedirect,
                 ),
                 enabled: true,
@@ -7355,7 +7266,7 @@ mod tests {
             ..Default::default()
         };
         let mut elsewhere =
-            super::super::edge_rules::action_parameters(EdgeRulePurpose::HttpsRedirect)
+            crate::cloudflare::edge_rules::action_parameters(EdgeRulePurpose::HttpsRedirect)
                 .expect("redirect");
         elsewhere["from_value"]["target_url"]["expression"] =
             serde_json::json!("concat(\"http://elsewhere.example.net\", http.request.uri.path)");
@@ -7365,7 +7276,7 @@ mod tests {
                 id: "user-elsewhere".into(),
                 reference: None,
                 description: Some("mine".into()),
-                expression: super::super::edge_rules::expression(
+                expression: crate::cloudflare::edge_rules::expression(
                     EdgeRulePurpose::HttpsRedirect,
                     "myapp.example.com",
                 ),

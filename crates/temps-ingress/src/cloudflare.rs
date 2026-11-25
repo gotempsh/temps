@@ -36,6 +36,10 @@ const API: &str = "https://api.cloudflare.com/client/v4";
 // which the node agent trusts too. `TUNNEL_TOKEN_FILE` needs 2025.4.0 or later.
 use temps_connector_pins::cloudflared as pins;
 
+pub mod edge_rules;
+pub mod live;
+pub mod run;
+
 pub struct CloudflareTunnelProvider {
     http: reqwest::Client,
     credentials: CloudflareCredentials,
@@ -764,6 +768,13 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
 
     fn tunnels(&self) -> Option<&dyn crate::registry::TunnelFactory> {
         Some(self)
+    }
+
+    fn run<'a>(
+        &self,
+        live: &'a crate::reachability::service::LiveOps,
+    ) -> Option<Box<dyn crate::reachability::run::ProviderRun + 'a>> {
+        Some(Box::new(run::CloudflareRun::new(live)))
     }
 }
 

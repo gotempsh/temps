@@ -19,6 +19,8 @@ use utoipa::ToSchema;
 
 use crate::error::IngressError;
 use crate::provider::{Capabilities, Reach, TunnelProvider};
+use crate::reachability::run::ProviderRun;
+use crate::reachability::service::LiveOps;
 
 /// What a provider is, for the console.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -138,6 +140,12 @@ pub trait ProviderFactory: Send + Sync {
     /// on a connector row with its secrets sealed, but never synced,
     /// published through or run on a node.
     fn tunnels(&self) -> Option<&dyn TunnelFactory> {
+        None
+    }
+
+    /// This provider's part of a reachability run, over the live effects
+    /// (ADR-116 D3). `None` for a provider with no steps of its own.
+    fn run<'a>(&self, _live: &'a LiveOps) -> Option<Box<dyn ProviderRun + 'a>> {
         None
     }
 }
@@ -269,6 +277,11 @@ impl ProviderRegistry {
             .tunnels()
             .ok_or_else(|| IngressError::Validation(format!("'{kind}' builds no tunnels.")))?;
         tunnels.build(deps, connector, secrets).await
+    }
+
+    /// Every provider's part of a reachability run, over the live effects.
+    pub fn runs<'a>(&self, live: &'a LiveOps) -> Vec<Box<dyn ProviderRun + 'a>> {
+        self.providers.iter().filter_map(|f| f.run(live)).collect()
     }
 
     /// A credential-free tunnel of `kind`, for node specs.
