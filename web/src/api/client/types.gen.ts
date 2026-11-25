@@ -913,7 +913,7 @@ export type AdoptHostnameRecord = {
  */
 export type AgentConfigResponse = {
     /**
-     * Preferred model for the CLI (e.g. "sonnet", "gpt-5-codex"). `None` means default.
+     * Preferred model for the CLI (e.g. "sonnet", "gpt-6.2-sol"). `None` means default.
      */
     ai_model?: string | null;
     ai_provider: string;
@@ -6772,6 +6772,61 @@ export type CmdResponse = {
 };
 
 /**
+ * The latest published release of one coding-agent CLI.
+ */
+export type CodingAgentRelease = {
+    /**
+     * Executable name inside a workspace.
+     */
+    binary: string;
+    /**
+     * When the registry was last asked.
+     */
+    checked_at?: string | null;
+    /**
+     * Why the latest version is unknown, when it is.
+     */
+    error?: string | null;
+    /**
+     * Latest version on the npm registry, when it could be read.
+     */
+    latest_version?: string | null;
+    name: string;
+    npm_package: string;
+    /**
+     * Temps provider id (`claude_cli`, `codex_cli`, `opencode`).
+     */
+    provider_id: string;
+};
+
+/**
+ * Instance-wide coding-agent settings.
+ */
+export type CodingAgentSettings = {
+    /**
+     * Install newer CLI releases in workspaces in use without asking.
+     */
+    auto_update: boolean;
+    updated_at?: string | null;
+};
+
+/**
+ * A settings change; omitted fields are left as they are.
+ */
+export type CodingAgentSettingsUpdate = {
+    auto_update?: boolean | null;
+};
+
+/**
+ * Every coding-agent CLI Temps manages, with its latest release, and the
+ * auto-update setting.
+ */
+export type CodingAgentsOverview = {
+    agents: Array<CodingAgentRelease>;
+    settings: CodingAgentSettings;
+};
+
+/**
  * Result of a command the server ran in the sandbox.
  */
 export type CommandOutcome = {
@@ -9887,6 +9942,11 @@ export type CreateProjectGroupRequest = {
 
 export type CreateProjectRequest = {
     automatic_deploy?: boolean | null;
+    /**
+     * Build command; the same setting as `preset_config.buildCommand`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     build_command?: string | null;
     /**
      * Override the instance default for this new project.
@@ -9932,12 +9992,22 @@ export type CreateProjectRequest = {
      * `hosted`.
      */
     hosting?: Hosting;
+    /**
+     * Install command; the same setting as `preset_config.installCommand`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     install_command?: string | null;
     is_on_demand?: boolean | null;
     is_public_repo?: boolean | null;
     is_web_app?: boolean | null;
     main_branch?: string;
     name: string;
+    /**
+     * Build output directory; the same setting as `preset_config.outputDir`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
     preset?: string;
@@ -10007,7 +10077,7 @@ export type CreateProviderKeyRequest = {
     base_url?: string | null;
     capabilities?: SelfHostedCapabilities | null;
     /**
-     * Model id to pin for this provider (e.g. "gpt-4o-mini"). Required for
+     * Model id to pin for this provider (e.g. "gpt-6.2-sol"). Required for
      * "openai_compatible": it must be one of the models the server lists
      * (see `POST /ai/providers/discover`), and is used to verify the key.
      */
@@ -19553,6 +19623,98 @@ export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
 
 /**
+ * What coordination did for this project in the last 30 days.
+ */
+export type IdenticalBuildActivityResponse = {
+    /**
+     * Builds of this project building for their group right now.
+     */
+    building: number;
+    /**
+     * Coordinated builds that built their own image.
+     */
+    built: number;
+    /**
+     * Deployments that deployed an identical build's image instead of building.
+     */
+    reused: number;
+    /**
+     * Builds of this project waiting for an identical build right now.
+     */
+    waiting: number;
+};
+
+/**
+ * What a build does when an identical build is already running.
+ */
+export type IdenticalBuildMode = 'parallel' | 'queue' | 'share';
+
+/**
+ * One mode, explained for the console and the CLI.
+ */
+export type IdenticalBuildModeOption = {
+    /**
+     * What the mode does, in plain words.
+     */
+    description: string;
+    /**
+     * A concrete case.
+     */
+    example: string;
+    id: IdenticalBuildMode;
+    label: string;
+};
+
+/**
+ * Which builds count as "the same group" for queueing.
+ *
+ * The scope only ever widens queueing. Reusing an image always requires the
+ * full fingerprint to match, whatever the scope.
+ */
+export type IdenticalBuildScope = 'fingerprint' | 'source';
+
+/**
+ * One grouping scope, explained for the console and the CLI.
+ */
+export type IdenticalBuildScopeOption = {
+    description: string;
+    id: IdenticalBuildScope;
+    label: string;
+};
+
+export type IdenticalBuildsResponse = {
+    /**
+     * The last 30 days.
+     */
+    activity: IdenticalBuildActivityResponse;
+    /**
+     * Whether the caller may change the setting.
+     */
+    can_edit: boolean;
+    /**
+     * The longest a build waits before it fails with a reason.
+     */
+    max_wait_seconds: number;
+    /**
+     * What this project's builds do when an identical build is running.
+     * `parallel` (the default) builds every deployment. Applies from the
+     * next build.
+     */
+    mode: IdenticalBuildMode;
+    modes: Array<IdenticalBuildModeOption>;
+    /**
+     * How long after it succeeded a shared image is offered to identical
+     * builds that start later.
+     */
+    reuse_window_seconds: number;
+    /**
+     * Which builds wait for each other.
+     */
+    scope: IdenticalBuildScope;
+    scopes: Array<IdenticalBuildScopeOption>;
+};
+
+/**
  * What an identify call did.
  */
 export type IdentifyOutcome = 'updated' | 'unchanged' | 'visitor_not_found' | 'cookieless_project' | 'browser_identify_refused' | 'server_identity_kept';
@@ -21970,7 +22132,7 @@ export type LiveVisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -23285,12 +23447,162 @@ export type ModelCapability = {
 };
 
 /**
+ * One stored catalog model.
+ */
+export type ModelCatalogEntry = {
+    cache_read_per_million?: number | null;
+    cache_write_per_million?: number | null;
+    context_window?: number | null;
+    deprecated: boolean;
+    display_name: string;
+    fetched_at: string;
+    /**
+     * USD per 1M input tokens; `null` when the catalog publishes no price.
+     */
+    input_per_million?: number | null;
+    max_output_tokens?: number | null;
+    model_id: string;
+    output_per_million?: number | null;
+    provider: string;
+    release_date?: string | null;
+    source_url: string;
+    supports_reasoning: boolean;
+    supports_tools: boolean;
+    supports_vision: boolean;
+};
+
+/**
+ * A page of stored catalog models.
+ */
+export type ModelCatalogEntryPage = {
+    items: Array<ModelCatalogEntry>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+/**
+ * What a successful refresh stored.
+ */
+export type ModelCatalogRefreshResult = {
+    /**
+     * Prices applied over the bundled table.
+     */
+    applied_prices: number;
+    /**
+     * Entries rejected as invalid.
+     */
+    skipped: number;
+    status: ModelCatalogStatus;
+    /**
+     * Models stored.
+     */
+    stored: number;
+};
+
+/**
+ * Where the catalog comes from and how it is refreshed.
+ */
+export type ModelCatalogSettings = {
+    /**
+     * Refresh the catalog in the background.
+     */
+    auto_refresh: boolean;
+    /**
+     * The catalog published in the Temps repository.
+     */
+    default_source_url: string;
+    /**
+     * Rediscover every active provider key's models on the same interval.
+     */
+    discover_provider_models: boolean;
+    /**
+     * The URL refreshes fetch.
+     */
+    effective_source_url: string;
+    /**
+     * Hours between background refreshes (1 to 168).
+     */
+    refresh_interval_hours: number;
+    /**
+     * Custom catalog URL; `null` uses `default_source_url`.
+     */
+    source_url?: string | null;
+};
+
+/**
+ * A change to the catalog settings. Absent fields are left as they are.
+ */
+export type ModelCatalogSettingsUpdate = {
+    auto_refresh?: boolean | null;
+    discover_provider_models?: boolean | null;
+    refresh_interval_hours?: number | null;
+    /**
+     * A custom `https://` catalog URL, or an empty string to go back to the
+     * catalog published in the Temps repository.
+     */
+    source_url?: string | null;
+};
+
+/**
  * Provenance of a provider model inventory. Only live and unexpired cached
  * inventories are authoritative enough to reject a saved model. Bootstrap
  * and stale inventories remain useful for selectors, but must not block a
  * turn because account entitlements may legitimately differ.
  */
 export type ModelCatalogSource = 'live' | 'cache' | 'stale_cache' | 'bootstrap';
+
+/**
+ * The catalog's settings and the outcome of its last refresh.
+ */
+export type ModelCatalogStatus = {
+    /**
+     * Catalog prices currently applied over the bundled table.
+     */
+    applied_price_count: number;
+    /**
+     * Models the bundled price table lists.
+     */
+    bundled_model_count: number;
+    /**
+     * Models stored by the last successful refresh.
+     */
+    entry_count: number;
+    /**
+     * When a refresh last started.
+     */
+    last_attempt_at?: string | null;
+    /**
+     * When provider keys' models were last rediscovered in the background.
+     */
+    last_discovery_at?: string | null;
+    /**
+     * Why the last attempt failed; `null` after a success.
+     */
+    last_error?: string | null;
+    /**
+     * When a refresh last succeeded.
+     */
+    last_refreshed_at?: string | null;
+    /**
+     * The URL the stored catalog came from.
+     */
+    last_source_url?: string | null;
+    /**
+     * When the next background refresh is due; `null` when automatic
+     * refresh is off.
+     */
+    next_refresh_at?: string | null;
+    /**
+     * A refresh is running right now.
+     */
+    refreshing: boolean;
+    settings: ModelCatalogSettings;
+    /**
+     * Entries the last successful refresh rejected as invalid.
+     */
+    skipped_count: number;
+};
 
 /**
  * What a provider's model catalogue says about one model, kept so a user can
@@ -23377,7 +23689,7 @@ export type ModelPricing = {
      */
     deprecated?: boolean;
     /**
-     * Human-readable model name (e.g. "Claude Sonnet 4.6")
+     * Human-readable model name (e.g. "Claude Sonnet 5.5")
      */
     display_name: string;
     /**
@@ -23385,7 +23697,7 @@ export type ModelPricing = {
      */
     input_per_million: number;
     /**
-     * Model identifier (e.g. "gpt-5.4", "claude-sonnet-4-6")
+     * Model identifier (e.g. "gpt-6.2-sol", "claude-sonnet-5-5")
      */
     model: string;
     /**
@@ -23396,6 +23708,10 @@ export type ModelPricing = {
      * Provider ID (e.g. "openai", "anthropic")
      */
     provider: string;
+    /**
+     * Whether the price is the bundled one or comes from the runtime catalog.
+     */
+    source: PriceSource;
 };
 
 /**
@@ -27977,6 +28293,11 @@ export type PreviousChoice = {
     mode: 'tunnel';
 };
 
+/**
+ * Where a model's price comes from.
+ */
+export type PriceSource = 'bundled' | 'catalog';
+
 export type PricingResponse = {
     models: Array<ModelPricing>;
 };
@@ -32097,7 +32418,7 @@ export type RestoreRunView = {
      * it. Always present; its fields are `None` where they are unknown.
      */
     source_backup: RestoreRunSourceBackup;
-    source_backup_id: number;
+    source_backup_id?: number | null;
     source_service_id: number;
     started_at?: string | null;
     status: string;
@@ -35354,7 +35675,7 @@ export type SessionReplayWithVisitorDto = {
     visitor_country_code?: string | null;
     visitor_crawler_name?: string | null;
     visitor_custom_data?: unknown;
-    visitor_environment_id: number;
+    visitor_environment_id?: number | null;
     visitor_first_seen: string;
     visitor_id: number;
     visitor_is_crawler: boolean;
@@ -36577,6 +36898,10 @@ export type SourceBackupIndexResponse = {
      * When the index was last updated
      */
     last_updated: string;
+    /**
+     * Errors encountered during the optional bucket scan.
+     */
+    scan_errors: Array<string>;
 };
 
 /**
@@ -37481,10 +37806,22 @@ export type StatusPageResponse = {
      */
     public_feed_url?: string | null;
     /**
+     * Path of the machine-readable form (`/api/status/{slug}/summary.json`);
+     * always present, like `public_path`.
+     */
+    public_json_path: string;
+    /**
      * Machine-readable form of the public page. `None` exactly when
      * `public_url` is.
      */
     public_json_url?: string | null;
+    /**
+     * Path of the public HTML page (`/api/status/{slug}`), on any address
+     * this install's public listener is reachable at. Always present, so a
+     * client can build the link itself when `public_url` is `None` because
+     * no public URL is configured.
+     */
+    public_path: string;
     /**
      * Public HTML page. Serves 404 while the page is unpublished. `None`
      * when this install has no public address to build it from; see
@@ -39949,6 +40286,31 @@ export type UnmergeErrorGroupResponse = {
 };
 
 /**
+ * A model enabled on a provider key that no price covers: its usage is
+ * charged the worst-case rate and reported as "price unknown".
+ */
+export type UnpricedModel = {
+    model_id: string;
+    provider: string;
+    provider_key_id: number;
+    provider_key_name: string;
+};
+
+/**
+ * Enabled models no price covers.
+ */
+export type UnpricedModelReport = {
+    /**
+     * Up to 100 models, ordered by provider key and model id.
+     */
+    models: Array<UnpricedModel>;
+    /**
+     * How many there are in total.
+     */
+    total: number;
+};
+
+/**
  * A feature from the source platform that cannot be migrated
  */
 export type UnsupportedFeature = {
@@ -40842,6 +41204,14 @@ export type UpdateHostImagePreparationBody = {
     keep_prepared: boolean;
 };
 
+export type UpdateIdenticalBuildsRequest = {
+    mode: IdenticalBuildMode;
+    /**
+     * Defaults to `source` (same repository and path).
+     */
+    scope?: IdenticalBuildScope;
+};
+
 export type UpdateInboundFilterRequest = {
     enabled?: boolean | null;
     pattern?: string | null;
@@ -41039,8 +41409,26 @@ export type UpdateMetricAlertRequest = {
     window_secs?: number | null;
 };
 
+/**
+ * Fields to change on a monitor. Every field is optional, a field left out
+ * keeps its stored value, and at least one must be present. The monitor's ID
+ * and uptime history are kept.
+ */
 export type UpdateMonitorRequest = {
-    check_path: string;
+    /**
+     * How often to probe, in seconds. **Clamped, not rejected**, exactly
+     * like on create: values below 30 are stored as 30 and non-positive
+     * values as 60, and the response reports the stored value.
+     */
+    check_interval_seconds?: number | null;
+    /**
+     * Path probed on the monitored environment; must start with `/`.
+     */
+    check_path?: string | null;
+    /**
+     * Display name; 1 to 255 characters after trimming.
+     */
+    name?: string | null;
 };
 
 export type UpdateNotificationEmailProviderRequest = {
@@ -42331,7 +42719,7 @@ export type VisitorDetails = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42446,7 +42834,7 @@ export type VisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42602,7 +42990,7 @@ export type VisitorWithGeolocation = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -47449,6 +47837,78 @@ export type CreateAssistantConversationResponses = {
 
 export type CreateAssistantConversationResponse = CreateAssistantConversationResponses[keyof CreateAssistantConversationResponses];
 
+export type ListCodingAgentsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Ask the npm registry again instead of using the six-hour cache
+         * (at most once a minute).
+         */
+        refresh?: boolean;
+    };
+    url: '/ai/coding-agents';
+};
+
+export type ListCodingAgentsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Database error
+     */
+    500: ProblemDetails;
+};
+
+export type ListCodingAgentsError = ListCodingAgentsErrors[keyof ListCodingAgentsErrors];
+
+export type ListCodingAgentsResponses = {
+    /**
+     * Coding agents and their latest releases
+     */
+    200: CodingAgentsOverview;
+};
+
+export type ListCodingAgentsResponse = ListCodingAgentsResponses[keyof ListCodingAgentsResponses];
+
+export type UpdateCodingAgentSettingsData = {
+    body: CodingAgentSettingsUpdate;
+    path?: never;
+    query?: never;
+    url: '/ai/coding-agents/settings';
+};
+
+export type UpdateCodingAgentSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Database error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateCodingAgentSettingsError = UpdateCodingAgentSettingsErrors[keyof UpdateCodingAgentSettingsErrors];
+
+export type UpdateCodingAgentSettingsResponses = {
+    /**
+     * Settings saved
+     */
+    200: CodingAgentSettings;
+};
+
+export type UpdateCodingAgentSettingsResponse = UpdateCodingAgentSettingsResponses[keyof UpdateCodingAgentSettingsResponses];
+
 export type ListAllConversationsData = {
     body?: never;
     path?: never;
@@ -49727,6 +50187,208 @@ export type UpdateProjectLimitsResponses = {
 
 export type UpdateProjectLimitsResponse = UpdateProjectLimitsResponses[keyof UpdateProjectLimitsResponses];
 
+export type GetModelCatalogData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/model-catalog';
+};
+
+export type GetModelCatalogErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Database error
+     */
+    500: ProblemDetails;
+};
+
+export type GetModelCatalogError = GetModelCatalogErrors[keyof GetModelCatalogErrors];
+
+export type GetModelCatalogResponses = {
+    /**
+     * Catalog status
+     */
+    200: ModelCatalogStatus;
+};
+
+export type GetModelCatalogResponse = GetModelCatalogResponses[keyof GetModelCatalogResponses];
+
+export type ListModelCatalogEntriesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Temps provider id (`openai`, `anthropic`, `gemini`, `xai`, `openrouter`).
+         */
+        provider?: string;
+        /**
+         * Case-insensitive part of the model id or name.
+         */
+        search?: string;
+        /**
+         * Page number, from 1 (default 1).
+         */
+        page?: number;
+        /**
+         * Page size (default 20, max 100).
+         */
+        page_size?: number;
+    };
+    url: '/ai/model-catalog/models';
+};
+
+export type ListModelCatalogEntriesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Database error
+     */
+    500: ProblemDetails;
+};
+
+export type ListModelCatalogEntriesError = ListModelCatalogEntriesErrors[keyof ListModelCatalogEntriesErrors];
+
+export type ListModelCatalogEntriesResponses = {
+    /**
+     * A page of catalog models
+     */
+    200: ModelCatalogEntryPage;
+};
+
+export type ListModelCatalogEntriesResponse = ListModelCatalogEntriesResponses[keyof ListModelCatalogEntriesResponses];
+
+export type RefreshModelCatalogData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/model-catalog/refresh';
+};
+
+export type RefreshModelCatalogErrors = {
+    /**
+     * The configured source URL is not allowed
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * A refresh is already running
+     */
+    409: ProblemDetails;
+    /**
+     * Database error
+     */
+    500: ProblemDetails;
+    /**
+     * The source failed or served an invalid catalog
+     */
+    502: ProblemDetails;
+    /**
+     * The source did not answer in time
+     */
+    504: ProblemDetails;
+};
+
+export type RefreshModelCatalogError = RefreshModelCatalogErrors[keyof RefreshModelCatalogErrors];
+
+export type RefreshModelCatalogResponses = {
+    /**
+     * Catalog refreshed
+     */
+    200: ModelCatalogRefreshResult;
+};
+
+export type RefreshModelCatalogResponse = RefreshModelCatalogResponses[keyof RefreshModelCatalogResponses];
+
+export type UpdateModelCatalogSettingsData = {
+    body: ModelCatalogSettingsUpdate;
+    path?: never;
+    query?: never;
+    url: '/ai/model-catalog/settings';
+};
+
+export type UpdateModelCatalogSettingsErrors = {
+    /**
+     * Invalid source URL or interval
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Database error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateModelCatalogSettingsError = UpdateModelCatalogSettingsErrors[keyof UpdateModelCatalogSettingsErrors];
+
+export type UpdateModelCatalogSettingsResponses = {
+    /**
+     * Settings saved
+     */
+    200: ModelCatalogSettings;
+};
+
+export type UpdateModelCatalogSettingsResponse = UpdateModelCatalogSettingsResponses[keyof UpdateModelCatalogSettingsResponses];
+
+export type ListUnpricedModelsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/model-catalog/unpriced';
+};
+
+export type ListUnpricedModelsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Database error
+     */
+    500: ProblemDetails;
+};
+
+export type ListUnpricedModelsError = ListUnpricedModelsErrors[keyof ListUnpricedModelsErrors];
+
+export type ListUnpricedModelsResponses = {
+    /**
+     * Enabled models without a price
+     */
+    200: UnpricedModelReport;
+};
+
+export type ListUnpricedModelsResponse = ListUnpricedModelsResponses[keyof ListUnpricedModelsResponses];
+
 export type GetUserPendingActionData = {
     body?: never;
     path: {
@@ -49905,7 +50567,7 @@ export type GetPricingError = GetPricingErrors[keyof GetPricingErrors];
 
 export type GetPricingResponses = {
     /**
-     * Model pricing information
+     * Model pricing: the bundled table with the runtime model catalog applied
      */
     200: PricingResponse;
 };
@@ -54429,6 +55091,10 @@ export type CreateS3SourceErrors = {
      */
     403: ProblemDetails;
     /**
+     * Another request changed the default source at the same time; nothing was saved, retry
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -55373,7 +56039,7 @@ export type DeleteBackupData = {
     body?: never;
     path: {
         /**
-         * Backup UUID
+         * Backup UUID (`backup_id`), or its integer `id` as returned by the backup lists
          */
         id: string;
     };
@@ -55403,9 +56069,13 @@ export type DeleteBackupErrors = {
      */
     409: ProblemDetails;
     /**
-     * Object storage or database error
+     * Object storage or database error; the `failure` field says which
      */
     500: ProblemDetails;
+    /**
+     * Transient failure (the backup's service is restarting or being deleted, or the database is unavailable); retry after the `Retry-After` header
+     */
+    503: ProblemDetails;
 };
 
 export type DeleteBackupError = DeleteBackupErrors[keyof DeleteBackupErrors];
@@ -62110,9 +62780,11 @@ export type GetServiceEnvironmentVariablesErrors = {
 
 export type GetServiceEnvironmentVariablesResponses = {
     /**
-     * List of environment variables
+     * Map of variable name to its masked value (`***`)
      */
-    200: Array<EnvironmentVariableInfo>;
+    200: {
+        [key: string]: string;
+    };
 };
 
 export type GetServiceEnvironmentVariablesResponse = GetServiceEnvironmentVariablesResponses[keyof GetServiceEnvironmentVariablesResponses];
@@ -73859,7 +74531,7 @@ export type QueryGenaiTracesData = {
          */
         gen_ai_system?: string;
         /**
-         * Filter by model (gpt-4, claude-sonnet-4-20250514, etc.)
+         * Filter by model (gpt-6.2-sol, claude-sonnet-5-5, etc.)
          */
         gen_ai_model?: string;
         /**
@@ -77656,6 +78328,84 @@ export type SetProjectHostingResponses = {
 };
 
 export type SetProjectHostingResponse = SetProjectHostingResponses[keyof SetProjectHostingResponses];
+
+export type GetIdenticalBuildsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type GetIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type GetIdenticalBuildsResponse = GetIdenticalBuildsResponses[keyof GetIdenticalBuildsResponses];
+
+export type UpdateIdenticalBuildsData = {
+    body: UpdateIdenticalBuildsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type UpdateIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * An unknown mode or scope
+     */
+    422: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type UpdateIdenticalBuildsResponse = UpdateIdenticalBuildsResponses[keyof UpdateIdenticalBuildsResponses];
 
 export type GetLastDeploymentData = {
     body?: never;
@@ -85313,6 +86063,50 @@ export type DeleteEnvironmentVariableResponses = {
 };
 
 export type DeleteEnvironmentVariableResponse = DeleteEnvironmentVariableResponses[keyof DeleteEnvironmentVariableResponses];
+
+export type GetEnvironmentVariableData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/env-vars/{var_id}';
+};
+
+export type GetEnvironmentVariableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEnvironmentVariableResponses = {
+    /**
+     * The environment variable, value masked
+     */
+    200: EnvironmentVariableResponse;
+};
+
+export type GetEnvironmentVariableResponse = GetEnvironmentVariableResponses[keyof GetEnvironmentVariableResponses];
 
 export type UpdateEnvironmentVariableData = {
     body: UpdateEnvironmentVariableRequest;
@@ -106485,7 +107279,13 @@ export type CreateSandboxErrors = {
      * Internal server error
      */
     500: unknown;
+    /**
+     * The project stores no clone URL and its git connection could not look up the project's repository
+     */
+    502: ProblemDetails;
 };
+
+export type CreateSandboxError = CreateSandboxErrors[keyof CreateSandboxErrors];
 
 export type CreateSandboxResponses = {
     /**

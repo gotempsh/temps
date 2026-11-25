@@ -72,7 +72,6 @@ use temps_core::secret_string::SecretString;
 use temps_core::BackupScheduleAuthority;
 use temps_entities::{backup_schedules::Model as BackupSchedule, s3_sources::Model as S3Source};
 use temps_providers::ExternalServiceManager;
-use tokio_stream::StreamExt;
 
 mod access_scope;
 mod deletion;
@@ -107,6 +106,7 @@ use retention::{retention_cutoff, retention_expiry, validate_retention_period};
 pub use retention::{
     RetentionCleanupFailure, RetentionCleanupReport, MAX_RETENTION_DAYS_FOR_SQL_ARITHMETIC,
 };
+pub use s3_sources::{PromotedDefaultSource, S3SourceDeletion};
 use schedules::exclude_source_backing_services;
 pub use types::{
     BackupAlertEntry, BackupTriggerParams, ChildBackupEntry, EnqueuedJob, ScheduleRunContext,

@@ -125,7 +125,7 @@ impl TestDBMockOperations {
         let visitor = visitor::ActiveModel {
             visitor_id: Set(uuid::Uuid::new_v4().to_string()),
             project_id: Set(project_id),
-            environment_id: Set(1), // Default environment
+            environment_id: Set(Some(1)), // Default environment
             user_agent: Set(Some("Test User Agent".to_string())),
             is_crawler: Set(false),
             first_seen: Set(chrono::Utc::now()),

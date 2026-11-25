@@ -15,7 +15,6 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
     TransactionTrait,
 };
-#[cfg(feature = "docker-tests")]
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 #[cfg(feature = "docker-tests")]
@@ -2495,4 +2494,92 @@ fn a_refused_parameter_is_reported_under_the_new_services_id() {
         ),
         "{failed:?}"
     );
+}
+
+/// Read-modify-write: the parameters a client just read, sent back with one
+/// real change, must validate. Unchanged read-only values are dropped; a
+/// changed one is kept so the update still rejects it.
+#[test]
+fn unchanged_read_only_parameters_are_dropped_before_validation() {
+    let strategy = parameter_strategies::get_strategy("postgres").expect("postgres strategy");
+    let stored: HashMap<String, JsonValue> = HashMap::from([
+        ("database".to_string(), JsonValue::from("app")),
+        ("username".to_string(), JsonValue::from("app_user")),
+        ("password".to_string(), JsonValue::from("s3cret-value")),
+        ("host".to_string(), JsonValue::from("localhost")),
+        ("port".to_string(), JsonValue::from("5432")),
+    ]);
+
+    let mut read_back: HashMap<String, JsonValue> = stored.clone();
+    read_back.insert("port".to_string(), JsonValue::from(6543));
+    assert!(
+        strategy.validate_for_update(&read_back).is_err(),
+        "without dropping, the read-only keys fail the whole update"
+    );
+    drop_unchanged_fixed_parameters(&mut read_back, &stored, &strategy.updateable_keys());
+    assert_eq!(
+        read_back,
+        HashMap::from([("port".to_string(), JsonValue::from(6543))])
+    );
+    assert!(strategy.validate_for_update(&read_back).is_ok());
+
+    // A number sent for a read-only value stored as a string is the same
+    // value (`port` is updateable, so it would be kept either way).
+    let numeric_stored = HashMap::from([("database".to_string(), JsonValue::from("123"))]);
+    let mut same_as_number = HashMap::from([("database".to_string(), JsonValue::from(123))]);
+    drop_unchanged_fixed_parameters(
+        &mut same_as_number,
+        &numeric_stored,
+        &strategy.updateable_keys(),
+    );
+    assert!(same_as_number.is_empty(), "{same_as_number:?}");
+    let mut different_number = HashMap::from([("database".to_string(), JsonValue::from(124))]);
+    drop_unchanged_fixed_parameters(
+        &mut different_number,
+        &numeric_stored,
+        &strategy.updateable_keys(),
+    );
+    assert!(different_number.contains_key("database"));
+    assert!(strategy.validate_for_update(&different_number).is_err());
+
+    // A real change to a read-only value is kept and still rejected.
+    let mut changed_password =
+        HashMap::from([("password".to_string(), JsonValue::from("another-value"))]);
+    drop_unchanged_fixed_parameters(&mut changed_password, &stored, &strategy.updateable_keys());
+    assert!(changed_password.contains_key("password"));
+    assert!(strategy.validate_for_update(&changed_password).is_err());
+}
+
+/// A port sent as a number used to be merged as a number, while every
+/// engine's configuration reads the stored port as a string, so the next read
+/// of the service failed to parse it.
+#[test]
+fn a_numeric_port_on_update_is_stored_as_a_string() {
+    let strategy = parameter_strategies::get_strategy("postgres").expect("postgres strategy");
+    let mut stored: HashMap<String, JsonValue> = HashMap::from([
+        ("database".to_string(), JsonValue::from("app")),
+        ("username".to_string(), JsonValue::from("app_user")),
+        ("port".to_string(), JsonValue::from("5432")),
+    ]);
+    let mut updates = HashMap::from([
+        ("port".to_string(), JsonValue::from(6543)),
+        ("console_port".to_string(), JsonValue::from(9001)),
+        ("max_connections".to_string(), JsonValue::from(200)),
+    ]);
+
+    stringify_numeric_ports(&mut updates);
+    assert_eq!(updates["port"], JsonValue::from("6543"));
+    assert_eq!(updates["console_port"], JsonValue::from("9001"));
+    assert_eq!(
+        updates["max_connections"],
+        JsonValue::from(200),
+        "only ports are rewritten"
+    );
+
+    updates.remove("console_port");
+    strategy
+        .validate_for_update(&updates)
+        .expect("valid update");
+    strategy.merge_updates(&mut stored, updates).expect("merge");
+    assert_eq!(stored["port"], JsonValue::from("6543"));
 }

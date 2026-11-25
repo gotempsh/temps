@@ -8,7 +8,7 @@ use super::*;
 
 /// Owns one uniquely named, labelled cleanup helper before creation starts.
 /// The create task retains this guard even if its caller is cancelled.
-struct OrphanWalgHelper {
+pub(super) struct OwnedWalgHelper {
     docker: bollard::Docker,
     name: String,
     backup_id: String,
@@ -16,7 +16,7 @@ struct OrphanWalgHelper {
     armed: bool,
 }
 
-impl Drop for OrphanWalgHelper {
+impl Drop for OwnedWalgHelper {
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -56,20 +56,20 @@ impl Drop for OrphanWalgHelper {
                 };
                 match time::timeout(std::time::Duration::from_secs(10), cleanup).await {
                     Ok(Ok(())) | Ok(Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. })) => {}
-                    Ok(Err(error)) => warn!(helper_name = %name, %error, "Orphan WAL-G helper removal failed; inspect this labelled helper before retrying cleanup"),
-                    Err(error) => warn!(helper_name = %name, %error, "Orphan WAL-G helper removal timed out; inspect this labelled helper before retrying cleanup"),
+                    Ok(Err(error)) => warn!(helper_name = %name, %error, "WAL-G helper removal failed; inspect this labelled helper before retrying cleanup"),
+                    Err(error) => warn!(helper_name = %name, %error, "WAL-G helper removal timed out; inspect this labelled helper before retrying cleanup"),
                 }
             });
         }
     }
 }
 
-async fn create_owned_orphan_helper(
+pub(super) async fn create_owned_walg_helper(
     docker: bollard::Docker,
     name: String,
     backup_id: String,
     config: bollard::models::ContainerCreateBody,
-) -> Result<(String, OrphanWalgHelper), BackupError> {
+) -> Result<(String, OwnedWalgHelper), BackupError> {
     match docker
         .inspect_container(
             &name,
@@ -79,7 +79,7 @@ async fn create_owned_orphan_helper(
     {
         Ok(_) => {
             return Err(BackupError::Validation(format!(
-                "Refusing to reuse existing orphan cleanup helper '{name}'"
+                "Refusing to reuse existing WAL-G helper '{name}'"
             )))
         }
         Err(bollard::errors::Error::DockerResponseServerError {
@@ -87,7 +87,7 @@ async fn create_owned_orphan_helper(
         }) => {}
         Err(error) => {
             return Err(BackupError::ExternalService(format!(
-                "Failed to check new orphan cleanup helper '{name}': {error}"
+                "Failed to check new WAL-G helper '{name}': {error}"
             )))
         }
     }
@@ -96,7 +96,7 @@ async fn create_owned_orphan_helper(
     // When this task finishes after its receiver disappeared, its owned guard
     // is dropped and removes the helper even if it was never started.
     tokio::spawn(async move {
-        let mut owner = OrphanWalgHelper {
+        let mut owner = OwnedWalgHelper {
             docker: docker.clone(),
             name: name.clone(),
             backup_id,
@@ -123,7 +123,7 @@ async fn create_owned_orphan_helper(
                     owner.armed = false;
                 }
                 BackupError::ExternalService(format!(
-                    "Failed to create orphan cleanup helper '{name}': {error}"
+                    "Failed to create WAL-G helper '{name}': {error}"
                 ))
             })?;
         owner.id = Some(created.id.clone());
@@ -131,9 +131,7 @@ async fn create_owned_orphan_helper(
     })
     .await
     .map_err(|error| {
-        BackupError::ExternalService(format!(
-            "Orphan cleanup helper creation task failed: {error}"
-        ))
+        BackupError::ExternalService(format!("WAL-G helper creation task failed: {error}"))
     })?
 }
 
@@ -351,6 +349,21 @@ fn stream_walg_target_name(
     Ok(found)
 }
 
+/// A WAL-G command could not be run in `container` at all (as opposed to
+/// running and failing): the container is missing, stopped or restarting,
+/// typically because its service is being stopped or deleted right now.
+fn service_container_unavailable(
+    service_name: &str,
+    container: &str,
+    error: impl std::fmt::Display,
+) -> BackupError {
+    BackupError::ServiceContainerUnavailable {
+        service_name: service_name.to_string(),
+        container: container.to_string(),
+        reason: error.to_string(),
+    }
+}
+
 impl BackupService {
     pub(super) async fn delete_walg_target_with_optional_service(
         &self,
@@ -407,7 +420,7 @@ impl BackupService {
             ))
         })?;
         let helper = format!("temps-backup-cleanup-{}", Uuid::new_v4());
-        let (created_id, mut helper_owner) = create_owned_orphan_helper(
+        let (created_id, mut helper_owner) = create_owned_walg_helper(
             docker.clone(),
             helper.clone(),
             backup.backup_id.clone(),
@@ -589,7 +602,7 @@ impl BackupService {
                     &cancellation,
                 )
                 .await
-                .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+                .map_err(|error| service_container_unavailable(service_name, container, error))?;
                 if inventory.exit_code != 0 {
                     return Err(BackupError::ExternalService(format!(
                         "Backup {} WAL-G stream inventory failed before deletion: {}",
@@ -610,7 +623,7 @@ impl BackupService {
                     &cancellation,
                 )
                 .await
-                .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+                .map_err(|error| service_container_unavailable(service_name, container, error))?;
                 if recheck.exit_code != 0
                     || stream_walg_target_name(
                         &serde_json::from_str::<serde_json::Value>(&recheck.stdout)?,
@@ -630,7 +643,7 @@ impl BackupService {
                 &cancellation,
             )
             .await
-            .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+            .map_err(|error| service_container_unavailable(service_name, container, error))?;
             last_delete_detail = format!(
                 "attempt {} exited {}: {}",
                 attempt,
@@ -654,7 +667,7 @@ impl BackupService {
                 &cancellation,
             )
             .await
-            .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+            .map_err(|error| service_container_unavailable(service_name, container, error))?;
             if list.exit_code != 0 {
                 return Err(BackupError::PartialDeletion {
                     backup_id: backup.backup_id.clone(),
@@ -718,7 +731,7 @@ impl BackupService {
             &cancellation,
         )
         .await
-        .map_err(|error| BackupError::ExternalService(error.to_string()))?;
+        .map_err(|error| service_container_unavailable(service_name, container, error))?;
         if garbage.exit_code != 0 {
             return Err(BackupError::PartialDeletion {
                 backup_id: backup.backup_id.clone(),
@@ -814,7 +827,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_helper_cancellation_during_create_removes_unstarted_helper() {
         let (docker, started, release, deleted) = fake_helper_docker(false).await;
-        let caller = tokio::spawn(create_owned_orphan_helper(
+        let caller = tokio::spawn(create_owned_walg_helper(
             docker,
             "owned-helper".to_string(),
             "owned-backup".to_string(),
@@ -836,7 +849,7 @@ mod tests {
     async fn orphan_helper_drop_before_start_removes_created_helper() {
         let (docker, _, release, deleted) = fake_helper_docker(false).await;
         release.notify_one();
-        let (_, owner) = create_owned_orphan_helper(
+        let (_, owner) = create_owned_walg_helper(
             docker,
             "owned-helper".to_string(),
             "owned-backup".to_string(),
@@ -854,7 +867,7 @@ mod tests {
     async fn orphan_helper_ambiguous_create_failure_checks_label_before_cleanup() {
         let (docker, _, release, deleted) = fake_helper_docker(true).await;
         release.notify_one();
-        assert!(create_owned_orphan_helper(
+        assert!(create_owned_walg_helper(
             docker,
             "owned-helper".to_string(),
             "owned-backup".to_string(),

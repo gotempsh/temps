@@ -56,6 +56,27 @@ impl ProjectService {
         request: CreateProjectRequest,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
+        self.update_project_with_build_settings(
+            project_id,
+            request,
+            TopLevelBuildSettings::default(),
+            caller,
+        )
+        .await
+    }
+
+    /// [`Self::update_project`] for a request that also carries top-level
+    /// `build_command`/`install_command`/`output_dir`. With `preset_config`
+    /// they are folded into it (a disagreement is a 400); without it they
+    /// are folded into the stored configuration, so the stored settings the
+    /// request does not name are kept.
+    pub async fn update_project_with_build_settings(
+        &self,
+        project_id: i32,
+        request: CreateProjectRequest,
+        build_settings: TopLevelBuildSettings,
+        caller: DeployCaller,
+    ) -> Result<Project, ProjectError> {
         // Find the existing project
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
@@ -84,14 +105,26 @@ impl ProjectService {
         )?;
 
         let normalized_directory = normalize_project_directory(&request.directory)?;
+        let mut request = request;
+        // Omitted means unchanged. Storing the literal "unknown" here used to
+        // detach the project from its repository whenever a client updated
+        // another field without repeating the repository.
+        let repo_owner = request
+            .repo_owner
+            .take()
+            .unwrap_or_else(|| project.repo_owner.clone());
+        let repo_name = request
+            .repo_name
+            .take()
+            .unwrap_or_else(|| project.repo_name.clone());
 
         if project.source_type == temps_entities::source_type::SourceType::Git {
             let target = SourceDirectoryTarget {
                 connection_id: project.git_provider_connection_id,
                 is_public_repo: project.is_public_repo,
                 git_url: project.git_url.as_deref(),
-                repo_owner: request.repo_owner.as_deref().unwrap_or("unknown"),
-                repo_name: request.repo_name.as_deref().unwrap_or("unknown"),
+                repo_owner: &repo_owner,
+                repo_name: &repo_name,
                 branch: &request.main_branch,
                 directory: &normalized_directory,
             };
@@ -101,6 +134,18 @@ impl ProjectService {
             }
         }
 
+        request.preset_config = match request.preset_config.take() {
+            Some(config) => fold_top_level_build_settings(
+                request.preset.as_str(),
+                Some(config),
+                build_settings,
+            )?,
+            None => fold_top_level_build_settings_onto_stored(
+                request.preset.as_str(),
+                project.preset_config.as_ref(),
+                build_settings,
+            )?,
+        };
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
             request.preset_config.as_ref(),
@@ -121,9 +166,8 @@ impl ProjectService {
         // Update the project
         let mut active_project: projects::ActiveModel = project.into();
         active_project.name = Set(name);
-        active_project.repo_name = Set(request.repo_name.unwrap_or_else(|| "unknown".to_string()));
-        active_project.repo_owner =
-            Set(request.repo_owner.unwrap_or_else(|| "unknown".to_string()));
+        active_project.repo_name = Set(repo_name);
+        active_project.repo_owner = Set(repo_owner);
         active_project.directory = Set(normalized_directory);
         active_project.main_branch = Set(request.main_branch);
         apply_resolved_preset(&mut active_project, resolved)?;

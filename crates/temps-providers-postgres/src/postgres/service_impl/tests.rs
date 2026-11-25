@@ -96,7 +96,7 @@ fn test_parameter_schema_editable_fields() {
         ("port", true),
         ("database", false),
         ("username", false),
-        ("password", true),
+        ("password", false),
         ("max_connections", true),
         ("ssl_mode", true),
         ("docker_image", true),

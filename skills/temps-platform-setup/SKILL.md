@@ -39,7 +39,7 @@ Apply these rules to every workflow:
    mode, channel, console URL, app URL pattern, domain, and admin email. Never
    read, print, copy, or use the generated password or API key.
 4. **Use browser device authorization for a person.** The agent starts the
-   latest stable CLI login, gives the user the exact short-lived approval URL and code,
+   Temps CLI login, gives the user the exact short-lived approval URL and code,
    keeps the process running, and waits for approval. Never ask the user to
    paste an API key or place one in a command, URL, file, log, or response.
 5. **Use an explicit context.** All verification and later operations name the
@@ -290,7 +290,7 @@ verification. Report the exact console URL once verified.
 ## Browser device authorization handoff
 
 Follow the adjacent [temps-cli skill](../temps-cli/SKILL.md) to select `bunx` or
-`npx`, check its version, and inspect runtime help. Use `@latest`; do not
+`npx`, check its version, and inspect runtime help. Keep its channel tag; do not
 assume a globally installed CLI.
 
 First verify the console is reachable, then start login yourself in a
@@ -299,11 +299,11 @@ a headless agent machine, suppress the best-effort local browser launch without
 disabling browser authorization:
 
 ```bash
-TEMPS_NO_BROWSER=1 bunx @temps-sdk/cli@latest \
+TEMPS_NO_BROWSER=1 bunx @temps-sdk/cli@beta \
   login "$console_url" --context "$context_name"
 ```
 
-Use the `npx @temps-sdk/cli@latest` equivalent when Bun is unavailable. The CLI prints a
+Use the `npx @temps-sdk/cli@beta` equivalent when Bun is unavailable. The CLI prints a
 `verification_uri_complete` URL, a user code, and continues polling.
 
 When those values appear:
@@ -320,7 +320,7 @@ When those values appear:
 5. On approval, verify the stored context read-only:
 
 ```bash
-bunx @temps-sdk/cli@latest --target-context "$context_name" whoami
+bunx @temps-sdk/cli@beta --target-context "$context_name" whoami
 ```
 
 Report the authenticated identity, server URL, and context name without
@@ -346,7 +346,7 @@ place them in command arguments or reproduce credential-reveal output.
 List users with an explicit context:
 
 ```bash
-bunx @temps-sdk/cli@latest --target-context <CONTEXT> users list
+bunx @temps-sdk/cli@beta --target-context <CONTEXT> users list
 ```
 
 Creating, disabling, deleting, or changing a role affects platform access.
@@ -360,8 +360,8 @@ and revocation state.
 Safe read-only checks include:
 
 ```bash
-bunx @temps-sdk/cli@latest --target-context <CONTEXT> dns list
-bunx @temps-sdk/cli@latest --target-context <CONTEXT> domains orders list
+bunx @temps-sdk/cli@beta --target-context <CONTEXT> dns list
+bunx @temps-sdk/cli@beta --target-context <CONTEXT> domains orders list
 ```
 
 For provider creation, identify the provider and zones, explain minimum
@@ -381,9 +381,9 @@ deleting, or changing storage.
 Read-only inventory examples:
 
 ```bash
-bunx @temps-sdk/cli@latest --target-context <CONTEXT> services list
-bunx @temps-sdk/cli@latest --target-context <CONTEXT> projects list
-bunx @temps-sdk/cli@latest --target-context <CONTEXT> domains list
+bunx @temps-sdk/cli@beta --target-context <CONTEXT> services list
+bunx @temps-sdk/cli@beta --target-context <CONTEXT> projects list
+bunx @temps-sdk/cli@beta --target-context <CONTEXT> domains list
 ```
 
 Connection strings and generated passwords belong in Temps secrets or a secret
@@ -416,7 +416,7 @@ or untrusted log content.
 
 ## Related skills
 
-- [temps-cli](../temps-cli/SKILL.md): latest stable CLI and command reference.
+- [temps-cli](../temps-cli/SKILL.md): CLI invocation and command reference.
 - [deploy-to-temps](../deploy-to-temps/SKILL.md): deploy an application after
   platform setup.
 - [add-custom-domain](../add-custom-domain/SKILL.md): configure a project

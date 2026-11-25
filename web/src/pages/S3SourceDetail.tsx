@@ -13,8 +13,6 @@ import {
   getS3SourceQueryKey,
   listBackupSchedulesOptions,
   listBackupSchedulesQueryKey,
-  listSourceBackupsOptions,
-  listSourceBackupsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   BackupScheduleResponse,
@@ -38,6 +36,7 @@ import {
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { RefreshButton } from '@/components/ui/refresh-button'
+import { readFailureServerDetail } from '@/lib/read-failure'
 import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -50,10 +49,14 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { testS3SourceConnection } from '@/lib/s3-sources'
+import { FoundInS3Badge } from './service-restore/FoundInS3Badge'
 import {
-  listSourceBackupsWithScan,
-  testS3SourceConnection,
-} from '@/lib/s3-sources'
+  mergeDiscovery,
+  visibleOrphans,
+  type SourceDiscovery,
+} from './service-restore/source-discovery'
+import { restoreSourceBackupsQuery } from './service-restore/restore-queries'
 import { runScheduleNow } from '@/lib/schedule-runs'
 import { workerCredentialsPresentation } from '@/lib/s3-source-presentation'
 import { cn, isPitrCapableFormat } from '@/lib/utils'
@@ -113,6 +116,24 @@ import {
   refetchOnFocusWhenStale,
   sourceBackupsRefetchInterval,
 } from '@/lib/live-refetch'
+
+function BackupRow({
+  href,
+  children,
+}: {
+  href?: string
+  children: React.ReactNode
+}) {
+  if (!href) return <div>{children}</div>
+  return (
+    <Link
+      to={href}
+      className="block focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-lg"
+    >
+      {children}
+    </Link>
+  )
+}
 
 /** Format a wall-clock timeout from seconds into a human-readable string.
  * Mirrors the helper in `BackupDetail.tsx`; if this gets copied a third
@@ -190,18 +211,41 @@ export function S3SourceDetail() {
     enabled: !!sourceId,
   })
 
+  const queryClient = useQueryClient()
   const { data: backupIndex, isLoading: isLoadingBackups } = useQuery({
-    ...listSourceBackupsOptions({
-      path: { id: sourceId! },
-    }),
+    ...restoreSourceBackupsQuery(sourceId!, false),
     enabled: !!sourceId,
     refetchOnWindowFocus: refetchOnFocusWhenStale,
-    // A backup started by a schedule, the CLI or another operator must show
-    // up in Recent Backups. The listing returns the whole history, so it is
-    // only polled slowly; running backups are followed per record below.
     refetchInterval: (query) =>
       sourceBackupsRefetchInterval(query.state.data?.backups),
   })
+  // Discovery runs only through this source's button. Navigating while a scan
+  // is in flight leaves its results and diagnostics with the original source.
+  const discoveryQuery = useQuery({
+    queryKey: ['source-backup-discovery', sourceId] as const,
+    enabled: false,
+    retry: false,
+    queryFn: async ({ queryKey }) => {
+      const id = queryKey[1]
+      if (!id) throw new Error('Select an S3 source to scan.')
+      const result = await queryClient.fetchQuery({
+        ...restoreSourceBackupsQuery(id, true),
+        staleTime: 0,
+      })
+      return mergeDiscovery(
+        queryClient.getQueryData<SourceDiscovery>(queryKey),
+        result
+      )
+    },
+  })
+  const discovery = discoveryQuery.data
+  const discoveryErrors = discoveryQuery.error
+    ? [
+        readFailureServerDetail(discoveryQuery.error) ||
+          discoveryQuery.error.message ||
+          'Check the S3 connection and retry discovery.',
+      ]
+    : (discovery?.errors ?? [])
 
   // Follow each running backup on its own record (O(running)) instead of
   // re-reading the whole listing every few seconds, and refetch the listing
@@ -280,44 +324,13 @@ export function S3SourceDetail() {
     },
   })
 
-  const queryClient = useQueryClient()
-
   useEffect(() => {
     if (!settledRunningBackups || !sourceId) return
     void queryClient.invalidateQueries({
-      queryKey: listSourceBackupsOptions({ path: { id: sourceId } }).queryKey,
+      queryKey: restoreSourceBackupsQuery(sourceId, false).queryKey,
+      exact: true,
     })
   }, [settledRunningBackups, sourceId, queryClient])
-
-  // "Discover orphan backups" — explicit opt-in S3 scan. Slow on some
-  // endpoints (5-30 s on OVH); only triggered by user action.
-  const discoverOrphansMutation = useMutation({
-    mutationFn: () => {
-      if (!sourceId) {
-        return Promise.reject(new Error('S3 source id is unknown'))
-      }
-      return listSourceBackupsWithScan(sourceId)
-    },
-    onSuccess: (result) => {
-      const scanned = result.backups.filter(
-        (b) => (b as { source?: string }).source === 's3_scan'
-      ).length
-      toast.success(
-        scanned > 0
-          ? `Found ${scanned} additional backup${scanned === 1 ? '' : 's'} in S3`
-          : 'No additional backups found in S3'
-      )
-      // Refresh the normal listing so newly discovered entries appear.
-      void queryClient.invalidateQueries({
-        queryKey: listSourceBackupsOptions({ path: { id: sourceId! } })
-          .queryKey,
-      })
-    },
-    onError: (err: unknown) => {
-      const message = err instanceof Error ? err.message : 'Unknown error'
-      toast.error('S3 scan failed', { description: message })
-    },
-  })
 
   const disableMutation = useMutation({
     ...disableBackupScheduleMutation(),
@@ -367,11 +380,12 @@ export function S3SourceDetail() {
           backupIndex?.backups ?? [],
           runningBackupQueries.map((result) => result.data)
         ),
+        ...visibleOrphans(backupIndex?.backups ?? [], discovery),
       ].sort(
         (a, b) =>
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
       ),
-    [backupIndex, runningBackupQueries]
+    [backupIndex, runningBackupQueries, discovery]
   )
 
   // Client-side filter + pagination over the recent-backups list. The list
@@ -504,7 +518,7 @@ export function S3SourceDetail() {
           <RefreshButton
             queryKeys={[
               getS3SourceQueryKey({ path: { id: sourceId! } }),
-              listSourceBackupsQueryKey({ path: { id: sourceId! } }),
+              restoreSourceBackupsQuery(sourceId!, false).queryKey,
               queryKeyPrefix(listBackupSchedulesQueryKey),
             ]}
           />
@@ -769,22 +783,41 @@ export function S3SourceDetail() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => discoverOrphansMutation.mutate()}
-                disabled={discoverOrphansMutation.isPending || !sourceId}
-                title="Scan S3 for backups not tracked in the database — useful after a Temps restore from a different instance"
+                onClick={() => void discoveryQuery.refetch()}
+                disabled={discoveryQuery.isFetching || !sourceId}
+                title="Search this bucket for backups this Temps server has no record of, such as ones made by another server"
               >
-                {discoverOrphansMutation.isPending ? (
+                {discoveryQuery.isFetching ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 ) : (
                   <ScanSearch className="mr-2 h-4 w-4" />
                 )}
-                <span className="hidden sm:inline">
-                  Discover orphan backups
-                </span>
-                <span className="sm:hidden">Scan S3</span>
+                <span className="hidden sm:inline">Search S3 for backups</span>
+                <span className="sm:hidden">Search S3</span>
               </Button>
             </CardHeader>
             <CardContent className="p-5">
+              {discoveryErrors.length > 0 ? (
+                <div role="alert" className="mb-4 text-sm text-destructive">
+                  <strong>Discovery incomplete</strong>
+                  <ul>
+                    {discoveryErrors.map((error, index) => (
+                      <li key={index}>{error}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                discovery && (
+                  <p
+                    role="status"
+                    className="mb-4 text-sm text-muted-foreground"
+                  >
+                    {discovery.orphans.length === 0
+                      ? 'No additional backups found in S3.'
+                      : `Found ${discovery.orphans.length} additional backup${discovery.orphans.length === 1 ? '' : 's'} in S3.`}
+                  </p>
+                )
+              )}
               {/* Search bar — instant client filter across name, service,
                 engine, state, UUID, format. */}
               {!isLoadingBackups && sortedBackups.length > 0 && (
@@ -848,10 +881,13 @@ export function S3SourceDetail() {
                     const FallbackIcon = iconForServiceType(backup.engine)
 
                     return (
-                      <Link
-                        key={`${backup.source}-${backup.backup_id || backup.location}`}
-                        to={`/backups/s3-sources/${id}/backups/${backup.backup_id}`}
-                        className="block focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-lg"
+                      <BackupRow
+                        key={`${backup.source}-${backup.backup_id || backup.location}-${backup.created_at}`}
+                        href={
+                          isOrphan
+                            ? undefined
+                            : `/backups/s3-sources/${id}/backups/${backup.backup_id}`
+                        }
                       >
                         <div className="flex flex-col gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between sm:p-4">
                           {/* Left: name + meta */}
@@ -890,11 +926,16 @@ export function S3SourceDetail() {
                                     PITR
                                   </Badge>
                                 ) : null}
-                                {isOrphan ? (
-                                  <Badge variant="outline" className="text-xs">
-                                    orphan
-                                  </Badge>
-                                ) : null}
+                                {isOrphan ? <FoundInS3Badge /> : null}
+                                {isOrphan &&
+                                  (discoveryQuery.isError ||
+                                    discovery?.staleLocations.has(
+                                      backup.location
+                                    )) && (
+                                    <Badge variant="outline">
+                                      From an earlier scan
+                                    </Badge>
+                                  )}
                               </div>
                               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                                 <span className="font-mono">
@@ -958,7 +999,7 @@ export function S3SourceDetail() {
                             )}
                           </div>
                         </div>
-                      </Link>
+                      </BackupRow>
                     )
                   })}
                 </div>

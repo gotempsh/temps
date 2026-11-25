@@ -11,7 +11,6 @@
  *   - POST /backups/s3-sources/{id}/set-default
  *   - POST /backups/s3-sources/{id}/test
  *   - POST /backups/s3-sources/test
- *   - GET  /backups/s3-sources/{id}/backups?include_s3_scan=true (scan variant)
  * once these endpoints are included in the OpenAPI spec / generated client.
  */
 
@@ -67,25 +66,6 @@ export async function testS3SourceConnection(
     credentials: 'include',
   })
   return readJsonOrThrow<S3ConnectionTestResult>(response)
-}
-
-/**
- * Fetch backups for an S3 source while requesting the full S3 bucket scan.
- * This is the slow path — may take 5-30 s on OVH and similar endpoints.
- * Use only when the user explicitly requests it (e.g. "Discover orphan backups").
- *
- * TODO(sdk-regen): replace with the generated SDK helper once
- * `listSourceBackupsOptions` supports `include_s3_scan` query param.
- */
-export async function listSourceBackupsWithScan(id: number): Promise<{
-  backups: Array<Record<string, unknown>>
-  last_updated: string
-}> {
-  const response = await fetch(
-    `/api/backups/s3-sources/${id}/backups?include_s3_scan=true`,
-    { credentials: 'include' }
-  )
-  return readJsonOrThrow(response)
 }
 
 export async function testS3ConnectionPreview(

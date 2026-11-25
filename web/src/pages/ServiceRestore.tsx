@@ -102,6 +102,11 @@ import {
   serviceRestoreRunsQuery,
 } from './service-restore/restore-queries'
 import {
+  mergeDiscovery,
+  visibleOrphans,
+  type SourceDiscovery,
+} from './service-restore/source-discovery'
+import {
   activeRestoreConflict,
   attachReasonFromLocationState,
   classifyQueryError,
@@ -113,6 +118,7 @@ import {
   phaseLabel,
   pickActiveRun,
   restoreGate,
+  restoreRequestFailure,
   runPollInterval,
   sectionLoadErrorCopy,
   sectionState,
@@ -125,10 +131,13 @@ import {
 import {
   hasBackupSelection,
   isSelectedBackup,
+  needsSnapshotKey,
+  backupRadioValue,
   parseRestoreSelection,
   patchRestoreSelection,
   type RestoreSelectionPatch,
 } from './service-restore/restore-selection'
+import { FoundInS3Badge } from './service-restore/FoundInS3Badge'
 import { cancelRefusal } from './service-restore/run-context'
 
 type Mode = 'in_place' | 'new_service' | 'pitr'
@@ -312,7 +321,14 @@ export function ServiceRestore() {
   const [pitrTargetTime, setPitrTargetTime] = useState('')
   const [pitrToNewService, setPitrToNewService] = useState(false)
   const [confirmText, setConfirmText] = useState('')
+  const [startFailure, setStartFailure] = useState<{
+    key: string
+    message: string
+  }>()
+  const [previewAttempt, setPreviewAttempt] = useState(0)
   const [search, setSearch] = useState('')
+  const [scanRequested, setScanRequested] = useState(false)
+  const includeScan = scanRequested || !!selection.backupLocation
   const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
   const effectiveSourceId = selectedSourceId ?? defaultSource?.id
   const effectiveNewServiceName =
@@ -337,9 +353,47 @@ export function ServiceRestore() {
 
   // ----- Backups list ------------------------------------------------------
   const sourceBackupsQuery = useQuery({
-    ...restoreSourceBackupsQuery(effectiveSourceId ?? 0),
+    ...restoreSourceBackupsQuery(effectiveSourceId ?? 0, includeScan),
+    placeholderData:
+      includeScan && effectiveSourceId !== undefined
+        ? () =>
+            queryClient.getQueryData(
+              restoreSourceBackupsQuery(effectiveSourceId, false).queryKey
+            )
+        : undefined,
     enabled: effectiveSourceId !== undefined && !sourcesRefused,
   })
+  const scanResult =
+    includeScan && !sourcesRefused && !sourceBackupsQuery.isPlaceholderData
+      ? sourceBackupsQuery.data
+      : undefined
+  const [scansBySource, setScansBySource] = useState(
+    () =>
+      new Map<
+        number,
+        {
+          result: NonNullable<typeof scanResult>
+          discovery: SourceDiscovery
+        }
+      >()
+  )
+  const lastScan =
+    effectiveSourceId === undefined
+      ? undefined
+      : scansBySource.get(effectiveSourceId)
+  if (
+    effectiveSourceId !== undefined &&
+    scanResult &&
+    lastScan?.result !== scanResult
+  ) {
+    setScansBySource(
+      new Map(scansBySource).set(effectiveSourceId, {
+        result: scanResult,
+        discovery: mergeDiscovery(lastScan?.discovery, scanResult),
+      })
+    )
+  }
+  const discovery = scanResult ? lastScan?.discovery : undefined
   // A role that may not read storage sources can still list and restore this
   // database's own backups, so the page falls back to them instead of
   // stopping at "ask an administrator".
@@ -365,15 +419,19 @@ export function ServiceRestore() {
   // Backups can be listed: from the chosen source, or from the database itself.
   const canListBackups = effectiveSourceId !== undefined || sourcesRefused
 
-  const allBackups = useMemo<SourceBackupEntry[]>(
-    () => backupIndex?.backups ?? [],
-    [backupIndex]
-  )
+  const allBackups = useMemo<SourceBackupEntry[]>(() => {
+    const rows = backupIndex?.backups ?? []
+    if (!discovery?.staleLocations.size) return rows
+    return [...rows, ...visibleOrphans(rows, discovery)]
+  }, [backupIndex, discovery])
 
   // The backup the URL selects, once this source's backups have loaded. A
   // backup of another engine is never selected, even by a crafted link.
   // `find` returns the list's own entry, so its identity is stable.
   const targetEngine = (service?.service_type ?? '').toLowerCase()
+  const hasLegacySnapshots = allBackups.some(
+    (b) => needsSnapshotKey(b) && enginesCompatible(b.engine, targetEngine)
+  )
   const selectedBackup = allBackups.find(
     (b) =>
       isSelectedBackup(b, selection) &&
@@ -382,7 +440,15 @@ export function ServiceRestore() {
   const selectionMissing =
     hasBackupSelection(selection) &&
     backupsSection.kind === 'ready' &&
-    !selectedBackup
+    !(
+      selection.backupLocation &&
+      (sourceBackupsQuery.isFetching ||
+        sourceBackupsQuery.data?.scan_errors?.length)
+    ) &&
+    !selectedBackup &&
+    !allBackups.some(
+      (b) => needsSnapshotKey(b) && b.location === selection.backupLocation
+    )
 
   // Filter rule: the backup row's `engine` must be in the same engine family
   // as the target service. Today the only multi-engine family is the
@@ -467,6 +533,10 @@ export function ServiceRestore() {
   const startMutation = useMutation({
     ...startRestoreMutation(),
     retry: false,
+    onMutate: () => {
+      setStartFailure(undefined)
+      return { key: planRequestKey }
+    },
     meta: { errorTitle: 'Failed to start restore' },
     onSuccess: (run) => {
       const r = run as RestoreRunView
@@ -478,7 +548,7 @@ export function ServiceRestore() {
         description: `Run ${r.id} (phase: ${phaseLabel(r.phase)}).`,
       })
     },
-    onError: (error, variables) => {
+    onError: (error, variables, context) => {
       if (
         handleSensitiveActionError(error, () => startMutation.mutate(variables))
       ) {
@@ -503,10 +573,15 @@ export function ServiceRestore() {
         })
         return
       }
-      const problem = error as { detail?: string; message?: string }
-      toast.error('Failed to start restore', {
-        description: problem.detail || problem.message || 'Unknown error',
-      })
+      const message = restoreRequestFailure(
+        error,
+        'start',
+        !!variables.body?.backup_location
+      )
+      setShowDestructiveConfirm(false)
+      if (context) setStartFailure({ key: context.key, message })
+      toast.error('Could not start restore', { description: message })
+      void activeRunsQuery.refetch()
     },
   })
 
@@ -620,6 +695,7 @@ export function ServiceRestore() {
   }, [
     selectedBackup?.id,
     selectedBackup?.location,
+    previewAttempt,
     effectiveSourceId,
     mode,
     effectiveNewServiceName,
@@ -630,7 +706,7 @@ export function ServiceRestore() {
 
   const plan =
     plannedRestore?.key === planRequestKey ? plannedRestore.plan : undefined
-  const planError = planMutation.error as Error | null
+  const planError = planMutation.error
   const planHasBlockingErrors = !!plan && plan.errors.length > 0
   // The server decides cross-service by service identity (the backup's
   // recorded producer ids). Only a completed plan for these exact inputs
@@ -904,6 +980,34 @@ export function ServiceRestore() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
+          {!sourcesRefused && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="include-s3-scan"
+                checked={includeScan}
+                onCheckedChange={(checked) => {
+                  setScanRequested(checked === true)
+                  if (checked !== true && selection.backupLocation)
+                    updateSelection({ backup: null })
+                }}
+              />
+              <Label htmlFor="include-s3-scan">
+                Also search the S3 bucket for backups made by other servers
+              </Label>
+            </div>
+          )}
+          {includeScan && sourceBackupsQuery.isFetching && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Searching the S3 bucket…
+            </p>
+          )}
+          {includeScan &&
+            sourceBackupsQuery.data?.scan_errors?.map((message) => (
+              <Alert key={message} variant="destructive">
+                <AlertTitle>S3 scan failed</AlertTitle>
+                <AlertDescription>{message}</AlertDescription>
+              </Alert>
+            ))}
           <div className="flex items-center gap-2">
             <div className="relative flex-1 max-w-md">
               <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
@@ -942,6 +1046,16 @@ export function ServiceRestore() {
             />
           ) : null}
 
+          {hasLegacySnapshots && (
+            <Alert>
+              <AlertTitle>Some WAL-G backups need a new scan</AlertTitle>
+              <AlertDescription>
+                These entries identify only a shared repository. Update the
+                destination Temps server and refresh this list to select an
+                individual snapshot.
+              </AlertDescription>
+            </Alert>
+          )}
           {!canListBackups ? (
             <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
               {sourcesView.kind === 'ready'
@@ -989,66 +1103,116 @@ export function ServiceRestore() {
               ) : null}
             </div>
           ) : (
-            <div className="border rounded-md">
-              <Table>
+            <RadioGroup
+              aria-label="Backup to restore"
+              className="@container min-w-0 grid-cols-1 rounded-md border"
+              value={selectedBackup ? backupRadioValue(selectedBackup) : ''}
+              onValueChange={(value) => {
+                const backup = paginatedBackups.find(
+                  (b) => backupRadioValue(b) === value && !needsSnapshotKey(b)
+                )
+                if (backup)
+                  updateSelection({ sourceId: effectiveSourceId, backup })
+              }}
+            >
+              <Table className="table-fixed @xl:table-auto">
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-8"></TableHead>
-                    <TableHead>Created</TableHead>
-                    <TableHead>Origin service</TableHead>
-                    <TableHead>Format</TableHead>
-                    <TableHead>Size</TableHead>
-                    <TableHead>Source</TableHead>
-                    <TableHead>State</TableHead>
+                    <TableHead className="w-8 px-2">
+                      <span className="sr-only">Select</span>
+                    </TableHead>
+                    <TableHead className="px-2">Origin service</TableHead>
+                    <TableHead className="hidden @xl:table-cell">
+                      Created
+                    </TableHead>
+                    <TableHead className="hidden @3xl:table-cell">
+                      Format
+                    </TableHead>
+                    <TableHead className="hidden @3xl:table-cell">
+                      Size
+                    </TableHead>
+                    <TableHead className="hidden @3xl:table-cell">
+                      Source
+                    </TableHead>
+                    <TableHead className="w-24 px-2">State</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {paginatedBackups.map((b) => {
-                    const isSel =
-                      selectedBackup &&
-                      selectedBackup.location === b.location &&
-                      selectedBackup.id === b.id
+                    const isSel = selectedBackup === b
+                    const unavailable = needsSnapshotKey(b)
+                    const value = backupRadioValue(b)
+                    const created = b.created_at ? (
+                      <time dateTime={b.created_at}>
+                        {new Date(b.created_at).toLocaleString()}
+                      </time>
+                    ) : (
+                      '—'
+                    )
+                    const size =
+                      b.size_bytes == null ? '—' : formatBytes(b.size_bytes)
+                    const source =
+                      b.source === 'db' ? (
+                        <Badge variant="outline" className="text-xs">
+                          Tracked
+                        </Badge>
+                      ) : (
+                        <FoundInS3Badge />
+                      )
                     return (
                       <TableRow
-                        key={`${b.source}-${b.id}-${b.location}`}
-                        className={`cursor-pointer ${isSel ? 'bg-accent' : ''}`}
-                        onClick={() =>
-                          // Pin the source too: with only the backup in the
-                          // URL, a saved link would follow a later change of
-                          // the default source and no longer find it.
-                          updateSelection({
-                            sourceId: effectiveSourceId,
-                            backup: b,
-                          })
-                        }
+                        key={unavailable ? `${value}-${b.created_at}` : value}
+                        className={`${unavailable ? '' : 'cursor-pointer'} ${isSel ? 'bg-accent' : ''}`}
+                        onClick={() => {
+                          if (!unavailable)
+                            updateSelection({
+                              sourceId: effectiveSourceId,
+                              backup: b,
+                            })
+                        }}
                       >
-                        <TableCell>
-                          <RadioGroup value={isSel ? 'on' : ''}>
-                            <RadioGroupItem
-                              value="on"
-                              checked={!!isSel}
-                              aria-label={`Restore backup from ${b.created_at ? new Date(b.created_at).toLocaleString() : 'unknown time'}`}
-                            />
-                          </RadioGroup>
+                        <TableCell className="px-2">
+                          <RadioGroupItem
+                            value={value}
+                            disabled={unavailable}
+                            onClick={(event) => event.stopPropagation()}
+                            aria-label={`Restore backup from ${b.created_at ? new Date(b.created_at).toLocaleString() : 'unknown time'}`}
+                          />
                         </TableCell>
-                        <TableCell className="font-mono text-xs whitespace-nowrap">
-                          {b.created_at
-                            ? new Date(b.created_at).toLocaleString()
-                            : '—'}
+                        <TableCell className="px-2 [overflow-wrap:anywhere]">
+                          <span>
+                            {b.origin_service_name ||
+                              b.name ||
+                              b.location ||
+                              '—'}
+                          </span>
+                          {discovery?.staleLocations.has(b.location) && (
+                            <Badge variant="outline">
+                              Previously discovered
+                            </Badge>
+                          )}
+                          <div className="mt-1 font-mono text-xs text-muted-foreground @xl:hidden">
+                            {created}
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground @3xl:hidden">
+                            <FormatBadge format={b.format} />
+                            <span>{size}</span>
+                            {source}
+                          </div>
                         </TableCell>
-                        <TableCell>{b.origin_service_name ?? '—'}</TableCell>
-                        <TableCell>
+                        <TableCell className="hidden font-mono text-xs @xl:table-cell">
+                          {created}
+                        </TableCell>
+                        <TableCell className="hidden @3xl:table-cell">
                           <FormatBadge format={b.format} />
                         </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
-                          {b.size_bytes ? formatBytes(b.size_bytes) : '—'}
+                        <TableCell className="hidden text-xs text-muted-foreground @3xl:table-cell">
+                          {size}
                         </TableCell>
-                        <TableCell>
-                          <Badge variant="outline" className="text-xs">
-                            {b.source === 'db' ? 'Tracked' : 'S3 only'}
-                          </Badge>
+                        <TableCell className="hidden @3xl:table-cell">
+                          {source}
                         </TableCell>
-                        <TableCell>
+                        <TableCell className="px-2 [overflow-wrap:anywhere]">
                           <Badge
                             variant={
                               b.state === 'completed' ? 'default' : 'secondary'
@@ -1063,7 +1227,7 @@ export function ServiceRestore() {
                   })}
                 </TableBody>
               </Table>
-            </div>
+            </RadioGroup>
           )}
 
           {canListBackups &&
@@ -1270,9 +1434,22 @@ export function ServiceRestore() {
                 className="max-w-md"
               />
               <p className="text-xs text-muted-foreground">
-                Suggested: {capabilities?.suggested_new_service_name}. The new
-                service uses the same image and credentials as{' '}
-                <strong>{service.name}</strong>.
+                {isOrphan &&
+                selectedBackup?.engine === 'postgres' &&
+                selectedBackup.format === 'walg' ? (
+                  <>
+                    The new service inherits its connection settings from{' '}
+                    <strong>{service.name}</strong>. For this physical backup,
+                    those settings must match the database name, username and
+                    password from the source server.
+                  </>
+                ) : (
+                  <>
+                    Suggested: {capabilities?.suggested_new_service_name}. The
+                    new service uses the same image and credentials as{' '}
+                    <strong>{service.name}</strong>.
+                  </>
+                )}
               </p>
             </div>
           ) : null}
@@ -1371,9 +1548,18 @@ export function ServiceRestore() {
             ) : planError ? (
               <Alert variant="destructive">
                 <AlertCircle className="h-4 w-4" />
+                <AlertTitle>Could not preview restore</AlertTitle>
                 <AlertDescription>
-                  Failed to compute plan: {planError.message}
+                  {restoreRequestFailure(planError, 'plan', isOrphan)}
                 </AlertDescription>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setPreviewAttempt((n) => n + 1)}
+                >
+                  Retry preview
+                </Button>
               </Alert>
             ) : plan ? (
               <>
@@ -1443,6 +1629,13 @@ export function ServiceRestore() {
         </Card>
       ) : null}
 
+      {startFailure?.key === planRequestKey && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>Could not start restore</AlertTitle>
+          <AlertDescription>{startFailure.message}</AlertDescription>
+        </Alert>
+      )}
       {/* Action bar */}
       {!gate.enabled && gate.reason ? (
         gate.retry === 'active_runs' ? (

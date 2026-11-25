@@ -54,6 +54,7 @@ import {
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { TERMS, groupHref } from '@/lib/terminology'
+import { groupSectionDestinations } from '@/lib/console-scope'
 import { CLUSTER_DNS_URL, WORKER_NODES_URL } from '@/lib/worker-nodes'
 import {
   mergeSettingsNavigationGroups,
@@ -548,6 +549,27 @@ const settingsNavItems: NavigationItem[] = [
     url: '/ai-gateway/usage',
     icon: BarChart3,
     keywords: ['ai', 'usage', 'credits', 'cost', 'tokens', 'spend', 'billing'],
+  },
+  {
+    title: 'AI models and coding agents',
+    url: '/ai-gateway/models',
+    icon: Boxes,
+    keywords: [
+      'ai',
+      'models',
+      'catalog',
+      'pricing',
+      'prices',
+      'new model',
+      'refresh',
+      'coding agents',
+      'claude code',
+      'codex',
+      'opencode',
+      'cli',
+      'update',
+      'version',
+    ],
   },
   {
     title: 'AI limits',
@@ -1704,14 +1726,20 @@ export function CommandPalette() {
       return pages
     })
 
-    const groupPages: CommandDestination[] = groups.map((group) => ({
-      id: `group:${group.id}`,
-      title: group.name,
-      description: `Open project ${group.name} (${group.slug})`,
-      url: groupHref(group.slug),
-      category: TERMS.group.singular,
-      keywords: ['project', 'group', 'services', group.name, group.slug],
-    }))
+    const groupPages: CommandDestination[] = groups.flatMap((group) => [
+      {
+        id: `group:${group.id}`,
+        title: group.name,
+        description: `Open project ${group.name} (${group.slug})`,
+        url: groupHref(group.slug),
+        category: TERMS.group.singular,
+        keywords: ['project', 'group', 'services', group.name, group.slug],
+      },
+      ...groupSectionDestinations(group).map((page) => ({
+        ...page,
+        category: TERMS.group.singular,
+      })),
+    ])
 
     const servicePages: CommandDestination[] = services.map((service) => ({
       id: `service:${service.id}`,

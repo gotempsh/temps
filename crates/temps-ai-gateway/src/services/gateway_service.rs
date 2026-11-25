@@ -942,9 +942,16 @@ impl GatewayService {
     /// blocked destination is reported as `InvalidProviderUrl` with the
     /// trusted-networks hint before anything is sent (#1410).
     ///
-    /// Uses the configured model when supplied, otherwise the vendor's test
-    /// default. Self-hosted providers have no such default: the model must be
-    /// one the administrator picked from the server's own listing.
+    /// Uses the configured model when supplied. Otherwise it tries the
+    /// vendor's low-cost models in order (`low_cost_models`), moving on only
+    /// when the provider refuses the model itself (400, 403, 404), so a key
+    /// restricted to an older cheap model still verifies; an invalid key, a
+    /// rate limit or a network failure stops at once. Self-hosted providers
+    /// have no such default: the model must be one the administrator picked
+    /// from the server's own listing.
+    ///
+    /// Returns the model that answered, so a caller can keep a key that only
+    /// verified on a fallback model from defaulting to one it was refused.
     pub async fn test_provider(
         &self,
         provider_id: &str,
@@ -952,7 +959,7 @@ impl GatewayService {
         base_url: Option<&str>,
         configured_model: Option<&str>,
         key_trust: Option<KeyTrust>,
-    ) -> Result<(), AiGatewayError> {
+    ) -> Result<String, AiGatewayError> {
         let provider = self.providers.get(provider_id).ok_or_else(|| {
             AiGatewayError::ProviderNotConfigured {
                 provider: provider_id.to_string(),
@@ -962,12 +969,10 @@ impl GatewayService {
             validate_provider_url(base_url, key_trust).await?;
         }
 
-        let fallback_model = match provider_id {
-            "openai" => Some("gpt-5-nano"),
-            "anthropic" => Some("claude-haiku-4-5"),
-            "xai" => Some("grok-4.5"),
-            "gemini" => Some("gemini-3.5-flash-lite"),
-            "openrouter" => Some("openai/gpt-4o-mini"),
+        let fallback_models: &[&str] = match provider_id {
+            "openai" | "anthropic" | "xai" | "gemini" | "openrouter" => {
+                crate::providers::low_cost_models(provider_id)
+            }
             OPENAI_COMPATIBLE => {
                 if base_url.is_none() {
                     return Err(AiGatewayError::Validation {
@@ -975,7 +980,7 @@ impl GatewayService {
                             .to_string(),
                     });
                 }
-                None
+                &[]
             }
             _ => {
                 return Err(AiGatewayError::ProviderNotConfigured {
@@ -983,13 +988,11 @@ impl GatewayService {
                 })
             }
         };
-        let model = match (
-            configured_model.map(str::trim).filter(|m| !m.is_empty()),
-            fallback_model,
-        ) {
-            (Some(model), _) => model,
-            (None, Some(fallback)) => fallback,
-            (None, None) => {
+        let configured = configured_model.map(str::trim).filter(|m| !m.is_empty());
+        let candidates: Vec<&str> = match configured {
+            Some(model) => vec![model],
+            None if !fallback_models.is_empty() => fallback_models.to_vec(),
+            None => {
                 return Err(AiGatewayError::Validation {
                     message: "Choose a default model from the models the server \
                               lists before verifying it"
@@ -998,36 +1001,31 @@ impl GatewayService {
             }
         };
 
-        let request = ChatCompletionRequest {
-            model: model.to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::Text("Say ok".to_string())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            stream: false,
-            temperature: None,
-            max_tokens: Some(20),
-            top_p: None,
-            stop: None,
-            n: None,
-            tools: None,
-            tool_choice: None,
-            response_format: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            user: None,
-            extra: None,
-        };
-
-        provider
-            .chat_completion(api_key, base_url, &request)
-            .await?;
-
-        Ok(())
+        let mut first_refusal = None;
+        for (index, model) in candidates.iter().enumerate() {
+            match provider
+                .chat_completion(api_key, base_url, &verification_request(model))
+                .await
+            {
+                Ok(_) => return Ok(model.to_string()),
+                Err(error) if model_refused(&error, model) => {
+                    // Status only: an upstream body can echo the credential.
+                    debug!(
+                        provider = provider_id,
+                        model,
+                        status = upstream_status(&error),
+                        remaining = candidates.len() - index - 1,
+                        "Key verification: the provider refused this model"
+                    );
+                    first_refusal.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Every candidate was refused: report the first, the current default.
+        Err(first_refusal.unwrap_or_else(|| AiGatewayError::Validation {
+            message: format!("No model to verify the {provider_id} key with"),
+        }))
     }
 
     /// List all available models from all configured (active) providers
@@ -1200,8 +1198,93 @@ pub(crate) fn parse_model_catalog_details(
     Ok(models)
 }
 
+/// The one-line chat request that verifies a key against `model`.
+fn verification_request(model: &str) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("Say ok".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        stream: false,
+        temperature: None,
+        max_tokens: Some(20),
+        top_p: None,
+        stop: None,
+        n: None,
+        tools: None,
+        tool_choice: None,
+        response_format: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        user: None,
+        extra: None,
+    }
+}
+
+/// Whether the provider refused `model` rather than the key, so another
+/// model may still verify it: an unknown model (404), or a 400/403 whose
+/// message names the model (OpenAI's "project does not have access to model
+/// ..."). A 403 that does not name it (an IP policy, a disabled account)
+/// would refuse every model, so it is not retried.
+fn model_refused(error: &AiGatewayError, model: &str) -> bool {
+    match error {
+        AiGatewayError::UpstreamError { status: 404, .. } => true,
+        AiGatewayError::UpstreamError {
+            status: 400 | 403,
+            message,
+            ..
+        } => {
+            let message = message.to_ascii_lowercase();
+            message.contains(&model.to_ascii_lowercase()) || message.contains("model_not_found")
+        }
+        _ => false,
+    }
+}
+
+/// The upstream HTTP status of `error`, for logs that must not carry its body.
+fn upstream_status(error: &AiGatewayError) -> Option<u16> {
+    match error {
+        AiGatewayError::UpstreamError { status, .. } => Some(*status),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_refusal_of_the_model_itself_moves_on_to_the_next_one() {
+        let upstream = |status: u16, message: &str| AiGatewayError::UpstreamError {
+            model: "gpt-6-luna".into(),
+            status,
+            message: message.into(),
+        };
+        assert!(model_refused(&upstream(404, "not found"), "gpt-6-luna"));
+        assert!(model_refused(
+            &upstream(403, "Project does not have access to model gpt-6-luna"),
+            "gpt-6-luna"
+        ));
+        assert!(model_refused(
+            &upstream(400, r#"{"error":{"code":"model_not_found"}}"#),
+            "gpt-6-luna"
+        ));
+        // A key-wide denial would refuse every model: stop at once.
+        assert!(!model_refused(
+            &upstream(403, "Access denied for this source address"),
+            "gpt-6-luna"
+        ));
+        assert!(!model_refused(
+            &upstream(401, "Invalid API key"),
+            "gpt-6-luna"
+        ));
+        assert!(!model_refused(&upstream(429, "rate limited"), "gpt-6-luna"));
+        assert_eq!(upstream_status(&upstream(403, "x")), Some(403));
+    }
+
     use super::*;
     use axum::{http::StatusCode, routing::post, Json, Router};
     use futures_util::StreamExt;

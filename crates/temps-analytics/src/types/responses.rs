@@ -117,7 +117,7 @@ pub struct VisitorInfo {
     pub id: i32,
     pub visitor_id: String,
     pub project_id: i32,
-    pub environment_id: i32,
+    pub environment_id: Option<i32>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
@@ -171,7 +171,7 @@ pub struct VisitorDetails {
     pub id: i32,
     pub visitor_id: String,
     pub project_id: i32,
-    pub environment_id: i32,
+    pub environment_id: Option<i32>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
@@ -469,7 +469,7 @@ pub struct VisitorWithGeolocation {
     pub id: i32,
     pub visitor_id: String,
     pub project_id: i32,
-    pub environment_id: i32,
+    pub environment_id: Option<i32>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
@@ -533,7 +533,7 @@ pub struct LiveVisitorInfo {
     pub id: i32,
     pub visitor_id: String,
     pub project_id: i32,
-    pub environment_id: i32,
+    pub environment_id: Option<i32>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]
     pub first_seen: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00")]

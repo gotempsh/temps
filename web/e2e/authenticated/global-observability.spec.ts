@@ -571,7 +571,7 @@ test('global log explorer inspects records, exports, and applies API facets', as
   await page.goto('/logs')
   await expect(
     page.getByRole('complementary', { name: 'Log facets' })
-  ).toContainText('Counts across the whole time range')
+  ).toContainText('Counts cover the whole time range')
   // 30 is the store's count for node 7, not the 1 line on screen.
   await expect(
     page.getByRole('region', { name: 'Node facets', exact: true })
@@ -588,12 +588,16 @@ test('global log explorer inspects records, exports, and applies API facets', as
   await expect(record).toContainText('worker-7')
   await record.getByRole('button', { name: 'Close log record' }).click()
   await expect(row).toBeFocused()
-  await page.getByRole('button', { name: 'Wrap', exact: true }).click()
+  await page
+    .getByRole('button', { name: 'Wrap long lines', exact: true })
+    .click()
   await expect(
-    page.getByRole('button', { name: 'Wrap', exact: true })
+    page.getByRole('button', { name: 'Wrap long lines', exact: true })
   ).toHaveAttribute('aria-pressed', 'true')
   const download = page.waitForEvent('download')
-  await page.getByRole('button', { name: 'Export page', exact: true }).click()
+  await page
+    .getByRole('button', { name: 'Export loaded lines', exact: true })
+    .click()
   expect((await download).suggestedFilename()).toBe('logs-current-page.ndjson')
   const request = page.waitForRequest(
     (request) =>
@@ -657,9 +661,13 @@ test('logs workspace supports grouping, columns and facets without a page-only v
   await expect(page.getByText('Volume by level', { exact: true })).toHaveCount(
     0
   )
+  // No extra column by default; the Columns menu adds them (below).
+  await expect(
+    page.getByRole('columnheader', { name: 'Message', exact: true })
+  ).toBeVisible()
   await expect(
     page.getByRole('columnheader', { name: 'deployment', exact: true })
-  ).toBeVisible()
+  ).toHaveCount(0)
   await page.screenshot({
     path: '/tmp/temps-logs-reference-desktop.png',
     fullPage: true,
@@ -675,10 +683,15 @@ test('logs workspace supports grouping, columns and facets without a page-only v
     page.getByRole('button', { name: 'Storefront / web', exact: true })
   ).toBeVisible()
   await page.getByRole('button', { name: 'List', exact: true }).click()
+  // Let the view switch settle before changing columns.
+  await expect(
+    page.getByRole('button', { name: 'List', exact: true })
+  ).toHaveAttribute('aria-pressed', 'true')
   await page.getByRole('button', { name: 'Columns', exact: true }).click()
   await page
     .getByRole('menuitemcheckbox', { name: 'node', exact: true })
     .click()
+  await expect(page).toHaveURL(/[?&]cols=[^&]*node/)
   await page.keyboard.press('Escape')
   await expect(
     page.getByRole('columnheader', { name: 'node', exact: true })

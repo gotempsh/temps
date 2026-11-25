@@ -272,7 +272,7 @@ impl AnalyticsTestHelper {
         let new_visitor = visitor::ActiveModel {
             visitor_id: Set(visitor_id.to_string()),
             project_id: Set(project_id),
-            environment_id: Set(1), // Add environment_id
+            environment_id: Set(Some(1)), // Add environment_id
             first_seen: Set(first_seen_dt),
             last_seen: Set(last_seen_dt),
             custom_data: Set(None),

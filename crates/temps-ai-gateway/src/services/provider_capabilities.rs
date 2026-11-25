@@ -19,35 +19,96 @@ fn option(id: &str, name: &str, description: &str) -> SelectOption {
 }
 
 fn thinking_modes(provider: &str, model: &str) -> (Vec<SelectOption>, Option<String>) {
-    if provider == "openai" && model.starts_with("gpt-5.6") {
-        return thinking_options(&["none", "low", "medium", "high", "xhigh", "max"], "medium");
+    // Effort values are each provider's published per-model options.
+    if provider == "openai" {
+        match family_version(model, "gpt-") {
+            // GPT-6.2 dropped `none`; GPT-6, 6.1 and 5.6 accept it.
+            Some((6, minor)) if minor >= 2 => {
+                return thinking_options(&["low", "medium", "high", "xhigh", "max"], "medium")
+            }
+            Some((major, _)) if major >= 6 => {
+                return thinking_options(
+                    &["none", "low", "medium", "high", "xhigh", "max"],
+                    "medium",
+                )
+            }
+            Some((5, minor)) if minor >= 6 => {
+                return thinking_options(
+                    &["none", "low", "medium", "high", "xhigh", "max"],
+                    "medium",
+                )
+            }
+            Some((5, _)) => return thinking_options(&["low", "medium", "high", "xhigh"], "medium"),
+            _ if model.starts_with('o') => {
+                return thinking_options(&["low", "medium", "high", "xhigh"], "medium")
+            }
+            _ => {}
+        }
     }
-    if provider == "openai" && (model.starts_with("gpt-5") || model.starts_with('o')) {
-        return thinking_options(&["low", "medium", "high", "xhigh"], "medium");
+    if provider == "xai" {
+        // xAI documents `reasoning_effort` for Grok 4.5 and later 4.x
+        // releases (`xhigh` from 4.6). Grok 4.20 is an earlier release whose
+        // number only compares higher, and its reasoning and non-reasoning
+        // SKUs take no effort.
+        let lower = model.to_ascii_lowercase();
+        if !lower.contains("non-reasoning") {
+            match family_version(model, "grok-") {
+                Some((4, minor)) if (6..10).contains(&minor) => {
+                    return thinking_options(&["low", "medium", "high", "xhigh"], "high")
+                }
+                Some((4, 5)) => return thinking_options(&["low", "medium", "high"], "high"),
+                _ => {}
+            }
+        }
     }
-    if provider == "xai" && model.starts_with("grok-4.5") {
-        return thinking_options(&["low", "medium", "high"], "high");
-    }
-    if provider == "anthropic"
-        && (model.starts_with("claude-sonnet-5")
-            || model.starts_with("claude-opus-5")
-            || model.starts_with("claude-fable-5"))
-    {
+    if provider == "anthropic" && crate::providers::anthropic::uses_adaptive_thinking(model) {
         // Adaptive thinking effort values differ between Claude SKUs and can
         // change independently. Advertise the portable intersection here;
         // live model discovery remains the source of truth for model ids.
-        return thinking_options(&["low", "medium", "high"], "high");
+        // Each default is the model's own (`medium` on Claude Haiku 5.5).
+        let default = if model.starts_with("claude-haiku-5") {
+            "medium"
+        } else {
+            "high"
+        };
+        return thinking_options(&["low", "medium", "high"], default);
     }
-    if provider == "gemini"
-        && model.starts_with("gemini-3")
-        && (model.contains("flash") || model.contains("lite"))
-    {
-        return thinking_options(&["minimal", "low", "medium", "high"], "medium");
-    }
-    if provider == "gemini" && model.starts_with("gemini-3") {
-        return thinking_options(&["low", "medium", "high"], "medium");
+    if provider == "gemini" {
+        match family_version(model, "gemini-") {
+            // `minimal` exists only on the Gemini 3 Flash and Flash-Lite
+            // models up to 3.6; Gemini 3.7 Flash and later start at `low`.
+            Some((3, minor))
+                if minor <= 6 && (model.contains("flash") || model.contains("lite")) =>
+            {
+                return thinking_options(&["minimal", "low", "medium", "high"], "medium")
+            }
+            Some((major, _)) if major >= 3 => {
+                return thinking_options(&["low", "medium", "high"], "medium")
+            }
+            _ => {}
+        }
     }
     (Vec::new(), None)
+}
+
+/// `(major, minor)` of a versioned model id such as `gpt-6.2-sol` or
+/// `gemini-3.8-flash` (`minor` is 0 when absent, as in `gpt-6-luna` or the
+/// dated snapshot `gpt-5-2025-08-07`).
+/// `None` when `model` does not start with `prefix` and a number.
+fn family_version(model: &str, prefix: &str) -> Option<(u16, u16)> {
+    let lower = model.to_ascii_lowercase();
+    let rest = lower.strip_prefix(prefix)?;
+    // The version ends at the first `-`: what follows is a variant (`-sol`)
+    // or a dated snapshot (`gpt-5-2025-08-07`), never a minor version, which
+    // only a `.` introduces.
+    let version = rest.split('-').next()?;
+    let mut components = version.split('.');
+    let major = components.next()?.parse::<u16>().ok()?;
+    let minor = components
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+    Some((major, minor))
 }
 
 /// Select the OpenAI wire API for a discovered model. OpenAI's model-list
@@ -160,11 +221,30 @@ pub fn gateway_provider_capabilities(
 /// Models worth starting a new chat on when nobody has pinned one, best first.
 ///
 /// Without this the fallback was the first id alphabetically, which on a
-/// catalogue of hundreds (OpenRouter) is an arbitrary model nobody chose. Only
-/// providers with such a catalogue need an entry; the rest keep the first id.
+/// catalogue of hundreds (OpenRouter) is an arbitrary model nobody chose, and
+/// on a vendor catalogue is often the dearest or an old one (`claude-fable-*`,
+/// `gemini-2*`). The first listed model the key actually serves wins; a
+/// provider without an entry, or a key serving none of them, keeps the first
+/// id.
 fn preferred_default_model(provider: &str, models: &[ModelCapability]) -> Option<String> {
     let preferred: &[&str] = match provider {
+        "anthropic" => &[
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ],
+        "openai" => &["gpt-6.2-sol", "gpt-6.1-sol", "gpt-5.6-sol", "gpt-5.4"],
+        "gemini" => &[
+            "gemini-4-hydrogen",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+        ],
+        "xai" => &["grok-4.7", "grok-4.6", "grok-4.5"],
         "openrouter" => &[
+            "anthropic/claude-sonnet-5.5",
+            "openai/gpt-6.2-sol",
+            "google/gemini-4-hydrogen",
             "anthropic/claude-sonnet-5",
             "openai/gpt-4o",
             "google/gemini-3.5-flash",
@@ -275,6 +355,139 @@ mod tests {
     fn gemini_flash_advertises_minimal_thinking() {
         let (modes, _) = thinking_modes("gemini", "gemini-3.6-flash");
         assert!(modes.iter().any(|mode| mode.id == "minimal"));
+    }
+
+    #[test]
+    fn current_models_advertise_their_published_effort_levels() {
+        let ids = |provider: &str, model: &str| -> Vec<String> {
+            thinking_modes(provider, model)
+                .0
+                .into_iter()
+                .map(|mode| mode.id)
+                .collect()
+        };
+        assert_eq!(
+            ids("openai", "gpt-6.2-sol"),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(ids("openai", "gpt-6-luna")[0], "none");
+        assert_eq!(ids("openai", "gpt-6.1-terra").len(), 6);
+        assert_eq!(ids("openai", "gpt-5.6-sol")[0], "none");
+        assert_eq!(ids("openai", "gpt-5.4"), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(ids("openai", "o3"), ["low", "medium", "high", "xhigh"]);
+        assert!(ids("openai", "gpt-4o").is_empty());
+        assert_eq!(ids("xai", "grok-4.7"), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(ids("xai", "grok-4.6"), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(ids("xai", "grok-4.5"), ["low", "medium", "high"]);
+        assert!(ids("xai", "grok-4.3").is_empty());
+        // A later 4.x release that discovery finds before Temps knows it
+        // keeps the newest family's effort controls without a code change.
+        assert_eq!(ids("xai", "grok-4.8"), ["low", "medium", "high", "xhigh"]);
+        // Grok 4.20 predates 4.5 though its number compares higher, and
+        // neither of its SKUs takes an effort.
+        for model in [
+            "grok-4.20",
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-0309-non-reasoning",
+            "grok-4.20-multi-agent",
+        ] {
+            assert!(ids("xai", model).is_empty(), "{model}");
+        }
+        for model in ["claude-haiku-5-5", "claude-mythos-5-2", "claude-opus-5-5"] {
+            assert_eq!(
+                ids("anthropic", model),
+                ["low", "medium", "high"],
+                "{model}"
+            );
+        }
+        assert!(ids("anthropic", "claude-haiku-4-5").is_empty());
+        // Each Claude model starts at its own default effort.
+        let default = |model: &str| thinking_modes("anthropic", model).1;
+        assert_eq!(default("claude-haiku-5-5").as_deref(), Some("medium"));
+        assert_eq!(default("claude-opus-5-5").as_deref(), Some("high"));
+        assert_eq!(ids("gemini", "gemini-4-neon"), ["low", "medium", "high"]);
+        // Gemini 3.8 Flash has no `minimal` level, unlike 3.6 Flash.
+        assert_eq!(ids("gemini", "gemini-3.8-flash"), ["low", "medium", "high"]);
+        assert_eq!(ids("gemini", "gemini-3.6-flash")[0], "minimal");
+        assert!(ids("gemini", "gemini-2.5-pro").is_empty());
+    }
+
+    #[test]
+    fn a_dated_snapshot_is_not_read_as_a_minor_version() {
+        assert_eq!(family_version("gpt-5-2025-08-07", "gpt-"), Some((5, 0)));
+        assert_eq!(
+            family_version("gpt-6.2-sol-2026-11-01", "gpt-"),
+            Some((6, 2))
+        );
+        assert_eq!(family_version("gpt-6-luna", "gpt-"), Some((6, 0)));
+        assert_eq!(family_version("grok-4-1-fast", "grok-"), Some((4, 0)));
+        assert_eq!(family_version("gemini-3.8-flash", "gemini-"), Some((3, 8)));
+        assert_eq!(family_version("gpt-image-1", "gpt-"), None);
+        // GPT-5 snapshots keep GPT-5's levels; `none` and `max` are 5.6+.
+        let ids: Vec<String> = thinking_modes("openai", "gpt-5-2025-08-07")
+            .0
+            .into_iter()
+            .map(|mode| mode.id)
+            .collect();
+        assert_eq!(ids, ["low", "medium", "high", "xhigh"]);
+    }
+
+    #[test]
+    fn unpinned_vendor_keys_start_on_a_current_model_not_the_first_id() {
+        let default = |provider: &str, ids: &[&str]| {
+            gateway_provider_capabilities(
+                "gateway_key:7".to_string(),
+                provider.to_string(),
+                provider,
+                None,
+                ids.iter().map(|id| id.to_string()).collect(),
+            )
+            .default_model_id
+        };
+        assert_eq!(
+            default(
+                "anthropic",
+                &["claude-fable-5-2", "claude-haiku-5-5", "claude-opus-5-5"]
+            )
+            .as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            default("openai", &["gpt-5.4", "gpt-6.2-astra", "gpt-6.2-sol"]).as_deref(),
+            Some("gpt-6.2-sol")
+        );
+        assert_eq!(
+            default("gemini", &["gemini-2.5-flash-lite", "gemini-4-hydrogen"]).as_deref(),
+            Some("gemini-4-hydrogen")
+        );
+        assert_eq!(
+            default("xai", &["grok-3", "grok-4.7"]).as_deref(),
+            Some("grok-4.7")
+        );
+        // A key serving none of them keeps the first id.
+        assert_eq!(
+            default("anthropic", &["claude-haiku-4-5"]).as_deref(),
+            Some("claude-haiku-4-5")
+        );
+    }
+
+    #[test]
+    fn unpinned_openrouter_key_prefers_the_current_generation() {
+        let capabilities = gateway_provider_capabilities(
+            "gateway_key:7".to_string(),
+            "OpenRouter".to_string(),
+            "openrouter",
+            None,
+            vec![
+                "anthropic/claude-sonnet-5".to_string(),
+                "anthropic/claude-sonnet-5.5".to_string(),
+                "openai/gpt-4o".to_string(),
+            ],
+        );
+        assert_eq!(
+            capabilities.default_model_id.as_deref(),
+            Some("anthropic/claude-sonnet-5.5")
+        );
     }
 
     #[test]

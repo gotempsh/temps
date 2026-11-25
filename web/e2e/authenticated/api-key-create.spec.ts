@@ -91,9 +91,11 @@ test.describe('API key creation', () => {
       // And it must be listed, not just usable -- proves the create flow
       // persisted, not just returned an optimistic response.
       await page.goto('/settings/keys')
-      await expect(page.getByText(name, { exact: true }).first()).toBeVisible({
-        timeout: 15_000,
-      })
+      // The name opens the key's details; its button also holds a narrow-
+      // screen scope label, so match its accessible name, not its text.
+      await expect(
+        page.getByRole('button', { name, exact: true }).first()
+      ).toBeVisible({ timeout: 15_000 })
 
       const listResponse = await page.request.get('/api/api-keys')
       const { api_keys: keys } = (await listResponse.json()) as {

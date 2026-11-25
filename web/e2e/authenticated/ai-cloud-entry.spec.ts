@@ -108,7 +108,11 @@ test.describe('AI entry and onboarding', () => {
       page.getByRole('heading', { name: ONBOARDING_HEADING })
     ).toBeVisible()
 
-    await page.getByRole('link', { name: 'Back to console' }).click()
+    // Labelled "Console"; "Back to console" is its tooltip.
+    await page
+      .getByRole('link', { name: 'Console', exact: true })
+      .and(page.getByTitle('Back to console'))
+      .click()
     await expect(page).toHaveURL(/\/projects(?:[?#]|$)/)
     await expect(
       page.getByRole('button', { name: 'AI assistant', exact: true })

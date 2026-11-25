@@ -26,6 +26,17 @@ export function groupHref(slug: string): string {
   return `/p/${slug}`
 }
 
+/** A project's shared variables page. */
+export function groupVariablesHref(slug: string): string {
+  return `${groupHref(slug)}/variables`
+}
+
+/** A project's settings, optionally at one of its sections. */
+export function groupSettingsHref(slug: string, section?: string): string {
+  const base = `${groupHref(slug)}/settings`
+  return section ? `${base}?section=${encodeURIComponent(section)}` : base
+}
+
 /** Search parameter of the connect-repository page naming a follow-up step. */
 export const THEN_PARAM = 'then'
 /** `?then=import`: continue into importing services once connected. */

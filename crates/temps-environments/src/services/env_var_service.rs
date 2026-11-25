@@ -373,37 +373,77 @@ impl EnvVarService {
                 continue;
             }
 
-            // Marked secrets are omitted from API responses. Deployment reads
-            // use a separate internal path; HTTP reveal rejects secret rows.
-            let (value, secret_suggestion) = if var.is_secret {
-                (None, None)
-            } else {
-                let plaintext =
-                    self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
-                let suggestion = Self::suggestion_for(
-                    &var.key,
-                    &plaintext,
-                    false,
-                    var.secret_suggestion_dismissed_at.is_some(),
-                );
-                (Some(plaintext), suggestion)
-            };
-
-            result.push(EnvVarWithEnvironments {
-                id: var.id,
-                project_id: var.project_id,
-                key: var.key,
-                value,
-                created_at: var.created_at,
-                updated_at: var.updated_at,
-                environments,
-                include_in_preview: var.include_in_preview,
-                is_secret: var.is_secret,
-                secret_suggestion,
-            });
+            result.push(self.with_environments(var, environments)?);
         }
 
         Ok(result)
+    }
+
+    /// One variable of `project_id`, exactly as
+    /// [`Self::get_environment_variables`] lists it.
+    pub async fn get_environment_variable(
+        &self,
+        project_id: i32,
+        var_id: i32,
+    ) -> Result<EnvVarWithEnvironments, EnvVarError> {
+        let var = env_vars::Entity::find_by_id(var_id)
+            .filter(env_vars::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                EnvVarError::NotFound(format!(
+                    "Environment variable {var_id} not found in project {project_id}"
+                ))
+            })?;
+        let environments = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvVarId.eq(var.id))
+            .find_also_related(environments::Entity)
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .filter_map(|(_, environment)| environment)
+            .map(|env| EnvVarEnvironment {
+                id: env.id,
+                name: env.name,
+                main_url: env.subdomain,
+                current_deployment_id: env.current_deployment_id,
+            })
+            .collect();
+        self.with_environments(var, environments)
+    }
+
+    fn with_environments(
+        &self,
+        var: env_vars::Model,
+        environments: Vec<EnvVarEnvironment>,
+    ) -> Result<EnvVarWithEnvironments, EnvVarError> {
+        // Marked secrets are omitted from API responses. Deployment reads
+        // use a separate internal path; HTTP reveal rejects secret rows.
+        let (value, secret_suggestion) = if var.is_secret {
+            (None, None)
+        } else {
+            let plaintext = self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
+            let suggestion = Self::suggestion_for(
+                &var.key,
+                &plaintext,
+                false,
+                var.secret_suggestion_dismissed_at.is_some(),
+            );
+            (Some(plaintext), suggestion)
+        };
+
+        Ok(EnvVarWithEnvironments {
+            id: var.id,
+            project_id: var.project_id,
+            key: var.key,
+            value,
+            created_at: var.created_at,
+            updated_at: var.updated_at,
+            environments,
+            include_in_preview: var.include_in_preview,
+            is_secret: var.is_secret,
+            secret_suggestion,
+        })
     }
 
     /// Serialize writes to one key of a project and refuse a scope another
@@ -1421,6 +1461,65 @@ mod tests {
         assert_eq!(result[0].key, "DB_PASSWORD");
         assert_eq!(result[0].value.as_deref(), Some(plaintext));
         assert!(!result[0].is_secret);
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variable_reads_one_variable_of_the_project() {
+        let svc = make_encryption_service();
+        let encrypted = svc.encrypt_string("postgres://db").unwrap();
+
+        let mock = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_env_var_model(
+                5,
+                10,
+                "DATABASE_URL",
+                &encrypted,
+                true,
+            )]])
+            .append_query_results(vec![Vec::<(
+                env_var_environments::Model,
+                Option<environments::Model>,
+            )>::new()])
+            .into_connection();
+        let db = Arc::new(mock);
+
+        let service = EnvVarService::new(db.clone(), svc);
+        let var = service.get_environment_variable(10, 5).await.unwrap();
+
+        assert_eq!(var.id, 5);
+        assert_eq!(var.key, "DATABASE_URL");
+        assert_eq!(var.value.as_deref(), Some("postgres://db"));
+
+        // The row is looked up within the project, so a variable ID from
+        // another project is never returned.
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
+        let log = db.into_transaction_log();
+        let lookup = format!("{:?}", log[0]);
+        assert!(
+            lookup.contains(r#"\"env_vars\".\"project_id\" = $2"#),
+            "{lookup}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variable_not_found_names_project_and_variable() {
+        let svc = make_encryption_service();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<env_vars::Model>::new()])
+                .into_connection(),
+        );
+
+        let service = EnvVarService::new(db, svc);
+        let error = service.get_environment_variable(10, 99).await.unwrap_err();
+
+        match error {
+            EnvVarError::NotFound(message) => {
+                assert_eq!(message, "Environment variable 99 not found in project 10")
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[tokio::test]

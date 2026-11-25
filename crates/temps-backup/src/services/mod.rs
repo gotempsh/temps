@@ -20,11 +20,11 @@ pub use backup::{
 pub use backup::{
     BackupAccessScope, BackupAlertEntry, BackupCollectionAccessScope, BackupError,
     BackupScheduleAccessScope, BackupService, BackupTriggerParams, BackupWithAccessScope,
-    ChildBackupEntry, EnqueuedJob, InternalArchiveReconcile, RecoverySetPublication,
-    RetentionCleanupFailure, RetentionCleanupReport, ScheduleRunEntry, ScheduleRunJobEntry,
-    ScheduleRunListResponse, ScheduleRunOutcome, ScheduleRunResponse, ScheduleRunSummary,
-    ScheduleRunSummaryList, ServiceBackupEntry, ServiceProjectScope, TriggerSource,
-    NO_ARCHIVE_DESTINATION_COMMAND,
+    ChildBackupEntry, EnqueuedJob, InternalArchiveReconcile, PromotedDefaultSource,
+    RecoverySetPublication, RetentionCleanupFailure, RetentionCleanupReport, S3SourceDeletion,
+    ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse, ScheduleRunOutcome,
+    ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList, ServiceBackupEntry,
+    ServiceProjectScope, TriggerSource, NO_ARCHIVE_DESTINATION_COMMAND,
 };
 pub use capability::{BackupCapabilityError, ExternalServiceBackupCapability};
 pub use notifier::BackupNotificationAdapter;

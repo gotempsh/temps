@@ -383,6 +383,8 @@ pub(super) fn environment_preview_project(id: i32) -> projects::Model {
         analytics_identity_mode: Default::default(),
         instantiation_token: None,
         allowed_capabilities: Vec::new(),
+        identical_build_mode: Default::default(),
+        identical_build_scope: Default::default(),
     }
 }
 

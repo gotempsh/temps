@@ -116,7 +116,7 @@ pub struct AgentConfigResponse {
     pub trigger_config: serde_json::Value,
     pub prompt: Option<String>,
     pub ai_provider: String,
-    /// Preferred model for the CLI (e.g. "sonnet", "gpt-5-codex"). `None` means default.
+    /// Preferred model for the CLI (e.g. "sonnet", "gpt-6.2-sol"). `None` means default.
     pub ai_model: Option<String>,
     /// `true` if an API key is set; `false` otherwise.
     pub api_key_set: bool,

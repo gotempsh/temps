@@ -368,6 +368,17 @@ impl AiService for AiProviderRegistry {
         service.capabilities_snapshot_for(provider, refresh).await
     }
 
+    async fn recent_workspace_principals(
+        &self,
+        provider: &str,
+        within: std::time::Duration,
+    ) -> Vec<i32> {
+        match self.agent_cli_services.get(provider) {
+            Some(service) => service.recent_workspace_principals(provider, within).await,
+            None => Vec::new(),
+        }
+    }
+
     async fn invalidate_capabilities_for(&self, provider: Option<&str>) {
         if let Some(service) = self.routed(provider).await {
             service.invalidate_capabilities_for(provider).await;

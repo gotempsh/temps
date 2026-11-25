@@ -74,6 +74,14 @@ pub fn redact_api_result(operation_id: &str, value: &serde_json::Value) -> serde
                 }
             }
         }
+        "get_environment_variable" => {
+            if let (Some(name), Some(object)) = (
+                value.get("key").and_then(serde_json::Value::as_str),
+                redacted.as_object_mut(),
+            ) {
+                object.insert("key".into(), serde_json::Value::String(redact_text(name)));
+            }
+        }
         "query_metrics" => {
             if let (Some(original), Some(masked)) = (
                 value.get("data").and_then(serde_json::Value::as_array),
@@ -362,6 +370,12 @@ mod tests {
             assert_eq!(result[0]["value"], "***");
             assert_eq!(result[0]["value_preview"], "***");
         }
+        let single = redact_api_result(
+            "get_environment_variable",
+            &serde_json::json!({"key":"DATABASE_URL","value":"private"}),
+        );
+        assert_eq!(single["key"], "DATABASE_URL");
+        assert_eq!(single["value"], "***");
         for url in [
             "postgres://fixture:private@example.test/db",
             "https://fixture:p%40ss@example.test/path",

@@ -107,6 +107,8 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_cron_by_id",
     "get_cron_executions",
     "get_environment_variables",
+    // One variable as the list returns it: the value masked, never plaintext.
+    "get_environment_variable",
     "get_resolved_environment_variables",
     // ── Error tracking ──
     "get_error_dashboard_stats",
@@ -205,6 +207,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_compose_security",
     // Which capabilities a project's containers get back; names only.
     "get_container_security",
+    // How identical builds coordinate, and counts of what that did; no
+    // fingerprints, values or other projects.
+    "get_identical_builds",
     "get_project_service_template",
     // The public IPs and whether domains can be created: what a user needs
     // to point a DNS record at this platform.
@@ -453,6 +458,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_conversation_detail",
     "get_pricing",
     "list_provider_keys",
+    // Model catalog: source, refresh status, effective prices and models
+    // with no known price. The source URL is refused at save time if it has
+    // userinfo, a query string or a fragment, so it cannot carry a token.
+    "get_model_catalog",
+    "list_model_catalog_entries",
+    "list_unpriced_models",
+    // Coding-agent CLIs: installed vs latest published version per workspace.
+    "list_coding_agents",
     // ── Status page: monitors/incidents/uptime ──
     "list_monitors",
     "get_monitor",
@@ -1049,6 +1062,8 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // runs it, never a permission mode, and the handler still requires an
     // instance administrator. Narrowing back is an ordinary confirmed write.
     "update_container_security",
+    // ── Identical builds (reversible: `parallel` is today's behaviour) ──
+    "update_identical_builds",
     // ── Container runtime control (reversible) ──
     "restart_container",
     "stop_container",

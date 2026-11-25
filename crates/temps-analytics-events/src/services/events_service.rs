@@ -1881,12 +1881,7 @@ WHERE project_id = $1
                         .upsert_visitor_on_miss(
                             visitor_id,
                             project_id,
-                            // `visitor.environment_id` is NOT NULL; the proxy's
-                            // own upsert defaults to 0 for "no environment"
-                            // (see `TrackingEvent.environment_id: i32` in
-                            // temps-proxy), so mirror that here rather than
-                            // trying to insert NULL.
-                            environment_id.unwrap_or(0),
+                            environment_id,
                             user_agent.clone(),
                             ip_geolocation_id,
                             // A visitor whose first event is excluded (a bot,
@@ -2260,7 +2255,7 @@ WHERE project_id = $1
         &self,
         visitor_id: &str,
         project_id: i32,
-        environment_id: i32,
+        environment_id: Option<i32>,
         user_agent: Option<String>,
         ip_address_id: Option<i32>,
         is_crawler: bool,
@@ -2768,7 +2763,7 @@ mod tests {
             id,
             visitor_id: "visitor-uuid".to_string(),
             project_id: 7,
-            environment_id: 1,
+            environment_id: Some(1),
             first_seen: now,
             last_seen: now,
             user_agent: None,
@@ -3576,7 +3571,7 @@ mod tests {
         let visitor1 = visitor::ActiveModel {
             visitor_id: Set("visitor1".to_string()),
             project_id: Set(1),
-            environment_id: Set(1),
+            environment_id: Set(Some(1)),
             first_seen: Set(base_time),
             last_seen: Set(base_time),
             ..Default::default()
@@ -3588,7 +3583,7 @@ mod tests {
         let visitor2 = visitor::ActiveModel {
             visitor_id: Set("visitor2".to_string()),
             project_id: Set(1),
-            environment_id: Set(1),
+            environment_id: Set(Some(1)),
             first_seen: Set(base_time),
             last_seen: Set(base_time),
             ..Default::default()
@@ -3802,7 +3797,7 @@ mod tests {
         let visitor1 = visitor::ActiveModel {
             visitor_id: Set("visitor1".to_string()),
             project_id: Set(1),
-            environment_id: Set(1),
+            environment_id: Set(Some(1)),
             first_seen: Set(now),
             last_seen: Set(now),
             ..Default::default()
@@ -3814,7 +3809,7 @@ mod tests {
         let bot_visitor = visitor::ActiveModel {
             visitor_id: Set("bot-visitor".to_string()),
             project_id: Set(1),
-            environment_id: Set(1),
+            environment_id: Set(Some(1)),
             first_seen: Set(now),
             last_seen: Set(now),
             ..Default::default()
@@ -4212,7 +4207,7 @@ mod tests {
             let row = visitor::ActiveModel {
                 visitor_id: Set(visitor_id.to_string()),
                 project_id: Set(project.id),
-                environment_id: Set(environment.id),
+                environment_id: Set(Some(environment.id)),
                 first_seen: Set(now),
                 last_seen: Set(now),
                 is_crawler: Set(is_crawler),
@@ -4229,7 +4224,7 @@ mod tests {
                     .upsert_visitor_on_miss(
                         visitor_id,
                         project.id,
-                        environment.id,
+                        Some(environment.id),
                         None,
                         None,
                         *loser_is_crawler,
@@ -5092,7 +5087,7 @@ mod tests {
         let placeholder = temps_entities::visitor::ActiveModel {
             visitor_id: Set("proxy-placeholder-visitor".to_string()),
             project_id: Set(p),
-            environment_id: Set(e),
+            environment_id: Set(Some(e)),
             first_seen: Set(chrono::Utc::now()),
             last_seen: Set(chrono::Utc::now()),
             user_agent: Set(Some(human_ua.to_string())),
@@ -5559,6 +5554,49 @@ mod tests {
             .expect("Failed to record second event");
 
         assert_eq!(second_event.visitor_id, event.visitor_id);
+        assert_eq!(visitor_row.environment_id, Some(environment.id));
+
+        // An event with no resolved environment stores NULL, not the old `0`
+        // sentinel every reader had to treat as absent (#2029).
+        let envless_visitor_uuid = uuid::Uuid::new_v4().to_string();
+        service
+            .record_event(
+                project.id,
+                None,
+                None,
+                Some("envless-session".to_string()),
+                Some(envless_visitor_uuid.clone()),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "",
+                None, // site_hostname
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(human_ua.to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record an event with no environment");
+        let envless_row = visitor::Entity::find()
+            .filter(visitor::Column::VisitorId.eq(envless_visitor_uuid))
+            .one(db.as_ref())
+            .await
+            .expect("query visitor")
+            .expect("record_event must create the visitor row on lookup miss");
+        assert_eq!(envless_row.environment_id, None);
 
         println!("✅ record_event visitor-race regression test passed!");
     }
@@ -5646,7 +5684,7 @@ mod tests {
         visitor::ActiveModel {
             visitor_id: Set(visitor_uuid.clone()),
             project_id: Set(project.id),
-            environment_id: Set(environment.id),
+            environment_id: Set(Some(environment.id)),
             first_seen: Set(chrono::Utc::now()),
             last_seen: Set(chrono::Utc::now()),
             has_activity: Set(false),
@@ -6487,7 +6525,7 @@ mod tests {
             visitor::ActiveModel {
                 visitor_id: Set(visitor_id.to_string()),
                 project_id: Set(project_id),
-                environment_id: Set(environment_id),
+                environment_id: Set(Some(environment_id)),
                 first_seen: Set(seen_at),
                 last_seen: Set(seen_at),
                 ..Default::default()
@@ -6818,7 +6856,7 @@ mod tests {
         visitor::ActiveModel {
             visitor_id: Set(visitor_uuid.clone()),
             project_id: Set(project.id),
-            environment_id: Set(environment.id),
+            environment_id: Set(Some(environment.id)),
             first_seen: Set(chrono::Utc::now()),
             last_seen: Set(chrono::Utc::now()),
             has_activity: Set(false),

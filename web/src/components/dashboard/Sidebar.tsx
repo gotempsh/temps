@@ -25,7 +25,7 @@ import {
   BarChart3,
   ChevronsUpDown,
   Check,
-  Folder,
+  Boxes,
   Gauge,
   LogOut,
   Monitor,
@@ -38,10 +38,14 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 
+import { adminGetNodeOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { ProjectResponse } from '@/api/client/types.gen'
+import { resolveConsoleScope } from '@/lib/console-scope'
 import {
-  adminGetNodeOptions,
-  getProjectBySlugOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+  ProjectGroupScopeNav,
+  ProjectScopeHeader,
+  ServiceScopeNav,
+} from './ProjectScopeNav'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
@@ -67,8 +71,8 @@ import {
 } from './primary-navigation'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronRight, type LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { type LucideIcon } from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
@@ -107,6 +111,12 @@ const aiNavItems: PlatformNavItem[] = [
     title: 'Usage',
     url: '/ai-gateway/usage',
     icon: BarChart3,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Models',
+    url: '/ai-gateway/models',
+    icon: Boxes,
     featureKey: 'ai-gateway',
   },
   {
@@ -248,10 +258,13 @@ export default function AppSidebar() {
   )
 
   // Route-driven sidebar swap.
-  //   /settings/*       → settings nav (back → default)
-  //   /projects/:slug/* → project nav  (back → default)
-  //   /settings/nodes/:id/* → node nav (back → the node list)
-  //   anything else     → default workspace nav
+  //   /settings/*            → settings nav (back → default)
+  //   /p/:slug/*             → the project's own nav
+  //   /projects/:slug/*      → the service's project nav, with the service
+  //                            open inside it (a standalone service keeps
+  //                            its own menu)
+  //   /settings/nodes/:id/*  → node nav (back → the node list)
+  //   anything else          → default (server-wide) nav
   // /projects (the list) and /projects/new keep the default nav.
   // Worker Nodes keeps its historical /settings/nodes URL but is a main-nav
   // page ("Applications"). Swapping to the settings sidebar there would
@@ -260,27 +273,23 @@ export default function AppSidebar() {
   const settingsMode = isSettingsSidebarRoute(location.pathname)
   const nodeRoute = nodeRouteOf(location.pathname)
   const aiMode = AI_MODE_PREFIXES.some((p) => location.pathname.startsWith(p))
-  const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
-  const projectSlug =
-    projectMatch &&
-    !['new', 'import-wizard', 'import'].includes(projectMatch[1])
-      ? projectMatch[1]
-      : null
+  const scope = resolveConsoleScope(location.pathname)
 
-  // Override: user pressed Back from a route-driven swap; show DefaultNav
+  // Override: user pressed Back from the settings or AI swap; show DefaultNav
   // only for that exact navigation. Keyed on `location.key` rather than
   // pathname — a Link back to the very same URL (e.g. clicking "AI" again
   // right after backing out of it) still produces a new history entry with
   // a new key, so the override correctly drops and the swap re-triggers.
-  // Comparing by pathname alone left the sidebar stuck on DefaultNav until
-  // the user navigated somewhere else first.
+  // A project's sidebar has no such override: its way out is a real link to
+  // every project, so the URL and the sidebar always agree.
   const [forceDefaultKey, setForceDefaultKey] = useState<string | null>(null)
   const forceDefault = forceDefaultKey === location.key
 
   const compact = isMinimal && !isMobile
 
   const showDefault =
-    forceDefault || (!settingsMode && !aiMode && !projectSlug && !nodeRoute)
+    (forceDefault && (settingsMode || aiMode)) ||
+    (!settingsMode && !aiMode && scope.kind === 'global' && !nodeRoute)
 
   return (
     <Sidebar>
@@ -327,19 +336,25 @@ export default function AppSidebar() {
         <NavCommandTrigger />
         <GettingStartedNavItem />
         {showDefault ? (
-          <DefaultNav
-            pluginItems={pluginItems}
-            pinnedProjectSlug={forceDefault && projectSlug ? projectSlug : null}
-            onReturnToProject={() => setForceDefaultKey(null)}
-          />
+          <DefaultNav pluginItems={pluginItems} />
         ) : settingsMode ? (
           <SettingsNav onBack={() => setForceDefaultKey(location.key)} />
         ) : aiMode ? (
           <AiNav onBack={() => setForceDefaultKey(location.key)} />
-        ) : projectSlug ? (
-          <ProjectNav
-            slug={projectSlug}
-            onBack={() => setForceDefaultKey(location.key)}
+        ) : scope.kind === 'project' ? (
+          <ProjectGroupScopeNav slug={scope.groupSlug} route={scope.route} />
+        ) : scope.kind === 'service' ? (
+          <ServiceScopeNav
+            slug={scope.serviceSlug}
+            route={scope.route}
+            standalone={(service, notice) => (
+              <ProjectNav
+                slug={scope.serviceSlug}
+                route={scope.route}
+                project={service}
+                notice={notice}
+              />
+            )}
           />
         ) : nodeRoute ? (
           <NodeNav nodeId={nodeRoute.nodeId} segment={nodeRoute.segment} />
@@ -721,12 +736,6 @@ function NavUser() {
 
 interface NavProps {
   pluginItems: { title: string; url: string; icon: LucideIcon }[]
-  // Slug of the project the user is currently viewing (URL still
-  // points inside `/projects/:slug/...`) but has temporarily swapped
-  // the sidebar to default via Back. When set, render a pinned row at
-  // the top so they can return to the project sidebar in one click.
-  pinnedProjectSlug?: string | null
-  onReturnToProject?: () => void
 }
 
 function ExtensionNav({ items }: { items?: ConsoleNavItem[] }) {
@@ -789,11 +798,7 @@ function ExtensionNav({ items }: { items?: ConsoleNavItem[] }) {
   )
 }
 
-function DefaultNav({
-  pluginItems,
-  pinnedProjectSlug,
-  onReturnToProject,
-}: NavProps) {
+function DefaultNav({ pluginItems }: NavProps) {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
 
@@ -808,12 +813,6 @@ function DefaultNav({
 
   return (
     <>
-      {pinnedProjectSlug && onReturnToProject && (
-        <CurrentProjectPin
-          slug={pinnedProjectSlug}
-          onReturn={onReturnToProject}
-        />
-      )}
       {primaryPlatformGroups.map((group) => (
         <NavSection
           key={group.label}
@@ -905,18 +904,27 @@ function AiNav({ onBack }: { onBack: () => void }) {
 // Project nav — replaces the whole sidebar when on /projects/:slug/*.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// The project menu: its pages grouped by job. Each section's own pages are
-// tabs on the page, so this stays one level deep. A monitoring-only project
-// gets the sections it has, plus a way to add hosting.
-function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
-  const { data: project } = useQuery(
-    getProjectBySlugOptions({ path: { slug } })
-  )
+// A standalone service's menu: its pages grouped by job. Each section's own
+// pages are tabs on the page, so this stays one level deep. A
+// monitoring-only service gets the sections it has, plus a way to add
+// hosting. A service inside a project gets its project's sidebar instead
+// (`ServiceScopeNav`).
+function ProjectNav({
+  slug,
+  route,
+  project,
+  notice,
+}: {
+  slug: string
+  route: string
+  project: ProjectResponse | undefined
+  /** Shown under the header, such as a failed project lookup. */
+  notice?: ReactNode
+}) {
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
   const root = projectRoot(slug)
-  const route = location.pathname.slice(root.length).replace(/^\/+/, '')
   // "Add hosting" is a page of its own, not part of any section.
   const onHosting = route === 'hosting' || route.startsWith('hosting/')
   const active = onHosting ? null : resolveProjectLocation(route).section.id
@@ -927,11 +935,8 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
   const query = env ? `?${ENVIRONMENT_PARAM}=${encodeURIComponent(env)}` : ''
   return (
     <>
-      <SwapHeader
-        title={project?.name ?? 'Loading…'}
-        onBack={onBack}
-        backLabel="Back to menu"
-      />
+      <ProjectScopeHeader title={project?.name ?? 'Loading…'} />
+      {notice}
       {groups.map((group, index) => (
         <SidebarGroup
           key={group.label ?? index}
@@ -1054,56 +1059,6 @@ function NodeNav({
         </SidebarMenu>
       </SidebarGroup>
     </>
-  )
-}
-
-// Inverse of SwapHeader: shown at the top of DefaultNav when the user
-// pressed Back from a project sidebar but the URL is still inside that
-// project. One click restores the project sidebar without navigating.
-function CurrentProjectPin({
-  slug,
-  onReturn,
-}: {
-  slug: string
-  onReturn: () => void
-}) {
-  const { isMinimal, isMobile } = useSidebar()
-  const compact = isMinimal && !isMobile
-  const { data: project } = useQuery({
-    ...getProjectBySlugOptions({ path: { slug } }),
-  })
-  const label = project?.name ?? slug
-  if (compact) {
-    return (
-      <SidebarGroup className="pb-0">
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              tooltip={`Open ${label}`}
-              onClick={onReturn}
-              className="justify-center"
-            >
-              <Folder />
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarGroup>
-    )
-  }
-  return (
-    <SidebarGroup className="pb-0">
-      <button
-        type="button"
-        onClick={onReturn}
-        className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors hover:bg-sidebar-accent"
-      >
-        <Folder className="size-4 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-medium text-foreground">
-          {label}
-        </span>
-        <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
-      </button>
-    </SidebarGroup>
   )
 }
 

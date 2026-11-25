@@ -9,6 +9,23 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrde
 use temps_entities::{external_service_backups, external_services, service_members};
 use tracing::{debug, info, warn};
 
+/// The repository a cluster seed fetches from and how it picks the backup: the
+/// exact snapshot a discovered stop-sentinel key names, else the user data, else
+/// the latest.
+fn cluster_fetch_target<'a>(
+    location: &'a str,
+    target_user_data: Option<&'a str>,
+) -> (&'a str, crate::externalsvc::postgres::WalgFetchSelector<'a>) {
+    let (repository, snapshot) = match crate::externalsvc::postgres::walg_snapshot(location) {
+        Some((root, name)) => (root, Some(name)),
+        None => (location, None),
+    };
+    (
+        repository,
+        crate::externalsvc::postgres::WalgFetchSelector::new(snapshot, target_user_data),
+    )
+}
+
 /// Build the env-file lines that WAL-G needs for both `backup-push`
 /// and `wal-push`. Same shape used by the standalone postgres path —
 /// kept here so the cluster path produces an identical file (any
@@ -843,17 +860,18 @@ impl ExternalServiceManager {
         // resolve helper bails to None for non-localhost endpoints
         // anyway.
         let resolved_endpoint = s3_credentials.endpoint.clone();
-        let mut walg_env =
-            build_walg_env(s3_credentials, walg_s3_prefix, resolved_endpoint.as_deref()).map_err(
-                |reason| ExternalServiceError::ParameterValidationFailed {
-                    service_id: service.id,
-                    reason: format!("Invalid WAL-G S3 configuration: {reason}"),
-                },
-            )?;
-        if let Some(target_user_data) = target_user_data {
+        let (repository, selector) = cluster_fetch_target(walg_s3_prefix, target_user_data);
+        let fetch_target = selector.fetch_argument();
+        let mut walg_env = build_walg_env(s3_credentials, repository, resolved_endpoint.as_deref())
+            .map_err(|reason| ExternalServiceError::ParameterValidationFailed {
+                service_id: service.id,
+                reason: format!("Invalid WAL-G S3 configuration: {reason}"),
+            })?;
+        if let Some(user_data) = selector.user_data() {
             walg_env.push(format!(
-                "export WALG_FETCH_TARGET_USER_DATA={}",
-                crate::externalsvc::postgres::shell_escape(target_user_data)
+                "export {}={}",
+                crate::externalsvc::postgres::FETCH_TARGET_USER_DATA_ENV,
+                crate::externalsvc::postgres::shell_escape(user_data)
             ));
         }
 
@@ -884,11 +902,8 @@ chown postgres:postgres /var/lib/postgresql/walg-restore.env
 chmod 0600 /var/lib/postgresql/walg-restore.env
 
 echo "[restore] Fetching selected WAL-G basebackup into $PGDATA..."
-if grep -q '^export WALG_FETCH_TARGET_USER_DATA=' /var/lib/postgresql/walg-restore.env; then
-  gosu postgres sh -c '. /var/lib/postgresql/walg-restore.env && wal-g backup-fetch "$PGDATA" --target-user-data "$WALG_FETCH_TARGET_USER_DATA"'
-else
-  gosu postgres sh -c '. /var/lib/postgresql/walg-restore.env && wal-g backup-fetch "$PGDATA" LATEST'
-fi
+gosu postgres sh -c '. /var/lib/postgresql/walg-restore.env && wal-g backup-fetch "$PGDATA" {fetch_target}'
+
 
 echo "[restore] Writing recovery.signal + restore_command"
 touch "$PGDATA/recovery.signal"
@@ -1307,6 +1322,33 @@ mod tests {
             bucket_path: "tenant".to_string(),
             force_path_style: true,
         }
+    }
+
+    #[test]
+    fn cluster_seed_uses_the_selected_snapshot_and_its_repository() {
+        use crate::externalsvc::postgres::WalgFetchSelector;
+        let root = "s3://backups-bucket/service-a/walg";
+        let sentinel = format!("{root}/basebackups_005/base_0001_backup_stop_sentinel.json");
+        assert_eq!(
+            cluster_fetch_target(&sentinel, None),
+            (root, WalgFetchSelector::Snapshot("base_0001"))
+        );
+        let (_, by_user_data) = cluster_fetch_target(root, Some("{}"));
+        assert!(by_user_data.fetch_argument().contains("--target-user-data"));
+        assert_eq!(by_user_data.user_data(), Some("{}"));
+    }
+
+    #[test]
+    fn cluster_seed_of_a_tracked_snapshot_does_not_also_select_by_user_data() {
+        // A tracked backup carries both its exact snapshot and its user data.
+        // WAL-G refuses a fetch given both, so only the snapshot is used.
+        let root = "s3://backups-bucket/service-a/walg";
+        let sentinel = format!("{root}/basebackups_005/base_0001_backup_stop_sentinel.json");
+        let (repository, selector) =
+            cluster_fetch_target(&sentinel, Some(r#"{"backup_uuid":"u-1"}"#));
+        assert_eq!(repository, root);
+        assert_eq!(selector.fetch_argument(), "base_0001");
+        assert_eq!(selector.user_data(), None);
     }
 
     #[test]

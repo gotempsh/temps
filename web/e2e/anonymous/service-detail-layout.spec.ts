@@ -77,6 +77,20 @@ async function mockService(page: Page, width: number) {
       }
     // The API still serves the workload mode to operators; the page must not
     // ask for it. Answered here so a regression renders the card, not a crash.
+    // The page's health check card; not configurable keeps it to one line.
+    else if (path === '/external-services/23/healthcheck')
+      body = {
+        service_id: 23,
+        service_name: 'redis-example',
+        service_type: 'redis',
+        capability: {
+          configurable: false,
+          can_apply_now: false,
+          reason: 'this example has none',
+        },
+        overrides: {},
+        pending_recreate: false,
+      }
     else if (path === '/external-services/23/workload-mode')
       body = {
         service_id: 23,
@@ -217,7 +231,8 @@ for (const width of [1153, 1400, 1700, 390]) {
     await openServicePage(page, width)
     const row = page.locator('li', { hasText: 'standalone' }).first()
     await expect(row).toBeVisible()
-    await expect(row.getByText('CPU', { exact: true })).toBeVisible()
+    // The CPU and memory meters have rendered.
+    await expect(row.getByRole('progressbar')).toHaveCount(2)
 
     const layout = await row.evaluate((item) => {
       const [identity, meters] = Array.from(

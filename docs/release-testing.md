@@ -1089,6 +1089,15 @@ and registry contents produce the same files, and a second run changes nothing.
   (npm `workspace:` ranges, Cargo path dependencies, uv path sources, Go
   `replace` directives) with at least a patch, transitively, and rewrites their
   exact pins (the plugin SDK's `=` requirement on the protocol).
+- **Stamped files.** A catalog entry's `stamped` list names committed files
+  generated from the package that record `<name>@<version>`, such as the CLI
+  command reference `skills/temps-cli/references/COMMANDS.md`. A bump rewrites
+  that stamp; a stamp that no longer matches the manifest stops preparation.
+- **Channel pins.** A catalog entry's `channel_pinned` globs name files that run
+  the package by dist-tag, such as the skills' `bunx @temps-sdk/cli@latest`.
+  When a bump changes the channel (a stable version to a beta, or back), every
+  `<name>@latest` moves to `<name>@beta` or the reverse, so the documented
+  commands exist in the CLI the skills run; finding no pin stops preparation.
 - **Guards, failing closed.** A version already published or tagged, a registry
   stable release ahead of the computed version, a stable package depending on a
   prerelease sibling, a Go v2+ version, or a target tag that already exists.
@@ -1259,8 +1268,8 @@ selection publishes to that registry. A read-only check on 2026-11-19 found:
   `analytics-core`, `blob`, `kv`, `node-sdk`, `plugin`, `react-analytics`,
   `svelte-analytics`, `vue-analytics` and `cli`. Publisher configuration is
   private, so check each package's settings.
-- **No `sdk-beta` or `sdk-stable` environment** exists. The repository does
-  not let GitHub Actions open pull requests.
+- **No `sdk` environment** exists. The repository does not let GitHub Actions
+  open pull requests.
 
 Re-check registry state before acting:
 
@@ -1282,48 +1291,57 @@ curl -s -o /dev/null -w '%{http_code}\n' -A 'temps-sdk-release' https://crates.i
    maintainer with write access selects **Approve workflows to run** in the
    PR's merge box before merging it.
 
-2. **Create the environments.** `release.yml` refers to `sdk-${channel}`;
-   GitHub would otherwise create them on first use without protection.
+2. **Create the environment.** The publish job runs in the `sdk` environment
+   for both channels, so every registry trusts a single environment name.
+   GitHub would otherwise create it on first use without protection. Allow
+   only server version tags (`v*.*.*` also matches `v1.2.0-beta.3`):
 
    ```sh
-   gh api --method PUT repos/gotempsh/temps/environments/sdk-beta \
+   gh api --method PUT repos/gotempsh/temps/environments/sdk \
      -F 'deployment_branch_policy[protected_branches]=false' \
      -F 'deployment_branch_policy[custom_branch_policies]=true'
-   gh api --method POST repos/gotempsh/temps/environments/sdk-beta/deployment-branch-policies \
-     -f name='v*-*' -f type=tag
-   ```
-
-   **Optional:** create `sdk-stable` the same way with tag pattern `v*.*.*`, and
-   require a reviewer, so a person approves each stable publication:
-
-   ```sh
-   gh api --method PUT repos/gotempsh/temps/environments/sdk-stable --input - <<'JSON'
-   {"reviewers": [{"type": "Team", "id": <maintainers-team-id>}],
-    "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
-   JSON
-   gh api --method POST repos/gotempsh/temps/environments/sdk-stable/deployment-branch-policies \
+   gh api --method POST repos/gotempsh/temps/environments/sdk/deployment-branch-policies \
      -f name='v*.*.*' -f type=tag
    ```
+
+   **Optional:** add required reviewers to `sdk` (Settings → Environments →
+   `sdk`), so a person approves each publication. This applies to beta and
+   stable alike. npm versions already wait for a maintainer's approval; PyPI
+   and crates.io uploads do not.
 
 3. **PyPI pending publishers** (allowed before the first upload; a pending
    publisher does not reserve the name, so do it shortly before the tag). In
    PyPI, open **Your account → Publishing** and add a GitHub publisher for each of
    `temps-plugin-sdk` and `temps-workflows`: owner `gotempsh`, repository
-   `temps`, workflow `release.yml`, environment `sdk-beta`. Add a second one with
-   environment `sdk-stable`. The first `release.yml` upload creates the project.
+   `temps`, workflow `release.yml`, environment `sdk`. The first `release.yml`
+   upload creates the project.
 
 4. **npm and crates.io trusted publishers for existing packages.** For each
    package, open **Settings → Trusted publishing** on npmjs.com (or **Settings →
    Trusted Publishing** on crates.io), choose GitHub Actions and enter owner
    `gotempsh`, repository `temps`, workflow `release.yml` and environment
-   `sdk-beta` (and a separate entry for `sdk-stable`). On npm, leave **Allow npm
-   publish** and **Allow npm dist-tag** unticked: `npm stage publish` is always
-   allowed, and the workflow uses only that. npmjs.com accepts several
-   publishers per package, but `npm trust github` only manages one; with a
-   single entry, leave the environment empty rather than picking one channel.
-   An npm configuration expires unless it publishes within 2 days. Add a
-   channel's entry no more than 2 days before the first tag that publishes on
-   that channel, and recreate it if it expired.
+   `sdk`. On npm, leave **Allow npm publish** and **Allow npm dist-tag**
+   unticked: `npm stage publish` is always allowed, and the workflow uses only
+   that. From a terminal, the same entry is:
+
+   ```sh
+   npm trust github @temps-sdk/<package> --file release.yml --repo gotempsh/temps \
+     --env sdk --allow-stage-publish --yes
+   ```
+
+   To replace an existing entry, such as one for an older environment, find
+   its id and revoke it, naming the package (outside its directory npm would
+   otherwise pick the current folder's `package.json`):
+
+   ```sh
+   npm trust list @temps-sdk/<package> --json
+   npm trust revoke @temps-sdk/<package> --id <id>
+   ```
+
+   Entries added on npmjs.com sit alongside the CLI's, so check that only the
+   `sdk` one is left. An npm
+   configuration expires unless it publishes within 2 days. Add it no more than
+   2 days before the first tag that publishes, and recreate it if it expired.
 
 5. **First publishes of never-published npm packages and crates.** npm and
    crates.io allow trusted publishing only on a package that already exists, so

@@ -230,9 +230,7 @@ impl AnthropicProvider {
             .and_then(|extra| extra.get("reasoning_effort"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
-        let adaptive_model = request.model.starts_with("claude-sonnet-5")
-            || request.model.starts_with("claude-opus-5")
-            || request.model.starts_with("claude-fable-5");
+        let adaptive_model = uses_adaptive_thinking(&request.model);
 
         AnthropicRequest {
             model: request.model.clone(),
@@ -631,28 +629,23 @@ impl AiProvider for AnthropicProvider {
     }
 
     fn available_models(&self) -> Vec<ModelInfo> {
-        vec![
-            ModelInfo {
-                id: "claude-opus-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
-            ModelInfo {
-                id: "claude-sonnet-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
-            ModelInfo {
-                id: "claude-fable-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
-            ModelInfo {
-                id: "claude-haiku-4-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
+        // Bootstrap fallback only: a key's live catalog (discovered from
+        // /v1/models) replaces this list once it is refreshed.
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-2",
+            "claude-opus-5",
+            "claude-sonnet-5",
         ]
+        .into_iter()
+        .map(|id| ModelInfo {
+            id: id.to_string(),
+            object: "model".to_string(),
+            owned_by: "anthropic".to_string(),
+        })
+        .collect()
     }
 
     async fn chat_completion(
@@ -888,6 +881,22 @@ impl AnthropicUsage {
     }
 }
 
+/// Claude 5 models think adaptively: they take `thinking: {type: "adaptive"}`
+/// with `output_config.effort`, and reject non-default sampling parameters
+/// (Claude Haiku 5.5 included; the Fable and Mythos models have thinking
+/// always on).
+pub(crate) fn uses_adaptive_thinking(model: &str) -> bool {
+    [
+        "claude-sonnet-5",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-haiku-5",
+    ]
+    .iter()
+    .any(|family| model.starts_with(family))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1000,45 @@ mod tests {
         assert_eq!(value["output_config"]["effort"], "medium");
         assert!(value.get("temperature").is_none());
         assert!(value.get("top_p").is_none());
+    }
+
+    #[test]
+    fn test_translate_request_maps_effort_for_every_adaptive_claude_family() {
+        for model in [
+            "claude-haiku-5-5",
+            "claude-mythos-5-2",
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+        ] {
+            let mut request = test_request(model);
+            request.temperature = Some(0.2);
+            request.top_p = Some(0.8);
+            request.extra = Some(serde_json::Map::from_iter([(
+                "reasoning_effort".to_string(),
+                serde_json::json!("low"),
+            )]));
+            let wire = serde_json::to_value(AnthropicProvider::translate_request(&request))
+                .expect("request serializes");
+            assert_eq!(wire["thinking"]["type"], "adaptive", "{model}");
+            assert_eq!(wire["output_config"]["effort"], "low", "{model}");
+            assert!(wire.get("temperature").is_none(), "{model}");
+            assert!(wire.get("top_p").is_none(), "{model}");
+        }
+
+        // An earlier model keeps its sampling parameters and gets no effort.
+        let mut request = test_request("claude-haiku-4-5");
+        request.temperature = Some(0.2);
+        request.extra = Some(serde_json::Map::from_iter([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("low"),
+        )]));
+        let wire = serde_json::to_value(AnthropicProvider::translate_request(&request))
+            .expect("request serializes");
+        assert!(wire.get("thinking").is_none());
+        assert!(wire.get("output_config").is_none());
+        assert!(wire["temperature"]
+            .as_f64()
+            .is_some_and(|t| (t - 0.2).abs() < 1e-6));
     }
 
     #[test]

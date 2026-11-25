@@ -2438,9 +2438,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
@@ -12406,6 +12406,7 @@ dependencies = [
 name = "temps-ai-gateway"
 version = "0.1.0-beta.63"
 dependencies = [
+ "arc-swap",
  "async-stream",
  "async-trait",
  "axum",
@@ -12437,6 +12438,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -12764,8 +12766,8 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
- "tokio-stream",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -15492,6 +15494,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "ipnetwork",
+ "mockito",
  "percent-encoding",
  "rand 0.10.3",
  "sea-orm 1.1.20",
@@ -16008,7 +16011,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workflows-sdk"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",

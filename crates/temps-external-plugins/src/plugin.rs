@@ -216,6 +216,45 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// The plugin router is merged into the `/api` router as a catch-all
+    /// fallback, so an unknown API path with no plugin behind it must be
+    /// the route-not-found problem, not an empty 404.
+    #[tokio::test]
+    async fn unknown_api_paths_are_a_route_not_found_problem() {
+        let dynamic = DynamicPluginRouter {
+            inner: Arc::new(RwLock::new(ExternalPluginsService::empty_proxy_router())),
+        };
+        let app = Router::new().nest("/api", dynamic.router());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/definitely-not-a-route")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router answers");
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem JSON");
+        assert_eq!(
+            problem["type"],
+            temps_core::api_problems::ROUTE_NOT_FOUND_PROBLEM_TYPE
+        );
+        assert!(problem["detail"]
+            .as_str()
+            .expect("detail")
+            .contains("/api/definitely-not-a-route"));
+    }
+
     #[test]
     fn test_plugin_name() {
         let config = ExternalPluginConfig::new(

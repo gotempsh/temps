@@ -97,6 +97,8 @@ pub fn project_model(id: i32) -> projects::Model {
         instantiation_token: None,
         cloud_telemetry_attribute_allowlist: Vec::new(),
         allowed_capabilities: Vec::new(),
+        identical_build_mode: Default::default(),
+        identical_build_scope: Default::default(),
     }
 }
 

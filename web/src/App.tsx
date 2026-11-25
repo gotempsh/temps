@@ -539,6 +539,11 @@ const AiGatewayUsagePage = lazy(() =>
     default: m.AiGatewayUsagePage,
   }))
 )
+const AiGatewayModelsPage = lazy(() =>
+  import('./pages/AiGatewayModelsPage').then((m) => ({
+    default: m.AiGatewayModelsPage,
+  }))
+)
 const AiGatewayActivityPage = lazy(() =>
   import('./pages/AiGatewayActivityPage').then((m) => ({
     default: m.AiGatewayActivityPage,
@@ -752,7 +757,7 @@ const FullAppRoutes = () => {
                         <Route path="/tools" element={<PlatformTools />} />
                         <Route path="/projects" element={<Projects />} />
                         <Route
-                          path="/p/:slug"
+                          path="/p/:slug/*"
                           element={<ProjectGroupDetail />}
                         />
                         <Route
@@ -879,9 +884,12 @@ const FullAppRoutes = () => {
                               <RedirectWithQuery to="/settings/notifications/new" />
                             }
                           />
+                          {/* Same page as Settings › Notifications › provider. */}
                           <Route
                             path="providers/edit/:id"
-                            element={<EditNotificationProvider />}
+                            element={
+                              <RedirectWithQuery to="/settings/notifications/:id" />
+                            }
                           />
                           <Route
                             path=":section"
@@ -1162,6 +1170,10 @@ const FullAppRoutes = () => {
                         <Route
                           path="/ai-gateway/limits"
                           element={<AiGatewayLimitsPage />}
+                        />
+                        <Route
+                          path="/ai-gateway/models"
+                          element={<AiGatewayModelsPage />}
                         />
                         <Route
                           path="/ai-gateway/activity"

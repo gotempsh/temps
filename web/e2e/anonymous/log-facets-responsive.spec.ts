@@ -46,7 +46,7 @@ async function expectFacets(page: Page, visible: boolean) {
   if (visible) {
     await expect(panel).toBeVisible()
     await expect(
-      panel.getByText('Counts across the whole time range', { exact: false })
+      panel.getByText('Counts cover the whole time range', { exact: false })
     ).toBeVisible()
   } else {
     await expect(panel).toHaveCount(0)

@@ -118,7 +118,7 @@ impl BackupService {
         request: CreateBackupScheduleRequest,
         authority: BackupScheduleAuthority,
     ) -> Result<BackupSchedule, BackupError> {
-        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use sea_orm::{ActiveModelTrait, EntityTrait, QuerySelect, Set};
 
         let target_all = request.target_all_services.unwrap_or(true);
         let include_control_plane = request.include_control_plane.unwrap_or(true);
@@ -172,6 +172,29 @@ impl BackupService {
         // A scheduler tick can therefore never observe an enabled specific-
         // target schedule before its databases have been attached.
         let txn = self.db.begin().await?;
+        // Hold the source until the schedule commits. Deleting a source locks
+        // its row FOR UPDATE, so a delete that is under way finishes first and
+        // the source is read as gone, and one that starts later waits and then
+        // sees this schedule and refuses. Without the hold, the insert failed
+        // on the foreign key with a database error.
+        if temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+            .lock_shared()
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            return Err(match request.s3_source_id {
+                Some(_) => BackupError::NotFound {
+                    resource: "S3Source".to_string(),
+                    detail: format!("S3 source {s3_source_id} not found"),
+                },
+                None => BackupError::Validation(format!(
+                    "The default S3 source {s3_source_id} was deleted while backup schedule \
+                     '{}' was being created; retry to use the current default",
+                    request.name
+                )),
+            });
+        }
         let now = chrono::Utc::now();
         let tags_json = serde_json::to_string(&request.tags)?;
         let new_schedule = temps_entities::backup_schedules::ActiveModel {
@@ -584,8 +607,9 @@ impl BackupService {
 
     // Add this new validation function
     fn validate_backup_schedule(&self, schedule: &str) -> Result<(), BackupError> {
-        let schedule = Schedule::from_str(schedule)
-            .map_err(|e| BackupError::Validation(format!("Invalid backup schedule: {}", e)))?;
+        let schedule = Schedule::from_str(schedule).map_err(|e| {
+            BackupError::Validation(describe_invalid_schedule(schedule, &e.to_string()))
+        })?;
 
         // Get the first two occurrences
         let upcoming = schedule.upcoming(Utc);
@@ -935,6 +959,38 @@ impl BackupService {
         self.fire_lifecycle_reconcile(updated_schedule.s3_source_id);
 
         Ok(updated_schedule)
+    }
+}
+
+/// The 400 detail for a schedule expression the cron parser rejected.
+///
+/// Backup schedules use a seconds-first cron expression, which most people do
+/// not expect: the parser's own message only points a caret at the input. Say
+/// what is expected, with an example, and when the input looks like a
+/// standard five-field expression, what to send instead.
+pub(crate) fn describe_invalid_schedule(expression: &str, parser_error: &str) -> String {
+    const EXPECTED: &str = "expected 6 or 7 space-separated fields with seconds first \
+         (`sec min hour day-of-month month day-of-week [year]`), \
+         for example `0 0 3 * * *` for every day at 03:00 UTC";
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    if fields.len() == 5 {
+        format!(
+            "Invalid backup schedule '{expression}': {EXPECTED}. It has 5 fields, the \
+             standard cron format without seconds; add a leading seconds field: `0 {}`",
+            fields.join(" ")
+        )
+    } else {
+        // The parser renders a caret diagram over several lines; one line
+        // reads better in a problem detail.
+        let parser_error = parser_error
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "Invalid backup schedule '{expression}': {EXPECTED}. It has {} field(s). \
+             Parser error: {parser_error}",
+            fields.len()
+        )
     }
 }
 

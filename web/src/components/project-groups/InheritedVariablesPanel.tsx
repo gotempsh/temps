@@ -8,7 +8,7 @@ import { getInheritedEnvVarsOptions } from '@/api/client/@tanstack/react-query.g
 import type { ProjectResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { groupHref } from '@/lib/terminology'
+import { groupHref, groupVariablesHref } from '@/lib/terminology'
 import { ServiceGroupControl } from './ServiceGroupControl'
 
 /**
@@ -59,7 +59,7 @@ export function InheritedVariablesPanel({
   }
 
   const variables = inherited.data?.variables ?? []
-  const manageHref = `${groupHref(group.slug)}?tab=variables`
+  const manageHref = groupVariablesHref(group.slug)
 
   // Nothing is inherited, so this is only a way in, not a section of the page.
   if (variables.length === 0) {
