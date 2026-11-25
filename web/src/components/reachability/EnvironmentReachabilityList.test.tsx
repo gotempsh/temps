@@ -226,3 +226,56 @@ test('a domain that moved to another environment is listed only where it is now'
     1
   )
 })
+
+test('a renamed domain is listed by its new name, not on the check for its old one', async () => {
+  // The check still names domain 1 by the hostname it had before the rename.
+  const view = renderList(
+    [address('old.example.test', 'reachable', 'direct:control-plane')],
+    [],
+    [domain(1, 'new.example.test', 3)]
+  )
+
+  await view.findByRole('link', { name: 'new.example.test' })
+  expect(view.queryByRole('link', { name: 'old.example.test' })).toBeNull()
+  expect(
+    view.getAllByRole('button', { name: 'Actions for new.example.test' })
+  ).toHaveLength(1)
+})
+
+test('domains still loading show a placeholder, not "No address yet"', async () => {
+  const api = mockApi({
+    'GET /projects/7/environments': () =>
+      jsonResponse([{ id: 3, name: 'production', slug: 'production' }]),
+    'GET /projects/7/environments/3/reachability': () =>
+      jsonResponse({ state: 'unreachable', summary: '', addresses: [] }),
+    'GET /projects/7/environments/3/reachability/runs': () => jsonResponse([]),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const list = (domainsPending: boolean) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <EnvironmentReachabilityList
+          projectId={7}
+          projectSlug="example"
+          domainsPending={domainsPending}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const view = render(list(true))
+  await view.findByRole('heading', { name: 'production' })
+  await waitFor(() =>
+    expect(api.called('GET', '/projects/7/environments/3/reachability')).toBe(
+      true
+    )
+  )
+  await act(() => new Promise((resolve) => setTimeout(resolve, 50)))
+
+  expect(view.queryByText(/No address yet/)).toBeNull()
+  expect(view.container.querySelector('.animate-pulse')).not.toBeNull()
+
+  view.rerender(list(false))
+  await view.findByText(/No address yet/)
+})

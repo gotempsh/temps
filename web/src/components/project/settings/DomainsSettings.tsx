@@ -231,6 +231,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           projectId={project.id}
           projectSlug={project.slug}
           domains={customDomains ? domains : undefined}
+          domainsPending={isPending}
           domainMenu={domainMenu}
         />
       ) : isPending ? (

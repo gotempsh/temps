@@ -65,6 +65,7 @@ export function EnvironmentReachabilityList({
   projectId,
   projectSlug,
   domains: projectDomains,
+  domainsPending = false,
   domainMenu,
 }: {
   projectId: number
@@ -75,6 +76,8 @@ export function EnvironmentReachabilityList({
    * stays, since none can be told to belong to a domain that moved.
    */
   domains?: CustomDomainResponse[]
+  /** Whether the domains are still loading: not the same as having none. */
+  domainsPending?: boolean
   domainMenu?: DomainMenu
 }) {
   const environments = useQuery({
@@ -112,6 +115,7 @@ export function EnvironmentReachabilityList({
             (domain) => domain.environment?.id === environment.id
           )}
           domainsKnown={projectDomains !== undefined}
+          domainsPending={domainsPending}
           domainMenu={domainMenu}
         />
       ))}
@@ -146,6 +150,7 @@ function EnvironmentAddresses({
   environment,
   domains,
   domainsKnown,
+  domainsPending,
   domainMenu,
 }: {
   projectId: number
@@ -154,6 +159,7 @@ function EnvironmentAddresses({
   domains: CustomDomainResponse[]
   /** Whether `domains` is this environment's full list, not a failed load. */
   domainsKnown: boolean
+  domainsPending: boolean
   domainMenu?: DomainMenu
 }) {
   const href = reachabilityPath(projectSlug, environment.id)
@@ -174,20 +180,19 @@ function EnvironmentAddresses({
   })
   const byId = new Map(domains.map((domain) => [domain.id, domain]))
   // A check kept from before a failed refresh can still list a domain that
-  // has since moved to another environment or gone; it shows only where it is.
+  // has since moved to another environment, gone, or been renamed; it shows
+  // only as the domain it is now.
   const addresses = (reachability.data?.addresses ?? []).filter(
     (address) =>
       !domainsKnown ||
       address.custom_domain_id == null ||
-      byId.has(address.custom_domain_id)
+      domainOf(address, byId) !== undefined
   )
   const settled =
     !reachability.isError && isEnvironmentSettled(addresses, newestRun?.state)
   const reachable = reachability.data?.state === 'reachable'
   const shown = new Set(
-    addresses.flatMap((address) =>
-      address.custom_domain_id != null ? [address.custom_domain_id] : []
-    )
+    addresses.flatMap((address) => domainOf(address, byId)?.id ?? [])
   )
   // A domain the check has not answered for still appears, once.
   const unmatched = reachability.isPending
@@ -236,11 +241,7 @@ function EnvironmentAddresses({
             <AddressRow
               key={address.address}
               address={address}
-              domain={
-                address.custom_domain_id != null
-                  ? byId.get(address.custom_domain_id)
-                  : undefined
-              }
+              domain={domainOf(address, byId)}
               domainMenu={domainMenu}
               makeReachableHref={reachabilityPath(projectSlug, environment.id, {
                 address: address.address,
@@ -255,7 +256,16 @@ function EnvironmentAddresses({
               menu={domainMenu}
             />
           ))}
+          {domainsPending && (
+            <li aria-hidden="true">
+              <AddressRowSkeleton />
+            </li>
+          )}
         </ul>
+      ) : domainsPending ? (
+        <div className={LIST}>
+          <AddressRowSkeleton />
+        </div>
       ) : (
         !reachability.isError && (
           <p className="text-sm text-muted-foreground">
@@ -280,6 +290,25 @@ function EnvironmentAddresses({
       )}
     </section>
   )
+}
+
+/** Hostnames compare without case or a trailing dot. */
+function sameHost(a: string, b: string): boolean {
+  const host = (name: string) => name.replace(/\.$/, '').toLowerCase()
+  return host(a) === host(b)
+}
+
+/**
+ * The domain an address is: the one it names, while the check still names
+ * it by its current hostname. A check from before a rename names the old one.
+ */
+function domainOf(
+  address: AddressReachability,
+  byId: Map<number, CustomDomainResponse>
+): CustomDomainResponse | undefined {
+  if (address.custom_domain_id == null) return undefined
+  const domain = byId.get(address.custom_domain_id)
+  return domain && sameHost(domain.domain, address.address) ? domain : undefined
 }
 
 function AddressRowSkeleton() {
