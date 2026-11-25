@@ -854,8 +854,11 @@ mod tests {
         );
         assert_eq!(incident.status, "identified");
         assert!(incident.resolved_at.is_none());
-        let updates = service.get_incident_updates(incident.id).await.unwrap();
-        assert_eq!(updates.len(), 1);
+        let (updates, total) = service
+            .get_incident_updates(incident.id, temps_core::PageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!((updates.len(), total), (1, 1));
         assert_eq!(
             updates[0].message,
             "Emails are arriving up to 10 minutes late."
@@ -884,8 +887,11 @@ mod tests {
             .await
             .unwrap();
 
-        let updates = service.get_incident_updates(incident.id).await.unwrap();
-        assert_eq!(updates.len(), 1);
+        let (updates, total) = service
+            .get_incident_updates(incident.id, temps_core::PageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!((updates.len(), total), (1, 1));
         assert!(updates[0].is_system);
         assert!(!updates[0].is_public);
     }

@@ -754,7 +754,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to mint an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to mint an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -769,7 +769,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to update an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to update an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -783,7 +783,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to rotate an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to rotate an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -797,7 +797,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to revoke an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to revoke an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -816,7 +816,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a role without AnalyticsRead must not list ingest keys");
+        .unwrap_or_else(|| panic!("a role without AnalyticsRead must not list ingest keys"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -971,7 +971,9 @@ mod tests {
         let err = get_analytics_ingest_key_endpoint(user_auth(Role::User), State(state), Path(7))
             .await
             .err()
-            .expect("a failed settings read must not be reported as 'no external URL'");
+            .unwrap_or_else(|| {
+                panic!("a failed settings read must not be reported as 'no external URL'")
+            });
 
         assert_eq!(err.status_code, StatusCode::INTERNAL_SERVER_ERROR);
         let rendered = serde_json::to_string(&err.body).expect("problem body should serialize");
@@ -996,7 +998,9 @@ mod tests {
         )
         .await
         .err()
-        .expect("a role without AnalyticsRead must not read the ingest endpoint");
+        .unwrap_or_else(|| {
+            panic!("a role without AnalyticsRead must not read the ingest endpoint")
+        });
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -1009,7 +1013,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not read the ingest endpoint");
+        .unwrap_or_else(|| panic!("a deployment token must not read the ingest endpoint"));
         assert_deployment_token_denied(err);
     }
 
@@ -1035,7 +1039,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to mint an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to mint an ingest key"));
         assert_deployment_token_denied(err);
         assert!(
             audit.recorded().is_empty(),
@@ -1053,7 +1057,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to list ingest keys");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to list ingest keys"));
         assert_deployment_token_denied(err);
     }
 
@@ -1068,7 +1072,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to update an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to update an ingest key"));
         assert_deployment_token_denied(err);
     }
 
@@ -1082,7 +1086,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to rotate an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to rotate an ingest key"));
         assert_deployment_token_denied(err);
     }
 
@@ -1096,7 +1100,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to revoke an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to revoke an ingest key"));
         assert_deployment_token_denied(err);
     }
 
@@ -1137,7 +1141,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a key from another project must not be updatable");
+        .unwrap_or_else(|| panic!("a key from another project must not be updatable"));
         assert_eq!(err.status_code, StatusCode::NOT_FOUND);
         assert!(
             audit.recorded().is_empty(),
@@ -1163,7 +1167,7 @@ mod tests {
         let err = get_analytics_ingest_key(user_auth(Role::User), State(state), Path((42, 10)))
             .await
             .err()
-            .expect("a key of another project is not found");
+            .unwrap_or_else(|| panic!("a key of another project is not found"));
         assert_eq!(err.status_code, StatusCode::NOT_FOUND);
         let detail = err
             .body
@@ -1196,14 +1200,14 @@ mod tests {
         )
         .await
         .err()
-        .expect("a role without AnalyticsRead");
+        .unwrap_or_else(|| panic!("a role without AnalyticsRead"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
 
         let err =
             get_analytics_ingest_key(deployment_token_auth(), State(empty_state()), Path((1, 10)))
                 .await
                 .err()
-                .expect("a deployment token");
+                .unwrap_or_else(|| panic!("a deployment token"));
         assert_deployment_token_denied(err);
     }
 
@@ -1222,7 +1226,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a key from another project must not be revocable");
+        .unwrap_or_else(|| panic!("a key from another project must not be revocable"));
         assert_eq!(err.status_code, StatusCode::NOT_FOUND);
     }
 
@@ -1558,9 +1562,16 @@ mod tests {
             }
         }
 
-        assert_eq!(operation_ids.len(), 6, "expected six operations");
+        // list, read one, create, update, rotate, revoke, endpoint
+        assert_eq!(operation_ids.len(), 7, "expected seven operations");
+        assert!(
+            operation_ids
+                .iter()
+                .any(|id| id == "get_analytics_ingest_key"),
+            "reading one key back must be documented: {operation_ids:?}"
+        );
         let unique: std::collections::HashSet<_> = operation_ids.iter().collect();
-        assert_eq!(unique.len(), 6, "operationIds must be unique");
+        assert_eq!(unique.len(), 7, "operationIds must be unique");
     }
 
     /// The `public_key` field must never be described as a secret, and must

@@ -743,7 +743,7 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
     )
     .await
     .err()
-    .expect("a reader cannot register");
+    .unwrap_or_else(|| panic!("a reader cannot register"));
     assert_eq!(forbidden.status_code, StatusCode::FORBIDDEN);
 
     let response = create_webhook(
@@ -1086,7 +1086,7 @@ async fn a_webhook_created_switched_off_reads_back_and_receives_nothing() {
     )
     .await
     .err()
-    .expect("missing webhook");
+    .unwrap_or_else(|| panic!("missing webhook"));
     assert_eq!(not_found.status_code, StatusCode::NOT_FOUND);
     assert!(format!("{:?}", not_found.body).contains(&missing.to_string()));
 
@@ -1106,7 +1106,7 @@ async fn a_webhook_created_switched_off_reads_back_and_receives_nothing() {
     )
     .await
     .err()
-    .expect("a key without status_page:read");
+    .unwrap_or_else(|| panic!("a key without status_page:read"));
     assert_eq!(forbidden.status_code, StatusCode::FORBIDDEN);
 
     schedule(&fx, "Database upgrade").await;

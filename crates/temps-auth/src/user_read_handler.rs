@@ -120,7 +120,7 @@ mod tests {
             )
             .await
             .err()
-            .expect("missing user");
+            .unwrap_or_else(|| panic!("missing user"));
             assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
             let detail = problem
                 .body
@@ -138,7 +138,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a plain user cannot read other users");
+        .unwrap_or_else(|| panic!("a plain user cannot read other users"));
         assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
 
         let response = crate::http_test_support::router(state, connection)

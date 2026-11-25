@@ -876,7 +876,7 @@ mod funnel_handler_tests {
         )
         .await
         .err()
-        .expect("the key lacks funnel:write");
+        .unwrap_or_else(|| panic!("the key lacks funnel:write"));
         assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
     }
 
