@@ -230,9 +230,15 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
   })
 
   // A cached read still in flight answers with what was known before this
-  // action; cancelled so it cannot overwrite the result written here.
+  // action; cancelled so it cannot overwrite the result written here. Done
+  // when the action starts and again just before writing, since a read can
+  // also start while the action runs (Check for releases refetches rows).
   const cancelPendingRead = () =>
     queryClient.cancelQueries({ queryKey: workspaceKey })
+  const writeStatus = async (status: typeof workspace.data) => {
+    await cancelPendingRead()
+    queryClient.setQueryData(workspaceKey, status)
+  }
 
   const inspect = useMutation({
     onMutate: cancelPendingRead,
@@ -244,7 +250,7 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
       })
       return data
     },
-    onSuccess: (status) => queryClient.setQueryData(workspaceKey, status),
+    onSuccess: (status) => writeStatus(status),
     onError: (error) =>
       toast.error(
         problemMessage(
@@ -263,8 +269,8 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
       })
       return data
     },
-    onSuccess: (status) => {
-      queryClient.setQueryData(workspaceKey, status)
+    onSuccess: async (status) => {
+      await writeStatus(status)
       announce(updateOutcome(agent.name, agent, status))
     },
     onError: (error) =>

@@ -354,6 +354,39 @@ describe('updateOutcome', () => {
     ).toEqual({ level: 'success', message: 'Codex updated to 1.1.0' })
   })
 
+  it('names a pre-release instead of reporting the update as done', () => {
+    const beta = updateOutcome('Codex', release, {
+      installed_version: '1.1.0-beta.1',
+      latest_version: '1.1.0',
+      update_available: false,
+      updating: false,
+    })
+    expect(beta).toEqual({
+      level: 'warning',
+      message:
+        'Codex now reports 1.1.0-beta.1, a pre-release; the latest release 1.1.0 is not installed',
+    })
+    // The row still counts it as current, as the server does.
+    expect(
+      agentVersionState(release, {
+        installed_version: '1.1.0-beta.1',
+        latest_version: '1.1.0',
+        update_available: false,
+        updating: false,
+        checked_at: '2026-11-25T09:00:00Z',
+      }).kind
+    ).toBe('current')
+    // The exact release, with or without a leading v, is a success.
+    expect(
+      updateOutcome('Codex', release, {
+        installed_version: 'v1.1.0',
+        latest_version: '1.1.0',
+        update_available: false,
+        updating: false,
+      }).level
+    ).toBe('success')
+  })
+
   it('never claims success when no latest release is known at all', () => {
     const unconfirmed = updateOutcome(
       'Codex',

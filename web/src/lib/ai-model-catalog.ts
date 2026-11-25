@@ -279,6 +279,16 @@ export function updateOutcome(
       message: `${name} now reports ${installed}, but the latest release could not be looked up to confirm it is current`,
     }
   }
+  // A pre-release of the latest number counts as current for automatic
+  // updates (as on the server), but is not the release Update installs.
+  const latest = latestReleaseVersion(release, status)
+  const bare = (version: string) => version.replace(/^v/, '')
+  if (latest && /[-+]/.test(installed) && bare(installed) !== bare(latest)) {
+    return {
+      level: 'warning',
+      message: `${name} now reports ${installed}, a pre-release; the latest release ${latest} is not installed`,
+    }
+  }
   return { level: 'success', message: `${name} updated to ${installed}` }
 }
 

@@ -192,3 +192,59 @@ test('a cached read still in flight cannot undo an explicit check', async () => 
   expect(view.getByText('1.1.0 available')).toBeTruthy()
   expect(view.queryByText(/Not checked yet/)).toBeNull()
 })
+
+test('a cached read started during a check cannot undo it', async () => {
+  let releaseLiveCheck: (() => void) | undefined
+  let releaseLateRead: (() => void) | undefined
+  let cachedReads = 0
+  client.setConfig({
+    baseUrl: 'http://temps.test',
+    fetch: (async (input: Request) => {
+      const url = new URL(input.url)
+      if (!url.pathname.endsWith('/harness-update')) return json(overview)
+      if (url.searchParams.get('refresh') === 'true') {
+        await new Promise<void>((resolve) => {
+          releaseLiveCheck = resolve
+        })
+        return json({
+          ...notChecked,
+          installed_version: '1.0.0',
+          latest_version: '1.1.0',
+          update_available: true,
+          checked_at: '2026-11-25T09:00:00Z',
+        })
+      }
+      cachedReads += 1
+      // The first read answers at once; one started during the check is
+      // held until after the check has written its result.
+      if (cachedReads > 1) {
+        await new Promise<void>((resolve) => {
+          releaseLateRead = resolve
+        })
+      }
+      return json(notChecked)
+    }) as typeof fetch,
+  })
+  const queries = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = render(
+    <QueryClientProvider client={queries}>
+      <CodingAgentsCard />
+    </QueryClientProvider>
+  )
+
+  await view.findByText(/Not checked yet/)
+  fireEvent.click(view.getByRole('button', { name: 'Check workspace' }))
+  await waitFor(() => expect(releaseLiveCheck).toBeDefined())
+  // A refetch starts while the live check is running.
+  void queries.refetchQueries({ type: 'all' })
+  await waitFor(() => expect(releaseLateRead).toBeDefined())
+  releaseLiveCheck?.()
+  await waitFor(() => expect(view.getByText('1.1.0 available')).toBeTruthy())
+
+  releaseLateRead?.()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(view.getByText('1.1.0 available')).toBeTruthy()
+  expect(view.queryByText(/Not checked yet/)).toBeNull()
+})
