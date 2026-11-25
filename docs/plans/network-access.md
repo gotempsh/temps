@@ -32,7 +32,7 @@
 | Per-workload egress/ingress profile: `open`, `restricted`, `none` | `network_policy_profiles` | Built |
 | Linking a service to a project or sandbox creates the allow rule (database triggers, `origin = link`) | same migration | Built |
 | Compile rules into one nftables transaction; a workload's addresses are a set keyed by identity | `crates/temps-workload-netpol/src/nft.rs`, `identity.rs` | Built |
-| Node enforcer loop with `legacy` → `shadow` → `enforce`; applies only when the transaction changed; leaving `enforce` removes the tables | `crates/temps-workload-netpol/src/enforcer.rs` | Built |
+| Node enforcer loop with `legacy` → `shadow` → `enforce`; every mode observes the local workloads and publishes the egress-proxy table, only `enforce` filters; applies only when the transaction changed; leaving `enforce` removes the tables | `crates/temps-workload-netpol/src/enforcer.rs` | Built |
 | DNS follows policy: the per-node resolver answers a restricted workload only for allowed names | `crates/temps-workload-netpol/src/dns.rs` (`DnsPolicy`) | Built |
 | Sandbox HTTP egress proxy with host/CIDR allow-list; private, loopback and metadata addresses always refused | `crates/temps-workload/src/egress.rs`, `crates/temps-workload-netpol/src/egress.rs` | Built |
 | Scoped credentials per sandbox (own database and role, never the admin password) for Postgres, MariaDB, MongoDB, Redis, S3 | `crates/temps-providers/src/sandbox_*.rs` | Built, control plane only |

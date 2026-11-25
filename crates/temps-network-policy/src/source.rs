@@ -34,11 +34,22 @@ pub const PASS_INTERVAL: Duration = Duration::from_secs(15);
 pub struct DbPolicySource {
     service: Arc<NetworkPolicyService>,
     node_id: i32,
+    /// The mode and policy revision the last `mode` call read, for
+    /// `legacy_snapshot` and `observed` in the same pass.
+    last: std::sync::Mutex<(NodeMode, i64)>,
 }
 
 impl DbPolicySource {
     pub fn new(service: Arc<NetworkPolicyService>, node_id: i32) -> Self {
-        Self { service, node_id }
+        Self {
+            service,
+            node_id,
+            last: std::sync::Mutex::new((NodeMode::default(), 0)),
+        }
+    }
+
+    fn last(&self) -> (NodeMode, i64) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn node(&self) -> String {
@@ -48,21 +59,31 @@ impl DbPolicySource {
 
 #[async_trait]
 impl PolicySource for DbPolicySource {
+    /// One query: the mode and the policy revision.
     async fn mode(&self) -> Result<NodeMode, EnforcerError> {
-        let mode =
-            self.service
-                .node_mode(self.node_id)
-                .await
-                .map_err(|e| EnforcerError::Source {
-                    node: self.node(),
-                    reason: e.to_string(),
-                })?;
-        if mode == NodeMode::Legacy {
-            // Nothing is observed in `legacy`; stop advertising what was.
-            self.service
-                .record_observed(self.node_id, IdentityMap::new());
-        }
+        let (mode, revision) = self
+            .service
+            .mode_and_revision(self.node_id)
+            .await
+            .map_err(|e| EnforcerError::Source {
+                node: self.node(),
+                reason: e.to_string(),
+            })?;
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = (mode, revision);
         Ok(mode)
+    }
+
+    /// The cached snapshot: no query while nothing it depends on changed.
+    async fn legacy_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        let (_, revision) = self.last();
+        self.service
+            .cached_snapshot(self.node_id, revision)
+            .await
+            .map(|(snapshot, _)| Some((*snapshot).clone()))
+            .map_err(|e| EnforcerError::Source {
+                node: self.node(),
+                reason: e.to_string(),
+            })
     }
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
@@ -78,7 +99,9 @@ impl PolicySource for DbPolicySource {
     /// Node 0's workloads, for the workers: the same record a worker's
     /// report makes.
     fn observed(&self, local: &IdentityMap) {
-        self.service.record_observed(self.node_id, local.clone());
+        let (mode, _) = self.last();
+        self.service
+            .record_observed(self.node_id, local.clone(), mode);
     }
 }
 

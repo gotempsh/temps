@@ -10989,3 +10989,95 @@ async fn test_sandbox_egress_recording_defaults_off_and_reverses() -> anyhow::Re
     assert_eq!(kept.try_get::<i32>("", "count")?, 1);
     Ok(())
 }
+
+async fn network_policy_revision_triggers(db: &DatabaseConnection) -> anyhow::Result<Vec<String>> {
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT tgname FROM pg_trigger WHERE NOT tgisinternal \
+               AND tgname IN ('sandboxes_network_policy_revision_update', \
+                 'service_members_network_policy_revision', \
+                 'service_endpoints_network_policy_revision', \
+                 'nodes_network_policy_revision', \
+                 'network_config_network_policy_revision') ORDER BY tgname"
+                .to_string(),
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| row.try_get::<String>("", "tgname").map_err(Into::into))
+        .collect()
+}
+
+async fn network_policy_revision(db: &DatabaseConnection) -> anyhow::Result<i64> {
+    Ok(db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT revision FROM network_policy_state WHERE id = 0".to_string(),
+        ))
+        .await?
+        .expect("state row")
+        .try_get("", "revision")?)
+}
+
+/// Every table a node's policy snapshot reads bumps the revision once the
+/// migration is in, and only on the columns a snapshot reads; `down`
+/// removes the triggers and leaves the revision row alone.
+#[tokio::test]
+async fn test_network_policy_revision_inputs_bump_and_reverse() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000002_network_policy_revision_inputs";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping network policy revision migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    assert_eq!(network_policy_revision_triggers(&db).await?.len(), 5);
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address) \
+         VALUES ('worker-1', 'x', 'https://10.201.0.9:3100', '10.201.0.9')",
+    )
+    .await?;
+    let before = network_policy_revision(&db).await?;
+    db.execute_unprepared("UPDATE nodes SET last_heartbeat = now()")
+        .await?;
+    assert_eq!(network_policy_revision(&db).await?, before, "a heartbeat");
+    db.execute_unprepared("UPDATE nodes SET private_address = '10.201.0.10'")
+        .await?;
+    assert!(network_policy_revision(&db).await? > before, "an address");
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(network_policy_revision_triggers(&db).await?.is_empty());
+    let after_down = network_policy_revision(&db).await?;
+    db.execute_unprepared("UPDATE nodes SET private_address = '10.201.0.11'")
+        .await?;
+    assert_eq!(network_policy_revision(&db).await?, after_down);
+    Ok(())
+}

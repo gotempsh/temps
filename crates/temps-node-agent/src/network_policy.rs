@@ -9,9 +9,11 @@
 //! the node's mode and snapshot back. The report tells the control plane
 //! which datapath this node enforces with, which is what allows an
 //! operator to move the node out of `legacy`, and which workloads it
-//! observed on its previous pass, which is how every other node learns
-//! their addresses. In `legacy` nothing else happens: no Docker call, no
-//! program loaded.
+//! observed on its previous pass (in every mode), which is how every other
+//! node learns their addresses. In `legacy` the pass only observes the
+//! local workloads and publishes the egress-proxy table: no rule applied,
+//! no program loaded. The digest of the snapshot it holds rides along, so
+//! a pass in which nothing changed brings back no snapshot.
 //!
 //! A failed fetch fails the pass, and the kernel keeps what the last pass
 //! applied: a control plane outage never opens or closes anything.
@@ -27,7 +29,7 @@ use temps_workload_netpol::{
     available_datapath, choose_executor, choose_port_resolver, spawn_container_wake,
     DatapathConfig, DockerInstanceSource, EgressRecordingCapability, EgressTable, EnforcerError,
     IdentityMap, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PolicySnapshot,
-    PolicySource, TableName,
+    PolicySource, TableName, POLICY_PROTOCOL,
 };
 use tracing::{info, warn};
 
@@ -59,6 +61,9 @@ pub struct AgentPolicySource {
     token: String,
     backend: &'static str,
     last: Mutex<Option<PolicySnapshot>>,
+    /// The control plane's digest of `last`, sent back so an unchanged
+    /// pass costs no snapshot.
+    last_digest: Mutex<Option<String>>,
     observed: Mutex<IdentityMap>,
     /// Where the last policy received is kept, so an agent that boots while
     /// the control plane is unreachable enforces it instead of nothing.
@@ -101,6 +106,7 @@ impl AgentPolicySource {
             token,
             backend,
             last: Mutex::new(None),
+            last_digest: Mutex::new(None),
             observed: Mutex::new(IdentityMap::new()),
             cache: None,
             cached: Mutex::new(None),
@@ -187,6 +193,11 @@ pub fn policy_url(control_plane_url: &str, node_id: i32) -> String {
 #[async_trait]
 impl PolicySource for AgentPolicySource {
     async fn mode(&self) -> Result<NodeMode, EnforcerError> {
+        let held_snapshot = {
+            let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            let digest = self.last_digest.lock().unwrap_or_else(|e| e.into_inner());
+            last.as_ref().and(digest.clone())
+        };
         let report = NodePolicyReport {
             backend: self.backend.to_string(),
             identities: self
@@ -195,9 +206,12 @@ impl PolicySource for AgentPolicySource {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
             egress_recording: Some(self.egress_recording.clone()),
+            protocol: POLICY_PROTOCOL,
+            held_snapshot,
         };
         let policy = match self.fetch(&report).await {
             Ok(policy) => {
+                let policy = self.resolve_unchanged(policy);
                 self.store_cache(&policy);
                 policy
             }
@@ -215,13 +229,16 @@ impl PolicySource for AgentPolicySource {
                 None => return Err(error),
             },
         };
-        if policy.mode == NodeMode::Legacy {
-            // Nothing is observed in `legacy`; stop reporting what was.
-            *self.observed.lock().unwrap_or_else(|e| e.into_inner()) = IdentityMap::new();
-        }
+        // Observations are reported in every mode: knowing its workloads
+        // does not depend on whether the node filters.
+        *self.last_digest.lock().unwrap_or_else(|e| e.into_inner()) = policy.snapshot_digest;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         *last = policy.snapshot;
         Ok(policy.mode)
+    }
+
+    async fn legacy_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        Ok(self.last.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
@@ -245,6 +262,21 @@ impl PolicySource for AgentPolicySource {
 }
 
 impl AgentPolicySource {
+    /// An `unchanged` answer means "keep the snapshot you hold": it becomes
+    /// that snapshot, so the cache and the pass see a complete policy.
+    fn resolve_unchanged(&self, mut policy: NodePolicy) -> NodePolicy {
+        if policy.unchanged {
+            policy.snapshot = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if policy.snapshot.is_none() {
+                // Cannot happen (the digest is only sent while a snapshot
+                // is held); the next pass asks again with no digest.
+                policy.snapshot_digest = None;
+            }
+            policy.unchanged = false;
+        }
+        policy
+    }
+
     async fn fetch(&self, report: &NodePolicyReport) -> Result<NodePolicy, EnforcerError> {
         let response = self
             .http
@@ -389,6 +421,132 @@ mod tests {
                 reason: temps_workload_netpol::RecordingUnavailable::UnsupportedPlatform { .. }
             }
         ));
+    }
+
+    /// A scripted control plane: answers each POST with the next of
+    /// `answers` and returns the request bodies it received.
+    async fn scripted_control_plane(
+        answers: Vec<String>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for answer in answers {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                let body = loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break body.to_string();
+                        }
+                    }
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                            answer.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                bodies.push(body);
+            }
+            bodies
+        });
+        (addr, server)
+    }
+
+    fn source(addr: std::net::SocketAddr) -> AgentPolicySource {
+        AgentPolicySource::new(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            4,
+            "token".into(),
+            "nftables",
+        )
+    }
+
+    /// A new agent asks with its protocol, holds the snapshot it gets in
+    /// `legacy`, sends its digest back, and keeps it on `unchanged`.
+    #[tokio::test]
+    async fn a_legacy_snapshot_is_held_and_an_unchanged_answer_keeps_it() {
+        let mut snapshot = PolicySnapshot::default();
+        snapshot
+            .system_ingress
+            .push("10.201.0.0/16".parse().unwrap());
+        let full = serde_json::to_string(&NodePolicy {
+            mode: NodeMode::Legacy,
+            snapshot: Some(snapshot.clone()),
+            snapshot_digest: Some("d1".into()),
+            unchanged: false,
+        })
+        .unwrap();
+        let unchanged = r#"{"mode":"legacy","snapshot_digest":"d1","unchanged":true}"#.to_string();
+        let (addr, server) = scripted_control_plane(vec![full, unchanged]).await;
+        let source = source(addr);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert_eq!(
+            source
+                .legacy_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .system_ingress,
+            snapshot.system_ingress
+        );
+        source.observed(&IdentityMap::new().with(
+            temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 1),
+            "10.237.1.2".parse().unwrap(),
+        ));
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert_eq!(
+            source
+                .legacy_snapshot()
+                .await
+                .unwrap()
+                .unwrap()
+                .system_ingress,
+            snapshot.system_ingress,
+            "unchanged keeps the held snapshot"
+        );
+        let bodies = server.await.unwrap();
+        let first: NodePolicyReport = serde_json::from_str(&bodies[0]).unwrap();
+        let second: NodePolicyReport = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(first.protocol, POLICY_PROTOCOL);
+        assert_eq!(first.held_snapshot, None, "nothing held yet");
+        assert_eq!(second.held_snapshot.as_deref(), Some("d1"));
+        assert_eq!(
+            second.identities.workloads().count(),
+            1,
+            "observations are reported in legacy"
+        );
+    }
+
+    /// An older control plane answers `legacy` with the mode alone: the
+    /// agent then has no snapshot, so its pass observes nothing, as today.
+    #[tokio::test]
+    async fn an_old_control_planes_legacy_answer_leaves_nothing_to_observe() {
+        let (addr, server) = scripted_control_plane(vec![r#"{"mode":"legacy"}"#.into()]).await;
+        let source = source(addr);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert!(source.legacy_snapshot().await.unwrap().is_none());
+        server.await.unwrap();
     }
 
     /// Every pass's report carries the capability, so the control plane can

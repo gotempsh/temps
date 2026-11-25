@@ -19,6 +19,7 @@
 
 pub mod error;
 pub mod handlers;
+pub mod idle;
 pub mod internal_access;
 pub mod model;
 pub mod node_api;

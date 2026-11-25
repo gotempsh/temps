@@ -53,9 +53,10 @@ pub use egress::{
     RecordingUnavailable, RelayKind, RelayUpstream,
 };
 pub use enforcer::{
-    identify, spawn_container_wake, with_best_datapath, DockerInstanceSource, EnforcerError,
-    InstanceSource, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PassSummary,
-    PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer, SystemPeer,
+    identify, snapshot_digest, spawn_container_wake, with_best_datapath, DockerInstanceSource,
+    EnforcerError, InstanceSource, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport,
+    PassOutcome, PassSummary, PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer,
+    SystemPeer, POLICY_PROTOCOL, PROTOCOL_SNAPSHOT_IN_EVERY_MODE,
 };
 pub use executor::{choose_executor, DockerVmNft, HostNft, NftError, NftExecutor};
 pub use identity::{IdentityEntry, IdentityMap};

@@ -663,7 +663,13 @@ pub struct PlacementSpec {
   priority for every profile.
 - **One egress proxy per node, not per sandbox.**
   - It identifies the workload by source address, from the same identity map
-    the reconciler uses.
+    the reconciler uses. Every node keeps that map and the proxy's table in
+    every mode, `legacy` included: the node mode governs only the packet
+    filter (nftables or eBPF, host-port rules, the restricted DNS view),
+    never whether a node knows its workloads. A `legacy` node receives its
+    snapshot from a per-node cache keyed on the policy revision and answers
+    "unchanged" to an agent that already holds it, so an idle pass stays one
+    query.
   - It applies the workload's hostname and CIDR rules, keeps the public-IP
     check of today's sidecar, and keeps the model, git and MCP relays.
   - It runs inside the node runtime (Rust, the same binary), not as a

@@ -20,6 +20,7 @@ use temps_workload_netpol::dns::NamedWorkload;
 use temps_workload_netpol::{
     Action, Cidr, Direction, EgressPolicy, IdentityMap, L4Protocol, NodeMode, NodePolicy,
     NodePolicyReport, PolicySnapshot, PortRange, Profile, SystemContainer,
+    PROTOCOL_SNAPSHOT_IN_EVERY_MODE,
 };
 
 use crate::error::NetworkPolicyError;
@@ -175,6 +176,10 @@ pub const MAX_REPORTED_ADDRESSES: usize = 4096;
 struct ObservedReport {
     identities: IdentityMap,
     seen: std::time::Instant,
+    /// The node's mode when it reported. Only a node outside `legacy` has
+    /// its workloads handed to other nodes as remote peers, as before
+    /// `legacy` nodes reported anything.
+    mode: NodeMode,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -213,7 +218,7 @@ impl NameRow {
 }
 
 pub struct NetworkPolicyService {
-    db: Arc<DatabaseConnection>,
+    pub(crate) db: Arc<DatabaseConnection>,
     /// Worker id → its agent's last enforcer report. In memory: agents
     /// report on every pass, so a restarted control plane relearns them
     /// within one.
@@ -228,9 +233,11 @@ pub struct NetworkPolicyService {
     pub(crate) recording: crate::recording::RecordingReports,
     /// Whether node 0 (this process) can record.
     pub(crate) local_recording: std::sync::Mutex<temps_workload_netpol::EgressRecordingCapability>,
+    /// Built snapshots of `legacy` nodes ([`crate::idle`]).
+    pub(crate) snapshots: crate::idle::SnapshotCache,
 }
 
-fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkPolicyError> {
+pub(crate) fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkPolicyError> {
     value
         .parse::<NodeMode>()
         .map_err(|e| NetworkPolicyError::Validation {
@@ -248,6 +255,7 @@ impl NetworkPolicyService {
             local_recording: std::sync::Mutex::new(
                 temps_workload_netpol::EgressRecordingCapability::detect(false),
             ),
+            snapshots: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -272,7 +280,7 @@ impl NetworkPolicyService {
     /// `node_id`'s compute subnet, see [`Self::node_snapshot`]). A report
     /// over [`MAX_REPORTED_ADDRESSES`] is refused with a warning, so one
     /// broken node cannot grow every other node's maps.
-    pub fn record_observed(&self, node_id: i32, identities: IdentityMap) {
+    pub fn record_observed(&self, node_id: i32, identities: IdentityMap, mode: NodeMode) {
         let count = identities.address_count();
         if count > MAX_REPORTED_ADDRESSES {
             tracing::warn!(
@@ -289,17 +297,22 @@ impl NetworkPolicyService {
             ObservedReport {
                 identities,
                 seen: std::time::Instant::now(),
+                mode,
             },
         );
     }
 
     /// What every node but `node_id` observed within
     /// [`ENFORCER_REPORT_TTL`], by node.
-    fn observed_elsewhere(&self, node_id: i32) -> Vec<(i32, IdentityMap)> {
+    pub(crate) fn observed_elsewhere(&self, node_id: i32) -> Vec<(i32, IdentityMap)> {
         let observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
         observed
             .iter()
-            .filter(|(id, report)| **id != node_id && report.seen.elapsed() <= ENFORCER_REPORT_TTL)
+            .filter(|(id, report)| {
+                **id != node_id
+                    && report.mode != NodeMode::Legacy
+                    && report.seen.elapsed() <= ENFORCER_REPORT_TTL
+            })
             .map(|(id, report)| (*id, report.identities.clone()))
             .collect()
     }
@@ -827,22 +840,53 @@ impl NetworkPolicyService {
         self.node_snapshot(CONTROL_PLANE_NODE_ID).await
     }
 
-    /// What `node_id` returns to its agent: its mode, and outside `legacy`
-    /// its snapshot. Calling it is the agent's enforcer report.
+    /// What `node_id` returns to its agent: its mode and its snapshot.
+    /// Calling it is the agent's enforcer report.
+    ///
+    /// Outside `legacy` the snapshot is built fresh every pass, as it
+    /// always was. In `legacy` it goes only to an agent that takes one
+    /// ([`PROTOCOL_SNAPSHOT_IN_EVERY_MODE`]); an older agent gets the mode
+    /// alone, as before. It comes from the per-node cache, and an agent
+    /// that already holds it gets `unchanged` instead ([`crate::idle`]).
     pub async fn node_policy(
         &self,
         node_id: i32,
         report: NodePolicyReport,
     ) -> Result<NodePolicy, NetworkPolicyError> {
-        let mode = self.node_mode(node_id).await?;
+        let (mode, revision) = self.mode_and_revision(node_id).await?;
         self.record_enforcer_report(node_id, &report.backend);
         self.record_egress_recording(node_id, report.egress_recording);
-        self.record_observed(node_id, report.identities);
-        let snapshot = match mode {
-            NodeMode::Legacy => None,
-            NodeMode::Shadow | NodeMode::Enforce => Some(self.node_snapshot(node_id).await?),
-        };
-        Ok(NodePolicy { mode, snapshot })
+        self.record_observed(node_id, report.identities, mode);
+        match mode {
+            NodeMode::Shadow | NodeMode::Enforce => Ok(NodePolicy {
+                mode,
+                snapshot: Some(self.node_snapshot(node_id).await?),
+                ..Default::default()
+            }),
+            NodeMode::Legacy if report.protocol < PROTOCOL_SNAPSHOT_IN_EVERY_MODE => {
+                Ok(NodePolicy {
+                    mode,
+                    ..Default::default()
+                })
+            }
+            NodeMode::Legacy => {
+                let (snapshot, digest) = self.cached_snapshot(node_id, revision).await?;
+                if report.held_snapshot.as_deref() == Some(digest.as_str()) {
+                    return Ok(NodePolicy {
+                        mode,
+                        snapshot: None,
+                        snapshot_digest: Some(digest),
+                        unchanged: true,
+                    });
+                }
+                Ok(NodePolicy {
+                    mode,
+                    snapshot: Some((*snapshot).clone()),
+                    snapshot_digest: Some(digest),
+                    unchanged: false,
+                })
+            }
+        }
     }
 
     /// Everything `node_id` needs to enforce, for every workload. A node
@@ -1372,7 +1416,11 @@ mod remote_tests {
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = NetworkPolicyService::new(Arc::new(db));
         let alpha = WorkloadRef::new(WorkloadKind::Deployment, 1);
-        service.record_observed(3, IdentityMap::new().with(alpha, ip("10.202.0.2")));
+        service.record_observed(
+            3,
+            IdentityMap::new().with(alpha, ip("10.202.0.2")),
+            NodeMode::Enforce,
+        );
 
         let seen_by = |node| {
             service
@@ -1392,7 +1440,7 @@ mod remote_tests {
         for n in 0..=MAX_REPORTED_ADDRESSES as u32 {
             flood.insert(alpha, std::net::IpAddr::V4(std::net::Ipv4Addr::from(n)));
         }
-        service.record_observed(4, flood);
+        service.record_observed(4, flood, NodeMode::Enforce);
         assert!(seen_by(3).is_empty(), "an oversized report is ignored");
     }
 

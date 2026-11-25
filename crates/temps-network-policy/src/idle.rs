@@ -1,0 +1,485 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Keeping a pass cheap when nothing changed.
+//!
+//! Every node gets its snapshot in every mode, so it knows its workloads
+//! and the egress proxy can identify a caller. Building a snapshot reads a
+//! dozen tables, which a node in `legacy` (the default for every install)
+//! must not pay every 15 seconds. So for `legacy`:
+//!
+//! - the node's mode and the policy revision come from **one query**
+//!   ([`NetworkPolicyService::mode_and_revision`]), as cheap as reading the
+//!   mode was;
+//! - the built snapshot is cached per node ([`CachedSnapshot`]) and reused
+//!   while the revision and the other nodes' shared observations are
+//!   unchanged. `network_policy_state.revision` is bumped by statement
+//!   triggers on every table a snapshot reads (m20261022_000007 and
+//!   m20261125_000002), so a change is never missed; the cache is also
+//!   rebuilt after [`SNAPSHOT_CACHE_MAX_AGE`] for what no trigger sees
+//!   (the host's routes, reports expiring);
+//! - the agent sends back the digest of the snapshot it holds, and the
+//!   answer to an equal digest is `unchanged`, with no snapshot.
+//!
+//! `shadow` and `enforce` are not cached: those nodes get a freshly built
+//! snapshot every pass, exactly as before.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
+use temps_workload_netpol::{snapshot_digest, NodeMode, PolicySnapshot};
+
+use crate::error::NetworkPolicyError;
+use crate::service::{parse_mode, NetworkPolicyService, CONTROL_PLANE_NODE_ID};
+
+/// The longest a cached snapshot is reused, whatever the revision says.
+pub const SNAPSHOT_CACHE_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// A node's built snapshot and what it was built from.
+#[derive(Debug, Clone)]
+pub(crate) struct CachedSnapshot {
+    revision: i64,
+    observed: u64,
+    built: Instant,
+    snapshot: Arc<PolicySnapshot>,
+    digest: String,
+}
+
+pub(crate) type SnapshotCache = std::sync::Mutex<std::collections::HashMap<i32, CachedSnapshot>>;
+
+#[derive(Debug, FromQueryResult)]
+struct ModeAndRevision {
+    mode: String,
+    revision: i64,
+}
+
+const WORKER_MODE_SQL: &str = "\
+    SELECT n.network_policy_mode AS mode, \
+           COALESCE((SELECT revision FROM network_policy_state WHERE id = 0), 0) AS revision \
+    FROM nodes n WHERE n.id = $1";
+
+const CONTROL_PLANE_MODE_SQL: &str = "\
+    SELECT c.network_policy_mode AS mode, \
+           COALESCE((SELECT revision FROM network_policy_state WHERE id = 0), 0) AS revision \
+    FROM control_plane_node_settings c WHERE c.id = 0";
+
+impl NetworkPolicyService {
+    /// The node's mode and the policy revision, in one query.
+    pub async fn mode_and_revision(
+        &self,
+        node_id: i32,
+    ) -> Result<(NodeMode, i64), NetworkPolicyError> {
+        let statement = if node_id == CONTROL_PLANE_NODE_ID {
+            Statement::from_string(DatabaseBackend::Postgres, CONTROL_PLANE_MODE_SQL)
+        } else {
+            Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                WORKER_MODE_SQL,
+                [node_id.into()],
+            )
+        };
+        let row = ModeAndRevision::find_by_statement(statement)
+            .one(self.db.as_ref())
+            .await
+            .map_err(NetworkPolicyError::db(
+                "read a node's network policy mode and the policy revision",
+            ))?;
+        match row {
+            Some(row) => Ok((parse_mode(node_id, &row.mode)?, row.revision)),
+            None if node_id == CONTROL_PLANE_NODE_ID => {
+                // The settings row was removed: recreated with the default.
+                let mode = self.node_mode(node_id).await?;
+                Ok((mode, self.revision().await?))
+            }
+            None => Err(NetworkPolicyError::NodeNotFound { node_id }),
+        }
+    }
+
+    /// `node_id`'s snapshot and its digest, rebuilt only when the revision,
+    /// the observations shared by other nodes, or [`SNAPSHOT_CACHE_MAX_AGE`]
+    /// says so.
+    pub async fn cached_snapshot(
+        &self,
+        node_id: i32,
+        revision: i64,
+    ) -> Result<(Arc<PolicySnapshot>, String), NetworkPolicyError> {
+        let observed = self.observed_key(node_id);
+        {
+            let cache = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(&node_id).filter(|c| {
+                c.revision == revision
+                    && c.observed == observed
+                    && c.built.elapsed() < SNAPSHOT_CACHE_MAX_AGE
+            }) {
+                return Ok((hit.snapshot.clone(), hit.digest.clone()));
+            }
+        }
+        let snapshot = Arc::new(self.node_snapshot(node_id).await?);
+        let digest = snapshot_digest(&snapshot);
+        let mut cache = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            node_id,
+            CachedSnapshot {
+                revision,
+                observed,
+                built: Instant::now(),
+                snapshot: snapshot.clone(),
+                digest: digest.clone(),
+            },
+        );
+        Ok((snapshot, digest))
+    }
+
+    /// A digest of what other nodes share with `node_id` (their live
+    /// observations outside `legacy`), which is part of its snapshot but
+    /// not of the database revision. In memory.
+    fn observed_key(&self, node_id: i32) -> u64 {
+        let mut elsewhere = self.observed_elsewhere(node_id);
+        elsewhere.sort_by_key(|(id, _)| *id);
+        let mut hasher = DefaultHasher::new();
+        for (id, identities) in &elsewhere {
+            id.hash(&mut hasher);
+            serde_json::to_string(identities)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temps_test_utils::TestDatabase;
+    use temps_workload::{WorkloadKind, WorkloadRef};
+    use temps_workload_netpol::{IdentityMap, NodePolicy, NodePolicyReport, POLICY_PROTOCOL};
+
+    /// A service on its own connection, counting every statement it runs.
+    async fn counted(db: &TestDatabase) -> (NetworkPolicyService, Arc<AtomicUsize>) {
+        let mut conn: DatabaseConnection = Database::connect(&db.database_url)
+            .await
+            .expect("connect to the test database");
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        conn.set_metric_callback(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+        (NetworkPolicyService::new(Arc::new(conn)), count)
+    }
+
+    async fn insert_id(db: &TestDatabase, sql: &str) -> i32 {
+        db.connection()
+            .query_one(Statement::from_string(DatabaseBackend::Postgres, sql))
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .unwrap_or_else(|| panic!("{sql}: no row"))
+            .try_get_by_index::<i32>(0)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    /// A migrated database with one worker, in `legacy`, and two live
+    /// sandboxes on it (or `None` without Docker).
+    async fn fixture() -> Option<(TestDatabase, i32)> {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Docker/TimescaleDB unavailable, skipping: {e}");
+                return None;
+            }
+        };
+        let worker = insert_id(
+            &db,
+            "INSERT INTO nodes (name, token_hash, address, private_address, compute_cidr) \
+             VALUES ('worker-1', 'x', 'https://10.201.0.9:3100', '10.201.0.9', '10.202.1.0/24') \
+             RETURNING id",
+        )
+        .await;
+        db.connection()
+            .execute_unprepared(&format!(
+                "INSERT INTO users (id, name, email) VALUES (8101, 'Owner', 'owner@example.com'); \
+                 INSERT INTO projects (id, name, slug, repo_name, repo_owner, directory, \
+                   main_branch, preset, created_at, updated_at) \
+                 VALUES (8101, 'Agent', 'agent-idle', 'agent', 'example', '/', 'main', 'static', \
+                   now(), now()); \
+                 INSERT INTO sandboxes (id, public_id, name, user_id, project_id, status, backend, \
+                   node_id) VALUES \
+                   (8101, 'sbx_00000000000d8101', 'a', 8101, 8101, 'running', 'docker', {worker}), \
+                   (8102, 'sbx_00000000000d8102', 'b', 8101, 8101, 'running', 'docker', {worker})"
+            ))
+            .await
+            .expect("seed");
+        Some((db, worker))
+    }
+
+    fn new_agent(held: Option<&str>) -> NodePolicyReport {
+        NodePolicyReport {
+            backend: "nftables".into(),
+            protocol: POLICY_PROTOCOL,
+            held_snapshot: held.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn old_agent() -> NodePolicyReport {
+        NodePolicyReport {
+            backend: "nftables".into(),
+            ..Default::default()
+        }
+    }
+
+    fn bytes(policy: &NodePolicy) -> usize {
+        serde_json::to_vec(policy).map(|b| b.len()).unwrap_or(0)
+    }
+
+    /// The idle pass, measured. Before this change a `legacy` pass was one
+    /// query (the mode) and a mode-only answer. Sending the snapshot every
+    /// pass would cost a full build; the cache and the digest bring an
+    /// unchanged pass back to one query and a mode-plus-digest answer.
+    #[tokio::test]
+    async fn an_idle_legacy_pass_costs_one_query_and_no_snapshot() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        let (service, queries) = counted(&db).await;
+
+        // An old agent: exactly today's answer.
+        queries.store(0, Ordering::Relaxed);
+        let old = service.node_policy(worker, old_agent()).await.unwrap();
+        let old_queries = queries.load(Ordering::Relaxed);
+        assert!(old.snapshot.is_none() && old.snapshot_digest.is_none() && !old.unchanged);
+
+        // A new agent's first pass: the full snapshot, built once.
+        queries.store(0, Ordering::Relaxed);
+        let first = service.node_policy(worker, new_agent(None)).await.unwrap();
+        let build_queries = queries.load(Ordering::Relaxed);
+        let digest = first.snapshot_digest.clone().expect("a digest");
+        assert!(first.snapshot.is_some());
+
+        // Later passes from an agent that holds it: unchanged.
+        queries.store(0, Ordering::Relaxed);
+        let idle = service
+            .node_policy(worker, new_agent(Some(&digest)))
+            .await
+            .unwrap();
+        let idle_queries = queries.load(Ordering::Relaxed);
+        assert!(idle.unchanged && idle.snapshot.is_none());
+        assert_eq!(idle.snapshot_digest.as_deref(), Some(digest.as_str()));
+
+        // Without the digest the cache still saves the build.
+        queries.store(0, Ordering::Relaxed);
+        let resent = service.node_policy(worker, new_agent(None)).await.unwrap();
+        let resend_queries = queries.load(Ordering::Relaxed);
+        assert!(resent.snapshot.is_some());
+
+        println!(
+            "idle legacy pass: before (old agent) {old_queries} queries, {} B answer; \
+             full snapshot {build_queries} queries, {} B answer; \
+             after (unchanged) {idle_queries} queries, {} B answer; \
+             snapshot from the cache without a digest {resend_queries} queries, {} B",
+            bytes(&old),
+            bytes(&first),
+            bytes(&idle),
+            bytes(&resent)
+        );
+        assert_eq!(
+            old_queries, 1,
+            "an old agent's pass is one query, as before"
+        );
+        assert_eq!(idle_queries, 1, "an unchanged pass is one query");
+        assert_eq!(resend_queries, 1, "a cached snapshot is not rebuilt");
+        assert!(
+            build_queries > 5,
+            "a build reads many tables: {build_queries}"
+        );
+        assert!(bytes(&idle) < 80, "{}", bytes(&idle));
+    }
+
+    /// Every input a snapshot reads moves the revision, so the cache never
+    /// serves a snapshot older than the data it came from.
+    #[tokio::test]
+    async fn a_change_a_snapshot_depends_on_rebuilds_it() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        let (service, _) = counted(&db).await;
+        let digest = |p: &NodePolicy| p.snapshot_digest.clone().unwrap();
+        let mut held = digest(&service.node_policy(worker, new_agent(None)).await.unwrap());
+        let revision = || async { service.revision().await.unwrap() };
+        for (what, sql) in [
+            (
+                "a sandbox opting in to recording",
+                "UPDATE sandboxes SET egress_recording = true WHERE id = 8101".to_string(),
+            ),
+            (
+                "a sandbox destroyed",
+                "UPDATE sandboxes SET status = 'destroyed' WHERE id = 8102".to_string(),
+            ),
+            (
+                "another node joining",
+                "INSERT INTO nodes (name, token_hash, address, private_address) \
+                 VALUES ('worker-9', 'z', 'https://10.201.0.99:3100', '10.201.0.99')"
+                    .to_string(),
+            ),
+        ] {
+            let before = revision().await;
+            db.connection().execute_unprepared(&sql).await.unwrap();
+            assert!(revision().await > before, "{what} bumps the revision");
+            let answer = service
+                .node_policy(worker, new_agent(Some(&held)))
+                .await
+                .unwrap();
+            assert!(!answer.unchanged, "{what}: a fresh snapshot");
+            held = digest(&answer);
+        }
+        // A change that does not alter this node's snapshot moves the
+        // revision, rebuilds, and still answers unchanged.
+        let before = revision().await;
+        db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE nodes SET compute_cidr = '10.202.9.0/24' WHERE id = {worker}"
+            ))
+            .await
+            .unwrap();
+        assert!(
+            revision().await > before,
+            "a compute subnet bumps the revision"
+        );
+        assert!(
+            service
+                .node_policy(worker, new_agent(Some(&held)))
+                .await
+                .unwrap()
+                .unchanged
+        );
+        // Heartbeats and activity do not.
+        let before = revision().await;
+        db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE nodes SET last_heartbeat = now() WHERE id = {worker}; \
+                 UPDATE sandboxes SET last_activity_at = now() WHERE id = 8101"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revision().await, before);
+        let answer = service
+            .node_policy(worker, new_agent(Some(&held)))
+            .await
+            .unwrap();
+        assert!(answer.unchanged);
+        // The opted-in sandbox is marked in the snapshot a legacy node holds.
+        let snapshot = service.cached_snapshot(worker, before).await.unwrap().0;
+        assert!(snapshot
+            .egress
+            .iter()
+            .any(|p| p.subject == WorkloadRef::new(WorkloadKind::Sandbox, 8101) && p.record));
+    }
+
+    /// A node outside `legacy` gets exactly what it got before: a freshly
+    /// built snapshot every pass, never `unchanged`, never a digest.
+    #[tokio::test]
+    async fn shadow_and_enforce_nodes_are_answered_as_before() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE nodes SET network_policy_mode = 'shadow' WHERE id = {worker}"
+            ))
+            .await
+            .unwrap();
+        let (service, queries) = counted(&db).await;
+        for report in [new_agent(Some("anything")), old_agent()] {
+            queries.store(0, Ordering::Relaxed);
+            let answer = service.node_policy(worker, report).await.unwrap();
+            assert!(answer.snapshot.is_some() && !answer.unchanged);
+            assert_eq!(answer.snapshot_digest, None);
+            assert!(queries.load(Ordering::Relaxed) > 5, "built fresh, uncached");
+        }
+    }
+
+    /// Observations are reported in every mode, but only a node outside
+    /// `legacy` has its workloads handed to other nodes, as before.
+    #[tokio::test]
+    async fn legacy_observations_are_not_shared_with_other_nodes() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        let other = insert_id(
+            &db,
+            "INSERT INTO nodes (name, token_hash, address, private_address, compute_cidr) \
+             VALUES ('worker-2', 'y', 'https://10.201.0.10:3100', '10.201.0.10', '10.202.2.0/24') \
+             RETURNING id",
+        )
+        .await;
+        let (service, _) = counted(&db).await;
+        let sandbox = WorkloadRef::new(WorkloadKind::Sandbox, 8101);
+        let report = |mode_identities: IdentityMap| NodePolicyReport {
+            identities: mode_identities,
+            ..new_agent(None)
+        };
+        let seen = IdentityMap::new().with(sandbox, "10.202.1.5".parse().unwrap());
+        service
+            .node_policy(worker, report(seen.clone()))
+            .await
+            .unwrap();
+        let snapshot = service.node_snapshot(other).await.unwrap();
+        assert_eq!(
+            snapshot.remote.addresses(&sandbox).count(),
+            0,
+            "a legacy node's workloads are not remote peers"
+        );
+        db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE nodes SET network_policy_mode = 'shadow' WHERE id = {worker}"
+            ))
+            .await
+            .unwrap();
+        service.node_policy(worker, report(seen)).await.unwrap();
+        let snapshot = service.node_snapshot(other).await.unwrap();
+        assert_eq!(snapshot.remote.addresses(&sandbox).count(), 1);
+    }
+
+    /// Node 0 reads its mode and the revision in one query, and its
+    /// `legacy` snapshot comes from the cache: a steady pass is one query.
+    #[tokio::test]
+    async fn node_zero_in_legacy_takes_its_snapshot_from_the_cache() {
+        use temps_workload_netpol::PolicySource;
+        let Some((db, _)) = fixture().await else {
+            return;
+        };
+        let (service, queries) = counted(&db).await;
+        let source = crate::source::DbPolicySource::new(Arc::new(service), CONTROL_PLANE_NODE_ID);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert!(source.legacy_snapshot().await.unwrap().is_some());
+        queries.store(0, Ordering::Relaxed);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert!(source.legacy_snapshot().await.unwrap().is_some());
+        assert_eq!(
+            queries.load(Ordering::Relaxed),
+            1,
+            "one query per steady pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_node_is_not_found() {
+        let Some((db, _)) = fixture().await else {
+            return;
+        };
+        let (service, _) = counted(&db).await;
+        assert!(matches!(
+            service.mode_and_revision(9999).await,
+            Err(NetworkPolicyError::NodeNotFound { node_id: 9999 })
+        ));
+        let (mode, _) = service
+            .mode_and_revision(CONTROL_PLANE_NODE_ID)
+            .await
+            .unwrap();
+        assert_eq!(mode, NodeMode::Legacy);
+    }
+}
