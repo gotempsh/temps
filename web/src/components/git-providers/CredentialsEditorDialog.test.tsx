@@ -98,3 +98,42 @@ test('a failed save says why beside the buttons and keeps what was typed', async
     expect(view.queryByText(/Credentials were not saved/)).toBeNull()
   )
 })
+
+test('the dialog stays open while a save is in flight', async () => {
+  let release: () => void = () => {}
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  mockApi({
+    'PATCH /git-providers/4/credentials': async () => {
+      await held
+      return jsonResponse({ ...provider, updated_fields: ['password'] })
+    },
+  })
+  const closes: boolean[] = []
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+      }
+    >
+      <CredentialsEditorDialog
+        provider={provider}
+        open
+        onOpenChange={(next) => closes.push(next)}
+      />
+    </QueryClientProvider>
+  )
+
+  fireEvent.change(view.getByLabelText('Password or token'), {
+    target: { value: 'new-app-password' },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Save Credentials' }))
+  await view.findByText('Saving…')
+
+  fireEvent.keyDown(view.getByRole('dialog'), { key: 'Escape' })
+  expect(closes).toEqual([])
+
+  release()
+  await waitFor(() => expect(closes).toEqual([false]))
+})

@@ -64,6 +64,9 @@ export function CredentialsEditorDialog({
   })
 
   const handleOpenChange = (next: boolean) => {
+    // A save in flight keeps the dialog open: closing would not cancel the
+    // request, and its success would later clear a reopened form.
+    if (!next && mutation.isPending) return
     // Reopening starts from a clean form, without the last attempt's error.
     if (!next) mutation.reset()
     onOpenChange(next)
