@@ -1822,12 +1822,7 @@ async fn proxy_upgrade(
     if status != StatusCode::SWITCHING_PROTOCOLS {
         let mut resp = Response::new(Body::from(leftover));
         *resp.status_mut() = status;
-        for (name, value) in headers_out.iter() {
-            if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
-                continue;
-            }
-            resp.headers_mut().insert(name.clone(), value.clone());
-        }
+        relay_response_headers(&headers_out, resp.headers_mut(), false);
         return resp;
     }
 
@@ -1842,11 +1837,7 @@ async fn proxy_upgrade(
     // there and must round-trip unchanged.
     let mut client_resp = Response::new(Body::empty());
     *client_resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    for (name, value) in response_bytes.iter().filter(|(name, _)| app_may_send(name)) {
-        client_resp
-            .headers_mut()
-            .insert(name.clone(), value.clone());
-    }
+    relay_response_headers(&response_bytes, client_resp.headers_mut(), true);
 
     // Spawn the bidirectional copy after the response is sent. We
     // need to detach the futures since axum returns the response
@@ -2274,18 +2265,27 @@ async fn forward_once(
 
     // Capture status + headers BEFORE consuming the response body
     // stream — `bytes_stream(self)` takes the response by value.
-    let status = upstream.status();
-    let upstream_headers_owned = upstream.headers().clone();
+    let mut out = Response::new(Body::empty());
+    *out.status_mut() = upstream.status();
+    relay_response_headers(upstream.headers(), out.headers_mut(), false);
+    *out.body_mut() = Body::from_stream(upstream.bytes_stream());
+    out
+}
 
-    let mut out = Response::new(Body::from_stream(upstream.bytes_stream()));
-    *out.status_mut() = status;
-    for (name, value) in upstream_headers_owned.iter() {
-        if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
+/// Copy an app's response headers onto the response the client gets.
+///
+/// Always appends: a field may repeat, and `Set-Cookie` must never be folded
+/// into one (RFC 6265 §3). `HeaderMap::insert` keeps only the last value of a
+/// name, so a sign-in setting several cookies would reach the browser with
+/// the last one alone (#2043). `keep_hop_by_hop` is for a 101, whose
+/// `Connection` and `Upgrade` the client needs.
+fn relay_response_headers(upstream: &HeaderMap, out: &mut HeaderMap, keep_hop_by_hop: bool) {
+    for (name, value) in upstream {
+        if (!keep_hop_by_hop && HOP_BY_HOP.contains(&name.as_str())) || !app_may_send(name) {
             continue;
         }
-        out.headers_mut().insert(name.clone(), value.clone());
+        out.append(name.clone(), value.clone());
     }
-    out
 }
 
 /// Whether an app's response may carry `name` to the client. No app, gated
@@ -2396,6 +2396,37 @@ mod tests {
             shield: None,
             allowed_callers: Vec::new(),
             allowed_sandboxes: Vec::new(),
+        }
+    }
+
+    /// #2043: repeated fields survive the relay in order, on an ordinary
+    /// response and on a 101 alike; a 101 alone keeps `Connection` and
+    /// `Upgrade`, and the gate header never passes.
+    #[test]
+    fn relayed_response_headers_keep_every_repeated_field() {
+        let mut upstream = HeaderMap::new();
+        for cookie in ["a=1; Path=/", "b=2; Path=/", "c=3; Path=/"] {
+            upstream.append("set-cookie", HeaderValue::from_static(cookie));
+        }
+        upstream.insert("connection", HeaderValue::from_static("upgrade"));
+        upstream.insert("upgrade", HeaderValue::from_static("websocket"));
+        upstream.insert(
+            temps_core::gate::GATE_HEADER,
+            HeaderValue::from_static("sign-in"),
+        );
+
+        for keep_hop_by_hop in [false, true] {
+            let mut out = HeaderMap::new();
+            relay_response_headers(&upstream, &mut out, keep_hop_by_hop);
+            let cookies: Vec<_> = out.get_all("set-cookie").iter().collect();
+            assert_eq!(
+                cookies,
+                vec!["a=1; Path=/", "b=2; Path=/", "c=3; Path=/"],
+                "keep_hop_by_hop={keep_hop_by_hop}"
+            );
+            assert_eq!(out.contains_key("connection"), keep_hop_by_hop);
+            assert_eq!(out.contains_key("upgrade"), keep_hop_by_hop);
+            assert!(!out.contains_key(temps_core::gate::GATE_HEADER));
         }
     }
 
