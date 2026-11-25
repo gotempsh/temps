@@ -116,30 +116,33 @@ Two consumers read them already: a Cloudflare connector's spec takes its trusted
 
 ### D3. Providers contribute steps; the engine runs them
 
-The engine keeps the steps every way in shares: `SaveDnsProvider`, `ManageDomain`, `AttachDomain`, `SetDnsRecord`, `ShowDnsRecord`, `IssueCertificate`, `SetAudience`, `SetHttpPolicy`, `WaitForPublication` and `CheckReachability`. The rest move to their providers:
+The engine keeps the steps every way in shares, and the steps every tunnel shares: `SaveDnsProvider`, `ManageDomain`, `AttachDomain`, `SetDnsRecord`, `ShowDnsRecord`, `IssueCertificate`, `SetAudience`, `SetHttpPolicy`, `WaitForPublication`, `CheckReachability`, and `WaitForTunnel`, `RouteHostname` and `PublishEnvironmentHosts` (ADR-068 D3). The tunnel steps act on Temps' own connector rows through the connector service, whose provider-specific half is already the `TunnelProvider` trait (ADR-058), so a second tunnel provider shares them as they are. The rest move to their providers:
 
-- **Cloudflare:** `CheckToken`, `CreateTunnel`, `WaitForTunnel`, `RouteHostname`, `PublishEnvironmentHosts` (ADR-068 D3), `RedirectToHttps` and `StandardPortsOnly` (Cloudflare edge rules, ADR-070 D1), and `AccessApp`. Access only ever fronts a tunnel (ADR-065 D9), so it is a Cloudflare step, not a separate kind of provider.
+- **Cloudflare:** `CheckToken` (its API token), `CreateTunnel` (a Cloudflare connector on a Cloudflare account), `RedirectToHttps` and `StandardPortsOnly` (Cloudflare edge rules, ADR-070 D1), and `AccessApp`. Access only ever fronts a tunnel (ADR-065 D9), so it is a Cloudflare step, not a separate kind of provider.
 - **Tailscale:** `SaveTailscaleCredential`, `DefineTailscaleService`, `ConfigureTailscaleServe` and `WaitForServiceApproval`.
 
-A step moves back into the engine when a second provider needs it. Each provider step implements:
+A step moves back into the engine when a second provider needs it. A provider contributes its steps for one run, and finds and undoes what they journaled:
 
 ```rust
 #[async_trait]
-pub trait ProviderStep: Send + Sync {
-    /// What the step makes, and how a lookup finds it: immediately, or
-    /// settled after two misses (ADR-064 D4, ADR-065 D4).
-    fn intent(&self) -> JournalIntent;
-    /// Authoritative lookup, before applying and when resuming.
-    async fn find(&self, deps: &StepDeps<'_>) -> Result<Found, IngressError>;
-    async fn apply(&self, deps: &StepDeps<'_>) -> Result<Applied, IngressError>;
-    /// Remove only what this run made; a changed resource is a conflict.
-    async fn undo(&self, deps: &StepDeps<'_>) -> Result<Undone, IngressError>;
+pub trait ProviderRun: Send + Sync {
+    fn runs(&self, kind: StepKind) -> bool;
+    async fn step(&self, run: &mut dyn StepRun, kind: StepKind) -> Outcome;
+    /// The journal intents and resources this provider finds and removes.
+    fn owns(&self, intent: &Intent) -> bool;
+    fn owns_resource(&self, resource: &RunResource) -> bool;
+    /// Authoritative lookup, when resolving a pending entry.
+    async fn look(&self, run_id: i32, intent: &Intent) -> Result<Found, String>;
+    /// Before removing: still what the run made, gone, no longer the run's,
+    /// changed since (undo pauses), or unreadable (undo stops).
+    async fn check_undo(&self, resource: &RunResource, checked: bool) -> UndoCheck;
+    async fn remove(&self, resource: &RunResource) -> Result<(), String>;
 }
 ```
 
-Journal, fingerprint, conflicts and undo order stay the engine's and keep ADR-064 D4's rules. A provider cannot skip the journal, because the engine writes the entry before calling `apply`.
+A step reaches the run only through `StepRun`, which the engine implements: the run's input, `begin` before a creating call, `finish` or `finish_failed` after it, and the few facts steps hand each other (the DNS provider saved, the tunnel made, the gate in front of the address). Journal, fingerprint, conflicts and undo order stay the engine's and keep ADR-064 D4's rules. A provider cannot skip the journal: `begin` stores the pending entry, and refuses, before the provider's call.
 
-The provider-specific methods of `RunOps` move into the providers' `StepDeps`. `RunOps` keeps the generic ones (DNS, domains, certificates, audience, HTTP policy, environment hosts, sleep).
+The provider-specific methods of `RunOps` move into each provider's own ops trait (`CloudflareOps`), which the live ops and the test fake both implement. `RunOps` keeps the generic ones (DNS, domains, certificates, connectors, hostname choices, audience, HTTP policy, environment hosts, sleep), and `RunOps::providers()` lists the providers of a run from the registry.
 
 ### D4. Where traffic arrives is the provider's declaration, and only there is anything trusted
 
