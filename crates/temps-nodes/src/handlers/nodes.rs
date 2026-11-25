@@ -7702,6 +7702,10 @@ mod tests {
             db.as_ref(),
             "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=",
             Some("198.51.100.1:51820".parse().unwrap()),
+            &temps_network::mesh::load_settings(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -7886,6 +7890,10 @@ mod tests {
             db.as_ref(),
             "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=",
             Some("198.51.100.1:51820".parse().unwrap()),
+            &temps_network::mesh::load_settings(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();

@@ -1130,11 +1130,46 @@ mod tests {
             .await
             .unwrap();
         const CONTROL_PLANE_KEY: &str = "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=";
+        let built_for = temps_network::mesh::load_settings(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            temps_network::mesh::publish_control_plane(db.as_ref(), CONTROL_PLANE_KEY, None)
-                .await
-                .unwrap(),
+            temps_network::mesh::publish_control_plane(
+                db.as_ref(),
+                CONTROL_PLANE_KEY,
+                None,
+                &built_for
+            )
+            .await
+            .unwrap(),
             "an enabled mesh publishes the control plane's key"
+        );
+        // An end set up for another listen port is not published: workers
+        // would dial a port the mesh no longer uses.
+        let other_port = temps_network::mesh::MeshSettings {
+            port: built_for.port + 1,
+            ..built_for.clone()
+        };
+        assert!(
+            !temps_network::mesh::publish_control_plane(
+                db.as_ref(),
+                "b3RoZXItY29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXM=",
+                Some("198.51.100.1:51821".parse().unwrap()),
+                &other_port
+            )
+            .await
+            .unwrap(),
+            "an end built for other settings is not published"
+        );
+        assert_eq!(
+            temps_network::mesh::published_control_plane(db.as_ref())
+                .await
+                .unwrap()
+                .map(|published| published.public_key)
+                .as_deref(),
+            Some(CONTROL_PLANE_KEY),
+            "the stale end did not replace the published one"
         );
         let audit = Arc::new(RecordingAuditLogger::default());
         let router = || shared_app(db.clone(), allow(), audit.clone());
@@ -1210,9 +1245,14 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(
-            !temps_network::mesh::publish_control_plane(db.as_ref(), CONTROL_PLANE_KEY, None)
-                .await
-                .unwrap(),
+            !temps_network::mesh::publish_control_plane(
+                db.as_ref(),
+                CONTROL_PLANE_KEY,
+                None,
+                &built_for
+            )
+            .await
+            .unwrap(),
             "nothing is published while the mesh is off"
         );
         assert!(temps_network::mesh::published_control_plane(db.as_ref())

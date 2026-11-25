@@ -1289,18 +1289,25 @@ mod db {
     }
 
     /// Record the control plane's public key, and the endpoint workers dial
-    /// if it has one, so workers can peer with it. Returns whether it is
-    /// published: nothing is written while the mesh is off, checked under
-    /// the row lock [`disable`] takes, so a setup that finishes after a
-    /// disable cannot publish the key again for a later enable to expose.
+    /// if it has one, so workers can peer with it. `built_for` is the mesh
+    /// settings the control plane's end was set up for.
+    ///
+    /// Returns whether it is published. Nothing is written unless the mesh
+    /// is on with exactly those settings, checked under the row lock
+    /// [`disable`] and [`enable`] take: a setup that finishes after the mesh
+    /// was turned off, or turned off and on again with another pool or port,
+    /// must not publish an endpoint built for settings the mesh no longer
+    /// has. The control plane's reconciler sees the changed settings and
+    /// sets its end up again, and that setup publishes.
     pub async fn publish_control_plane(
         db: &DatabaseConnection,
         public_key: &str,
         endpoint: Option<SocketAddr>,
+        built_for: &MeshSettings,
     ) -> Result<bool, MeshError> {
         let txn = db.begin().await?;
         let cfg = lock_config(&txn).await?;
-        if !cfg.wireguard_enabled {
+        if settings_from(&cfg)?.as_ref() != Some(built_for) {
             return Ok(false);
         }
         let endpoint = endpoint.map(|endpoint| endpoint.to_string());
