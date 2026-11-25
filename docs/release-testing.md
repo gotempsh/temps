@@ -1069,10 +1069,11 @@ and registry contents produce the same files, and a second run changes nothing.
   releases `0.1.0`. A user matches SDKs to a server by version alone. The
   commits since each package's last release are still listed in the prep PR. A
   server version already published, or below a version the registry or package
-  tags already have, stops preparation. Registry versions are compared by the
-  registry's own ordering (SemVer for npm, crates.io and Go, so an npm
-  `-canary.1` counts; PEP 440 for PyPI, so a `.devN` counts), and one that cannot
-  be ordered stops preparation too. A server tag outside
+  tags already have, stops preparation. Registry and package-tag versions are
+  compared by the registry's own ordering (SemVer for npm, crates.io and Go, so
+  an npm `-canary.1` counts and `+build` metadata makes no new version; PEP 440
+  for PyPI, so a `.devN` counts), and one that cannot be ordered stops
+  preparation too. A server tag outside
   `X.Y.Z[-(alpha|beta|rc).N]` cannot version SDKs and is refused.
 - **Own version lines.** A catalog entry's `versioning` overrides that:
   `independent` keeps the package on its own line, bumped from its commits by

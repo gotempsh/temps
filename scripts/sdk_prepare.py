@@ -128,23 +128,24 @@ def follows_server(state, server):
 
 
 def at_or_above(state, version, *, inclusive):
-    """Tagged and registry versions of the package above `version` (or equal, when inclusive).
+    """Package-tag and registry versions of the package above `version` (or equal, when inclusive).
 
-    Registry versions are ordered by the registry's own rules, so a version
-    `Version` cannot represent (an npm `0.3.0-canary.1`, a PyPI `0.2.0.dev1`)
-    still counts; one that cannot be ordered at all stops preparation.
+    Both are ordered by the registry's own rules, so a version `Version` cannot
+    represent (an npm `0.3.0-canary.1`, a PyPI `0.2.0.dev1`) still counts, and one
+    differing only in build metadata (`0.1.0-beta.64+build.5`) is equal. A version
+    that cannot be ordered at all stops preparation.
     """
-    kind = state.package['kind']
+    kind, name = state.package['kind'], state.package['name']
     key = precedence(version.format(kind), kind)
-    found = [tag.format(kind) for tag in state.tagged
-             if tag.key() > version.key() or (inclusive and tag.key() == version.key())]
-    for text in sorted(state.registry_texts):
-        other = precedence(text, kind)
-        if other is None:
-            raise ValueError(f"{state.package['name']}: cannot order registry version {text!r} against "
-                             f"{version.format(kind)}; resolve it on the registry before preparing")
-        if other > key or (inclusive and other == key):
-            found.append(text)
+    found = []
+    for source, texts in (('package tag', state.tag_texts), ('registry version', state.registry_texts)):
+        for text in sorted(texts):
+            other = precedence(text, kind)
+            if other is None:
+                raise ValueError(f'{name}: cannot order {source} {text!r} against {version.format(kind)}; '
+                                 f'resolve it before preparing')
+            if other > key or (inclusive and other == key):
+                found.append(text)
     return found
 
 
@@ -442,7 +443,7 @@ class Assessment:
     dependencies: list = field(default_factory=list)
     version: Version | None = None
     server: Version | None = None  # set when the package releases at the server version
-    tagged: set = field(default_factory=set)  # versions of this package's own release tags
+    tag_texts: set = field(default_factory=set)  # this package's release tags, as versions spelled in the tag
     registry_texts: set = field(default_factory=set)  # every registry version, as the registry spells it
 
     def selected(self, target):
@@ -474,8 +475,9 @@ def assess(package, catalog, history, published):
     kind = package['kind']
     current = Version.parse(package['version'], kind)
     prefix = release.package_tag(package['key'], package, '')
-    tagged = {}
+    tagged, tag_texts = {}, set()
     for tag in history.tags(prefix):
+        tag_texts.add(tag.removeprefix(prefix))
         try:
             tagged[tag] = Version.parse(tag.removeprefix(prefix), kind)
         except ValueError:
@@ -483,7 +485,7 @@ def assess(package, catalog, history, published):
     texts = set(published(package))
     registry = parse_all(texts, kind)
     state = Assessment(package, current, known=registry | set(tagged.values()), published=registry,
-                       tagged=set(tagged.values()), registry_texts=texts)
+                       tag_texts=tag_texts, registry_texts=texts)
     if tagged:
         tag, state.previous = max(tagged.items(), key=lambda item: item[1].key())
         base = f'refs/tags/{tag}'
@@ -515,7 +517,9 @@ def choose_version(state, target):
     if state.server is not None:
         candidate = state.server
         name = f"{package['name']} {candidate.format(kind)}"
-        if candidate in state.known:
+        # Equal precedence counts as taken: registries refuse a version that differs only in build metadata.
+        if candidate in state.known or at_or_above(state, candidate, inclusive=True) != at_or_above(
+                state, candidate, inclusive=False):
             raise ValueError(f'{name} is already published or tagged; reconcile the registry and package tags first')
         if ahead := at_or_above(state, candidate, inclusive=False):
             raise ValueError(f"{name}: {', '.join(ahead)} {'is' if len(ahead) == 1 else 'are'} already published "
@@ -887,20 +891,33 @@ def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
     hidden_tags = {entry['tag'] for entry in planned}
     # By catalog key: packages on different registries can share a name (the Python and
     # Rust plugin SDKs are both `temps-plugin-sdk`).
-    hidden = {entry['key']: {Version.parse(entry['version'], entry['kind'])} for entry in planned}
+    # Each hidden version by `Version` and by registry precedence, so a later release
+    # `Version` cannot represent (an npm canary) is hidden too.
+    hidden = {}
+
+    def hide(key, text, kind):
+        versions, keys = hidden.setdefault(key, (set(), set()))
+        if (order := precedence(text, kind)) is not None:
+            keys.add(order)
+        try:
+            versions.add(Version.parse(text, kind))
+        except ValueError:
+            pass
+
+    for entry in planned:
+        hide(entry['key'], entry['version'], entry['kind'])
     reachable = history.reachable_tags()
     for package in release.catalog_packages(root):
         prefix = release.package_tag(package['key'], package, '')
         for later in (tag for tag in history.tags(prefix) if tag not in reachable):
             hidden_tags.add(later)
-            try:
-                hidden.setdefault(package['key'], set()).add(Version.parse(later.removeprefix(prefix), package['kind']))
-            except ValueError:
-                continue
+            hide(package['key'], later.removeprefix(prefix), package['kind'])
 
     def before_release(package):
-        versions = published(package)
-        return {text for text in versions if registry_version(text, package['kind']) not in hidden.get(package['key'], ())}
+        versions, keys = hidden.get(package['key'], (set(), set()))
+        kind = package['kind']
+        return {text for text in published(package)
+                if registry_version(text, kind) not in versions and precedence(text, kind) not in keys}
 
     _, files = prepare(tag, root, history=BeforeRelease(history, hidden_tags), published=before_release,
                        write=False, at_tag=True)

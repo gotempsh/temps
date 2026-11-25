@@ -856,6 +856,40 @@ class PrepareTests(unittest.TestCase):
             self.prepare('v0.1.0-beta.64')
         self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
 
+    def test_a_package_tag_prepare_cannot_parse_still_keeps_the_own_line(self):
+        # A tag whose upload never happened: 0.3.0-canary.1 is above the server's 0.2.0-beta.1.
+        self.add('cli', 'npm', '0.1.38', published={'0.1.38'}, versioning='until-server-passes')
+        self.release_tag('cli', '0.1.38')
+        self.release_tag('cli', '0.3.0-canary.1')
+        self.assertEqual(self.selection('v0.2.0-beta.1'), {})
+        self.assertEqual(self.selection('v0.3.0'), {'cli': '0.3.0'})
+        self.release_tag('cli', 'next')
+        with self.assertRaisesRegex(ValueError, r"@temps-sdk/cli: cannot order package tag 'next' against 0\.3\.1"):
+            self.prepare('v0.3.1')
+
+    def test_a_registry_version_differing_only_in_build_metadata_is_taken(self):
+        self.add('temps-plugin-protocol', 'crate', '0.1.0-beta.62',
+                 published={'0.1.0-beta.62', '0.1.0-beta.64+build.5'}, versioning='server')
+        with self.assertRaisesRegex(ValueError, r'temps-plugin-protocol 0\.1\.0-beta\.64 is already published'):
+            self.prepare('v0.1.0-beta.64')
+        self.assertEqual(self.selection('v0.1.0-beta.65'), {'temps-plugin-protocol': '0.1.0-beta.65'})
+
+    def test_an_older_tag_is_verified_without_a_later_release_prepare_cannot_parse(self):
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'}, versioning='server')
+        self.prepare_and_tag('v0.1.0-beta.64')
+        self.registry['@temps-sdk/kv'].add('0.1.0-beta.64')
+        self.release_tag('kv', '0.1.0-beta.64')
+        # A later release, from a commit after this tag, published a canary.
+        self.registry['@temps-sdk/kv'].add('0.3.0-canary.1')
+        self.release_tag('kv', '0.3.0-canary.1')
+        self.history.unreachable.add('sdk/kv/v0.3.0-canary.1')
+        self.history.tag('v0.1.0-beta.64')
+        self.assertEqual(self.verify('v0.1.0-beta.64'), ([], ['kv']))
+        # A canary no release tagged is still above the server version and stops the check.
+        self.registry['@temps-sdk/kv'].add('0.2.0-canary.1')
+        with self.assertRaisesRegex(ValueError, r'0\.2\.0-canary\.1 is already published or tagged, above'):
+            self.verify('v0.1.0-beta.64')
+
     def test_independent_packages_are_not_released_by_the_server_version(self):
         self.add('kv', 'npm', '0.0.4', published={'0.0.4'})
         self.release_tag('kv', '0.0.4')
