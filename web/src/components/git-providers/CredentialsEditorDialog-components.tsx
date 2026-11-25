@@ -63,6 +63,12 @@ export function CredentialsEditorDialog({
     },
   })
 
+  const handleOpenChange = (next: boolean) => {
+    // Reopening starts from a clean form, without the last attempt's error.
+    if (!next) mutation.reset()
+    onOpenChange(next)
+  }
+
   if (fields.length === 0) {
     return null
   }
@@ -89,7 +95,7 @@ export function CredentialsEditorDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Edit credentials</DialogTitle>
@@ -111,8 +117,11 @@ export function CredentialsEditorDialog({
           {fields.map((field) => {
             const id = `cred-${field.key}`
             const value = values[field.key as string] ?? ''
-            const onChange = (v: string) =>
+            const onChange = (v: string) => {
+              // A failed save stays on screen until the user changes a value.
+              if (mutation.isError) mutation.reset()
               setValues((prev) => ({ ...prev, [field.key as string]: v }))
+            }
             const error = fieldErrors[field.key]
             const errorId = `${id}-error`
 
@@ -157,11 +166,17 @@ export function CredentialsEditorDialog({
             )
           })}
 
+          {mutation.isError && (
+            <p role="alert" className="text-sm text-destructive">
+              Credentials were not saved:{' '}
+              {problemDetail(mutation.error, 'Check the values and try again.')}
+            </p>
+          )}
           <DialogFooter>
             <Button
               type="button"
               variant="outline"
-              onClick={() => onOpenChange(false)}
+              onClick={() => handleOpenChange(false)}
               disabled={mutation.isPending}
             >
               Cancel

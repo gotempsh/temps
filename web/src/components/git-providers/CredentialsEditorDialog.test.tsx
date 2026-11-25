@@ -55,3 +55,46 @@ test('saving sends only the changed fields through the generated client', async 
   await waitFor(() => expect(open).toBe(false))
   expect(submitted).toEqual({ password: 'new-app-password' })
 })
+
+test('a failed save says why beside the buttons and keeps what was typed', async () => {
+  mockApi({
+    'PATCH /git-providers/4/credentials': () =>
+      jsonResponse(
+        {
+          type: 'about:blank',
+          title: 'Invalid credentials',
+          status: 400,
+          detail: 'The password must not contain a newline.',
+        },
+        400
+      ),
+  })
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+      }
+    >
+      <CredentialsEditorDialog
+        provider={provider}
+        open
+        onOpenChange={() => {}}
+      />
+    </QueryClientProvider>
+  )
+  const password = view.getByLabelText('Password or token') as HTMLInputElement
+
+  fireEvent.change(password, { target: { value: 'rejected-password' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save Credentials' }))
+
+  const saveError = await view.findByText(/Credentials were not saved/)
+  expect(saveError.textContent).toContain(
+    'The password must not contain a newline.'
+  )
+  expect(password.value).toBe('rejected-password')
+
+  fireEvent.change(password, { target: { value: 'another-password' } })
+  await waitFor(() =>
+    expect(view.queryByText(/Credentials were not saved/)).toBeNull()
+  )
+})
