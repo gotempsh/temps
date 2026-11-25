@@ -283,6 +283,14 @@ fn orphaned_container_note(node_name: &str, node_id: i32) -> String {
     )
 }
 
+/// A worker's effective build limits ([`NodeService::get_build_limits`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeBuildLimits {
+    pub limits: temps_deployer::build_protocol::BuildLimits,
+    /// True when nothing is stored for the node, so the defaults apply.
+    pub is_default: bool,
+}
+
 #[derive(Error, Debug)]
 pub enum NodeError {
     /// Cleaning up a node's leftover containers stopped partway; the counts
@@ -305,6 +313,16 @@ pub enum NodeError {
 
     #[error("Node with id {node_id} not found")]
     NotFoundById { node_id: i32 },
+
+    #[error(
+        "Node {node_id} is the control plane, which has no per-node build limits: build limits \
+         (concurrency, queue wait, build timeout) apply to worker nodes that run remote builds. \
+         The control plane builds with its own Docker daemon; use a worker node id instead"
+    )]
+    ControlPlaneHasNoBuildLimits { node_id: i32 },
+
+    #[error("Node {node_id} has invalid stored build limits: {reason}")]
+    InvalidStoredBuildLimits { node_id: i32, reason: String },
 
     #[error("Node '{name}' already exists")]
     AlreadyExists { name: String },
@@ -2024,11 +2042,52 @@ impl NodeService {
             .ok_or(NodeError::NotFoundById { node_id })
     }
 
+    /// A worker's effective build limits, and whether they are the defaults
+    /// (nothing stored for the node). The control plane has none.
+    pub async fn get_build_limits(&self, node_id: i32) -> Result<NodeBuildLimits, NodeError> {
+        if node_id == temps_core::CONTROL_PLANE_NODE_ID {
+            return Err(NodeError::ControlPlaneHasNoBuildLimits { node_id });
+        }
+        let node = self.get_by_id(node_id).await?;
+        if node.role != "worker" {
+            return Err(NodeError::Validation {
+                message: format!(
+                    "Node {node_id} is not a worker (role '{}'); build limits apply to workers",
+                    node.role
+                ),
+            });
+        }
+        match node.build_limits {
+            None => Ok(NodeBuildLimits {
+                limits: temps_deployer::build_protocol::BuildLimits::default(),
+                is_default: true,
+            }),
+            Some(value) => {
+                // The stored object also carries `_version`, which the
+                // limits ignore.
+                let limits: temps_deployer::build_protocol::BuildLimits =
+                    serde_json::from_value(value).map_err(|error| {
+                        NodeError::InvalidStoredBuildLimits {
+                            node_id,
+                            reason: error.to_string(),
+                        }
+                    })?;
+                Ok(NodeBuildLimits {
+                    limits,
+                    is_default: false,
+                })
+            }
+        }
+    }
+
     pub async fn set_build_limits(
         &self,
         node_id: i32,
         limits: temps_deployer::build_protocol::BuildLimits,
     ) -> Result<(), NodeError> {
+        if node_id == temps_core::CONTROL_PLANE_NODE_ID {
+            return Err(NodeError::ControlPlaneHasNoBuildLimits { node_id });
+        }
         limits
             .validate()
             .map_err(|message| NodeError::Validation { message })?;
