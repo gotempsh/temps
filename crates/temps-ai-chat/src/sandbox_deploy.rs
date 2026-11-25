@@ -66,6 +66,19 @@ pub struct DeployArgs {
     pub directory: Option<String>,
 }
 
+/// The credential files a sandbox deploy leaves out, in the words the tool
+/// description, the approval card and the empty-directory error share. The
+/// match is the fixed list of names and extensions in
+/// `applications::is_sensitive_workspace_path`, not a scan of file contents,
+/// so the text says it is a list and gives examples instead of promising
+/// that "credentials" in general are left out.
+macro_rules! credential_files_left_out {
+    () => {
+        "files whose names are on a fixed list of key, certificate and credential names (such \
+         as id_rsa, *.pem, *.key, .npmrc, .pgpass, kubeconfig, *.tfstate and *.tfvars)"
+    };
+}
+
 #[derive(Error, Debug)]
 pub enum SandboxDeployError {
     #[error(
@@ -120,8 +133,9 @@ pub enum SandboxDeployError {
 
     #[error(
         "{directory} in sandbox {sandbox_id} has no deployable files (node_modules, .git, \
-         .env files, credentials and folders named dist, build, .next, target or coverage are \
-         never uploaded, at any depth)"
+         .env files, folders named dist, build, .next, target or coverage, and {credentials} \
+         are never uploaded, at any depth)",
+        credentials = credential_files_left_out!()
     )]
     Empty {
         sandbox_id: String,
@@ -135,13 +149,18 @@ pub enum SandboxDeployError {
 pub fn deploy_tool() -> ChatTool {
     ChatTool {
         name: SANDBOX_DEPLOY_TOOL.to_string(),
-        description: "Deploy the files in the linked sandbox as the source of a Temps project, \
+        description: concat!(
+            "Deploy the files in the linked sandbox as the source of a Temps project, \
             with no Git repository: Temps builds them with the project's preset and serves the \
             result. Use it to publish an app you built in the sandbox. The server packs the \
-            directory itself and leaves out node_modules, .git, .env files, credentials and every \
-            folder named dist, build, .next, target or coverage at any depth (so a source folder \
-            such as `src/build/` must be renamed to be deployed), so do not zip or upload \
-            anything yourself and do not commit the code just to deploy it. The user is asked to \
+            directory itself and leaves out node_modules, .git, .env files, every folder named \
+            dist, build, .next, target or coverage at any depth (so a source folder such as \
+            `src/build/` must be renamed to be deployed), and \
+            ",
+            credential_files_left_out!(),
+            "; every other file is uploaded as it is, \
+            so keep secrets out of the directory. Do not zip or upload anything yourself and do \
+            not commit the code just to deploy it. The user is asked to \
             approve the deployment. The project must deploy from uploaded source (create it with \
             `source_type` `uploaded_source` so Temps builds it) or have alternate sources \
             enabled; a `static_files` project takes plain HTML, CSS and JS, and to deploy a \
@@ -149,7 +168,8 @@ pub fn deploy_tool() -> ChatTool {
             (for example `web/dist`). \
             Returns the deployment. The chat shows its build stages live to the user, so never \
             poll it or sleep waiting for it."
-            .to_string(),
+        )
+        .to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -224,12 +244,17 @@ impl PreparedDeploy {
             None => String::new(),
         };
         format!(
-            "Deploy {} files ({}) from the chat's sandbox to project {}{target}, without Git. \
-             node_modules, .git, .env files, credentials and build folders (dist, build, .next, \
-             target, coverage) are left out.",
+            concat!(
+                "Deploy {} files ({}) from the chat's sandbox to project {}{target}, without Git. \
+                 node_modules, .git, .env files, build folders (dist, build, .next, target, \
+                 coverage) and ",
+                credential_files_left_out!(),
+                " are left out; every other file is uploaded as it is."
+            ),
             self.packed.files,
             human_bytes(self.packed.source_bytes),
-            self.args.project_id
+            self.args.project_id,
+            target = target,
         )
     }
 }
@@ -1077,6 +1102,92 @@ mod tests {
         assert!(summary.contains("project 7"));
         assert!(summary.contains("environment 3"));
         assert!(summary.contains("without Git"));
+    }
+
+    /// Issue #2023: the credential exclusion is a fixed list of names, so
+    /// the card, the tool and the empty-directory error say so instead of
+    /// promising that "credentials" are left out.
+    #[test]
+    fn what_is_left_out_is_described_as_a_fixed_list_of_names() {
+        let data = tarball(|b| add_file(b, "./index.html", b"x", 0o644));
+        let prepared = PreparedDeploy {
+            packed: zip_from_tar_gz("sbx_t", "/work", &data).expect("packs"),
+            args: DeployArgs {
+                project_id: 7,
+                environment_id: None,
+                directory: None,
+            },
+            sandbox_id: "sbx_t".to_string(),
+            directory: "/work".to_string(),
+        };
+        let empty = SandboxDeployError::Empty {
+            sandbox_id: "sbx_t".to_string(),
+            directory: "/work".to_string(),
+        }
+        .to_string();
+        let tool = deploy_tool().description;
+        for text in [prepared.summary(), empty, tool] {
+            assert!(text.contains("fixed list"), "{text}");
+            assert!(text.contains("*.tfvars"), "{text}");
+            assert!(!text.contains("credentials and"), "{text}");
+        }
+        assert!(
+            prepared
+                .summary()
+                .contains("every other file is uploaded as it is"),
+            "{}",
+            prepared.summary()
+        );
+    }
+
+    /// Issue #2023: credential files that are not one of the original names
+    /// are left out too; files that only look similar still pack.
+    #[test]
+    fn more_key_and_credential_file_names_are_left_out() {
+        let left_out = [
+            "./keys/id_ecdsa",
+            "./keys/id_ed25519_sk",
+            "./infra/prod.tfvars",
+            "./infra/prod.auto.tfvars.json",
+            "./.pgpass",
+            "./.my.cnf",
+            "./public/.htpasswd",
+            "./kubeconfig",
+            "./deploy/staging.kubeconfig",
+            "./.dockercfg",
+            "./.boto",
+            "./.s3cfg",
+            "./AuthKey_ABC123.p8",
+            "./backup/secrets.gpg",
+            // Controls already on the list.
+            "./keys/id_ed25519",
+            "./infra/prod.tfstate",
+        ];
+        let data = tarball(|b| {
+            add_file(b, "./package.json", b"{}", 0o644);
+            add_file(b, "./keys/id_ecdsa.pub", b"ssh-ecdsa AAAA", 0o644);
+            add_file(
+                b,
+                "./infra/terraform.tfvars.example",
+                b"region = \"\"",
+                0o644,
+            );
+            add_file(b, "./docs/kubeconfig.md", b"# kubeconfig", 0o644);
+            for path in left_out {
+                add_file(b, path, b"dummy", 0o600);
+            }
+        });
+        let packed = zip_from_tar_gz("sbx_t", "/work", &data).expect("packs");
+        assert_eq!(
+            names(&packed),
+            vec![
+                "docs/kubeconfig.md",
+                "infra/terraform.tfvars.example",
+                "keys/id_ecdsa.pub",
+                "package.json",
+            ]
+        );
+        assert_eq!(packed.left_out, left_out.len());
     }
 
     #[test]

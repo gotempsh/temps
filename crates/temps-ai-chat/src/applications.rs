@@ -1264,6 +1264,11 @@ fn validate_workspace_relative_path(
     Ok(())
 }
 
+/// Whether a workspace path is kept out of file listings, imports and sandbox
+/// deploys: version-control and tool state, build folders, `.env` files, and
+/// a fixed list of key, certificate and credential file names and
+/// extensions. It matches names only and never reads contents, so a secret in
+/// a file with any other name is not caught; the sandbox deploy card says so.
 pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
     if path.starts_with('/') || path.contains("../") {
         return true;
@@ -1311,20 +1316,42 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
             || lower == ".yarnrc"
             || lower == "credentials"
             || lower == "credentials.json"
-            || lower == "id_dsa"
-            || lower == "id_rsa"
-            || lower == "id_ed25519"
+            || is_ssh_private_key_name(lower)
+            // Database, web-server and cloud-tool credential files.
+            || matches!(
+                lower,
+                ".pgpass"
+                    | ".my.cnf"
+                    | ".htpasswd"
+                    | ".dockercfg"
+                    | ".boto"
+                    | ".s3cfg"
+                    | "kubeconfig"
+            )
+            || lower.ends_with(".kubeconfig")
             || lower.ends_with(".credentials.json")
             || (lower.contains("service-account") && lower.ends_with(".json"))
             || lower.ends_with(".pem")
             || lower.ends_with(".key")
+            || lower.ends_with(".p8")
             || lower.ends_with(".p12")
             || lower.ends_with(".pfx")
             || lower.ends_with(".jks")
             || lower.ends_with(".keystore")
+            || lower.ends_with(".gpg")
             || lower.ends_with(".tfstate")
             || lower.ends_with(".tfstate.backup")
+            // Terraform variable files hold the secrets passed to a plan.
+            || lower.ends_with(".tfvars")
+            || lower.ends_with(".tfvars.json")
     })
+}
+
+/// The default names `ssh-keygen` gives a private key, including the
+/// security-key (`_sk`) variants. Public keys (`.pub`) are not secret.
+fn is_ssh_private_key_name(lower: &str) -> bool {
+    let base = lower.strip_suffix("_sk").unwrap_or(lower);
+    matches!(base, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519")
 }
 
 fn map_workspace_read_error(path: String, source: std::io::Error) -> ApplicationError {
