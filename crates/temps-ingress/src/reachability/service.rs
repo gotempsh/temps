@@ -3097,8 +3097,15 @@ impl ReachabilityService {
             }
         };
         let mut record = record_to_change(&row)?;
-        decide(&mut record.journal, &request.key, request.decision, undoing)
-            .map_err(ReachabilityError::Validation)?;
+        let ops = self.ops(Some(project_id), Some(environment_id));
+        decide(
+            &mut record.journal,
+            &request.key,
+            request.decision,
+            undoing,
+            &ops.providers(),
+        )
+        .map_err(ReachabilityError::Validation)?;
         let left = record.conflicts().len();
         let mut active: reachability_runs::ActiveModel = row.into();
         active.journal = Set(serde_json::to_value(&record.journal).unwrap_or(Value::Array(vec![])));

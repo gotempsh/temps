@@ -11,11 +11,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::reachability::model::{Intent, JournalState, RunResource, StepKind};
+use crate::reachability::model::{
+    Decision, Intent, JournalEntry, JournalState, RunResource, StepKind, UndoResult,
+};
 use crate::reachability::run::{
-    tailscale_addrs, unrecorded_hosts, unrecorded_message, Begin, Found, Outcome, ProviderRun,
-    ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget, ServeWish, ServiceDeletion,
-    ServiceEntryHost, ServicePlan, StepRun, UndoCheck, WriteError,
+    pause, still_ours, tailscale_addrs, unrecorded_hosts, unrecorded_message, Begin, Found,
+    Outcome, ProviderRun, ProviderUndo, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget,
+    ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, StepRun, Stop, UndoCheck,
+    WriteError,
 };
 use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
 use temps_core::tailnet::messages as tailnet_messages;
@@ -607,6 +610,367 @@ impl<'a> TailscaleRun<'a> {
             waited += run.timing().poll.max(Duration::from_millis(1));
         }
     }
+
+    /// ADR 065 D4: this run's reference goes first; the entry, and the
+    /// worker's configuration, only with the last one.
+    async fn undo_serve(
+        &self,
+        entry: &mut JournalEntry,
+        resource: &RunResource,
+        run_id: i32,
+        now: temps_core::DBDateTime,
+    ) -> ProviderUndo {
+        let RunResource::TailscaleServe {
+            node_id,
+            node_name,
+            address_id,
+            hostname,
+            entry_id,
+            ..
+        } = resource
+        else {
+            return ProviderUndo::Engine;
+        };
+        let report = |label: String| {
+            ProviderUndo::Settled(Some(Box::new(UndoResult {
+                label,
+                resource: resource.clone(),
+                ok: true,
+                error: None,
+            })))
+        };
+        if entry.deleting && entry.undo_decision == Some(Decision::Keep) {
+            let outcome = self.ops.forget_serve_entry(*entry_id).await;
+            if outcome.is_ok() {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+            }
+            return ProviderUndo::Settled(Some(Box::new(UndoResult {
+                label: format!(
+                    "Left {node_name}'s Serve config as it is and forgot Temps' entry for \
+                     {hostname}"
+                ),
+                resource: resource.clone(),
+                ok: outcome.is_ok(),
+                error: outcome.err(),
+            })));
+        }
+        if entry.deleting {
+            // Still waiting on the agent (resolved above when pending).
+            return ProviderUndo::Stop(Stop::Pending(format!(
+                "Waiting for {node_name} to take {hostname} off its Serve config; undo carries \
+                 on once its agent reports it."
+            )));
+        }
+        match self
+            .ops
+            .release_serve_entry(run_id, *node_id, address_id)
+            .await
+        {
+            Ok(ServeRelease::Gone) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                ProviderUndo::Settled(None)
+            }
+            Ok(ServeRelease::Kept(why)) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                report(format!("Kept {hostname} on {node_name}: {why}"))
+            }
+            Ok(ServeRelease::Deleted) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                report(format!(
+                    "Removed Temps' Serve entry for {hostname} ({node_name} had written nothing \
+                     for it)"
+                ))
+            }
+            Ok(ServeRelease::Removing) => {
+                entry.deleting = true;
+                entry.state = JournalState::Pending;
+                entry.pending_since = Some(now);
+                entry.next_lookup_at = None;
+                entry.failed_lookups = 0;
+                entry.at = now;
+                ProviderUndo::RecordThenStop {
+                    then: Stop::Pending(format!(
+                        "{node_name} is taking {hostname} off its Serve config; undo carries on \
+                         once its agent reports it, within a minute."
+                    )),
+                    unrecorded: format!("{node_name} is taking {hostname} off its Serve config"),
+                }
+            }
+            Err(error) => ProviderUndo::Stop(Stop::Failed(format!(
+                "Temps could not release its Serve entry for {hostname} on {node_name}, so it \
+                 touched nothing from there on: {error} Undo again to retry."
+            ))),
+        }
+    }
+
+    /// Remove the saved OAuth client unless a Service setup still needs it.
+    async fn undo_credential(
+        &self,
+        entry: &mut JournalEntry,
+        resource: &RunResource,
+        now: temps_core::DBDateTime,
+    ) -> ProviderUndo {
+        let RunResource::TailscaleCredential { id, name } = resource else {
+            return ProviderUndo::Engine;
+        };
+        let outcome = self.ops.release_tailscale_credential(*id).await;
+        let label = match &outcome {
+            Ok(Some(why)) => format!("Kept Tailscale OAuth client {name}: {why}"),
+            _ => format!("Removed Tailscale OAuth client {name}"),
+        };
+        if outcome.is_ok() {
+            entry.state = JournalState::Absent;
+            entry.at = now;
+        }
+        ProviderUndo::Settled(Some(Box::new(UndoResult {
+            label,
+            resource: resource.clone(),
+            ok: outcome.is_ok(),
+            error: outcome.err(),
+        })))
+    }
+
+    /// Undo a Tailscale Service (ADR 065 D4): keep it while any Serve entry
+    /// names it, never delete one no journal of this install records as
+    /// created, pause on a changed definition or an unrecorded host, and
+    /// otherwise ask the user; delete only once they confirmed what they were
+    /// shown, with the checks made again under the Service's lock.
+    async fn undo_service(
+        &self,
+        entry: &mut JournalEntry,
+        resource: &RunResource,
+        now: temps_core::DBDateTime,
+    ) -> ProviderUndo {
+        let RunResource::TailscaleService {
+            tailnet,
+            name,
+            creator_run_id,
+            ..
+        } = resource
+        else {
+            return ProviderUndo::Engine;
+        };
+        let kept = |entry: &mut JournalEntry, why: String| {
+            entry.state = JournalState::Absent;
+            entry.at = now;
+            ProviderUndo::Settled(Some(Box::new(UndoResult {
+                label: format!("Kept `{name}`: {why}"),
+                resource: resource.clone(),
+                ok: true,
+                error: None,
+            })))
+        };
+        let failed = |what: &str, error: String| {
+            ProviderUndo::Stop(Stop::Failed(format!(
+                "Temps could not {what} `{name}`, so it left it and everything this run did before \
+                 it: {error} Undo again to retry."
+            )))
+        };
+        // A person confirmed the delete of what they were shown.
+        if entry.undo_decision == Some(Decision::Overwrite) {
+            let Some(shown) = entry.shown_service.clone() else {
+                return kept(entry, "nothing was shown to confirm".to_string());
+            };
+            return match self
+                .ops
+                .delete_service(tailnet, name, *creator_run_id, &shown)
+                .await
+            {
+                Ok(ServiceDeletion::Deleted) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    ProviderUndo::Settled(Some(Box::new(UndoResult {
+                        label: format!("Deleted `{name}` from {tailnet}"),
+                        resource: resource.clone(),
+                        ok: true,
+                        error: None,
+                    })))
+                }
+                Ok(ServiceDeletion::Gone) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    ProviderUndo::Settled(None)
+                }
+                Ok(ServiceDeletion::Kept(why)) => kept(entry, why),
+                Err(error) => failed("delete", error),
+            };
+        }
+        // Still in use: expected, not a conflict.
+        let entries = match self.ops.service_entries(name).await {
+            Ok(entries) => entries,
+            Err(error) => return failed("tell what uses", error),
+        };
+        if let Some(user) = entries.first() {
+            return kept(
+                entry,
+                format!("it still serves {} on {}", user.hostname, user.node_name),
+            );
+        }
+        // Never deleted without this install's journal of creating it.
+        let creation = match self.ops.service_creation(name, *creator_run_id).await {
+            Ok(Some(creation)) => creation,
+            Ok(None) => {
+                return kept(
+                    entry,
+                    "no setup of this Temps install records creating it".to_string(),
+                )
+            }
+            Err(error) => return failed("find who created", error),
+        };
+        let current = match self.ops.read_service(name).await {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                entry.state = JournalState::Absent;
+                entry.at = now;
+                return ProviderUndo::Settled(None);
+            }
+            Err(error) => return failed("read", error),
+        };
+        // A Service that no longer carries the marker this run gave it is not
+        // Temps' any more, whatever the journal says (D4): never offered for
+        // deletion.
+        let owner = tailscale::parse_marker(&creation.0.comment)
+            .map(|(install, _)| install)
+            .unwrap_or_default();
+        if let Err(why) = still_ours(&current, name, &owner, *creator_run_id) {
+            return kept(entry, why);
+        }
+        let changed = if creation.0.addrs.is_empty() {
+            current.differs_from(&ServiceDefinition {
+                addrs: current.addrs.clone(),
+                ..creation.0.clone()
+            })
+        } else {
+            current.differs_from(&creation.0)
+        };
+        let question = match changed {
+            Some(why) => format!(
+                "{why}, which Temps did not set. Keep it, or delete it anyway? Temps deletes it only \
+                 if it still is exactly what you see here."
+            ),
+            None => {
+                let hosts = match self.ops.service_hosts(name).await {
+                    Ok(hosts) => hosts,
+                    Err(error) => return failed("read the hosts of", error),
+                };
+                let foreign = unrecorded_hosts(&hosts, &[], None);
+                if foreign.is_empty() {
+                    format!(
+                        "Delete `{name}` from tailnet `{tailnet}`? It was created by this Temps \
+                         install on {} and nothing uses it now.",
+                        creation.1.format("%-d %B")
+                    )
+                } else {
+                    format!(
+                        "`{name}` is now also hosted by {}, which no Temps setup configured. Keep \
+                         it, or delete it anyway?",
+                        foreign
+                            .iter()
+                            .map(|h| format!("`{h}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+        };
+        entry.shown_service = Some(current);
+        ProviderUndo::Stop(pause(entry, question, now))
+    }
+
+    /// ADR 065 D4: what a person may decide about a Serve entry or a
+    /// Service in conflict.
+    fn decide_own(
+        &self,
+        entry: &mut JournalEntry,
+        decision: Decision,
+        undoing: bool,
+    ) -> Option<Result<(), String>> {
+        if let Intent::TailscaleServe {
+            node_name,
+            hostname,
+            ..
+        } = &entry.intent
+        {
+            // ADR 065 D4: Temps never removes a handler it did not write, so
+            // the only answer is to leave the worker as it is and forget the
+            // entry; undo then deletes the row and carries on.
+            if decision == Decision::Overwrite || !undoing {
+                return Some(Err(format!(
+                    "Temps never changes Serve configuration it did not write, so it cannot take \
+                     {hostname} off {node_name} for you. Remove it there yourself, or keep it."
+                )));
+            }
+            entry.at = chrono::Utc::now();
+            entry.undo_decision = Some(Decision::Keep);
+            entry.state = JournalState::Done;
+            return Some(Ok(()));
+        }
+        if let Intent::TailscaleService { name, tailnet, .. } = &entry.intent {
+            // ADR 065 D4: Temps never updates a Service, so going forward
+            // there is nothing to decide; undo deletes one only when a person
+            // confirms the definition they were shown.
+            if !undoing {
+                return Some(Err(format!(
+                    "Temps never changes a Tailscale Service, so it cannot take `{name}` over. Check \
+                     it in the admin console, then plan again with another name or once it is fixed."
+                )));
+            }
+            entry.at = chrono::Utc::now();
+            entry.undo_decision = Some(decision);
+            entry.state = match decision {
+                Decision::Keep => JournalState::Absent,
+                Decision::Overwrite if entry.shown_service.is_some() => JournalState::Done,
+                Decision::Overwrite => {
+                    return Some(Err(format!(
+                        "Temps deletes `{name}` from {tailnet} only after showing you what it \
+                         deletes, and nothing was shown for it. Undo again to see it."
+                    )))
+                }
+            };
+            return Some(Ok(()));
+        }
+        None
+    }
+
+    /// Where taking a Serve entry off its worker stands (ADR 065 D4): the
+    /// entry is gone once the agent reported `removed` or `absent`.
+    async fn serve_removal(&self, resource: &RunResource) -> Result<Found, String> {
+        let RunResource::TailscaleServe {
+            node_id,
+            node_name,
+            address_id,
+            hostname,
+            entry_id,
+            ..
+        } = resource
+        else {
+            return Ok(Found::Missing);
+        };
+        Ok(match self.ops.serve_entry(*node_id, address_id).await? {
+            Some(status) if status.entry_id == *entry_id && status.removing => {
+                if status.worker_gone {
+                    Found::Changed(format!(
+                        "`{node_name}` left the cluster while it served `{hostname}`. Remove it \
+                         from the tailnet, or run `tailscale serve reset` on it, then confirm"
+                    ))
+                } else if status.report.as_deref() == Some(REPORT_CONFLICT) {
+                    Found::Changed(
+                        status
+                            .detail
+                            .unwrap_or_else(|| "a Serve entry Temps did not write".to_string()),
+                    )
+                } else {
+                    Found::Made(Box::new(resource.clone()))
+                }
+            }
+            // Removed, or replaced by a new entry since.
+            _ => Found::Missing,
+        })
+    }
 }
 
 /// The Tailscale Service this run defined, as journaled.
@@ -658,9 +1022,13 @@ impl ProviderRun for TailscaleRun<'_> {
         )
     }
 
-    /// Undo of Tailscale's resources is still the engine's (ADR-116 D8).
-    fn owns_resource(&self, _resource: &RunResource) -> bool {
-        false
+    fn owns_resource(&self, resource: &RunResource) -> bool {
+        matches!(
+            resource,
+            RunResource::TailscaleServe { .. }
+                | RunResource::TailscaleService { .. }
+                | RunResource::TailscaleCredential { .. }
+        )
     }
 
     async fn look(&self, run_id: i32, intent: &Intent) -> Result<Found, String> {
@@ -726,11 +1094,63 @@ impl ProviderRun for TailscaleRun<'_> {
         }
     }
 
+    /// Never reached: [`Self::undo`] settles every Tailscale resource.
     async fn check_undo(&self, _resource: &RunResource, _checked: bool) -> UndoCheck {
         UndoCheck::Remove
     }
 
+    /// Never reached: [`Self::undo`] settles every Tailscale resource.
     async fn remove(&self, _resource: &RunResource) -> Result<(), String> {
         Ok(())
+    }
+
+    /// A Serve entry being taken off its worker is gone once the agent
+    /// reports it (ADR 065 D4).
+    async fn removal(&self, resource: &RunResource) -> Option<Result<Found, String>> {
+        match resource {
+            RunResource::TailscaleServe { .. } => Some(self.serve_removal(resource).await),
+            _ => None,
+        }
+    }
+
+    fn decide(
+        &self,
+        entry: &mut JournalEntry,
+        decision: Decision,
+        undoing: bool,
+    ) -> Option<Result<(), String>> {
+        self.decide_own(entry, decision, undoing)
+    }
+
+    fn waiting_for(&self, intent: &Intent) -> Option<String> {
+        match intent {
+            Intent::TailscaleServe {
+                node_name,
+                hostname,
+                ..
+            } => Some(format!(
+                "{node_name} to take {hostname} off its Serve config"
+            )),
+            _ => None,
+        }
+    }
+
+    async fn undo(
+        &self,
+        entry: &mut JournalEntry,
+        resource: &RunResource,
+        run_id: i32,
+        now: temps_core::DBDateTime,
+    ) -> ProviderUndo {
+        match resource {
+            RunResource::TailscaleServe { .. } => {
+                self.undo_serve(entry, resource, run_id, now).await
+            }
+            RunResource::TailscaleService { .. } => self.undo_service(entry, resource, now).await,
+            RunResource::TailscaleCredential { .. } => {
+                self.undo_credential(entry, resource, now).await
+            }
+            _ => ProviderUndo::Engine,
+        }
     }
 }
