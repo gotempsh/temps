@@ -642,15 +642,16 @@ impl UserService {
             .all(self.db.as_ref())
             .await?;
 
-        let mut user_roles = Vec::new();
-        for user_role_entry in user_role_entries {
-            if let Some(role) = temps_entities::roles::Entity::find_by_id(user_role_entry.role_id)
-                .one(self.db.as_ref())
+        // One query for every role, not one per assignment.
+        let role_ids: Vec<i32> = user_role_entries.iter().map(|ur| ur.role_id).collect();
+        let user_roles = if role_ids.is_empty() {
+            Vec::new()
+        } else {
+            temps_entities::roles::Entity::find()
+                .filter(temps_entities::roles::Column::Id.is_in(role_ids))
+                .all(self.db.as_ref())
                 .await?
-            {
-                user_roles.push(role);
-            }
-        }
+        };
 
         Ok(UserWithRoles {
             user: user.into(),
@@ -1060,6 +1061,17 @@ impl UserService {
             user_update.email = Set(email);
         }
         if let Some(name) = name_p {
+            // The same rule `create_user` applies to a new username.
+            let name = name.trim().to_string();
+            let name_chars = name.chars().count();
+            if !(1..=MAX_USER_NAME_CHARS).contains(&name_chars)
+                || name.chars().any(char::is_control)
+            {
+                return Err(UserServiceError::Validation(format!(
+                    "Username for user {user_id} must contain between 1 and \
+                     {MAX_USER_NAME_CHARS} characters"
+                )));
+            }
             user_update.name = Set(name);
         }
 

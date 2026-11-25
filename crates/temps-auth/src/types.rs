@@ -100,9 +100,17 @@ pub struct RouteUserWithRoles {
     pub roles: Vec<RouteRole>,
 }
 
+/// Body of `POST /users/{user_id}/roles`. The target user comes from the
+/// path; the body names only the role.
 #[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AssignRoleRequest {
-    pub user_id: i32,
+    /// Deprecated: the target is the path's `user_id`. Still accepted for
+    /// older clients, but only when it equals the path id (otherwise 400).
+    #[serde(default)]
+    #[schema(deprecated)]
+    pub user_id: Option<i32>,
+    #[schema(example = "admin")]
     pub role_type: String,
 }
 
@@ -116,12 +124,18 @@ pub struct CreateUserRequest {
     pub must_change_password: bool,
 }
 
+/// Body of `PATCH /users/{user_id}`. Unknown fields are rejected so a
+/// misspelt field is an error instead of a silent no-op.
 #[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateUserRequest {
     #[schema(example = "john.doe@example.com")]
     pub email: Option<String>,
-    #[schema(example = "John Doe")]
-    pub name: Option<String>,
+    /// The new username, as in `CreateUserRequest`. The deprecated field
+    /// name `name` is still accepted as an alias.
+    #[serde(default, alias = "name")]
+    #[schema(example = "john.doe")]
+    pub username: Option<String>,
 }
 
 // Add a new route for self-modification
