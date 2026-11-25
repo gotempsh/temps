@@ -20,6 +20,12 @@ export interface UpdateProviderCredentialsBody {
   webhook_secret?: string
   redirect_uri?: string
   token?: string
+  /** Basic-auth providers: the username (omit to keep it). */
+  username?: string
+  /** Basic-auth providers: the password or app password. */
+  password?: string
+  /** SSH-key providers: the public key, sent together with `private_key`. */
+  public_key?: string
 }
 
 export interface ProviderResponse {

@@ -102,6 +102,41 @@ export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
     ]
   }
 
+  if (method === 'basic') {
+    return [
+      {
+        key: 'username',
+        label: 'Username',
+        type: 'text',
+        placeholder: 'Leave blank to keep current value',
+      },
+      {
+        key: 'password',
+        label: type === 'bitbucket' ? 'App password' : 'Password or token',
+        type: 'password',
+        placeholder: 'Leave blank to keep current value',
+      },
+    ]
+  }
+
+  if (method === 'ssh') {
+    return [
+      {
+        key: 'private_key',
+        label: 'Private key',
+        type: 'textarea',
+        placeholder: 'Leave blank to keep current value',
+        help: 'Paste the full key including BEGIN/END lines. Replace it together with the public key.',
+      },
+      {
+        key: 'public_key',
+        label: 'Public key',
+        type: 'textarea',
+        placeholder: 'ssh-ed25519 AAAA… deploy@example',
+      },
+    ]
+  }
+
   return []
 }
 
