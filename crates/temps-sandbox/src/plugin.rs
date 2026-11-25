@@ -460,9 +460,18 @@ impl TempsPlugin for SandboxPlugin {
             image_preparation,
         });
         let recording = egress_recording_service(context);
-        if app_state.sandbox_service.runs_local_sandboxes() {
-            start_local_egress_recorder(context, &recording);
-        }
+        // Routes are built once per listener; the recorder is one per
+        // process. Several would each bind a port, publish it as the
+        // address sidecars hand traffic to, and replace the same sidecars
+        // concurrently.
+        static RECORDER: std::sync::Once = std::sync::Once::new();
+        RECORDER.call_once(|| {
+            if app_state.sandbox_service.runs_local_sandboxes() {
+                start_local_egress_recorder(context, &recording);
+            } else {
+                temps_sandbox_providers::docker::publish_egress_recording(None);
+            }
+        });
         let recording_state =
             Arc::new(crate::handlers::egress_recording::EgressRecordingAppState {
                 service: recording,
@@ -551,12 +560,17 @@ fn start_local_egress_recorder(
         Some(Ok(docker)) => (*docker).clone(),
         Some(Err(error)) => {
             info!(%error, "egress recording: no local Docker, so this host records nothing");
+            temps_sandbox_providers::docker::publish_egress_recording(None);
             return;
         }
-        None => return,
+        None => {
+            temps_sandbox_providers::docker::publish_egress_recording(None);
+            return;
+        }
     };
     let Some(policy) = context.get_service::<temps_network_policy::NetworkPolicyService>() else {
         warn!("egress recording: no network policy service; the control plane records nothing");
+        temps_sandbox_providers::docker::publish_egress_recording(None);
         return;
     };
     let sidecars: Option<Arc<dyn SidecarRefresh>> = context

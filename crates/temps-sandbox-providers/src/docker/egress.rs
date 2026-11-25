@@ -128,12 +128,25 @@ struct EgressRecordingRoute {
     sandboxes: std::collections::HashSet<String>,
 }
 
-static EGRESS_RECORDING: std::sync::RwLock<Option<EgressRecordingRoute>> =
-    std::sync::RwLock::new(None);
+/// What this process knows about the egress recorder.
+enum EgressRecordingState {
+    /// The recorder has not said yet: the process is starting. Sidecars
+    /// keep the hand-off they have, so recovering sandboxes at startup does
+    /// not replace a recorded sandbox's sidecar only for the recorder to
+    /// replace it again a moment later.
+    Unknown,
+    /// Nothing records on this host.
+    Off,
+    Serving(EgressRecordingRoute),
+}
+
+static EGRESS_RECORDING: std::sync::RwLock<EgressRecordingState> =
+    std::sync::RwLock::new(EgressRecordingState::Unknown);
 
 /// Record where the egress recorder listens and which sandboxes record, or
-/// that it does not serve (`None`). An egress proxy created or checked from
-/// now on hands the traffic of a recorded sandbox to `address`.
+/// that nothing records on this host (`None`). An egress proxy created or
+/// checked from now on hands the traffic of a recorded sandbox to
+/// `address`.
 pub fn publish_egress_recording(
     route: Option<(std::net::SocketAddr, std::collections::HashSet<String>)>,
 ) {
@@ -141,21 +154,34 @@ pub fn publish_egress_recording(
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *slot = route.map(|(address, sandboxes)| EgressRecordingRoute { address, sandboxes });
+    *slot = match route {
+        Some((address, sandboxes)) => {
+            EgressRecordingState::Serving(EgressRecordingRoute { address, sandboxes })
+        }
+        None => EgressRecordingState::Off,
+    };
 }
 
 /// The value `sandbox_container_name`'s egress proxy receives in
 /// [`SANDBOX_EGRESS_RECORDING_ENV`]: the recorder's address while that
-/// sandbox records, empty otherwise.
-pub(super) fn egress_recording_environment_value(sandbox_container_name: &str) -> String {
+/// sandbox records, empty otherwise, and `None` while the recorder has not
+/// said whether anything records (the sidecar keeps what it has).
+pub(super) fn egress_recording_environment_value(sandbox_container_name: &str) -> Option<String> {
     let slot = match EGRESS_RECORDING.read() {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
     };
-    slot.as_ref()
-        .filter(|route| route.sandboxes.contains(sandbox_container_name))
-        .map(|route| route.address.to_string())
-        .unwrap_or_default()
+    match &*slot {
+        EgressRecordingState::Unknown => None,
+        EgressRecordingState::Off => Some(String::new()),
+        EgressRecordingState::Serving(route) => {
+            Some(if route.sandboxes.contains(sandbox_container_name) {
+                route.address.to_string()
+            } else {
+                String::new()
+            })
+        }
+    }
 }
 
 /// The host's address on [`SANDBOX_EGRESS_NETWORK`] (its gateway), where a
@@ -1112,7 +1138,17 @@ impl DockerSandboxProvider {
         };
         let egress = SidecarEgressPolicy::new(sandbox_container_name, &policy)?;
         let internal_proxy = internal_proxy_environment_value();
-        let recording = egress_recording_environment_value(sandbox_container_name);
+        // While the recorder has not said, keep the sidecar's own hand-off.
+        let recording =
+            egress_recording_environment_value(sandbox_container_name).unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|info| {
+                        container_environment_value(info, SANDBOX_EGRESS_RECORDING_ENV)
+                    })
+                    .unwrap_or("")
+                    .to_string()
+            });
 
         if let Some(info) = &existing {
             let image_matches = info
@@ -1171,19 +1207,8 @@ impl DockerSandboxProvider {
                 return Ok(false);
             }
 
-            self.docker
-                .remove_container(
-                    &proxy_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|source| AgentError::SandboxProviderUnavailable {
-                    provider: "docker".to_string(),
-                    reason: format!("replace drifted sandbox egress proxy: {source}"),
-                })?;
+            self.remove_egress_proxy_for_replacement(&proxy_name)
+                .await?;
         }
 
         self.create_egress_proxy_container(
@@ -1224,6 +1249,67 @@ impl DockerSandboxProvider {
             "Managed sandbox egress proxy is ready"
         );
         Ok(true)
+    }
+
+    /// Force-removes the drifted sidecar `proxy_name` so its replacement can
+    /// take the name. When Docker answers that a removal is already in
+    /// progress (another caller, or the daemon, is removing it), waits for
+    /// that removal to finish instead of failing: failing here would leave
+    /// the sandbox with no sidecar at all, and so with no way out.
+    async fn remove_egress_proxy_for_replacement(
+        &self,
+        proxy_name: &str,
+    ) -> Result<(), AgentError> {
+        let unavailable = |reason: String| AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason,
+        };
+        match self
+            .docker
+            .remove_container(
+                proxy_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if docker_error_is_not_found(&error) => return Ok(()),
+            Err(error) if removal_in_progress(&error) => {}
+            Err(source) => {
+                return Err(unavailable(format!(
+                    "replace drifted sandbox egress proxy '{proxy_name}': {source}"
+                )))
+            }
+        }
+        let deadline = tokio::time::Instant::now() + SIDECAR_REMOVAL_WAIT;
+        loop {
+            match self
+                .docker
+                .inspect_container(
+                    proxy_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Err(error) if docker_error_is_not_found(&error) => return Ok(()),
+                Err(source) => {
+                    return Err(unavailable(format!(
+                        "wait for sandbox egress proxy '{proxy_name}' to be removed: {source}"
+                    )))
+                }
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    return Err(unavailable(format!(
+                        "sandbox egress proxy '{proxy_name}' was still being removed after {} \
+                         seconds; its replacement is created on the next attempt",
+                        SIDECAR_REMOVAL_WAIT.as_secs()
+                    )))
+                }
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            }
+        }
     }
 
     /// Create (without starting) the egress proxy container `proxy_name` for
@@ -1353,10 +1439,22 @@ impl DockerSandboxProvider {
             // Never started: the proxy that runs is recreated on start,
             // with the address current then.
             &internal_proxy_environment_value(),
-            &egress_recording_environment_value(sandbox_container_name),
+            &egress_recording_environment_value(sandbox_container_name).unwrap_or_default(),
         )
         .await
     }
+}
+
+/// How long a replacement waits for a removal already in progress.
+const SIDECAR_REMOVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Docker's 409 for a container another caller is already removing.
+fn removal_in_progress(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError { status_code: 409, message }
+            if message.contains("already in progress")
+    )
 }
 
 #[cfg(test)]
@@ -1374,15 +1472,38 @@ mod identity_tests {
             std::collections::HashSet::from([recorded.to_string()]),
         )));
         assert_eq!(
-            egress_recording_environment_value(recorded),
-            "172.30.0.1:41000"
+            egress_recording_environment_value(recorded).as_deref(),
+            Some("172.30.0.1:41000")
         );
         assert_eq!(
-            egress_recording_environment_value("temps-sandbox-other-only-test"),
-            ""
+            egress_recording_environment_value("temps-sandbox-other-only-test").as_deref(),
+            Some("")
         );
         publish_egress_recording(None);
-        assert_eq!(egress_recording_environment_value(recorded), "");
+        assert_eq!(
+            egress_recording_environment_value(recorded).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn only_a_removal_already_in_progress_is_waited_out() {
+        let conflict = |message: &str| bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: message.to_string(),
+        };
+        assert!(removal_in_progress(&conflict(
+            "removal of container temps-sandbox-egress-proxy-v2-x is already in progress"
+        )));
+        assert!(!removal_in_progress(&conflict(
+            "container name is already in use"
+        )));
+        assert!(!removal_in_progress(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "removal is already in progress".to_string(),
+            }
+        ));
     }
 
     #[test]
