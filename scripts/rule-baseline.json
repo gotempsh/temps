@@ -209,9 +209,8 @@
       "handler_db_access": 1,
       "lazy_error_variants": 9,
       "unguarded_require_auth": 1,
-      "files_over_3000_lines": 3,
-      "functions_over_300_lines": 5,
-      "provider_named_outside_module": 20
+      "files_over_3000_lines": 2,
+      "functions_over_300_lines": 5
     },
     "temps-kv": {
       "lazy_error_variants": 6
