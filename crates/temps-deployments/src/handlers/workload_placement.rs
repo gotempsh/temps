@@ -144,6 +144,12 @@ pub struct SetNodeResourcesRequest {
     /// threshold and, on an enforced node, before reservations.
     #[serde(default)]
     pub system_reserved: Option<SystemReserved>,
+    /// Put `system_reserved` back to the default, so `system_reserved_is_default`
+    /// is true again: the control plane's stored values are cleared (it then
+    /// follows the default), a worker gets its role's default. Cannot be
+    /// combined with `system_reserved`.
+    #[serde(default)]
+    pub reset_system_reserved: bool,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -420,7 +426,7 @@ pub async fn admin_get_node_resources(
     request_body = SetNodeResourcesRequest,
     responses(
         (status = 200, body = NodeResourcesResponse),
-        (status = 400, description = "Invalid reserve", body = ProblemDetails),
+        (status = 400, description = "Invalid reserve, nothing to change, or system_reserved together with reset_system_reserved", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Instance admin required", body = ProblemDetails),
         (status = 404, description = "Node not found", body = ProblemDetails),
@@ -436,11 +442,15 @@ pub async fn admin_set_node_resources(
     Json(request): Json<SetNodeResourcesRequest>,
 ) -> Result<Json<NodeResourcesResponse>, Problem> {
     permission_guard!(auth, SettingsWrite);
-    if request.resource_policy.is_none() && request.system_reserved.is_none() {
+    if request.resource_policy.is_none()
+        && request.system_reserved.is_none()
+        && !request.reset_system_reserved
+    {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Placement Settings")
             .with_detail(format!(
-                "Nothing to change for node {node_id}: set resource_policy and/or system_reserved"
+                "Nothing to change for node {node_id}: set resource_policy and/or \
+                 system_reserved, or reset_system_reserved"
             )));
     }
     let (previous, current) = state
@@ -450,6 +460,7 @@ pub async fn admin_set_node_resources(
             NodeResourceUpdate {
                 resource_policy: request.resource_policy,
                 system_reserved: request.system_reserved,
+                reset_system_reserved: request.reset_system_reserved,
             },
         )
         .await?;
@@ -460,6 +471,7 @@ pub async fn admin_set_node_resources(
         resource_policy: current.resource_policy.as_str().to_string(),
         previous_system_reserved: previous.system_reserved,
         system_reserved: current.system_reserved,
+        system_reserved_reset: request.reset_system_reserved,
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!(node_id, error = %e, "node resources changed but the audit record failed");
@@ -845,6 +857,66 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "an empty change is refused"
         );
+    }
+
+    /// `reset_system_reserved` puts a worker's reserve back to its role's
+    /// default and is audited as a reset (#2050); node 0 is covered against a
+    /// real database in the service tests.
+    #[tokio::test]
+    async fn resetting_a_reserve_is_audited() {
+        use temps_entities::node_resource_settings::{self, SystemReserved};
+        let row = |reserved: SystemReserved| node_resource_settings::Model {
+            id: 4,
+            name: "worker-a".into(),
+            role: "worker".into(),
+            resource_policy: NodeResourcePolicy::BestEffort,
+            system_reserved: reserved,
+            updated_at: chrono::Utc::now(),
+        };
+        let custom = SystemReserved {
+            cpu_millis: 1000,
+            memory_mb: 2048,
+        };
+        let db = mock_db()
+            // previous, the role, the update, current
+            .append_query_results(vec![vec![row(custom)]])
+            .append_query_results(vec![vec![row(custom)]])
+            .append_query_results(vec![vec![row(SystemReserved::WORKER)]])
+            .append_query_results(vec![vec![row(SystemReserved::WORKER)]])
+            .into_connection();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let (status, _, body) = send(
+            app(db, audit.clone()),
+            "PUT",
+            "/internal/nodes/4/resources",
+            Some(serde_json::json!({"reset_system_reserved": true})),
+            Some(admin()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["system_reserved_is_default"], true, "{body}");
+        let records = audit.records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].operation, "NODE_RESOURCES_CHANGED");
+        assert!(
+            records[0].body.contains("\"system_reserved_reset\":true"),
+            "{}",
+            records[0].body
+        );
+
+        let (status, _, body) = send(
+            app(mock_db().into_connection(), audit.clone()),
+            "PUT",
+            "/internal/nodes/4/resources",
+            Some(serde_json::json!({
+                "reset_system_reserved": true,
+                "system_reserved": {"cpu_millis": 500, "memory_mb": 512}
+            })),
+            Some(admin()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(audit.records().len(), 1, "a refused change is not audited");
     }
 
     fn isolation_row(
