@@ -85,6 +85,33 @@ fn cluster_dns_reportable(enabled: bool, attempted: bool) -> bool {
     !enabled || attempted
 }
 
+/// What node 0's report may describe on this pass: while cluster DNS is off,
+/// nothing it ran, even on the pass that stops it. That report is the one the
+/// gate then holds for an interval, so it must already say it stopped.
+fn reported_services<R, P>(
+    enabled: bool,
+    resolver: Option<R>,
+    routing: Option<P>,
+) -> (Option<R>, Option<P>) {
+    if enabled {
+        (resolver, routing)
+    } else {
+        (None, None)
+    }
+}
+
+/// How long until the next pass. A failing Docker lookup on a host known not
+/// to run the resolver still backs off, but never past the report interval:
+/// node 0 must keep reporting it unsupported, or its stored report goes stale
+/// and the console reads it as not reporting.
+fn next_pass_delay(failures: u32, unsupported: bool) -> Duration {
+    match failures {
+        0 => DNS_RETRY_INTERVAL,
+        failures if unsupported => dns_retry_delay(failures).min(temps_dns::CP_REPORT_INTERVAL),
+        failures => dns_retry_delay(failures),
+    }
+}
+
 /// What the control plane needs to serve `*.temps.local` HTTP calls to its
 /// own containers next to its resolver (ADR-104): the route table it serves
 /// from and where the routes snapshot is kept. `None` in a standalone
@@ -206,12 +233,16 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                 attempted = false;
             }
             if cluster_dns_reportable(enabled, attempted) {
-                let routing_report = routing
-                    .as_ref()
-                    .and_then(|_| super::internal_routing::ControlPlaneRouting::report());
+                let (resolver, routing_report) = reported_services(
+                    enabled,
+                    active.as_ref(),
+                    routing
+                        .as_ref()
+                        .and_then(|_| super::internal_routing::ControlPlaneRouting::report()),
+                );
                 reporter
                     .maybe_report(
-                        active.as_ref(),
+                        resolver,
                         last_error.as_deref(),
                         unsupported.as_deref(),
                         routing_report,
@@ -372,17 +403,12 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                     warn!(
                         error = %error,
                         attempts = failures,
-                        retry_in_secs = dns_retry_delay(failures).as_secs(),
+                        retry_in_secs = next_pass_delay(failures, unsupported.is_some()).as_secs(),
                         "Proxy cluster DNS reconciliation failed; containers keep Docker's embedded DNS until it recovers"
                     );
                 }
             }
-            tokio::time::sleep(if failures == 0 {
-                DNS_RETRY_INTERVAL
-            } else {
-                dns_retry_delay(failures)
-            })
-            .await;
+            tokio::time::sleep(next_pass_delay(failures, unsupported.is_some())).await;
         }
     });
 }
@@ -830,6 +856,32 @@ mod tests {
         assert!(cluster_dns_reportable(true, true));
         // Off is known without trying.
         assert!(cluster_dns_reportable(false, false));
+    }
+
+    #[test]
+    fn the_pass_that_turns_cluster_dns_off_reports_nothing_running() {
+        assert_eq!(
+            reported_services(false, Some("resolver"), Some("routing")),
+            (None, None)
+        );
+        assert_eq!(
+            reported_services(true, Some("resolver"), Some("routing")),
+            (Some("resolver"), Some("routing"))
+        );
+    }
+
+    #[test]
+    fn an_unsupported_host_keeps_reporting_while_docker_lookups_fail() {
+        assert_eq!(next_pass_delay(0, true), DNS_RETRY_INTERVAL);
+        assert_eq!(next_pass_delay(2, true), Duration::from_secs(10));
+        // Backs off, but reports again within the interval.
+        assert_eq!(next_pass_delay(7, true), temps_dns::CP_REPORT_INTERVAL);
+        assert_eq!(
+            next_pass_delay(u32::MAX, true),
+            temps_dns::CP_REPORT_INTERVAL
+        );
+        // A resolver that fails to start keeps the long backoff.
+        assert_eq!(next_pass_delay(7, false), Duration::from_secs(300));
     }
 
     #[test]
