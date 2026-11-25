@@ -1099,7 +1099,8 @@ mod db {
         blocker_in(db, &cfg).await
     }
 
-    /// Turn the mesh off. Returns `false` when it was already off. Refused
+    /// Turn the mesh off. Returns the settings it turned off, read from the
+    /// locked row, or `None` when it was already off. Refused
     /// with [`MeshError::DisableBlocked`] while a node holds a mesh address,
     /// a pairing is in progress or the control plane's overlay runs on its
     /// mesh address; the check and the change happen under the config row
@@ -1109,12 +1110,12 @@ mod db {
     /// changes the cluster setting: the control plane stops tending its end
     /// (its reconciler sees the change), but its kernel interface is left as
     /// it is until the host removes it or Temps restarts.
-    pub async fn disable(db: &DatabaseConnection) -> Result<bool, MeshError> {
+    pub async fn disable(db: &DatabaseConnection) -> Result<Option<MeshSettings>, MeshError> {
         let txn = db.begin().await?;
         let cfg = lock_config(&txn).await?;
-        if !cfg.wireguard_enabled {
-            return Ok(false);
-        }
+        let Some(settings) = settings_from(&cfg)? else {
+            return Ok(None);
+        };
         if let Some(reason) = blocker_in(&txn, &cfg).await? {
             return Err(MeshError::DisableBlocked { reason });
         }
@@ -1127,7 +1128,7 @@ mod db {
         active.updated_at = Set(chrono::Utc::now());
         active.update(&txn).await?;
         txn.commit().await?;
-        Ok(true)
+        Ok(Some(settings))
     }
 
     /// Refuse a mesh pool that contains an address a node registered as its
@@ -1288,25 +1289,33 @@ mod db {
     }
 
     /// Record the control plane's public key, and the endpoint workers dial
-    /// if it has one, so workers can peer with it.
+    /// if it has one, so workers can peer with it. Returns whether it is
+    /// published: nothing is written while the mesh is off, checked under
+    /// the row lock [`disable`] takes, so a setup that finishes after a
+    /// disable cannot publish the key again for a later enable to expose.
     pub async fn publish_control_plane(
         db: &DatabaseConnection,
         public_key: &str,
         endpoint: Option<SocketAddr>,
-    ) -> Result<(), MeshError> {
-        let cfg = load_config(db).await?;
+    ) -> Result<bool, MeshError> {
+        let txn = db.begin().await?;
+        let cfg = lock_config(&txn).await?;
+        if !cfg.wireguard_enabled {
+            return Ok(false);
+        }
         let endpoint = endpoint.map(|endpoint| endpoint.to_string());
         if cfg.control_plane_wg_public_key.as_deref() == Some(public_key)
             && cfg.control_plane_wg_endpoint == endpoint
         {
-            return Ok(());
+            return Ok(true);
         }
         let mut active: network_config::ActiveModel = cfg.into();
         active.control_plane_wg_public_key = Set(Some(public_key.to_string()));
         active.control_plane_wg_endpoint = Set(endpoint);
         active.updated_at = Set(chrono::Utc::now());
-        active.update(db).await?;
-        Ok(())
+        active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(true)
     }
 
     /// The control plane's end of the mesh as workers see it.

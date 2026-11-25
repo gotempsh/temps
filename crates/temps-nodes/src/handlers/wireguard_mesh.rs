@@ -1129,6 +1129,13 @@ mod tests {
         temps_network::mesh::enable(db.as_ref(), Some("10.201.0.0/24"), Some(51820), None)
             .await
             .unwrap();
+        const CONTROL_PLANE_KEY: &str = "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=";
+        assert!(
+            temps_network::mesh::publish_control_plane(db.as_ref(), CONTROL_PLANE_KEY, None)
+                .await
+                .unwrap(),
+            "an enabled mesh publishes the control plane's key"
+        );
         let audit = Arc::new(RecordingAuditLogger::default());
         let router = || shared_app(db.clone(), allow(), audit.clone());
 
@@ -1195,6 +1202,23 @@ mod tests {
             send(router(), "DELETE", "/nodes/wireguard", None, Some(admin())).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(audit.records().len(), 1);
+
+        // The published key was cleared, and a control-plane setup that
+        // finishes after the disable cannot publish it again.
+        assert!(temps_network::mesh::published_control_plane(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            !temps_network::mesh::publish_control_plane(db.as_ref(), CONTROL_PLANE_KEY, None)
+                .await
+                .unwrap(),
+            "nothing is published while the mesh is off"
+        );
+        assert!(temps_network::mesh::published_control_plane(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     async fn migrated_test_db() -> Option<temps_test_utils::TestDatabase> {

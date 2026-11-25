@@ -463,14 +463,12 @@ impl WireguardMeshService {
     /// already off). Refused with `DisableBlocked` while anything depends on
     /// it; see [`temps_network::mesh::disable`] for what changes.
     pub async fn disable(&self) -> Result<Option<MeshSettings>, WireguardMeshError> {
-        let db = self.db.as_ref();
-        let settings = temps_network::mesh::load_settings(db)
+        // The settings come from the row `disable` locked, so a concurrent
+        // enable or pool change cannot make them disagree with what it
+        // turned off.
+        temps_network::mesh::disable(self.db.as_ref())
             .await
-            .map_err(mesh("read the mesh settings"))?;
-        let turned_off = temps_network::mesh::disable(db)
-            .await
-            .map_err(mesh("turn the mesh off"))?;
-        Ok(settings.filter(|_| turned_off))
+            .map_err(mesh("turn the mesh off"))
     }
 
     /// Make `hub` the mesh hub, or remove it (`None`).
