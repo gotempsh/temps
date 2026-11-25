@@ -89,7 +89,11 @@ export function isSelectedBackup(
     return entry.source === 'db' && entry.id === selection.backupId
   }
   if (selection.backupLocation !== undefined) {
-    return entry.location === selection.backupLocation
+    return (
+      entry.source === 's3_scan' &&
+      entry.location === selection.backupLocation &&
+      !needsSnapshotKey(entry)
+    )
   }
   return false
 }
@@ -111,4 +115,18 @@ export function restoreBackupHref(
     backup: String(backup.backupId),
   })
   return `/storage/${serviceId}/restore?${params.toString()}`
+}
+
+/** Older servers return the same repository path for every scanned PostgreSQL base backup. */
+export function needsSnapshotKey(entry: SourceBackupEntry): boolean {
+  return (
+    entry.source === 's3_scan' &&
+    entry.engine === 'postgres' &&
+    entry.format === 'walg' &&
+    /\/walg\/?$/.test(entry.location)
+  )
+}
+
+export function backupRadioValue(entry: SourceBackupEntry): string {
+  return entry.source === 'db' ? `db:${entry.id}` : `s3:${entry.location}`
 }

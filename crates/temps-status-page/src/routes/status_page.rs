@@ -385,7 +385,12 @@ where
         .map_err(map_error)
 }
 
-/// Update a monitor's check path
+/// Update a monitor's name, check interval or check path
+///
+/// Fields left out keep their stored value; at least one is required. The
+/// monitor keeps its ID and uptime history. `check_interval_seconds` is
+/// clamped like on create (minimum 30). Changing `check_path` discards probe
+/// results still in flight for the old path.
 #[utoipa::path(
     patch,
     path = "/monitors/{monitor_id}",
@@ -2213,7 +2218,8 @@ mod tests {
             Extension(test_request_metadata()),
             Path(fx.monitor_id),
             Json(UpdateMonitorRequest {
-                check_path: "/forbidden".to_string(),
+                check_path: Some("/forbidden".to_string()),
+                ..Default::default()
             }),
         )
         .await
@@ -2318,7 +2324,8 @@ mod tests {
             Extension(test_request_metadata()),
             Path(fx.monitor_id),
             Json(UpdateMonitorRequest {
-                check_path: "/ready".to_string(),
+                check_path: Some("/ready".to_string()),
+                ..Default::default()
             }),
         )
         .await;
@@ -2418,7 +2425,8 @@ mod tests {
             Extension(test_request_metadata()),
             Path(fx.monitor_id),
             Json(UpdateMonitorRequest {
-                check_path: "/audit-unavailable".to_string(),
+                check_path: Some("/audit-unavailable".to_string()),
+                ..Default::default()
             }),
         )
         .await;

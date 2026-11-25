@@ -6,7 +6,11 @@ import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { restoreOwnBackupsQuery, restoreSourcesQuery } from './restore-queries'
+import {
+  restoreOwnBackupsQuery,
+  restoreSourceBackupsQuery,
+  restoreSourcesQuery,
+} from './restore-queries'
 
 installBrowserWindow()
 afterEach(() => undefined)
@@ -103,4 +107,31 @@ test('a short list is read in a single request', async () => {
   expect(requested).toEqual(['1'])
   expect(merged.backups).toHaveLength(2)
   api.restore()
+})
+
+test('the optional bucket scan keeps its own results and errors in cache', async () => {
+  const api = mockApi({
+    'GET /backups/s3-sources/7/backups': (request) => {
+      const scan = new URL(request.url).searchParams.get('include_s3_scan')
+      return jsonResponse({
+        backups: [],
+        last_updated: '2026-01-01T00:00:00Z',
+        scan_errors: scan === 'true' ? ['Bucket unavailable'] : [],
+      })
+    },
+  })
+  try {
+    const client = new QueryClient()
+    const plain = restoreSourceBackupsQuery(7)
+    const scanned = restoreSourceBackupsQuery(7, true)
+    expect((await client.fetchQuery(scanned)).scan_errors).toEqual([
+      'Bucket unavailable',
+    ])
+    expect((await client.fetchQuery(plain)).scan_errors).toEqual([])
+    expect(client.getQueryData(scanned.queryKey)?.scan_errors).toEqual([
+      'Bucket unavailable',
+    ])
+  } finally {
+    api.restore()
+  }
 })

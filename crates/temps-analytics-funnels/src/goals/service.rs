@@ -745,7 +745,7 @@ mod tests {
         visitor::ActiveModel {
             visitor_id: Set(key.to_string()),
             project_id: Set(project_id),
-            environment_id: Set(environment_id),
+            environment_id: Set(Some(environment_id)),
             first_seen: Set(Utc::now()),
             last_seen: Set(Utc::now()),
             is_crawler: Set(false),

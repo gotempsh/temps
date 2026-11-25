@@ -25,6 +25,22 @@ pub use node_recreate::{NodeAfterCreate, NodeRecreate};
 use restore::*;
 pub use walg::*;
 
+/// Splits a discovered WAL-G stop-sentinel key into its repository and exact base backup name.
+pub fn walg_snapshot(location: &str) -> Option<(&str, &str)> {
+    let (root, file) = location.rsplit_once("/basebackups_005/")?;
+    let name = file.strip_suffix("_backup_stop_sentinel.json")?;
+    (root.ends_with("/walg")
+        && name.starts_with("base_")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')))
+    .then_some((root, name))
+}
+
+pub use temps_providers_core::externalsvc::walg_fetch::{
+    WalgFetchSelector, FETCH_TARGET_USER_DATA_ENV,
+};
+
 pub struct PostgresService {
     name: String,
     config: Arc<RwLock<Option<PostgresConfig>>>,

@@ -6,7 +6,7 @@ description: Operate Temps through the published `@temps-sdk/cli` package with b
 # Temps CLI
 
 Use the zero-install package invocation below to operate a Temps server. Prefer
-`bunx @temps-sdk/cli@latest`; use `npx @temps-sdk/cli@latest` when Bun is not
+`bunx @temps-sdk/cli@beta`; use `npx @temps-sdk/cli@beta` when Bun is not
 available. Treat this skill as procedural guidance and command documentation,
 not as authorization to mutate a server.
 
@@ -15,12 +15,12 @@ not as authorization to mutate a server.
 1. Run `command -v bunx || command -v npx` to select an available package
    runner. Prefer `bunx` when both exist.
 2. Check the current stable runtime as shown below, then run
-   `bunx @temps-sdk/cli@latest --version` (or its `npx` equivalent).
+   `bunx @temps-sdk/cli@beta --version` (or its `npx` equivalent).
    Keep the explicit channel tag.
 3. Identify the requested operation and locate its command in
    [references/COMMANDS.md](references/COMMANDS.md). Search only the relevant
    command group instead of loading the entire reference.
-4. Run `bunx @temps-sdk/cli@latest <group> <command> --help` when flags or
+4. Run `bunx @temps-sdk/cli@beta <group> <command> --help` when flags or
    behavior may have changed. Runtime help is authoritative.
 5. Classify the operation as read-only, state-changing, destructive, or
    secret-bearing.
@@ -73,13 +73,13 @@ For common multi-command journeys, read
 Check the installed version and command help before operations:
 
 ```bash
-bunx @temps-sdk/cli@latest --version
+bunx @temps-sdk/cli@beta --version
 ```
 
 When Bun is unavailable, use npm:
 
 ```bash
-npx @temps-sdk/cli@latest --version
+npx @temps-sdk/cli@beta --version
 ```
 
 The channel tag in these commands is the npm dist-tag that publishes the CLI version
@@ -126,15 +126,15 @@ Use one named context per Temps server. Inspect contexts read-only before a
 write:
 
 ```bash
-bunx @temps-sdk/cli@latest context list
-bunx @temps-sdk/cli@latest context show production
-bunx @temps-sdk/cli@latest --target-context production whoami
+bunx @temps-sdk/cli@beta context list
+bunx @temps-sdk/cli@beta context show production
+bunx @temps-sdk/cli@beta --target-context production whoami
 ```
 
 Place the global option immediately after the package specifier:
 
 ```bash
-bunx @temps-sdk/cli@latest --target-context production projects list
+bunx @temps-sdk/cli@beta --target-context production projects list
 ```
 
 Do not rely on `context use` for agentic writes because it mutates ambient
@@ -145,8 +145,8 @@ state for subsequent commands.
 Use interactive browser login for a person:
 
 ```bash
-bunx @temps-sdk/cli@latest login https://temps.example.com --context production
-bunx @temps-sdk/cli@latest --target-context production whoami
+bunx @temps-sdk/cli@beta login https://temps.example.com --context production
+bunx @temps-sdk/cli@beta --target-context production whoami
 ```
 
 For CI, inject `TEMPS_TOKEN` and `TEMPS_API_URL` from the CI secret store. Do
@@ -155,9 +155,9 @@ not print them or persist them in repository files.
 Configuration commands manage non-secret CLI preferences:
 
 ```bash
-bunx @temps-sdk/cli@latest configure show
-bunx @temps-sdk/cli@latest configure get output-format
-bunx @temps-sdk/cli@latest configure set output-format json
+bunx @temps-sdk/cli@beta configure show
+bunx @temps-sdk/cli@beta configure get output-format
+bunx @temps-sdk/cli@beta configure set output-format json
 ```
 
 Relevant environment variables:
@@ -177,10 +177,10 @@ Pair every mutation with a read-only check against the same explicit context:
 
 ```bash
 # Mutation shown only as a structural example; confirm before running it.
-bunx @temps-sdk/cli@latest --target-context staging projects create --name example
+bunx @temps-sdk/cli@beta --target-context staging projects create --name example
 
 # Read-only evidence.
-bunx @temps-sdk/cli@latest --target-context staging projects list --json
+bunx @temps-sdk/cli@beta --target-context staging projects list --json
 ```
 
 Prefer structured output when available. Parse only fields required for the

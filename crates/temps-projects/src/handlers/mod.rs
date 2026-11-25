@@ -18,3 +18,4 @@ pub use types::*;
 
 pub mod compose_security;
 pub mod container_security;
+pub mod identical_builds;

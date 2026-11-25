@@ -162,8 +162,36 @@ pub(super) fn merge_preset_config(
             }
             PresetConfig::DockerCompose(parsed_cfg)
         }
+        // Every other preset is flat settings (`buildCommand`,
+        // `installCommand`, `outputDir`, ...): a key the request omits keeps
+        // its stored value and a key sent as `null` clears it. Replacing the
+        // whole config made a one-field update (say, just `buildCommand`)
+        // silently reset the rest to the preset defaults.
+        (Some(existing), parsed) if existing.preset_type() == parsed.preset_type() => {
+            keep_omitted_settings(existing, config_value).unwrap_or(parsed)
+        }
         (_, other) => other,
     }
+}
+
+/// `existing` with every key of `config_value` written over it, parsed back
+/// as the same preset. `None` when either side is not a JSON object or the
+/// result does not parse, in which case the caller keeps the parsed request.
+fn keep_omitted_settings(
+    existing: &temps_entities::preset::PresetConfig,
+    config_value: &serde_json::Value,
+) -> Option<temps_entities::preset::PresetConfig> {
+    let serde_json::Value::Object(mut merged) = serde_json::to_value(existing).ok()? else {
+        return None;
+    };
+    for (key, value) in config_value.as_object()? {
+        merged.insert(key.clone(), value.clone());
+    }
+    temps_entities::preset::PresetConfig::parse_for_preset(
+        &existing.preset_type(),
+        &serde_json::Value::Object(merged),
+    )
+    .ok()
 }
 
 /// Resolve a settings patch against the caller's current project row. Writers
@@ -373,6 +401,143 @@ fn validate_unsandboxed_services(
 /// Existing config is retained when it belongs to the same canonical preset.
 /// Selecting base `nixpacks` is authoritative: omitted providers reset to
 /// auto-detection while other Nixpacks settings remain intact.
+/// Top-level build settings a create/update request may carry next to
+/// `preset_config`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TopLevelBuildSettings {
+    pub build_command: Option<String>,
+    pub install_command: Option<String>,
+    pub output_dir: Option<String>,
+}
+
+/// Fold a create/update request's top-level `build_command`,
+/// `install_command` and `output_dir` into its `preset_config`
+/// (`buildCommand`, `installCommand`, `outputDir`), where the build reads
+/// them, and return the `preset_config` to store.
+///
+/// They used to be accepted and silently dropped, so a client believed it had
+/// configured a build it had not. A value that disagrees with the one in
+/// `preset_config`, or that the chosen preset has no setting for (a
+/// Dockerfile build has no build command), is a 400 instead.
+pub fn fold_top_level_build_settings(
+    preset: &str,
+    preset_config: Option<serde_json::Value>,
+    settings: TopLevelBuildSettings,
+) -> Result<Option<serde_json::Value>, ProjectError> {
+    let folded = settings.into_folded();
+    if folded.is_empty() {
+        return Ok(preset_config);
+    }
+    let config = match preset_config {
+        None | Some(serde_json::Value::Null) => serde_json::Map::new(),
+        Some(serde_json::Value::Object(config)) => config,
+        Some(_) => {
+            return Err(ProjectError::InvalidInput(
+                "preset_config must be a JSON object when build_command, install_command or \
+                 output_dir is set"
+                    .to_string(),
+            ))
+        }
+    };
+    fold_into(preset, config, &folded, FoldMode::RejectConflicts).map(Some)
+}
+
+/// Fold top-level build settings into the preset configuration a project
+/// already has, for an update that omits `preset_config`.
+///
+/// Omitting `preset_config` means "keep it", so the stored settings the
+/// request does not mention survive (sending only `build_command` used to
+/// replace the whole configuration and drop the stored `installCommand` and
+/// `outputDir`). A top-level value replaces the stored one for its key. When
+/// the stored configuration belongs to another preset, nothing of it carries
+/// over, as when `preset_config` is omitted without top-level settings.
+pub(super) fn fold_top_level_build_settings_onto_stored(
+    preset: &str,
+    stored: Option<&temps_entities::preset::PresetConfig>,
+    settings: TopLevelBuildSettings,
+) -> Result<Option<serde_json::Value>, ProjectError> {
+    let folded = settings.into_folded();
+    if folded.is_empty() {
+        return Ok(None);
+    }
+    let preset_type = resolve_preset_slug(preset, None)?.preset;
+    let base = match stored.filter(|config| config.preset_type() == preset_type) {
+        Some(config) => match serde_json::to_value(config).map_err(|error| {
+            ProjectError::InvalidInput(format!("Stored preset config could not be read: {error}"))
+        })? {
+            serde_json::Value::Object(config) => config,
+            _ => serde_json::Map::new(),
+        },
+        None => serde_json::Map::new(),
+    };
+    fold_into(preset, base, &folded, FoldMode::ReplaceStored).map(Some)
+}
+
+impl TopLevelBuildSettings {
+    /// `(request field, preset_config key, value)` for every setting given.
+    fn into_folded(self) -> Vec<(&'static str, &'static str, String)> {
+        [
+            ("build_command", "buildCommand", self.build_command),
+            ("install_command", "installCommand", self.install_command),
+            ("output_dir", "outputDir", self.output_dir),
+        ]
+        .into_iter()
+        .filter_map(|(field, key, value)| value.map(|value| (field, key, value)))
+        .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldMode {
+    /// The request also sent the key in `preset_config`: a different value
+    /// is ambiguous and rejected.
+    RejectConflicts,
+    /// The base is the stored configuration: the request's value wins.
+    ReplaceStored,
+}
+
+fn fold_into(
+    preset: &str,
+    mut config: serde_json::Map<String, serde_json::Value>,
+    folded: &[(&'static str, &'static str, String)],
+    mode: FoldMode,
+) -> Result<serde_json::Value, ProjectError> {
+    use temps_entities::preset::PresetConfig;
+
+    for (field, key, value) in folded {
+        match config.get(*key) {
+            Some(existing)
+                if mode == FoldMode::RejectConflicts
+                    && existing.as_str() != Some(value.as_str()) =>
+            {
+                return Err(ProjectError::InvalidInput(format!(
+                    "{field} '{value}' conflicts with preset_config.{key} {existing}; set it in \
+                     one place"
+                )));
+            }
+            _ => {
+                config.insert((*key).to_string(), serde_json::Value::String(value.clone()));
+            }
+        }
+    }
+
+    let preset_type = resolve_preset_slug(preset, None)?.preset;
+    let config = serde_json::Value::Object(config);
+    let parsed = PresetConfig::parse_for_preset(&preset_type, &config)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset config: {error}")))?;
+    let stored = serde_json::to_value(&parsed)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset config: {error}")))?;
+    for (field, key, value) in folded {
+        if stored.get(*key).and_then(serde_json::Value::as_str) != Some(value.as_str()) {
+            return Err(ProjectError::InvalidInput(format!(
+                "preset '{preset}' has no {field} setting; remove {field} or choose a preset \
+                 that builds with one"
+            )));
+        }
+    }
+    Ok(config)
+}
+
 pub(super) fn resolve_preset_selection(
     slug: &str,
     config_value: Option<&serde_json::Value>,
@@ -431,6 +596,175 @@ pub(super) fn resolve_preset_selection(
 mod tests {
     use super::*;
     use temps_entities::preset::Preset;
+
+    fn settings(
+        build: Option<&str>,
+        install: Option<&str>,
+        output: Option<&str>,
+    ) -> TopLevelBuildSettings {
+        TopLevelBuildSettings {
+            build_command: build.map(str::to_string),
+            install_command: install.map(str::to_string),
+            output_dir: output.map(str::to_string),
+        }
+    }
+
+    /// A partial framework `preset_config` (`{"buildCommand": ...}`) used to
+    /// replace the stored one, resetting the install command and output
+    /// directory to the preset defaults. Omitted keys now keep their stored
+    /// value and `null` clears one.
+    #[test]
+    fn a_partial_framework_preset_config_keeps_the_settings_it_omits() {
+        use temps_entities::preset::{Preset, PresetConfig};
+
+        let stored = PresetConfig::parse_for_preset(
+            &Preset::Vite,
+            &serde_json::json!({
+                "buildCommand": "npm run build",
+                "installCommand": "npm ci",
+                "outputDir": "dist",
+            }),
+        )
+        .expect("stored vite config");
+        let resolved_json = |request: serde_json::Value| {
+            let resolved =
+                resolve_preset_selection("vite", Some(&request), Some(&stored)).expect("resolves");
+            serde_json::to_value(resolved.config.expect("a config")).expect("serializes")
+        };
+
+        let partial = resolved_json(serde_json::json!({ "buildCommand": "pnpm build" }));
+        assert_eq!(partial["buildCommand"], "pnpm build");
+        assert_eq!(partial["installCommand"], "npm ci");
+        assert_eq!(partial["outputDir"], "dist");
+
+        let cleared = resolved_json(serde_json::json!({ "outputDir": null }));
+        assert_eq!(cleared["buildCommand"], "npm run build");
+        assert_eq!(cleared["installCommand"], "npm ci");
+        assert!(cleared.get("outputDir").is_none(), "{cleared}");
+    }
+
+    /// An update that omits `preset_config` and sends only `build_command`
+    /// used to replace the stored configuration with `{buildCommand}`,
+    /// dropping the stored install command and output directory.
+    #[test]
+    fn top_level_build_settings_keep_the_stored_settings_they_do_not_name() {
+        use temps_entities::preset::{Preset, PresetConfig};
+
+        let stored = PresetConfig::parse_for_preset(
+            &Preset::Vite,
+            &serde_json::json!({
+                "buildCommand": "npm run build",
+                "installCommand": "npm ci",
+                "outputDir": "dist",
+            }),
+        )
+        .expect("stored vite config");
+
+        let config = fold_top_level_build_settings_onto_stored(
+            "vite",
+            Some(&stored),
+            settings(Some("pnpm build"), None, None),
+        )
+        .expect("folded")
+        .expect("a config is produced");
+        assert_eq!(config["buildCommand"], "pnpm build", "the request wins");
+        assert_eq!(config["installCommand"], "npm ci");
+        assert_eq!(config["outputDir"], "dist");
+
+        // Nothing to fold keeps the omitted preset_config omitted.
+        assert_eq!(
+            fold_top_level_build_settings_onto_stored(
+                "vite",
+                Some(&stored),
+                TopLevelBuildSettings::default()
+            )
+            .unwrap(),
+            None
+        );
+
+        // A stored config of another preset does not carry over.
+        let other = PresetConfig::parse_for_preset(
+            &Preset::Dockerfile,
+            &serde_json::json!({ "dockerfilePath": "Dockerfile" }),
+        )
+        .expect("stored dockerfile config");
+        let config = fold_top_level_build_settings_onto_stored(
+            "vite",
+            Some(&other),
+            settings(Some("pnpm build"), None, None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config, serde_json::json!({ "buildCommand": "pnpm build" }));
+    }
+
+    /// Top-level build settings used to be accepted and silently dropped.
+    #[test]
+    fn top_level_build_settings_are_stored_in_the_preset_config() {
+        let config = fold_top_level_build_settings(
+            "vite",
+            None,
+            settings(Some("pnpm build"), Some("pnpm install"), Some("build")),
+        )
+        .expect("vite has all three settings")
+        .expect("a config is produced");
+        assert_eq!(config["buildCommand"], "pnpm build");
+        assert_eq!(config["installCommand"], "pnpm install");
+        assert_eq!(config["outputDir"], "build");
+
+        // Merged with what preset_config already sets, and the same value in
+        // both places is not a conflict.
+        let config = fold_top_level_build_settings(
+            "vite",
+            Some(serde_json::json!({ "buildCommand": "pnpm build", "outputDir": "dist" })),
+            settings(Some("pnpm build"), Some("pnpm install"), None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(config["installCommand"], "pnpm install");
+        assert_eq!(config["outputDir"], "dist");
+
+        // Nothing set: preset_config passes through untouched.
+        let untouched = serde_json::json!({ "dockerfilePath": "Dockerfile" });
+        assert_eq!(
+            fold_top_level_build_settings(
+                "dockerfile",
+                Some(untouched.clone()),
+                TopLevelBuildSettings::default()
+            )
+            .unwrap(),
+            Some(untouched)
+        );
+    }
+
+    #[test]
+    fn conflicting_or_unsupported_build_settings_are_rejected() {
+        let conflict = fold_top_level_build_settings(
+            "vite",
+            Some(serde_json::json!({ "buildCommand": "npm run build" })),
+            settings(Some("pnpm build"), None, None),
+        );
+        assert!(matches!(
+            conflict,
+            Err(ProjectError::InvalidInput(ref message))
+                if message.contains("build_command") && message.contains("buildCommand")
+        ));
+
+        let unsupported =
+            fold_top_level_build_settings("dockerfile", None, settings(Some("make"), None, None));
+        assert!(matches!(
+            unsupported,
+            Err(ProjectError::InvalidInput(ref message))
+                if message.contains("preset 'dockerfile' has no build_command")
+        ));
+
+        let not_an_object = fold_top_level_build_settings(
+            "vite",
+            Some(serde_json::json!(["buildCommand"])),
+            settings(Some("pnpm build"), None, None),
+        );
+        assert!(matches!(not_an_object, Err(ProjectError::InvalidInput(_))));
+    }
 
     #[test]
     fn resolved_framework_and_nixpacks_presets_get_their_runtime_project_type() {

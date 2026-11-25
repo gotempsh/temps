@@ -175,7 +175,7 @@ describe('sourceBackupSummary', () => {
   test('shows the location of an untracked backup', () => {
     const summary = sourceBackupSummary(
       run({
-        source_backup_id: 0,
+        source_backup_id: null,
         source_backup: {
           id: null,
           backup_id: null,

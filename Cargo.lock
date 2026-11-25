@@ -12766,8 +12766,8 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
- "tokio-stream",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -15494,6 +15494,7 @@ dependencies = [
  "hex",
  "http 1.5.0",
  "ipnetwork",
+ "mockito",
  "percent-encoding",
  "rand 0.10.3",
  "sea-orm 1.1.20",
@@ -16010,7 +16011,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workflows-sdk"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",

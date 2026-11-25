@@ -9934,6 +9934,11 @@ export type CreateProjectGroupRequest = {
 
 export type CreateProjectRequest = {
     automatic_deploy?: boolean | null;
+    /**
+     * Build command; the same setting as `preset_config.buildCommand`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     build_command?: string | null;
     /**
      * Override the instance default for this new project.
@@ -9979,12 +9984,22 @@ export type CreateProjectRequest = {
      * `hosted`.
      */
     hosting?: Hosting;
+    /**
+     * Install command; the same setting as `preset_config.installCommand`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     install_command?: string | null;
     is_on_demand?: boolean | null;
     is_public_repo?: boolean | null;
     is_web_app?: boolean | null;
     main_branch?: string;
     name: string;
+    /**
+     * Build output directory; the same setting as `preset_config.outputDir`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
     preset?: string;
@@ -19600,6 +19615,98 @@ export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
 
 /**
+ * What coordination did for this project in the last 30 days.
+ */
+export type IdenticalBuildActivityResponse = {
+    /**
+     * Builds of this project building for their group right now.
+     */
+    building: number;
+    /**
+     * Coordinated builds that built their own image.
+     */
+    built: number;
+    /**
+     * Deployments that deployed an identical build's image instead of building.
+     */
+    reused: number;
+    /**
+     * Builds of this project waiting for an identical build right now.
+     */
+    waiting: number;
+};
+
+/**
+ * What a build does when an identical build is already running.
+ */
+export type IdenticalBuildMode = 'parallel' | 'queue' | 'share';
+
+/**
+ * One mode, explained for the console and the CLI.
+ */
+export type IdenticalBuildModeOption = {
+    /**
+     * What the mode does, in plain words.
+     */
+    description: string;
+    /**
+     * A concrete case.
+     */
+    example: string;
+    id: IdenticalBuildMode;
+    label: string;
+};
+
+/**
+ * Which builds count as "the same group" for queueing.
+ *
+ * The scope only ever widens queueing. Reusing an image always requires the
+ * full fingerprint to match, whatever the scope.
+ */
+export type IdenticalBuildScope = 'fingerprint' | 'source';
+
+/**
+ * One grouping scope, explained for the console and the CLI.
+ */
+export type IdenticalBuildScopeOption = {
+    description: string;
+    id: IdenticalBuildScope;
+    label: string;
+};
+
+export type IdenticalBuildsResponse = {
+    /**
+     * The last 30 days.
+     */
+    activity: IdenticalBuildActivityResponse;
+    /**
+     * Whether the caller may change the setting.
+     */
+    can_edit: boolean;
+    /**
+     * The longest a build waits before it fails with a reason.
+     */
+    max_wait_seconds: number;
+    /**
+     * What this project's builds do when an identical build is running.
+     * `parallel` (the default) builds every deployment. Applies from the
+     * next build.
+     */
+    mode: IdenticalBuildMode;
+    modes: Array<IdenticalBuildModeOption>;
+    /**
+     * How long after it succeeded a shared image is offered to identical
+     * builds that start later.
+     */
+    reuse_window_seconds: number;
+    /**
+     * Which builds wait for each other.
+     */
+    scope: IdenticalBuildScope;
+    scopes: Array<IdenticalBuildScopeOption>;
+};
+
+/**
  * What an identify call did.
  */
 export type IdentifyOutcome = 'updated' | 'unchanged' | 'visitor_not_found' | 'cookieless_project' | 'browser_identify_refused' | 'server_identity_kept';
@@ -22017,7 +22124,7 @@ export type LiveVisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -32295,7 +32402,7 @@ export type RestoreRunView = {
      * it. Always present; its fields are `None` where they are unknown.
      */
     source_backup: RestoreRunSourceBackup;
-    source_backup_id: number;
+    source_backup_id?: number | null;
     source_service_id: number;
     started_at?: string | null;
     status: string;
@@ -35552,7 +35659,7 @@ export type SessionReplayWithVisitorDto = {
     visitor_country_code?: string | null;
     visitor_crawler_name?: string | null;
     visitor_custom_data?: unknown;
-    visitor_environment_id: number;
+    visitor_environment_id?: number | null;
     visitor_first_seen: string;
     visitor_id: number;
     visitor_is_crawler: boolean;
@@ -36775,6 +36882,10 @@ export type SourceBackupIndexResponse = {
      * When the index was last updated
      */
     last_updated: string;
+    /**
+     * Errors encountered during the optional bucket scan.
+     */
+    scan_errors: Array<string>;
 };
 
 /**
@@ -37679,10 +37790,22 @@ export type StatusPageResponse = {
      */
     public_feed_url?: string | null;
     /**
+     * Path of the machine-readable form (`/api/status/{slug}/summary.json`);
+     * always present, like `public_path`.
+     */
+    public_json_path: string;
+    /**
      * Machine-readable form of the public page. `None` exactly when
      * `public_url` is.
      */
     public_json_url?: string | null;
+    /**
+     * Path of the public HTML page (`/api/status/{slug}`), on any address
+     * this install's public listener is reachable at. Always present, so a
+     * client can build the link itself when `public_url` is `None` because
+     * no public URL is configured.
+     */
+    public_path: string;
     /**
      * Public HTML page. Serves 404 while the page is unpublished. `None`
      * when this install has no public address to build it from; see
@@ -41065,6 +41188,14 @@ export type UpdateHostImagePreparationBody = {
     keep_prepared: boolean;
 };
 
+export type UpdateIdenticalBuildsRequest = {
+    mode: IdenticalBuildMode;
+    /**
+     * Defaults to `source` (same repository and path).
+     */
+    scope?: IdenticalBuildScope;
+};
+
 export type UpdateInboundFilterRequest = {
     enabled?: boolean | null;
     pattern?: string | null;
@@ -41262,8 +41393,26 @@ export type UpdateMetricAlertRequest = {
     window_secs?: number | null;
 };
 
+/**
+ * Fields to change on a monitor. Every field is optional, a field left out
+ * keeps its stored value, and at least one must be present. The monitor's ID
+ * and uptime history are kept.
+ */
 export type UpdateMonitorRequest = {
-    check_path: string;
+    /**
+     * How often to probe, in seconds. **Clamped, not rejected**, exactly
+     * like on create: values below 30 are stored as 30 and non-positive
+     * values as 60, and the response reports the stored value.
+     */
+    check_interval_seconds?: number | null;
+    /**
+     * Path probed on the monitored environment; must start with `/`.
+     */
+    check_path?: string | null;
+    /**
+     * Display name; 1 to 255 characters after trimming.
+     */
+    name?: string | null;
 };
 
 export type UpdateNotificationEmailProviderRequest = {
@@ -42554,7 +42703,7 @@ export type VisitorDetails = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42669,7 +42818,7 @@ export type VisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42825,7 +42974,7 @@ export type VisitorWithGeolocation = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -54926,6 +55075,10 @@ export type CreateS3SourceErrors = {
      */
     403: ProblemDetails;
     /**
+     * Another request changed the default source at the same time; nothing was saved, retry
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -55870,7 +56023,7 @@ export type DeleteBackupData = {
     body?: never;
     path: {
         /**
-         * Backup UUID
+         * Backup UUID (`backup_id`), or its integer `id` as returned by the backup lists
          */
         id: string;
     };
@@ -55900,9 +56053,13 @@ export type DeleteBackupErrors = {
      */
     409: ProblemDetails;
     /**
-     * Object storage or database error
+     * Object storage or database error; the `failure` field says which
      */
     500: ProblemDetails;
+    /**
+     * Transient failure (the backup's service is restarting or being deleted, or the database is unavailable); retry after the `Retry-After` header
+     */
+    503: ProblemDetails;
 };
 
 export type DeleteBackupError = DeleteBackupErrors[keyof DeleteBackupErrors];
@@ -62607,9 +62764,11 @@ export type GetServiceEnvironmentVariablesErrors = {
 
 export type GetServiceEnvironmentVariablesResponses = {
     /**
-     * List of environment variables
+     * Map of variable name to its masked value (`***`)
      */
-    200: Array<EnvironmentVariableInfo>;
+    200: {
+        [key: string]: string;
+    };
 };
 
 export type GetServiceEnvironmentVariablesResponse = GetServiceEnvironmentVariablesResponses[keyof GetServiceEnvironmentVariablesResponses];
@@ -78154,6 +78313,84 @@ export type SetProjectHostingResponses = {
 
 export type SetProjectHostingResponse = SetProjectHostingResponses[keyof SetProjectHostingResponses];
 
+export type GetIdenticalBuildsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type GetIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type GetIdenticalBuildsResponse = GetIdenticalBuildsResponses[keyof GetIdenticalBuildsResponses];
+
+export type UpdateIdenticalBuildsData = {
+    body: UpdateIdenticalBuildsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type UpdateIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * An unknown mode or scope
+     */
+    422: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type UpdateIdenticalBuildsResponse = UpdateIdenticalBuildsResponses[keyof UpdateIdenticalBuildsResponses];
+
 export type GetLastDeploymentData = {
     body?: never;
     path: {
@@ -85810,6 +86047,50 @@ export type DeleteEnvironmentVariableResponses = {
 };
 
 export type DeleteEnvironmentVariableResponse = DeleteEnvironmentVariableResponses[keyof DeleteEnvironmentVariableResponses];
+
+export type GetEnvironmentVariableData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/env-vars/{var_id}';
+};
+
+export type GetEnvironmentVariableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEnvironmentVariableResponses = {
+    /**
+     * The environment variable, value masked
+     */
+    200: EnvironmentVariableResponse;
+};
+
+export type GetEnvironmentVariableResponse = GetEnvironmentVariableResponses[keyof GetEnvironmentVariableResponses];
 
 export type UpdateEnvironmentVariableData = {
     body: UpdateEnvironmentVariableRequest;
@@ -106988,7 +107269,13 @@ export type CreateSandboxErrors = {
      * Internal server error
      */
     500: unknown;
+    /**
+     * The project stores no clone URL and its git connection could not look up the project's repository
+     */
+    502: ProblemDetails;
 };
+
+export type CreateSandboxError = CreateSandboxErrors[keyof CreateSandboxErrors];
 
 export type CreateSandboxResponses = {
     /**

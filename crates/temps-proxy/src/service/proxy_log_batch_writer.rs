@@ -107,7 +107,9 @@ pub struct TrackingEvent {
     /// Session UUID from the stateless cookie codec.
     pub session_uuid: String,
     pub project_id: i32,
-    pub environment_id: i32,
+    /// `None` when the request resolved to a project but not to an
+    /// environment; stored as `visitor.environment_id = NULL`.
+    pub environment_id: Option<i32>,
     /// Timestamp of this page view (used as `last_seen` for the visitor and
     /// `last_accessed_at` for the session).
     pub last_seen: chrono::DateTime<Utc>,
@@ -1100,7 +1102,7 @@ mod tests {
             visitor_uuid: "test-visitor-uuid".to_string(),
             session_uuid: "test-session-uuid".to_string(),
             project_id: 1,
-            environment_id: 1,
+            environment_id: Some(1),
             last_seen: Utc::now(),
             client_ip: None,
             user_agent: None,
@@ -1142,7 +1144,7 @@ mod tests {
             visitor_uuid: "same-visitor".to_string(),
             session_uuid: "sess-a".to_string(),
             project_id: 1,
-            environment_id: 1,
+            environment_id: Some(1),
             last_seen: earlier,
             client_ip: None,
             user_agent: None,
@@ -1166,7 +1168,7 @@ mod tests {
             visitor_uuid: "same-visitor".to_string(),
             session_uuid: "sess-a".to_string(),
             project_id: 1,
-            environment_id: 1,
+            environment_id: Some(1),
             last_seen: now,
             client_ip: None,
             user_agent: None,
@@ -1380,7 +1382,7 @@ mod tests {
                 visitor_uuid: visitor_uuid.clone(),
                 session_uuid: uuid::Uuid::new_v4().to_string(),
                 project_id,
-                environment_id,
+                environment_id: Some(environment_id),
                 last_seen: Utc::now(),
                 client_ip: None,
                 user_agent: None,
@@ -1425,6 +1427,68 @@ mod tests {
             assert_eq!(row.first_channel.as_deref(), Some("Organic Search"));
         }
 
+        /// A request that resolved to a project but not to an environment
+        /// stores `visitor.environment_id = NULL`, not the old `0` sentinel
+        /// every reader had to remember to treat as absent (#2029).
+        #[tokio::test]
+        async fn test_visitor_without_environment_stores_null() {
+            let test_db = TestDatabase::with_migrations().await.unwrap();
+            let db = test_db.connection_arc().clone();
+            let ip_service = {
+                let geoip = Arc::new(temps_geo::GeoIpService::Mock(
+                    temps_geo::MockGeoIpService::new(),
+                ));
+                Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip))
+            };
+            let storage = Arc::new(crate::storage::TimescaleDbProxyLogStore::new(
+                db.clone(),
+                ip_service.clone(),
+            ));
+            let (_, _, writer) = ProxyLogBatchWriter::new(db.clone(), ip_service, storage);
+
+            let (project_id, _environment_id) = setup_project(&db).await;
+            let visitor_uuid = uuid::Uuid::new_v4().to_string();
+
+            let event = TrackingEvent {
+                visitor_uuid: visitor_uuid.clone(),
+                session_uuid: uuid::Uuid::new_v4().to_string(),
+                project_id,
+                environment_id: None,
+                last_seen: Utc::now(),
+                client_ip: None,
+                user_agent: None,
+                is_crawler: false,
+                crawler_name: None,
+                is_new_session: true,
+                session_referrer: None,
+                session_referrer_hostname: None,
+                session_utm_source: None,
+                session_utm_medium: None,
+                session_utm_campaign: None,
+                session_utm_content: None,
+                session_utm_term: None,
+                session_channel: None,
+                attribution: FirstVisitAttribution {
+                    referrer: None,
+                    referrer_hostname: None,
+                    channel: None,
+                    utm_source: None,
+                    utm_medium: None,
+                    utm_campaign: None,
+                },
+            };
+
+            writer.upsert_visitor(&event, None).await.unwrap();
+
+            let row = visitor::Entity::find()
+                .filter(visitor::Column::VisitorId.eq(&visitor_uuid))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("visitor row must exist");
+            assert_eq!(row.environment_id, None);
+        }
+
         #[tokio::test]
         async fn test_returning_visitor_first_referrer_not_overwritten() {
             let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -1449,7 +1513,7 @@ mod tests {
                 visitor_uuid: visitor_uuid.clone(),
                 session_uuid: uuid::Uuid::new_v4().to_string(),
                 project_id,
-                environment_id,
+                environment_id: Some(environment_id),
                 last_seen: Utc::now() - chrono::Duration::seconds(60),
                 client_ip: None,
                 user_agent: None,
@@ -1480,7 +1544,7 @@ mod tests {
                 visitor_uuid: visitor_uuid.clone(),
                 session_uuid: uuid::Uuid::new_v4().to_string(),
                 project_id,
-                environment_id,
+                environment_id: Some(environment_id),
                 last_seen: Utc::now(),
                 client_ip: None,
                 user_agent: None,

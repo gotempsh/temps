@@ -173,7 +173,7 @@ pub struct SessionReplayWithVisitorDto {
     // Visitor info merged
     pub visitor_uuid: String,
     pub visitor_project_id: i32,
-    pub visitor_environment_id: i32,
+    pub visitor_environment_id: Option<i32>,
     pub visitor_first_seen: String,
     pub visitor_last_seen: String,
     pub visitor_is_crawler: bool,
@@ -1214,7 +1214,7 @@ mod tests {
                 id: 123,
                 visitor_id: "visitor123".to_string(),
                 project_id: 1,
-                environment_id: 1,
+                environment_id: Some(1),
                 first_seen: chrono::Utc::now(),
                 last_seen: chrono::Utc::now(),
                 user_agent: Some("Mozilla/5.0".to_string()),
@@ -1316,9 +1316,7 @@ mod tests {
         temps_entities::visitor::ActiveModel {
             visitor_id: Set(visitor_id.to_string()),
             project_id: Set(project_id),
-            // `visitor.environment_id` is still `NOT NULL` with no FK; making
-            // it nullable is tracked separately (ADR-040 §4 follow-up).
-            environment_id: Set(0),
+            environment_id: Set(None),
             first_seen: Set(chrono::Utc::now()),
             last_seen: Set(chrono::Utc::now()),
             has_activity: Set(false),
@@ -2013,6 +2011,10 @@ mod tests {
         assert_eq!(visitors.len(), 1);
         assert_eq!(visitors[0].visitor_id, "client-generated-visitor");
         assert_eq!(visitors[0].project_id, project.id);
+        assert_eq!(
+            visitors[0].environment_id, None,
+            "a route with no environment must store NULL, not a `0` sentinel"
+        );
         assert_eq!(sessions[0].visitor_id, visitors[0].id);
 
         test_db.cleanup().await;

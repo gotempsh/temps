@@ -109,7 +109,7 @@ impl LoadBalancer {
             visitor_uuid: visitor_uuid.clone(),
             session_uuid: session_decision.session_uuid.clone(),
             project_id: ctx.project.as_ref().map(|p| p.id).unwrap_or(0),
-            environment_id: ctx.environment.as_ref().map(|e| e.id).unwrap_or(0),
+            environment_id: ctx.environment.as_ref().map(|e| e.id),
             last_seen: chrono::Utc::now(),
             client_ip: ctx.ip_address.clone(),
             user_agent: Some(ctx.user_agent.clone()),

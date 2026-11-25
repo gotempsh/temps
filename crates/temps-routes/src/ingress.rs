@@ -826,6 +826,8 @@ mod tests {
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
             allowed_capabilities: Vec::new(),
+            identical_build_mode: Default::default(),
+            identical_build_scope: Default::default(),
         }
     }
 

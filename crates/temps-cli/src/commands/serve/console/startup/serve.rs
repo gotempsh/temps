@@ -226,6 +226,10 @@ pub(super) async fn serve(
                 &config.data_dir,
             );
 
+            // On its own, the public surface has no fallback: an unknown
+            // route would be a bare 404. (In single-listener mode the admin
+            // app's fallback answers it.)
+            let public_app = public_app.fallback(temps_core::api_problems::api_route_not_found);
             let public_fut = axum::serve(
                 public_listener,
                 public_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

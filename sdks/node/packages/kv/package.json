@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/kv",
-  "version": "0.0.4",
+  "version": "0.0.5-beta.1",
   "description": "Key-Value store SDK for Temps platform",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

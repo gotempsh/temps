@@ -15,7 +15,24 @@ import {
   isValidComparator,
   isValidSeverity,
   applyS3Flags,
+  serviceEnvironmentEntries,
 } from './index.js'
+
+describe('serviceEnvironmentEntries', () => {
+  test('reads the name-to-value map the service environment endpoint returns', () => {
+    expect(
+      serviceEnvironmentEntries({ POSTGRES_PORT: '***', POSTGRES_HOST: '***', POSTGRES_PASSWORD: '***' }),
+    ).toEqual([
+      { name: 'POSTGRES_HOST', value: '***', sensitive: false },
+      { name: 'POSTGRES_PASSWORD', value: '***', sensitive: true },
+      { name: 'POSTGRES_PORT', value: '***', sensitive: false },
+    ])
+  })
+
+  test('an absent response is no variables', () => {
+    expect(serviceEnvironmentEntries(undefined)).toEqual([])
+  })
+})
 
 describe('schemaToPromptParams', () => {
   test('returns nothing for a schema with no properties', () => {

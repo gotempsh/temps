@@ -173,6 +173,12 @@ Passing secrets as flags stores them in your shell history. Omit `--access-key`,
 
 Your choices (source, backup and mode) are kept in the page address, so a reload or a shared link keeps them. Once a restore starts, the page follows the run: it shows which backup is being restored (with a link to it), each phase, and the outcome. While a restore runs, the database's own page shows a banner linking back to it.
 
+### Choose an older PostgreSQL snapshot
+
+For a managed database, enable **Also search the S3 bucket for backups made by other servers** in the restore picker. **Found in S3** means this Temps server has no local record for that snapshot. Select the individual recovery point, including when several snapshots share one WAL-G repository.
+
+Older **control-plane** backups can have a catalog row that identifies only the repository. If its snapshots predate the Temps backup ID marker, Temps cannot determine which base belongs to that row. Run `wal-g backup-list` against the original repository, identify the intended base by name and time, and fetch it to an empty staging directory with `wal-g backup-fetch <staging-directory> <exact-base-name>`. Configure recovery to read the archived WAL from that same repository and verify the recovered catalog before switching over.
+
 ### Cancel a running restore
 
 A restore can be cancelled only while stopping it is safe:

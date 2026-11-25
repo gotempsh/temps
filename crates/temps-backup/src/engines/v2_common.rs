@@ -378,6 +378,15 @@ pub async fn record_walg_identity(
     backup_id: i32,
     backup_uuid: &str,
 ) -> Result<(), BackupError> {
+    record_snapshot_identity(db, backup_id, backup_uuid, None).await
+}
+
+pub(super) async fn record_snapshot_identity(
+    db: &DatabaseConnection,
+    backup_id: i32,
+    backup_uuid: &str,
+    snapshot_name: Option<&str>,
+) -> Result<(), BackupError> {
     let backup = temps_entities::backups::Entity::find_by_id(backup_id)
         .one(db)
         .await
@@ -401,6 +410,9 @@ pub async fn record_walg_identity(
         .ok_or_else(|| BackupError::PermanentFailure {
             reason: format!("backup {} metadata is not a JSON object", backup_id),
         })?;
+    if let Some(name) = snapshot_name {
+        object.insert("walg_snapshot_name".into(), serde_json::json!(name));
+    }
     object.insert("walg_identity_version".to_string(), serde_json::json!(1));
     object.insert(
         "walg_target_user_data".to_string(),

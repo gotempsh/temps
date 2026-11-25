@@ -216,6 +216,8 @@ fn project(id: i32) -> projects::Model {
         log_ingest_kib_per_sec: None,
         instantiation_token: None,
         allowed_capabilities: Vec::new(),
+        identical_build_mode: Default::default(),
+        identical_build_scope: Default::default(),
     }
 }
 

@@ -38,7 +38,7 @@ use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::secret_string::SecretString;
 use temps_core::RequestMetadata;
 use temps_core::SensitiveAction;
-use tracing::error;
+use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
 impl From<ResolveEngineError> for Problem {
@@ -138,6 +138,49 @@ impl From<BackupError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            BackupError::DefaultSourceConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(DEFAULT_SOURCE_CONFLICT_PROBLEM_TYPE)
+                .with_title("Default S3 Source Changed Concurrently")
+                .with_detail(error.to_string()),
+
+            BackupError::TemporarilyUnavailable {
+                retry_after_secs, ..
+            } => temporarily_unavailable_problem(error.to_string(), retry_after_secs),
+
+            // The runtime's message names containers and hosts: log it, and
+            // tell the client which service was busy and when to retry.
+            BackupError::ServiceContainerUnavailable {
+                ref service_name,
+                ref container,
+                ref reason,
+            } => {
+                warn!(
+                    service = %service_name,
+                    container = %container,
+                    reason = %reason,
+                    "managed service container could not run a backup command"
+                );
+                temporarily_unavailable_problem(
+                    format!(
+                        "Managed service '{service_name}' could not run the backup command in \
+                         its container; it may be restarting, stopping or being deleted. \
+                         Retry the request"
+                    ),
+                    SERVICE_CONTAINER_RETRY_AFTER_SECS,
+                )
+            }
+
+            // A pool that could not hand out a connection, or a connection
+            // that dropped, clears by itself: tell the client to retry
+            // instead of reporting a failure it cannot act on.
+            BackupError::Database(ref db_error) if error.is_transient_database_failure() => {
+                error!(error = %db_error, "backup request hit a transient database failure");
+                temporarily_unavailable_problem(
+                    "The backup database is temporarily unavailable; retry the request".to_string(),
+                    TRANSIENT_RETRY_AFTER_SECS,
+                )
+            }
+
             internal_error @ (BackupError::Database(_)
             | BackupError::S3(_)
             | BackupError::Configuration(_)
@@ -148,10 +191,95 @@ impl From<BackupError> for Problem {
             | BackupError::Serialization(_)
             | BackupError::Authorization { .. }) => {
                 error!(error = %internal_error, "backup request failed internally");
+                // The underlying message can name endpoints, containers or
+                // credentials' owners, so it stays in the server log. The
+                // client still learns which part failed, which is what it
+                // needs to decide between retrying and giving up.
+                let (failure, detail) = internal_failure_summary(&internal_error);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail("The backup operation could not be completed")
+                    .with_value("failure", failure)
+                    .with_detail(detail)
             }
+        }
+    }
+}
+
+/// Problem `type` for a create or set-default that lost a race for the
+/// default S3 source.
+pub const DEFAULT_SOURCE_CONFLICT_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/s3-source-default-conflict";
+
+/// Problem `type` for a backup request that failed for a transient reason.
+pub const TEMPORARILY_UNAVAILABLE_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/backup-temporarily-unavailable";
+
+/// Seconds a client should wait before retrying after a transient failure.
+const TRANSIENT_RETRY_AFTER_SECS: u64 = 5;
+
+/// Seconds to wait when a managed service's container was busy: long enough
+/// for a stop, restart or deletion to finish.
+const SERVICE_CONTAINER_RETRY_AFTER_SECS: u64 = 15;
+
+fn temporarily_unavailable_problem(detail: String, retry_after_secs: u64) -> Problem {
+    problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+        .with_type(TEMPORARILY_UNAVAILABLE_PROBLEM_TYPE)
+        .with_title("Temporarily Unavailable")
+        .with_value("retry_after_seconds", retry_after_secs)
+        .with_detail(detail)
+        .with_retry_after(retry_after_secs)
+}
+
+/// What part of a backup request failed, as a stable slug and a sentence that
+/// carries no internal detail.
+fn internal_failure_summary(error: &BackupError) -> (&'static str, &'static str) {
+    match error {
+        BackupError::Database(_) => (
+            "database",
+            "A database operation failed while processing the backup request",
+        ),
+        BackupError::S3(_) => (
+            "object_storage",
+            "The request to the backup's object storage failed",
+        ),
+        BackupError::Configuration(_) => (
+            "configuration",
+            "The stored backup configuration could not be used",
+        ),
+        BackupError::ExternalService(_) => (
+            "managed_service",
+            "The managed service the backup belongs to could not run the operation",
+        ),
+        BackupError::NotificationError(_) => {
+            ("notification", "Sending the backup notification failed")
+        }
+        BackupError::Io(_) => ("io", "A local file operation failed"),
+        BackupError::Serialization(_) => (
+            "metadata",
+            "The backup's stored metadata could not be read or written",
+        ),
+        BackupError::Authorization { .. } => (
+            "authorization",
+            "Access to the backup could not be verified",
+        ),
+        BackupError::Internal { .. }
+        | BackupError::Validation(_)
+        | BackupError::InvalidS3Endpoint { .. }
+        | BackupError::S3Unreachable { .. }
+        | BackupError::Schedule(_)
+        | BackupError::NotFound { .. }
+        | BackupError::Unsupported(_)
+        | BackupError::AlreadyInFlight { .. }
+        | BackupError::ScheduleRunAlreadyInFlight { .. }
+        | BackupError::BackupNotTerminal { .. }
+        | BackupError::BackupHasRestoreHistory { .. }
+        | BackupError::PartialDeletion { .. }
+        | BackupError::CleanupPreviewStale { .. }
+        | BackupError::DefaultSourceConflict { .. }
+        | BackupError::TemporarilyUnavailable { .. }
+        | BackupError::ServiceContainerUnavailable { .. }
+        | BackupError::Forbidden { .. } => {
+            ("internal", "The backup operation could not be completed")
         }
     }
 }
@@ -827,6 +955,8 @@ pub struct BackupResponse {
 /// Response type for source backup index
 #[derive(Serialize, ToSchema)]
 pub struct SourceBackupIndexResponse {
+    /// Errors encountered during the optional bucket scan.
+    pub scan_errors: Vec<String>,
     /// List of backups in the source
     pub backups: Vec<SourceBackupEntry>,
     /// When the index was last updated
@@ -992,48 +1122,6 @@ impl From<temps_entities::backups::Model> for BackupResponse {
     }
 }
 
-#[derive(Deserialize)]
-struct S3BackupIndex {
-    backups: Vec<S3BackupEntry>,
-    last_updated: String,
-}
-
-#[derive(Deserialize)]
-struct S3BackupEntry {
-    #[serde(default)]
-    id: i32,
-    #[serde(default)]
-    backup_id: String,
-    name: String,
-    #[serde(rename = "type")]
-    backup_type: String,
-    created_at: String,
-    #[serde(default)]
-    expires_at: Option<String>,
-    #[serde(default)]
-    size_bytes: Option<i64>,
-    #[serde(default)]
-    location: String,
-    #[serde(default)]
-    metadata_location: String,
-    // Newly surfaced fields — older cached JSON may not include them, so
-    // `#[serde(default)]` keeps backwards compat with any legacy index.json.
-    #[serde(default)]
-    engine: Option<String>,
-    #[serde(default)]
-    origin_service_name: Option<String>,
-    #[serde(default)]
-    format: Option<String>,
-    #[serde(default = "default_backup_source")]
-    source: String,
-    #[serde(default)]
-    state: String,
-}
-
-fn default_backup_source() -> String {
-    "db".to_string()
-}
-
 /// Query parameters for the S3-source backup listing.
 #[derive(serde::Deserialize, utoipa::IntoParams)]
 struct ListSourceBackupsParams {
@@ -1076,13 +1164,8 @@ async fn list_source_backups(
         .await
         .map_err(Problem::from)?;
 
-    let s3_index: S3BackupIndex = serde_json::from_value(index).map_err(|e| {
-        error!("Failed to parse backup index: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
     let response = SourceBackupIndexResponse {
-        backups: s3_index
+        backups: index
             .backups
             .into_iter()
             .map(|entry| SourceBackupEntry {
@@ -1090,7 +1173,10 @@ async fn list_source_backups(
                 backup_id: entry.backup_id,
                 name: entry.name,
                 backup_type: entry.backup_type,
-                created_at: entry.created_at,
+                created_at: entry
+                    .created_at
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+                    .unwrap_or_default(),
                 expires_at: entry.expires_at,
                 size_bytes: entry.size_bytes,
                 location: entry.location,
@@ -1102,7 +1188,8 @@ async fn list_source_backups(
                 state: entry.state,
             })
             .collect(),
-        last_updated: s3_index.last_updated,
+        last_updated: index.last_updated,
+        scan_errors: index.scan_errors,
     };
     Ok(Json(response))
 }
@@ -1703,6 +1790,7 @@ async fn list_s3_sources(
         (status = 400, description = "Invalid request", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 409, description = "Another request changed the default source at the same time; nothing was saved, retry", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(
@@ -1866,6 +1954,7 @@ fn s3_source_updated_fields(request: &UpdateS3SourceRequest) -> HashMap<String, 
     tag = "Backups",
     delete,
     path = "/backups/s3-sources/{id}",
+    description = "Delete an S3 source. A source still referenced by a backup schedule or by backup records is refused with 400 (delete those first). Deleting the default source while others exist makes the oldest remaining source the default, in the same transaction; the change is recorded in the audit log.",
     responses(
         (status = 204, description = "S3 source deleted"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -1888,7 +1977,7 @@ async fn delete_s3_source(
     // Get source details before deletion for audit log
     let source = app_state.backup_service.get_s3_source(id).await?;
 
-    app_state.backup_service.delete_s3_source(id).await?;
+    let deletion = app_state.backup_service.delete_s3_source(id).await?;
 
     let audit = S3SourceDeletedAudit {
         context: AuditContext {
@@ -1899,6 +1988,8 @@ async fn delete_s3_source(
         source_id: source.id,
         name: source.name,
         bucket_name: source.bucket_name,
+        promoted_default_source_id: deletion.promoted_default.as_ref().map(|next| next.id),
+        promoted_default_source_name: deletion.promoted_default.map(|next| next.name),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -2668,7 +2759,7 @@ async fn run_backup_for_source(
     tag = "Backups",
     delete,
     path = "/backups/{id}",
-    params(("id" = String, Path, description = "Backup UUID")),
+    params(("id" = String, Path, description = "Backup UUID (`backup_id`), or its integer `id` as returned by the backup lists")),
     responses(
         (status = 204, description = "Backup deleted"),
         (status = 400, description = "Backup artifact cannot be safely attributed", body = ProblemDetails),
@@ -2676,7 +2767,8 @@ async fn run_backup_for_source(
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup not found", body = ProblemDetails),
         (status = 409, description = "Backup is running, referenced, or lacks safe artifact identity", body = ProblemDetails),
-        (status = 500, description = "Object storage or database error", body = ProblemDetails),
+        (status = 500, description = "Object storage or database error; the `failure` field says which", body = ProblemDetails),
+        (status = 503, description = "Transient failure (the backup's service is restarting or being deleted, or the database is unavailable); retry after the `Retry-After` header", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2684,13 +2776,17 @@ async fn delete_backup(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<BackupAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Path(id): Path<String>,
+    Path(reference): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    // The UUID or the integer `id` the backup lists return, exactly as
+    // `GET /backups/{id}` accepts. Everything below (the sensitive-action
+    // binding, the audit entries, the deletion) uses the resolved UUID.
     let scoped_backup = app_state
         .backup_service
-        .backup_with_access_scope_by_uuid(&id)
+        .backup_with_access_scope_by_reference(&reference)
         .await?;
+    let id = scoped_backup.backup.backup_id.clone();
     require_backup_access(
         &app_state,
         &auth,
@@ -3665,6 +3761,110 @@ mod tests {
         );
     }
 
+    /// A container that vanished under a WAL-G command (its service being
+    /// stopped or deleted) is a retryable 503 naming the service, not a
+    /// generic 500; the runtime's message, which names the container, stays
+    /// in the log.
+    #[test]
+    fn busy_service_container_is_a_retryable_503() {
+        let problem = Problem::from(BackupError::ServiceContainerUnavailable {
+            service_name: "orders-db".to_string(),
+            container: "temps-postgres-orders-db-internal".to_string(),
+            reason: "No such container: temps-postgres-orders-db-internal".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.retry_after_secs(), Some(15));
+        assert_eq!(problem.body["type"], TEMPORARILY_UNAVAILABLE_PROBLEM_TYPE);
+        assert_eq!(problem.body["retry_after_seconds"], 15);
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("orders-db"), "{detail}");
+        assert!(!detail.contains("internal"), "{detail}");
+
+        let response = axum::response::IntoResponse::into_response(problem);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn transient_database_failures_are_retryable_503s() {
+        let problem = Problem::from(BackupError::Database(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::error::ConnAcquireErr::Timeout,
+        )));
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.retry_after_secs(), Some(5));
+
+        let problem = Problem::from(BackupError::TemporarilyUnavailable {
+            operation: "delete backup 7".to_string(),
+            reason: "the service is restarting".to_string(),
+            retry_after_secs: 30,
+        });
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.retry_after_secs(), Some(30));
+
+        // A query that failed for another reason is not transient.
+        let problem = Problem::from(BackupError::Database(sea_orm::DbErr::Custom(
+            "relation does not exist".to_string(),
+        )));
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.retry_after_secs(), None);
+    }
+
+    /// Different internal failures used to share one detail, so a client could
+    /// not tell an object-store failure from a database one.
+    #[test]
+    fn internal_failures_say_which_part_failed_without_leaking_it() {
+        let cases = [
+            (
+                BackupError::S3("put_object to s3://secret-bucket failed".to_string()),
+                "object_storage",
+            ),
+            (
+                BackupError::Database(sea_orm::DbErr::Custom("syntax error".to_string())),
+                "database",
+            ),
+            (
+                BackupError::ExternalService("docker exec failed on host-7".to_string()),
+                "managed_service",
+            ),
+            (
+                BackupError::Internal {
+                    message: "anything".to_string(),
+                },
+                "internal",
+            ),
+        ];
+        for (error, failure) in cases {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(problem.body["failure"], failure);
+            let detail = problem.body["detail"].as_str().unwrap_or_default();
+            assert!(
+                !detail.contains("secret-bucket")
+                    && !detail.contains("host-7")
+                    && !detail.contains("syntax"),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_source_conflict_is_a_409_with_a_stable_type() {
+        let problem = Problem::from(BackupError::DefaultSourceConflict {
+            name: "primary".to_string(),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(problem.body["type"], DEFAULT_SOURCE_CONFLICT_PROBLEM_TYPE);
+        assert!(problem.body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("'primary'")));
+    }
+
     /// The secret key an operator (or the assistant, through a secret slot)
     /// supplies is published as a flagged credential, so tooling in front of
     /// the API can tell it from an ordinary string without a hand-kept list.
@@ -3785,5 +3985,197 @@ mod tests {
         assert!(serde_json::to_string(&problem.body)
             .unwrap()
             .contains("External service 404"));
+    }
+
+    /// `DELETE /backups/{id}` through the router: the integer `id` the list
+    /// returns resolves to the backup, and the deletion runs on its UUID (a
+    /// running backup is refused with a 409 that names that UUID). An unknown
+    /// integer is a 404 problem, and no token is a 401.
+    mod delete_backup_route {
+        use super::*;
+        use crate::handlers::test_support::{test_state, RecordingAuditLogger};
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Request};
+        use sea_orm::{ActiveModelTrait, Set};
+        use tower::ServiceExt;
+
+        fn admin() -> temps_auth::AuthContext {
+            let now = chrono::Utc::now();
+            // A persisted browser session: deleting a backup is a sensitive
+            // action, which an API key or an unpersisted session cannot do.
+            temps_auth::AuthContext::new_persisted_session(
+                temps_entities::users::Model {
+                    id: 1,
+                    name: "Backup admin".to_string(),
+                    email: "backup-admin@example.com".to_string(),
+                    password_hash: None,
+                    email_verified: true,
+                    email_verification_token: None,
+                    email_verification_expires: None,
+                    password_reset_token: None,
+                    password_reset_expires: None,
+                    must_change_password: false,
+                    deleted_at: None,
+                    mfa_secret: None,
+                    mfa_enabled: false,
+                    mfa_recovery_codes: None,
+                    oidc_subject: None,
+                    oidc_provider_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                temps_auth::Role::Admin,
+                99,
+            )
+        }
+
+        fn delete(path: &str, auth: Option<temps_auth::AuthContext>) -> Request<Body> {
+            let mut request = Request::builder()
+                .method("DELETE")
+                .uri(path)
+                .body(Body::empty())
+                .expect("request builds");
+            request.extensions_mut().insert(RequestMetadata {
+                ip_address: "203.0.113.10".to_string(),
+                user_agent: "backup-delete-route-test".to_string(),
+                headers: HeaderMap::new(),
+                visitor_id_cookie: None,
+                session_id_cookie: None,
+                base_url: "http://localhost".to_string(),
+                scheme: "http".to_string(),
+                host: "localhost".to_string(),
+                is_secure: false,
+            });
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            request
+        }
+
+        async fn send(
+            app: axum::Router,
+            request: Request<Body>,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = app.oneshot(request).await.expect("router answers");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            let body = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes).expect("JSON body")
+            };
+            (status, body)
+        }
+
+        #[tokio::test]
+        async fn without_a_token_it_is_401() {
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            );
+            let app = configure_routes().with_state(test_state(
+                db,
+                Arc::new(RecordingAuditLogger::default()),
+                None,
+            ));
+            let (status, _) = send(app, delete("/backups/1", None)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn the_integer_id_resolves_to_the_backup_it_lists() {
+            let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+                Ok(test_db) => test_db,
+                Err(error) => {
+                    println!("TestDatabase unavailable, skipping: {error}");
+                    return;
+                }
+            };
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let state = test_state(test_db.db.clone(), audit.clone(), None);
+            let source = state
+                .backup_service
+                .persist_verified_s3_source(CreateS3SourceRequest {
+                    name: "route-test".to_string(),
+                    bucket_name: "backups".to_string(),
+                    bucket_path: "route-test".to_string(),
+                    access_key_id: SecretString::new("access".to_string()),
+                    secret_key: SecretString::new("secret".to_string()),
+                    region: "us-east-1".to_string(),
+                    endpoint: Some("http://storage.example.test:9000".to_string()),
+                    use_tls: None,
+                    force_path_style: Some(true),
+                    is_default: None,
+                    backing_service_id: None,
+                    worker_credentials: None,
+                })
+                .await
+                .expect("source is stored");
+            let creator = temps_entities::users::ActiveModel {
+                name: Set("Backup admin".to_string()),
+                email: Set("backup-admin@example.com".to_string()),
+                email_verified: Set(true),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("user is stored");
+            let uuid = "0f9e3c4a-6b1d-4c2e-9a7f-5d8b2e1c3a40";
+            let backup = temps_entities::backups::ActiveModel {
+                name: Set("nightly".to_string()),
+                backup_id: Set(uuid.to_string()),
+                schedule_id: Set(None),
+                backup_type: Set("full".to_string()),
+                state: Set("running".to_string()),
+                started_at: Set(chrono::Utc::now()),
+                finished_at: Set(None),
+                size_bytes: Set(None),
+                file_count: Set(None),
+                s3_source_id: Set(source.id),
+                s3_location: Set(format!("s3://backups/route-test/{uuid}")),
+                error_message: Set(None),
+                metadata: Set("{}".to_string()),
+                checksum: Set(None),
+                compression_type: Set("gzip".to_string()),
+                created_by: Set(creator.id),
+                expires_at: Set(None),
+                tags: Set("[]".to_string()),
+                schedule_run_id: Set(None),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("backup is stored");
+            let app = configure_routes().with_state(state);
+
+            let (status, body) = send(
+                app.clone(),
+                delete(&format!("/backups/{}", backup.id), Some(admin())),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            let detail = body["detail"].as_str().expect("problem detail");
+            assert!(detail.contains(uuid), "{detail}");
+            assert!(detail.contains("running"), "{detail}");
+            let audited = audit
+                .operations
+                .lock()
+                .expect("audit mutex")
+                .iter()
+                .map(|(_, record)| record.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(audited.contains(uuid), "audit names the UUID: {audited}");
+
+            let missing = backup.id + 1000;
+            let (status, body) =
+                send(app, delete(&format!("/backups/{missing}"), Some(admin()))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(body["detail"]
+                .as_str()
+                .expect("problem detail")
+                .contains(&missing.to_string()));
+        }
     }
 }

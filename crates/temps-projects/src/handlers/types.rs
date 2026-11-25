@@ -237,8 +237,17 @@ pub struct CreateProjectRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<PresetConfigSchema>)]
     pub preset_config: Option<serde_json::Value>,
+    /// Build output directory; the same setting as `preset_config.outputDir`.
+    /// Rejected when the preset has no such setting or `preset_config` sets
+    /// a different value.
     pub output_dir: Option<String>,
+    /// Build command; the same setting as `preset_config.buildCommand`.
+    /// Rejected when the preset has no such setting or `preset_config` sets
+    /// a different value.
     pub build_command: Option<String>,
+    /// Install command; the same setting as `preset_config.installCommand`.
+    /// Rejected when the preset has no such setting or `preset_config` sets
+    /// a different value.
     pub install_command: Option<String>,
     /// Environment variables to seed the default (production) environment with.
     ///

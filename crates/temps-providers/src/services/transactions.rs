@@ -346,7 +346,7 @@ mod tests {
     fn active_name_restore(id: i32, name: &str) -> temps_entities::restore_runs::Model {
         temps_entities::restore_runs::Model {
             id,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: 17,
             target_service_id: None,
             target_service_name: Some(name.to_string()),
