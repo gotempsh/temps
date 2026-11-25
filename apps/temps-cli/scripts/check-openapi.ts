@@ -19,6 +19,7 @@
 
 import { isPluginPath } from './core-openapi'
 import { SPEC_PATH, pathCount, serialize } from './openapi-canonical'
+import { BASELINE_PATH, describeSecurityDrift, securityDrift } from './openapi-security'
 
 const fix = process.argv.slice(2).includes('--fix')
 const file = Bun.file(SPEC_PATH)
@@ -56,6 +57,21 @@ if (pluginPaths.length) {
   console.error(
     'Regenerate with bun run spec:update, then bun run generate:api. Plugin APIs use local bindings against the shared client.',
   )
+  process.exit(1)
+}
+
+// `--fix` only reformats; it cannot declare security, so it does not stop here.
+const baselineFile = Bun.file(BASELINE_PATH)
+if (!fix && !(await baselineFile.exists())) {
+  console.error(`Missing ${BASELINE_PATH}`)
+  process.exit(1)
+}
+const securityProblem = fix
+  ? null
+  : describeSecurityDrift(securityDrift(spec, (await baselineFile.json()) as string[]))
+if (securityProblem) {
+  console.error(`${SPEC_PATH} has operations whose authentication is not declared.\n`)
+  console.error(securityProblem)
   process.exit(1)
 }
 

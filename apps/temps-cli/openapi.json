@@ -164027,6 +164027,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Get environment variables for a project, optionally filtered by environment",
         "tags": [
           "Projects"
@@ -164077,6 +164082,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Create a new environment variable",
         "tags": [
           "Projects"
@@ -164130,6 +164140,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Resolved env vars for a project (manual + integration-sourced, merged).",
         "tags": [
           "Projects"
@@ -164215,6 +164230,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Reveal the plaintext value of a resolved environment variable.",
         "tags": [
           "Projects"
@@ -164434,6 +164454,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Get a regular environment variable value by key. Marked secrets return 403.",
         "tags": [
           "Projects"
@@ -164476,6 +164501,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Delete an environment variable",
         "tags": [
           "Projects"
@@ -164595,6 +164625,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Update an environment variable",
         "tags": [
           "Projects"
@@ -164694,6 +164729,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Get all environments for a project",
         "tags": [
           "Projects"
@@ -164744,6 +164784,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Create a new environment for a project",
         "tags": [
           "Projects"
@@ -164796,6 +164841,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Delete an environment permanently",
         "tags": [
           "Projects"
@@ -164843,6 +164893,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Get a specific environment by ID or slug",
         "tags": [
           "Projects"
@@ -165094,6 +165149,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Get all environment domains for a specific environment",
         "tags": [
           "Projects"
@@ -165154,6 +165214,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Add a new environment domain",
         "tags": [
           "Projects"
@@ -165206,6 +165271,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Delete an environment domain",
         "tags": [
           "Projects"
@@ -165447,6 +165517,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Projects"
         ]
@@ -165502,6 +165577,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Sleep an on-demand environment",
         "tags": [
           "Environments"
@@ -165565,6 +165645,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Rename the auto-managed subdomain for an environment.",
         "tags": [
           "Projects"
@@ -165663,6 +165748,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Wake a sleeping on-demand environment",
         "tags": [
           "Environments"
@@ -182554,6 +182644,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "List project secrets (metadata only — values never returned).",
         "tags": [
           "Secrets"
@@ -182604,6 +182699,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Create a new secret. The value is encrypted before storage and will be\nmounted as a file at `/run/secrets/<KEY>` on the next deployment.\nThe plaintext value is NOT returned — the response carries only metadata.",
         "tags": [
           "Secrets"
@@ -182646,6 +182746,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Delete a project secret. Running containers keep their mounted secret files\nuntil they are redeployed.",
         "tags": [
           "Secrets"
@@ -182706,6 +182811,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Update a project secret. Value rotation requires a redeploy to take effect —\nrunning containers keep their currently-mounted values until the next\ndeployment.",
         "tags": [
           "Secrets"

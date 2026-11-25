@@ -10885,13 +10885,104 @@ async fn visitor_environments(
         .collect()
 }
 
+/// `status_monitor_interval_changes` records the interval a monitor had
+/// before each change, so uptime coverage of windows that have ended does not
+/// move with a later interval change (#2039). Rows need a monitor, reject a
+/// non-positive interval and go with their monitor; `down` drops the table.
+#[tokio::test]
+async fn test_status_monitor_interval_changes_table_up_and_down() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000001_status_monitor_interval_changes";
+    const TABLE: &str = "status_monitor_interval_changes";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping monitor interval history migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        !table_exists(&db, TABLE).await?,
+        "{TABLE} before the migration"
+    );
+    db.execute_unprepared(
+        "INSERT INTO projects (id, name, slug, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at) \
+         VALUES (1, 'Sample site', 'sample-site', 'sample', 'example', '/', 'main', 'static', now(), now()); \
+         INSERT INTO status_monitors (id, project_id, name, monitor_type, check_interval_seconds, is_active, created_at, updated_at) \
+         VALUES (7, 1, 'Sample monitor', 'web', 60, true, now(), now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    assert!(table_exists(&db, TABLE).await?, "{TABLE} after up");
+    db.execute_unprepared(
+        "INSERT INTO status_monitor_interval_changes (monitor_id, previous_interval_seconds) \
+         VALUES (7, 60)",
+    )
+    .await?;
+    for rejected in [
+        "INSERT INTO status_monitor_interval_changes (monitor_id, previous_interval_seconds) VALUES (7, 0)",
+        "INSERT INTO status_monitor_interval_changes (monitor_id, previous_interval_seconds) VALUES (999, 60)",
+    ] {
+        assert!(
+            db.execute_unprepared(rejected).await.is_err(),
+            "{rejected} must be rejected"
+        );
+    }
+    db.execute_unprepared("DELETE FROM status_monitors WHERE id = 7")
+        .await?;
+    let remaining = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM status_monitor_interval_changes".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(
+        remaining.try_get::<i64>("", "n")?,
+        0,
+        "rows go with their monitor"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(!table_exists(&db, TABLE).await?, "{TABLE} after down");
+    Ok(())
+}
+
 /// Whether each catalog capability was stated lives in new `*_stated`
 /// columns, leaving `supports_*` `NOT NULL` so the previous binary still reads
 /// every row: existing rows and rows inserted without the new columns count as
 /// stated, and `down` drops the three columns.
 #[tokio::test]
 async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyhow::Result<()> {
-    const MIGRATION: &str = "m20261125_000001_ai_model_catalog_unknown_capabilities";
+    const MIGRATION: &str = "m20261125_000002_ai_model_catalog_unknown_capabilities";
     if external_db_configured() {
         return Ok(());
     }
