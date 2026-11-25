@@ -163,7 +163,10 @@ export function latestReleaseVersion(
   const fromRegistry = release.latest_version ?? null
   if (!fromWorkspace || !fromRegistry) return fromWorkspace ?? fromRegistry
   const workspaceAt = Date.parse(workspace?.checked_at ?? '')
-  const registryAt = release.error ? NaN : Date.parse(release.checked_at ?? '')
+  // A failed lookup's checked_at is when it failed, not when its version
+  // was confirmed: a dated workspace check wins, whichever is higher.
+  if (release.error && Number.isFinite(workspaceAt)) return fromWorkspace
+  const registryAt = Date.parse(release.checked_at ?? '')
   if (Number.isFinite(workspaceAt) && Number.isFinite(registryAt)) {
     return workspaceAt >= registryAt ? fromWorkspace : fromRegistry
   }
@@ -191,6 +194,12 @@ export function agentVersionState(
     return { kind: 'unchecked' }
   }
   const installed = workspace?.installed_version ?? null
+  // The last read failed: a version kept from before it (React Query keeps
+  // the last good data) may no longer be what is installed, for example
+  // after a failed update. Show it, but confirm nothing.
+  if (workspaceError && installed) {
+    return { kind: 'unknown', installed, reason: workspaceError }
+  }
   const latest = latestReleaseVersion(release, workspace)
   if (!installed) {
     return {

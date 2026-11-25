@@ -285,6 +285,59 @@ describe('agentVersionState after a withdrawn release', () => {
     })
     expect(latestReleaseVersion(failed, workspace)).toBe('1.1.0')
   })
+
+  it('keeps a dated workspace check over a failed lookup with a higher version', () => {
+    // The registry kept 1.1.0 from before a failed 09:00 lookup; the
+    // workspace checked at 10:00 and found 1.0.0 is the latest (1.1.0 was
+    // withdrawn), which is installed.
+    const failed = {
+      latest_version: '1.1.0',
+      checked_at: '2026-11-24T09:00:00Z',
+      error: 'registry request timed out',
+    }
+    const workspace = {
+      installed_version: '1.0.0',
+      latest_version: '1.0.0',
+      update_available: false,
+      updating: false,
+      checked_at: '2026-11-24T10:00:00Z',
+    }
+    expect(latestReleaseVersion(failed, workspace)).toBe('1.0.0')
+    expect(agentVersionState(failed, workspace)).toEqual({
+      kind: 'current',
+      installed: '1.0.0',
+    })
+    // Without a workspace date there is nothing to rank: the newer one.
+    expect(
+      latestReleaseVersion(failed, { ...workspace, checked_at: null })
+    ).toBe('1.1.0')
+  })
+
+  it('confirms nothing about a version kept from before a failed read', () => {
+    const kept = {
+      installed_version: '1.1.0',
+      latest_version: '1.1.0',
+      update_available: false,
+      updating: false,
+      checked_at: '2026-11-24T10:00:00Z',
+    }
+    expect(
+      agentVersionState(
+        { latest_version: '1.1.0' },
+        kept,
+        'Your workspace could not be inspected'
+      )
+    ).toEqual({
+      kind: 'unknown',
+      installed: '1.1.0',
+      reason: 'Your workspace could not be inspected',
+    })
+    // A read that succeeded is still trusted.
+    expect(agentVersionState({ latest_version: '1.1.0' }, kept)).toEqual({
+      kind: 'current',
+      installed: '1.1.0',
+    })
+  })
 })
 
 describe('agentVersionState before the workspace was read', () => {
