@@ -6,7 +6,15 @@
 //! provider through [`crate::registry::ProviderRegistry`] and the provider
 //! traits.
 
+// Private to `providers`, so the compiler keeps the engine from naming a
+// provider (ADR-116 D1). Tests reach in for their fixtures.
+#[cfg(not(test))]
+mod cloudflare;
+#[cfg(test)]
 pub(crate) mod cloudflare;
+#[cfg(not(test))]
+mod tailscale;
+#[cfg(test)]
 pub(crate) mod tailscale;
 
 /// What planning and applying ask of the tailnet: Tailscale's own state,
