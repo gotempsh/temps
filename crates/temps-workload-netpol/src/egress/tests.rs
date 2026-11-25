@@ -51,6 +51,7 @@ fn deny_beats_allow_and_ports_default_to_web() {
             host_rule(2, "*.blocked.test", Action::Deny),
         ],
         record: false,
+        public_only: false,
     });
     assert_eq!(
         rules.check_host("registry.npmjs.org", 443),
@@ -76,6 +77,7 @@ fn a_restricted_workload_without_rules_reaches_nothing() {
         subject: sandbox(1),
         rules: vec![],
         record: false,
+        public_only: false,
     });
     assert_eq!(
         rules.check_host("example.com", 443),
@@ -96,6 +98,7 @@ fn private_answers_are_refused_unless_a_cidr_allows_them() {
             cidr_rule(2, "10.237.9.0/24", Some(8080), Action::Allow),
         ],
         record: false,
+        public_only: false,
     });
     let public: IpAddr = "93.184.216.34".parse().unwrap();
     let private: IpAddr = "10.0.0.5".parse().unwrap();
@@ -131,6 +134,7 @@ fn an_unrelated_cidr_allow_does_not_open_public_literals() {
         subject: sandbox(1),
         rules: vec![cidr_rule(1, "10.20.0.0/16", Some(443), Action::Allow)],
         record: false,
+        public_only: false,
     });
     assert_eq!(
         rules.check_host("93.184.216.34", 22),
@@ -184,6 +188,7 @@ fn a_cidr_deny_refuses_public_addresses_too() {
             cidr_rule(2, "93.184.216.0/24", None, Action::Deny),
         ],
         record: false,
+        public_only: false,
     });
     assert_eq!(
         rules.check_addresses(&["93.184.216.34".parse().unwrap()], 443, Admission::ByRule),
@@ -415,6 +420,7 @@ async fn start(rules: Vec<EgressRule>, max_connections: usize) -> (Arc<EgressPro
             subject: sandbox(1),
             rules,
             record: false,
+            public_only: false,
         }],
         &identities,
     );
@@ -561,6 +567,7 @@ async fn start_recording(
             subject: sandbox(1),
             rules,
             record,
+            public_only: false,
         }],
         &identities,
     );
@@ -889,6 +896,7 @@ async fn a_proxy_without_a_recorder_ignores_the_opt_in() {
             subject: sandbox(1),
             rules: vec![echo_rule(echo.port())],
             record: true,
+            public_only: false,
         }],
         &identities,
     );
@@ -948,5 +956,36 @@ fn hosts_in_records_are_bounded() {
     assert_eq!(
         recorded_host("a".repeat(5000)).len(),
         record::MAX_RECORDED_HOST
+    );
+}
+
+#[test]
+fn a_public_only_policy_refuses_private_addresses_even_inside_an_allowed_cidr() {
+    let policy = |public_only| EgressPolicy {
+        subject: sandbox(1),
+        rules: vec![cidr_rule(1, "10.237.9.0/24", Some(443), Action::Allow)],
+        record: false,
+        public_only,
+    };
+    let inside: IpAddr = "10.237.9.4".parse().unwrap();
+    let netpol = CompiledRules::new(&policy(false));
+    assert_eq!(
+        netpol.check_addresses(&[inside], 443, Admission::ByRule),
+        Ok(())
+    );
+    let sandbox_policy = CompiledRules::new(&policy(true));
+    assert_eq!(
+        sandbox_policy.check_addresses(&[inside], 443, Admission::ByRule),
+        Err(Refusal::Private),
+        "a sandbox's own policy never reaches a private address"
+    );
+    let public: IpAddr = "93.184.216.34".parse().unwrap();
+    let public_rules = CompiledRules::new(&EgressPolicy {
+        rules: vec![host_rule(1, "*", Action::Allow)],
+        ..policy(true)
+    });
+    assert_eq!(
+        public_rules.check_addresses(&[public], 443, Admission::ByRule),
+        Ok(())
     );
 }

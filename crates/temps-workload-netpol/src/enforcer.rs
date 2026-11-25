@@ -1761,6 +1761,7 @@ mod tests {
                 subject: sandbox(1),
                 rules: Vec::new(),
                 record: true,
+                public_only: false,
             }],
             ..Default::default()
         }
@@ -1840,7 +1841,7 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_value(&new).unwrap();
-        assert_eq!(json["protocol"], 2);
+        assert_eq!(json["protocol"], POLICY_PROTOCOL);
         assert_eq!(json["held_snapshot"], "00ff");
     }
 

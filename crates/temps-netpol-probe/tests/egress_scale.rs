@@ -450,6 +450,7 @@ fn proxy_config(identities: Vec<(WorkloadRef, IpAddr)>, record: bool) -> ServeCo
                 },
             ],
             record,
+            public_only: false,
         })
         .collect();
     ServeConfig {

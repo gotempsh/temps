@@ -27,6 +27,8 @@
 //!   namespace a workload cannot write.
 
 pub mod ingest;
+pub mod local;
+pub mod policy;
 pub mod records;
 pub mod sink;
 
@@ -191,12 +193,21 @@ struct Blocker {
     setup_path: Option<String>,
 }
 
+/// What happens on this host when a sandbox's recording is turned on or
+/// off ([`local::LocalHooks`] on a control plane that records).
+#[async_trait]
+pub trait EgressRecordingHooks: Send + Sync {
+    async fn changed(&self, row: &sandboxes::Model);
+}
+
 pub struct EgressRecordingService {
     db: Arc<DatabaseConnection>,
     capabilities: Arc<dyn NodeRecordingCapabilities>,
     /// `None` when this control plane runs without OTel storage: recording
     /// then reports itself unavailable, saying so.
     store: Option<Arc<dyn EgressLogStore>>,
+    /// Set once the local recorder runs; absent, a change is only stored.
+    hooks: std::sync::OnceLock<Arc<dyn EgressRecordingHooks>>,
 }
 
 impl EgressRecordingService {
@@ -209,7 +220,13 @@ impl EgressRecordingService {
             db,
             capabilities,
             store,
+            hooks: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Wires what a change does on this host. Set once.
+    pub fn set_hooks(&self, hooks: Arc<dyn EgressRecordingHooks>) {
+        let _ = self.hooks.set(hooks);
     }
 
     /// The caller's live sandbox `public_id_value`, or not found.
@@ -271,10 +288,17 @@ impl EgressRecordingService {
             .capabilities
             .status(row.node_id.unwrap_or(CONTROL_PLANE_NODE_ID));
         let reason = status.describe()?;
+        // The node's page fixes only an agent that is not reporting or is
+        // too old; nothing in the console fixes a platform or a proxy that
+        // is not serving, so those get no link.
+        let fixable_on_the_node = matches!(
+            status,
+            NodeRecordingStatus::NotReporting { .. } | NodeRecordingStatus::AgentPredatesRecording
+        );
         Some(Blocker {
             code: status.code(),
             reason,
-            setup_path: Some(match row.node_id {
+            setup_path: fixable_on_the_node.then(|| match row.node_id {
                 Some(node_id) => format!("{NODES_SETUP_PATH}/{node_id}"),
                 None => NODES_SETUP_PATH.to_string(),
             }),
@@ -371,6 +395,11 @@ impl EgressRecordingService {
                     "updating a sandbox's egress recording",
                 ))?
         };
+        if previous != enabled {
+            if let Some(hooks) = self.hooks.get() {
+                hooks.changed(&row).await;
+            }
+        }
         tracing::info!(
             sandbox_id = %row.public_id,
             internal_id = row.id,

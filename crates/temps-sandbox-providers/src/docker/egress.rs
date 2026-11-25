@@ -117,6 +117,116 @@ pub(super) fn container_has_internal_proxy(
     container_environment_value(container, SANDBOX_INTERNAL_PROXY_ENV).unwrap_or("") == expected
 }
 
+/// Where this host's per-node egress proxy takes the traffic of sandboxes
+/// that record their outbound connections, and which sandboxes (by
+/// container name) do. Published by the control plane's egress recorder;
+/// `None` while it is not serving. One per process, like the internal
+/// proxy's address; read when an egress proxy is created or checked for
+/// drift, never per request.
+struct EgressRecordingRoute {
+    address: std::net::SocketAddr,
+    sandboxes: std::collections::HashSet<String>,
+}
+
+static EGRESS_RECORDING: std::sync::RwLock<Option<EgressRecordingRoute>> =
+    std::sync::RwLock::new(None);
+
+/// Record where the egress recorder listens and which sandboxes record, or
+/// that it does not serve (`None`). An egress proxy created or checked from
+/// now on hands the traffic of a recorded sandbox to `address`.
+pub fn publish_egress_recording(
+    route: Option<(std::net::SocketAddr, std::collections::HashSet<String>)>,
+) {
+    let mut slot = match EGRESS_RECORDING.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = route.map(|(address, sandboxes)| EgressRecordingRoute { address, sandboxes });
+}
+
+/// The value `sandbox_container_name`'s egress proxy receives in
+/// [`SANDBOX_EGRESS_RECORDING_ENV`]: the recorder's address while that
+/// sandbox records, empty otherwise.
+pub(super) fn egress_recording_environment_value(sandbox_container_name: &str) -> String {
+    let slot = match EGRESS_RECORDING.read() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.as_ref()
+        .filter(|route| route.sandboxes.contains(sandbox_container_name))
+        .map(|route| route.address.to_string())
+        .unwrap_or_default()
+}
+
+/// The host's address on [`SANDBOX_EGRESS_NETWORK`] (its gateway), where a
+/// host service listens to be reached by sandbox egress proxies from their
+/// own address on that network. `None` while the network does not exist.
+pub async fn egress_network_gateway(
+    docker: &Docker,
+) -> Result<Option<std::net::IpAddr>, bollard::errors::Error> {
+    let network = match docker
+        .inspect_network(
+            SANDBOX_EGRESS_NETWORK,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+    {
+        Ok(network) => network,
+        Err(error) if docker_error_is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(network
+        .ipam
+        .and_then(|ipam| ipam.config)
+        .into_iter()
+        .flatten()
+        .filter_map(|config| config.gateway)
+        .find_map(|gateway| gateway.parse().ok()))
+}
+
+/// Every running sandbox egress proxy on this host: the sandbox it serves
+/// (container name, as [`egress_proxy_sandbox`] establishes it from what
+/// only Docker records) and its address on [`SANDBOX_EGRESS_NETWORK`].
+pub async fn egress_proxy_endpoints(
+    docker: &Docker,
+) -> Result<Vec<(String, std::net::IpAddr)>, bollard::errors::Error> {
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            filters: Some(HashMap::from([(
+                "name".to_string(),
+                vec![SANDBOX_EGRESS_PROXY_PREFIX.to_string()],
+            )])),
+            ..Default::default()
+        }))
+        .await?;
+    let mut endpoints = Vec::new();
+    for container in containers {
+        let Some(name) = container.names.as_ref().and_then(|names| names.first()) else {
+            continue;
+        };
+        let Some(networks) = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+        else {
+            continue;
+        };
+        let names: Vec<&str> = networks.keys().map(String::as_str).collect();
+        let Some(sandbox) = egress_proxy_sandbox(name, container.labels.as_ref(), &names) else {
+            continue;
+        };
+        let Some(address) = networks
+            .get(SANDBOX_EGRESS_NETWORK)
+            .and_then(|endpoint| endpoint.ip_address.as_deref())
+            .and_then(|address| address.parse().ok())
+        else {
+            continue;
+        };
+        endpoints.push((sandbox, address));
+    }
+    Ok(endpoints)
+}
+
 pub(super) fn sandbox_egress_proxy_extra_hosts() -> Vec<String> {
     vec![SANDBOX_HOST_GATEWAY.to_string()]
 }
@@ -329,6 +439,9 @@ pub(super) const SANDBOX_NAME_ENV: &str = "TEMPS_SANDBOX_NAME";
 /// listens (ADR 105). Set by Temps from the internal routing supervisor's
 /// status; the Temps binary itself reads no such variable.
 pub(super) const SANDBOX_INTERNAL_PROXY_ENV: &str = "TEMPS_INTERNAL_PROXY_ADDRESS";
+/// Where the egress proxy of a sandbox that records its outbound
+/// connections hands that traffic; absent or empty when it does not.
+pub(super) const SANDBOX_EGRESS_RECORDING_ENV: &str = "TEMPS_EGRESS_RECORDING_PROXY_ADDRESS";
 
 pub(super) const SANDBOX_MCP_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
@@ -364,13 +477,20 @@ const sandboxName = process.env.TEMPS_SANDBOX_NAME || "unknown";
 // Where this host's internal proxy listens (ADR 105), set by Temps when it
 // creates this sidecar; empty while internal routing is not serving here.
 const internalProxy = parseInternalProxy(process.env.TEMPS_INTERNAL_PROXY_ADDRESS || "");
+// Where this host's egress recorder listens, set by Temps only while this
+// sandbox records its outbound connections. Then every outbound request
+// (not the Temps relays, not internal names) goes through it: it applies
+// this sandbox's policy and records each connection. Unreachable, the
+// request fails: recording is never bypassed.
+const recordingProxy = parseInternalProxy(
+  process.env.TEMPS_EGRESS_RECORDING_PROXY_ADDRESS || "", "TEMPS_EGRESS_RECORDING_PROXY_ADDRESS");
 
-function parseInternalProxy(value) {
+function parseInternalProxy(value, name = "TEMPS_INTERNAL_PROXY_ADDRESS") {
   if (value === "") return null;
   const match = /^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$/.exec(value);
   const host = match && (match[1] || match[2]);
   if (!match || net.isIP(host) === 0 || Number(match[3]) < 1 || Number(match[3]) > 65535) {
-    throw new Error("TEMPS_INTERNAL_PROXY_ADDRESS must be an IP address and port");
+    throw new Error(`${name} must be an IP address and port`);
   }
   return { host, port: Number(match[3]), display: value };
 }
@@ -821,6 +941,31 @@ function forwardInternal(request, response, target) {
   request.pipe(upstream);
 }
 
+// Hand a plain-http request to the egress recorder, as an absolute-form
+// proxy request: it decides, connects and records.
+function forwardRecorded(request, response, target) {
+  const headers = { ...request.headers, host: target.host };
+  delete headers["proxy-authorization"];
+  delete headers["proxy-connection"];
+  const upstream = http.request({
+    host: recordingProxy.host,
+    port: recordingProxy.port,
+    method: request.method,
+    path: target.href,
+    headers,
+  }, (upstreamResponse) => {
+    upstreamResponse.on("error", () => response.destroy());
+    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+    upstreamResponse.pipe(response);
+  });
+  upstream.on("error", () => {
+    if (!response.headersSent) response.writeHead(502);
+    response.end();
+  });
+  request.on("error", () => upstream.destroy());
+  request.pipe(upstream);
+}
+
 async function handleRequest(request, response) {
   try {
     const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
@@ -849,6 +994,10 @@ async function handleRequest(request, response) {
       forwardInternal(request, response, target);
       return;
     }
+    if (recordingProxy) {
+      forwardRecorded(request, response, target);
+      return;
+    }
     await forward(request, response, target, false);
   } catch (error) {
     refuseRequest(request, response, error);
@@ -871,6 +1020,24 @@ server.on("connect", async (request, client, head) => {
   try {
     const { hostname, port } = parseAuthority(request.url, 443);
     destination = formatDestination(hostname, port);
+    if (recordingProxy && !isInternalName(normalizeHost(hostname))) {
+      // The recorder answers the CONNECT itself (200 or 403) and carries
+      // the tunnel; this side only pipes bytes.
+      let connected = false;
+      upstream = net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {
+        connected = true;
+        upstream.write(`CONNECT ${request.url} HTTP/1.1\r\nHost: ${request.url}\r\n\r\n`);
+        if (head.length) upstream.write(head);
+        client.pipe(upstream);
+        upstream.pipe(client);
+      });
+      upstream.setTimeout(60_000, () => upstream.destroy());
+      upstream.on("error", () => {
+        if (connected || client.destroyed) return client.destroy();
+        client.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      });
+      return;
+    }
     const address = await admit(hostname, port);
     if (client.destroyed) return;
     upstream = net.connect({ host: address, port }, () => {
@@ -945,6 +1112,7 @@ impl DockerSandboxProvider {
         };
         let egress = SidecarEgressPolicy::new(sandbox_container_name, &policy)?;
         let internal_proxy = internal_proxy_environment_value();
+        let recording = egress_recording_environment_value(sandbox_container_name);
 
         if let Some(info) = &existing {
             let image_matches = info
@@ -981,6 +1149,9 @@ impl DockerSandboxProvider {
             );
             let host_gateway_matches = container_has_extra_host(info, SANDBOX_HOST_GATEWAY);
             let internal_proxy_matches = container_has_internal_proxy(info, &internal_proxy);
+            let recording_matches = container_environment_value(info, SANDBOX_EGRESS_RECORDING_ENV)
+                .unwrap_or("")
+                == recording;
             let rules_match = egress.is_carried_by(info, sandbox_container_name);
             // A stopped proxy is always recreated rather than started: it
             // was parked with its sandbox, and its endpoint still names the
@@ -993,6 +1164,7 @@ impl DockerSandboxProvider {
                 && control_plane_matches
                 && host_gateway_matches
                 && internal_proxy_matches
+                && recording_matches
                 && rules_match
                 && running
             {
@@ -1020,6 +1192,7 @@ impl DockerSandboxProvider {
             control_plane_url,
             &egress,
             &internal_proxy,
+            &recording,
         )
         .await?;
 
@@ -1062,6 +1235,7 @@ impl DockerSandboxProvider {
         control_plane_url: &str,
         egress: &SidecarEgressPolicy,
         internal_proxy: &str,
+        recording: &str,
     ) -> Result<(), AgentError> {
         let mut tmpfs = HashMap::new();
         tmpfs.insert("/tmp".to_string(), "size=16m,mode=1777".to_string());
@@ -1078,6 +1252,7 @@ impl DockerSandboxProvider {
                 format!("{SANDBOX_EGRESS_RULES_ENV}={}", egress.json),
                 format!("{SANDBOX_NAME_ENV}={sandbox_container_name}"),
                 format!("{SANDBOX_INTERNAL_PROXY_ENV}={internal_proxy}"),
+                format!("{SANDBOX_EGRESS_RECORDING_ENV}={recording}"),
             ]),
             labels: Some(HashMap::from([
                 (
@@ -1178,6 +1353,7 @@ impl DockerSandboxProvider {
             // Never started: the proxy that runs is recreated on start,
             // with the address current then.
             &internal_proxy_environment_value(),
+            &egress_recording_environment_value(sandbox_container_name),
         )
         .await
     }
@@ -1186,6 +1362,34 @@ impl DockerSandboxProvider {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    /// Only a sandbox the recorder lists gets the hand-off address; every
+    /// other sidecar gets the empty value, which keeps today's behaviour.
+    #[test]
+    fn only_recorded_sandboxes_hand_their_traffic_to_the_recorder() {
+        let recorded = "temps-sandbox-recorded-only-test";
+        let address: std::net::SocketAddr = "172.30.0.1:41000".parse().unwrap();
+        publish_egress_recording(Some((
+            address,
+            std::collections::HashSet::from([recorded.to_string()]),
+        )));
+        assert_eq!(
+            egress_recording_environment_value(recorded),
+            "172.30.0.1:41000"
+        );
+        assert_eq!(
+            egress_recording_environment_value("temps-sandbox-other-only-test"),
+            ""
+        );
+        publish_egress_recording(None);
+        assert_eq!(egress_recording_environment_value(recorded), "");
+    }
+
+    #[test]
+    fn the_sidecar_script_hands_recorded_traffic_to_the_recorder() {
+        assert!(SANDBOX_EGRESS_PROXY_SCRIPT.contains("TEMPS_EGRESS_RECORDING_PROXY_ADDRESS"));
+        assert!(SANDBOX_EGRESS_PROXY_SCRIPT.contains("forwardRecorded(request, response, target)"));
+    }
 
     const SANDBOX: &str = "temps-sandbox-alpha";
 

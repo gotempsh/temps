@@ -77,7 +77,7 @@ test('a node that cannot record onboards instead of hiding the option', async ()
           reason_code: 'unsupported_platform',
           reason:
             'the node runs macos; outbound connections are recorded by the per-node egress proxy, which records only on Linux nodes',
-          setup_path: '/settings/nodes/3',
+          setup_path: null,
         })
       ),
   })
@@ -90,6 +90,27 @@ test('a node that cannot record onboards instead of hiding the option', async ()
   )
   expect(notice.textContent).toContain('the node runs macos')
   expect(notice.textContent).toContain(EXAMPLE_RECORDS[0])
+  expect(
+    card.queryByRole('link', { name: /in Nodes/ }),
+    'nothing on the node page fixes a platform'
+  ).toBeNull()
+  api.restore()
+})
+
+test('a node whose agent is not reporting links to the node', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/egress-recording': () =>
+      jsonResponse(
+        status({
+          configured: false,
+          reason_code: 'node_not_reporting',
+          reason: "the node's agent has not reported in the last 120 seconds",
+          setup_path: '/settings/nodes/3',
+        })
+      ),
+  })
+  const card = view(<SandboxEgressRecordingCard sandboxId="sbx_1" />)
+  await settle()
   expect(
     card
       .getByRole('link', { name: 'Open worker-a in Nodes' })

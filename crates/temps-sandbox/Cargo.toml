@@ -30,6 +30,8 @@ temps-otel = { path = "../temps-otel" }
 temps-routes = { path = "../temps-routes" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
+arc-swap = { workspace = true }
+bollard = { workspace = true }
 base64 = { workspace = true }
 sea-orm = { workspace = true }
 tokio = { workspace = true }
@@ -59,7 +61,6 @@ tar = { workspace = true }
 [dev-dependencies]
 # The egress recording e2e drives the per-node proxy (the probe binary) in
 # Docker; it skips without Docker or the cross-built binary.
-bollard = { workspace = true }
 temps-netpol-probe = { path = "../temps-netpol-probe" }
 temps-test-utils = { path = "../temps-test-utils" }
 bytes = { workspace = true }

@@ -200,6 +200,11 @@ pub struct EgressPolicy {
     /// an older control plane, which means off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub record: bool,
+    /// Never connect to a non-public address, even inside an allowed CIDR:
+    /// a sandbox's own egress policy refuses private, loopback, link-local
+    /// and metadata destinations whatever its rules name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public_only: bool,
 }
 
 /// Why a request was refused. Stable strings, for logs and metrics.
@@ -245,6 +250,8 @@ pub struct CompiledRules {
     pub workload: WorkloadRef,
     /// Whether this workload's connections are recorded.
     pub record: bool,
+    /// See [`EgressPolicy::public_only`].
+    pub public_only: bool,
     deny: Vec<EgressRule>,
     allow: Vec<EgressRule>,
 }
@@ -257,6 +264,7 @@ impl CompiledRules {
         Self {
             workload: policy.subject,
             record: policy.record,
+            public_only: policy.public_only,
             deny,
             allow,
         }
@@ -308,6 +316,9 @@ impl CompiledRules {
         }
         for &addr in addrs {
             let addr = unmap(addr);
+            if self.public_only && !is_public(addr) {
+                return Err(Refusal::Private);
+            }
             let in_cidr = |r: &&EgressRule| {
                 matches!(&r.target, EgressTarget::Cidr(c) if c.contains(addr))
                     && r.port_matches(port)

@@ -670,6 +670,13 @@ pub struct PlacementSpec {
     snapshot from a per-node cache keyed on the policy revision and answers
     "unchanged" to an agent that already holds it, so an idle pass stays one
     query.
+  - On the control plane it already carries the traffic of sandboxes that
+    record their outbound connections: their sidecar keeps the Temps relays
+    and internal names and hands every other request to the proxy, which
+    identifies the sandbox by the sidecar's address on the shared egress
+    network, applies the sandbox's own policy and records each connection.
+    Every other sandbox still egresses through its sidecar alone; workers
+    do not serve the proxy yet.
   - It applies the workload's hostname and CIDR rules, keeps the public-IP
     check of today's sidecar, and keeps the model, git and MCP relays.
   - It runs inside the node runtime (Rust, the same binary), not as a

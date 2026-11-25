@@ -377,6 +377,7 @@ pub fn compile_policies(
             subject,
             rules,
             record: false,
+            public_only: false,
         })
         .collect();
     Ok(compiled)

@@ -1256,6 +1256,7 @@ fn mark_recorded(
                 subject,
                 rules: Vec::new(),
                 record: true,
+                public_only: false,
             }),
         }
     }
@@ -1322,11 +1323,13 @@ mod remote_tests {
                 subject: sandbox(1),
                 rules: Vec::new(),
                 record: false,
+                public_only: false,
             },
             EgressPolicy {
                 subject: sandbox(2),
                 rules: Vec::new(),
                 record: false,
+                public_only: false,
             },
         ];
         let marked = mark_recorded(egress, [sandbox(2), sandbox(3)]);

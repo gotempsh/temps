@@ -222,8 +222,8 @@ async fn recording_is_off_by_default_and_reports_whether_it_can_work() {
     assert_eq!(mac.reason_code.as_deref(), Some("unsupported_platform"));
     assert!(mac.reason.unwrap().contains("macos"));
     assert_eq!(
-        mac.setup_path,
-        Some(format!("{NODES_SETUP_PATH}/{}", f.worker_b))
+        mac.setup_path, None,
+        "nothing on the node page fixes a platform"
     );
 
     let projectless = service.status(PROJECTLESS.1, OWNER).await.unwrap();
