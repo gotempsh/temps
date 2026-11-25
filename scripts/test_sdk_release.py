@@ -808,6 +808,54 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual({e['key']: (e['version'], e['reason']) for e in report},
                          {'cli': ('0.2.0-beta.3', 'server version'), 'kv': ('0.2.0-beta.3', 'server version')})
 
+    def test_registry_versions_are_ordered_by_each_registry_s_rules(self):
+        semver = ['0.1.0-beta.64', '1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta', '1.0.0-beta', '1.0.0-beta.2',
+                  '1.0.0-beta.11', '1.0.0-canary.1', '1.0.0-rc.1', '1.0.0', '1.0.1-0', '1.0.1']
+        pep440 = ['0.1.0b64', '1.0.dev1', '1.0a1', '1.0b1.dev1', '1.0b1', '1.0b1.post1', '1.0rc1',
+                  '1.0.post1.dev1', '1.0.post1', '1.1.dev1']
+        for kind, ordered in [('npm', semver), ('crate', semver), ('go', semver), ('pypi', pep440)]:
+            with self.subTest(kind=kind):
+                keys = [sdk_prepare.precedence(text, kind) for text in ordered]
+                self.assertEqual(sorted(keys), keys)
+                self.assertEqual(len(set(keys)), len(keys))
+        self.assertEqual(sdk_prepare.precedence('1.0', 'pypi'), sdk_prepare.precedence('1.0.0', 'pypi'))
+        self.assertEqual(sdk_prepare.precedence('1.0.0+build.5', 'npm'), sdk_prepare.precedence('1.0.0', 'npm'))
+        self.assertLess(sdk_prepare.precedence('1.0rc1', 'pypi'), sdk_prepare.precedence('1.0', 'pypi'))
+        for text, kind in [('1!0.1.0', 'pypi'), ('01.0.0', 'npm'), ('1.0', 'npm'), ('latest', 'crate')]:
+            with self.subTest(text=text):
+                self.assertIsNone(sdk_prepare.precedence(text, kind))
+
+    def test_a_registry_prerelease_prepare_cannot_parse_still_counts_as_published(self):
+        # npm accepts any SemVer prerelease label; 0.3.0-canary.1 is above the server's 0.2.0-beta.1.
+        self.add('cli', 'npm', '0.1.38', published={'0.1.38', '0.3.0-canary.1'}, versioning='until-server-passes')
+        self.release_tag('cli', '0.1.38')
+        self.assertEqual(self.selection('v0.2.0-beta.1'), {})
+        # canary sorts above beta of the same core, so 0.3.0-beta.1 has not passed it either.
+        self.assertEqual(self.selection('v0.3.0-beta.1'), {})
+        self.assertEqual(self.selection('v0.3.0'), {'cli': '0.3.0'})
+        self.setUp()
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4', '0.3.0-canary.1'}, versioning='server')
+        with self.assertRaisesRegex(ValueError, r'@temps-sdk/kv 0\.2\.0-beta\.1: 0\.3\.0-canary\.1 is already '
+                                                r'published or tagged, above the server version'):
+            self.prepare('v0.2.0-beta.1')
+
+    def test_a_pypi_development_release_above_the_server_version_fails_closed(self):
+        self.add('py', 'pypi', '0.1.0b1', name='temps-sample', published={'0.1.0b1', '0.2.0.dev1'},
+                 versioning='server')
+        with self.assertRaisesRegex(ValueError, r'temps-sample 0\.1\.0b64: 0\.2\.0\.dev1 is already published'):
+            self.prepare('v0.1.0-beta.64')
+        self.assertEqual(self.version('py'), '0.1.0b1')
+        # A development release below the server version (0.1.0.dev1 precedes 0.1.0b64) is no obstacle.
+        self.registry['temps-sample'] = {'0.1.0b1', '0.1.0.dev1'}
+        self.assertEqual(self.selection('v0.1.0-beta.64'), {'py': '0.1.0b64'})
+
+    def test_a_registry_version_that_cannot_be_ordered_stops_preparation(self):
+        self.add('py', 'pypi', '0.1.0b1', name='temps-sample', published={'0.1.0b1', '1!0.0.1'}, versioning='server')
+        with self.assertRaisesRegex(ValueError, r"temps-sample: cannot order registry version '1!0\.0\.1' "
+                                                r'against 0\.1\.0b64'):
+            self.prepare('v0.1.0-beta.64')
+        self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
+
     def test_independent_packages_are_not_released_by_the_server_version(self):
         self.add('kv', 'npm', '0.0.4', published={'0.0.4'})
         self.release_tag('kv', '0.0.4')

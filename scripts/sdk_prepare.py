@@ -117,14 +117,35 @@ def server_version(tag):
                          f'X.Y.Z-(alpha|beta|rc).N') from None
 
 
-def follows_server(package, known, server):
-    """Whether `package` releases at the server version `server` (catalog `versioning`)."""
-    mode = package.get('versioning', 'server')
+def follows_server(state, server):
+    """Whether a package releases at the server version `server` (catalog `versioning`)."""
+    mode = state.package.get('versioning', 'server')
     if mode == 'until-server-passes':
         # Already ahead of the server (the CLI shipped 0.1.38 before SDKs followed it):
         # keep its own line until the server version is above everything it published.
-        return all(version.key() < server.key() for version in known)
+        return not at_or_above(state, server, inclusive=True)
     return mode == 'server'
+
+
+def at_or_above(state, version, *, inclusive):
+    """Tagged and registry versions of the package above `version` (or equal, when inclusive).
+
+    Registry versions are ordered by the registry's own rules, so a version
+    `Version` cannot represent (an npm `0.3.0-canary.1`, a PyPI `0.2.0.dev1`)
+    still counts; one that cannot be ordered at all stops preparation.
+    """
+    kind = state.package['kind']
+    key = precedence(version.format(kind), kind)
+    found = [tag.format(kind) for tag in state.tagged
+             if tag.key() > version.key() or (inclusive and tag.key() == version.key())]
+    for text in sorted(state.registry_texts):
+        other = precedence(text, kind)
+        if other is None:
+            raise ValueError(f"{state.package['name']}: cannot order registry version {text!r} against "
+                             f"{version.format(kind)}; resolve it on the registry before preparing")
+        if other > key or (inclusive and other == key):
+            found.append(text)
+    return found
 
 
 class GitHistory:
@@ -228,6 +249,45 @@ def published_versions(package, fetch=release.registry_json):
 
 PEP440 = re.compile(r'v?(\d+(?:\.\d+)*)(?:[-_.]?(a|b|rc|alpha|beta|c|pre|preview)[-_.]?(\d*))?'
                     r'(?:[-_.]?(post|rev|r)[-_.]?(\d*)|-(\d+))?(?:[-_.]?dev[-_.]?(\d*))?', re.I)
+
+
+SEMVER_PRECEDENCE = re.compile(r'v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)'
+                               r'(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?')
+INF = float('inf')
+
+
+def precedence(text, kind):
+    """A sort key that orders any registry version as its registry does, or None.
+
+    SemVer 2.0 precedence for npm, crates.io and Go (any prerelease identifiers,
+    build metadata ignored); PEP 440 for PyPI (`.devN` before its pre-releases,
+    `.postN` after its release, `1.0` equal to `1.0.0`).
+    """
+    text = text.strip()
+    if kind != 'pypi':
+        match = SEMVER_PRECEDENCE.fullmatch(text)
+        if not match:
+            return None
+        core = tuple(int(part) for part in match.group(1, 2, 3))
+        if match[4] is None:
+            return (core, (1,))
+        identifiers = tuple((0, int(part), '') if part.isdigit() else (1, 0, part) for part in match[4].split('.'))
+        return (core, (0, identifiers))
+    match = PEP440.fullmatch(text)
+    if not match:
+        return None
+    release = [int(part) for part in match[1].split('.')]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()
+    label = (match[2] or '').lower()
+    has_post = bool(match[4]) or match[6] is not None
+    post = int((match[5] if match[4] else match[6]) or 0) if has_post else None
+    dev = int(match[7] or 0) if match[7] is not None else None
+    if label:
+        pre = ({'a': 0, 'alpha': 0, 'b': 1, 'beta': 1}.get(label, 2), int(match[3] or 0))
+    else:
+        pre = (-INF,) if dev is not None and post is None else (INF,)
+    return (tuple(release), pre, (-INF,) if post is None else (post,), (INF,) if dev is None else (dev,))
 
 
 def registry_version(text, kind):
@@ -382,6 +442,8 @@ class Assessment:
     dependencies: list = field(default_factory=list)
     version: Version | None = None
     server: Version | None = None  # set when the package releases at the server version
+    tagged: set = field(default_factory=set)  # versions of this package's own release tags
+    registry_texts: set = field(default_factory=set)  # every registry version, as the registry spells it
 
     def selected(self, target):
         graduation = target == 'stable' and self.previous is not None and self.previous.pre is not None
@@ -418,8 +480,10 @@ def assess(package, catalog, history, published):
             tagged[tag] = Version.parse(tag.removeprefix(prefix), kind)
         except ValueError:
             continue
-    registry = parse_all(published(package), kind)
-    state = Assessment(package, current, known=registry | set(tagged.values()), published=registry)
+    texts = set(published(package))
+    registry = parse_all(texts, kind)
+    state = Assessment(package, current, known=registry | set(tagged.values()), published=registry,
+                       tagged=set(tagged.values()), registry_texts=texts)
     if tagged:
         tag, state.previous = max(tagged.items(), key=lambda item: item[1].key())
         base = f'refs/tags/{tag}'
@@ -453,9 +517,9 @@ def choose_version(state, target):
         name = f"{package['name']} {candidate.format(kind)}"
         if candidate in state.known:
             raise ValueError(f'{name} is already published or tagged; reconcile the registry and package tags first')
-        ahead = sorted((v for v in state.known if v.key() > candidate.key()), key=Version.key)
-        if ahead:
-            raise ValueError(f"{name}: {ahead[-1].format(kind)} is already published or tagged, above the "
+        if ahead := at_or_above(state, candidate, inclusive=False):
+            raise ValueError(f"{name}: {', '.join(ahead)} {'is' if len(ahead) == 1 else 'are'} already published "
+                             f"or tagged, above the "
                              f"server version; set \"versioning\": \"until-server-passes\" in its catalog entry")
         if kind == 'go' and candidate.major >= 2:
             raise ValueError(f'{name}: Go v2+ requires a new /v2 module path and catalog entry')
@@ -734,7 +798,7 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
     by_key = {package['key']: package for package in catalog}
     states = {package['key']: assess(package, catalog, history, published) for package in catalog}
     for key, state in states.items():
-        if follows_server(by_key[key], state.known, server):
+        if follows_server(state, server):
             state.server = server
     depends = {key: local_dependencies(by_key[key], catalog, root) for key in by_key}
     # Re-release dependents so registry consumers get the new dependency, to a fixed point.
