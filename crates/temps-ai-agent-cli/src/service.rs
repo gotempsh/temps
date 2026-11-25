@@ -216,8 +216,25 @@ const PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 struct HarnessUpdateState {
     status: Option<temps_ai::HarnessUpdateStatus>,
+    /// When the check behind `status` started reading the workspace.
     checked_at: Option<Instant>,
     updating: bool,
+}
+
+impl HarnessUpdateState {
+    /// Record a check that started reading the workspace at `started`, unless
+    /// a check that started later has already published: an earlier check can
+    /// finish last (its registry lookup stalled) and must not replace, say,
+    /// the version read after an install with the one read before it.
+    /// Returns whether `status` was recorded.
+    fn publish_check(&mut self, started: Instant, status: temps_ai::HarnessUpdateStatus) -> bool {
+        if self.checked_at.is_some_and(|newer| newer > started) {
+            return false;
+        }
+        self.status = Some(status);
+        self.checked_at = Some(started);
+        true
+    }
 }
 
 type HarnessUpdates = Arc<std::sync::Mutex<HashMap<i32, HarnessUpdateState>>>;
@@ -2182,6 +2199,7 @@ impl AgentCliAiService {
     ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
         use crate::harness_update as hu;
 
+        let started = Instant::now();
         let installed = self
             .run_in_workspace(
                 principal_id,
@@ -2244,8 +2262,19 @@ impl AgentCliAiService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = states.entry(principal_id).or_default();
-        state.status = Some(status.clone());
-        state.checked_at = Some(Instant::now());
+        if !state.publish_check(started, status.clone()) {
+            tracing::debug!(
+                provider = self.provider.name(),
+                principal_id,
+                "a newer harness check already published; returning it instead of this one"
+            );
+            if let Some(newer) = state.status.as_ref() {
+                return Ok(temps_ai::HarnessUpdateStatus {
+                    updating: state.updating,
+                    ..newer.clone()
+                });
+            }
+        }
         Ok(temps_ai::HarnessUpdateStatus {
             updating: state.updating,
             ..status
@@ -10579,6 +10608,38 @@ mod tests {
             deltas.as_slice(),
             [ChatStreamDelta::ToolResult { result, .. }] if result == "failed with [REDACTED]"
         ));
+    }
+
+    #[test]
+    fn an_earlier_check_finishing_last_never_replaces_a_later_one() {
+        let status = |installed: &str| temps_ai::HarnessUpdateStatus {
+            provider_id: "codex_cli".to_string(),
+            installed_version: Some(installed.to_string()),
+            latest_version: Some("1.1.0".to_string()),
+            update_available: installed != "1.1.0",
+            updating: false,
+            checked_at: None,
+            detail: None,
+        };
+        let refresh_started = Instant::now();
+        let after_install = refresh_started + Duration::from_secs(5);
+        let mut state = HarnessUpdateState::default();
+        // The post-install check read 1.1.0 and published first.
+        assert!(state.publish_check(after_install, status("1.1.0")));
+        // A refresh that read 1.0.0 before the install finishes later.
+        assert!(!state.publish_check(refresh_started, status("1.0.0")));
+        assert_eq!(
+            state
+                .status
+                .as_ref()
+                .and_then(|status| status.installed_version.as_deref()),
+            Some("1.1.0")
+        );
+        assert_eq!(state.checked_at, Some(after_install));
+        // A check that started later still replaces it.
+        let later = after_install + Duration::from_secs(5);
+        assert!(state.publish_check(later, status("1.0.0")));
+        assert_eq!(state.checked_at, Some(later));
     }
 
     #[test]

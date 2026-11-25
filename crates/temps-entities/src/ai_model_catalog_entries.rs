@@ -27,10 +27,17 @@ pub struct Model {
     pub cache_write_per_million: Option<f64>,
     pub context_window: Option<i64>,
     pub max_output_tokens: Option<i64>,
-    /// `null` when the catalog does not say.
-    pub supports_tools: Option<bool>,
-    pub supports_vision: Option<bool>,
-    pub supports_reasoning: Option<bool>,
+    /// `false` when the catalog says no or does not say; the matching
+    /// `*_stated` column tells the two apart.
+    pub supports_tools: bool,
+    pub supports_vision: bool,
+    pub supports_reasoning: bool,
+    /// Whether `supports_tools` came from the catalog.
+    pub tools_stated: bool,
+    /// Whether `supports_vision` came from the catalog.
+    pub vision_stated: bool,
+    /// Whether `supports_reasoning` came from the catalog.
+    pub reasoning_stated: bool,
     pub deprecated: bool,
     /// Release date as the catalog states it (`YYYY-MM-DD` or `YYYY-MM`).
     pub release_date: Option<String>,

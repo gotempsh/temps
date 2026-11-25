@@ -137,19 +137,30 @@ pub async fn get_ai_provider_harness_update(
 ) -> Result<impl IntoResponse, Problem> {
     authorize(&auth, &provider_id)?;
     let ai_service = service(&app_state)?;
-    let status = if query.cached_only && !query.refresh {
-        ai_service
-            .cached_workspace_harness_update_status(&provider_id, auth.user_id())
-            .await
-            .map_err(|error| update_problem(&provider_id, &error))?
-            .unwrap_or_else(|| not_checked_yet(&provider_id))
-    } else {
-        ai_service
-            .workspace_harness_update_status(&provider_id, auth.user_id(), query.refresh)
-            .await
-            .map_err(|error| update_problem(&provider_id, &error))?
-    };
+    let status = harness_status(ai_service.as_ref(), &provider_id, auth.user_id(), &query)
+        .await
+        .map_err(|error| update_problem(&provider_id, &error))?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(status)))
+}
+
+/// The status the `GET` returns. `cached_only` never looks inside the
+/// workspace (which could create or wake it) and reports "not checked yet"
+/// when nothing was read; `refresh` always looks, and wins over `cached_only`.
+async fn harness_status(
+    ai_service: &dyn temps_ai::AiService,
+    provider_id: &str,
+    user_id: i32,
+    query: &HarnessUpdateQuery,
+) -> Result<temps_ai::HarnessUpdateStatus, temps_ai::AiError> {
+    if query.cached_only && !query.refresh {
+        return Ok(ai_service
+            .cached_workspace_harness_update_status(provider_id, user_id)
+            .await?
+            .unwrap_or_else(|| not_checked_yet(provider_id)));
+    }
+    ai_service
+        .workspace_harness_update_status(provider_id, user_id, query.refresh)
+        .await
 }
 
 /// Install the latest release of the provider's harness CLI in your
@@ -218,6 +229,137 @@ pub async fn update_ai_provider_harness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Records which read the handler chose; the live read stands in for
+    /// "looked inside (and possibly woke) the workspace".
+    #[derive(Default)]
+    struct RecordingAiService {
+        cached: Option<temps_ai::HarnessUpdateStatus>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    fn checked(installed: &str) -> temps_ai::HarnessUpdateStatus {
+        temps_ai::HarnessUpdateStatus {
+            provider_id: "codex_cli".to_string(),
+            installed_version: Some(installed.to_string()),
+            latest_version: Some("1.1.0".to_string()),
+            update_available: installed != "1.1.0",
+            updating: false,
+            checked_at: Some("2026-11-25T09:00:00.000Z".to_string()),
+            detail: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl temps_ai::AiService for RecordingAiService {
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            _request: temps_ai::AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+
+        async fn workspace_harness_update_status(
+            &self,
+            _provider: &str,
+            principal_id: i32,
+            refresh: bool,
+        ) -> Result<temps_ai::HarnessUpdateStatus, temps_ai::AiError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("inspect user={principal_id} refresh={refresh}"));
+            Ok(checked("1.0.0"))
+        }
+
+        async fn cached_workspace_harness_update_status(
+            &self,
+            _provider: &str,
+            principal_id: i32,
+        ) -> Result<Option<temps_ai::HarnessUpdateStatus>, temps_ai::AiError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("cached user={principal_id}"));
+            Ok(self.cached.clone())
+        }
+    }
+
+    fn query(refresh: bool, cached_only: bool) -> HarnessUpdateQuery {
+        HarnessUpdateQuery {
+            refresh,
+            cached_only,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cached_only_read_never_inspects_the_workspace() {
+        let never_checked = RecordingAiService::default();
+        let status = harness_status(&never_checked, "codex_cli", 7, &query(false, true))
+            .await
+            .unwrap();
+        assert_eq!(*never_checked.calls.lock().unwrap(), vec!["cached user=7"]);
+        // Not checked yet: every version field and `checked_at` are null.
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            serde_json::to_value(not_checked_yet("codex_cli")).unwrap()
+        );
+        assert!(status.checked_at.is_none() && status.installed_version.is_none());
+
+        let checked_before = RecordingAiService {
+            cached: Some(checked("1.1.0")),
+            ..Default::default()
+        };
+        let status = harness_status(&checked_before, "codex_cli", 7, &query(false, true))
+            .await
+            .unwrap();
+        assert_eq!(status.installed_version.as_deref(), Some("1.1.0"));
+        assert_eq!(*checked_before.calls.lock().unwrap(), vec!["cached user=7"]);
+    }
+
+    #[tokio::test]
+    async fn refresh_inspects_the_workspace_even_with_cached_only() {
+        let service = RecordingAiService {
+            cached: Some(checked("1.1.0")),
+            ..Default::default()
+        };
+        let status = harness_status(&service, "codex_cli", 7, &query(true, true))
+            .await
+            .unwrap();
+        assert_eq!(status.installed_version.as_deref(), Some("1.0.0"));
+        let plain = harness_status(&service, "codex_cli", 7, &query(false, false))
+            .await
+            .unwrap();
+        assert_eq!(plain.installed_version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            *service.calls.lock().unwrap(),
+            vec![
+                "inspect user=7 refresh=true",
+                "inspect user=7 refresh=false"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_query_flags_default_to_a_plain_cached_check() {
+        let parsed: HarnessUpdateQuery =
+            serde_json::from_value(serde_json::json!({ "cached_only": true })).unwrap();
+        assert!(parsed.cached_only && !parsed.refresh);
+        let parsed: HarnessUpdateQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!parsed.cached_only && !parsed.refresh);
+    }
 
     #[test]
     fn busy_workspace_is_a_conflict_and_other_failures_are_unavailable() {

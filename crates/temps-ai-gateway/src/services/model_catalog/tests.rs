@@ -228,6 +228,31 @@ fn a_models_dev_document_is_read_for_supported_providers_only() {
 }
 
 #[test]
+fn modalities_that_list_only_outputs_leave_vision_unknown() {
+    let body = br#"{"openai": {"models": {
+        "example-output-only": {"modalities": {"output": ["text"]}},
+        "example-text-input": {"modalities": {"input": ["text"], "output": ["text"]}},
+        "example-stated-no": {"attachment": false, "modalities": {"output": ["text"]}}
+    }}}"#;
+    let parsed = parse_catalog("https://catalog.example.com/api.json", body).unwrap();
+    let vision = |id: &str| {
+        parsed
+            .models
+            .iter()
+            .find(|model| model.model_id == id)
+            .unwrap_or_else(|| panic!("{id} parsed"))
+            .supports_vision
+    };
+    assert_eq!(vision("example-output-only"), None, "inputs not listed");
+    assert_eq!(vision("example-text-input"), Some(false), "inputs listed");
+    assert_eq!(
+        vision("example-stated-no"),
+        Some(false),
+        "attachment stated"
+    );
+}
+
+#[test]
 fn a_document_that_is_not_a_catalog_is_rejected_with_its_url() {
     let url = "https://catalog.example.com/api.json";
     for body in ["[]", "\"text\"", "{", "<html></html>"] {
@@ -619,6 +644,86 @@ async fn a_stored_catalog_replaces_the_previous_one_and_survives_a_restart() {
     pricing::install_catalog_prices(&[]);
 }
 
+/// A capability the catalog does not state is listed as unknown, and is stored
+/// so the previous binary, which reads `supports_*` as a plain boolean, still
+/// decodes every row after a binary-only rollback.
+#[tokio::test]
+async fn unknown_capabilities_round_trip_and_stay_readable_by_the_previous_binary() {
+    use sea_orm::ConnectionTrait;
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let _serial = CATALOG_TEST_LOCK.lock().await;
+    let db = test_db.connection_arc();
+    let service = service_on(db.clone());
+    let mut stated = model("openai", "example-stated", Some((1.0, 2.0)));
+    stated.supports_reasoning = Some(false);
+    let mut silent = model("openai", "example-silent", Some((1.0, 2.0)));
+    silent.supports_tools = None;
+    silent.supports_vision = None;
+    silent.supports_reasoning = None;
+    let catalog = ParsedCatalog {
+        models: vec![stated, silent],
+        skipped: 0,
+    };
+    service
+        .store_and_apply(&catalog, "https://catalog.example.com/api.json")
+        .await
+        .unwrap();
+
+    let page = service
+        .list_entries(ModelCatalogEntryFilter::default(), 1, 20)
+        .await
+        .unwrap();
+    let listed = |id: &str| {
+        let entry = page
+            .items
+            .iter()
+            .find(|entry| entry.model_id == id)
+            .unwrap_or_else(|| panic!("{id} listed"));
+        (
+            entry.supports_tools,
+            entry.supports_vision,
+            entry.supports_reasoning,
+        )
+    };
+    assert_eq!(
+        listed("example-stated"),
+        (Some(true), Some(false), Some(false))
+    );
+    assert_eq!(listed("example-silent"), (None, None, None));
+
+    // Exactly the columns the previous binary selects, decoded as it does.
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT model_id, supports_tools, supports_vision, supports_reasoning \
+             FROM ai_model_catalog_entries ORDER BY model_id"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let previous: Vec<(String, bool, bool, bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get("", "model_id").unwrap(),
+                row.try_get("", "supports_tools").unwrap(),
+                row.try_get("", "supports_vision").unwrap(),
+                row.try_get("", "supports_reasoning").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        previous,
+        vec![
+            ("example-silent".to_string(), false, false, false),
+            ("example-stated".to_string(), true, false, false),
+        ]
+    );
+    pricing::install_catalog_prices(&[]);
+}
+
 #[tokio::test]
 async fn stored_entries_are_filtered_searched_and_paginated() {
     let Some(test_db) = test_database().await else {
@@ -871,6 +976,9 @@ async fn the_startup_load_waits_for_a_refresh_in_flight() {
     let Some(test_db) = test_database().await else {
         return;
     };
+    // `load_stored` installs this (empty) catalog into the process-wide price
+    // table, so it must not run while another test relies on its prices.
+    let _serial = CATALOG_TEST_LOCK.lock().await;
     let service = Arc::new(service_on(test_db.connection_arc()));
     // A refresh holds the lock from before its SELECT until its prices are
     // installed; the startup load must not read and install an older

@@ -136,8 +136,10 @@ struct ModelDoc {
 
 #[derive(Deserialize, Default)]
 struct ModalitiesDoc {
+    /// Absent means the catalog does not say which inputs the model takes,
+    /// even when it lists the outputs.
     #[serde(default)]
-    input: Vec<String>,
+    input: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -250,7 +252,8 @@ fn validate(provider: &'static str, id: &str, raw: serde_json::Value) -> Option<
     let image_input = doc
         .modalities
         .as_ref()
-        .map(|modalities| modalities.input.iter().any(|kind| kind == "image"));
+        .and_then(|modalities| modalities.input.as_ref())
+        .map(|input| input.iter().any(|kind| kind == "image"));
     let supports_vision = match (doc.attachment, image_input) {
         (Some(true), _) | (_, Some(true)) => Some(true),
         (None, None) => None,

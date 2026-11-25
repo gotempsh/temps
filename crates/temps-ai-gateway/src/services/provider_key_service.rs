@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set,
+    sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -53,6 +53,10 @@ pub struct ProviderKeyUpdate<'a> {
     pub api_key: Option<&'a str>,
     pub base_url: Option<Option<&'a str>>,
     pub default_model: Option<Option<&'a str>>,
+    /// Pin this default only if the key still has none when the update is
+    /// written, so a default saved meanwhile by another request is kept.
+    /// Ignored when `default_model` is given.
+    pub default_model_if_unset: Option<&'a str>,
     pub is_active: Option<bool>,
     pub trust: Option<TrustChange>,
     pub capabilities: Option<SelfHostedCapabilities>,
@@ -419,7 +423,30 @@ impl ProviderKeyService {
             active.capabilities = Set(Some(capabilities.to_stored()));
         }
 
-        let result = active.update(self.db.as_ref()).await?;
+        let pin = changes
+            .default_model_if_unset
+            .filter(|_| changes.default_model.is_none());
+        let txn = self.db.begin().await?;
+        let mut result = active.update(&txn).await?;
+        if let Some(model) = pin {
+            // Conditional on the row as it is now, not as it was read: a
+            // default another request saved in the meantime wins.
+            let pinned = ai_provider_keys::Entity::update_many()
+                .col_expr(ai_provider_keys::Column::DefaultModel, Expr::value(model))
+                .filter(ai_provider_keys::Column::Id.eq(id))
+                .filter(ai_provider_keys::Column::DefaultModel.is_null())
+                .exec(&txn)
+                .await?;
+            if pinned.rows_affected == 1 {
+                result.default_model = Some(model.to_string());
+            } else {
+                result = ai_provider_keys::Entity::find_by_id(id)
+                    .one(&txn)
+                    .await?
+                    .ok_or(AiGatewayError::ProviderKeyNotFound { key_id: id })?;
+            }
+        }
+        txn.commit().await?;
 
         Ok(result)
     }
@@ -447,6 +474,79 @@ impl ProviderKeyService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
+
+    /// A fallback pinned by a key rotation is written only if the key still
+    /// has no default, so a default another administrator saved while the
+    /// rotation was verifying is kept.
+    #[tokio::test]
+    async fn a_fallback_pin_never_overwrites_a_default_saved_meanwhile() {
+        use sea_orm::ConnectionTrait;
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&format!("{error:#}")) =>
+            {
+                println!(
+                    "Skipping: no container runtime for the PostgreSQL test database: {error:#}"
+                );
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error:#}"),
+        };
+        let db = test_db.connection_arc();
+        db.execute_unprepared(
+            "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active, default_model) VALUES \
+             (921, 'openai', 'Unpinned', 'enc', true, NULL), \
+             (922, 'openai', 'Pinned meanwhile', 'enc', true, 'example-chosen-model')",
+        )
+        .await
+        .unwrap();
+        let service = ProviderKeyService::new(db, test_encryption());
+        let rotate = || ProviderKeyUpdate {
+            api_key: Some("sk-example-replacement"),
+            default_model_if_unset: Some("example-fallback-model"),
+            ..Default::default()
+        };
+
+        let pinned = service.update(921, rotate()).await.unwrap();
+        assert_eq!(
+            pinned.default_model.as_deref(),
+            Some("example-fallback-model")
+        );
+        let kept = service.update(922, rotate()).await.unwrap();
+        assert_eq!(kept.default_model.as_deref(), Some("example-chosen-model"));
+        assert_eq!(
+            service
+                .get_by_id(922)
+                .await
+                .unwrap()
+                .default_model
+                .as_deref(),
+            Some("example-chosen-model")
+        );
+        // The credential itself was still replaced.
+        assert_ne!(kept.api_key_encrypted, "enc");
+    }
+
+    /// A failed page must be an error, never an empty page: discovery reads an
+    /// empty page as "every key seen" and records the pass as complete.
+    #[tokio::test]
+    async fn a_failed_active_key_page_is_an_error_not_an_empty_page() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+                    "connection reset while reading page after key 911".to_string(),
+                ))])
+                .into_connection(),
+        );
+        let service = ProviderKeyService::new(db, test_encryption());
+        match service.active_key_ids_after(911, 100).await {
+            Err(AiGatewayError::Database(error)) => {
+                assert!(error.to_string().contains("after key 911"), "{error}");
+            }
+            other => panic!("expected a database error, got {other:?}"),
+        }
+    }
 
     fn test_encryption() -> Arc<EncryptionService> {
         Arc::new(EncryptionService::new("01234567890123456789012345678901").unwrap())

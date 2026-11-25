@@ -10885,9 +10885,10 @@ async fn visitor_environments(
         .collect()
 }
 
-/// A catalog entry's capabilities become nullable ("the catalog does not
-/// say"): existing values are kept, an entry inserted without them is NULL,
-/// and `down` stores unknown as FALSE and restores NOT NULL.
+/// Whether each catalog capability was stated lives in new `*_stated`
+/// columns, leaving `supports_*` `NOT NULL` so the previous binary still reads
+/// every row: existing rows and rows inserted without the new columns count as
+/// stated, and `down` drops the three columns.
 #[tokio::test]
 async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyhow::Result<()> {
     const MIGRATION: &str = "m20261125_000001_ai_model_catalog_unknown_capabilities";
@@ -10931,23 +10932,31 @@ async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyh
     db.execute_unprepared(
         "INSERT INTO ai_model_catalog_entries \
          (provider, model_id, display_name, supports_tools, source_url, fetched_at) \
-         VALUES ('openai', 'stated-model', 'Stated', TRUE, 'https://catalog.example.com/api.json', now())",
+         VALUES ('openai', 'existing-model', 'Existing', TRUE, 'https://catalog.example.com/api.json', now())",
     )
     .await?;
 
     Migrator::up(&db, None).await?;
+    // The previous binary inserts without the new columns.
     db.execute_unprepared(
         "INSERT INTO ai_model_catalog_entries \
          (provider, model_id, display_name, source_url, fetched_at) \
-         VALUES ('openai', 'silent-model', 'Silent', 'https://catalog.example.com/api.json', now())",
+         VALUES ('openai', 'previous-binary-model', 'Previous', 'https://catalog.example.com/api.json', now())",
     )
     .await?;
-    let read = |model: &'static str| {
+    // The new binary records an unknown capability as FALSE, not stated.
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, supports_vision, vision_stated, source_url, fetched_at) \
+         VALUES ('openai', 'silent-model', 'Silent', FALSE, FALSE, 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+    let stated = |model: &'static str| {
         let db = &db;
         async move {
             db.query_one(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
-                "SELECT supports_tools, supports_vision, supports_reasoning \
+                "SELECT tools_stated, vision_stated, reasoning_stated \
                  FROM ai_model_catalog_entries WHERE model_id = $1",
                 [model.into()],
             ))
@@ -10955,35 +10964,32 @@ async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyh
             .map(|row| {
                 let row = row.expect("entry");
                 (
-                    row.try_get::<Option<bool>>("", "supports_tools")
-                        .expect("tools"),
-                    row.try_get::<Option<bool>>("", "supports_vision")
-                        .expect("vision"),
-                    row.try_get::<Option<bool>>("", "supports_reasoning")
+                    row.try_get::<bool>("", "tools_stated").expect("tools"),
+                    row.try_get::<bool>("", "vision_stated").expect("vision"),
+                    row.try_get::<bool>("", "reasoning_stated")
                         .expect("reasoning"),
                 )
             })
         }
     };
-    assert_eq!(
-        read("stated-model").await?,
-        (Some(true), Some(false), Some(false)),
-        "existing values are kept"
-    );
-    assert_eq!(read("silent-model").await?, (None, None, None));
-
-    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
-    assert_eq!(
-        read("silent-model").await?,
-        (Some(false), Some(false), Some(false))
-    );
+    assert_eq!(stated("existing-model").await?, (true, true, true));
+    assert_eq!(stated("previous-binary-model").await?, (true, true, true));
+    assert_eq!(stated("silent-model").await?, (true, false, true));
     assert!(
         db.execute_unprepared(
-            "UPDATE ai_model_catalog_entries SET supports_tools = NULL WHERE model_id = 'stated-model'"
+            "UPDATE ai_model_catalog_entries SET supports_tools = NULL WHERE model_id = 'silent-model'"
         )
         .await
         .is_err(),
-        "down restores NOT NULL"
+        "supports_tools stays NOT NULL for the previous binary"
     );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    for column in ["tools_stated", "vision_stated", "reasoning_stated"] {
+        assert!(
+            !column_exists(&db, "ai_model_catalog_entries", column).await?,
+            "{column} after down"
+        );
+    }
     Ok(())
 }
