@@ -230,7 +230,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         <EnvironmentReachabilityList
           projectId={project.id}
           projectSlug={project.slug}
-          domains={domains}
+          domains={customDomains ? domains : undefined}
           domainMenu={domainMenu}
         />
       ) : isPending ? (
@@ -250,6 +250,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
       ) : (
         !error && (
           <EmptyState
+            size="compact"
             icon={Globe}
             title="No domains configured yet"
             description="Add a domain to get started."

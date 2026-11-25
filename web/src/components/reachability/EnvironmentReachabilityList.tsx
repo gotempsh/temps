@@ -64,12 +64,16 @@ const LIST = 'divide-y rounded-lg border'
 export function EnvironmentReachabilityList({
   projectId,
   projectSlug,
-  domains = [],
+  domains: projectDomains,
   domainMenu,
 }: {
   projectId: number
   projectSlug: string
-  /** The project's custom domains, each shown on the address it is. */
+  /**
+   * The project's custom domains, each shown on the address it is. Leave it
+   * out while they are unknown (their request failed): every address then
+   * stays, since none can be told to belong to a domain that moved.
+   */
   domains?: CustomDomainResponse[]
   domainMenu?: DomainMenu
 }) {
@@ -89,7 +93,7 @@ export function EnvironmentReachabilityList({
       </AlertDescription>
     </Alert>
   )
-  if (!environments.data) return loadError
+  const domains = projectDomains ?? []
   const list = environments.data ?? []
   const known = new Set(list.map((environment) => environment.id))
   const elsewhere = domains.filter(
@@ -107,12 +111,20 @@ export function EnvironmentReachabilityList({
           domains={domains.filter(
             (domain) => domain.environment?.id === environment.id
           )}
+          domainsKnown={projectDomains !== undefined}
           domainMenu={domainMenu}
         />
       ))}
       {elsewhere.length > 0 && (
-        <section className="space-y-2" aria-label="Other domains">
-          <h3 className="text-sm font-medium">Other domains</h3>
+        // Without the environments every domain is listed here, so its
+        // actions stay at hand while they cannot be grouped.
+        <section
+          className="space-y-2"
+          aria-label={environments.data ? 'Other domains' : 'Domains'}
+        >
+          <h3 className="text-sm font-medium">
+            {environments.data ? 'Other domains' : 'Domains'}
+          </h3>
           <ul className={LIST}>
             {elsewhere.map((domain) => (
               <CustomDomainRow
@@ -133,12 +145,15 @@ function EnvironmentAddresses({
   projectSlug,
   environment,
   domains,
+  domainsKnown,
   domainMenu,
 }: {
   projectId: number
   projectSlug: string
   environment: EnvironmentResponse
   domains: CustomDomainResponse[]
+  /** Whether `domains` is this environment's full list, not a failed load. */
+  domainsKnown: boolean
   domainMenu?: DomainMenu
 }) {
   const href = reachabilityPath(projectSlug, environment.id)
@@ -157,11 +172,18 @@ function EnvironmentAddresses({
     staleTime: 30_000,
     retry: false,
   })
-  const addresses = reachability.data?.addresses ?? []
+  const byId = new Map(domains.map((domain) => [domain.id, domain]))
+  // A check kept from before a failed refresh can still list a domain that
+  // has since moved to another environment or gone; it shows only where it is.
+  const addresses = (reachability.data?.addresses ?? []).filter(
+    (address) =>
+      !domainsKnown ||
+      address.custom_domain_id == null ||
+      byId.has(address.custom_domain_id)
+  )
   const settled =
     !reachability.isError && isEnvironmentSettled(addresses, newestRun?.state)
   const reachable = reachability.data?.state === 'reachable'
-  const byId = new Map(domains.map((domain) => [domain.id, domain]))
   const shown = new Set(
     addresses.flatMap((address) =>
       address.custom_domain_id != null ? [address.custom_domain_id] : []

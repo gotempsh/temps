@@ -153,3 +153,26 @@ test("deleting a domain refreshes this project's reachability with it", async ()
   )
   await waitFor(() => expect(reachabilityReads()).toBeGreaterThan(before))
 })
+
+test('a project with no domains shows the compact empty state', () => {
+  const project = {
+    id: 1,
+    slug: 'shop',
+    hosting: 'external',
+  } as ProjectResponse
+  const client = new QueryClient()
+  client.setQueryData(
+    listCustomDomainsForProjectQueryKey({ path: { project_id: project.id } }),
+    { domains: [], total: 0 }
+  )
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <DomainsSettings project={project} />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  expect(html).toContain('No domains configured yet')
+  expect(html).toContain('min-h-60')
+  expect(html).not.toContain('min-h-[400px]')
+})

@@ -45,11 +45,17 @@ const domain = (id: number, host: string, environmentId: number | null) => ({
 function renderList(
   addresses: ReturnType<typeof address>[],
   runs: { id: number; state: string; address: string }[] = [],
-  domains: ReturnType<typeof domain>[] = []
+  domains?: ReturnType<typeof domain>[],
+  environmentsDown = false
 ) {
   mockApi({
     'GET /projects/7/environments': () =>
-      jsonResponse([{ id: 3, name: 'production', slug: 'production' }]),
+      environmentsDown
+        ? jsonResponse(
+            { title: 'Unavailable', detail: 'Database is down' },
+            503
+          )
+        : jsonResponse([{ id: 3, name: 'production', slug: 'production' }]),
     'GET /projects/7/environments/3/reachability': () =>
       jsonResponse({
         state: 'reachable',
@@ -183,4 +189,40 @@ test('a failed refresh of the environments keeps the rows and says so', async ()
 
   await view.findByText(/Database is down/)
   expect(view.getByRole('link', { name: 'app.example.test' })).toBeTruthy()
+})
+
+test('environments that cannot load still list every domain with its actions', async () => {
+  const view = renderList(
+    [],
+    [],
+    [domain(1, 'app.example.test', 3), domain(2, 'other.example.test', null)],
+    true
+  )
+
+  await view.findByText(/Database is down/)
+  expect(view.getByRole('heading', { name: 'Domains' })).toBeTruthy()
+  expect(
+    view.getByRole('button', { name: 'Actions for app.example.test' })
+  ).toBeTruthy()
+  expect(
+    view.getByRole('button', { name: 'Actions for other.example.test' })
+  ).toBeTruthy()
+})
+
+test('a domain that moved to another environment is listed only where it is now', async () => {
+  // The check for environment 3 still names domain 1, which is now on an
+  // environment this project does not list.
+  const view = renderList(
+    [address('app.example.test', 'reachable', 'direct:control-plane')],
+    [],
+    [domain(1, 'app.example.test', 9)]
+  )
+
+  await view.findByRole('heading', { name: 'Other domains' })
+  await waitFor(() =>
+    expect(view.queryByText('No address yet', { exact: false })).toBeTruthy()
+  )
+  expect(view.getAllByRole('link', { name: 'app.example.test' })).toHaveLength(
+    1
+  )
 })
