@@ -35,9 +35,14 @@ pub struct HarnessPackage {
     pub name: &'static str,
     pub binary: &'static str,
     pub npm_package: &'static str,
-    /// The vendor installer's update, for a copy installed under `$HOME`.
+    /// The vendor installer's update, for a copy in [`Self::home_install`].
     /// A fixed shell snippet: nothing from a request reaches it.
     home_update: &'static str,
+    /// The directory under `$HOME` the vendor installer puts the binary in
+    /// (once its links are resolved). Only a copy there is the vendor
+    /// installer's: anything else under the home directory, such as an npm
+    /// prefix in `~/.local`, is left alone when npm cannot claim it.
+    home_install: &'static str,
 }
 
 const PACKAGES: &[HarnessPackage] = &[
@@ -47,6 +52,8 @@ const PACKAGES: &[HarnessPackage] = &[
         binary: "claude",
         npm_package: "@anthropic-ai/claude-code",
         home_update: "claude update",
+        // ~/.local/bin/claude links into the native installer's tree.
+        home_install: ".local/share/claude",
     },
     HarnessPackage {
         provider_id: "codex_cli",
@@ -54,6 +61,7 @@ const PACKAGES: &[HarnessPackage] = &[
         binary: "codex",
         npm_package: "@openai/codex",
         home_update: r#"BUN_INSTALL="$HOME/.bun" BUN_INSTALL_BIN="$HOME/.bun/bin" bun add -g @openai/codex@latest"#,
+        home_install: ".bun",
     },
     HarnessPackage {
         provider_id: "opencode",
@@ -61,6 +69,7 @@ const PACKAGES: &[HarnessPackage] = &[
         binary: "opencode",
         npm_package: "opencode-ai",
         home_update: "opencode upgrade --method curl",
+        home_install: ".opencode",
     },
 ];
 
@@ -79,15 +88,20 @@ pub fn harness_package(provider_id: &str) -> Option<HarnessPackage> {
 
 /// Shell prelude that resolves the binary that actually runs and decides
 /// which installer owns it, in `$where`: `npm` for a copy inside npm's
-/// global prefix, `home` for one under the sandbox user's home, `other`
+/// global prefix, `home` for one in the vendor installer's directory under
+/// the sandbox user's home ([`HarnessPackage::home_install`]), `other`
 /// otherwise. Exits 4 when the binary is not on `PATH`. npm is asked for its
 /// prefix only after that, and a missing or failing npm only means no copy
 /// is npm's: an image that installed every CLI with its vendor's installer
-/// may ship without npm at all.
+/// may ship without npm at all. A copy elsewhere under the home directory
+/// (an npm prefix in `~/.local` while npm is unavailable) is `other`: an
+/// update through the vendor installer would add a second copy that the
+/// first one shadows on `PATH`.
 fn locate(package: HarnessPackage) -> String {
     format!(
-        r#"bin="$(command -v {binary})" || exit 4; bin="$(readlink -f "$bin")" || exit 4; prefix="$(npm config get prefix 2>/dev/null)" || prefix=""; where=other; if [ -n "$prefix" ]; then case "$bin" in "$prefix"/*) where=npm;; esac; fi; if [ "$where" = other ] && [ -n "$HOME" ]; then case "$bin" in "$HOME"/*) where=home;; esac; fi;"#,
-        binary = package.binary
+        r#"bin="$(command -v {binary})" || exit 4; bin="$(readlink -f "$bin")" || exit 4; prefix="$(npm config get prefix 2>/dev/null)" || prefix=""; where=other; if [ -n "$prefix" ]; then case "$bin" in "$prefix"/*) where=npm;; esac; fi; if [ "$where" = other ] && [ -n "$HOME" ]; then case "$bin" in "$HOME"/{home_install}/*) where=home;; esac; fi;"#,
+        binary = package.binary,
+        home_install = package.home_install,
     )
 }
 
@@ -391,6 +405,27 @@ mod tests {
     /// recorded.
     #[cfg(unix)]
     fn run_script(script: &str, binary: &str, npm_prefix: Option<&str>) -> (i32, String) {
+        let package = harness_packages()
+            .iter()
+            .find(|package| package.binary == binary)
+            .expect("a known binary");
+        run_script_at(
+            script,
+            binary,
+            &format!("{}/bin", package.home_install),
+            npm_prefix,
+        )
+    }
+
+    /// [`run_script`] with the real binary at `install_dir` under the home
+    /// directory; `npm_prefix` may name a path under it as `~/...`.
+    #[cfg(unix)]
+    fn run_script_at(
+        script: &str,
+        binary: &str,
+        install_dir: &str,
+        npm_prefix: Option<&str>,
+    ) -> (i32, String) {
         use std::os::unix::fs::PermissionsExt;
 
         let scratch = tempfile::tempdir().expect("scratch");
@@ -398,7 +433,7 @@ mod tests {
         let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
         let home = root.join("home");
         let tools = root.join("tools");
-        let home_bin = home.join(".local/bin");
+        let home_bin = home.join(install_dir);
         std::fs::create_dir_all(&home_bin).expect("home bin");
         std::fs::create_dir_all(&tools).expect("tools");
         let log = root.join("log");
@@ -417,6 +452,10 @@ mod tests {
             .expect("readlink");
         std::os::unix::fs::symlink(readlink, tools.join("readlink")).expect("readlink");
         if let Some(prefix) = npm_prefix {
+            let prefix = match prefix.strip_prefix("~/") {
+                Some(rest) => home.join(rest).display().to_string(),
+                None => prefix.to_string(),
+            };
             write_tool(
                 &tools.join("npm"),
                 &format!(
@@ -470,5 +509,36 @@ mod tests {
         assert_eq!(status, 0, "{recorded}");
         assert_eq!(recorded.trim(), "claude update");
         assert!(!recorded.contains("npm install"), "{recorded}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_npm_install_under_home_is_never_taken_for_the_vendor_installer() {
+        let codex = harness_package("codex_cli").expect("codex");
+        let npm_tree = ".local/lib/node_modules/@openai/codex/bin";
+        // npm is missing: nothing can say who owns the copy, so the probe
+        // cannot pick an account and the update adds no second copy.
+        let (status, _) = run_script_at(
+            &install_writable_probe_command(codex)[6],
+            "codex",
+            npm_tree,
+            None,
+        );
+        assert_eq!(install_owner_from_probe(status), None, "exit {status}");
+        let (status, recorded) = run_script_at(&update_command(codex)[6], "codex", npm_tree, None);
+        assert_eq!(status, 5, "{recorded}");
+        assert!(recorded.is_empty(), "nothing was installed: {recorded}");
+        // With npm present, its prefix under the home directory claims it.
+        let (status, recorded) = run_script_at(
+            &update_command(codex)[6],
+            "codex",
+            npm_tree,
+            Some("~/.local"),
+        );
+        assert_eq!(status, 0, "{recorded}");
+        assert!(
+            recorded.contains("npm install -g @openai/codex@latest"),
+            "{recorded}"
+        );
     }
 }
