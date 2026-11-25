@@ -102,7 +102,11 @@ pub(crate) fn assert_golden(name: &str, golden: &str, actual: &str) {
          intended, migrate the stored rows and replace \
          crates/temps-ingress/src/reachability/wire_shape/{name} with {}{}.",
         out.display(),
-        if written { "" } else { " (could not be written)" }
+        if written {
+            ""
+        } else {
+            " (could not be written)"
+        }
     );
 }
 
@@ -125,8 +129,8 @@ mod tests {
         schema_shape::<StepKind>(&mut schemas);
         schema_shape::<Intent>(&mut schemas);
         schema_shape::<RunResource>(&mut schemas);
-        let actual = serde_json::to_string_pretty(&Value::Object(schemas)).expect("serializes")
-            + "\n";
+        let actual =
+            serde_json::to_string_pretty(&Value::Object(schemas)).expect("serializes") + "\n";
         assert_golden(
             "schemas.json",
             include_str!("wire_shape/schemas.json"),
@@ -150,7 +154,8 @@ mod tests {
             "tunnel_environment_hosts",
         ];
         for word in stored {
-            let kind = PlanOptionKind::parse(word).unwrap_or_else(|| panic!("{word} no longer parses"));
+            let kind =
+                PlanOptionKind::parse(word).unwrap_or_else(|| panic!("{word} no longer parses"));
             assert_eq!(kind.as_str(), word);
             assert_eq!(
                 serde_json::to_value(kind).expect("serializes"),

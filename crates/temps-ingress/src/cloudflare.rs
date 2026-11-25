@@ -22,7 +22,8 @@ use tracing::{info, warn};
 
 use crate::error::IngressError;
 use crate::provider::{
-    DnsIntent, TunnelContext, TunnelHandle, TunnelHealth, TunnelLink, TunnelProvider,
+    Capabilities, DnsIntent, Ja4Header, Origin, Reach, TunnelContext, TunnelHandle, TunnelHealth,
+    TunnelLink, TunnelProvider,
 };
 use crate::wire::{
     Artifact, ContainerSpec, DriverChoice, ForwardedJa4, NodeConnectorSpec, ProcessSpec, Readiness,
@@ -436,11 +437,11 @@ impl TunnelProvider for CloudflareTunnelProvider {
             provider: KIND.into(),
             revision: String::new(),
             edge_port,
-            client_address_header: Some("CF-Connecting-IP".into()),
-            // Cloudflare sends it with Bot Management's request headers.
+            // The headers nodes trust are the ones `capabilities` declares.
+            client_address_header: Some(CLIENT_ADDRESS_HEADER.into()),
             client_ja4: Some(ForwardedJa4 {
-                header: "cf-ja4".into(),
-                source: "cloudflare".into(),
+                header: JA4.header.into(),
+                source: JA4.source.into(),
             }),
             drivers,
             secrets,
@@ -675,6 +676,28 @@ pub struct CloudflareTunnelFactory;
 const FIELD_ACCOUNT: &str = "dns_provider_id";
 const FIELD_DOMAIN: &str = "domain";
 
+/// The visitor's address, as Cloudflare's edge sets it.
+const CLIENT_ADDRESS_HEADER: &str = "CF-Connecting-IP";
+/// Cloudflare sends it with Bot Management's request headers.
+const JA4: Ja4Header = Ja4Header {
+    header: "cf-ja4",
+    source: "cloudflare",
+};
+
+/// What every Cloudflare Tunnel connector is (ADR-116 D2): public, through
+/// ADR-107 D3's loopback origin with Cloudflare's client-address and JA4
+/// headers, with DNS that Temps writes.
+pub fn capabilities() -> Capabilities {
+    Capabilities {
+        reach: Reach::Public,
+        origin: Origin::LoopbackHttp {
+            client_address_header: CLIENT_ADDRESS_HEADER,
+            ja4: Some(JA4),
+        },
+        dns: crate::registry::DnsHandling::Automatic,
+    }
+}
+
 #[async_trait]
 impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
     fn info(&self) -> crate::registry::ProviderInfo {
@@ -717,6 +740,13 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
         }
     }
 
+    fn capabilities(
+        &self,
+        _connector: Option<&temps_entities::ingress_connectors::Model>,
+    ) -> Capabilities {
+        capabilities()
+    }
+
     async fn validate(
         &self,
         deps: &crate::registry::ProviderDeps<'_>,
@@ -732,6 +762,13 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
         Ok(())
     }
 
+    fn tunnels(&self) -> Option<&dyn crate::registry::TunnelFactory> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl crate::registry::TunnelFactory for CloudflareTunnelFactory {
     async fn build(
         &self,
         deps: &crate::registry::ProviderDeps<'_>,

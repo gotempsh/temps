@@ -35,6 +35,7 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 use crate::error::IngressError;
+use crate::provider::{Capabilities, Origin, Reach};
 use crate::registry::{
     DnsHandling, FieldKind, ProviderDeps, ProviderInfo, ProviderSetup, SetupField,
 };
@@ -1143,10 +1144,34 @@ impl TailscaleFactory {
     }
 }
 
+/// What every Tailscale way in is (ADR-116 D2), a machine name or a
+/// Service: only the tailnet reaches it, through the per-address Serve socket
+/// (ADR 065 D3) where tailscaled's identity headers are trusted, under the
+/// tailnet's own `*.ts.net` names.
+pub fn capabilities() -> Capabilities {
+    Capabilities {
+        reach: Reach::Private {
+            network: "tailscale",
+        },
+        origin: Origin::ServeSocket {
+            identity_headers: &temps_core::tailnet::SERVE_IDENTITY_HEADERS,
+        },
+        dns: DnsHandling::ProviderHostname,
+    }
+}
+
+/// A credential, not a tunnel: no [`crate::registry::TunnelFactory`].
 #[async_trait]
-impl crate::registry::CredentialFactory for TailscaleFactory {
+impl crate::registry::ProviderFactory for TailscaleFactory {
     fn info(&self) -> ProviderInfo {
         Self::info()
+    }
+
+    fn capabilities(
+        &self,
+        _connector: Option<&temps_entities::ingress_connectors::Model>,
+    ) -> Capabilities {
+        capabilities()
     }
 
     async fn validate(

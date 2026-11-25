@@ -53,49 +53,43 @@ This ADR adds no provider and changes no behaviour. It moves the two that exist 
 
 Providers live in `temps-ingress/src/providers/<kind>/`, declared as private modules. The only public item is `providers::builtin() -> ProviderRegistry`. The reachability engine, the connector service, the handlers and the checks reach a provider only through the registry and the traits below, so naming `cloudflare` or `tailscale` from outside is a compile error, not a review comment.
 
-Wire vocabulary is the one exception (D5). A `rule_drift.py` metric, `provider_variant_outside_module`, counts matches on a provider's option or step variants outside its module. Today's count is the baseline; the migration (D8) brings it to zero.
+Until the moves (D8) finish, a `rule_drift.py` metric, `provider_named_outside_module`, holds the line: it counts every `cloudflare::` or `tailscale::` path, and every `"cloudflare_tunnel"` or `"tailscale"` literal, in `temps-ingress` production code outside the provider modules. It started at 35, can only go down, and reaches zero when the modules turn private. Wire vocabulary (D5) is the one exception, because stored step and option names keep their place in `model.rs`.
 
 On the agent, drivers are per mechanism, not per provider: a pinned process, `tailscaled`'s LocalAPI. A connector spec names a driver and its parameters, never a provider kind.
 
-### D2. One trait, built per connector
+### D2. One registry, answering per connector
 
-`TunnelProvider` and `CredentialFactory` merge into one trait, `IngressProvider`, and `is_credential_kind` goes. A factory builds an instance for one connector row, so every answer is that connector's, not the provider's in general. For example, a Tailscale machine-name connector has one host, and a Service connector may have several.
+`CredentialFactory` and the special case for its kind (`is_credential_kind`, which named `"tailscale"`) are gone. Every provider registers one `ProviderFactory`, and the registry tells tunnels from credentials by asking the provider, not by its name:
 
 ```rust
 #[async_trait]
-pub trait IngressProvider: Send + Sync {
-    fn kind(&self) -> &'static str;
+pub trait ProviderFactory: Send + Sync {
+    fn info(&self) -> ProviderInfo;
 
-    /// What the engine must know about this connector outside its own steps.
-    fn capabilities(&self) -> Capabilities;
+    /// What this provider's way in is like: for `connector` when there is
+    /// one, else for a way in that needs no connector row (a Tailscale
+    /// machine name).
+    fn capabilities(&self, connector: Option<&ingress_connectors::Model>) -> Capabilities;
 
-    /// The ways this connector can serve `address`, each with the steps it
-    /// takes (D3). Empty when it cannot, with the reason in `blocked`.
-    async fn options(&self, ctx: &PlanContext<'_>) -> Result<ProviderOptions, IngressError>;
+    async fn validate(&self, deps: &ProviderDeps<'_>, setup: &ProviderSetup) -> Result<(), IngressError>;
 
-    /// The implementation of a step this provider planned (D3).
-    fn step(&self, step: &PlannedStep) -> Result<Arc<dyn ProviderStep>, IngressError>;
+    /// The tunnel side, for a provider whose connector rows are tunnels.
+    /// `None` for one whose rows are credentials (Tailscale's OAuth client).
+    fn tunnels(&self) -> Option<&dyn TunnelFactory> { None }
+}
 
-    /// What a node runs or configures for this connector, if anything.
-    fn node_spec(&self, node: &NodeContext<'_>) -> Option<NodeIngressSpec>;
-
-    /// Whether `host` counts as published, given what each node reports.
-    /// Replaces ADR-107 D4's "every replica serves it", which is
-    /// Cloudflare's rule because Cloudflare load-balances replicas.
-    fn published(&self, host: &str, nodes: &[NodeServing]) -> bool;
-
-    async fn health(&self) -> Result<ProviderHealth, IngressError>;
-
-    /// Invalidate the node secret and cut connections not in `keep`
-    /// (today's `rotate_secret`). Default: cannot rotate.
-    async fn rotate_secret(&self, _keep: &HashSet<String>) -> Result<Option<String>, IngressError> { Ok(None) }
-
-    /// The binaries and images this connector's nodes run (D7).
-    fn artifacts(&self) -> &'static [PinnedArtifact] { &[] }
+#[async_trait]
+pub trait TunnelFactory: Send + Sync {
+    /// The tunnel for one stored connector, with its credentials.
+    async fn build(&self, deps: &ProviderDeps<'_>, connector: &ingress_connectors::Model,
+                   secrets: &BTreeMap<String, String>) -> Result<Box<dyn TunnelProvider>, IngressError>;
+    fn spec_provider(&self, http: &reqwest::Client) -> Box<dyn TunnelProvider>;
 }
 ```
 
-The names settle in the first migration PR. The split is the decision: lifecycle and plan contribution belong to the provider, and orchestration belongs to the engine.
+`TunnelProvider` keeps its name and its lifecycle methods (ensure, connector spec, publish, health, rotate, delete): it is the tunnel side, built per connector, and only tunnels have one. Capabilities are answered per connector, as decided, with a connector-less answer for ways in that have no row: a Tailscale machine name needs no credential and so no connector row, which is why "per connector" could not mean "only for a row".
+
+The plan and run contribution (D3) joins `ProviderFactory` when the steps move.
 
 `Capabilities` holds only what the engine itself enforces, and only values a shipped provider uses:
 
@@ -105,8 +99,8 @@ pub struct Capabilities {
     /// connector a public route, nor a Public one a private route.
     pub reach: Reach,              // Public | Private { network: &'static str }
     /// Where the node hands traffic to Temps, and what is trusted there (D4).
-    pub origin: Origin,            // LoopbackHttp { client_address: HeaderRule, ja4: Option<HeaderRule> }
-                                   // | ServeSocket { identity: &'static [&'static str] }
+    pub origin: Origin,            // LoopbackHttp { client_address_header, ja4: Option<Ja4Header> }
+                                   // | ServeSocket { identity_headers }
     /// Who makes names resolve: today's DnsHandling, now per connector.
     pub dns: DnsHandling,          // Automatic | Manual | ProviderHostname
 }
@@ -118,7 +112,7 @@ pub struct Capabilities {
 | `origin` | `LoopbackHttp`, `CF-Connecting-IP`, `cf-ja4` | `ServeSocket`, `Tailscale-User-*` |
 | `dns` | `Automatic` | `ProviderHostname` |
 
-Everything else (certificates, tokens, approval waits, replicas) is behaviour: the provider's steps and `published`, not flags the engine branches on. A value is added to these enums only with the provider that needs it. `ProviderInfo` and its API shape are unchanged, and the setup form still comes from its fields.
+Two consumers read them already: a Cloudflare connector's spec takes its trusted headers from its declared origin (a test checks every tunnel provider's spec against its origin), and the certificate check skips a tunnel whose `reach` is private instead of one named `tailscale`. Everything else (certificates, tokens, approval waits, replicas) is behaviour: the provider's steps, not flags the engine branches on. A value is added to these enums only with the provider that needs it. `ProviderInfo` and its API shape are unchanged, and the setup form still comes from its fields.
 
 ### D3. Providers contribute steps; the engine runs them
 
@@ -170,13 +164,13 @@ The variants stay in `model.rs` as wire vocabulary; only their meaning moves. A 
 
 ### D7. Pins live with the provider; the agent keeps the final say
 
-`artifacts()` returns pinned binaries and container images by digest (Cloudflare pins both). The pins live in a dependency-free crate, `temps-connector-pins`, one module per provider, which `temps-ingress` and `temps-node-agent` both depend on. That removes the copy in `TRUSTED_ARTIFACTS` and the test keeping the copies in step.
+A provider's pinned binaries and container images (by digest; Cloudflare pins both) live in a dependency-free crate, `temps-connector-pins`, one module per provider, which `temps-ingress` and `temps-node-agent` both depend on. The provider builds its node spec from them, and the agent trusts exactly `temps_connector_pins::binaries()`. That removed the copy in the agent's `TRUSTED_ARTIFACTS` and the test that parsed `cloudflare.rs` to keep the copies in step.
 
-Tailscale returns none: it uses the host's `tailscaled`, and its minimum version (1.94, ADR-065 D2) stays a check in its driver. The agent still runs only what its own build pins, so a newer control plane cannot make an older agent run a new binary.
+Tailscale pins nothing: it uses the host's `tailscaled`, and its minimum version (1.94, ADR-065 D2) stays a check in its driver. The agent still runs only what its own build pins, so a newer control plane cannot make an older agent run a new binary.
 
 ### D8. The migration: four PRs, no behaviour change
 
-1. **The boundary.** `IngressProvider`, `ProviderStep`, `Capabilities`, the registry merge, the golden wire test, the drift metric at baseline.
+1. **The boundary.** `Capabilities`, the registry merge (D2), the golden wire test (D5), the drift metric at baseline (D1). Done.
 2. **Cloudflare behind it.** Its options, steps, checks and `RunOps` methods move into `providers/cloudflare/`, with `token_check.rs`, `edge_rules.rs`, `access.rs`, `access_service.rs` and `gate_check.rs`'s Access half.
 3. **Tailscale behind it.** Its credential, options, the four steps, the Serve-entry code (`serve_entries.rs`) and its `RunOps` methods move into `providers/tailscale/`. `is_credential_kind` goes.
 4. **Pins.** `temps-connector-pins`. Done first, with D5's golden tests, because neither depends on the rest.
@@ -185,7 +179,7 @@ Tailscale returns none: it uses the host's `tailscaled`, and its minimum version
 
 - the existing reachability, run and service tests pass with only imports changed, never assertions;
 - the drift metric reaches zero;
-- the test provider (`FakeTunnels`, `service.rs` tests) becomes an `IngressProvider` with one step of its own and `reach: Private`, and is planned, run, resumed and undone without editing any file outside it.
+- the test provider (`FakeTunnels`, `service.rs` tests) becomes a provider with one step of its own and `reach: Private`, and is planned, run, resumed and undone without editing any file outside it.
 
 Each PR leaves `main` working, and the order can stop after any step.
 

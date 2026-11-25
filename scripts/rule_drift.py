@@ -54,6 +54,7 @@ METRICS: dict[str, str] = {
     "anyhow_in_library": "anyhow usage in library crates (use a thiserror enum)",
     "files_over_3000_lines": f"production files over {FILE_LINE_LIMIT} lines (split by responsibility)",
     "functions_over_300_lines": f"functions over {FUNCTION_LINE_LIMIT} lines (extract steps)",
+    "provider_named_outside_module": "temps-ingress code naming an ingress provider outside its module (go through the registry and the provider traits, ADR-116 D1)",
 }
 
 SKIPPED_DIRS = frozenset({"tests", "benches", "examples", "target", "fuzz"})
@@ -357,6 +358,19 @@ _ERROR_DERIVE = re.compile(r"#\[derive\([^)]*\bError\b[^)]*\)\]")
 _ENUM_HEAD = re.compile(r"\benum\s+\w+[^{;]*\{")
 _STRING_VARIANT = re.compile(r"^\s*(\w+)\s*\(\s*(?:std::string::)?String\s*\)\s*,?\s*$")
 _ANYHOW = re.compile(r"\banyhow\b")
+# ADR-116 D1: an ingress provider lives in its own module, and the rest of
+# temps-ingress reaches it only through the registry and the traits.
+_PROVIDER_CRATE = "temps-ingress"
+_PROVIDER_MODULES = ("src/cloudflare.rs", "src/tailscale.rs", "src/providers/")
+_PROVIDER_PATH = re.compile(r"\b(?:cloudflare|tailscale)::")
+_PROVIDER_KIND_LITERAL = re.compile(r'"(?:cloudflare_tunnel|tailscale)"')
+
+
+def is_provider_module(rel: str) -> bool:
+    crate_rel = rel.split(f"crates/{_PROVIDER_CRATE}/", 1)[-1]
+    return crate_rel.startswith(_PROVIDER_MODULES)
+
+
 _IGNORE = re.compile(r"#\[ignore(\s*=\s*\"[^\"]*\"|\s*\])")
 
 
@@ -388,6 +402,13 @@ def analyze_file(source: SourceFile, text: str) -> list[Finding]:
     nonblank = sum(1 for line in stripped_text.split("\n") if line.strip())
     if nonblank > FILE_LINE_LIMIT:
         findings.append(Finding("files_over_3000_lines", source.rel, 1, f"{nonblank} lines"))
+
+    if source.crate == _PROVIDER_CRATE and not is_provider_module(source.rel):
+        for idx, (line, masked_line) in enumerate(zip(stripped_text.split("\n"), lines), start=1):
+            if _PROVIDER_PATH.search(masked_line) or (
+                _PROVIDER_KIND_LITERAL.search(line) and not line.lstrip().startswith("//")
+            ):
+                findings.append(Finding("provider_named_outside_module", source.rel, idx, line.strip()[:80]))
 
     if is_handler_file(source.rel):
         for idx, line in enumerate(lines, start=1):

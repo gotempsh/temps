@@ -7523,7 +7523,12 @@ mod tests {
         let inputs = [
             token_input(),
             access_input(None),
-            access_input(Some(access_app_named("app-1", "Grafana", "app.example.com", "p"))),
+            access_input(Some(access_app_named(
+                "app-1",
+                "Grafana",
+                "app.example.com",
+                "p",
+            ))),
             direct_input(7, PlannedRecord::default()),
             private_input(7),
             edge_input(),
