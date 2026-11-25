@@ -120,6 +120,16 @@ impl ScanListError {
     }
 }
 
+/// Most stop sentinels one discovery scan reads in a single WAL-G
+/// repository, newest first. Each read matches a tracked backup to its
+/// snapshot and supplies the snapshot's size; snapshots beyond the limit are
+/// still listed, without a size.
+const MAX_SENTINEL_READS_PER_REPOSITORY: usize = 64;
+
+/// Most stop sentinels one discovery scan reads across all repositories, so
+/// a bucket with many services stays a bounded number of S3 requests.
+const MAX_SENTINEL_READS_PER_SCAN: usize = 256;
+
 /// Walk the S3 source's `external_services/` prefix to find backups that
 /// aren't represented in the local DB (e.g., backups produced by a
 /// previous Temps instance). Returns entries tagged with `source: "s3_scan"`.
@@ -174,8 +184,7 @@ async fn scan_s3_for_orphan_backups(
             }
         }
     }
-    const MAX_UNSCOPED_SENTINELS: usize = 32;
-    let mut unknown_budget = MAX_UNSCOPED_SENTINELS;
+    let mut scan_read_budget = MAX_SENTINEL_READS_PER_SCAN;
 
     for engine_prefix in engine_prefixes {
         let engine = extract_trailing_segment(&engine_prefix);
@@ -191,67 +200,85 @@ async fn scan_s3_for_orphan_backups(
             let walg_sentinels =
                 list_walg_sentinels(s3_client, bucket, &walg_prefix, scan_errors).await;
             let repository = format!("s3://{}/{}", bucket, walg_prefix.trim_end_matches('/'));
-            let mut unresolved = candidates.remove(&repository).unwrap_or_default();
-            for (sentinel, last_modified, _) in walg_sentinels {
-                let location = if engine == "postgres" {
-                    let location = format!("s3://{bucket}/{sentinel}");
-                    if seen_locations.contains(&location) {
-                        continue;
-                    }
-                    if !unresolved.is_empty() || (!unscoped.is_empty() && unknown_budget > 0) {
-                        if unresolved.is_empty() {
-                            unknown_budget -= 1;
-                        }
-                        let identity =
-                            crate::engines::walg_size::read_sentinel(s3_client, bucket, &sentinel)
-                                .await
-                                .map_err(|_| "Could not read")
-                                .and_then(|bytes| {
-                                    crate::engines::walg_size::sentinel_backup_id(&bytes)
-                                        .map_err(|_| "Could not parse")
-                                });
-                        match identity {
-                            Ok(id) => {
-                                if let Some(index) = id.as_ref().and_then(|id| by_id.get(id)) {
-                                    if unresolved.remove(index) || unscoped.remove(index) {
-                                        let entry = &mut entries[*index];
-                                        entry.location.clone_from(&location);
-                                        entry.format = Some("walg".into());
-                                        continue;
-                                    }
+            let untracked = |location: String, created_at, size_bytes| SourceBackupIndexEntry {
+                id: 0,
+                backup_id: String::new(),
+                name: format!("{engine} backup ({service_name})"),
+                backup_type: "full".into(),
+                created_at,
+                expires_at: None,
+                size_bytes,
+                location,
+                metadata_location: String::new(),
+                engine: Some(engine.clone()),
+                origin_service_name: Some(service_name.clone()),
+                format: Some("walg".to_string()),
+                source: "s3_scan".into(),
+                state: "completed".into(),
+            };
+            if engine == "postgres" {
+                let mut unresolved = candidates.remove(&repository).unwrap_or_default();
+                let mut snapshots: Vec<_> = walg_sentinels
+                    .into_iter()
+                    .map(|(key, last_modified, _)| {
+                        (format!("s3://{bucket}/{key}"), key, last_modified)
+                    })
+                    .filter(|(location, _, _)| !seen_locations.contains(location))
+                    .collect();
+                // Newest first, so a bounded scan reads the snapshots a
+                // restore is most likely to want.
+                snapshots.sort_by_key(|(_, _, last_modified)| std::cmp::Reverse(*last_modified));
+                let reads = snapshots
+                    .len()
+                    .min(MAX_SENTINEL_READS_PER_REPOSITORY)
+                    .min(scan_read_budget);
+                scan_read_budget -= reads;
+                let keys = snapshots[..reads]
+                    .iter()
+                    .map(|(_, key, _)| key.clone())
+                    .collect();
+                let mut summaries =
+                    crate::engines::walg_size::summarize_sentinels(s3_client, bucket, keys)
+                        .await
+                        .into_iter();
+                let total = snapshots.len();
+                for (location, sentinel, last_modified) in snapshots {
+                    let mut size_bytes = None;
+                    match summaries.next().map(|(_, summary)| summary) {
+                        Some(Ok(summary)) => {
+                            if let Some(index) =
+                                summary.backup_id.as_ref().and_then(|id| by_id.get(id))
+                            {
+                                if unresolved.remove(index) || unscoped.remove(index) {
+                                    let entry = &mut entries[*index];
+                                    entry.location.clone_from(&location);
+                                    entry.format = Some("walg".into());
+                                    entry.size_bytes = entry.size_bytes.or(summary.compressed_size);
+                                    continue;
                                 }
                             }
-                            Err(reason) => {
-                                scan_errors.push(format!("{reason} WAL-G metadata for {sentinel}"))
-                            }
+                            size_bytes = summary.compressed_size;
                         }
+                        Some(Err(error)) => {
+                            scan_errors.push(format!("{error} WAL-G metadata for {sentinel}"))
+                        }
+                        None => {}
                     }
-                    location
-                } else {
+                    entries.push(untracked(location, last_modified, size_bytes));
+                }
+                if !unresolved.is_empty() && reads < total {
+                    scan_errors.push(format!(
+                        "Read the newest {reads} of {total} WAL-G snapshots in {repository}. {} of this server's backups there were not matched to a snapshot, so they may also be listed as found in S3; restoring one of them finds its snapshot.",
+                        unresolved.len()
+                    ));
+                }
+            } else {
+                for (_, last_modified, _) in walg_sentinels {
                     if seen_locations.contains(&repository) {
                         continue;
                     }
-                    repository.clone()
-                };
-                if seen_locations.contains(&location) {
-                    continue;
+                    entries.push(untracked(repository.clone(), last_modified, None));
                 }
-                entries.push(SourceBackupIndexEntry {
-                    id: 0,
-                    backup_id: String::new(),
-                    name: format!("{engine} backup ({service_name})"),
-                    backup_type: "full".into(),
-                    created_at: last_modified,
-                    expires_at: None,
-                    size_bytes: None,
-                    location,
-                    metadata_location: String::new(),
-                    engine: Some(engine.clone()),
-                    origin_service_name: Some(service_name.clone()),
-                    format: Some("walg".to_string()),
-                    source: "s3_scan".into(),
-                    state: "completed".into(),
-                });
             }
 
             // Look for pg_dump-style objects under the service prefix.
@@ -1018,10 +1045,18 @@ mod tests {
                 format!("<ListBucketResult>{contents}</ListBucketResult>"),
             )
         }
-        let app = Router::new().route("/backups-bucket/", get(list)).route(
-            "/backups-bucket/external_services/postgres/service-b/walg/basebackups_005/base_001_backup_stop_sentinel.json",
-            get(|| async { r#"{"UserData":{"temps_backup_id":"pending-a"}}"# }),
-        );
+        let app = Router::new()
+            .route("/backups-bucket/", get(list))
+            .route(
+                "/backups-bucket/external_services/postgres/service-b/walg/basebackups_005/base_001_backup_stop_sentinel.json",
+                get(|| async { r#"{"UserData":{"temps_backup_id":"pending-a"}}"# }),
+            )
+            .route(
+                "/backups-bucket/external_services/postgres/service-b/walg/basebackups_005/base_002_backup_stop_sentinel.json",
+                get(|| async {
+                    r#"{"CompressedSize":52428800,"UserData":{"temps_backup_id":"another-server"}}"#
+                }),
+            );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -1061,7 +1096,6 @@ mod tests {
         )
         .await;
         server.abort();
-        // Fetching base_002 after resolving the tracked row would add a fourth error.
         assert!(entries[0]
             .location
             .ends_with("base_001_backup_stop_sentinel.json"));
@@ -1070,9 +1104,163 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.location.ends_with("/backup-a/dump.sql.gz")));
-        assert!(entries.iter().any(|entry| entry
-            .location
-            .ends_with("/base_002_backup_stop_sentinel.json")));
+        // An untracked snapshot shows the size its stop sentinel records,
+        // not nothing (#2031).
+        let untracked = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .location
+                    .ends_with("/base_002_backup_stop_sentinel.json")
+            })
+            .ok_or("base_002 must be listed")?;
+        assert_eq!(untracked.source, "s3_scan");
+        assert_eq!(untracked.size_bytes, Some(52_428_800));
+        Ok(())
+    }
+
+    /// A repository with more snapshots than one scan may read: the newest
+    /// ones are read (and get their size), the rest are still listed, and a
+    /// tracked backup whose snapshot was not reached is reported rather than
+    /// silently left unmatched (#2030, #2031).
+    #[tokio::test]
+    async fn discovery_reads_a_bounded_number_of_sentinels_per_repository(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{
+            extract::{OriginalUri, Query},
+            http::StatusCode,
+            response::IntoResponse,
+            Router,
+        };
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const SNAPSHOTS: usize = MAX_SENTINEL_READS_PER_REPOSITORY + 6;
+        let basebackups = "external_services/postgres/service-a/walg/basebackups_005/";
+        let reads = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({
+            let reads = reads.clone();
+            move |OriginalUri(uri): OriginalUri, Query(query): Query<HashMap<String, String>>| {
+                let reads = reads.clone();
+                async move {
+                    if uri.path() == "/backups-bucket/" {
+                        let contents = match query.get("prefix").map(String::as_str) {
+                            Some("external_services/") => "<CommonPrefixes><Prefix>external_services/postgres/</Prefix></CommonPrefixes>".to_string(),
+                            Some("external_services/postgres/") => "<CommonPrefixes><Prefix>external_services/postgres/service-a/</Prefix></CommonPrefixes>".to_string(),
+                            Some(prefix) if prefix == basebackups => (1..=SNAPSHOTS)
+                                .map(|n| {
+                                    format!(
+                                        "<Contents><Key>{basebackups}base_{n:04}_backup_stop_sentinel.json</Key><LastModified>2026-01-01T00:{:02}:{:02}.000Z</LastModified></Contents>",
+                                        n / 60,
+                                        n % 60
+                                    )
+                                })
+                                .collect(),
+                            _ => String::new(),
+                        };
+                        return (
+                            StatusCode::OK,
+                            format!("<ListBucketResult>{contents}</ListBucketResult>"),
+                        )
+                            .into_response();
+                    }
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    let n: usize = uri
+                        .path()
+                        .rsplit("base_")
+                        .next()
+                        .and_then(|rest| rest.split('_').next())
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or_default();
+                    let id = if n == 1 { "old-tracked".to_string() } else { format!("other-{n}") };
+                    (
+                        StatusCode::OK,
+                        format!(r#"{{"CompressedSize":{},"UserData":{{"temps_backup_id":"{id}"}}}}"#, n * 1000),
+                    )
+                        .into_response()
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let credentials = aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test");
+        let config = crate::engines::v2_common::s3_config_builder(
+            "us-east-1",
+            true,
+            credentials,
+            Some(&endpoint),
+        )
+        .build();
+        let client = aws_sdk_s3::Client::from_conf(config);
+        let repository = "s3://backups-bucket/external_services/postgres/service-a/walg";
+        let mut entries = vec![SourceBackupIndexEntry {
+            id: 1,
+            backup_id: "old-tracked".into(),
+            name: "service-a".into(),
+            backup_type: "full".into(),
+            created_at: None,
+            expires_at: None,
+            size_bytes: None,
+            location: repository.into(),
+            metadata_location: String::new(),
+            engine: Some("postgres".into()),
+            origin_service_name: Some("service-a".into()),
+            format: Some("walg".into()),
+            source: "db".into(),
+            state: "completed".into(),
+        }];
+        let mut errors = Vec::new();
+        scan_s3_for_orphan_backups(
+            &client,
+            "backups-bucket",
+            "",
+            &Default::default(),
+            &mut entries,
+            &mut errors,
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            MAX_SENTINEL_READS_PER_REPOSITORY
+        );
+        let scanned: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.source == "s3_scan")
+            .collect();
+        assert_eq!(scanned.len(), SNAPSHOTS, "every snapshot is listed");
+        let newest = scanned
+            .iter()
+            .find(|entry| {
+                entry
+                    .location
+                    .ends_with(&format!("base_{SNAPSHOTS:04}_backup_stop_sentinel.json"))
+            })
+            .ok_or("newest snapshot listed")?;
+        assert_eq!(newest.size_bytes, Some((SNAPSHOTS * 1000) as i64));
+        let oldest = scanned
+            .iter()
+            .find(|entry| {
+                entry
+                    .location
+                    .ends_with("base_0001_backup_stop_sentinel.json")
+            })
+            .ok_or("oldest snapshot listed")?;
+        assert_eq!(oldest.size_bytes, None, "not read, so no size");
+        assert_eq!(
+            entries[0].location, repository,
+            "its snapshot was not reached"
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains(&format!(
+                "newest {MAX_SENTINEL_READS_PER_REPOSITORY} of {SNAPSHOTS}"
+            )) && errors[0].contains("1 of this server's backups"),
+            "{errors:?}"
+        );
         Ok(())
     }
 

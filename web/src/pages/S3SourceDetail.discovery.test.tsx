@@ -83,7 +83,7 @@ test('discovery stays with its source and live tracked refreshes never rescan th
   )
   try {
     const scanButton = () =>
-      view.getByRole('button', { name: /Discover orphan backups/ })
+      view.getByRole('button', { name: /Search S3 for backups/ })
     await view.findByText('source-1')
     fireEvent.click(scanButton())
     await waitFor(() => expect(finish).toBeDefined())
@@ -94,6 +94,10 @@ test('discovery stays with its source and live tracked refreshes never rescan th
     expect(view.queryByText('service-a')).toBeNull()
     fireEvent.click(view.getByRole('link', { name: 'View first source' }))
     await view.findByText('service-a')
+    // One name for a backup this server does not track, as in the restore
+    // picker; never "orphan".
+    expect(view.getByText('Found in S3')).toBeTruthy()
+    expect(view.queryByText('orphan')).toBeNull()
     publishTracked = true
     await client.invalidateQueries({
       queryKey: restoreSourceBackupsQuery(1, false).queryKey,

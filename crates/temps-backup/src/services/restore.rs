@@ -697,7 +697,9 @@ impl RestoreService {
     ) -> Result<RestorePlan, RestoreError> {
         let target = self.load_service(target_service_id).await?;
 
-        // Resolve the backup identity. We don't touch the DB beyond reads.
+        // Resolve the backup identity. Planning only reads, except that a
+        // pre-upgrade WAL-G backup's resolved snapshot name is recorded on its
+        // row (`resolve_tracked_walg_snapshot`).
         let (backup_row, backup_location, backup_engine_hint, s3_source_id, backup_id_opt) =
             match &selector {
                 BackupSelector::Id(id) => {
@@ -773,8 +775,13 @@ impl RestoreService {
                     .one(self.db.as_ref())
                     .await?
                     .ok_or(RestoreError::S3SourceNotFound { s3_source_id })?;
-                resolved_location =
-                    resolve_tracked_walg_snapshot(row, &source, &self.encryption_service).await?;
+                resolved_location = resolve_tracked_walg_snapshot(
+                    self.db.as_ref(),
+                    row,
+                    &source,
+                    &self.encryption_service,
+                )
+                .await?;
                 location_was_resolved = true;
             }
         }
@@ -2637,7 +2644,7 @@ async fn run_restore_inner(
         && needs_walg_identity_lookup(&backup_model, &target_service.service_type)
     {
         backup_model.s3_location =
-            resolve_tracked_walg_snapshot(&backup_model, &s3_source, &enc).await?;
+            resolve_tracked_walg_snapshot(db.as_ref(), &backup_model, &s3_source, &enc).await?;
     }
 
     // A restore into a service on a worker node writes there: a PostgreSQL
@@ -5199,7 +5206,11 @@ impl RestoreService {
     }
 }
 
+/// Find the WAL-G snapshot a backup taken before snapshot names were recorded
+/// belongs to, and record its name on the row so later restores and listings
+/// use it directly instead of reading every stop sentinel again.
 async fn resolve_tracked_walg_snapshot(
+    db: &DatabaseConnection,
     backup: &temps_entities::backups::Model,
     source: &temps_entities::s3_sources::Model,
     enc: &Arc<temps_core::EncryptionService>,
@@ -5225,15 +5236,80 @@ async fn resolve_tracked_walg_snapshot(
     };
     let client = crate::engines::v2_common::build_s3_client(source, enc, "temps-backup")
         .map_err(lookup_error)?;
-    crate::engines::walg_size::find_snapshot(&client, &source.bucket_name, key, &backup.backup_id)
+    let location =
+        crate::engines::walg_size::find_snapshot(&client, &source.bucket_name, key, &backup.backup_id)
+            .await
+            .map_err(lookup_error)?
+            .ok_or_else(|| RestoreError::Validation {
+                message: format!(
+                    "No WAL-G snapshot in {} identifies backup {}. Search the S3 bucket and select the individual snapshot to restore.",
+                    backup.s3_location, backup.backup_id
+                ),
+            })?;
+    record_resolved_walg_snapshot(db, backup, &location).await;
+    Ok(location)
+}
+
+/// Store the resolved snapshot's name as the row's `walg_snapshot_name`, the
+/// same metadata a backup taken today records, which `use_recorded_snapshot`
+/// and the source listing already read.
+///
+/// The write is conditional on the metadata being unchanged since the row was
+/// read, so it never overwrites a concurrent update. A failed write only costs
+/// the next restore another lookup, so it is logged and the restore goes on.
+async fn record_resolved_walg_snapshot(
+    db: &DatabaseConnection,
+    backup: &temps_entities::backups::Model,
+    location: &str,
+) {
+    use temps_entities::backups::{Column, Entity};
+    let Some(metadata) = metadata_with_snapshot_name(backup, location) else {
+        warn!(
+            backup_id = backup.id,
+            location, "Not recording the resolved WAL-G snapshot: it is outside the backup's repository or the row's metadata is not a JSON object"
+        );
+        return;
+    };
+    match Entity::update_many()
+        .col_expr(Column::Metadata, sea_orm::sea_query::Expr::value(metadata))
+        .filter(Column::Id.eq(backup.id))
+        .filter(Column::Metadata.eq(backup.metadata.as_str()))
+        .exec(db)
         .await
-        .map_err(lookup_error)?
-        .ok_or_else(|| RestoreError::Validation {
-            message: format!(
-                "No WAL-G snapshot in {} identifies backup {}. Search the S3 bucket and select the individual snapshot to restore.",
-                backup.s3_location, backup.backup_id
-            ),
-        })
+    {
+        Ok(result) if result.rows_affected == 1 => info!(
+            backup_id = backup.id,
+            location,
+            "Recorded the WAL-G snapshot of a backup taken before snapshot names were stored"
+        ),
+        Ok(_) => info!(
+            backup_id = backup.id,
+            location,
+            "Backup metadata changed while its WAL-G snapshot was resolved; not recording it"
+        ),
+        Err(error) => warn!(
+            backup_id = backup.id,
+            location, %error, "Could not record the resolved WAL-G snapshot; the next restore resolves it again"
+        ),
+    }
+}
+
+/// `backup.metadata` with `walg_snapshot_name` set to the snapshot `location`
+/// names. `None` unless `location` is a snapshot in the backup's own
+/// repository and the metadata is a JSON object.
+fn metadata_with_snapshot_name(
+    backup: &temps_entities::backups::Model,
+    location: &str,
+) -> Option<String> {
+    let (repository, name) = temps_providers::externalsvc::postgres::walg_snapshot(location)?;
+    if repository != backup.s3_location.trim_end_matches('/') {
+        return None;
+    }
+    let mut metadata: serde_json::Value = serde_json::from_str(&backup.metadata).ok()?;
+    metadata
+        .as_object_mut()?
+        .insert("walg_snapshot_name".into(), serde_json::json!(name));
+    Some(metadata.to_string())
 }
 
 /// Probe an S3 source for a backup belonging to `<engine>/<origin_service>/`.
@@ -7562,6 +7638,114 @@ mod tests {
             cancel_requested_by: Set(None),
             restored_login_encrypted: Set(None),
         }
+    }
+
+    /// A WAL-G backup taken before snapshot names were recorded is resolved by
+    /// reading sentinels once; the resolved name is then stored on the row, so
+    /// the next restore uses it directly instead of scanning again (#2030).
+    /// A row whose metadata changed meanwhile, or a snapshot outside the
+    /// row's repository, is left alone.
+    #[tokio::test]
+    async fn resolved_walg_snapshot_is_recorded_once_and_never_over_a_newer_write(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("TestDatabase unavailable, skipping: {e}");
+                return Ok(());
+            }
+        };
+        let db = test_db.db.clone();
+        let user = temps_entities::users::ActiveModel {
+            name: Set("Restore Tester".to_string()),
+            email: Set("walg-snapshot-tester@example.com".to_string()),
+            password_hash: Set(Some("hash".to_string())),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let source = temps_entities::s3_sources::ActiveModel {
+            name: Set("restore-source".to_string()),
+            bucket_name: Set("restore-bucket".to_string()),
+            bucket_path: Set("/".to_string()),
+            access_key_id: Set(String::new()),
+            secret_key: Set(String::new()),
+            region: Set("us-east-1".to_string()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let repository = "s3://restore-bucket/external_services/postgres/orders/walg";
+        let insert_backup = |name: &'static str| {
+            temps_entities::backups::ActiveModel {
+                id: NotSet,
+                name: Set(name.to_string()),
+                backup_id: Set(uuid::Uuid::new_v4().to_string()),
+                schedule_id: Set(None),
+                schedule_run_id: Set(None),
+                backup_type: Set("full".to_string()),
+                state: Set("completed".to_string()),
+                started_at: Set(Utc::now()),
+                finished_at: Set(Some(Utc::now())),
+                s3_source_id: Set(source.id),
+                s3_location: Set(repository.to_string()),
+                compression_type: Set("none".to_string()),
+                created_by: Set(user.id),
+                tags: Set("[]".to_string()),
+                size_bytes: Set(None),
+                file_count: Set(None),
+                error_message: Set(None),
+                expires_at: Set(None),
+                checksum: Set(None),
+                metadata: Set(r#"{"service_type":"postgres"}"#.to_string()),
+            }
+            .insert(db.as_ref())
+        };
+        let reload = |id: i32| temps_entities::backups::Entity::find_by_id(id).one(db.as_ref());
+        let snapshot = format!("{repository}/basebackups_005/base_0002_backup_stop_sentinel.json");
+
+        let pre_upgrade = insert_backup("pre-upgrade").await?;
+        assert!(needs_walg_identity_lookup(&pre_upgrade, "postgres"));
+        record_resolved_walg_snapshot(db.as_ref(), &pre_upgrade, &snapshot).await;
+        let mut recorded = reload(pre_upgrade.id).await?.ok_or("backup row")?;
+        use_recorded_snapshot(&mut recorded);
+        assert_eq!(recorded.s3_location, snapshot);
+        assert!(
+            !needs_walg_identity_lookup(&recorded, "postgres"),
+            "the next restore must not read the sentinels again"
+        );
+
+        let raced = insert_backup("raced").await?;
+        temps_entities::backups::Entity::update_many()
+            .col_expr(
+                temps_entities::backups::Column::Metadata,
+                sea_orm::sea_query::Expr::value(r#"{"service_type":"postgres","note":"newer"}"#),
+            )
+            .filter(temps_entities::backups::Column::Id.eq(raced.id))
+            .exec(db.as_ref())
+            .await?;
+        record_resolved_walg_snapshot(db.as_ref(), &raced, &snapshot).await;
+        assert_eq!(
+            reload(raced.id).await?.ok_or("backup row")?.metadata,
+            r#"{"service_type":"postgres","note":"newer"}"#,
+            "a concurrent metadata write must not be overwritten"
+        );
+
+        let elsewhere = insert_backup("elsewhere").await?;
+        record_resolved_walg_snapshot(
+            db.as_ref(),
+            &elsewhere,
+            "s3://restore-bucket/external_services/postgres/other/walg/basebackups_005/base_0002_backup_stop_sentinel.json",
+        )
+        .await;
+        assert_eq!(
+            reload(elsewhere.id).await?.ok_or("backup row")?.metadata,
+            r#"{"service_type":"postgres"}"#
+        );
+        Ok(())
     }
 
     #[tokio::test]

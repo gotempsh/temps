@@ -10768,3 +10768,119 @@ async fn test_ai_model_catalog_tables_default_bound_and_reverse() -> anyhow::Res
     }
     Ok(())
 }
+
+/// `visitor.environment_id` stored "no environment" as a `0` sentinel (#2029).
+/// `up` makes the column nullable and turns existing `0` rows into `NULL`,
+/// leaving real environment ids alone; `down` maps `NULL` back to `0` and
+/// restores `NOT NULL`, losing nothing because the two meant the same thing.
+#[tokio::test]
+async fn test_visitor_environment_zero_becomes_null_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261124_000002_nullable_visitor_environment";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping visitor.environment_id migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert_eq!(
+        visitor_environment_nullable(&db).await?,
+        "NO",
+        "before the migration"
+    );
+    db.execute_unprepared(
+        "INSERT INTO projects (id, name, slug, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at) \
+         VALUES (1, 'Sample site', 'sample-site', 'sample', 'example', '/', 'main', 'static', now(), now()); \
+         INSERT INTO visitor (visitor_id, first_seen, last_seen, project_id, environment_id) VALUES \
+           ('visitor-no-environment', now(), now(), 1, 0), \
+           ('visitor-with-environment', now(), now(), 1, 4)",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(visitor_environment_nullable(&db).await?, "YES");
+    assert_eq!(
+        visitor_environments(&db).await?,
+        vec![
+            ("visitor-no-environment".to_string(), None),
+            ("visitor-with-environment".to_string(), Some(4)),
+        ]
+    );
+    db.execute_unprepared(
+        "INSERT INTO visitor (visitor_id, first_seen, last_seen, project_id, environment_id) \
+         VALUES ('visitor-written-after-upgrade', now(), now(), 1, NULL)",
+    )
+    .await?;
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert_eq!(visitor_environment_nullable(&db).await?, "NO");
+    assert_eq!(
+        visitor_environments(&db).await?,
+        vec![
+            ("visitor-no-environment".to_string(), Some(0)),
+            ("visitor-with-environment".to_string(), Some(4)),
+            ("visitor-written-after-upgrade".to_string(), Some(0)),
+        ]
+    );
+    Ok(())
+}
+
+async fn visitor_environment_nullable(db: &DatabaseConnection) -> anyhow::Result<String> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_name = 'visitor' AND column_name = 'environment_id'"
+                .to_string(),
+        ))
+        .await?
+        .expect("visitor.environment_id column");
+    Ok(row.try_get("", "is_nullable")?)
+}
+
+async fn visitor_environments(
+    db: &DatabaseConnection,
+) -> anyhow::Result<Vec<(String, Option<i32>)>> {
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT visitor_id, environment_id FROM visitor ORDER BY visitor_id".to_string(),
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get("", "visitor_id")?,
+                row.try_get("", "environment_id")?,
+            ))
+        })
+        .collect()
+}

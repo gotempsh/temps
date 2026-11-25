@@ -50,7 +50,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { testS3SourceConnection } from '@/lib/s3-sources'
-import { OrphanBackupBadge } from './service-restore/OrphanBackupBadge'
+import { FoundInS3Badge } from './service-restore/FoundInS3Badge'
 import {
   mergeDiscovery,
   visibleOrphans,
@@ -785,17 +785,15 @@ export function S3SourceDetail() {
                 size="sm"
                 onClick={() => void discoveryQuery.refetch()}
                 disabled={discoveryQuery.isFetching || !sourceId}
-                title="Scan S3 for backups not tracked in the database — useful after a Temps restore from a different instance"
+                title="Search this bucket for backups this Temps server has no record of, such as ones made by another server"
               >
                 {discoveryQuery.isFetching ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 ) : (
                   <ScanSearch className="mr-2 h-4 w-4" />
                 )}
-                <span className="hidden sm:inline">
-                  Discover orphan backups
-                </span>
-                <span className="sm:hidden">Scan S3</span>
+                <span className="hidden sm:inline">Search S3 for backups</span>
+                <span className="sm:hidden">Search S3</span>
               </Button>
             </CardHeader>
             <CardContent className="p-5">
@@ -928,7 +926,7 @@ export function S3SourceDetail() {
                                     PITR
                                   </Badge>
                                 ) : null}
-                                {isOrphan ? <OrphanBackupBadge /> : null}
+                                {isOrphan ? <FoundInS3Badge /> : null}
                                 {isOrphan &&
                                   (discoveryQuery.isError ||
                                     discovery?.staleLocations.has(

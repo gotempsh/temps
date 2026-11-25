@@ -3,6 +3,7 @@
 
 use aws_sdk_s3::Client as S3Client;
 use serde::Deserialize;
+use thiserror::Error;
 use tokio::io::AsyncReadExt;
 
 use crate::execution::engine_v2::BackupError;
@@ -46,20 +47,80 @@ pub(crate) async fn load_backup_size_bytes(
     size_from_sentinel(&body, backup_uuid, &format!("s3://{bucket}/{sentinel_key}"))
 }
 
-/// Legacy or externally written WAL-G snapshots may carry arbitrary user data.
-pub(crate) fn sentinel_backup_id(bytes: &[u8]) -> Result<Option<String>, serde_json::Error> {
+/// How many stop sentinels are read from S3 at once. A repository can hold
+/// hundreds of base backups; one at a time made a lookup hundreds of
+/// sequential round trips. Each read holds at most one sentinel body
+/// (`MAX_SENTINEL_SIZE_BYTES`), so this also bounds the memory in flight.
+pub(crate) const SENTINEL_READ_CONCURRENCY: usize = 8;
+
+/// What a stop sentinel records about its base backup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SentinelSummary {
+    /// The `temps_backup_id` in the sentinel's user data. Legacy or externally
+    /// written snapshots may carry arbitrary user data, or none.
+    pub backup_id: Option<String>,
+    /// The compressed size of the base backup (`CompressedSize`), the same
+    /// figure a tracked backup records as its size. `None` when absent or
+    /// invalid, so an odd size never hides the backup's identity.
+    pub compressed_size: Option<i64>,
+}
+
+/// Why a stop sentinel told us nothing.
+#[derive(Debug, Error)]
+pub(crate) enum SentinelReadError {
+    #[error("Could not read")]
+    Unreadable(#[source] BackupError),
+    #[error("Could not parse")]
+    Malformed(#[source] serde_json::Error),
+}
+
+pub(crate) fn sentinel_summary(bytes: &[u8]) -> Result<SentinelSummary, serde_json::Error> {
     #[derive(Deserialize)]
     struct Marker {
         #[serde(rename = "UserData")]
         user_data: Option<serde_json::Value>,
+        #[serde(rename = "CompressedSize")]
+        compressed_size: Option<serde_json::Value>,
     }
     let marker: Marker = serde_json::from_slice(bytes)?;
-    Ok(marker
-        .user_data
-        .and_then(|data| data.get("temps_backup_id")?.as_str().map(str::to_owned)))
+    Ok(SentinelSummary {
+        backup_id: marker
+            .user_data
+            .and_then(|data| data.get("temps_backup_id")?.as_str().map(str::to_owned)),
+        compressed_size: marker
+            .compressed_size
+            .and_then(|size| size.as_i64())
+            .filter(|size| *size >= 0),
+    })
+}
+
+/// Read and summarize the stop sentinels `keys` name, up to
+/// [`SENTINEL_READ_CONCURRENCY`] at a time, in the order given. Only the
+/// summaries are kept, never the bodies.
+pub(crate) async fn summarize_sentinels(
+    client: &S3Client,
+    bucket: &str,
+    keys: Vec<String>,
+) -> Vec<(String, Result<SentinelSummary, SentinelReadError>)> {
+    use futures::StreamExt;
+    futures::stream::iter(keys)
+        .map(|key| async move {
+            let summary = match read_sentinel(client, bucket, &key).await {
+                Ok(bytes) => sentinel_summary(&bytes).map_err(SentinelReadError::Malformed),
+                Err(error) => Err(SentinelReadError::Unreadable(error)),
+            };
+            (key, summary)
+        })
+        .buffered(SENTINEL_READ_CONCURRENCY)
+        .collect()
+        .await
 }
 
 /// Only an exact UUID in a valid stop sentinel can identify a tracked snapshot.
+///
+/// Every sentinel in the repository is read, concurrently, because two can
+/// carry the same UUID (a retried backup-push) and the lookup must refuse to
+/// guess between them.
 pub(crate) async fn find_snapshot(
     client: &S3Client,
     bucket: &str,
@@ -74,43 +135,80 @@ pub(crate) async fn find_snapshot(
         .delimiter("/")
         .into_paginator()
         .send();
-    let mut unreadable = None;
-    let mut matched = None;
+    let mut keys = Vec::new();
     while let Some(page) = pages.next().await {
         let page = page.map_err(|error| BackupError::Failed {
             reason: format!("Could not list {prefix} for backup {backup_id}: {error}"),
         })?;
-        for key in page
-            .contents()
-            .iter()
-            .filter_map(|object| object.key())
-            .filter(|key| temps_providers::externalsvc::postgres::walg_snapshot(key).is_some())
-        {
-            let bytes = match read_sentinel(client, bucket, key).await {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!(key, backup_id, %error, "Skipping unreadable WAL-G stop sentinel");
-                    unreadable.get_or_insert(error);
-                    continue;
-                }
-            };
-            match sentinel_backup_id(&bytes) {
-                Ok(Some(id)) if id == backup_id => {
-                    if matched.is_some() {
-                        return Err(BackupError::PermanentFailure { reason: format!("Multiple WAL-G snapshots identify backup {backup_id} in {prefix}. Select the individual snapshot from S3.") });
-                    }
-                    matched = Some(format!("s3://{bucket}/{key}"));
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(key, backup_id, %error, "Skipping malformed WAL-G stop sentinel")
-                }
+        keys.extend(
+            page.contents()
+                .iter()
+                .filter_map(|object| object.key())
+                .filter(|key| temps_providers::externalsvc::postgres::walg_snapshot(key).is_some())
+                .map(str::to_owned),
+        );
+    }
+    let summaries = summarize_sentinels(client, bucket, keys).await;
+    pick_snapshot(bucket, &prefix, backup_id, summaries)
+}
+
+/// Choose the one snapshot whose sentinel names `backup_id`.
+///
+/// A match is returned even when other sentinels could not be read: the
+/// unreadable ones are logged, not fatal. With no match, an unreadable
+/// sentinel is an error, because the backup may be the one that failed.
+fn pick_snapshot(
+    bucket: &str,
+    prefix: &str,
+    backup_id: &str,
+    summaries: Vec<(String, Result<SentinelSummary, SentinelReadError>)>,
+) -> Result<Option<String>, BackupError> {
+    let total = summaries.len();
+    let mut matched = Vec::new();
+    let mut unreadable = Vec::new();
+    for (key, summary) in summaries {
+        match summary {
+            Ok(summary) if summary.backup_id.as_deref() == Some(backup_id) => matched.push(key),
+            Ok(_) => {}
+            Err(SentinelReadError::Malformed(error)) => {
+                tracing::warn!(key, backup_id, %error, "Skipping malformed WAL-G stop sentinel")
+            }
+            Err(SentinelReadError::Unreadable(error)) => {
+                tracing::warn!(key, backup_id, %error, "Skipping unreadable WAL-G stop sentinel");
+                unreadable.push(error);
             }
         }
     }
-    match unreadable {
-        Some(error) => Err(error),
-        None => Ok(matched),
+    match matched.as_slice() {
+        [_, _, ..] => Err(BackupError::PermanentFailure {
+            reason: format!(
+                "Multiple WAL-G snapshots identify backup {backup_id} in {prefix} ({}). Select the individual snapshot from S3.",
+                matched.join(", ")
+            ),
+        }),
+        [key] => {
+            if !unreadable.is_empty() {
+                tracing::warn!(
+                    backup_id,
+                    key,
+                    unreadable = unreadable.len(),
+                    total,
+                    "Found the WAL-G snapshot for a tracked backup; some other stop sentinels in its repository could not be read"
+                );
+            }
+            Ok(Some(format!("s3://{bucket}/{key}")))
+        }
+        [] => {
+            let failed = unreadable.len();
+            match unreadable.into_iter().next() {
+                Some(first) => Err(BackupError::Failed {
+                    reason: format!(
+                        "No readable WAL-G stop sentinel in {prefix} identifies backup {backup_id}, and {failed} of {total} could not be read, so the backup may be one of them. First failure: {first}"
+                    ),
+                }),
+                None => Ok(None),
+            }
+        }
     }
 }
 
@@ -464,6 +562,235 @@ mod tests {
         assert_eq!(
             path_receiver.await.expect("captured S3 request path"),
             "/backups/tenant/postgres/service/walg/basebackups_005/base_0001_backup_stop_sentinel.json"
+        );
+    }
+
+    #[test]
+    fn sentinel_summary_reads_identity_and_size_and_ignores_an_invalid_size() {
+        let summary = sentinel_summary(
+            br#"{"CompressedSize":52428800,"UserData":{"temps_backup_id":"backup-a"}}"#,
+        )
+        .expect("valid sentinel");
+        assert_eq!(summary.backup_id.as_deref(), Some("backup-a"));
+        assert_eq!(summary.compressed_size, Some(52_428_800));
+
+        for sentinel in [
+            br#"{"CompressedSize":-1,"UserData":{"temps_backup_id":"backup-a"}}"#.as_slice(),
+            br#"{"CompressedSize":"12","UserData":{"temps_backup_id":"backup-a"}}"#.as_slice(),
+            br#"{"UserData":{"temps_backup_id":"backup-a"}}"#.as_slice(),
+        ] {
+            let summary = sentinel_summary(sentinel).expect("valid sentinel");
+            assert_eq!(summary.backup_id.as_deref(), Some("backup-a"));
+            assert_eq!(summary.compressed_size, None);
+        }
+        assert_eq!(
+            sentinel_summary(br#"{"CompressedSize":1}"#).expect("valid"),
+            SentinelSummary {
+                backup_id: None,
+                compressed_size: Some(1)
+            }
+        );
+        assert!(sentinel_summary(b"not json").is_err());
+    }
+
+    fn summary_of(
+        key: &str,
+        backup_id: &str,
+    ) -> (String, Result<SentinelSummary, SentinelReadError>) {
+        (
+            key.to_string(),
+            Ok(SentinelSummary {
+                backup_id: Some(backup_id.to_string()),
+                compressed_size: None,
+            }),
+        )
+    }
+
+    fn unreadable_summary(key: &str) -> (String, Result<SentinelSummary, SentinelReadError>) {
+        (
+            key.to_string(),
+            Err(SentinelReadError::Unreadable(BackupError::Failed {
+                reason: format!("AccessDenied reading {key}"),
+            })),
+        )
+    }
+
+    #[test]
+    fn pick_snapshot_returns_a_match_despite_unreadable_sentinels() {
+        let picked = pick_snapshot(
+            "backups",
+            "svc/walg/basebackups_005/",
+            "wanted",
+            vec![
+                unreadable_summary("svc/walg/basebackups_005/base_0001_backup_stop_sentinel.json"),
+                summary_of(
+                    "svc/walg/basebackups_005/base_0002_backup_stop_sentinel.json",
+                    "wanted",
+                ),
+            ],
+        )
+        .expect("a found snapshot is returned even when another sentinel is unreadable");
+        assert_eq!(
+            picked.as_deref(),
+            Some("s3://backups/svc/walg/basebackups_005/base_0002_backup_stop_sentinel.json")
+        );
+    }
+
+    #[test]
+    fn pick_snapshot_without_a_match_fails_only_when_a_sentinel_was_unreadable() {
+        let error = pick_snapshot(
+            "backups",
+            "svc/walg/basebackups_005/",
+            "wanted",
+            vec![
+                unreadable_summary("svc/walg/basebackups_005/base_0001_backup_stop_sentinel.json"),
+                summary_of(
+                    "svc/walg/basebackups_005/base_0002_backup_stop_sentinel.json",
+                    "other",
+                ),
+            ],
+        )
+        .expect_err("the backup may be the unreadable one");
+        let message = error.to_string();
+        assert!(message.contains("1 of 2 could not be read"), "{message}");
+        assert!(message.contains("wanted"), "{message}");
+
+        assert_eq!(
+            pick_snapshot(
+                "backups",
+                "svc/walg/basebackups_005/",
+                "wanted",
+                vec![summary_of(
+                    "svc/walg/basebackups_005/base_0002_backup_stop_sentinel.json",
+                    "other"
+                )],
+            )
+            .expect("every sentinel was read"),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_snapshot_refuses_two_snapshots_with_one_identity() {
+        let error = pick_snapshot(
+            "backups",
+            "svc/walg/basebackups_005/",
+            "wanted",
+            vec![
+                summary_of(
+                    "svc/walg/basebackups_005/base_0001_backup_stop_sentinel.json",
+                    "wanted",
+                ),
+                summary_of(
+                    "svc/walg/basebackups_005/base_0002_backup_stop_sentinel.json",
+                    "wanted",
+                ),
+            ],
+        )
+        .expect_err("two snapshots claim the backup");
+        assert!(matches!(error, BackupError::PermanentFailure { .. }));
+        assert!(error.to_string().contains("base_0001"));
+        assert!(error.to_string().contains("base_0002"));
+    }
+
+    /// A repository of 16 snapshots, one of which carries the wanted UUID and
+    /// one of which is unreadable. The lookup reads sentinels several at a
+    /// time (never more than the limit) and still returns the match (#2030).
+    #[tokio::test]
+    async fn find_snapshot_reads_sentinels_concurrently_and_skips_unreadable_ones() {
+        use axum::{
+            extract::{OriginalUri, Query},
+            http::StatusCode,
+            response::IntoResponse,
+            Router,
+        };
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("sandbox denied TCP bind; skipping concurrent sentinel test");
+                return;
+            }
+            Err(error) => panic!("bind S3 stub: {error}"),
+        };
+        let address = listener.local_addr().expect("S3 stub address");
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().fallback({
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            move |OriginalUri(uri): OriginalUri, Query(query): Query<HashMap<String, String>>| {
+                let in_flight = in_flight.clone();
+                let max_in_flight = max_in_flight.clone();
+                async move {
+                    if uri.path() == "/backups/" {
+                        let prefix = query.get("prefix").cloned().unwrap_or_default();
+                        let contents: String = (1..=16)
+                            .map(|n| {
+                                format!("<Contents><Key>{prefix}base_{n:04}_backup_stop_sentinel.json</Key></Contents>")
+                            })
+                            .collect();
+                        return (
+                            StatusCode::OK,
+                            format!("<ListBucketResult>{contents}</ListBucketResult>"),
+                        )
+                            .into_response();
+                    }
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let path = uri.path();
+                    if path.contains("base_0003_") {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            "<Error><Code>AccessDenied</Code></Error>".to_string(),
+                        )
+                            .into_response();
+                    }
+                    let id = if path.contains("base_0011_") { "wanted" } else { "other" };
+                    (
+                        StatusCode::OK,
+                        format!(r#"{{"CompressedSize":10,"UserData":{{"temps_backup_id":"{id}"}}}}"#),
+                    )
+                        .into_response()
+                }
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .force_path_style(true)
+            .endpoint_url(format!("http://{address}"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test",
+                "test",
+                None,
+                None,
+                "walg-size-test",
+            ))
+            .build();
+        let client = S3Client::from_conf(config);
+
+        let found = find_snapshot(&client, "backups", "svc/walg", "wanted").await;
+        server.abort();
+
+        assert_eq!(
+            found.expect("the match is returned despite base_0003 being unreadable"),
+            Some(
+                "s3://backups/svc/walg/basebackups_005/base_0011_backup_stop_sentinel.json"
+                    .to_string()
+            )
+        );
+        let max = max_in_flight.load(Ordering::SeqCst);
+        assert!(max > 1, "sentinels were read one at a time");
+        assert!(
+            max <= SENTINEL_READ_CONCURRENCY,
+            "{max} reads in flight exceeds the limit of {SENTINEL_READ_CONCURRENCY}"
         );
     }
 

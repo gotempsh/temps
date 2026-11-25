@@ -1586,7 +1586,7 @@ mod tests {
             temps_entities::visitor::ActiveModel {
                 visitor_id: Set(visitor_id.to_string()),
                 project_id: Set(project.id),
-                environment_id: Set(environment.id),
+                environment_id: Set(Some(environment.id)),
                 first_seen: Set(chrono::Utc::now()),
                 last_seen: Set(chrono::Utc::now()),
                 is_crawler: Set(true),
