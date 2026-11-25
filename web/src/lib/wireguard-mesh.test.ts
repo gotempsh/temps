@@ -70,6 +70,8 @@ function mesh(
     control_plane: null,
     can_enable: true,
     enable_blocker: null,
+    can_disable: false,
+    disable_blocker: null,
     enable_command: 'temps network setup-multi-node --wireguard',
     join_url: null,
     handshake_error: null,

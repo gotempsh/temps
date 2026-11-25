@@ -120,6 +120,8 @@ function makeMesh(overrides: Partial<WireguardMeshStatusResponse> = {}): Wiregua
     reason: null,
     cidr: null,
     ca_rotation_required: false,
+    can_disable: false,
+    disable_blocker: null,
     pool_cidr: '10.201.0.0/24',
     listen_port: 51820,
     control_plane: null,

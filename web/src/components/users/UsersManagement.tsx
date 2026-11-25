@@ -212,9 +212,9 @@ export function UsersManagement({
         path: {
           user_id: userId,
         },
+        // The target user is the path's user_id.
         body: {
           role_type: roleType,
-          user_id: userId,
         },
       })
     }

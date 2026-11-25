@@ -517,7 +517,6 @@ async function manageRoles(options: RoleOptions): Promise<void> {
         path: { user_id: id },
         body: {
           role_type: options.add!,
-          user_id: id,
         },
       })
       if (error) {
