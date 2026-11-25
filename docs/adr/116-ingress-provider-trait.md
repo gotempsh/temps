@@ -51,9 +51,14 @@ This ADR adds no provider and changes no behaviour. It moves the two that exist 
 
 ### D1. A provider is a module the engine cannot name
 
-Providers live in `temps-ingress/src/providers/<kind>/`, declared as private modules. The only public item is `providers::builtin() -> ProviderRegistry`. The reachability engine, the connector service, the handlers and the checks reach a provider only through the registry and the traits below, so naming `cloudflare` or `tailscale` from outside is a compile error, not a review comment.
+Providers live in `temps-ingress/src/providers/<kind>/`, declared private to `providers` outside tests (tests reach in for fixtures). Outside it the crate sees two items:
 
-Until the moves (D8) finish, a `rule_drift.py` metric, `provider_named_outside_module`, holds the line: it counts every `cloudflare::` or `tailscale::` path, and every `"cloudflare_tunnel"` or `"tailscale"` literal, in `temps-ingress` production code outside the provider modules. It started at 35, can only go down, and reaches zero when the modules turn private. Wire vocabulary (D5) is the one exception, because stored step and option names keep their place in `model.rs`.
+- `providers::builtin()`, the factories the registry is built from;
+- `providers::Tailnet`, the state Tailscale's planning keeps (see "Provider state the engine holds" below).
+
+The reachability engine, the connector service, the handlers and the checks reach a provider only through the registry, the traits below and that handle. Naming `cloudflare` or `tailscale` from outside is a compile error, not a review comment.
+
+A `rule_drift.py` metric, `provider_named_outside_module`, counted the moves down. It counts every `cloudflare::` or `tailscale::` path, and every `"cloudflare_tunnel"` or `"tailscale"` literal, in `temps-ingress` production code outside `providers/`. It started at 35 and is now 0. With no baseline entry, any new crossing fails the check, which also catches a test-only path that the compiler allows. Wire vocabulary (D5) is the one exception, because stored step and option names keep their place in `model.rs`.
 
 On the agent, drivers are per mechanism, not per provider: a pinned process, `tailscaled`'s LocalAPI. A connector spec names a driver and its parameters, never a provider kind.
 
@@ -89,7 +94,14 @@ pub trait TunnelFactory: Send + Sync {
 
 `TunnelProvider` keeps its name and its lifecycle methods (ensure, connector spec, publish, health, rotate, delete): it is the tunnel side, built per connector, and only tunnels have one. Capabilities are answered per connector, as decided, with a connector-less answer for ways in that have no row: a Tailscale machine name needs no credential and so no connector row, which is why "per connector" could not mean "only for a row".
 
-The plan and run contribution (D3) joins `ProviderFactory` when the steps move.
+The plan and run contribution (D3) joined `ProviderFactory` as two optional hooks:
+
+```rust
+    /// Its part of planning, for a provider that plans audiences whole.
+    fn plans(&self) -> Option<&dyn ProviderPlan> { None }
+    /// Its part of one run, over the live effects.
+    fn run<'a>(&self, live: &'a LiveOps) -> Option<Box<dyn ProviderRun + 'a>> { None }
+```
 
 `Capabilities` holds only what the engine itself enforces, and only values a shipped provider uses:
 
@@ -142,7 +154,24 @@ pub trait ProviderRun: Send + Sync {
 
 A step reaches the run only through `StepRun`, which the engine implements: the run's input, `begin` before a creating call, `finish` or `finish_failed` after it, and the few facts steps hand each other (the DNS provider saved, the tunnel made, the gate in front of the address). Journal, fingerprint, conflicts and undo order stay the engine's and keep ADR-064 D4's rules. A provider cannot skip the journal: `begin` stores the pending entry, and refuses, before the provider's call.
 
-The provider-specific methods of `RunOps` move into each provider's own ops trait (`CloudflareOps`), which the live ops and the test fake both implement. `RunOps` keeps the generic ones (DNS, domains, certificates, connectors, hostname choices, audience, HTTP policy, environment hosts, sleep), and `RunOps::providers()` lists the providers of a run from the registry.
+The provider-specific methods of `RunOps` move into each provider's own ops trait (`CloudflareOps`, `TailscaleOps`), which the live ops and the test fake both implement. `RunOps` keeps the generic ones (DNS, domains, certificates, connectors, hostname choices, audience, HTTP policy, environment hosts, sleep), and `RunOps::providers()` lists the providers of a run from the registry.
+
+**Planning.** A provider that plans an audience whole contributes a `ProviderPlan`, and the engine asks `ProviderRegistry::planner(audience)` before falling back to its own plan:
+
+```rust
+pub trait ProviderPlan: Send + Sync {
+    fn plans(&self, audience: Audience) -> bool;
+    /// The address it would suggest, or why it cannot.
+    fn address(&self, facts: &PlanFacts) -> Result<Option<String>, String>;
+    fn plan(&self, facts: &PlanFacts) -> ReachabilityPlan;
+    /// The plan `choices` shows, when it differs from `plan`.
+    fn choice_plan(&self, facts: &PlanFacts) -> ReachabilityPlan { self.plan(facts) }
+}
+```
+
+Tailscale plans `Private` and `TailnetUsers`. With no planner, `Private` keeps the engine's own listener plan, and `TailnetUsers` says Temps cannot plan an address for it.
+
+**Provider state the engine holds.** Planning and applying ask the tailnet questions before any run exists: they read the cluster's OAuth client and prove its scopes, read the Service an address names and its hosts, check that the hosting worker is a device of the credential's tailnet, and take a pasted credential. That code, and its short-lived caches, is Tailscale's: `providers/tailscale/service.rs` defines `Tailnet`, the engine holds one, and it calls the handle's methods without knowing how they work. A run's own reachability check gets `Tailnet::uncached()`, so a check made after the run's changes never reuses a read made before them.
 
 ### D4. Where traffic arrives is the provider's declaration, and only there is anything trusted
 
@@ -174,8 +203,8 @@ Tailscale pins nothing: it uses the host's `tailscaled`, and its minimum version
 ### D8. The migration: four PRs, no behaviour change
 
 1. **The boundary.** `Capabilities`, the registry merge (D2), the golden wire test (D5), the drift metric at baseline (D1). Done.
-2. **Cloudflare behind it.** Its options, steps, checks and `RunOps` methods move into `providers/cloudflare/`, with `token_check.rs`, `edge_rules.rs`, `access.rs`, `access_service.rs` and `gate_check.rs`'s Access half.
-3. **Tailscale behind it.** Its credential, options, the four steps, the Serve-entry code (`serve_entries.rs`) and its `RunOps` methods move into `providers/tailscale/`. `is_credential_kind` goes.
+2. **Cloudflare behind it.** Its steps, `RunOps` methods and edge-rule calls moved into `providers/cloudflare/`. Done for everything that named it. Still under `reachability/`, with no provider path but Cloudflare-only in what they do: `token_check.rs`, the rest of `edge_rules.rs`, `access.rs`, `access_service.rs` and `gate_check.rs`'s Access half.
+3. **Tailscale behind it.** Its credential, plan, the four steps, its `RunOps` methods and its planning state (`Tailnet`) moved into `providers/tailscale/`. `is_credential_kind` is gone. Still under `reachability/`: `serve_entries.rs`, the Serve-entry rows the agent reads, and apply's mapping from a Tailscale option to the run's input (see the proof below).
 4. **Pins.** `temps-connector-pins`. Done first, with D5's golden tests, because neither depends on the rest.
 
 **The proof** has three parts:
@@ -183,6 +212,13 @@ Tailscale pins nothing: it uses the host's `tailscaled`, and its minimum version
 - the existing reachability, run and service tests pass with only imports changed, never assertions;
 - the drift metric reaches zero;
 - the test provider (`FakeTunnels`, `service.rs` tests) becomes a provider with one step of its own and `reach: Private`, and is planned, run, resumed and undone without editing any file outside it.
+
+**Where the proof stands.** The first part holds: no assertion changed. Two tests changed their fixture, never their expectation: the DNS-retry test now sets the connector's DNS capability instead of renaming its provider, and the Service-label test calls the one label check that is left. The second part holds: the metric is 0 and the modules are private.
+
+The third part cannot be met as written, because it conflicts with D5. A step of a provider's own needs a `StepKind` word, its option a `PlanOptionKind` word, and what it journals an `Intent` and a `RunResource`. D5 keeps all four as closed wire vocabulary in `model.rs`, so that stored plans and runs keep their strings. A new provider therefore edits `model.rs`. Apply also maps each option kind to the run's input (`RunInput`) in `service.rs`, so a new option needs a branch there too. Borrowing an existing word for the test provider would make the proof pass without proving anything. Two ways forward:
+
+- **Narrow the proof.** A new provider is its module plus its words in `model.rs`. Meeting that needs one more move: a provider hook that maps its own options to the run's input, which also takes apply's Tailscale branches out of the engine.
+- **Open the vocabulary.** Add a provider-named variant to the four enums (`provider:<kind>:<word>`). Stored rows are unaffected, but this is a wire change: the generated clients gain a variant and the golden test grows. That is beyond this refactor.
 
 Each PR leaves `main` working, and the order can stop after any step.
 
