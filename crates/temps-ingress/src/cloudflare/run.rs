@@ -9,7 +9,9 @@
 //!
 //! The edge rules of ADR 070: a redirect from plain HTTP to HTTPS, and a WAF
 //! rule refusing ports other than 80 and 443, each for one hostname. And the
-//! Access application of ADR 065 D9 in front of an address.
+//! Access application of ADR 065 D9 in front of an address. And the first
+//! two steps of a new tunnel: checking the pasted API token, and creating the
+//! tunnel's connector on the Cloudflare account.
 
 use async_trait::async_trait;
 
@@ -18,8 +20,9 @@ use crate::reachability::access::{covers, run_app_name, AccessApp, AccessPolicyA
 use crate::reachability::edge_rules::EdgeRulePurpose;
 use crate::reachability::model::{AccessBinding, Intent, JournalState, RunResource, StepKind};
 use crate::reachability::run::{
-    wait_message, Begin, Found, Outcome, ProviderRun, StepRun, UndoCheck, WriteError,
+    wait_message, Begin, Found, Outcome, ProviderRun, StepRun, TunnelStatus, UndoCheck, WriteError,
 };
+use crate::reachability::token_check::TokenCheckResult;
 
 /// Where a rule a run added lives at Cloudflare (ADR 070).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +65,17 @@ pub enum EdgeRuleMade {
 /// What a run does at Cloudflare, behind a trait so tests can stand in.
 #[async_trait]
 pub trait CloudflareOps: Send + Sync {
+    /// What the pasted API token may do, for `zone` only.
+    async fn check_token(&self, token: &str, zone: &str) -> TokenCheckResult;
+    /// Creates a tunnel that publishes only the hostnames chosen for it.
+    /// On failure, the id of a tunnel that was saved anyway.
+    async fn create_tunnel(
+        &self,
+        name: &str,
+        provider_id: i32,
+        domain: &str,
+        node_ids: &[i32],
+    ) -> Result<(i32, TunnelStatus), (Option<i32>, String)>;
     /// Add `purpose`'s Cloudflare rule for `host` (ADR 070), with the token
     /// of `connector_id`'s DNS provider (else the one managing the zone), or
     /// find one doing the same already.
@@ -183,6 +197,92 @@ impl<'a> CloudflareRun<'a> {
                         error.message
                     );
                     Outcome::Skipped(degraded_message(&host, purpose, &error))
+                }
+            },
+        }
+    }
+
+    /// Check the pasted token has every permission, for this zone only.
+    async fn check_token(&self, run: &mut dyn StepRun) -> Outcome {
+        let input = run.input();
+        let (Some(token), Some(new)) = (&input.token, &input.new_tunnel) else {
+            return Outcome::Failed(
+                "Paste the Cloudflare API token again: Temps never stores it until the run \
+                 saves it."
+                    .into(),
+            );
+        };
+        let result = self.ops.check_token(token, &new.zone).await;
+        match result.refusal() {
+            Some(reason) => Outcome::Failed(reason),
+            None => Outcome::Done(Some(
+                "Every permission is there, for this zone only.".into(),
+            )),
+        }
+    }
+
+    /// Create the new tunnel on the account the run saved, journaled first.
+    async fn create_tunnel(&self, run: &mut dyn StepRun) -> Outcome {
+        let run_id = run.input().run_id;
+        let Some(new) = run.input().new_tunnel.clone() else {
+            return Outcome::Skipped("No new tunnel.".into());
+        };
+        let Some(provider_id) = run.dns_provider_id() else {
+            return Outcome::Failed("No Cloudflare account to create the tunnel with.".into());
+        };
+        let intent = Intent::Connector {
+            name: new.name.clone(),
+        };
+        match run.begin(&intent).await {
+            Err(hold) => hold.into(),
+            Ok(Begin::Have(resource)) => {
+                if let RunResource::Connector { id, .. } = *resource {
+                    run.set_connector(id);
+                }
+                Outcome::Done(Some(format!(
+                    "Tunnel {} for {} (created earlier).",
+                    new.name, new.domain
+                )))
+            }
+            Ok(Begin::Go) => match self
+                .ops
+                .create_tunnel(&new.name, provider_id, &new.domain, &[new.worker.id])
+                .await
+            {
+                Ok((id, status)) => {
+                    run.set_connector(id);
+                    run.finish(
+                        &intent.key(run_id),
+                        Some(RunResource::Connector {
+                            id,
+                            name: new.name.clone(),
+                        }),
+                    )
+                    .await;
+                    if status.status == "error" {
+                        return Outcome::Failed(
+                            status
+                                .last_error
+                                .unwrap_or_else(|| "Cloudflare refused the tunnel.".into()),
+                        );
+                    }
+                    Outcome::Done(Some(format!("Tunnel {} for {}.", new.name, new.domain)))
+                }
+                Err((saved, error)) => {
+                    match saved {
+                        Some(id) => {
+                            run.finish(
+                                &intent.key(run_id),
+                                Some(RunResource::Connector {
+                                    id,
+                                    name: new.name.clone(),
+                                }),
+                            )
+                            .await
+                        }
+                        None => run.finish_failed(&intent, true).await,
+                    }
+                    Outcome::Failed(error)
                 }
             },
         }
@@ -325,7 +425,11 @@ impl ProviderRun for CloudflareRun<'_> {
     fn runs(&self, kind: StepKind) -> bool {
         matches!(
             kind,
-            StepKind::RedirectToHttps | StepKind::StandardPortsOnly | StepKind::AccessApp
+            StepKind::CheckToken
+                | StepKind::CreateTunnel
+                | StepKind::RedirectToHttps
+                | StepKind::StandardPortsOnly
+                | StepKind::AccessApp
         )
     }
 
@@ -335,6 +439,8 @@ impl ProviderRun for CloudflareRun<'_> {
             StepKind::StandardPortsOnly => {
                 self.edge_rule(run, EdgeRulePurpose::StandardPorts).await
             }
+            StepKind::CheckToken => self.check_token(run).await,
+            StepKind::CreateTunnel => self.create_tunnel(run).await,
             StepKind::AccessApp => self.access_app(run).await,
             other => Outcome::Failed(format!("{other:?} is not a Cloudflare step.")),
         }

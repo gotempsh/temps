@@ -91,8 +91,7 @@ use super::token_check::{
 use crate::error::IngressError;
 use crate::registry::ProviderRegistry;
 use crate::service::{
-    CreateConnectorRequest, CreateError, HostnameMode, IngressConnectorService,
-    SetHostnameChoiceRequest, TunnelMoveGuard,
+    HostnameMode, IngressConnectorService, SetHostnameChoiceRequest, TunnelMoveGuard,
 };
 use crate::tailscale::{
     self, ScopeCheck, ServiceDefinition, ServiceHost, TailnetApi, TailscaleClient,
@@ -3453,10 +3452,6 @@ impl LiveOps {
 
 #[async_trait]
 impl RunOps for LiveOps {
-    async fn check_token(&self, token: &str, zone: &str) -> TokenCheckResult {
-        check_token(&self.http, token, Some(zone)).await
-    }
-
     async fn find(&self, intent: &Intent) -> Result<Option<RunResource>, String> {
         let db = self.deps.db.as_ref();
         Ok(match intent {
@@ -3690,45 +3685,6 @@ impl RunOps for LiveOps {
             .remove_managed_domain(provider_id, zone)
             .await
             .map_err(text)
-    }
-
-    async fn create_tunnel(
-        &self,
-        name: &str,
-        provider_id: i32,
-        domain: &str,
-        node_ids: &[i32],
-    ) -> Result<(i32, TunnelStatus), (Option<i32>, String)> {
-        let mut values = std::collections::BTreeMap::new();
-        values.insert("dns_provider_id".to_string(), Value::from(provider_id));
-        values.insert("domain".to_string(), Value::from(domain));
-        let request = CreateConnectorRequest {
-            name: name.to_string(),
-            provider: crate::cloudflare::KIND.to_string(),
-            values,
-            secrets: Default::default(),
-            node_ids: node_ids.to_vec(),
-            // Publish only what runs choose, so a tunnel on a whole zone
-            // never puts other apps under it online by surprise.
-            auto_publish: Some(false),
-            host_suffix: None,
-        };
-        match self.deps.connectors.create(request).await {
-            Ok(view) => Ok((
-                view.id,
-                TunnelStatus {
-                    status: view.status,
-                    last_error: view.last_error,
-                    replicas: Vec::new(),
-                },
-            )),
-            Err(CreateError::NotSaved(error)) => Err((None, error.to_string())),
-            Err(CreateError::Saved {
-                connector_id,
-                error,
-                ..
-            }) => Err((Some(connector_id), error.to_string())),
-        }
     }
 
     async fn tunnel_status(&self, id: i32) -> Result<TunnelStatus, String> {

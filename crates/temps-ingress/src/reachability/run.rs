@@ -51,7 +51,6 @@ use super::model::{
     UndoResult,
 };
 use super::plan::NamedId;
-use super::token_check::TokenCheckResult;
 use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
 use temps_core::tailnet::messages as tailnet_messages;
 use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT, REPORT_ERROR};
@@ -256,7 +255,6 @@ pub enum ServeRelease {
 /// Everything a run does to the rest of Temps.
 #[async_trait]
 pub trait RunOps: Send + Sync {
-    async fn check_token(&self, token: &str, zone: &str) -> TokenCheckResult;
     /// Finds what `intent` describes, if it exists: how a pending journal
     /// entry is resolved.
     async fn find(&self, intent: &Intent) -> Result<Option<RunResource>, String>;
@@ -269,15 +267,6 @@ pub trait RunOps: Send + Sync {
     async fn set_auto_manage(&self, provider_id: i32, zone: &str, on: bool) -> Result<(), String>;
     async fn verify_zone(&self, provider_id: i32, zone: &str) -> Result<bool, String>;
     async fn remove_managed_zone(&self, provider_id: i32, zone: &str) -> Result<(), String>;
-    /// Creates a tunnel that publishes only the hostnames chosen for it.
-    /// On failure, the id of a tunnel that was saved anyway.
-    async fn create_tunnel(
-        &self,
-        name: &str,
-        provider_id: i32,
-        domain: &str,
-        node_ids: &[i32],
-    ) -> Result<(i32, TunnelStatus), (Option<i32>, String)>;
     async fn tunnel_status(&self, id: i32) -> Result<TunnelStatus, String>;
     /// Marks the connector `id` named `name` `deleting`, so sync never
     /// recreates it; returns its provider tunnel id. `Ok(None)` when it is
@@ -545,6 +534,10 @@ pub trait StepRun: Send {
     async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool);
     /// The gate now in front of the address, which attaching it records.
     fn protect_with(&mut self, binding: AccessBinding);
+    /// The DNS provider an earlier step of this run saved or chose.
+    fn dns_provider_id(&self) -> Option<i32>;
+    /// The tunnel this step made, which later steps publish through.
+    fn set_connector(&mut self, id: i32);
 }
 
 #[async_trait]
@@ -575,6 +568,14 @@ impl StepRun for Runner<'_> {
 
     fn protect_with(&mut self, binding: AccessBinding) {
         self.ctx.access = Some(binding);
+    }
+
+    fn dns_provider_id(&self) -> Option<i32> {
+        self.ctx.provider_id
+    }
+
+    fn set_connector(&mut self, id: i32) {
+        self.ctx.connector_id = Some(id);
     }
 }
 
@@ -2397,22 +2398,6 @@ impl Runner<'_> {
         let input = self.input;
         let address = input.address.clone();
         match kind {
-            StepKind::CheckToken => {
-                let (Some(token), Some(new)) = (&input.token, &input.new_tunnel) else {
-                    return Outcome::Failed(
-                        "Paste the Cloudflare API token again: Temps never stores it until \
-                         the run saves it."
-                            .into(),
-                    );
-                };
-                let result = self.ops.check_token(token, &new.zone).await;
-                match result.refusal() {
-                    Some(reason) => Outcome::Failed(reason),
-                    None => Outcome::Done(Some(
-                        "Every permission is there, for this zone only.".into(),
-                    )),
-                }
-            }
             StepKind::SaveDnsProvider => {
                 let Some(new) = &input.new_tunnel else {
                     return Outcome::Skipped("No new tunnel.".into());
@@ -2574,72 +2559,6 @@ impl Runner<'_> {
                 } else {
                     "Added and verified.".into()
                 }))
-            }
-            StepKind::CreateTunnel => {
-                let Some(new) = input.new_tunnel.clone() else {
-                    return Outcome::Skipped("No new tunnel.".into());
-                };
-                let Some(provider_id) = self.ctx.provider_id else {
-                    return Outcome::Failed(
-                        "No Cloudflare account to create the tunnel with.".into(),
-                    );
-                };
-                let intent = Intent::Connector {
-                    name: new.name.clone(),
-                };
-                match self.begin(&intent).await {
-                    Err(hold) => hold.into(),
-                    Ok(Begin::Have(resource)) => {
-                        if let RunResource::Connector { id, .. } = *resource {
-                            self.ctx.connector_id = Some(id);
-                        }
-                        Outcome::Done(Some(format!(
-                            "Tunnel {} for {} (created earlier).",
-                            new.name, new.domain
-                        )))
-                    }
-                    Ok(Begin::Go) => match self
-                        .ops
-                        .create_tunnel(&new.name, provider_id, &new.domain, &[new.worker.id])
-                        .await
-                    {
-                        Ok((id, status)) => {
-                            self.ctx.connector_id = Some(id);
-                            self.finish(
-                                &intent.key(input.run_id),
-                                Some(RunResource::Connector {
-                                    id,
-                                    name: new.name.clone(),
-                                }),
-                            )
-                            .await;
-                            if status.status == "error" {
-                                return Outcome::Failed(
-                                    status
-                                        .last_error
-                                        .unwrap_or_else(|| "Cloudflare refused the tunnel.".into()),
-                                );
-                            }
-                            Outcome::Done(Some(format!("Tunnel {} for {}.", new.name, new.domain)))
-                        }
-                        Err((saved, error)) => {
-                            match saved {
-                                Some(id) => {
-                                    self.finish(
-                                        &intent.key(input.run_id),
-                                        Some(RunResource::Connector {
-                                            id,
-                                            name: new.name.clone(),
-                                        }),
-                                    )
-                                    .await
-                                }
-                                None => self.finish_failed(&intent, true).await,
-                            }
-                            Outcome::Failed(error)
-                        }
-                    },
-                }
             }
             StepKind::WaitForTunnel => {
                 let (Some(id), Some(new)) = (self.ctx.connector_id, &input.new_tunnel) else {
@@ -3083,7 +3002,11 @@ impl Runner<'_> {
                     },
                 }
             }
-            StepKind::AccessApp | StepKind::RedirectToHttps | StepKind::StandardPortsOnly => {
+            StepKind::CheckToken
+            | StepKind::CreateTunnel
+            | StepKind::AccessApp
+            | StepKind::RedirectToHttps
+            | StepKind::StandardPortsOnly => {
                 Outcome::Failed(format!("No provider runs {kind:?} steps here."))
             }
             StepKind::SetHttpPolicy => self.record_http_policy(&address).await,
@@ -4245,7 +4168,9 @@ pub async fn undo(
 mod tests {
     use super::*;
     use crate::reachability::model::{AddressSource, Audience};
-    use crate::reachability::token_check::{PermissionCheck, PermissionState, TokenPermission};
+    use crate::reachability::token_check::{
+        PermissionCheck, PermissionState, TokenCheckResult, TokenPermission,
+    };
 
     fn done(intent: Intent, resource: RunResource) -> JournalEntry {
         JournalEntry {
@@ -4367,29 +4292,6 @@ mod tests {
 
     #[async_trait]
     impl RunOps for Fake {
-        async fn check_token(&self, _token: &str, _zone: &str) -> TokenCheckResult {
-            self.log("check_token");
-            let state = if self.fail.contains(&"check_token") {
-                PermissionState::Missing
-            } else {
-                PermissionState::Present
-            };
-            TokenCheckResult {
-                valid: true,
-                error: None,
-                zones: vec!["example.com".into()],
-                checked_zone: Some("example.com".into()),
-                permissions: vec![PermissionCheck {
-                    permission: TokenPermission::DnsEdit,
-                    label: "Zone · DNS · Edit".into(),
-                    state,
-                    detail: String::new(),
-                }],
-                scope: None,
-                ready: state == PermissionState::Present,
-                template_url: String::new(),
-            }
-        }
         async fn find(&self, intent: &Intent) -> Result<Option<RunResource>, String> {
             self.log(format!("find {}", intent.key(0)));
             if self.fail.contains(&"find") {
@@ -4436,26 +4338,6 @@ mod tests {
         async fn remove_managed_zone(&self, _p: i32, zone: &str) -> Result<(), String> {
             self.log(format!("remove_managed_zone {zone}"));
             Ok(())
-        }
-        async fn create_tunnel(
-            &self,
-            _name: &str,
-            _provider_id: i32,
-            _domain: &str,
-            _node_ids: &[i32],
-        ) -> Result<(i32, TunnelStatus), (Option<i32>, String)> {
-            self.log("create_tunnel");
-            if self.fail.contains(&"create_tunnel") {
-                return Err((Some(40), "Cloudflare refused it".into()));
-            }
-            Ok((
-                40,
-                TunnelStatus {
-                    status: "ready".into(),
-                    last_error: None,
-                    replicas: Vec::new(),
-                },
-            ))
         }
         async fn tunnel_status(&self, _id: i32) -> Result<TunnelStatus, String> {
             self.log("tunnel_status");
@@ -4959,6 +4841,49 @@ mod tests {
                 .expect("lock")
                 .retain(|a| a.id != id);
             Ok(())
+        }
+        async fn check_token(&self, _token: &str, _zone: &str) -> TokenCheckResult {
+            self.log("check_token");
+            let state = if self.fail.contains(&"check_token") {
+                PermissionState::Missing
+            } else {
+                PermissionState::Present
+            };
+            TokenCheckResult {
+                valid: true,
+                error: None,
+                zones: vec!["example.com".into()],
+                checked_zone: Some("example.com".into()),
+                permissions: vec![PermissionCheck {
+                    permission: TokenPermission::DnsEdit,
+                    label: "Zone · DNS · Edit".into(),
+                    state,
+                    detail: String::new(),
+                }],
+                scope: None,
+                ready: state == PermissionState::Present,
+                template_url: String::new(),
+            }
+        }
+        async fn create_tunnel(
+            &self,
+            _name: &str,
+            _provider_id: i32,
+            _domain: &str,
+            _node_ids: &[i32],
+        ) -> Result<(i32, TunnelStatus), (Option<i32>, String)> {
+            self.log("create_tunnel");
+            if self.fail.contains(&"create_tunnel") {
+                return Err((Some(40), "Cloudflare refused it".into()));
+            }
+            Ok((
+                40,
+                TunnelStatus {
+                    status: "ready".into(),
+                    last_error: None,
+                    replicas: Vec::new(),
+                },
+            ))
         }
     }
 

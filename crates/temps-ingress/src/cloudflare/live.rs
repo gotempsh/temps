@@ -14,8 +14,11 @@ use super::run::{CloudflareOps, EdgeRuleAt, EdgeRuleMade};
 use crate::reachability::access::{AccessApp, AccessPolicyAnswer};
 use crate::reachability::edge_rules::EdgeRulePurpose;
 use crate::reachability::model::RunResource;
-use crate::reachability::run::WriteError;
+use crate::reachability::run::{TunnelStatus, WriteError};
 use crate::reachability::service::LiveOps;
+use crate::reachability::token_check::{check_token, TokenCheckResult};
+use crate::service::{CreateConnectorRequest, CreateError};
+use serde_json::Value;
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -179,6 +182,49 @@ impl CloudflareOps for LiveOps {
 
     async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
         self.deps.access.delete_app(provider_id, id).await
+    }
+
+    async fn check_token(&self, token: &str, zone: &str) -> TokenCheckResult {
+        check_token(&self.http, token, Some(zone)).await
+    }
+
+    async fn create_tunnel(
+        &self,
+        name: &str,
+        provider_id: i32,
+        domain: &str,
+        node_ids: &[i32],
+    ) -> Result<(i32, TunnelStatus), (Option<i32>, String)> {
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("dns_provider_id".to_string(), Value::from(provider_id));
+        values.insert("domain".to_string(), Value::from(domain));
+        let request = CreateConnectorRequest {
+            name: name.to_string(),
+            provider: super::KIND.to_string(),
+            values,
+            secrets: Default::default(),
+            node_ids: node_ids.to_vec(),
+            // Publish only what runs choose, so a tunnel on a whole zone
+            // never puts other apps under it online by surprise.
+            auto_publish: Some(false),
+            host_suffix: None,
+        };
+        match self.deps.connectors.create(request).await {
+            Ok(view) => Ok((
+                view.id,
+                TunnelStatus {
+                    status: view.status,
+                    last_error: view.last_error,
+                    replicas: Vec::new(),
+                },
+            )),
+            Err(CreateError::NotSaved(error)) => Err((None, error.to_string())),
+            Err(CreateError::Saved {
+                connector_id,
+                error,
+                ..
+            }) => Err((Some(connector_id), error.to_string())),
+        }
     }
 }
 
