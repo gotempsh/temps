@@ -10975,3 +10975,112 @@ async fn test_status_monitor_interval_changes_table_up_and_down() -> anyhow::Res
     assert!(!table_exists(&db, TABLE).await?, "{TABLE} after down");
     Ok(())
 }
+
+/// Whether each catalog capability was stated lives in new `*_stated`
+/// columns, leaving `supports_*` `NOT NULL` so the previous binary still reads
+/// every row: existing rows and rows inserted without the new columns count as
+/// stated, and `down` drops the three columns.
+#[tokio::test]
+async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000002_ai_model_catalog_unknown_capabilities";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!(
+                    "Skipping AI model catalog capability migration test: Docker unavailable"
+                );
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, supports_tools, source_url, fetched_at) \
+         VALUES ('openai', 'existing-model', 'Existing', TRUE, 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    // The previous binary inserts without the new columns.
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, source_url, fetched_at) \
+         VALUES ('openai', 'previous-binary-model', 'Previous', 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+    // The new binary records an unknown capability as FALSE, not stated.
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, supports_vision, vision_stated, source_url, fetched_at) \
+         VALUES ('openai', 'silent-model', 'Silent', FALSE, FALSE, 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+    let stated = |model: &'static str| {
+        let db = &db;
+        async move {
+            db.query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT tools_stated, vision_stated, reasoning_stated \
+                 FROM ai_model_catalog_entries WHERE model_id = $1",
+                [model.into()],
+            ))
+            .await
+            .map(|row| {
+                let row = row.expect("entry");
+                (
+                    row.try_get::<bool>("", "tools_stated").expect("tools"),
+                    row.try_get::<bool>("", "vision_stated").expect("vision"),
+                    row.try_get::<bool>("", "reasoning_stated")
+                        .expect("reasoning"),
+                )
+            })
+        }
+    };
+    assert_eq!(stated("existing-model").await?, (true, true, true));
+    assert_eq!(stated("previous-binary-model").await?, (true, true, true));
+    assert_eq!(stated("silent-model").await?, (true, false, true));
+    assert!(
+        db.execute_unprepared(
+            "UPDATE ai_model_catalog_entries SET supports_tools = NULL WHERE model_id = 'silent-model'"
+        )
+        .await
+        .is_err(),
+        "supports_tools stays NOT NULL for the previous binary"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    for column in ["tools_stated", "vision_stated", "reasoning_stated"] {
+        assert!(
+            !column_exists(&db, "ai_model_catalog_entries", column).await?,
+            "{column} after down"
+        );
+    }
+    Ok(())
+}

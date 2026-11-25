@@ -333,6 +333,23 @@ impl AiService for AiProviderRegistry {
             .await
     }
 
+    async fn cached_workspace_harness_update_status(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<Option<temps_ai::HarnessUpdateStatus>, AiError> {
+        let service = self
+            .routed(Some(provider))
+            .await
+            .ok_or_else(|| AiError::Provider {
+                purpose: "provider.harness.update".into(),
+                reason: format!("provider '{provider}' is unavailable"),
+            })?;
+        service
+            .cached_workspace_harness_update_status(provider, principal_id)
+            .await
+    }
+
     async fn update_workspace_harness(
         &self,
         provider: &str,

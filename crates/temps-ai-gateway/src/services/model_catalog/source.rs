@@ -65,9 +65,10 @@ pub struct CatalogModel {
     pub cache_write_per_million: Option<f64>,
     pub context_window: Option<i64>,
     pub max_output_tokens: Option<i64>,
-    pub supports_tools: bool,
-    pub supports_vision: bool,
-    pub supports_reasoning: bool,
+    /// `null` when the catalog does not say.
+    pub supports_tools: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub supports_reasoning: Option<bool>,
     pub deprecated: bool,
     pub release_date: Option<String>,
 }
@@ -110,12 +111,13 @@ struct ProviderDoc {
 struct ModelDoc {
     #[serde(default)]
     name: Option<String>,
+    // Absent means the catalog does not say, not "no".
     #[serde(default)]
-    attachment: bool,
+    attachment: Option<bool>,
     #[serde(default)]
-    reasoning: bool,
+    reasoning: Option<bool>,
     #[serde(default)]
-    tool_call: bool,
+    tool_call: Option<bool>,
     #[serde(default)]
     release_date: Option<String>,
     #[serde(default)]
@@ -134,8 +136,10 @@ struct ModelDoc {
 
 #[derive(Deserialize, Default)]
 struct ModalitiesDoc {
+    /// Absent means the catalog does not say which inputs the model takes,
+    /// even when it lists the outputs.
     #[serde(default)]
-    input: Vec<String>,
+    input: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -245,10 +249,16 @@ fn validate(provider: &'static str, id: &str, raw: serde_json::Value) -> Option<
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| id.to_string());
     let limit = doc.limit.unwrap_or_default();
-    let supports_vision = doc.attachment
-        || doc
-            .modalities
-            .is_some_and(|modalities| modalities.input.iter().any(|kind| kind == "image"));
+    let image_input = doc
+        .modalities
+        .as_ref()
+        .and_then(|modalities| modalities.input.as_ref())
+        .map(|input| input.iter().any(|kind| kind == "image"));
+    let supports_vision = match (doc.attachment, image_input) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (None, None) => None,
+        _ => Some(false),
+    };
     Some(CatalogModel {
         provider: provider.to_string(),
         model_id: id.to_string(),

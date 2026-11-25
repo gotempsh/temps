@@ -50583,22 +50583,29 @@
             "type": "string"
           },
           "supports_reasoning": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "supports_tools": {
-            "type": "boolean"
+            "description": "`null` when the catalog does not say.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "supports_vision": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [
           "provider",
           "model_id",
           "display_name",
-          "supports_tools",
-          "supports_vision",
-          "supports_reasoning",
           "deprecated",
           "source_url",
           "fetched_at"
@@ -190585,6 +190592,15 @@
             "description": "Look inside the workspace again instead of returning the cached check.",
             "in": "query",
             "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Return only what was last read, never looking inside the workspace\n(which could create or wake it). Not checked yet: every version field\nand `checked_at` are null. Ignored when `refresh` is set.",
+            "in": "query",
+            "name": "cached_only",
             "required": false,
             "schema": {
               "type": "boolean"

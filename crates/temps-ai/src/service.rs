@@ -458,6 +458,21 @@ pub trait AiService: Send + Sync {
         })
     }
 
+    /// The last status read from the caller's workspace, stale or not, or
+    /// `None` when it has never been read. Never looks inside the workspace,
+    /// so a caller that only wants to show what is known does not create or
+    /// wake one.
+    async fn cached_workspace_harness_update_status(
+        &self,
+        provider: &str,
+        _principal_id: i32,
+    ) -> Result<Option<crate::HarnessUpdateStatus>, AiError> {
+        Err(AiError::Provider {
+            purpose: "provider.harness.update".into(),
+            reason: format!("harness updates are unavailable for '{provider}'"),
+        })
+    }
+
     /// Update the provider's harness CLI inside the caller's persistent
     /// workspace to the latest release and return its new status.
     async fn update_workspace_harness(

@@ -42,6 +42,8 @@ struct FakeWorkspaces {
     lookup_failing: Vec<i32>,
     /// npm exits zero but the CLI on PATH still reports the old version.
     stale_after_update: Vec<i32>,
+    /// The installed CLI cannot report its version; npm still can.
+    unreadable: Vec<i32>,
     updates: Mutex<Vec<(String, i32)>>,
     status_checks: Mutex<usize>,
 }
@@ -92,6 +94,14 @@ impl AiService for FakeWorkspaces {
                 update_available: false,
                 detail: Some("npm view timed out".into()),
                 ..status(provider, "1.0.0", "1.0.0")
+            });
+        }
+        if self.unreadable.contains(&principal_id) {
+            return Ok(HarnessUpdateStatus {
+                installed_version: None,
+                update_available: false,
+                detail: Some("the installed version could not be read from the workspace".into()),
+                ..status(provider, "1.0.0", "1.1.0")
             });
         }
         Ok(if self.behind.contains(&principal_id) {
@@ -497,4 +507,86 @@ async fn one_pass_touches_a_bounded_number_of_workspaces() {
     let next = service.run_auto_update_pass().await.unwrap();
     assert_eq!(next.updated, MAX_UPDATES_PER_PASS);
     assert_eq!(ai.updates.lock().unwrap()[MAX_UPDATES_PER_PASS].1, 11);
+}
+
+#[tokio::test]
+async fn an_unreadable_installed_cli_is_a_failed_check() {
+    let Some(db) = test_db().await else { return };
+    let ai = Arc::new(FakeWorkspaces {
+        recent: HashMap::from([("claude_cli", vec![1])]),
+        unreadable: vec![1],
+        ..Default::default()
+    });
+    let service = service(
+        db.connection_arc(),
+        ai.clone(),
+        Arc::new(RecordingAudit::default()),
+        "https://registry.invalid/",
+    );
+    enable_auto_update(&service).await;
+    let pass = service.run_auto_update_pass().await.unwrap();
+    assert_eq!(
+        pass,
+        AutoUpdatePass {
+            checked: 1,
+            updated: 0,
+            failed: 1,
+            busy: 0
+        }
+    );
+    assert!(ai.updates.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn busy_workspaces_do_not_starve_the_idle_ones_behind_them() {
+    let Some(db) = test_db().await else { return };
+    let busy: Vec<i32> = (1..=MAX_UPDATES_PER_PASS as i32).collect();
+    let idle = MAX_UPDATES_PER_PASS as i32 + 1;
+    let mut recent = busy.clone();
+    recent.push(idle);
+    let ai = Arc::new(FakeWorkspaces {
+        recent: HashMap::from([("claude_cli", recent.clone()), ("codex_cli", vec![idle])]),
+        behind: recent,
+        busy,
+        ..Default::default()
+    });
+    let service = service(
+        db.connection_arc(),
+        ai.clone(),
+        Arc::new(RecordingAudit::default()),
+        "https://registry.invalid/",
+    );
+    enable_auto_update(&service).await;
+    let pass = service.run_auto_update_pass().await.unwrap();
+    assert_eq!(pass.busy, MAX_UPDATES_PER_PASS);
+    assert_eq!(
+        *ai.updates.lock().unwrap(),
+        vec![
+            ("claude_cli".to_string(), idle),
+            ("codex_cli".to_string(), idle)
+        ],
+        "the idle workspace and the next provider are still reached"
+    );
+}
+
+#[tokio::test]
+async fn a_pass_stops_after_a_bounded_number_of_busy_workspaces() {
+    let Some(db) = test_db().await else { return };
+    let busy: Vec<i32> = (1..=100).collect();
+    let ai = Arc::new(FakeWorkspaces {
+        recent: HashMap::from([("claude_cli", busy.clone())]),
+        behind: busy.clone(),
+        busy,
+        ..Default::default()
+    });
+    let service = service(
+        db.connection_arc(),
+        ai.clone(),
+        Arc::new(RecordingAudit::default()),
+        "https://registry.invalid/",
+    );
+    enable_auto_update(&service).await;
+    let pass = service.run_auto_update_pass().await.unwrap();
+    assert_eq!(pass.checked, MAX_WORKSPACES_EXAMINED_PER_PASS);
+    assert_eq!(pass.busy, MAX_WORKSPACES_EXAMINED_PER_PASS);
 }

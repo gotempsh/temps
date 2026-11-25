@@ -59,6 +59,7 @@ tempfile = { workspace = true }
 [dev-dependencies]
 temps-sandbox-providers = { path = "../temps-sandbox-providers", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
+tower = { workspace = true }
 
 [lints]
 workspace = true

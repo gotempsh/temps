@@ -55,6 +55,10 @@ pub const RECENT_WORKSPACE_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
 pub const AUTO_UPDATE_COOLDOWN: Duration = Duration::from_secs(6 * 60 * 60);
 /// Bounded fan-out: workspaces touched by one pass.
 pub const MAX_UPDATES_PER_PASS: usize = 10;
+/// Busy workspaces do not use up `MAX_UPDATES_PER_PASS` (they are retried,
+/// and ten of them must not starve the idle ones behind), but every
+/// workspace looked at counts against this bound.
+pub const MAX_WORKSPACES_EXAMINED_PER_PASS: usize = 4 * MAX_UPDATES_PER_PASS;
 const FIRST_PASS_DELAY: Duration = Duration::from_secs(5 * 60);
 const PASS_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
@@ -320,7 +324,9 @@ impl CodingAgentService {
                 .recent_workspace_principals(package.provider_id, RECENT_WORKSPACE_WINDOW)
                 .await;
             for principal_id in principals {
-                if outcome.checked >= MAX_UPDATES_PER_PASS {
+                if outcome.checked - outcome.busy >= MAX_UPDATES_PER_PASS
+                    || outcome.checked >= MAX_WORKSPACES_EXAMINED_PER_PASS
+                {
                     break 'packages;
                 }
                 if self.attempted_recently(package.provider_id, principal_id, now) {
@@ -368,21 +374,23 @@ impl CodingAgentService {
             self.record_attempt(provider_id, principal_id, now);
             return;
         }
-        // Without a latest version there is nothing to compare: the release
-        // lookup failed (registry timeout, `npm view` error). That is a failed
-        // check, not an up-to-date CLI.
-        if status.latest_version.is_none() {
+        // Without both versions there is nothing to compare: the release
+        // lookup failed (registry timeout, `npm view` error) or the CLI in the
+        // workspace could not report its version (a broken install). Either
+        // is a failed check, not an up-to-date CLI.
+        if status.latest_version.is_none() || status.installed_version.is_none() {
             self.record_attempt(provider_id, principal_id, now);
             outcome.failed += 1;
             warn!(
                 provider_id,
                 principal_id,
                 installed = status.installed_version.as_deref().unwrap_or("unknown"),
+                latest = status.latest_version.as_deref().unwrap_or("unknown"),
                 detail = status
                     .detail
                     .as_deref()
-                    .unwrap_or("no latest version reported"),
-                "Coding-agent release lookup failed; automatic update skipped"
+                    .unwrap_or("a version was not reported"),
+                "Coding-agent version check incomplete; automatic update skipped"
             );
             return;
         }
@@ -487,7 +495,8 @@ impl CodingAgentService {
 
     /// Run automatic-update passes in the background for the life of the
     /// process.
-    pub fn spawn_background(self: Arc<Self>) {
+    /// The returned handle is the only one; aborting it stops the task.
+    pub fn spawn_background(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             tokio::time::sleep(FIRST_PASS_DELAY).await;
             let mut ticker = tokio::time::interval(PASS_INTERVAL);
@@ -498,7 +507,7 @@ impl CodingAgentService {
                     warn!(error = %error, "Coding-agent automatic update pass failed");
                 }
             }
-        });
+        })
     }
 }
 
