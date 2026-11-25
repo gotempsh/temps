@@ -6,6 +6,7 @@ import {
   BASELINE_PATH,
   describeSecurityDrift,
   operationsWithoutSecurity,
+  requiresAuthentication,
   securityDrift,
 } from './openapi-security'
 import { SPEC_PATH } from './openapi-canonical'
@@ -21,15 +22,27 @@ const spec = {
     },
     '/status/{slug}': { get: {} },
     '/auth/login': { post: { security: bearer } },
+    '/anonymous': { get: { security: [{}] } },
+    '/optional-auth': { get: { security: [{}, { bearer_auth: [] }] } },
   },
 }
 
 describe('operationsWithoutSecurity', () => {
-  test('lists operations with a missing or empty security list, sorted', () => {
+  test('lists operations with a missing, empty or anonymous security list, sorted', () => {
     expect(operationsWithoutSecurity(spec)).toEqual([
+      'GET /anonymous',
+      'GET /optional-auth',
       'GET /status/{slug}',
       'POST /projects/{project_id}/env-vars',
     ])
+  })
+
+  test('an empty requirement object is the anonymous alternative', () => {
+    expect(requiresAuthentication(bearer)).toBe(true)
+    expect(requiresAuthentication([{}])).toBe(false)
+    expect(requiresAuthentication([{}, { bearer_auth: [] }])).toBe(false)
+    expect(requiresAuthentication([])).toBe(false)
+    expect(requiresAuthentication(undefined)).toBe(false)
   })
 
   test('is empty for a document without paths', () => {
@@ -40,7 +53,7 @@ describe('operationsWithoutSecurity', () => {
 
 describe('securityDrift', () => {
   test('flags an unsecured operation the baseline does not list', () => {
-    const drift = securityDrift(spec, ['GET /status/{slug}'])
+    const drift = securityDrift(spec, ['GET /anonymous', 'GET /optional-auth', 'GET /status/{slug}'])
     expect(drift).toEqual({ undeclared: ['POST /projects/{project_id}/env-vars'], stale: [] })
     const message = describeSecurityDrift(drift) ?? ''
     expect(message).toContain('POST /projects/{project_id}/env-vars')
@@ -49,6 +62,8 @@ describe('securityDrift', () => {
 
   test('flags a baseline entry that now declares security or is gone', () => {
     const drift = securityDrift(spec, [
+      'GET /anonymous',
+      'GET /optional-auth',
       'GET /status/{slug}',
       'POST /projects/{project_id}/env-vars',
       'POST /auth/login',
@@ -59,7 +74,12 @@ describe('securityDrift', () => {
   })
 
   test('passes when the baseline matches', () => {
-    const drift = securityDrift(spec, ['GET /status/{slug}', 'POST /projects/{project_id}/env-vars'])
+    const drift = securityDrift(spec, [
+      'GET /anonymous',
+      'GET /optional-auth',
+      'GET /status/{slug}',
+      'POST /projects/{project_id}/env-vars',
+    ])
     expect(describeSecurityDrift(drift)).toBeNull()
   })
 })

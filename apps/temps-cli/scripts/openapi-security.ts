@@ -24,7 +24,24 @@ export const BASELINE_PATH = new URL('../openapi-unsecured-operations.json', imp
 
 const METHODS = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'] as const
 
-/** `METHOD /path` of every operation with no (or an empty) `security` list, sorted. */
+/**
+ * Whether a `security` list requires authentication. The entries are
+ * alternatives, and an empty requirement object (`{}`) is the anonymous
+ * alternative, so a list that contains one, even next to `bearer_auth`,
+ * lets an unauthenticated caller in.
+ */
+export function requiresAuthentication(security: unknown): boolean {
+  return (
+    Array.isArray(security) &&
+    security.length > 0 &&
+    security.every(
+      (requirement) =>
+        requirement !== null && typeof requirement === 'object' && Object.keys(requirement).length > 0,
+    )
+  )
+}
+
+/** `METHOD /path` of every operation whose `security` does not require authentication, sorted. */
 export function operationsWithoutSecurity(spec: unknown): string[] {
   const paths = (spec as { paths?: Record<string, Record<string, unknown>> } | null)?.paths ?? {}
   const unsecured: string[] = []
@@ -32,8 +49,7 @@ export function operationsWithoutSecurity(spec: unknown): string[] {
     for (const method of METHODS) {
       const operation = item?.[method] as { security?: unknown } | undefined
       if (!operation) continue
-      const security = operation.security
-      if (!Array.isArray(security) || security.length === 0) {
+      if (!requiresAuthentication(operation.security)) {
         unsecured.push(`${method.toUpperCase()} ${path}`)
       }
     }
