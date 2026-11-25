@@ -2,7 +2,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { execFileSync } from 'node:child_process'
-import { MCP_SERVER_NAME, redactSecrets, type InstallResult, type McpClientAdapter, type McpServerEntry } from './base.js'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
+import {
+  bridgeUrlFromText,
+  localBridgeCommand,
+  MCP_SERVER_NAME,
+  redactSecrets,
+  type InstallResult,
+  type McpClientAdapter,
+  type McpServerEntry,
+} from './base.js'
 import { execErrorMessage, resolveOnPath } from './exec-utils.js'
 
 /**
@@ -26,7 +37,35 @@ export const TOKEN_ENV_VAR = 'TEMPS_MCP_AUTH_HEADER'
  */
 export function parseCodexMcpGetOutput(output: string): string | null {
   const match = output.match(/^\s*url:\s*(\S+)/m)
-  return match?.[1] ?? null
+  return match?.[1] ?? bridgeUrlFromText(output)
+}
+
+/**
+ * The `codex mcp add` arguments for an entry. Over HTTP, config.toml names
+ * the environment variable that holds the token (see TOKEN_ENV_VAR). The
+ * bridge runs over stdio, and Codex starts it with only the variables its
+ * entry sets, so the key is stored in config.toml; `addServer` then makes
+ * that file readable by this user only.
+ */
+export function codexAddArgs(entry: McpServerEntry): string[] {
+  if (entry.bridge) {
+    const command = localBridgeCommand(entry, entry.bridge)
+    return [
+      'mcp',
+      'add',
+      MCP_SERVER_NAME,
+      ...Object.entries(command.env).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+      '--',
+      command.command,
+      ...command.args,
+    ]
+  }
+  return ['mcp', 'add', MCP_SERVER_NAME, '--url', entry.url, '--bearer-token-env-var', TOKEN_ENV_VAR]
+}
+
+/** Codex's settings file, which holds the key of a bridge entry. */
+export function codexConfigPath(): string {
+  return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml')
 }
 
 // Same rationale as Claude Code: shell out to the official `codex` CLI so
@@ -76,14 +115,21 @@ export class CodexAdapter implements McpClientAdapter {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The codex CLI was not found on PATH.' }
     try {
-      execFileSync(
-        binary,
-        ['mcp', 'add', MCP_SERVER_NAME, '--url', entry.url, '--bearer-token-env-var', TOKEN_ENV_VAR],
-        {
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: { ...process.env, [TOKEN_ENV_VAR]: `Bearer ${entry.apiKey}` },
-        },
-      )
+      execFileSync(binary, codexAddArgs(entry), {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, [TOKEN_ENV_VAR]: `Bearer ${entry.apiKey}` },
+      })
+      if (entry.bridge) {
+        const configPath = codexConfigPath()
+        try {
+          await fs.promises.chmod(configPath, 0o600)
+        } catch (error) {
+          return {
+            success: false,
+            reason: `Codex saved the server, but ${configPath}, which now holds the API key, could not be made private (${execErrorMessage(error)}). Run: chmod 600 ${configPath}`,
+          }
+        }
+      }
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
@@ -108,6 +154,6 @@ export class CodexAdapter implements McpClientAdapter {
   }
 
   async describeTarget(): Promise<string> {
-    return `codex mcp add ${MCP_SERVER_NAME} --url <url> --bearer-token-env-var ${TOKEN_ENV_VAR}`
+    return `codex mcp add ${MCP_SERVER_NAME} (${codexConfigPath()})`
   }
 }

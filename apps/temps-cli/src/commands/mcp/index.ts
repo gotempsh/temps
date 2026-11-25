@@ -16,6 +16,8 @@ import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/inde
 import { TOKEN_ENV_VAR as CODEX_TOKEN_ENV_VAR } from './clients/codex.js'
 import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups.js'
 import { probeMcpEndpoint } from './probe.js'
+import { bridgeAction, bridgePackageSpec, checkBridgeAddress, resolveFolder } from './bridge.js'
+import * as fs from 'node:fs'
 import { addCredentialSources } from '../../lib/value-source.js'
 
 /**
@@ -211,9 +213,19 @@ interface AddOptions {
   yes?: boolean
   apiKey?: string
   url?: string
+  deployFolder?: string[]
 }
 
+/** Collects a repeatable option's values. */
+function collect(value: string, previous: string[] = []): string[] {
+  return [...previous, value]
+}
+
+/** The version `mcp add` pins the bridge to: this CLI's own. */
+let cliVersion = 'latest'
+
 export function registerMcpCommands(program: Command): void {
+  cliVersion = program.version() ?? 'latest'
   const mcp = program
     .command('mcp')
     .description(
@@ -245,8 +257,22 @@ export function registerMcpCommands(program: Command): void {
     .option('-k, --api-key <key>', 'Use this API key instead of creating or prompting for one')
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login)')
+    .option(
+      '-d, --deploy-folder <dir>',
+      'Let the agent deploy project folders from this computer, from inside this folder (repeatable). The app then runs the Temps bridge locally (temps mcp bridge) instead of connecting over HTTP. Implies --write',
+      collect,
+    )
     .action(addAction)
   addCredentialSources(addCommand, [{ flag: 'api-key', what: 'the API key' }])
+
+  mcp
+    .command('bridge')
+    .description(
+      'Run the Temps MCP server on this computer over stdio, adding a tool that deploys local folders. AI apps start this themselves (see mcp add --deploy-folder); the API key comes from TEMPS_API_KEY',
+    )
+    .option('-u, --url <url>', 'The address of your Temps console (default: TEMPS_URL)')
+    .option('-f, --folder <dir>', 'A folder the agent may deploy from, with everything inside it (repeatable)', collect)
+    .action(bridgeAction)
 
   mcp.command('remove [client]').description('Remove the Temps MCP server from an AI client').action(removeAction)
 
@@ -349,7 +375,28 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     groups = []
   }
 
+  const deployFolders = (options.deployFolder ?? []).map(resolveFolder)
+  for (const folder of deployFolders) {
+    if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
+      warning(`${folder} is not a folder on this computer. Pass the folder that holds your projects to --deploy-folder.`)
+      return
+    }
+  }
+  if (deployFolders.length > 0) {
+    // The bridge refuses some addresses (plain HTTP beyond this computer or
+    // a tailnet); say so now, before a key exists, rather than in the app.
+    try {
+      checkBridgeAddress(mcpBaseUrl)
+    } catch (error) {
+      warning(error instanceof Error ? error.message : String(error))
+      return
+    }
+  }
+
+  // Deploying is a change, so a bridge always gets the write tools; the
+  // key's role still decides what runs.
   const write =
+    (deployFolders.length > 0 ? true : undefined) ??
     options.write ??
     (options.yes
       ? false
@@ -399,12 +446,25 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   }
 
   const url = buildMcpUrl(mcpBaseUrl, groups, write)
+  const bridge =
+    deployFolders.length > 0 ? { folders: deployFolders, packageSpec: bridgePackageSpec(cliVersion) } : undefined
 
   newline()
   header(`Configure ${adapter.label}`)
   keyValue('Target', await adapter.describeTarget())
   keyValue('URL', url)
-  keyValue('Primary tools', write ? 'temps, temps_write, confirm_action' : 'temps (read-only)')
+  if (bridge) {
+    keyValue('Runs locally', `npx ${bridge.packageSpec} mcp bridge`)
+    keyValue('Deploys from', bridge.folders.join(', '))
+  }
+  keyValue(
+    'Primary tools',
+    bridge
+      ? 'temps, temps_write, confirm_action, temps_deploy_folder'
+      : write
+        ? 'temps, temps_write, confirm_action'
+        : 'temps (read-only)',
+  )
   if (options.groups) keyValue('Legacy groups', groups.join(', '))
   info('Start with temps --help. Available operations follow the API key permissions.')
   newline()
@@ -417,7 +477,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     }
   }
 
-  const result = await adapter.addServer({ url, apiKey })
+  const result = await adapter.addServer({ url, apiKey, bridge })
   if (!result.success) {
     warning(`Failed to configure ${adapter.label}: ${result.reason}`)
     return
@@ -429,13 +489,18 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     success(`${adapter.label} configured.`)
   }
   info(`Restart ${adapter.label} to pick up the change.`)
+  if (!bridge) {
+    info(
+      `To let ${adapter.label} deploy project folders from this computer, run this again with --deploy-folder <folder that holds your projects>.`,
+    )
+  }
 
   // Codex resolves its bearer token from its OWN process environment at
   // connect time -- config.toml only stores the env var's name, never the
   // value (see codex.ts's TOKEN_ENV_VAR doc comment). Without this export,
   // `codex mcp add` reports success but real codex sessions will silently
   // fail to authenticate.
-  if (adapter.id === 'codex') {
+  if (adapter.id === 'codex' && !bridge) {
     newline()
     warning(
       `Codex reads its bearer token from the ${CODEX_TOKEN_ENV_VAR} environment variable at connect time -- export it in your shell profile, or every codex session will fail to authenticate to Temps:`,

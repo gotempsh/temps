@@ -5,7 +5,15 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { MCP_SERVER_NAME, redactSecrets, type InstallResult, type McpClientAdapter, type McpServerEntry } from './base.js'
+import {
+  bridgeUrlFromText,
+  localBridgeCommand,
+  MCP_SERVER_NAME,
+  redactSecrets,
+  type InstallResult,
+  type McpClientAdapter,
+  type McpServerEntry,
+} from './base.js'
 import { execErrorMessage, resolveOnPath } from './exec-utils.js'
 
 /**
@@ -15,7 +23,41 @@ import { execErrorMessage, resolveOnPath } from './exec-utils.js'
  */
 export function parseClaudeCodeMcpGetOutput(output: string): string | null {
   const match = output.match(/^\s*URL:\s*(\S+)/m)
-  return match?.[1] ?? null
+  return match?.[1] ?? bridgeUrlFromText(output)
+}
+
+/**
+ * The `claude mcp add` arguments for an entry: the HTTP endpoint, or the
+ * bridge over stdio when it deploys local folders. The name comes before
+ * `-e`, which takes several values, and `--` ends the options.
+ */
+export function claudeCodeAddArgs(entry: McpServerEntry): string[] {
+  if (entry.bridge) {
+    const command = localBridgeCommand(entry, entry.bridge)
+    return [
+      'mcp',
+      'add',
+      '--scope',
+      'user',
+      MCP_SERVER_NAME,
+      ...Object.entries(command.env).flatMap(([name, value]) => ['-e', `${name}=${value}`]),
+      '--',
+      command.command,
+      ...command.args,
+    ]
+  }
+  return [
+    'mcp',
+    'add',
+    '--transport',
+    'http',
+    '--scope',
+    'user',
+    MCP_SERVER_NAME,
+    entry.url,
+    '--header',
+    `Authorization: Bearer ${entry.apiKey}`,
+  ]
 }
 
 // Claude Code owns its own config format/location, so this shells out to the
@@ -84,22 +126,7 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
       // key is briefly visible in this process's argv (e.g. /proc/<pid>/cmdline
       // on Linux) for the duration of the exec call. Tracked as a known
       // upstream limitation rather than worked around with a fragile hack.
-      execFileSync(
-        binary,
-        [
-          'mcp',
-          'add',
-          '--transport',
-          'http',
-          '--scope',
-          'user',
-          MCP_SERVER_NAME,
-          entry.url,
-          '--header',
-          `Authorization: Bearer ${entry.apiKey}`,
-        ],
-        { stdio: ['ignore', 'pipe', 'pipe'] },
-      )
+      execFileSync(binary, claudeCodeAddArgs(entry), { stdio: ['ignore', 'pipe', 'pipe'] })
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
@@ -124,6 +151,6 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
   }
 
   async describeTarget(): Promise<string> {
-    return `claude mcp add --transport http --scope user ${MCP_SERVER_NAME} <url>`
+    return `claude mcp add --scope user ${MCP_SERVER_NAME} (Claude Code's user settings)`
   }
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { parseClaudeCodeMcpGetOutput } from './claude-code.js'
+import { claudeCodeAddArgs, parseClaudeCodeMcpGetOutput } from './claude-code.js'
 
 describe('parseClaudeCodeMcpGetOutput', () => {
   test('extracts the URL from a well-formed mcp get entry', () => {
@@ -37,5 +37,56 @@ describe('parseClaudeCodeMcpGetOutput', () => {
   test('takes the first URL: line when the output has multiple (defensive; real CLI only emits one)', () => {
     const output = 'URL: http://first.example.com/mcp\nURL: http://second.example.com/mcp\n'
     expect(parseClaudeCodeMcpGetOutput(output)).toBe('http://first.example.com/mcp')
+  })
+})
+
+describe('claudeCodeAddArgs', () => {
+  test('over HTTP, the endpoint and the key as a header', () => {
+    expect(claudeCodeAddArgs({ url: 'https://temps.example.com/mcp?write=1', apiKey: 'k' })).toEqual([
+      'mcp',
+      'add',
+      '--transport',
+      'http',
+      '--scope',
+      'user',
+      'temps',
+      'https://temps.example.com/mcp?write=1',
+      '--header',
+      'Authorization: Bearer k',
+    ])
+  })
+
+  test('with deploy folders, the bridge over stdio: the name before -e, the command after --', () => {
+    expect(
+      claudeCodeAddArgs({
+        url: 'https://temps.example.com/mcp?write=1',
+        apiKey: 'k',
+        bridge: { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
+      }),
+    ).toEqual([
+      'mcp',
+      'add',
+      '--scope',
+      'user',
+      'temps',
+      '-e',
+      'TEMPS_API_KEY=k',
+      '--',
+      'npx',
+      '-y',
+      '@temps-sdk/cli@1.2.3',
+      'mcp',
+      'bridge',
+      '--url',
+      'https://temps.example.com',
+      '--folder',
+      '/srv/apps',
+    ])
+  })
+
+  test('status reads a bridge entry back as read/write', () => {
+    const output =
+      'temps:\n  Scope: User config\n  Type: stdio\n  Command: npx\n  Args: -y @temps-sdk/cli@1.2.3 mcp bridge --url https://temps.example.com --folder /srv/apps\n'
+    expect(parseClaudeCodeMcpGetOutput(output)).toBe('https://temps.example.com/mcp?write=1')
   })
 })

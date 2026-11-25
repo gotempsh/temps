@@ -44,6 +44,7 @@ syntax may have changed.
 - [`server`](server.md)
 - [`traces`](traces.md)
 - [`facets`](facets.md)
+- [`ingress`](ingress.md)
 - [`otel-forward`](otel-forward.md)
 - [`otel`](otel.md)
 - [`flags`](flags.md)

@@ -13,6 +13,67 @@ import * as jsonc from 'jsonc-parser/lib/esm/main.js'
 export interface McpServerEntry {
   url: string
   apiKey: string
+  /**
+   * Run the Temps bridge on this computer (`temps mcp bridge`) instead of
+   * connecting to `url`: the app starts it over stdio, and it adds the
+   * `temps_deploy_folder` tool for these folders.
+   */
+  bridge?: LocalBridge
+}
+
+export interface LocalBridge {
+  /** Full paths of the folders the agent may deploy from. */
+  folders: string[]
+  /** The npm package that provides `temps mcp bridge`, pinned to a version. */
+  packageSpec: string
+}
+
+/** How an app starts the bridge. The key is in `env`, never in `args`, so it stays out of the process list. */
+export interface LocalBridgeCommand {
+  command: string
+  args: string[]
+  env: Record<string, string>
+}
+
+export function localBridgeCommand(entry: McpServerEntry, bridge: LocalBridge): LocalBridgeCommand {
+  return {
+    command: 'npx',
+    args: [
+      '-y',
+      bridge.packageSpec,
+      'mcp',
+      'bridge',
+      '--url',
+      new URL(entry.url).origin,
+      ...bridge.folders.flatMap((folder) => ['--folder', folder]),
+    ],
+    env: { TEMPS_API_KEY: entry.apiKey },
+  }
+}
+
+/**
+ * The MCP URL a bridge entry connects to, from its command line: the bridge
+ * always asks for the write tools. Null when the arguments are not a bridge.
+ */
+export function bridgeUrlFromArgs(args: unknown): string | null {
+  if (!Array.isArray(args)) return null
+  const bridgeAt = args.findIndex((arg, i) => arg === 'bridge' && args[i - 1] === 'mcp')
+  const urlAt = args.indexOf('--url')
+  const url = urlAt === -1 ? undefined : args[urlAt + 1]
+  if (bridgeAt === -1 || typeof url !== 'string') return null
+  try {
+    const mcp = new URL('/mcp', new URL(url).origin)
+    mcp.searchParams.set('write', '1')
+    return mcp.toString()
+  } catch {
+    return null
+  }
+}
+
+/** The same, from the text an app's `mcp get` prints for a bridge entry. */
+export function bridgeUrlFromText(text: string): string | null {
+  const match = text.match(/\bmcp\s+bridge\b[\s\S]*?--url\s+(\S+)/)
+  return match?.[1] ? bridgeUrlFromArgs(['mcp', 'bridge', '--url', match[1]]) : null
 }
 
 export interface InstallResult {
@@ -62,6 +123,10 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
   protected abstract getConfigPath(): string
   protected abstract getServerPropertyName(): string
   protected abstract buildServerConfig(entry: McpServerEntry): Record<string, unknown>
+  /** The entry that starts the bridge over stdio. Most apps take a command, its arguments and environment. */
+  protected buildBridgeConfig(command: LocalBridgeCommand): Record<string, unknown> {
+    return { command: command.command, args: command.args, env: command.env }
+  }
   /** Pulls the connection URL back out of a config entry previously built by buildServerConfig. */
   protected abstract extractUrl(serverConfig: Record<string, unknown>): string | null
 
@@ -88,7 +153,8 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
 
   async getServerUrl(): Promise<string | null> {
     const serverConfig = await this.readServerConfig()
-    return serverConfig ? this.extractUrl(serverConfig) : null
+    if (!serverConfig) return null
+    return bridgeUrlFromArgs(serverConfig.args) ?? this.extractUrl(serverConfig)
   }
 
   async addServer(entry: McpServerEntry): Promise<InstallResult> {
@@ -110,7 +176,9 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
 
       const prop = this.getServerPropertyName()
       const existing = (jsonc.parse(content || '{}') ?? {}) as Record<string, any>
-      const newEntry = this.buildServerConfig(entry)
+      const newEntry = entry.bridge
+        ? this.buildBridgeConfig(localBridgeCommand(entry, entry.bridge))
+        : this.buildServerConfig(entry)
       const currentEntry = existing?.[prop]?.[MCP_SERVER_NAME]
 
       if (currentEntry !== undefined && JSON.stringify(currentEntry) === JSON.stringify(newEntry)) {

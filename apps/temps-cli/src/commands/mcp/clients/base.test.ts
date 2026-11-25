@@ -6,7 +6,13 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writ
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as jsonc from 'jsonc-parser'
-import { JsonConfigMcpClientAdapter, type McpServerEntry } from './base.js'
+import {
+  bridgeUrlFromArgs,
+  bridgeUrlFromText,
+  JsonConfigMcpClientAdapter,
+  localBridgeCommand,
+  type McpServerEntry,
+} from './base.js'
 
 class TestAdapter extends JsonConfigMcpClientAdapter {
   readonly id = 'test-client'
@@ -146,5 +152,79 @@ describe('JsonConfigMcpClientAdapter', () => {
     await adapter.removeServer()
 
     expect(statSync(configPath).mode & 0o777).toBe(0o600)
+  })
+})
+
+describe('the local bridge entry', () => {
+  let dir: string
+  const entry: McpServerEntry = {
+    url: 'https://temps.example.test/mcp?write=1',
+    apiKey: 'secret-key',
+    bridge: { folders: ['/Users/me/code', '/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'temps-mcp-bridge-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('the app starts the pinned CLI with the folders, and the key only in its environment', () => {
+    const command = localBridgeCommand(entry, entry.bridge!)
+    expect(command).toEqual({
+      command: 'npx',
+      args: [
+        '-y',
+        '@temps-sdk/cli@1.2.3',
+        'mcp',
+        'bridge',
+        '--url',
+        'https://temps.example.test',
+        '--folder',
+        '/Users/me/code',
+        '--folder',
+        '/srv/apps',
+      ],
+      env: { TEMPS_API_KEY: 'secret-key' },
+    })
+    expect(command.args.join(' ')).not.toContain('secret-key')
+  })
+
+  test('a JSON-config app gets a stdio entry, and status reads it back as read/write', async () => {
+    const configPath = join(dir, 'config.json')
+    const adapter = new TestAdapter(configPath)
+    expect(await adapter.addServer(entry)).toEqual({ success: true })
+    const written = JSON.parse(readFileSync(configPath, 'utf8'))
+    expect(written.mcpServers.temps).toEqual(localBridgeCommand(entry, entry.bridge!))
+    expect(statSync(configPath).mode & 0o777).toBe(0o600)
+    expect(await adapter.getServerUrl()).toBe('https://temps.example.test/mcp?write=1')
+  })
+
+  test('VS Code marks the entry as stdio', async () => {
+    const { VsCodeAdapter } = await import('./vscode.js')
+    class TempVsCode extends VsCodeAdapter {
+      protected override getConfigPath(): string {
+        return join(dir, 'mcp.json')
+      }
+    }
+    await new TempVsCode().addServer(entry)
+    const written = JSON.parse(readFileSync(join(dir, 'mcp.json'), 'utf8'))
+    expect(written.servers.temps.type).toBe('stdio')
+    expect(written.servers.temps.command).toBe('npx')
+  })
+
+  test('the URL of a bridge entry, from its arguments or from printed text', () => {
+    const args = localBridgeCommand(entry, entry.bridge!).args
+    expect(bridgeUrlFromArgs(args)).toBe('https://temps.example.test/mcp?write=1')
+    expect(bridgeUrlFromArgs(['-y', 'mcp-remote', 'https://temps.example.test/mcp'])).toBeNull()
+    expect(bridgeUrlFromArgs('not a list')).toBeNull()
+    expect(
+      bridgeUrlFromText(
+        'temps:\n  Type: stdio\n  Command: npx\n  Args: -y @temps-sdk/cli@1.2.3 mcp bridge --url https://temps.example.test --folder /srv/apps\n',
+      ),
+    ).toBe('https://temps.example.test/mcp?write=1')
+    expect(bridgeUrlFromText('URL: https://temps.example.test/mcp')).toBeNull()
   })
 })

@@ -258,7 +258,7 @@ export type AcmeOrderResponse = {
     updated_at: number;
 };
 
-export type ActionKind = 'make_reachable' | 'deploy' | 'set_dns_record' | 'open_ingress' | 'open_worker' | 'wait' | 'run_command';
+export type ActionKind = 'make_reachable' | 'deploy' | 'set_dns_record' | 'open_ingress' | 'open_worker' | 'wait' | 'run_command' | 'serve_privately';
 
 export type ActivateProviderResponse = {
     default_provider: string;
@@ -1456,7 +1456,7 @@ export type AiHarnessCredential = {
 /**
  * Which credential proved the harness connected.
  */
-export type AiHarnessCredentialKind = 'dedicated_key' | 'cli_login';
+export type AiHarnessCredentialKind = 'dedicated_key' | 'cli_login' | 'mcp_client';
 
 /**
  * Where the harness onboarding stands for the calling user.
@@ -9072,6 +9072,7 @@ export type CreateEnvironmentRequest = {
 
 export type CreateEnvironmentVariableRequest = {
     environment_ids: Array<number>;
+    generate?: GenerateValueRequest | null;
     /**
      * Include this environment variable in preview environments (default: false)
      */
@@ -9084,7 +9085,11 @@ export type CreateEnvironmentVariableRequest = {
      */
     is_secret?: boolean;
     key: string;
-    value: string;
+    /**
+     * The value. Leave it empty and set `generate` to have the server make
+     * one instead.
+     */
+    value?: string;
 };
 
 export type CreateEnvironmentVolumeRequest = {
@@ -10003,6 +10008,17 @@ export type CreateProjectRequest = {
      * For `docker_image` and `static_files` source types, `repo_name` and `repo_owner` are optional.
      */
     source_type?: SourceType;
+    /**
+     * Variable aliases for each linked storage service, keyed by service id
+     * (as a string, JSON object keys being strings): app name → injected
+     * name, such as `{"12": {"DATABASE_URL": "POSTGRES_URL"}}`. Set before
+     * the first deployment is queued.
+     */
+    storage_service_env_aliases?: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
     storage_service_ids?: Array<number>;
     use_default_wildcard?: boolean | null;
 };
@@ -11244,6 +11260,37 @@ export type DatabaseMetricsRow = {
 };
 
 /**
+ * A managed database the app could get, with what it would fill.
+ */
+export type DatabaseOptionResponse = {
+    /**
+     * App name → injected name for the keys it fills under another name
+     * (`DATABASE_URL` → `POSTGRES_URL`); set on the link as `env_aliases`.
+     */
+    envAliases: {
+        [key: string]: string;
+    };
+    evidence: Array<string>;
+    label: string;
+    /**
+     * Env-example keys a linked database of this type fills.
+     */
+    provides: Array<string>;
+    /**
+     * One line naming the evidence, when suggested.
+     */
+    reason?: string | null;
+    /**
+     * The service type to create: `postgres`, `mariadb`, `mongodb`, `redis`.
+     */
+    serviceType: string;
+    /**
+     * The repository points at this database.
+     */
+    suggested: boolean;
+};
+
+/**
  * Controls which logical database a deployment receives through a
  * project-to-service link.
  */
@@ -11286,6 +11333,24 @@ export type DecideRequest = {
  * A user's answer to a conflict (ADR 064 D4), journaled with the entry.
  */
 export type Decision = 'keep' | 'overwrite';
+
+/**
+ * The install's default way in, which a new project's "Make it reachable"
+ * starts from so the answer is not asked again.
+ */
+export type DefaultReach = {
+    audience: ReachAudience;
+    /**
+     * The tunnel connector, when the way is a tunnel and one exists.
+     */
+    connector_id?: number | null;
+    /**
+     * Base domain for a wildcard; `null` per app and for the tailnet name.
+     */
+    domain?: string | null;
+    naming: ReachNaming;
+    way: ReachWay;
+};
 
 export type DeferredWalGeneration = {
     bytes: number;
@@ -12469,6 +12534,15 @@ export type DiscoveredModelResponse = {
     owned_by: string;
 };
 
+export type DiskFact = {
+    available_bytes: number;
+    /**
+     * The mount point holding Temps' data directory.
+     */
+    mount_point: string;
+    total_bytes: number;
+};
+
 /**
  * Disk space information for a single disk/partition
  */
@@ -13506,6 +13580,15 @@ export type DockerDiskUsageCategory = {
      * Number of objects in this category (all images, all containers, …).
      */
     total_count: number;
+};
+
+export type DockerFact = {
+    /**
+     * Why Docker could not be read, when it could not.
+     */
+    error?: string | null;
+    running: boolean;
+    version?: string | null;
 };
 
 export type DockerRegistrySettings = {
@@ -14718,6 +14801,11 @@ export type EnvExampleVariable = {
 
 export type EnvExampleVariableResponse = {
     /**
+     * Temps can generate a value for it server-side (a session secret, not
+     * a credential for another service).
+     */
+    canGenerate?: boolean;
+    /**
      * Placeholder/default value as written in the file (may be empty)
      */
     defaultValue: string;
@@ -14730,6 +14818,11 @@ export type EnvExampleVariableResponse = {
      * Variable name (e.g. "DATABASE_URL")
      */
     key: string;
+    /**
+     * The key looks like it holds a secret (`*_SECRET`, `*_KEY`,
+     * `*_TOKEN`, ...); public client keys (`NEXT_PUBLIC_*`) never do.
+     */
+    looksSecret?: boolean;
 };
 
 /**
@@ -17636,6 +17729,22 @@ export type GenerateJoinTokenResponse = {
 };
 
 /**
+ * Ask the server to generate the value instead of sending one.
+ */
+export type GenerateValueRequest = {
+    /**
+     * Random bytes, from 16 to 64; 32 when omitted.
+     */
+    bytes?: number;
+    kind: GeneratedValueKind;
+};
+
+/**
+ * What to generate.
+ */
+export type GeneratedValueKind = 'secret';
+
+/**
  * Freshness of the geolocation database backing this instance
  */
 export type GeoDatabaseStatusResponse = {
@@ -19343,6 +19452,29 @@ export type HistogramSummary = {
 };
 
 /**
+ * The control plane's machine, as the welcome flow's first screen shows it.
+ */
+export type HostFacts = {
+    cpu_cores: number;
+    disk?: DiskFact | null;
+    docker: DockerFact;
+    hostname?: string | null;
+    inbound: InboundCheck;
+    lan_ip?: string | null;
+    memory: MemoryFact;
+    /**
+     * Ports 80 and 443 on this machine.
+     */
+    ports: Array<PortFact>;
+    public_ip?: string | null;
+    /**
+     * Swap configured; `0` when there is none.
+     */
+    swap_total_bytes: number;
+    tailscale: TailscaleFact;
+};
+
+/**
  * One host's sandbox image preparation, as the API reports it.
  */
 export type HostImagePreparation = {
@@ -20288,6 +20420,21 @@ export type ImportedHostVerdict = {
      * Whether the cert was written (or would be written on `dry_run: false`).
      */
     success: boolean;
+};
+
+export type InboundCheck = {
+    /**
+     * Whether ports 80 and 443 were checked from outside the box.
+     */
+    checked: boolean;
+    /**
+     * Why it was not checked, or what was found.
+     */
+    note: string;
+    /**
+     * The answer, when checked.
+     */
+    reachable?: boolean | null;
 };
 
 /**
@@ -21626,6 +21773,13 @@ export type LinkServiceRequest = {
      * How deployments linked through this service select a logical database.
      */
     database_provisioning_mode?: DatabaseProvisioningMode;
+    /**
+     * Extra names for injected variables: app name → injected name, such as
+     * `{"DATABASE_URL": "POSTGRES_URL"}`. The link injects both.
+     */
+    env_aliases?: {
+        [key: string]: string;
+    };
     project_id: number;
 };
 
@@ -22686,6 +22840,14 @@ export type MemberSyncResult = {
     name: string;
     project_id: number;
     slug: string;
+};
+
+export type MemoryFact = {
+    /**
+     * Memory the OS reports as available for new work now.
+     */
+    available_bytes: number;
+    total_bytes: number;
 };
 
 /**
@@ -25324,6 +25486,75 @@ export type OnDemandTlsSettings = {
     zone?: string | null;
 };
 
+/**
+ * A step to leave for later, as sent by a client.
+ */
+export type OnboardingLaterInput = {
+    reason: string;
+    step: OnboardingStep;
+};
+
+/**
+ * A step the operator chose to leave for later, and why.
+ */
+export type OnboardingLaterStep = {
+    /**
+     * When it was left for later.
+     */
+    at: string;
+    /**
+     * What the operator said, or the screen's own words ("No domain yet").
+     */
+    reason: string;
+    step: OnboardingStep;
+};
+
+/**
+ * A partial update. Absent fields are left as they are.
+ */
+export type OnboardingPatch = {
+    /**
+     * `true` marks the flow finished (keeping the first time it was);
+     * `false` reopens it.
+     */
+    completed?: boolean | null;
+    default_reach?: DefaultReach | null;
+    /**
+     * Mark these steps done. A step done is no longer "later".
+     */
+    done?: Array<OnboardingStep> | null;
+    /**
+     * Leave these steps for later, replacing an earlier reason for the same
+     * step.
+     */
+    later?: Array<OnboardingLaterInput> | null;
+};
+
+/**
+ * The stored onboarding record.
+ */
+export type OnboardingState = {
+    /**
+     * When the welcome flow was finished or skipped as a whole. `null` until
+     * then: an instance admin with no projects is sent to `/welcome`.
+     */
+    completed_at?: string | null;
+    default_reach?: DefaultReach | null;
+    /**
+     * Steps the operator finished in the welcome flow.
+     */
+    done?: Array<OnboardingStep>;
+    /**
+     * Steps left for later, with why. The Setup page lists them.
+     */
+    later?: Array<OnboardingLaterStep>;
+};
+
+/**
+ * A step of the welcome flow.
+ */
+export type OnboardingStep = 'host' | 'reach' | 'agents' | 'app';
+
 export type OpenAiError = {
     code?: string | null;
     message: string;
@@ -27540,6 +27771,16 @@ export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environmen
  */
 export type PolicySource = 'draft' | 'environment' | 'project' | 'none';
 
+export type PortFact = {
+    holder: PortHolder;
+    port: number;
+};
+
+/**
+ * Who holds a port on this machine.
+ */
+export type PortHolder = 'free' | 'temps' | 'other';
+
 /**
  * Port mapping
  */
@@ -27957,6 +28198,80 @@ export type PrimaryAddress = {
 export type PrincipalKind = 'login' | 'tag';
 
 /**
+ * The stored consent.
+ */
+export type PrivateIngressConsent = {
+    /**
+     * Who counts as inside (ADR-114 D8): private ranges such as
+     * `10.8.0.0/24`. Empty means the listen address's own network (the
+     * interface's subnet, or Tailscale's ranges).
+     */
+    admit?: Array<string>;
+    /**
+     * `tailscale`, or the private address to serve on.
+     */
+    listen: string;
+    /**
+     * Temps may write its own entries in tailscaled's Serve configuration
+     * (ADR 065 D2). Without it Temps never opens the LocalAPI for writing.
+     */
+    tailscale_serve?: boolean;
+    /**
+     * When the consent was last given or changed.
+     */
+    updated_at: string;
+};
+
+/**
+ * What a client sends to give or change the consent.
+ */
+export type PrivateIngressRequest = {
+    /**
+     * Who counts as inside: private ranges such as `10.8.0.0/24`. Leave
+     * empty to admit the listen address's own network.
+     */
+    admit?: Array<string>;
+    /**
+     * `tailscale`, or a private address of this machine: one in
+     * `100.64.0.0/10`, RFC 1918 or `fd00::/8`.
+     */
+    listen: string;
+    tailscale_serve?: boolean;
+};
+
+/**
+ * The consent and what the control plane made of it, as it last reported
+ * in `node_public_ingress` row `0`.
+ */
+export type PrivateIngressStatus = {
+    /**
+     * The ranges admitted now (`10.8.0.0/24`), empty when nothing is
+     * served.
+     */
+    admit: Array<string>;
+    consent?: PrivateIngressConsent | null;
+    /**
+     * Why nothing is served although consent was given, with the fix.
+     */
+    error?: string | null;
+    /**
+     * This machine's private networks, with what serving on each would
+     * admit, for choosing one (ADR-114 D8). Empty where no private-ingress
+     * loop runs in this process.
+     */
+    networks: Array<PrivateNetworkOption>;
+    /**
+     * When the control plane last applied the consent.
+     */
+    reported_at?: string | null;
+    /**
+     * The private address served on now (`100.101.102.103`), `null` when
+     * none is.
+     */
+    serving?: string | null;
+};
+
+/**
  * Information about private/local IP addresses
  */
 export type PrivateIpInfo = {
@@ -27972,6 +28287,24 @@ export type PrivateIpInfo = {
      * The primary private IP address (most likely to be useful)
      */
     primary_ip?: string | null;
+};
+
+/**
+ * A network the console can offer: what serving on it would admit, or why
+ * it cannot be used.
+ */
+export type PrivateNetworkOption = {
+    address: string;
+    /**
+     * The ranges it would admit by default.
+     */
+    admit: Array<string>;
+    interface: string;
+    /**
+     * Why it cannot be served on without naming ranges, if it cannot.
+     */
+    problem?: string | null;
+    tailscale: boolean;
 };
 
 /**
@@ -28280,6 +28613,7 @@ export type ProjectDeliverySettingsResponse = {
  * with its `is_secret` flag.
  */
 export type ProjectEnvVarInput = {
+    generate?: GenerateValueRequest | null;
     /**
      * Mark the variable as a secret. Secret values are encrypted at rest,
      * masked in list responses, and revealable only through an audited,
@@ -28291,9 +28625,9 @@ export type ProjectEnvVarInput = {
      */
     key: string;
     /**
-     * Variable value
+     * Variable value. Leave empty when `generate` is set.
      */
-    value: string;
+    value?: string;
 };
 
 export type ProjectGroupListResponse = {
@@ -30324,6 +30658,11 @@ export type ReachAction = {
 };
 
 /**
+ * Who should reach the apps on this install.
+ */
+export type ReachAudience = 'public' | 'private';
+
+/**
  * Something about an address that visitors can still reach.
  */
 export type ReachFinding = {
@@ -30333,7 +30672,17 @@ export type ReachFinding = {
     message: string;
 };
 
+/**
+ * How apps are named under a domain.
+ */
+export type ReachNaming = 'wildcard' | 'per_app';
+
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
+
+/**
+ * How traffic gets in.
+ */
+export type ReachWay = 'tunnel' | 'direct' | 'tailnet_domain' | 'tailnet_name';
 
 /**
  * `GET …/reachability/choices` (ADR 069 D3): which audiences, and which
@@ -31214,6 +31563,11 @@ export type RepositoryComposeServicesResponse = {
 };
 
 export type RepositoryEnvExampleResponse = {
+    /**
+     * Every database Temps can create, the suggested ones first (strongest
+     * evidence first), each with the keys it would fill.
+     */
+    databases?: Array<DatabaseOptionResponse>;
     /**
      * Path of the detected env-example file (e.g. ".env.example"), `null`
      * if the repository has none
@@ -37999,6 +38353,31 @@ export type TailLogsRequest = {
 export type TailnetPrincipal = {
     kind: PrincipalKind;
     value: string;
+};
+
+export type TailscaleFact = {
+    ip?: string | null;
+    /**
+     * The machine's name on the tailnet, from MagicDNS.
+     */
+    machine?: string | null;
+    /**
+     * MagicDNS answered for this machine.
+     */
+    magic_dns: boolean;
+    /**
+     * What was not read, and why. HTTPS certificates are only known through
+     * tailscaled's LocalAPI, which Temps opens only with consent.
+     */
+    note?: string | null;
+    /**
+     * An interface holds a tailnet address.
+     */
+    running: boolean;
+    /**
+     * The tailnet's MagicDNS suffix, such as `example.ts.net`.
+     */
+    tailnet?: string | null;
 };
 
 /**
@@ -76105,6 +76484,33 @@ export type GetPlatformFeaturesResponses = {
 
 export type GetPlatformFeaturesResponse = GetPlatformFeaturesResponses[keyof GetPlatformFeaturesResponses];
 
+export type GetHostFactsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/platform/host-facts';
+};
+
+export type GetHostFactsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetHostFactsResponses = {
+    /**
+     * Facts about the control plane's machine
+     */
+    200: HostFacts;
+};
+
+export type GetHostFactsResponse = GetHostFactsResponses[keyof GetHostFactsResponses];
+
 export type GetPrivateIpData = {
     body?: never;
     path?: never;
@@ -102176,6 +102582,72 @@ export type RevealGlobalMcpConfigResponses = {
 
 export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
 
+export type GetOnboardingData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/onboarding';
+};
+
+export type GetOnboardingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The record could not be read
+     */
+    500: unknown;
+};
+
+export type GetOnboardingResponses = {
+    /**
+     * The onboarding record
+     */
+    200: OnboardingState;
+};
+
+export type GetOnboardingResponse = GetOnboardingResponses[keyof GetOnboardingResponses];
+
+export type UpdateOnboardingData = {
+    body: OnboardingPatch;
+    path?: never;
+    query?: never;
+    url: '/settings/onboarding';
+};
+
+export type UpdateOnboardingErrors = {
+    /**
+     * The update is invalid; the detail says which field and why
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The record could not be written
+     */
+    500: unknown;
+};
+
+export type UpdateOnboardingResponses = {
+    /**
+     * The updated record
+     */
+    200: OnboardingState;
+};
+
+export type UpdateOnboardingResponse = UpdateOnboardingResponses[keyof UpdateOnboardingResponses];
+
 export type GetPreviewDomainStatusData = {
     body?: never;
     path?: never;
@@ -102203,6 +102675,103 @@ export type GetPreviewDomainStatusResponses = {
 };
 
 export type GetPreviewDomainStatusResponse = GetPreviewDomainStatusResponses[keyof GetPreviewDomainStatusResponses];
+
+export type DeletePrivateIngressData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/private-ingress';
+};
+
+export type DeletePrivateIngressErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The consent could not be written
+     */
+    500: unknown;
+};
+
+export type DeletePrivateIngressResponses = {
+    /**
+     * The consent is withdrawn
+     */
+    204: void;
+};
+
+export type DeletePrivateIngressResponse = DeletePrivateIngressResponses[keyof DeletePrivateIngressResponses];
+
+export type GetPrivateIngressData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/private-ingress';
+};
+
+export type GetPrivateIngressErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The consent could not be read
+     */
+    500: unknown;
+};
+
+export type GetPrivateIngressResponses = {
+    /**
+     * The consent and its status
+     */
+    200: PrivateIngressStatus;
+};
+
+export type GetPrivateIngressResponse = GetPrivateIngressResponses[keyof GetPrivateIngressResponses];
+
+export type PutPrivateIngressData = {
+    body: PrivateIngressRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/private-ingress';
+};
+
+export type PutPrivateIngressErrors = {
+    /**
+     * The address is not one a private listener may use; the detail says why
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The consent could not be written
+     */
+    500: unknown;
+};
+
+export type PutPrivateIngressResponses = {
+    /**
+     * The stored consent
+     */
+    200: PrivateIngressConsent;
+};
+
+export type PutPrivateIngressResponse = PutPrivateIngressResponses[keyof PutPrivateIngressResponses];
 
 export type GetPublicIngressStatusData = {
     body?: never;

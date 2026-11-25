@@ -46,6 +46,7 @@ import { registerMetricsCommands } from './commands/metrics/index.js'
 import { registerServerCommands } from './commands/server/index.js'
 import { registerTracesCommands } from './commands/traces/index.js'
 import { registerFacetsCommands } from './commands/facets/index.js'
+import { registerIngressCommands } from './commands/ingress/index.js'
 import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
 import { registerOtelCommands } from './commands/otel/index.js'
 import { registerKvCommands } from './commands/kv/index.js'
@@ -213,6 +214,7 @@ export function createProgram(): Command {
   registerServerCommands(program)
   registerTracesCommands(program)
   registerFacetsCommands(program)
+  registerIngressCommands(program)
   registerOtelForwardCommands(program)
   registerOtelCommands(program)
   registerKvCommands(program)

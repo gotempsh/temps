@@ -98,6 +98,110 @@ describe('mcp add wizard', () => {
   })
 })
 
+describe('mcp add --deploy-folder', () => {
+  test('the app runs the bridge with the folders, pinned to this CLI, with write tools and no write prompt', async () => {
+    const { Command } = await import('commander')
+    const { mkdtempSync, rmSync, realpathSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const api = await import('../../lib/api-client.js')
+    const prompts = await import('../../ui/prompts.js')
+    const probe = await import('./probe.js')
+    const contexts = await import('../../config/contexts.js')
+    const { getClientAdapter } = await import('./clients/index.js')
+    const adapter = getClientAdapter('cursor')!
+    const folder = realpathSync(mkdtempSync(join(tmpdir(), 'temps-deploy-folder-')))
+    const confirmations: string[] = []
+    const spies = [
+      spyOn(contexts, 'listContexts').mockResolvedValue([
+        { name: 'test', url: 'https://temps.example.test', apiKey: 'test-key', email: 'test@example.test' },
+      ]),
+      spyOn(api, 'setupClient').mockResolvedValue(undefined),
+      spyOn(probe, 'probeMcpEndpoint').mockResolvedValue({ supported: true }),
+      spyOn(adapter, 'isClientSupported').mockResolvedValue(true),
+      spyOn(adapter, 'describeTarget').mockResolvedValue('test configuration'),
+      spyOn(console, 'log').mockImplementation(() => {}),
+      spyOn(prompts, 'promptConfirm').mockImplementation(async (options) => {
+        confirmations.push(options.message)
+        return true
+      }),
+    ]
+    const add = spyOn(adapter, 'addServer').mockResolvedValue({ success: true })
+    try {
+      const program = new Command().exitOverride().version('9.8.7')
+      registerMcpCommands(program)
+      await program.parseAsync(
+        [
+          'mcp',
+          'add',
+          'cursor',
+          '--url',
+          'https://temps.example.test',
+          '--api-key',
+          'test-key',
+          '--deploy-folder',
+          folder,
+        ],
+        { from: 'user' },
+      )
+      expect(add).toHaveBeenCalledWith({
+        url: 'https://temps.example.test/mcp?write=1',
+        apiKey: 'test-key',
+        bridge: { folders: [folder], packageSpec: '@temps-sdk/cli@9.8.7' },
+      })
+      expect(confirmations).toEqual(['Apply this configuration?'])
+    } finally {
+      add.mockRestore()
+      spies.forEach((spy) => spy.mockRestore())
+      rmSync(folder, { recursive: true, force: true })
+    }
+  })
+
+  test('a folder that does not exist, or an address the bridge refuses, writes nothing', async () => {
+    const { Command } = await import('commander')
+    const api = await import('../../lib/api-client.js')
+    const probe = await import('./probe.js')
+    const contexts = await import('../../config/contexts.js')
+    const output = await import('../../ui/output.js')
+    const { getClientAdapter } = await import('./clients/index.js')
+    const adapter = getClientAdapter('cursor')!
+    const warnings: string[] = []
+    const spies = [
+      spyOn(contexts, 'listContexts').mockResolvedValue([
+        { name: 'test', url: 'https://temps.example.test', apiKey: 'test-key', email: 'test@example.test' },
+        { name: 'lan', url: 'http://192.168.1.10:8080', apiKey: 'test-key', email: 'test@example.test' },
+      ]),
+      spyOn(api, 'setupClient').mockResolvedValue(undefined),
+      spyOn(probe, 'probeMcpEndpoint').mockResolvedValue({ supported: true }),
+      spyOn(adapter, 'isClientSupported').mockResolvedValue(true),
+      spyOn(console, 'log').mockImplementation(() => {}),
+      spyOn(output, 'warning').mockImplementation((message: string) => {
+        warnings.push(message)
+      }),
+    ]
+    const add = spyOn(adapter, 'addServer').mockResolvedValue({ success: true })
+    try {
+      for (const [url, folder] of [
+        ['https://temps.example.test', '/definitely/not/a/folder'],
+        ['http://192.168.1.10:8080', process.cwd()],
+      ] as const) {
+        const program = new Command().exitOverride()
+        registerMcpCommands(program)
+        await program.parseAsync(
+          ['mcp', 'add', 'cursor', '--url', url, '--api-key', 'test-key', '--deploy-folder', folder, '-y'],
+          { from: 'user' },
+        )
+      }
+      expect(add).not.toHaveBeenCalled()
+      expect(warnings[0]).toContain('is not a folder on this computer')
+      expect(warnings[1]).toContain('plain HTTP')
+    } finally {
+      add.mockRestore()
+      spies.forEach((spy) => spy.mockRestore())
+    }
+  })
+})
+
 test('MCP status describes read/write access and labels legacy group filters', () => {
   expect(formatMcpAccess('https://temps.example.test/mcp')).toBe('Read-only')
   expect(formatMcpAccess('https://temps.example.test/mcp?write=1')).toBe('Read/write (confirmation)')
