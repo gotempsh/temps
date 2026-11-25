@@ -90,9 +90,6 @@ pub trait IngressProvider: Send + Sync {
     /// (today's `rotate_secret`). Default: cannot rotate.
     async fn rotate_secret(&self, _keep: &HashSet<String>) -> Result<Option<String>, IngressError> { Ok(None) }
 
-    /// Whether a response came through this provider's edge (D6).
-    fn edge_signature(&self, _response: &ResponseFacts) -> Option<bool> { None }
-
     /// The binaries and images this connector's nodes run (D7).
     fn artifacts(&self) -> &'static [PinnedArtifact] { &[] }
 }
@@ -165,9 +162,11 @@ Every other listener keeps stripping both sets (ADR-065 D3). A provider cannot a
 
 The variants stay in `model.rs` as wire vocabulary; only their meaning moves. A golden test serializes every variant and compares it with today's strings, and changing one is refused unless it comes with a migration of the stored rows.
 
-### D6. Checks ask the provider
+### D6. Checks: the token check moves, the CDN check stays
 
-`forward_check.rs` stops looking for `cf-ray` or `server: cloudflare` and asks the connector's `edge_signature`. `None` means "cannot tell which edge answered", and the check shows exactly that, not a pass. `token_check.rs` becomes Cloudflare's `CheckToken` step.
+`token_check.rs` becomes Cloudflare's `CheckToken` step.
+
+`forward_check.rs` stays where it is. Its `cf-ray` / `server: cloudflare` test recognises Cloudflare's proxy in front of an address (`Edge::Cloudflare`, reported as `cdn:cloudflare`), which an ordinary proxied DNS record produces as much as a tunnel. That is a fact about the zone's DNS provider, not about a tunnel provider, so it is not a method of the trait. A first draft of this ADR put an `edge_signature` method there; reading the check showed why it does not belong.
 
 ### D7. Pins live with the provider; the agent keeps the final say
 
@@ -180,7 +179,7 @@ Tailscale returns none: it uses the host's `tailscaled`, and its minimum version
 1. **The boundary.** `IngressProvider`, `ProviderStep`, `Capabilities`, the registry merge, the golden wire test, the drift metric at baseline.
 2. **Cloudflare behind it.** Its options, steps, checks and `RunOps` methods move into `providers/cloudflare/`, with `token_check.rs`, `edge_rules.rs`, `access.rs`, `access_service.rs` and `gate_check.rs`'s Access half.
 3. **Tailscale behind it.** Its credential, options, the four steps, the Serve-entry code (`serve_entries.rs`) and its `RunOps` methods move into `providers/tailscale/`. `is_credential_kind` goes.
-4. **Pins.** `temps-connector-pins`.
+4. **Pins.** `temps-connector-pins`. Done first, with D5's golden tests, because neither depends on the rest.
 
 **The proof** has three parts:
 
