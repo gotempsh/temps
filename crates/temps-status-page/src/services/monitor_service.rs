@@ -1206,16 +1206,22 @@ impl MonitorService {
         // `[valid_from, valid_until)`, each with the interval that ran
         // during it; the first span is open at the start. Changes are taken
         // in `id` order, the order their transactions held the monitor's row
-        // lock (see `interval_history`). A check after the
-        // last change matches no span and uses the current interval ($4).
-        // Previous intervals are stored normalised, like the current one.
+        // lock (see `interval_history`). A span starts at the latest earlier
+        // `changed_at`, not the previous one, so a timestamp that stepped
+        // back (a clock correction, or nodes whose clocks disagree) leaves
+        // that span empty instead of overlapping an earlier one and giving a
+        // check two grace periods. A check after the last change matches no
+        // span and uses the current interval ($4). Previous intervals are
+        // stored normalised, like the current one.
         let row = CoverageRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r#"
             WITH intervals AS (
                 SELECT
                     previous_interval_seconds::float8 * 2 + 60 AS grace_secs,
-                    LAG(changed_at) OVER (ORDER BY id) AS valid_from,
+                    MAX(changed_at) OVER (
+                        ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                    ) AS valid_from,
                     changed_at AS valid_until
                 FROM status_monitor_interval_changes
                 WHERE monitor_id = $1
@@ -3208,6 +3214,46 @@ mod tests {
         assert_eq!(status.monitored_seconds, 180 + 660 + 300);
         assert_eq!(status.downtime_seconds, 660);
         assert_eq!(status.unknown_seconds, 3_600 - (180 + 660 + 300));
+    }
+
+    /// A recorded timestamp that steps back (a clock correction, or nodes
+    /// whose clocks disagree) must not make two interval spans overlap: each
+    /// check gets exactly one grace period, the one in effect when it ran.
+    /// Starting each span at the previous `changed_at` put a check at minute
+    /// 15 in both the first span and the third, which then started at 10.
+    #[tokio::test]
+    async fn a_timestamp_that_steps_back_gives_each_check_one_grace_period() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        let at = |minutes: i64| start + chrono::Duration::minutes(minutes);
+        // In lock (id) order: 300 s until minute 20, 120 s until a time
+        // stamped minute 10, 600 s until minute 40, 60 s (current) after.
+        for (previous, changed_at) in [(300, at(20)), (120, at(10)), (600, at(40))] {
+            temps_entities::status_monitor_interval_changes::ActiveModel {
+                monitor_id: Set(monitor_id),
+                previous_interval_seconds: Set(previous),
+                changed_at: Set(changed_at),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+        insert_check(&db, monitor_id, "operational", at(15)).await; // 300 s: 660
+        insert_check(&db, monitor_id, "major_outage", at(30)).await; // 600 s: 1,260
+
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(status.monitored_seconds, 660 + 1_260);
+        assert_eq!(status.downtime_seconds, 1_260);
+        assert_eq!(status.unknown_seconds, 3_600 - (660 + 1_260));
     }
 
     /// The coverage scan reaches back only for intervals whose checks can

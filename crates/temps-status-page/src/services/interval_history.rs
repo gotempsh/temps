@@ -26,9 +26,10 @@ use super::types::normalize_check_interval_seconds;
 /// and the change is recorded only if the update commits. The time is taken
 /// here, under that lock, not when the request arrived: an edit that waited
 /// for the lock behind another must not be stamped before it. Rows are also
-/// read in `id` order, which follows the lock, so the order of changes holds
-/// even if two timestamps compare out of order. The scheduler reads the new
-/// interval once the transaction commits, a moment after this time.
+/// read in `id` order, which follows the lock, and each interval's span
+/// starts at the latest earlier timestamp, so a clock that stepped back
+/// cannot make two spans overlap. The scheduler reads the new interval once
+/// the transaction commits, a moment after this time.
 pub(crate) async fn record_interval_change<C: ConnectionTrait>(
     conn: &C,
     monitor_id: i32,
