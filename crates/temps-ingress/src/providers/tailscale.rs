@@ -24,6 +24,7 @@
 //! is [`TailscaleApiError::NotUnderstood`]: the run stops rather than guess.
 
 pub mod live;
+pub mod plan;
 pub mod run;
 
 use std::collections::{BTreeMap, HashMap};
@@ -1140,6 +1141,10 @@ impl crate::registry::ProviderFactory for TailscaleFactory {
         live: &'a crate::reachability::service::LiveOps,
     ) -> Option<Box<dyn crate::reachability::run::ProviderRun + 'a>> {
         Some(Box::new(run::TailscaleRun::new(live)))
+    }
+
+    fn plans(&self) -> Option<&dyn crate::reachability::plan::ProviderPlan> {
+        Some(self)
     }
 }
 

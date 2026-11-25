@@ -73,10 +73,10 @@ use super::plan::{
 use super::plan::{
     address_for_audience, choice, chosen_http_policy, direct_for, environment_hosts_tunnel,
     fingerprint, gate_allow_answer, guess_zone, place_http_policy_steps, plan, planned_record,
-    private_worker, record_type_of, records_to_read, service_of, service_tag, service_worker,
-    tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts,
-    PrivateWorkerFact, ServeEntryFact, ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact,
-    ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_HTTP_POLICY, FIELD_TOKEN,
+    private_worker, record_type_of, records_to_read, tunnel_domain_for, tunnel_route,
+    unique_tunnel_name, zone_for, NamedId, PlanFacts, PrivateWorkerFact, ServeEntryFact,
+    ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact, ZoneFact, FIELD_ADDRESS,
+    FIELD_DNS_PROVIDER, FIELD_HTTP_POLICY, FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
@@ -88,6 +88,7 @@ use super::token_check::{
     check_token, check_token_matching, TokenCheckRequest, TokenCheckResult, ZoneMatch,
 };
 use crate::error::IngressError;
+use crate::providers::tailscale::plan::{service_of, service_tag, service_worker};
 use crate::providers::tailscale::{
     self, ScopeCheck, ServiceDefinition, ServiceHost, TailnetApi, TailscaleClient,
     TailscaleCredential,
@@ -1322,7 +1323,7 @@ impl ReachabilityService {
                     Vec::new(),
                 )
                 .await?;
-            Some(plan(&facts))
+            Some(plan(&facts, &self.providers))
         };
         Ok(EnvironmentReachability {
             project_id,
@@ -1371,7 +1372,7 @@ impl ReachabilityService {
                     Vec::new(),
                 )
                 .await?;
-            audiences.push(choice(&facts));
+            audiences.push(choice(&facts, &self.providers));
         }
         Ok(ReachabilityChoices {
             project_id,
@@ -1687,7 +1688,7 @@ impl ReachabilityService {
         let mut service_seen = None;
         let mut principals_now = Vec::new();
         // The suggested address is known only now; D9 decides it too.
-        if let Ok(Some(address)) = address_for_audience(&facts) {
+        if let Ok(Some(address)) = address_for_audience(&facts, &self.providers) {
             // ADR 065 D6: who it admits now, which the plan is held to.
             if let Some(binding) = gathered
                 .addresses
@@ -1865,8 +1866,8 @@ impl ReachabilityService {
         facts: &PlanFacts,
         user_id: Option<i32>,
     ) -> Result<ReachabilityPlan, ReachabilityError> {
-        let mut planned = plan(facts);
-        let address = address_for_audience(facts).ok().flatten();
+        let mut planned = plan(facts, &self.providers);
+        let address = address_for_audience(facts, &self.providers).ok().flatten();
         let print = fingerprint(facts, address.as_deref());
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -1985,7 +1986,7 @@ impl ReachabilityService {
         let (facts, settings) = self
             .facts_for(&scope, audience, gate, requested, principals)
             .await?;
-        let address = match address_for_audience(&facts) {
+        let address = match address_for_audience(&facts, &self.providers) {
             Ok(Some(address)) => address,
             Ok(None) => {
                 return Err(ReachabilityError::Validation(

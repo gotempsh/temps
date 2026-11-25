@@ -143,6 +143,12 @@ pub trait ProviderFactory: Send + Sync {
         None
     }
 
+    /// Its part of planning, for a provider that plans audiences whole
+    /// (ADR-116 D3).
+    fn plans(&self) -> Option<&dyn crate::reachability::plan::ProviderPlan> {
+        None
+    }
+
     /// This provider's part of a reachability run, over the live effects
     /// (ADR-116 D3). `None` for a provider with no steps of its own.
     fn run<'a>(&self, _live: &'a LiveOps) -> Option<Box<dyn ProviderRun + 'a>> {
@@ -212,6 +218,17 @@ impl ProviderRegistry {
     /// Who can reach what `kind` serves, when the kind is registered.
     pub fn reach(&self, kind: &str) -> Option<Reach> {
         self.find(kind).map(|f| f.capabilities(None).reach)
+    }
+
+    /// The provider that plans `audience` whole, the first registered.
+    pub fn planner(
+        &self,
+        audience: crate::reachability::model::Audience,
+    ) -> Option<&dyn crate::reachability::plan::ProviderPlan> {
+        self.providers
+            .iter()
+            .filter_map(|f| f.plans())
+            .find(|p| p.plans(audience))
     }
 
     /// Whether Temps writes the DNS of what `connector` publishes, through
