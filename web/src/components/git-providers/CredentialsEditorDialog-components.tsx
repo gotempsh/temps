@@ -22,7 +22,11 @@ import {
   updateGitProviderCredentials,
   type UpdateProviderCredentialsBody,
 } from '@/lib/git-providers'
-import { fieldsForProvider, type Props } from './CredentialsEditorDialog-shared'
+import {
+  credentialFieldErrors,
+  fieldsForProvider,
+  type Props,
+} from './CredentialsEditorDialog-shared'
 
 export function CredentialsEditorDialog({
   provider,
@@ -62,6 +66,8 @@ export function CredentialsEditorDialog({
   }
 
   const hasChanges = Object.values(values).some((v) => v.trim().length > 0)
+  const fieldErrors = credentialFieldErrors(fields, values)
+  const hasErrors = Object.keys(fieldErrors).length > 0
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -76,6 +82,7 @@ export function CredentialsEditorDialog({
       toast.info('No changes to save')
       return
     }
+    if (hasErrors) return
     mutation.mutate(body)
   }
 
@@ -104,6 +111,8 @@ export function CredentialsEditorDialog({
             const value = values[field.key as string] ?? ''
             const onChange = (v: string) =>
               setValues((prev) => ({ ...prev, [field.key as string]: v }))
+            const error = fieldErrors[field.key]
+            const errorId = `${id}-error`
 
             return (
               <div key={field.key as string}>
@@ -115,6 +124,8 @@ export function CredentialsEditorDialog({
                     onChange={(e) => onChange(e.target.value)}
                     placeholder={field.placeholder}
                     rows={6}
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
                     className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                   />
                 ) : (
@@ -126,7 +137,14 @@ export function CredentialsEditorDialog({
                     placeholder={field.placeholder}
                     className="mt-1 font-mono"
                     autoComplete="off"
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
                   />
+                )}
+                {error && (
+                  <p id={errorId} className="mt-1 text-xs text-destructive">
+                    {error}
+                  </p>
                 )}
                 {field.help && (
                   <p className="text-xs text-muted-foreground mt-1">
@@ -146,7 +164,10 @@ export function CredentialsEditorDialog({
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={!hasChanges || mutation.isPending}>
+            <Button
+              type="submit"
+              disabled={!hasChanges || hasErrors || mutation.isPending}
+            >
               {mutation.isPending ? (
                 <>
                   <RefreshCw className="mr-2 h-4 w-4 animate-spin" />

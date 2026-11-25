@@ -17,18 +17,6 @@ const MAX_PASSWORD_LEN: usize = 4096;
 /// Longest SSH key accepted, private or public (an RSA-16384 PEM fits).
 const MAX_SSH_KEY_LEN: usize = 16 * 1024;
 
-/// Public key algorithms an OpenSSH `authorized_keys` line may start with.
-const SSH_PUBLIC_KEY_PREFIXES: &[&str] = &[
-    "ssh-ed25519 ",
-    "ssh-rsa ",
-    "ssh-dss ",
-    "ecdsa-sha2-nistp256 ",
-    "ecdsa-sha2-nistp384 ",
-    "ecdsa-sha2-nistp521 ",
-    "sk-ssh-ed25519@openssh.com ",
-    "sk-ecdsa-sha2-nistp256@openssh.com ",
-];
-
 /// A partial credential update. `Some` replaces the field, `None` keeps the
 /// stored value. Deliberately not `Debug`: every field may be a secret.
 #[derive(Default, Clone)]
@@ -159,22 +147,31 @@ fn validate_password(provider_id: i32, password: &str) -> Result<(), GitProvider
     }
 }
 
-fn validate_ssh_private_key(provider_id: i32, key: &str) -> Result<(), GitProviderManagerError> {
-    let key = key.trim();
-    if key.len() > MAX_SSH_KEY_LEN {
+/// Check a new SSH key pair before it replaces the stored one: the private
+/// key must be an unencrypted PEM or OpenSSH key that parses completely, the
+/// public key one OpenSSH line that parses, and the public key must be the
+/// one derived from the private key, so the provider never shows a key it
+/// does not authenticate with.
+fn validate_ssh_key_pair(
+    provider_id: i32,
+    private_key: &str,
+    public_key: &str,
+) -> Result<(), GitProviderManagerError> {
+    let private_key = private_key.trim();
+    if private_key.len() > MAX_SSH_KEY_LEN {
         return Err(invalid(
             provider_id,
             "ssh",
             format!("private_key is longer than {MAX_SSH_KEY_LEN} bytes"),
         ));
     }
-    let first = key.lines().next().unwrap_or_default().trim();
-    let last = key.lines().last().unwrap_or_default().trim();
+    let first = private_key.lines().next().unwrap_or_default().trim();
+    let last = private_key.lines().last().unwrap_or_default().trim();
     let armored = first.starts_with("-----BEGIN ")
         && first.ends_with("PRIVATE KEY-----")
         && last.starts_with("-----END ")
         && last.ends_with("PRIVATE KEY-----")
-        && key.lines().count() > 2;
+        && first["-----BEGIN ".len()..] == last["-----END ".len()..];
     if !armored {
         return Err(invalid(
             provider_id,
@@ -183,28 +180,46 @@ fn validate_ssh_private_key(provider_id: i32, key: &str) -> Result<(), GitProvid
              ('-----BEGIN ... PRIVATE KEY-----' ... '-----END ... PRIVATE KEY-----')",
         ));
     }
-    Ok(())
-}
+    // The parser's error is not forwarded: it is about the key's content.
+    let parsed_private =
+        match russh::keys::decode_secret_key(private_key, None) {
+            Ok(key) if key.is_encrypted() => None,
+            Ok(key) => Some(key),
+            Err(russh::keys::Error::KeyIsEncrypted) => None,
+            Err(_) => return Err(invalid(
+                provider_id,
+                "ssh",
+                "private_key could not be parsed: its body is not a complete PEM or OpenSSH key",
+            )),
+        };
+    let Some(parsed_private) = parsed_private else {
+        return Err(invalid(
+            provider_id,
+            "ssh",
+            "private_key is protected by a passphrase; provide the key without one",
+        ));
+    };
 
-fn validate_ssh_public_key(provider_id: i32, key: &str) -> Result<(), GitProviderManagerError> {
-    let key = key.trim();
-    let well_formed = key.len() <= MAX_SSH_KEY_LEN
-        && !key.contains('\n')
-        && SSH_PUBLIC_KEY_PREFIXES
-            .iter()
-            .find_map(|prefix| key.strip_prefix(prefix))
-            .and_then(|rest| rest.split_whitespace().next())
-            .is_some_and(|blob| {
-                !blob.is_empty()
-                    && blob
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
-            });
-    if !well_formed {
+    let public_key = public_key.trim();
+    let parsed_public = (public_key.len() <= MAX_SSH_KEY_LEN && !public_key.contains('\n'))
+        .then(|| russh::keys::PublicKey::from_openssh(public_key).ok())
+        .flatten();
+    let Some(parsed_public) = parsed_public else {
         return Err(invalid(
             provider_id,
             "ssh",
             "public_key must be one OpenSSH public key line, such as 'ssh-ed25519 AAAA... comment'",
+        ));
+    };
+    if parsed_private.public_key().key_data() != parsed_public.key_data() {
+        return Err(invalid(
+            provider_id,
+            "ssh",
+            format!(
+                "public_key ({}) is not the public half of private_key ({}); send the matching pair",
+                parsed_public.algorithm(),
+                parsed_private.algorithm()
+            ),
         ));
     }
     Ok(())
@@ -323,8 +338,7 @@ pub(super) fn merge_credentials(
             // public key that does not match the key it authenticates with.
             match (&update.private_key, &update.public_key) {
                 (Some(private_key), Some(public_key)) => {
-                    validate_ssh_private_key(provider_id, private_key)?;
-                    validate_ssh_public_key(provider_id, public_key)?;
+                    validate_ssh_key_pair(provider_id, private_key, public_key)?;
                 }
                 (None, None) => {}
                 _ => {
@@ -357,11 +371,16 @@ pub(super) fn merge_credentials(
 mod tests {
     use super::*;
 
-    const PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
-        b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
-        -----END OPENSSH PRIVATE KEY-----\n";
-    const PUBLIC_KEY: &str =
-        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExam deploy@example";
+    use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding};
+    use russh::keys::PrivateKey;
+
+    /// A real Ed25519 pair derived from `seed`: (private key, public key line).
+    fn key_pair(seed: u8) -> (String, String) {
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
+        let private_key = key.to_openssh(LineEnding::LF).unwrap().to_string();
+        let public_key = key.public_key().to_openssh().unwrap();
+        (private_key, format!("{public_key} deploy@example"))
+    }
 
     fn basic() -> AuthMethod {
         AuthMethod::BasicAuth {
@@ -489,12 +508,13 @@ mod tests {
 
     #[test]
     fn an_ssh_key_pair_is_replaced_together() {
+        let (private, public) = key_pair(1);
         let (merged, fields) = merge_credentials(
             7,
             ssh(),
             ProviderCredentialsUpdate {
-                private_key: Some(PRIVATE_KEY.to_string()),
-                public_key: Some(format!("{PUBLIC_KEY}\n")),
+                private_key: Some(private.clone()),
+                public_key: Some(format!("{public}\n")),
                 ..Default::default()
             },
         )
@@ -505,8 +525,8 @@ mod tests {
                 private_key,
                 public_key,
             } => {
-                assert_eq!(private_key, PRIVATE_KEY);
-                assert_eq!(public_key, PUBLIC_KEY);
+                assert_eq!(private_key, private);
+                assert_eq!(public_key, public);
             }
             _ => panic!("the auth method stays ssh"),
         }
@@ -516,7 +536,7 @@ mod tests {
                 7,
                 ssh(),
                 ProviderCredentialsUpdate {
-                    private_key: Some(PRIVATE_KEY.to_string()),
+                    private_key: Some(private.clone()),
                     ..Default::default()
                 },
             )
@@ -525,19 +545,9 @@ mod tests {
         assert!(half.contains("together"), "{half}");
     }
 
-    #[test]
-    fn malformed_ssh_keys_are_refused() {
-        for (private_key, public_key) in [
-            ("not a key", PUBLIC_KEY),
-            (
-                "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----",
-                PUBLIC_KEY,
-            ),
-            (PRIVATE_KEY, "ssh-ed25519"),
-            (PRIVATE_KEY, "ssh-ed25519 not*base64"),
-            (PRIVATE_KEY, "rsa AAAA"),
-        ] {
-            let result = merge_credentials(
+    fn ssh_refusal(private_key: &str, public_key: &str) -> String {
+        reason(
+            merge_credentials(
                 7,
                 ssh(),
                 ProviderCredentialsUpdate {
@@ -545,15 +555,64 @@ mod tests {
                     public_key: Some(public_key.to_string()),
                     ..Default::default()
                 },
-            );
-            assert!(
-                matches!(
-                    result,
-                    Err(GitProviderManagerError::InvalidCredentials { .. })
-                ),
-                "{public_key}"
-            );
+            )
+            .unwrap_err(),
+        )
+    }
+
+    #[test]
+    fn malformed_ssh_keys_are_refused() {
+        let (private, public) = key_pair(2);
+        let body: Vec<&str> = private.lines().collect();
+        let truncated = format!("{}\n{}\n{}\n", body[0], body[1], body[body.len() - 1]);
+        for (private_key, public_key) in [
+            ("not a key".to_string(), public.clone()),
+            (
+                "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----".to_string(),
+                public.clone(),
+            ),
+            // Armor that passes a shape check but holds no key.
+            (
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nnot-base64!\n-----END OPENSSH PRIVATE KEY-----"
+                    .to_string(),
+                public.clone(),
+            ),
+            (truncated, public.clone()),
+            (
+                private.replace("END OPENSSH", "END RSA"),
+                public.clone(),
+            ),
+            (private.clone(), "ssh-ed25519".to_string()),
+            (private.clone(), "ssh-ed25519 =".to_string()),
+            (private.clone(), "ssh-ed25519 not*base64".to_string()),
+            (private.clone(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5".to_string()),
+            (private.clone(), "rsa AAAA".to_string()),
+        ] {
+            let reason = ssh_refusal(&private_key, &public_key);
+            assert!(!reason.contains(&private), "the key is never echoed: {reason}");
         }
+    }
+
+    #[test]
+    fn an_ssh_public_key_from_another_pair_is_refused() {
+        let (private, _) = key_pair(3);
+        let (_, other_public) = key_pair(4);
+        let reason = ssh_refusal(&private, &other_public);
+        assert!(reason.contains("not the public half"), "{reason}");
+    }
+
+    #[test]
+    fn a_passphrase_protected_ssh_key_is_refused_with_that_reason() {
+        let (_, public) = key_pair(5);
+        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[5; 32]));
+        let encrypted = key
+            .encrypt(&mut rand::rng(), "passphrase")
+            .unwrap()
+            .to_openssh(LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let reason = ssh_refusal(&encrypted, &public);
+        assert!(reason.contains("passphrase"), "{reason}");
     }
 
     #[test]

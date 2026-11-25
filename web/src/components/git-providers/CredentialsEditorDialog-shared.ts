@@ -10,6 +10,8 @@ export interface FieldSpec {
   type: 'text' | 'password' | 'textarea'
   placeholder: string
   help?: string
+  /** A field that must be replaced together with this one. */
+  pairedWith?: keyof UpdateProviderCredentialsBody
 }
 
 export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
@@ -127,17 +129,41 @@ export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
         type: 'textarea',
         placeholder: 'Leave blank to keep current value',
         help: 'Paste the full key including BEGIN/END lines. Replace it together with the public key.',
+        pairedWith: 'public_key',
       },
       {
         key: 'public_key',
         label: 'Public key',
         type: 'textarea',
         placeholder: 'ssh-ed25519 AAAA… deploy@example',
+        pairedWith: 'private_key',
       },
     ]
   }
 
   return []
+}
+
+/**
+ * Errors to show beside fields before Save: a paired field (an SSH key pair)
+ * left blank while its partner is filled in, which the server would refuse.
+ * Keyed by field; empty when the values can be submitted.
+ */
+export function credentialFieldErrors(
+  fields: FieldSpec[],
+  values: Record<string, string | undefined>
+): Partial<Record<keyof UpdateProviderCredentialsBody, string>> {
+  const filled = (key: string) => (values[key] ?? '').trim().length > 0
+  const errors: Partial<Record<keyof UpdateProviderCredentialsBody, string>> =
+    {}
+  for (const field of fields) {
+    const partner = fields.find((other) => other.key === field.pairedWith)
+    if (partner && !filled(field.key) && filled(partner.key)) {
+      errors[field.key] =
+        `Required: the ${partner.label.toLowerCase()} is replaced together with the ${field.label.toLowerCase()}.`
+    }
+  }
+  return errors
 }
 
 /** True when the provider's auth method has editable fields. Use to gate

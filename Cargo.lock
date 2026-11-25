@@ -13945,6 +13945,7 @@ dependencies = [
  "rand 0.10.3",
  "regex",
  "reqwest 0.12.28",
+ "russh",
  "rustls",
  "sea-orm 1.1.20",
  "serde",
