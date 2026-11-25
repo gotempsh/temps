@@ -171,4 +171,47 @@ mod tests {
         let environments_plugin = EnvironmentsPlugin::new();
         assert_eq!(environments_plugin.name(), "environments");
     }
+
+    /// Every route this plugin serves requires an authenticated caller, so
+    /// every operation it publishes must say so. An operation without a
+    /// `security` declaration reads as public in the spec and in the clients
+    /// generated from it.
+    #[test]
+    fn every_published_operation_declares_bearer_auth() {
+        let doc = EnvironmentsPlugin::new()
+            .openapi_schema()
+            .expect("the environments plugin publishes an OpenAPI document");
+        let mut operations = 0;
+        let mut undeclared = Vec::new();
+        for (path, item) in &doc.paths.paths {
+            let methods = [
+                ("GET", &item.get),
+                ("POST", &item.post),
+                ("PUT", &item.put),
+                ("PATCH", &item.patch),
+                ("DELETE", &item.delete),
+            ];
+            for (method, operation) in methods {
+                let Some(operation) = operation else { continue };
+                operations += 1;
+                let declares_bearer = operation.security.as_ref().is_some_and(|requirements| {
+                    serde_json::to_value(requirements)
+                        .expect("security requirements serialize")
+                        .as_array()
+                        .is_some_and(|list| list.iter().any(|req| req.get("bearer_auth").is_some()))
+                });
+                if !declares_bearer {
+                    undeclared.push(format!("{method} {path}"));
+                }
+            }
+        }
+        assert!(
+            operations > 20,
+            "expected the environment, variable and secret operations, found {operations}"
+        );
+        assert!(
+            undeclared.is_empty(),
+            "operations without security((\"bearer_auth\" = [])): {undeclared:?}"
+        );
+    }
 }
