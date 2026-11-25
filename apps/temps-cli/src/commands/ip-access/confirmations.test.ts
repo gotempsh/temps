@@ -223,6 +223,32 @@ describe('ip-access create and update', () => {
     expect(run.bodies).toHaveLength(1)
   })
 
+  test('a refused save fails the spinner instead of marking it done', async () => {
+    const invalid = await runWithApi(register, ['ip-access', 'create', '--ip', 'bad', '--action', 'deny', '-y'], {
+      'POST /ip-access-control': () =>
+        Response.json({ title: 'Invalid IP Address', detail: 'Invalid IP address: bad', status: 400 }, { status: 400 }),
+    })
+    expect(invalid.error?.message).toBe('Invalid IP address: bad')
+    expect(invalid.stderr).toContain('✖ Creating IP access control rule... - Invalid IP address: bad')
+    expect(invalid.stderr).not.toContain('✔')
+
+    const broad = await runWithApi(
+      register,
+      ['ip-access', 'update', '--id', '3', '--ip', 'fc00::/7', '--action', 'deny'],
+      { 'PATCH /ip-access-control/3': refusingUntil(['confirm_broad_range']) },
+      { stdin: '' }
+    )
+    expect(broad.stderr).toContain('✖ Updating rule... - Block rule fc00::/7 covers a /7 range')
+    expect(broad.stderr).not.toContain('✔')
+
+    const saved = await runWithApi(
+      register,
+      ['ip-access', 'create', '--ip', 'fc00::/7', '--action', 'deny', '--confirm-broad-range', '-y'],
+      { 'POST /ip-access-control': refusingUntil(['confirm_broad_range']) }
+    )
+    expect(saved.stderr).toContain('✔ Creating IP access control rule...')
+  })
+
   test('another conflict keeps the server message', async () => {
     const run = await runWithApi(
       register,

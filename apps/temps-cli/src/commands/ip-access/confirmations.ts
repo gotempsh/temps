@@ -11,7 +11,7 @@
  */
 
 import { getErrorMessage } from '../../lib/api-client.js'
-import { withSpinner } from '../../ui/spinner.js'
+import { isQuietMode, withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
 
 /** What a refused IP block rule save is waiting for the operator to confirm. */
@@ -90,6 +90,21 @@ export interface ConfirmationOptions {
   interactive: boolean
 }
 
+/**
+ * A save the server refused. The SDK resolves (it does not throw) on a 4xx or
+ * 5xx, so the refusal is thrown inside the spinner, which then shows a
+ * failure instead of a success mark, and carries the response out to the
+ * confirmation logic.
+ */
+class RefusedSave extends Error {
+  constructor(
+    message: string,
+    readonly refusal: { error: unknown; response?: Response }
+  ) {
+    super(message)
+  }
+}
+
 /** Injected in tests; the terminal prompt otherwise. */
 export type Ask = (question: string) => Promise<boolean>
 
@@ -114,15 +129,30 @@ export async function saveWithConfirmations<T>(
   }
   // Each confirmation is asked at most once, so this ends after three sends.
   for (;;) {
-    const { data, error, response } = await withSpinner(progress, () => send({ ...fields }))
-    if (!error) return { saved: data }
+    let refusal: { error: unknown; response?: Response }
+    try {
+      const saved = await withSpinner(progress, async () => {
+        const { data, error, response } = await send({ ...fields })
+        if (error) {
+          const reason = ipRuleConfirmation(error, response?.status) ? refusalReason(error) : getErrorMessage(error)
+          throw new RefusedSave(reason, { error, response })
+        }
+        return data
+      })
+      return { saved }
+    } catch (err) {
+      if (!(err instanceof RefusedSave)) throw err
+      refusal = err.refusal
+    }
+    const { error, response } = refusal
     const confirmation = ipRuleConfirmation(error, response?.status)
     if (confirmation === null) throw new Error(getErrorMessage(error))
     const info = CONFIRMATIONS[confirmation]
     if (fields[info.field] || !options.interactive || !process.stdin.isTTY) {
       throw new Error(confirmationMessage(confirmation, error))
     }
-    console.error(`${refusalReason(error)}.`)
+    // The failed spinner already showed the reason, unless spinners are off.
+    if (isQuietMode()) console.error(`${refusalReason(error)}.`)
     if (!(await ask(info.question))) return undefined
     fields[info.field] = true
   }
