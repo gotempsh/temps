@@ -193,7 +193,7 @@ impl ProcessDriver {
         }
         // Streamed to disk and hashed as it arrives: a large body (an error
         // page served with 200, say) must not be buffered in memory first.
-        let tmp = bin_dir.join(format!("{expected}.part"));
+        let tmp = unique_part(&path);
         let actual = match download_to(response, &tmp, &artifact.url).await {
             Ok(actual) => actual,
             Err(error) => {
@@ -222,6 +222,22 @@ impl ProcessDriver {
             .map_err(|e| format!("could not install {}: {e}", path.display()))?;
         Ok(path)
     }
+}
+
+/// A temporary path beside `path` that no other write uses. Two connectors
+/// starting at once with the same artifact each download and extract into
+/// their own file, so neither truncates the other's, and only a complete,
+/// checked file is renamed over `path`.
+fn unique_part(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{n}.part", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Larger than any connector binary we pin (cloudflared is about 40 MiB);
@@ -303,7 +319,7 @@ fn extract_entry(archive: &Path, entry: &str, target: &Path, url: &str) -> Resul
         if item.size() > MAX_CONNECTOR_BYTES {
             return Err(too_large(url));
         }
-        let tmp = target.with_extension("part");
+        let tmp = unique_part(target);
         let written = (|| -> std::io::Result<()> {
             let mut out = std::fs::OpenOptions::new()
                 .write(true)
@@ -721,7 +737,55 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"the binary");
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755);
-        assert!(!target.with_extension("part").exists());
+        assert_eq!(part_files(dir.path()), Vec::<String>::new());
+    }
+
+    fn part_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".part"))
+            .collect()
+    }
+
+    #[test]
+    fn every_write_gets_its_own_temporary_file() {
+        let target = Path::new("/bin-dir/abc-cloudflared");
+        let (a, b) = (unique_part(target), unique_part(target));
+        assert_ne!(a, b);
+        for part in [&a, &b] {
+            assert_eq!(part.parent(), target.parent());
+            let name = part.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("abc-cloudflared."), "{name}");
+            assert!(name.ends_with(".part"), "{name}");
+        }
+    }
+
+    #[test]
+    fn concurrent_extractions_of_one_artifact_each_install_a_complete_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        // Large enough that the copies overlap.
+        let binary = vec![7u8; 8 * 1024 * 1024];
+        let archive = tgz(
+            dir.path(),
+            &[("cloudflared", binary.as_slice(), tar::EntryType::Regular)],
+        );
+        let target = dir.path().join("abc-cloudflared");
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        extract_entry(&archive, "cloudflared", &target, "https://x/a.tgz")
+                    })
+                })
+                .collect();
+            starts.into_iter().map(|s| s.join().unwrap()).collect()
+        });
+        for result in results {
+            assert_eq!(result, Ok(()));
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), binary);
+        assert_eq!(part_files(dir.path()), Vec::<String>::new());
     }
 
     #[test]
