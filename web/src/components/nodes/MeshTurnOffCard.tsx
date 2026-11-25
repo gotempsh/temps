@@ -50,7 +50,11 @@ export function MeshTurnOffCard({
   const disable = useMutation({
     ...wireguardMeshDisableMutation(),
     onSuccess: async (status) => {
-      queryClient.setQueryData(wireguardMeshStatusGetOptions().queryKey, status)
+      // A status read already in flight would land after this and show the
+      // mesh as still on, so cancel it before writing the new state.
+      const statusKey = wireguardMeshStatusGetOptions().queryKey
+      await queryClient.cancelQueries({ queryKey: statusKey })
+      queryClient.setQueryData(statusKey, status)
       toast.success('WireGuard mesh turned off', {
         description:
           'The control plane stops tending its end; the interface goes away when temps restarts.',
