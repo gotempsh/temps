@@ -78,12 +78,17 @@ pub struct ProcessSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Artifact {
-    /// `linux`.
+    /// `linux` or `macos` (Rust's `std::env::consts::OS`).
     pub os: String,
     /// `x86_64` or `aarch64` (Rust's `std::env::consts::ARCH`).
     pub arch: String,
     pub url: String,
+    /// Of the file at `url`: the archive itself when `archive_entry` is set.
     pub sha256: String,
+    /// When set, `url` is a gzipped tarball and this names the file in it to
+    /// run (macOS cloudflared ships only as one). Absent: `url` is the binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_entry: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
