@@ -401,7 +401,7 @@ pub async fn admin_set_environment_workload_isolation(
     operation_id = "admin_get_node_resources",
     params(("node_id" = i32, Path, description = "Node ID; 0 is the control plane")),
     responses(
-        (status = 200, body = NodeResourcesResponse),
+        (status = 200, description = "The node's capacity, reservation and what is placed on it", body = NodeResourcesResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Node not found", body = ProblemDetails),
@@ -425,7 +425,7 @@ pub async fn admin_get_node_resources(
     params(("node_id" = i32, Path, description = "Node ID; 0 is the control plane")),
     request_body = SetNodeResourcesRequest,
     responses(
-        (status = 200, body = NodeResourcesResponse),
+        (status = 200, description = "The node's resources after the change", body = NodeResourcesResponse),
         (status = 400, description = "Invalid reserve, nothing to change, or system_reserved together with reset_system_reserved", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Instance admin required", body = ProblemDetails),

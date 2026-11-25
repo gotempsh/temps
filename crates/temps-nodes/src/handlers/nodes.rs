@@ -3180,7 +3180,7 @@ pub struct NodeBuildLimitsResponse {
     tag = "Nodes", get, path = "/internal/nodes/{node_id}/build-limits",
     operation_id = "admin_get_node_build_limits",
     params(("node_id" = i32, Path, description = "Worker node ID")),
-    responses((status = 200, body = NodeBuildLimitsResponse),
+    responses((status = 200, description = "The worker's effective build limits, and whether they are the defaults", body = NodeBuildLimitsResponse),
         (status = 400, description = "The node is the control plane or not a worker"),
         (status = 401, description = "Unauthorized"), (status = 403, description = "Forbidden"),
         (status = 404, description = "Node not found"),

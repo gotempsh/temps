@@ -41739,8 +41739,14 @@ export type UpdateTraefikRouteEnabledRequest = {
 export type UpdateUserRequest = {
     email?: string | null;
     /**
-     * The new username, as in `CreateUserRequest`. The deprecated field
-     * name `name` is still accepted as an alias.
+     * Deprecated: the old name of `username`, still accepted. Sending both
+     * with different values is refused.
+     *
+     * @deprecated
+     */
+    name?: string | null;
+    /**
+     * The new username, as in `CreateUserRequest`.
      */
     username?: string | null;
 };
@@ -68316,6 +68322,9 @@ export type AdminGetNodeBuildLimitsErrors = {
 };
 
 export type AdminGetNodeBuildLimitsResponses = {
+    /**
+     * The worker's effective build limits, and whether they are the defaults
+     */
     200: NodeBuildLimitsResponse;
 };
 
@@ -68933,6 +68942,9 @@ export type AdminGetNodeResourcesErrors = {
 export type AdminGetNodeResourcesError = AdminGetNodeResourcesErrors[keyof AdminGetNodeResourcesErrors];
 
 export type AdminGetNodeResourcesResponses = {
+    /**
+     * The node's capacity, reservation and what is placed on it
+     */
     200: NodeResourcesResponse;
 };
 
@@ -68976,6 +68988,9 @@ export type AdminSetNodeResourcesErrors = {
 export type AdminSetNodeResourcesError = AdminSetNodeResourcesErrors[keyof AdminSetNodeResourcesErrors];
 
 export type AdminSetNodeResourcesResponses = {
+    /**
+     * The node's resources after the change
+     */
     200: NodeResourcesResponse;
 };
 

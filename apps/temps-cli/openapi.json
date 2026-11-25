@@ -89762,8 +89762,17 @@
               "null"
             ]
           },
+          "name": {
+            "deprecated": true,
+            "description": "Deprecated: the old name of `username`, still accepted. Sending both\nwith different values is refused.",
+            "example": "john.doe",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "username": {
-            "description": "The new username, as in `CreateUserRequest`. The deprecated field\nname `name` is still accepted as an alias.",
+            "description": "The new username, as in `CreateUserRequest`.",
             "example": "john.doe",
             "type": [
               "string",
@@ -135334,7 +135343,8 @@
                   "$ref": "#/components/schemas/NodeBuildLimitsResponse"
                 }
               }
-            }
+            },
+            "description": "The worker's effective build limits, and whether they are the defaults"
           },
           "400": {
             "description": "The node is the control plane or not a worker"
@@ -136176,7 +136186,8 @@
                   "$ref": "#/components/schemas/NodeResourcesResponse"
                 }
               }
-            }
+            },
+            "description": "The node's capacity, reservation and what is placed on it"
           },
           "401": {
             "content": {
@@ -136260,7 +136271,8 @@
                   "$ref": "#/components/schemas/NodeResourcesResponse"
                 }
               }
-            }
+            },
+            "description": "The node's resources after the change"
           },
           "400": {
             "content": {
