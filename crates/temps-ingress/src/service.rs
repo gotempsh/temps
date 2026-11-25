@@ -1992,6 +1992,7 @@ impl IngressConnectorService {
         let connectors: Vec<PlannedConnector> = models
             .into_iter()
             .map(|model| PlannedConnector {
+                writes_dns: self.registry.writes_dns(&model),
                 placement: placements.remove(&model.id).unwrap_or_default(),
                 zone: zones.remove(&model.id).flatten(),
                 model,
@@ -2641,6 +2642,8 @@ fn assign_generated<'a>(
 
 struct PlannedConnector {
     model: ingress_connectors::Model,
+    /// Temps writes the DNS of what it publishes (ADR-116 D2).
+    writes_dns: bool,
     /// `None` when its domain is no longer managed; it then covers nothing.
     zone: Option<String>,
     placement: Placement,
@@ -3190,6 +3193,7 @@ mod tests {
         let mut plan = Plan {
             connectors: vec![
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(1, "example.com", false),
                     zone: Some("example.com".into()),
                     placement: Placement {
@@ -3198,6 +3202,7 @@ mod tests {
                     },
                 },
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(2, "apps.example.com", true),
                     zone: Some("example.com".into()),
                     placement: Placement {
@@ -3234,6 +3239,7 @@ mod tests {
         let mut plan = Plan {
             connectors: vec![
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(1, "example.com", false),
                     zone: Some("example.com".into()),
                     placement: Placement {
@@ -3242,6 +3248,7 @@ mod tests {
                     },
                 },
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(2, "other.example.org", true),
                     zone: Some("example.org".into()),
                     placement: Placement {
@@ -3348,6 +3355,7 @@ mod tests {
     fn placement_plan(placement: Placement) -> Plan {
         Plan {
             connectors: vec![PlannedConnector {
+                writes_dns: true,
                 model: connector_model(1, "example.com", true),
                 zone: Some("example.com".into()),
                 placement,
@@ -3362,8 +3370,21 @@ mod tests {
         }
     }
 
+    /// Only a connector whose provider has Temps write its DNS is retried
+    /// for DNS: Cloudflare's, not a credential's or an unknown kind's.
     #[test]
-    fn retry_dns_requires_a_failed_publication_on_the_planned_cloudflare_tunnel() {
+    fn the_registry_says_which_connectors_temps_writes_dns_for() {
+        let registry = ProviderRegistry::builtin();
+        let mut model = connector_model(1, "example.com", true);
+        assert!(registry.writes_dns(&model));
+        model.provider = crate::tailscale::KIND.into();
+        assert!(!registry.writes_dns(&model));
+        model.provider = "another_provider".into();
+        assert!(!registry.writes_dns(&model));
+    }
+
+    #[test]
+    fn retry_dns_requires_a_failed_publication_on_a_planned_tunnel_whose_dns_temps_writes() {
         let mut plan = placement_plan(Placement {
             workers: true,
             control_plane: false,
@@ -3398,7 +3419,9 @@ mod tests {
         plan.choices.insert(host.into(), None);
         assert_eq!(retry(&plan, &row), None);
         plan.choices.clear();
-        plan.connectors[0].model.provider = "another_provider".into();
+        // A connector whose DNS Temps does not write (the registry says
+        // which, by its provider's capabilities).
+        plan.connectors[0].writes_dns = false;
         assert_eq!(retry(&plan, &row), None);
     }
 

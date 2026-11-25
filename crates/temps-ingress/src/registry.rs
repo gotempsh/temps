@@ -217,6 +217,13 @@ impl ProviderRegistry {
         self.find(kind).map(|f| f.capabilities(None).reach)
     }
 
+    /// Whether Temps writes the DNS of what `connector` publishes, through
+    /// whichever DNS provider manages the zone. An unknown kind does not.
+    pub fn writes_dns(&self, connector: &ingress_connectors::Model) -> bool {
+        self.find(&connector.provider)
+            .is_some_and(|f| f.capabilities(Some(connector)).dns == DnsHandling::Automatic)
+    }
+
     /// The credential provider of `kind`.
     pub fn credential(&self, kind: &str) -> Result<Arc<dyn ProviderFactory>, IngressError> {
         self.find(kind)
