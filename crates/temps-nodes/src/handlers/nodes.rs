@@ -814,6 +814,7 @@ pub struct ClusterDnsStatusResponse {
         node_capability,
         crate::handlers::wireguard_mesh::wireguard_mesh_status,
         crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::wireguard_mesh::disable_wireguard_mesh,
         crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
         crate::handlers::cluster_network::get_cluster_network,
         crate::handlers::cluster_network::update_cluster_network,
@@ -1023,7 +1024,8 @@ pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
         .route(
             "/nodes/wireguard",
             get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
-                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh)
+                .delete(crate::handlers::wireguard_mesh::disable_wireguard_mesh),
         )
         .route(
             "/nodes/wireguard/hub",

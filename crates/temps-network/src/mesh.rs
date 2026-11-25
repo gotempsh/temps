@@ -282,6 +282,9 @@ pub enum MeshError {
     TooManyPairings { limit: usize },
     #[error("{0} is not on the WireGuard mesh yet, so it cannot be the hub")]
     NotOnMesh(String),
+    /// Something still depends on the mesh, so it cannot be turned off.
+    #[error("the WireGuard mesh cannot be turned off: {reason}")]
+    DisableBlocked { reason: String },
     #[error("stored mesh data for {what} is invalid: {reason}")]
     Corrupt { what: String, reason: String },
     #[cfg(feature = "control_plane")]
@@ -315,6 +318,47 @@ impl PartialEq for DatabaseError {
 
 #[cfg(feature = "control_plane")]
 impl Eq for DatabaseError {}
+
+/// What still depends on a mesh that is on, from the facts
+/// [`disable_blocker`] reads: the names of nodes holding a mesh address
+/// (at most a few) and how many there are, the pairings in progress, and
+/// the control plane's overlay underlay address when it is on the mesh.
+/// `None` when the mesh can be turned off.
+pub fn disable_blocker_reason(
+    member_names: &[String],
+    member_count: u64,
+    pending_pairings: u64,
+    underlay_on_mesh: Option<Ipv4Addr>,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if member_count > 0 {
+        let more = member_count.saturating_sub(member_names.len() as u64);
+        let names = if more > 0 {
+            format!("{} and {more} more", member_names.join(", "))
+        } else {
+            member_names.join(", ")
+        };
+        reasons.push(format!(
+            "{member_count} node(s) are on the mesh ({names}) and reach the control plane over \
+             it. Remove them from the cluster (or re-join them over the private network) first."
+        ));
+    }
+    if pending_pairings > 0 {
+        reasons.push(format!(
+            "{pending_pairings} node pairing(s) are in progress and hold mesh addresses. Cancel \
+             them on the Worker Nodes page (or let them expire) first."
+        ));
+    }
+    if let Some(address) = underlay_on_mesh {
+        reasons.push(format!(
+            "the control plane's overlay network runs on its mesh address {address}, so its \
+             workloads' cross-node network depends on the mesh, and the overlay cannot be moved \
+             off it from the API. A mesh with no members carries no traffic, so leaving it on \
+             is harmless."
+        ));
+    }
+    (!reasons.is_empty()).then(|| reasons.join(" "))
+}
 
 /// Parse and check a mesh pool. It must be private IPv4 space (it becomes
 /// the underlay, which the allocator requires to be private), leave room for
@@ -1007,6 +1051,85 @@ mod db {
         })
     }
 
+    /// Nodes named in a [`MeshError::DisableBlocked`] reason; the rest are counted.
+    const DISABLE_BLOCKER_NAMES: u64 = 5;
+
+    /// [`disable_blocker_reason`] for the stored state, read on `db` (the
+    /// locked transaction when turning the mesh off). `None` while the mesh
+    /// is off.
+    pub(crate) async fn blocker_in<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        cfg: &network_config::Model,
+    ) -> Result<Option<String>, MeshError> {
+        if !cfg.wireguard_enabled {
+            return Ok(None);
+        }
+        let on_mesh = || nodes::Entity::find().filter(nodes::Column::MeshWgAddress.is_not_null());
+        let member_count = on_mesh().count(db).await?;
+        let member_names: Vec<String> = if member_count > 0 {
+            on_mesh()
+                .order_by_asc(nodes::Column::Id)
+                .limit(DISABLE_BLOCKER_NAMES)
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|node| node.name)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let pending = crate::pairing::pending_count(db).await?;
+        let pool = reserved_mesh_pool(&cfg.wireguard_cidr);
+        let underlay_on_mesh = cfg
+            .control_plane_underlay_address
+            .as_deref()
+            .and_then(identity_ipv4)
+            .filter(|address| pool.contains(address));
+        Ok(disable_blocker_reason(
+            &member_names,
+            member_count,
+            pending,
+            underlay_on_mesh,
+        ))
+    }
+
+    /// Why the mesh cannot be turned off now. `None` when it is off or can be.
+    pub async fn disable_blocker(db: &DatabaseConnection) -> Result<Option<String>, MeshError> {
+        let cfg = load_config(db).await?;
+        blocker_in(db, &cfg).await
+    }
+
+    /// Turn the mesh off. Returns `false` when it was already off. Refused
+    /// with [`MeshError::DisableBlocked`] while a node holds a mesh address,
+    /// a pairing is in progress or the control plane's overlay runs on its
+    /// mesh address; the check and the change happen under the config row
+    /// lock, which registration and pairing also take, so no member can join
+    /// between them. The hub and the control plane's published key are
+    /// cleared, so turning it on again starts from a clean state. This only
+    /// changes the cluster setting: the control plane stops tending its end
+    /// (its reconciler sees the change), but its kernel interface is left as
+    /// it is until the host removes it or Temps restarts.
+    pub async fn disable(db: &DatabaseConnection) -> Result<bool, MeshError> {
+        let txn = db.begin().await?;
+        let cfg = lock_config(&txn).await?;
+        if !cfg.wireguard_enabled {
+            return Ok(false);
+        }
+        if let Some(reason) = blocker_in(&txn, &cfg).await? {
+            return Err(MeshError::DisableBlocked { reason });
+        }
+        let mut active: network_config::ActiveModel = cfg.into();
+        active.wireguard_enabled = Set(false);
+        active.mesh_hub_node_id = Set(None);
+        active.mesh_hub_control_plane = Set(false);
+        active.control_plane_wg_public_key = Set(None);
+        active.control_plane_wg_endpoint = Set(None);
+        active.updated_at = Set(chrono::Utc::now());
+        active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(true)
+    }
+
     /// Refuse a mesh pool that contains an address a node registered as its
     /// own name, address or private address.
     ///
@@ -1465,6 +1588,31 @@ mod tests {
 
     fn pool() -> Ipv4Net {
         "172.20.0.0/16".parse().unwrap()
+    }
+
+    #[test]
+    fn a_mesh_nothing_depends_on_can_be_turned_off() {
+        assert_eq!(disable_blocker_reason(&[], 0, 0, None), None);
+    }
+
+    #[test]
+    fn every_dependency_on_the_mesh_is_named_in_the_refusal() {
+        let names = vec!["worker-1".to_string(), "worker-2".to_string()];
+        let reason = disable_blocker_reason(&names, 7, 0, None).unwrap();
+        assert!(reason.contains("7 node(s)"), "{reason}");
+        assert!(reason.contains("worker-1, worker-2 and 5 more"), "{reason}");
+
+        let reason = disable_blocker_reason(&[], 0, 2, None).unwrap();
+        assert!(reason.contains("2 node pairing(s)"), "{reason}");
+
+        let reason = disable_blocker_reason(&[], 0, 0, Some(Ipv4Addr::new(10, 201, 0, 1))).unwrap();
+        assert!(reason.contains("10.201.0.1"), "{reason}");
+        assert!(reason.contains("overlay"), "{reason}");
+
+        let all = disable_blocker_reason(&names, 2, 1, Some(Ipv4Addr::new(10, 201, 0, 1))).unwrap();
+        for part in ["2 node(s)", "1 node pairing(s)", "10.201.0.1"] {
+            assert!(all.contains(part), "{part}: {all}");
+        }
     }
 
     #[test]

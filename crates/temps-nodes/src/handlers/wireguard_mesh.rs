@@ -9,6 +9,8 @@
 //! so the Worker Nodes page can onboard instead of hiding the option.
 //! `POST /nodes/wireguard` turns the mesh on; the running `temps serve`
 //! notices the setting change and brings its end up without a restart.
+//! `DELETE /nodes/wireguard` turns it off again, refused while anything
+//! depends on it (`can_disable` / `disable_blocker` in the status).
 //!
 //! The logic lives in [`WireguardMeshService`]; these handlers check
 //! permissions, record the audit trail and map errors to problems.
@@ -27,7 +29,9 @@ use temps_network::mesh_links::Hub;
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::handlers::audit::{WireguardMeshEnabledAudit, WireguardMeshHubChangedAudit};
+use crate::handlers::audit::{
+    WireguardMeshDisabledAudit, WireguardMeshEnabledAudit, WireguardMeshHubChangedAudit,
+};
 use crate::services::wireguard_mesh::{EnableMesh, WireguardMeshError, WireguardMeshService};
 
 // The response types are the service's view of the mesh; re-exported so the
@@ -93,6 +97,9 @@ fn mesh_problem(error: WireguardMeshError) -> Problem {
         MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
             .with_title("WireGuard Mesh Off")
             .with_detail("Turn the WireGuard mesh on before choosing a hub."),
+        MeshError::DisableBlocked { .. } => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("WireGuard Mesh In Use")
+            .with_detail(error.to_string()),
         MeshError::NotOnMesh(_) => problemdetails::new(StatusCode::CONFLICT)
             .with_title("Not On The Mesh")
             .with_detail(error.to_string()),
@@ -207,8 +214,8 @@ pub async fn wireguard_mesh_status(
 }
 
 /// Turn on the cluster's WireGuard mesh (idempotent). The running control
-/// plane brings its end up within a minute and nodes follow; it cannot be
-/// turned off again from the API.
+/// plane brings its end up within a minute and nodes follow.
+/// `DELETE /nodes/wireguard` turns it off while nothing depends on it.
 #[utoipa::path(
     tag = "Nodes",
     post,
@@ -257,6 +264,59 @@ pub async fn enable_wireguard_mesh(
     };
     if let Err(error) = state.audit_service.create_audit_log(&audit).await {
         error!(%error, "WireGuard mesh enabled but audit record failed");
+    }
+
+    Ok(Json(
+        state.mesh_service.status().await.map_err(mesh_problem)?,
+    ))
+}
+
+/// Turn the cluster's WireGuard mesh off (idempotent: an off mesh answers
+/// with its status). Refused with 409 and the reason while anything depends
+/// on it: nodes on the mesh, pairings in progress, or the control plane's
+/// overlay running on its mesh address (`can_disable` / `disable_blocker` in
+/// `GET /nodes/wireguard` say so in advance). This changes the cluster
+/// setting: new joins and pairings over the mesh are refused and the control
+/// plane stops tending its end; the control plane's kernel interface is left
+/// in place until the host removes it or Temps restarts.
+#[utoipa::path(
+    tag = "Nodes",
+    delete,
+    path = "/nodes/wireguard",
+    operation_id = "WireguardMeshDisable",
+    responses(
+        (status = 200, description = "Mesh off; current state", body = WireguardMeshStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Something still depends on the mesh; the detail says what"),
+        (status = 428, description = "Re-authentication required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn disable_wireguard_mesh(
+    RequireAuth(auth): RequireAuth,
+    Extension(state): Extension<WireguardMeshAdminState>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DisableWireguardMesh,
+    )
+    .await?;
+
+    let previous = state.mesh_service.disable().await.map_err(mesh_problem)?;
+    if let Some(settings) = previous {
+        let audit = WireguardMeshDisabledAudit {
+            context: audit_context(&auth, &metadata),
+            cidr: Some(settings.cidr.to_string()),
+            listen_port: Some(settings.port),
+        };
+        if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+            error!(%error, "WireGuard mesh disabled but audit record failed");
+        }
     }
 
     Ok(Json(
@@ -738,7 +798,14 @@ mod tests {
         authorizer: Arc<dyn SensitiveActionAuthorizer>,
         audit: Arc<RecordingAuditLogger>,
     ) -> Router {
-        let db = Arc::new(db);
+        shared_app(Arc::new(db), authorizer, audit)
+    }
+
+    fn shared_app(
+        db: Arc<DatabaseConnection>,
+        authorizer: Arc<dyn SensitiveActionAuthorizer>,
+        audit: Arc<RecordingAuditLogger>,
+    ) -> Router {
         let settings = temps_config::AppSettings {
             external_url: Some("https://cp.example.com/".to_string()),
             ..Default::default()
@@ -755,10 +822,17 @@ mod tests {
         Router::new()
             .route(
                 "/nodes/wireguard",
-                get(wireguard_mesh_status).post(enable_wireguard_mesh),
+                get(wireguard_mesh_status)
+                    .post(enable_wireguard_mesh)
+                    .delete(disable_wireguard_mesh),
             )
             .route("/nodes/wireguard/hub", put(set_wireguard_mesh_hub))
             .layer(Extension(state))
+    }
+
+    /// A `COUNT(*)` row as sea-orm's paginator reads it.
+    fn count(n: i64) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
+        std::collections::BTreeMap::from([("num_items", sea_orm::Value::BigInt(Some(n)))])
     }
 
     fn allow() -> Arc<dyn SensitiveActionAuthorizer> {
@@ -784,6 +858,7 @@ mod tests {
         for (method, uri, body) in [
             ("GET", "/nodes/wireguard", None),
             ("POST", "/nodes/wireguard", Some(serde_json::json!({}))),
+            ("DELETE", "/nodes/wireguard", None),
             (
                 "PUT",
                 "/nodes/wireguard/hub",
@@ -806,6 +881,25 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn turning_the_mesh_off_needs_settings_write_and_step_up() {
+        let (status, _, _) = send(
+            quiet_app(),
+            "DELETE",
+            "/nodes/wireguard",
+            None,
+            Some(settings_reader()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let app = app(mock_db().into_connection(), step_up(), audit.clone());
+        let (status, _, body) = send(app, "DELETE", "/nodes/wireguard", None, Some(admin())).await;
+        assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "{body}");
+        assert!(audit.records().is_empty());
     }
 
     #[tokio::test]
@@ -946,10 +1040,14 @@ mod tests {
             .append_query_results(vec![vec![network_config(true, false)]])
             .append_query_results(vec![Vec::<temps_entities::nodes::Model>::new()])
             .append_query_results(vec![vec![network_config(true, false)]])
-            // status: load_settings, published_control_plane, the nodes
+            // status: load_settings, published_control_plane, the nodes,
+            // then what blocks turning it off (config, members, pairings)
             .append_query_results(vec![vec![network_config(true, false)]])
             .append_query_results(vec![vec![network_config(true, false)]])
             .append_query_results(vec![Vec::<temps_entities::nodes::Model>::new()])
+            .append_query_results(vec![vec![network_config(true, false)]])
+            .append_query_results(vec![vec![count(0)]])
+            .append_query_results(vec![vec![count(0)]])
             .into_connection();
         let audit = Arc::new(RecordingAuditLogger::default());
         let app = app(db, allow(), audit.clone());
@@ -979,10 +1077,13 @@ mod tests {
             .append_query_results(vec![vec![network_config(true, false)]])
             .append_query_results(vec![vec![network_config(true, false)]])
             // status: load_settings, published_control_plane (not yet, so
-            // no links are read), the nodes
+            // no links are read), the nodes, then the disable blockers
             .append_query_results(vec![vec![network_config(true, false)]])
             .append_query_results(vec![vec![network_config(true, false)]])
             .append_query_results(vec![Vec::<temps_entities::nodes::Model>::new()])
+            .append_query_results(vec![vec![network_config(true, false)]])
+            .append_query_results(vec![vec![count(0)]])
+            .append_query_results(vec![vec![count(0)]])
             .into_connection();
         let audit = Arc::new(RecordingAuditLogger::default());
         let app = app(db, allow(), audit.clone());
@@ -1002,6 +1103,115 @@ mod tests {
         assert!(records[0].body.contains("\"hub\":\"none\""), "{records:?}");
         assert_eq!(records[0].ip_address.as_deref(), Some(CLIENT_IP));
         assert_eq!(records[0].user_agent, CLIENT_AGENT);
+    }
+
+    #[test]
+    fn a_blocked_disable_is_a_conflict_naming_the_reason() {
+        let problem = mesh_problem(WireguardMeshError::Mesh {
+            action: "turn the mesh off",
+            source: MeshError::DisableBlocked {
+                reason: "1 node(s) are on the mesh (worker-1)".into(),
+            },
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("worker-1"), "{body}");
+    }
+
+    /// A mesh nothing uses turns off, and the change is audited with who
+    /// did it; one a node is on is refused with the reason (#2051).
+    #[tokio::test]
+    async fn turning_the_mesh_off_on_a_real_database() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        temps_network::mesh::enable(db.as_ref(), Some("10.201.0.0/24"), Some(51820), None)
+            .await
+            .unwrap();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let router = || shared_app(db.clone(), allow(), audit.clone());
+
+        // A node on the mesh blocks it.
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+        let mut member = node(1, "worker-1", "worker-1-token").into_active_model();
+        member.id = sea_orm::ActiveValue::NotSet;
+        member.mesh_wg_address = Set(Some("10.201.0.2".to_string()));
+        member.mesh_wg_public_key = Set(Some(
+            "d29ya2VyLWtleS0zMi1ieXRlcy1sb25nLWVub3VnaCE=".to_string(),
+        ));
+        let member = member.insert(db.as_ref()).await.unwrap();
+
+        let (status, _, body) =
+            send(router(), "GET", "/nodes/wireguard", None, Some(admin())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["can_disable"], false, "{body}");
+        assert!(
+            body["disable_blocker"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("worker-1")),
+            "{body}"
+        );
+        let (status, _, body) =
+            send(router(), "DELETE", "/nodes/wireguard", None, Some(admin())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worker-1"),
+            "{body}"
+        );
+        assert!(
+            audit.records().is_empty(),
+            "a refused change is not audited"
+        );
+
+        // With the member gone, it turns off.
+        temps_entities::nodes::Entity::delete_by_id(member.id)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        let (status, _, body) =
+            send(router(), "DELETE", "/nodes/wireguard", None, Some(admin())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "disabled", "{body}");
+        assert_eq!(
+            body["can_disable"], false,
+            "nothing left to turn off: {body}"
+        );
+        assert!(temps_network::mesh::load_settings(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        let records = audit.records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].operation, "WIREGUARD_MESH_DISABLED");
+        assert!(records[0].body.contains("10.201.0.0/24"), "{records:?}");
+        assert_eq!(records[0].ip_address.as_deref(), Some(CLIENT_IP));
+
+        // Turning an off mesh off again is a no-op, not audited twice.
+        let (status, _, body) =
+            send(router(), "DELETE", "/nodes/wireguard", None, Some(admin())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(audit.records().len(), 1);
+    }
+
+    async fn migrated_test_db() -> Option<temps_test_utils::TestDatabase> {
+        if std::env::var("TEMPS_TEST_DATABASE_URL").is_err() {
+            let docker_up = match bollard::Docker::connect_with_local_defaults() {
+                Ok(docker) => docker.ping().await.is_ok(),
+                Err(_) => false,
+            };
+            if !docker_up {
+                println!("Docker not available and TEMPS_TEST_DATABASE_URL unset, skipping");
+                return None;
+            }
+        }
+        match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(e) => panic!("test database setup failed: {e}"),
+        }
     }
 
     #[tokio::test]

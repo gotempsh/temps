@@ -645,7 +645,8 @@ fn register_problem(node_id: i32, error: MeshError) -> Problem {
         | MeshError::OverlapsComputePool { .. }
         | MeshError::InvalidPort(_)
         | MeshError::PortClashesWithVxlan(_)
-        | MeshError::InUse { .. } => {
+        | MeshError::InUse { .. }
+        | MeshError::DisableBlocked { .. } => {
             error!(node_id, "WireGuard mesh registration failed: {error}");
             return problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("WireGuard Mesh Registration Failed")

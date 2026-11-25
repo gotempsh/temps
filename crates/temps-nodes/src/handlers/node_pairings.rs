@@ -159,7 +159,8 @@ pub(crate) fn problem(error: MeshError) -> Problem {
         | MeshError::InUse { .. }
         | MeshError::InvalidPublicKey
         | MeshError::PublicKeyInUse
-        | MeshError::NotOnMesh(_) => {
+        | MeshError::NotOnMesh(_)
+        | MeshError::DisableBlocked { .. } => {
             error!("node pairing failed: {error}");
             problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Node Pairing Error")
