@@ -412,6 +412,13 @@ impl Lab {
         if let Some(workload) = workload {
             container_labels.insert(labels::KIND.to_string(), workload.kind.as_str().to_string());
             container_labels.insert(labels::OWNER_ID.to_string(), workload.id.to_string());
+            // A deployment replica is identified by its environment (policy
+            // subject `deployment/N` names environment N); the plane stamps
+            // every replica with it, and without it a replica stays
+            // unidentified (see `identify`).
+            if workload.kind == WorkloadKind::Deployment {
+                container_labels.insert(labels::ENVIRONMENT.to_string(), workload.id.to_string());
+            }
         }
         let full = self.full(name);
         self.docker
@@ -513,9 +520,24 @@ impl Lab {
         text
     }
 
-    /// Runs `script` on the Docker VM's network namespace with
-    /// `NET_ADMIN` (the nft helper image).
+    /// Runs `script` where the Docker bridges are, as the enforcer's
+    /// executor does: on this host with its own `nft` when the daemon is
+    /// local on Linux (`HostNft`; the test runs as root), otherwise in the
+    /// Docker VM's network namespace through the nft helper image
+    /// (`DockerVmNft`). The helper's older `nft` must not edit a host's
+    /// iptables-nft chains: it can crash on rules a newer iptables wrote.
     async fn vm_shell(&self, script: &str) -> Result<String, String> {
+        if cfg!(target_os = "linux") && daemon_is_local() {
+            let output = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .await
+                .map_err(|e| format!("running the script on this host: {e}"))?;
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            return Ok(text);
+        }
         let name = self.full("vm-shell");
         let _ = self
             .docker
@@ -582,9 +604,7 @@ impl Lab {
     async fn enforcer(&mut self, node: &'static str) {
         let table = TableName::new(format!("temps_p7_{}_{node}", self.run))
             .unwrap_or_else(|e| panic!("{e}"));
-        let daemon_is_local = std::env::var("DOCKER_HOST")
-            .map(|h| h.starts_with("unix://"))
-            .unwrap_or(true);
+        let daemon_is_local = daemon_is_local();
         let executor: Arc<dyn temps_workload_netpol::NftExecutor> =
             Arc::from(choose_executor(self.docker.clone(), daemon_is_local));
         let ports: Arc<dyn temps_workload_netpol::PortResolver> =
@@ -687,6 +707,13 @@ fn remove_route_script(comment: &str) -> String {
         "for h in $(nft -a list chain ip filter DOCKER-USER 2>/dev/null | grep '{comment}' | sed 's/.*# handle //'); do \
            nft delete rule ip filter DOCKER-USER handle $h; done; true"
     )
+}
+
+/// Whether the Docker daemon runs on this machine (no remote `DOCKER_HOST`).
+fn daemon_is_local() -> bool {
+    std::env::var("DOCKER_HOST")
+        .map(|h| h.starts_with("unix://"))
+        .unwrap_or(true)
 }
 
 fn sh(script: &str) -> Vec<String> {
@@ -819,6 +846,22 @@ async fn run(lab: &mut Lab) {
     lab.enforcer("b").await;
     assert_eq!(lab.set_mode(0, NodeMode::Legacy).await, PassOutcome::Legacy);
     assert_eq!(lab.set_mode(1, NodeMode::Legacy).await, PassOutcome::Legacy);
+    // `legacy` filters nothing but still knows the node's workloads: each
+    // node identified its own containers and reported them.
+    let observed_a = lab.enforcers[0].1.last_observed();
+    for workload in [sandbox(), victim(), attacker()] {
+        assert_eq!(
+            observed_a.addresses(&workload).count(),
+            1,
+            "node A in legacy identifies {workload}"
+        );
+    }
+    let observed_b = lab.enforcers[1].1.last_observed();
+    assert_eq!(
+        observed_b.workloads().count(),
+        2,
+        "node A's are not node B's"
+    );
 
     // ---- Controls: nothing enforced, everything reachable. ----
     wait_for("R reaching S1:5432", || lab.tcp("r", S1_IP, 5432)).await;
