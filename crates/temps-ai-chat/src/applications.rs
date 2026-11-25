@@ -1090,12 +1090,18 @@ fn store_workspace_files_fd_relative(
             for name in names {
                 let name = std::ffi::OsStr::from_bytes(name.to_bytes());
                 let relative = parent_path.join(name);
-                if relative.to_str().is_some_and(is_sensitive_workspace_path) {
-                    continue;
-                }
                 let stat = statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
                 let file_type = FileType::from_raw_mode(stat.st_mode);
+                // Only generated directories are free; credential files are
+                // hidden and refused on import, but they still take up space.
+                if file_type.is_dir()
+                    && name.to_str().is_some_and(|name| {
+                        is_generated_workspace_dir_name(&name.to_ascii_lowercase())
+                    })
+                {
+                    continue;
+                }
                 existing_paths.insert(relative.clone());
                 if file_type.is_dir() {
                     // Queue the relative directory name, not its descriptor.
@@ -1284,26 +1290,10 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
     }
     components.iter().any(|lower| {
         let lower = lower.as_str();
-        lower == ".git"
-            || lower == ".temps"
+        is_generated_workspace_dir_name(lower)
             || matches!(
                 lower,
-                ".aws"
-                    | ".azure"
-                    | ".docker"
-                    | ".gnupg"
-                    | ".kube"
-                    | ".next"
-                    | ".pulumi"
-                    | ".ssh"
-                    | ".terraform"
-                    | ".turbo"
-                    | ".vercel"
-                    | "build"
-                    | "coverage"
-                    | "dist"
-                    | "node_modules"
-                    | "target"
+                ".aws" | ".azure" | ".docker" | ".gnupg" | ".kube" | ".ssh"
             )
             || lower == ".env"
             || (lower.starts_with(".env.") && lower != ".env.example")
@@ -1345,6 +1335,26 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
             || lower.ends_with(".tfvars")
             || lower.ends_with(".tfvars.json")
     })
+}
+
+/// Version-control and tool state and build output: regenerated, not authored,
+/// so never listed, imported, deployed or counted against the quota.
+fn is_generated_workspace_dir_name(lower: &str) -> bool {
+    matches!(
+        lower,
+        ".git"
+            | ".temps"
+            | ".next"
+            | ".pulumi"
+            | ".terraform"
+            | ".turbo"
+            | ".vercel"
+            | "build"
+            | "coverage"
+            | "dist"
+            | "node_modules"
+            | "target"
+    )
 }
 
 /// The default names `ssh-keygen` gives a private key, including the
@@ -4145,6 +4155,55 @@ mod tests {
             .expect_err("files in another project must consume the application quota");
         assert!(matches!(error, ApplicationError::WorkspaceQuota { .. }));
         assert!(!projects.join("web/new.bin").exists());
+    }
+
+    /// Credential files are hidden from listings and refused on import, but
+    /// they still take up space: one already in the workspace counts against
+    /// the aggregate quota, so it cannot be used to exceed it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_credential_files_count_against_the_workspace_quota() {
+        for existing in [
+            "projects/api/backup/secrets.gpg",
+            "projects/api/.env",
+            ".ssh/id_rsa",
+        ] {
+            let data_dir = tempfile::tempdir().expect("temporary data directory");
+            let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
+            let workspace = service
+                .ensure("app_safe_123", &[])
+                .await
+                .expect("managed workspace");
+            tokio::fs::create_dir_all(workspace.host_work_dir.join("projects/web"))
+                .await
+                .expect("web project");
+            let existing_path = workspace.host_work_dir.join(existing);
+            tokio::fs::create_dir_all(existing_path.parent().expect("parent"))
+                .await
+                .expect("credential file parent");
+            tokio::fs::write(&existing_path, vec![0; 6])
+                .await
+                .expect("existing credential file");
+
+            let error = service
+                .store_project_files_bounded(
+                    "app_safe_123",
+                    "web",
+                    vec![(PathBuf::from("new.bin"), vec![0; 3], None)],
+                    8,
+                    100,
+                )
+                .await
+                .expect_err("an existing credential file consumes the quota");
+            assert!(
+                matches!(error, ApplicationError::WorkspaceQuota { .. }),
+                "{existing}: {error:?}"
+            );
+            assert!(!workspace
+                .host_work_dir
+                .join("projects/web/new.bin")
+                .exists());
+        }
     }
 
     #[cfg(unix)]
