@@ -233,9 +233,7 @@ impl TailscaleOps for LiveOps {
         // Still this run's, by this install's marker, immediately before
         // the DELETE: never a Service someone else made at the name.
         let install = self.deps.records.instance_id().await.map_err(text)?;
-        if let Err(why) =
-            crate::reachability::run::still_ours(&current, name, &install, creator_run_id)
-        {
+        if let Err(why) = super::run::still_ours(&current, name, &install, creator_run_id) {
             return Ok(ServiceDeletion::Kept(why));
         }
         if let Some(why) = current.differs_from(shown) {

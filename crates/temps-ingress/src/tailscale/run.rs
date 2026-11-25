@@ -15,10 +15,9 @@ use crate::reachability::model::{
     Decision, Intent, JournalEntry, JournalState, RunResource, StepKind, UndoResult,
 };
 use crate::reachability::run::{
-    pause, still_ours, tailscale_addrs, unrecorded_hosts, unrecorded_message, Begin, Found,
-    Outcome, ProviderRun, ProviderUndo, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget,
-    ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, StepRun, Stop, UndoCheck,
-    WriteError,
+    pause, tailscale_addrs, unrecorded_hosts, unrecorded_message, Begin, Found, Outcome,
+    ProviderRun, ProviderUndo, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget, ServeWish,
+    ServiceDeletion, ServiceEntryHost, ServicePlan, StepRun, Stop, UndoCheck, WriteError,
 };
 use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
 use temps_core::tailnet::messages as tailnet_messages;
@@ -1153,4 +1152,30 @@ impl ProviderRun for TailscaleRun<'_> {
             _ => ProviderUndo::Engine,
         }
     }
+}
+
+/// Whether `current` still carries the marker run `creator_run_id` of
+/// `install` gave it (ADR 065 D4): no marker, another install's or another
+/// run's is never written to or deleted. Why not, when it is not.
+pub(crate) fn still_ours(
+    current: &ServiceDefinition,
+    name: &str,
+    install: &str,
+    creator_run_id: i32,
+) -> Result<(), String> {
+    let ours = !install.is_empty()
+        && tailscale::ownership(current, install) == Ownership::Ours { creator_run_id };
+    if ours {
+        return Ok(());
+    }
+    let now = current.comment.trim();
+    Err(if now.is_empty() {
+        format!("`{name}` no longer carries the marker this Temps install gave it, so it is not Temps' to delete")
+    } else {
+        format!(
+            "`{name}` now carries `{now}`, not the marker this Temps install gave it (`{}`), so it \
+             is not Temps' to delete",
+            tailscale::marker(install, creator_run_id)
+        )
+    })
 }

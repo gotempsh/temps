@@ -51,7 +51,7 @@ use super::model::{
     UndoResult,
 };
 use super::plan::NamedId;
-use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
+use crate::tailscale::{ServiceDefinition, ServiceHost, TailscaleCredential};
 
 /// A managed zone's state under one DNS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2726,32 +2726,6 @@ pub(crate) fn pause(
     Stop::Conflict(undo_conflict_message(entry))
 }
 
-/// Whether `current` still carries the marker run `creator_run_id` of
-/// `install` gave it (ADR 065 D4): no marker, another install's or another
-/// run's is never written to or deleted. Why not, when it is not.
-pub(crate) fn still_ours(
-    current: &ServiceDefinition,
-    name: &str,
-    install: &str,
-    creator_run_id: i32,
-) -> Result<(), String> {
-    let ours = !install.is_empty()
-        && tailscale::ownership(current, install) == Ownership::Ours { creator_run_id };
-    if ours {
-        return Ok(());
-    }
-    let now = current.comment.trim();
-    Err(if now.is_empty() {
-        format!("`{name}` no longer carries the marker this Temps install gave it, so it is not Temps' to delete")
-    } else {
-        format!(
-            "`{name}` now carries `{now}`, not the marker this Temps install gave it (`{}`), so it \
-             is not Temps' to delete",
-            tailscale::marker(install, creator_run_id)
-        )
-    })
-}
-
 /// Remove what a run created and put back what it changed, newest first,
 /// marking each in the journal. Pre-existing resources are never in it.
 ///
@@ -3314,7 +3288,8 @@ mod tests {
     use crate::reachability::token_check::{
         PermissionCheck, PermissionState, TokenCheckResult, TokenPermission,
     };
-    use crate::tailscale::run::TailscaleOps;
+    use crate::tailscale;
+    use crate::tailscale::run::{still_ours, TailscaleOps};
     use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT};
 
     /// [`super::decide`] with the providers every test run has.

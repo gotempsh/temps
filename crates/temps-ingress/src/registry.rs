@@ -176,10 +176,7 @@ impl ProviderRegistry {
     /// Every provider that ships with Temps.
     pub fn builtin() -> Self {
         Self {
-            providers: vec![
-                Arc::new(crate::cloudflare::CloudflareTunnelFactory),
-                Arc::new(crate::tailscale::TailscaleFactory),
-            ],
+            providers: crate::providers::builtin(),
         }
     }
 
