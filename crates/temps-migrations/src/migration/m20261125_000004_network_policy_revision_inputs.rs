@@ -113,6 +113,6 @@ mod tests {
             .collect();
         assert!(names
             .iter()
-            .any(|n| n == "m20261125_000002_network_policy_revision_inputs"));
+            .any(|n| n == "m20261125_000004_network_policy_revision_inputs"));
     }
 }

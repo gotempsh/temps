@@ -10921,7 +10921,7 @@ async fn egress_recording_column(
 /// the sandboxes.
 #[tokio::test]
 async fn test_sandbox_egress_recording_defaults_off_and_reverses() -> anyhow::Result<()> {
-    const MIGRATION: &str = "m20261125_000001_sandbox_egress_recording";
+    const MIGRATION: &str = "m20261125_000003_sandbox_egress_recording";
     if external_db_configured() {
         return Ok(());
     }
@@ -11004,7 +11004,7 @@ async fn test_sandbox_egress_recording_defaults_off_and_reverses() -> anyhow::Re
 /// environment.
 #[tokio::test]
 async fn test_environment_egress_recording_defaults_off_and_reverses() -> anyhow::Result<()> {
-    const MIGRATION: &str = "m20261125_000005_environment_egress_recording";
+    const MIGRATION: &str = "m20261125_000007_environment_egress_recording";
     if external_db_configured() {
         return Ok(());
     }
@@ -11128,7 +11128,7 @@ async fn network_policy_revision(db: &DatabaseConnection) -> anyhow::Result<i64>
 /// removes the triggers and leaves the revision row alone.
 #[tokio::test]
 async fn test_network_policy_revision_inputs_bump_and_reverse() -> anyhow::Result<()> {
-    const MIGRATION: &str = "m20261125_000002_network_policy_revision_inputs";
+    const MIGRATION: &str = "m20261125_000004_network_policy_revision_inputs";
     if external_db_configured() {
         return Ok(());
     }
@@ -11190,7 +11190,7 @@ async fn test_network_policy_revision_inputs_bump_and_reverse() -> anyhow::Resul
 /// rewritten; `down` turns `off` back into `legacy` and refuses `off` again.
 #[tokio::test]
 async fn test_network_policy_mode_off_is_accepted_and_reverses() -> anyhow::Result<()> {
-    const MIGRATION: &str = "m20261125_000003_network_policy_mode_off";
+    const MIGRATION: &str = "m20261125_000005_network_policy_mode_off";
     if external_db_configured() {
         return Ok(());
     }
@@ -11280,13 +11280,13 @@ async fn test_network_policy_mode_off_is_accepted_and_reverses() -> anyhow::Resu
     Ok(())
 }
 
-/// A log record can be owned by a workload (kind and id, partially
-/// indexed) with or without a project: older rows keep working, compressed
+/// A log record can be owned by a workload (kind and id) with or without a
+/// project: older rows keep working, compressed
 /// chunks are not rewritten and accept records without a project, and
 /// `down` removes the columns and the records that had no project.
 #[tokio::test]
 async fn test_otel_log_events_workload_owner_is_added_and_reverses() -> anyhow::Result<()> {
-    const MIGRATION: &str = "m20261125_000004_otel_log_events_workload_owner";
+    const MIGRATION: &str = "m20261125_000006_otel_log_events_workload_owner";
     if external_db_configured() {
         return Ok(());
     }
@@ -11405,21 +11405,17 @@ async fn test_otel_log_events_workload_owner_is_added_and_reverses() -> anyhow::
             owned("unowned compressed", None, Some(("deployment", 7))),
         ]
     );
+    // The migration adds no index: building one on the log table would
+    // block ingestion, so `temps_schema` builds it after boot.
     let index = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT indexdef FROM pg_indexes \
+            "SELECT 1 AS present FROM pg_indexes \
              WHERE indexname = 'idx_otel_logs_workload_timestamp'"
                 .to_string(),
         ))
-        .await?
-        .expect("the workload index exists");
-    let definition: String = index.try_get("", "indexdef")?;
-    assert!(
-        definition.contains("(workload_kind, workload_id, \"timestamp\" DESC)")
-            && definition.contains("WHERE (workload_id IS NOT NULL)"),
-        "{definition}"
-    );
+        .await?;
+    assert!(index.is_none(), "the index is built after boot, not here");
 
     Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
     let columns = db

@@ -21,8 +21,15 @@
 //!
 //! Adding nullable columns without a default and dropping a `NOT NULL`
 //! change only the catalog, so existing chunks, compressed ones included,
-//! are not rewritten. The index is partial: rows without a workload, which
-//! are almost all of them, add nothing to it.
+//! are not rewritten and ingestion is not held up.
+//!
+//! The index a workload's records are read by
+//! (`idx_otel_logs_workload_timestamp`, partial: rows without a workload,
+//! which are almost all of them, add nothing to it) is not built here. On
+//! an install with months of logs a `CREATE INDEX` inside the migration
+//! would block log ingestion for the whole build, so it is built after boot,
+//! one chunk per transaction, by `temps_schema`'s post-migration step. Until
+//! then a workload's records are still read correctly, by a scan.
 //!
 //! Down deletes the records that have no project, since the column cannot
 //! hold them once it is `NOT NULL` again.
@@ -41,10 +48,7 @@ impl MigrationTrait for Migration {
                 "ALTER TABLE otel_log_events \
                      ADD COLUMN IF NOT EXISTS workload_kind TEXT, \
                      ADD COLUMN IF NOT EXISTS workload_id BIGINT; \
-                 ALTER TABLE otel_log_events ALTER COLUMN project_id DROP NOT NULL; \
-                 CREATE INDEX IF NOT EXISTS idx_otel_logs_workload_timestamp \
-                     ON otel_log_events (workload_kind, workload_id, timestamp DESC) \
-                     WHERE workload_id IS NOT NULL;",
+                 ALTER TABLE otel_log_events ALTER COLUMN project_id DROP NOT NULL;",
             )
             .await?;
         Ok(())

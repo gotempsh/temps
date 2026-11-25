@@ -34,6 +34,9 @@ struct ReferenceIndex {
     name: &'static str,
     table: &'static str,
     column: &'static str,
+    /// The index key, when it is more than `column` alone (a composite
+    /// key that also orders the rows). `None` indexes `column`.
+    key: Option<&'static str>,
     /// Index only rows where the column is set. Most rows of the high-volume
     /// tables carry no address, so a partial index costs them nothing.
     partial: bool,
@@ -50,6 +53,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_visitor_last_seen",
         table: "visitor",
         column: "last_seen",
+        key: None,
         partial: false,
         hypertable: false,
     },
@@ -57,6 +61,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_error_events_ip_geolocation",
         table: "error_events",
         column: "ip_geolocation_id",
+        key: None,
         partial: true,
         hypertable: true,
     },
@@ -64,6 +69,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_proxy_logs_ip_geolocation",
         table: "proxy_logs",
         column: "ip_geolocation_id",
+        key: None,
         partial: true,
         hypertable: true,
     },
@@ -71,6 +77,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_visitor_ip_address",
         table: "visitor",
         column: "ip_address_id",
+        key: None,
         partial: true,
         hypertable: false,
     },
@@ -78,6 +85,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_performance_metrics_ip_address",
         table: "performance_metrics",
         column: "ip_address_id",
+        key: None,
         partial: true,
         hypertable: false,
     },
@@ -85,6 +93,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_audit_logs_ip_address",
         table: "audit_logs",
         column: "ip_address_id",
+        key: None,
         partial: true,
         hypertable: false,
     },
@@ -96,6 +105,7 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_deployments_image_name",
         table: "deployments",
         column: "image_name",
+        key: None,
         partial: true,
         hypertable: false,
     },
@@ -107,8 +117,23 @@ const REFERENCE_INDEXES: &[ReferenceIndex] = &[
         name: "idx_visitor_user_id",
         table: "visitor",
         column: "user_id",
+        key: None,
         partial: true,
         hypertable: false,
+    },
+    // Not an IP reference either: records the platform observes about a
+    // workload (its recorded outbound connections) are read by the workload,
+    // newest first, from a table that is mostly ordinary log lines with no
+    // workload at all. The migration only adds the columns
+    // (`m20261125_000006_otel_log_events_workload_owner`); building this on
+    // an install with months of logs inside it would stop log ingestion.
+    ReferenceIndex {
+        name: "idx_otel_logs_workload_timestamp",
+        table: "otel_log_events",
+        column: "workload_id",
+        key: Some("workload_kind, workload_id, timestamp DESC"),
+        partial: true,
+        hypertable: true,
     },
 ];
 
@@ -122,18 +147,18 @@ impl ReferenceIndex {
         if self.hypertable {
             // `WITH (...)` precedes `WHERE` in the CREATE INDEX grammar.
             format!(
-                "CREATE INDEX IF NOT EXISTS {name} ON {table} ({column}) \
+                "CREATE INDEX IF NOT EXISTS {name} ON {table} ({key}) \
                  WITH (timescaledb.transaction_per_chunk){predicate}",
                 name = self.name,
                 table = self.table,
-                column = self.column,
+                key = self.key.unwrap_or(self.column),
             )
         } else {
             format!(
-                "CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({column}){predicate}",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} ON {table} ({key}){predicate}",
                 name = self.name,
                 table = self.table,
-                column = self.column,
+                key = self.key.unwrap_or(self.column),
             )
         }
     }
@@ -1505,6 +1530,29 @@ mod tests {
         }
     }
 
+    /// A workload's records are found by kind and id and read newest first,
+    /// so the index is on all three, only over rows that have a workload,
+    /// and it is built here, one chunk per transaction, not in the
+    /// migration that added the columns.
+    #[test]
+    fn the_workload_log_index_is_composite_partial_and_built_per_chunk() {
+        let index = REFERENCE_INDEXES
+            .iter()
+            .find(|index| index.name == "idx_otel_logs_workload_timestamp")
+            .expect("the workload log index is built after boot");
+        assert_eq!(
+            index.create_sql(),
+            "CREATE INDEX IF NOT EXISTS idx_otel_logs_workload_timestamp ON otel_log_events \
+             (workload_kind, workload_id, timestamp DESC) \
+             WITH (timescaledb.transaction_per_chunk) WHERE workload_id IS NOT NULL"
+        );
+        // The column whose presence decides whether to build it at all.
+        assert_eq!(
+            (index.table, index.column),
+            ("otel_log_events", "workload_id")
+        );
+    }
+
     /// TimescaleDB rejects `CREATE INDEX CONCURRENTLY` on a hypertable.
     #[test]
     fn hypertable_reference_indexes_build_one_chunk_per_transaction() {
@@ -1516,7 +1564,10 @@ mod tests {
             .map(|i| i.table)
             .collect();
         hypertables.sort_unstable();
-        assert_eq!(hypertables, ["error_events", "proxy_logs"]);
+        assert_eq!(
+            hypertables,
+            ["error_events", "otel_log_events", "proxy_logs"]
+        );
 
         for index in REFERENCE_INDEXES.iter().filter(|i| i.hypertable) {
             let sql = index.create_sql();

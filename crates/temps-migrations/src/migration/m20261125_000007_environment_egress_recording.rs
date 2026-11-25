@@ -72,6 +72,6 @@ mod tests {
             .collect();
         assert!(names
             .iter()
-            .any(|n| n == "m20261125_000005_environment_egress_recording"));
+            .any(|n| n == "m20261125_000007_environment_egress_recording"));
     }
 }

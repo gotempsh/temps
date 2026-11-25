@@ -73,8 +73,10 @@ every error are the shared ones.
 
 ### D4. Records are owned by a workload, and a project is optional
 
-`otel_log_events` gains `workload_kind` and `workload_id`, with a partial
-index, and `project_id` becomes nullable. A record the platform observes
+`otel_log_events` gains `workload_kind` and `workload_id`, and `project_id`
+becomes nullable. The partial index a workload's records are read by is
+built after boot, one chunk at a time, so adding it never blocks log
+ingestion. A record the platform observes
 about a workload is stored with that identity and read by it. It is also its
 project's log record when the workload has a project.
 

@@ -166,7 +166,8 @@ for every workload kind:
 
 - `otel_log_events` gets nullable `workload_kind` and `workload_id` columns
   and a partial index on `(workload_kind, workload_id, timestamp DESC)
-  WHERE workload_id IS NOT NULL`. `project_id` becomes nullable. ClickHouse
+  WHERE workload_id IS NOT NULL`, built after boot one chunk at a time.
+  `project_id` becomes nullable. ClickHouse
   delegates logs to this table, so it needs no change. Workload logs leave
   the workload columns `NULL`. Only the platform ingest
   (`ingest_platform_logs`) sets them, and the existing `temps.platform.*`
