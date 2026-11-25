@@ -13,6 +13,7 @@ import { Route, Webhook } from 'lucide-react'
 import { useEffect } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { returnNavigation, safeReturnTo } from '@/lib/safe-return-to'
+import { ALERTS_URL } from '@/lib/server-navigation'
 
 export function Notifications() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -24,15 +25,18 @@ export function Notifications() {
   const returnTo = safeReturnTo(searchParams.get('returnTo'))
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Notifications' }])
+    setBreadcrumbs([
+      { label: 'Alerts', href: ALERTS_URL },
+      { label: 'Channels' },
+    ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Notifications')
+  usePageTitle('Alert channels')
 
   return (
     <div className="w-full min-w-0 space-y-6">
       <PageHeader
-        title="Notifications"
+        title="Channels"
         description="Providers and routes apply to all projects on this instance. Alert rules are set per project and deliver through these routes."
         actions={
           returnTo ? (

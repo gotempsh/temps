@@ -8,10 +8,11 @@ import { Command, CommandList } from '@/components/ui/command'
 import Fuse from 'fuse.js'
 
 import { CLUSTER_DNS_URL } from '@/lib/worker-nodes'
-import { PROJECT_NAV_GROUPS } from '@/lib/project-navigation'
+import { PROJECT_NAV_SECTIONS } from '@/lib/project-navigation'
 import {
   CommandPaletteSuggestions,
   indexedMainNavItems,
+  indexedSettingsNavItems,
   projectNavItems,
   projectNavItemsFor,
 } from './CommandPalette'
@@ -69,8 +70,12 @@ describe('navigation search', () => {
     expect(first?.item.url).toBe(CLUSTER_DNS_URL)
   })
 
-  test('the setup checklist stays reachable after its sidebar card is hidden', () => {
-    const fuse = new Fuse(indexedMainNavItems, NAV_FUSE_OPTIONS)
+  test('the setup checklist stays reachable once Settings no longer lists it', () => {
+    // It is a settings page, found among them and listed once.
+    expect(indexedMainNavItems.some((item) => item.url === '/setup')).toBe(
+      false
+    )
+    const fuse = new Fuse(indexedSettingsNavItems, NAV_FUSE_OPTIONS)
     for (const query of [
       'Finish setting up',
       'platform setup',
@@ -89,14 +94,14 @@ describe('navigation search', () => {
 })
 
 describe('project pages in the palette', () => {
-  test('the Monitoring pages carry the icon of their tab', () => {
-    const tabs = PROJECT_NAV_GROUPS.flatMap((group) => group.sections)
-      .find((section) => section.id === 'monitoring')
-      ?.tabs.filter((tab) =>
-        ['monitors', 'cron-jobs', 'check-ins'].includes(tab.url)
-      )
+  test('the Uptime pages carry the icon of their tab', () => {
+    const tabs = PROJECT_NAV_SECTIONS.find(
+      (section) => section.id === 'uptime'
+    )?.tabs.filter((tab) =>
+      ['monitors', 'cron-jobs', 'check-ins'].includes(tab.url)
+    )
     expect(tabs?.map((tab) => tab.title)).toEqual([
-      'Uptime',
+      'Monitors',
       'Cron jobs',
       'Check-ins',
     ])

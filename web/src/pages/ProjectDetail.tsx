@@ -934,7 +934,10 @@ export function ProjectDetail() {
                   path="runtime"
                   element={<ProjectRuntime project={project} />}
                 />
-                <Route path="observe" element={<Observe project={project} />} />
+                <Route
+                  path="activity"
+                  element={<Observe project={project} />}
+                />
                 <Route
                   path="settings/*"
                   element={

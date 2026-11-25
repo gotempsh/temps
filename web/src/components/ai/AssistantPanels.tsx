@@ -3,7 +3,6 @@
 
 import {
   createAssistantConversation,
-  createProviderKey,
   setChatWorkspace,
   uploadUserConversationAttachment,
   type ConversationResponse,
@@ -13,22 +12,17 @@ import {
   getChatSandboxOptions,
   getProjectsOptions,
   getAiProviderStatusQueryKey,
-  listProviderKeysQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
-import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowRight,
   Boxes,
   Cloud,
-  KeyRound,
   ArrowUp,
   Loader2,
   Paperclip,
@@ -38,10 +32,8 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
-import { useForm } from 'react-hook-form'
 import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
-import { z } from 'zod'
 import { FOCUS_COMPOSER_HINT } from './assistant-view'
 import { WorkspaceChip } from './WorkspaceChip'
 import { ChatPluginWatches } from './ChatPluginWatches'
@@ -53,12 +45,13 @@ import { NewChatProjectChip } from './NewChatProjectChip'
 import { useFocusComposerShortcut } from './useFocusComposerShortcut'
 import {
   ASSISTANT_CONTEXT_TYPE,
-  ASSISTANT_EXAMPLE_PROMPTS,
+  PROVIDER_SETUP_PATH,
   assistantExamplePrompts,
   assistantReadiness,
   setupPathFromProblem,
 } from './assistant-state'
 import { AssistantModelChip, AssistantModelSetup } from './AssistantModelPicker'
+import { AssistantProviderSetup } from './AssistantProviderSetup'
 import { gatewayKeyProviderId } from './assistant-keys'
 import { enterSendsMessage } from './chat-page-state'
 import {
@@ -69,7 +62,6 @@ import {
   ASSISTANT_ATTACHMENT_LIMITS,
   assistantAttachTitle,
   assistantImageError,
-  attachHint,
   attachmentSelectionError,
   type OpeningAttachment,
 } from './attachment-previews'
@@ -105,19 +97,15 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 
-const keySchema = z.object({
-  api_key: z.string().trim().min(1, 'Paste your OpenRouter API key'),
-})
-type KeyForm = z.infer<typeof keySchema>
-
 /**
- * What the assistant does and exactly what is missing, with the fix on the
- * same screen. Shown in place of the chat whenever no AI provider exists, so
- * the feature is discoverable instead of absent.
+ * Exactly what is missing, with the fix on the same screen. Shown in place of
+ * the chat whenever no AI provider exists, so the feature is discoverable
+ * instead of absent. Setup is all it holds: things to ask belong to the start
+ * screen, where they can be sent.
  *
- * Pasting an OpenRouter key here is the whole setup: it is verified and stored
- * encrypted by the same endpoint the AI Gateway page uses, and never shown
- * again.
+ * Every supported provider is a choice here, with the whole of its form:
+ * nothing about connecting one sends the user to another page. It is tested
+ * and stored by the same endpoints the AI providers page uses.
  */
 export function AssistantOnboarding({
   reason,
@@ -143,31 +131,6 @@ export function AssistantOnboarding({
   // status is only refreshed when that step ends, because a ready status swaps
   // this onboarding out for the chat before the model has been chosen.
   const [savedKeyId, setSavedKeyId] = useState<number | null>(null)
-  const form = useForm<KeyForm>({
-    resolver: zodResolver(keySchema),
-    defaultValues: { api_key: '' },
-  })
-  const save = useMutation({
-    mutationFn: async (values: KeyForm) =>
-      createProviderKey({
-        body: {
-          provider: 'openrouter',
-          display_name: 'OpenRouter',
-          api_key: values.api_key,
-        },
-        throwOnError: true,
-      }),
-    onSuccess: async (result) => {
-      form.reset()
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: listProviderKeysQueryKey() }),
-        queryClient.invalidateQueries({ queryKey: ['providerKeys'] }),
-      ])
-      toast.success('OpenRouter key saved')
-      setSavedKeyId(result.data?.id ?? null)
-      if (result.data?.id == null) await finishSetup()
-    },
-  })
 
   const finishSetup = async () => {
     await queryClient.invalidateQueries({
@@ -181,43 +144,33 @@ export function AssistantOnboarding({
     <div
       className={cn(
         'flex h-full min-h-0 flex-col gap-5 overflow-y-auto p-5',
-        roomy && 'justify-center gap-8 p-6'
+        // Centred only while it fits: plain centring would push the top of
+        // a taller panel above the scroll area, where it cannot be reached.
+        roomy && 'gap-8 p-6 [justify-content:safe_center]'
       )}
     >
-      <div className={cn('space-y-2', roomy && 'space-y-4')}>
-        <Badge
-          variant="outline"
-          className={cn(
-            'gap-1.5 whitespace-normal font-normal',
-            roomy && 'px-3 py-1 text-sm'
-          )}
-        >
-          <KeyRound
-            className={cn('size-3 shrink-0', roomy && 'size-4')}
-            aria-hidden="true"
-          />
-          {reason}
-        </Badge>
-        <h2
-          className={cn(
-            'text-xl font-semibold tracking-tight',
-            roomy && 'text-4xl'
-          )}
-        >
-          Get things running on Temps by chat
-        </h2>
-        <p
-          className={cn(
-            'text-sm leading-6 text-muted-foreground',
-            roomy && 'text-lg leading-8'
-          )}
-        >
-          Say what you want: deploy a repository from a Git URL, back up your
-          databases to S3, add a database to a project. The assistant works out
-          the steps and uses the same API as this console, with your own
-          permissions.
-        </p>
-      </div>
+      {savedKeyId === null ? (
+        <div className={cn('space-y-1.5', roomy && 'space-y-3')}>
+          <h2
+            className={cn(
+              'text-xl font-semibold tracking-tight',
+              roomy && 'text-2xl sm:text-4xl'
+            )}
+          >
+            Connect an AI provider
+          </h2>
+          {reason ? (
+            <p
+              className={cn(
+                'text-sm leading-6 text-muted-foreground',
+                roomy && 'text-base leading-7 sm:text-lg sm:leading-8'
+              )}
+            >
+              {reason}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       {savedKeyId !== null ? (
         <AssistantModelSetup
@@ -227,81 +180,25 @@ export function AssistantOnboarding({
         />
       ) : (
         <>
-          <AssistantExample roomy={roomy} />
+          <AssistantProviderSetup
+            roomy={roomy}
+            onSaved={async ({ keyId, modelChosen }) => {
+              // A server of the user's own had its model picked in the form.
+              if (keyId === null || modelChosen) await finishSetup()
+              else setSavedKeyId(keyId)
+            }}
+          />
 
-          <form
-            noValidate
-            onSubmit={form.handleSubmit((values) => save.mutate(values))}
-            className={cn('space-y-2', roomy && 'space-y-3')}
-          >
-            <label
-              htmlFor="assistant-openrouter-key"
-              className={cn('text-sm font-medium', roomy && 'text-base')}
-            >
-              OpenRouter API key
-            </label>
-            <div className="flex gap-2">
-              <Input
-                className={cn(roomy && 'h-12 text-base md:text-base')}
-                id="assistant-openrouter-key"
-                type="password"
-                autoComplete="off"
-                spellCheck={false}
-                placeholder="sk-or-…"
-                disabled={save.isPending}
-                aria-invalid={form.formState.errors.api_key ? true : undefined}
-                {...form.register('api_key')}
-              />
-              <Button
-                type="submit"
-                disabled={save.isPending}
-                className={cn(roomy && 'h-12 px-6 text-base')}
-              >
-                {save.isPending ? (
-                  <Loader2 className="size-4 animate-spin" aria-hidden="true" />
-                ) : null}
-                Save key
-              </Button>
-            </div>
-            {form.formState.errors.api_key ? (
-              <p className="text-sm text-destructive" role="alert">
-                {form.formState.errors.api_key.message}
-              </p>
-            ) : null}
-            {save.isError ? (
-              <p className="text-sm text-destructive" role="alert">
-                {getErrorMessage(
-                  save.error,
-                  'OpenRouter rejected the key. Check it and try again.'
-                )}
-              </p>
-            ) : null}
-            <p
-              className={cn(
-                'text-xs leading-5 text-muted-foreground',
-                roomy && 'text-sm leading-6'
-              )}
-            >
-              The key is checked with OpenRouter, then stored encrypted. It is
-              never shown again.{' '}
-              <a
-                className="underline underline-offset-2"
-                href="https://openrouter.ai/keys"
-                target="_blank"
-                rel="noreferrer"
-              >
-                Get a key
-              </a>
-            </p>
-          </form>
-
-          <div className={cn('grid gap-2', roomy && 'gap-3')}>
+          {/* Not needed to connect: the form above is the whole setup. One
+              shrinkable column, and labels that wrap: a long label on one
+              line made this wider than a phone. */}
+          <div className="grid grid-cols-1 gap-1">
             <Button
               asChild
-              variant="outline"
+              variant="ghost"
               className={cn(
-                'w-full justify-between',
-                roomy && 'h-12 text-base'
+                'h-auto min-h-9 w-full justify-between whitespace-normal py-2 text-left text-muted-foreground',
+                roomy && 'min-h-12 text-base'
               )}
             >
               <Link to={setupPath} onClick={onNavigate}>
@@ -313,8 +210,8 @@ export function AssistantOnboarding({
                 asChild
                 variant="ghost"
                 className={cn(
-                  'w-full justify-between text-muted-foreground',
-                  roomy && 'h-12 text-base'
+                  'h-auto min-h-9 w-full justify-between whitespace-normal py-2 text-left text-muted-foreground',
+                  roomy && 'min-h-12 text-base'
                 )}
               >
                 <Link to={cloudPath} onClick={onNavigate}>
@@ -329,39 +226,6 @@ export function AssistantOnboarding({
           </div>
         </>
       )}
-    </div>
-  )
-}
-
-/** A concrete exchange, so "ask the assistant" is not an abstract promise. */
-function AssistantExample({ roomy }: { roomy?: boolean }) {
-  return (
-    <div
-      className={cn(
-        'space-y-2 rounded-lg border border-border bg-muted/30 p-3 text-sm',
-        roomy && 'space-y-3 p-5 text-base'
-      )}
-    >
-      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        Example
-      </p>
-      <p
-        className={cn(
-          'rounded-md bg-background px-3 py-2',
-          roomy && 'px-4 py-3'
-        )}
-      >
-        {ASSISTANT_EXAMPLE_PROMPTS[0]}
-      </p>
-      <p
-        className={cn(
-          'px-1 text-xs leading-5 text-muted-foreground',
-          roomy && 'text-sm leading-6'
-        )}
-      >
-        Reads and changes run straight away unless you turn on “Ask before
-        changes”. Deletions always wait for your approval.
-      </p>
     </div>
   )
 }
@@ -532,7 +396,7 @@ export function AssistantStart({
             setupPathFromProblem(error.problem) ??
             (readiness.state === 'unconfigured'
               ? readiness.setupPath
-              : '/ai-gateway?add=openrouter'),
+              : PROVIDER_SETUP_PATH),
         })
         return
       }
@@ -571,7 +435,7 @@ export function AssistantStart({
     return (
       <AssistantOnboarding
         reason={view?.reason ?? ''}
-        setupPath={view?.setupPath ?? '/ai-gateway?add=openrouter'}
+        setupPath={view?.setupPath ?? PROVIDER_SETUP_PATH}
         cloudPath={cloudPath}
         roomy={roomy}
         onNavigate={onNavigate}
@@ -634,7 +498,8 @@ export function AssistantStart({
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
-            // Enter sends on a computer and breaks the line on a phone.
+            // Enter sends on a computer and breaks the line on a phone;
+            // ⌘Enter and Ctrl+Enter send on both.
             if (
               enterSendsMessage(
                 { ...event, isComposing: event.nativeEvent.isComposing },
@@ -750,9 +615,6 @@ export function AssistantStart({
           </Button>
         </div>
       </form>
-      <p className="-mt-2 text-xs text-muted-foreground">
-        {attachHint(true, imageSupport, ASSISTANT_ATTACHMENT_LIMITS)}
-      </p>
       {/* Suggestions fill the box rather than send: most goals need the user to
           add a detail (the repository URL, the bucket) before they make sense. */}
       <div

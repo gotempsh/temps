@@ -160,6 +160,22 @@ describe('enterSendsMessage', () => {
   test('is a new line on a phone', () => {
     expect(enterSendsMessage(enter, true)).toBe(false)
   })
+
+  test('⌘Enter and Ctrl+Enter send at every width', () => {
+    for (const mobile of [false, true]) {
+      expect(enterSendsMessage({ ...enter, metaKey: true }, mobile)).toBe(true)
+      expect(enterSendsMessage({ ...enter, ctrlKey: true }, mobile)).toBe(true)
+    }
+  })
+
+  test('a modifier does not send another key, or an IME confirmation', () => {
+    expect(
+      enterSendsMessage({ key: 'k', shiftKey: false, metaKey: true }, false)
+    ).toBe(false)
+    expect(
+      enterSendsMessage({ ...enter, metaKey: true, isComposing: true }, true)
+    ).toBe(false)
+  })
 })
 
 describe('chat list pagination', () => {

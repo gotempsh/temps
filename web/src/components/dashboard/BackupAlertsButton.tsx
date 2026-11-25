@@ -3,6 +3,7 @@
 
 import {
   backupAlertsQueryOptions,
+  backupAlertsShown,
   type BackupAlertResponse,
 } from '@/lib/backup-alerts'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
@@ -17,9 +18,10 @@ import { Separator } from '../ui/separator'
 
 /**
  * Global header button that surfaces open backup alerts (overdue schedules
- * + stalled jobs). Visible on every page so operators see problems even when
- * they're not on `/backups`. Renders the bell icon with a count badge when
- * alerts exist; a popover lists each alert.
+ * + stalled jobs), on every page, so operators see problems even when
+ * they're not on `/backups`. It is there only while an alert is open: the
+ * bell with a count badge, and a popover that lists each alert. With every
+ * backup healthy the top bar shows nothing for them.
  *
  * Color coding — any open alert is a danger state. Backups not firing is
  * never "informational" — it means a recovery point is missing. The badge
@@ -42,7 +44,7 @@ export function BackupAlertsButton() {
   const hasAlerts = count > 0
   const [open, setOpen] = useState(false)
 
-  if (!isAdmin) return null
+  if (!isAdmin || !backupAlertsShown(count, open)) return null
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

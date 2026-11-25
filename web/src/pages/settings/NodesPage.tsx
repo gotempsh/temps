@@ -50,6 +50,7 @@ import { useNodeRemoval } from '@/components/nodes/useNodeRemoval'
 import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
 import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { PageTabStrip } from '@/components/navigation/PageTabStrip'
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { problemDetail } from '@/lib/api-problem'
 import {
@@ -1352,6 +1353,19 @@ function NodeDetail({
           )}
         </div>
       </div>
+
+      {/* The node's sections; its name above says whose they are. */}
+      <PageTabStrip
+        label={`${node.name} sections`}
+        icons={false}
+        tabs={nodeSections(node.role).map((link) => ({
+          key: link.section,
+          title: link.title,
+          icon: link.icon,
+          to: nodeSectionUrl(nodeId, link.section),
+          active: link.section === section,
+        }))}
+      />
 
       {/* Drain confirmation dialog */}
       <ConfirmDeleteDialog

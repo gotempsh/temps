@@ -5,8 +5,9 @@ import type { Page } from '@playwright/test'
 import { expect, expectAppMounted, test } from '../fixtures'
 
 /**
- * The top-bar AI button opens the assistant full screen (`/chat`). Whether it
- * shows the chat or the setup is decided by the provider-status capability, so
+ * The top bar's "Ask" button opens the assistant (`/chat`) inside the console.
+ * Whether it shows the chat or the setup is decided by the provider-status
+ * capability, so
  * that is the only response these specs change: the real server answers it and
  * the gateway fields are overridden, keeping every other field the shape the
  * server actually sends.
@@ -31,7 +32,7 @@ const routeGatewayAvailability = async (
   })
 }
 
-const ONBOARDING_HEADING = 'Get things running on Temps by chat'
+const ONBOARDING_HEADING = 'Connect an AI provider'
 const READY_HEADING = 'What should we get running?'
 
 test.describe('AI entry and onboarding', () => {
@@ -43,8 +44,8 @@ test.describe('AI entry and onboarding', () => {
     await page.goto('/projects')
     await expectAppMounted(page)
 
-    const entry = page.getByRole('button', {
-      name: 'AI assistant',
+    const entry = page.getByRole('banner').getByRole('button', {
+      name: 'Ask',
       exact: true,
     })
     await expect(entry).toBeVisible()
@@ -85,7 +86,8 @@ test.describe('AI entry and onboarding', () => {
     await expectAppMounted(page)
 
     await page
-      .getByRole('button', { name: 'AI assistant', exact: true })
+      .getByRole('banner')
+      .getByRole('button', { name: 'Ask', exact: true })
       .click()
     await expect(page).toHaveURL(/\/chat(?:[?#]|$)/)
     await expect(
@@ -97,7 +99,7 @@ test.describe('AI entry and onboarding', () => {
     expect(consoleErrors).toEqual([])
   })
 
-  test('the full-screen assistant leads back to the console', async ({
+  test('the assistant keeps the console around it, and Ask leads back', async ({
     page,
     consoleErrors,
   }) => {
@@ -107,16 +109,19 @@ test.describe('AI entry and onboarding', () => {
     await expect(
       page.getByRole('heading', { name: ONBOARDING_HEADING })
     ).toBeVisible()
-
-    // Labelled "Console"; "Back to console" is its tooltip.
-    await page
-      .getByRole('link', { name: 'Console', exact: true })
-      .and(page.getByTitle('Back to console'))
-      .click()
-    await expect(page).toHaveURL(/\/projects(?:[?#]|$)/)
+    // The same sidebar as every other page, with Ask marked as the page shown.
     await expect(
-      page.getByRole('button', { name: 'AI assistant', exact: true })
-    ).toHaveAttribute('aria-pressed', 'false')
+      page.getByRole('link', { name: /^Ask/ }).first()
+    ).toHaveAttribute('aria-current', 'page')
+
+    const entry = page
+      .getByRole('banner')
+      .getByRole('button', { name: 'Ask', exact: true })
+    await expect(entry).toHaveAttribute('aria-pressed', 'true')
+    // A direct visit has nowhere to go back to, so it lands on a real page.
+    await entry.click()
+    await expect(page).toHaveURL(/\/projects(?:[?#]|$)/)
+    await expect(entry).toHaveAttribute('aria-pressed', 'false')
     expect(consoleErrors).toEqual([])
   })
 })

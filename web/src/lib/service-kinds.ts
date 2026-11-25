@@ -54,7 +54,6 @@ const SECTION_KINDS: Partial<Record<GroupSectionId, readonly ServiceKind[]>> = {
   domains: ['deployed', 'static'],
   variables: ['deployed', 'static'],
   databases: ['deployed'],
-  backups: ['deployed'],
 }
 
 /** Whether a service of `kind` has the project page `section`. */

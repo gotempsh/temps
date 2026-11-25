@@ -423,7 +423,8 @@ export function GroupDomainsPage({ group }: { group: ProjectGroupResponse }) {
 
 export function GroupBackupsPage({ group }: { group: ProjectGroupResponse }) {
   useGroupPageChrome(group, 'Backups')
-  const members = servicesWithSection(group.projects, 'backups')
+  // Backups are a page of Databases: the same services have both.
+  const members = servicesWithSection(group.projects, 'databases')
   const { databases, ...databaseState } = useGroupDatabases(members)
   const { backups, ...backupState } = useGroupBackups(databases)
   const state: ScopedListState = {

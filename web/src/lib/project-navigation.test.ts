@@ -4,13 +4,95 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
-  PROJECT_NAV_GROUPS,
   PROJECT_NAV_SECTIONS,
+  projectEntityViewsFor,
+  projectEnvironmentScope,
+  projectLocationFor,
+  projectNavSectionsFor,
   projectPageWidth,
   projectTabNamesPage,
-  projectNavGroupsFor,
   resolveProjectLocation,
 } from './project-navigation'
+
+describe("a service's views", () => {
+  test('are one list, with no parent grouping them by kind', () => {
+    expect(PROJECT_NAV_SECTIONS.map((section) => section.title)).toEqual([
+      'Overview',
+      'Deployments',
+      'Logs',
+      'Errors',
+      'Variables',
+      'Traces',
+      'Metrics',
+      'Uptime',
+      'Analytics',
+      'Alerts',
+      'Domains',
+      'Databases',
+      'Security',
+      'Automation',
+      'Settings',
+    ])
+    // The former parents are not pages: their sub-paths are the overview's.
+    for (const path of ['observe', 'resources', 'configure'])
+      expect(resolveProjectLocation(path).section.id).toBe('overview')
+  })
+
+  test('names each concept once', () => {
+    const titles = PROJECT_NAV_SECTIONS.map((section) => section.title)
+    expect(new Set(titles).size).toBe(titles.length)
+    // "Telemetry" used to name both the OTLP logs and the ingest settings.
+    const tabs = PROJECT_NAV_SECTIONS.flatMap((section) =>
+      section.tabs.flatMap((tab) => [tab, ...(tab.views ?? [])])
+    ).map((tab) => tab.title)
+    expect(tabs).not.toContain('Telemetry')
+    expect(tabs).toContain('OpenTelemetry')
+    expect(tabs).toContain('Data ingest')
+  })
+
+  test('gives every page one home', () => {
+    const urls = PROJECT_NAV_SECTIONS.flatMap((section) =>
+      section.tabs.flatMap((tab) =>
+        (tab.views ?? [tab]).map((page) => page.url)
+      )
+    )
+    expect(new Set(urls).size).toBe(urls.length)
+  })
+
+  test('keeps a section to a few tabs, with the rest one row down', () => {
+    const tabsOf = (id: string) =>
+      PROJECT_NAV_SECTIONS.find((section) => section.id === id)?.tabs.map(
+        (tab) => tab.title
+      )
+    expect(tabsOf('errors')).toEqual([
+      'Issues',
+      'Feedback',
+      'Releases',
+      'Settings',
+    ])
+    expect(tabsOf('analytics')).toEqual([
+      'Overview',
+      'Visitors',
+      'Pages',
+      'Funnels',
+      'Revenue',
+      'Settings',
+    ])
+    expect(tabsOf('deployments')).toEqual([
+      'Deployments',
+      'Environments',
+      'Build',
+    ])
+    for (const section of PROJECT_NAV_SECTIONS) {
+      expect(section.tabs.length).toBeLessThanOrEqual(6)
+      for (const tab of section.tabs) {
+        if (!tab.views) continue
+        // A tab that holds pages opens on the first of them.
+        expect(tab.url).toBe(tab.views[0].url)
+      }
+    }
+  })
+})
 
 describe('resolveProjectLocation', () => {
   test('maps each section landing page to that section', () => {
@@ -22,16 +104,17 @@ describe('resolveProjectLocation', () => {
   })
 
   test('prefers the longest prefix across sections', () => {
-    expect(resolveProjectLocation('errors/alert-rules/new').tab.title).toBe(
-      'Alerts'
-    )
+    const errorAlert = resolveProjectLocation('errors/alert-rules/new')
+    expect(errorAlert.section.id).toBe('alerts')
+    expect(errorAlert.tab.title).toBe('Error alerts')
     expect(resolveProjectLocation('metrics/dashboards/3').tab.title).toBe(
       'Dashboards'
     )
     expect(resolveProjectLocation('metrics').tab.title).toBe('Metrics')
-    expect(resolveProjectLocation('metrics/alerts/new').tab.title).toBe(
-      'Alerts'
-    )
+    const metricAlert = resolveProjectLocation('metrics/alerts/new')
+    expect(metricAlert.section.id).toBe('alerts')
+    expect(metricAlert.tab.title).toBe('Metric alerts')
+    expect(resolveProjectLocation('monitors/3').section.id).toBe('uptime')
     const feedback = resolveProjectLocation('errors/feedback/12')
     expect(feedback.section.id).toBe('errors')
     expect(feedback.tab.title).toBe('Feedback')
@@ -48,13 +131,47 @@ describe('resolveProjectLocation', () => {
     expect(resolveProjectLocation('security/scans/1').tab.title).toBe('Scans')
   })
 
-  test('folds the old build, git and delivery settings into Build & deploy', () => {
+  test('folds the old build, git and delivery settings into Deployments › Build', () => {
     for (const route of [
       'settings/delivery',
       'connect-repository/connections/1',
+      'build-deploy',
     ]) {
-      expect(resolveProjectLocation(route).section.id).toBe('build')
+      const location = resolveProjectLocation(route)
+      expect(location.section.id).toBe('deployments')
+      expect(location.tab.title).toBe('Build')
     }
+    expect(resolveProjectLocation('environments').tab.title).toBe(
+      'Environments'
+    )
+  })
+
+  test('a page behind a tab resolves to the tab and its view', () => {
+    const maps = resolveProjectLocation('errors/source-maps')
+    expect(maps.section.id).toBe('errors')
+    expect(maps.tab.title).toBe('Settings')
+    expect(maps.view?.title).toBe('Source maps')
+    const replay = resolveProjectLocation('analytics/replays/abc')
+    expect(replay.tab.title).toBe('Visitors')
+    expect(replay.view?.title).toBe('Sessions')
+    expect(resolveProjectLocation('speed').tab.title).toBe('Pages')
+    // A tab that is one page has no view.
+    expect(resolveProjectLocation('errors').view).toBeUndefined()
+  })
+
+  test('the former Activity page keeps its place', () => {
+    expect(resolveProjectLocation('activity').tab.title).toBe('Activity')
+  })
+
+  test('the environment bar follows the page, not only its section', () => {
+    const scopeOf = (route: string) =>
+      projectEnvironmentScope(resolveProjectLocation(route))
+    expect(scopeOf('deployments')).toBe('all')
+    expect(scopeOf('environments')).toBe('single')
+    expect(scopeOf('build-deploy')).toBe('single')
+    expect(scopeOf('errors/alert-rules')).toBe('all')
+    expect(scopeOf('metrics/alerts')).toBe('single')
+    expect(scopeOf('domains')).toBe('project')
   })
 
   test('does not match a sibling that only shares a string prefix', () => {
@@ -69,36 +186,124 @@ describe('resolveProjectLocation', () => {
   })
 })
 
-describe('projectNavGroupsFor', () => {
+describe('projectNavSectionsFor', () => {
   const titles = (sourceType: string) =>
-    projectNavGroupsFor({ source_type: sourceType }).flatMap((group) =>
-      group.sections.map(
-        (section) =>
-          `${section.title}: ${section.tabs.map((tab) => tab.title).join(', ')}`
-      )
+    projectNavSectionsFor({ source_type: sourceType }).map(
+      (section) =>
+        `${section.title}: ${section.tabs.map((tab) => tab.title).join(', ')}`
     )
 
-  test('a hosted service gets the whole menu', () => {
-    expect(projectNavGroupsFor({ source_type: 'git' })).toBe(PROJECT_NAV_GROUPS)
+  test('a hosted service gets every view', () => {
+    expect(projectNavSectionsFor({ source_type: 'git' })).toBe(
+      PROJECT_NAV_SECTIONS
+    )
   })
 
   test('a monitoring-only project keeps only the pages it registers', () => {
     const menu = titles('external')
     expect(menu).toContain('Overview: Overview')
-    expect(menu).toContain('General: General')
+    expect(menu).toContain('Settings: General, Data ingest')
     // Hosting sections disappear entirely, not as empty headings.
     expect(menu.some((entry) => entry.startsWith('Deployments'))).toBe(false)
-    expect(menu.some((entry) => entry.startsWith('Build & deploy'))).toBe(false)
+    expect(menu.some((entry) => entry.startsWith('Variables'))).toBe(false)
     // A section keeps the tabs a monitoring project has.
-    const monitoring = menu.find((entry) => entry.startsWith('Monitoring'))
-    expect(monitoring).toContain('Uptime')
-    expect(monitoring).toContain('Check-ins')
+    const uptime = menu.find((entry) => entry.startsWith('Uptime'))
+    expect(uptime).toContain('Monitors')
+    expect(uptime).toContain('Check-ins')
     // An external project runs no jobs of its own; it only reports check-ins.
-    expect(monitoring).not.toContain('Cron jobs')
+    expect(uptime).not.toContain('Cron jobs')
+  })
+
+  test('a monitoring-only project has no domains or databases of its own', () => {
+    const ids = projectNavSectionsFor({ source_type: 'external' }).map(
+      (section) => section.id
+    )
+    expect(ids).not.toContain('domains')
+    expect(ids).not.toContain('databases')
+    expect(ids).toContain('traces')
+    expect(ids).toContain('general')
+  })
+
+  test('a tab left with one page is that page, with no second row', () => {
+    const external = { source_type: 'external' }
+    const analytics = projectNavSectionsFor(external).find(
+      (section) => section.id === 'analytics'
+    )
+    const pages = analytics?.tabs.find((tab) => tab.title === 'Pages')
+    // `speed` is registered; `analytics/*` too, so Pages keeps its views.
+    expect(pages?.views?.map((view) => view.title)).toContain('Web performance')
+    const location = projectLocationFor(external, 'monitors')
+    expect(location.section.tabs.map((tab) => tab.title)).toEqual([
+      'Monitors',
+      'Check-ins',
+    ])
+    expect(location.tab.title).toBe('Monitors')
   })
 
   test("a monitoring-only project's integrations page highlights Overview", () => {
     expect(resolveProjectLocation('integrations').section.id).toBe('overview')
+  })
+})
+
+describe('projectEntityViewsFor', () => {
+  const hosted = projectEntityViewsFor({ source_type: 'git' })
+
+  test('the tabs of a service: its views, then one Settings', () => {
+    expect(hosted.map((view) => view.title)).toEqual([
+      'Overview',
+      'Deployments',
+      'Logs',
+      'Errors',
+      'Variables',
+      'Traces',
+      'Metrics',
+      'Uptime',
+      'Analytics',
+      'Alerts',
+      'Domains',
+      'Databases',
+      'Settings',
+    ])
+  })
+
+  test('Settings holds what is configured once, its own pages first', () => {
+    const settings = hosted[hosted.length - 1]
+    expect(settings.id).toBe('general')
+    expect(settings.sections.map((section) => section.id)).toEqual([
+      'general',
+      'access',
+      'automation',
+    ])
+    expect(settings.tabs.map((tab) => tab.title)).toEqual([
+      'General',
+      'Data ingest',
+      'Protection',
+      'Edge rules',
+      'Access',
+      'Scans',
+      'Automation',
+      'Integrations',
+    ])
+  })
+
+  test('every section is behind exactly one tab', () => {
+    const behind = hosted.flatMap((view) =>
+      view.sections.map((section) => section.id)
+    )
+    expect([...behind].sort()).toEqual(
+      PROJECT_NAV_SECTIONS.map((section) => section.id).sort()
+    )
+  })
+
+  test('a monitoring-only project keeps a Settings tab with the pages it has', () => {
+    const views = projectEntityViewsFor({ source_type: 'external' })
+    const settings = views[views.length - 1]
+    expect(settings.title).toBe('Settings')
+    expect(settings.tabs.map((tab) => tab.title)).toEqual([
+      'General',
+      'Data ingest',
+    ])
+    expect(views.map((view) => view.title)).not.toContain('Deployments')
   })
 })
 
@@ -111,18 +316,25 @@ describe('projectTabNamesPage', () => {
     expect(names('metrics')).toBe(true)
     expect(names('errors')).toBe(true)
     expect(names('analytics/visitors')).toBe(true)
+    // A view's own page is named by the second row.
+    expect(names('errors/source-maps')).toBe(true)
+    expect(names('analytics/replays')).toBe(true)
   })
 
   test('a record below a tab keeps its own title', () => {
     expect(names('errors/42')).toBe(false)
     expect(names('metrics/dashboards/3')).toBe(false)
     expect(names('security/scans/1')).toBe(false)
+    expect(names('analytics/replays/abc')).toBe(false)
   })
 
-  test('a section without a tab strip keeps its title', () => {
-    expect(names('deployments')).toBe(false)
-    expect(names('domains')).toBe(false)
-    expect(names('settings/general')).toBe(false)
+  test("a view with one page is named by the service's tabs", () => {
+    expect(names('domains')).toBe(true)
+    expect(names('traces')).toBe(true)
+  })
+
+  test('the Overview names the service, whatever its tab says', () => {
+    expect(names('project')).toBe(false)
   })
 })
 
@@ -130,9 +342,11 @@ describe('projectPageWidth', () => {
   const widthOf = (route: string, search = '') =>
     projectPageWidth(resolveProjectLocation(route), search)
 
-  test('Configure forms are narrow, its tables use the full width', () => {
-    const configure = PROJECT_NAV_GROUPS.find((g) => g.label === 'Configure')
-    expect(configure).toBeDefined()
+  test('Settings forms are narrow, its tables use the full width', () => {
+    const settings = projectEntityViewsFor({ source_type: 'git' }).find(
+      (view) => view.title === 'Settings'
+    )
+    expect(settings).toBeDefined()
     const tables = new Set([
       'environment-variables',
       'settings/variables',
@@ -140,7 +354,7 @@ describe('projectPageWidth', () => {
       'settings/edge-rules',
       'security',
     ])
-    for (const section of configure?.sections ?? []) {
+    for (const section of settings?.sections ?? []) {
       for (const tab of section.tabs) {
         expect([tab.url, widthOf(tab.url)]).toEqual([
           tab.url,

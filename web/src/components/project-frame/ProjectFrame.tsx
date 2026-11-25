@@ -9,6 +9,7 @@ import {
   useProjectTabNamesPage,
 } from './use-project-location'
 import { ProjectEnvironmentProvider } from './ProjectEnvironmentProvider'
+import { projectEnvironmentScope } from '@/lib/project-navigation'
 import { ProjectSectionTabs } from './ProjectSectionTabs'
 
 /**
@@ -29,7 +30,7 @@ export function ProjectFrame({
     <ProjectEnvironmentProvider
       key={project.id}
       project={project}
-      scope={location.section.environmentScope}
+      scope={projectEnvironmentScope(location)}
     >
       <PageTitleLevelContext.Provider value="h2">
         {children}
@@ -39,8 +40,9 @@ export function ProjectFrame({
 }
 
 /**
- * The current section's tabs above its page. When the selected tab already
- * names the page, the page's own title is kept for screen readers only.
+ * The service's views, and the pages of the one shown, as tabs above the
+ * page. When a selected tab already names the page, the page's own title is
+ * kept for screen readers only.
  */
 export function ProjectSectionChrome({
   project,
@@ -53,7 +55,7 @@ export function ProjectSectionChrome({
   const tabNamesPage = useProjectTabNamesPage(project)
   return (
     <>
-      <ProjectSectionTabs projectSlug={project.slug} location={location} />
+      <ProjectSectionTabs project={project} location={location} />
       <PageNamedByChromeContext.Provider value={tabNamesPage}>
         {children}
       </PageNamedByChromeContext.Provider>

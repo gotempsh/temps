@@ -37,8 +37,8 @@ export function VendorBaseUrlHint({
         <span>
           This key will be verified with {providerName}&apos;s own models. For
           another API that speaks the OpenAI protocol (DeepSeek, Groq, Together,
-          vLLM…), add an OpenAI-compatible provider: it lists the server&apos;s
-          models instead.
+          vLLM…), add an OpenAI API provider: it lists the server&apos;s models
+          instead.
         </span>
         <Button
           type="button"
@@ -48,7 +48,7 @@ export function VendorBaseUrlHint({
           onClick={onSwitch}
           disabled={disabled}
         >
-          Switch to OpenAI-compatible
+          Switch to OpenAI API
         </Button>
       </AlertDescription>
     </Alert>

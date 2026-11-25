@@ -110,9 +110,9 @@ test('a legacy environment link is rewritten as ?env=, so the next tab keeps it'
     expect(view.getByTestId('search').textContent).toBe('?env=staging')
   )
   expect(view.getByText('Selected: staging')).toBeTruthy()
-  const alerts = view.getByRole('link', { name: 'Alerts' })
-  expect(alerts.getAttribute('href')).toBe(
-    '/projects/first/errors/alert-rules?env=staging'
+  const feedback = view.getByRole('link', { name: 'Feedback' })
+  expect(feedback.getAttribute('href')).toBe(
+    '/projects/first/errors/feedback?env=staging'
   )
 })
 

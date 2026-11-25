@@ -45,16 +45,18 @@ import {
   buildAccessibleNavigationMap,
   excludeNavigationUrls,
   filterRestrictedNavigationItems,
-  isSettingsNavigationUrl,
   indexSettingsNavigationGroups,
   mergeNavigationItems,
-  platformToolNavigationItems,
+  serverNavigationItems,
   platformSettingNavigationItems,
   settingsPageNavigationItems,
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { TERMS, groupHref } from '@/lib/terminology'
 import { groupSectionDestinations } from '@/lib/console-scope'
+import { ALERTS_URL } from '@/lib/server-navigation'
+import { isSettingsSidebarRoute } from '@/components/dashboard/primary-navigation'
+import { openOperationsTray } from '@/components/operations/operations-tray-store'
 import { CLUSTER_DNS_URL, WORKER_NODES_URL } from '@/lib/worker-nodes'
 import {
   mergeSettingsNavigationGroups,
@@ -235,6 +237,24 @@ const commandActions: CommandAction[] = [
     keywords: ['toggle', 'theme', 'dark', 'light', 'mode'],
     run: () => document.body.classList.toggle('dark'),
   },
+  {
+    // The top bar shows its button only while work is running; this opens
+    // the same list, history included, at any time.
+    id: 'operations',
+    title: 'Operations',
+    icon: Activity,
+    keywords: [
+      'operations',
+      'running',
+      'in progress',
+      'deployments',
+      'backups',
+      'restores',
+      'history',
+      'activity',
+    ],
+    run: () => openOperationsTray(),
+  },
 ]
 
 const mainNavItems: NavigationItem[] = [
@@ -249,12 +269,6 @@ const mainNavItems: NavigationItem[] = [
     url: '/projects',
     icon: Folder,
     keywords: ['apps', 'applications', 'sites'],
-  },
-  {
-    title: 'All tools',
-    url: '/tools',
-    icon: Boxes,
-    keywords: ['tools', 'platform', 'features', 'capabilities', 'everything'],
   },
   {
     title: 'Sandboxes',
@@ -337,10 +351,17 @@ const mainNavItems: NavigationItem[] = [
     keywords: ['cpu', 'memory', 'disk', 'docker', 'network', 'host', 'server'],
   },
   {
-    title: 'Monitoring',
-    url: '/monitoring/alerts',
+    title: 'Alerts',
+    url: ALERTS_URL,
     icon: Gauge,
-    keywords: ['metrics', 'resources', 'alerts', 'alarms', 'health'],
+    keywords: [
+      'monitoring',
+      'metrics',
+      'resources',
+      'alerts',
+      'alarms',
+      'health',
+    ],
   },
   {
     title: 'Delivery preferences',
@@ -366,10 +387,11 @@ const mainNavItems: NavigationItem[] = [
   // so this entry is filtered back out of the main category unless the page
   // is absent from the settings registry — which it now is, by design.
   {
-    title: 'Worker nodes',
+    title: 'Servers',
     url: WORKER_NODES_URL,
     icon: Network,
     keywords: [
+      'worker nodes',
       'worker',
       'nodes',
       'cluster',
@@ -593,8 +615,8 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['ai', 'activity', 'traces', 'telemetry', 'otel', 'spans'],
   },
   {
-    // Always listed: the sidebar's setup card can be hidden, and this is the
-    // way back to the checklist.
+    // Always listed: Settings drops its Setup entry once the checklist is
+    // done or dismissed, and this is the way back to it.
     title: 'Finish setting up',
     url: '/setup',
     icon: BadgeCheck,
@@ -783,37 +805,25 @@ const settingsNavItems: NavigationItem[] = [
   },
 ]
 
-const observeNavItems: NavigationItem[] = [
-  {
-    title: 'Proxy logs',
-    url: '/proxy-logs',
-    icon: Activity,
-    keywords: ['logs', 'proxy', 'requests', 'traffic'],
-  },
-  {
-    title: 'Audit logs',
-    url: '/audit-logs',
-    icon: ScrollText,
-    keywords: ['logs', 'audit', 'history', 'activity'],
-  },
-]
-
-const indexedSettingsNavItems = mergeNavigationItems(
-  settingsNavItems.filter((item) => isSettingsNavigationUrl(item.url)),
+// The menus name each page; the registries built from them come first, so a
+// page is called the same here as in the sidebar. The hand-written entries
+// above add search terms to those pages (their own titles included) and the
+// destinations no menu lists, such as "New service".
+export const indexedSettingsNavItems = mergeNavigationItems(
   settingsPageNavigationItems,
+  settingsNavItems.filter((item) => isSettingsSidebarRoute(item.url)),
   platformSettingNavigationItems
 )
-const secondaryNavigationUrls = new Set([
-  ...observeNavItems.map((item) => item.url),
-  ...indexedSettingsNavItems.map((item) => item.url),
-])
+const settingsNavigationUrls = new Set(
+  indexedSettingsNavItems.map((item) => item.url)
+)
 export const indexedMainNavItems = excludeNavigationUrls(
   mergeNavigationItems(
+    serverNavigationItems,
     mainNavItems,
-    settingsNavItems.filter((item) => !isSettingsNavigationUrl(item.url)),
-    platformToolNavigationItems
+    settingsNavItems.filter((item) => !isSettingsSidebarRoute(item.url))
   ),
-  secondaryNavigationUrls
+  settingsNavigationUrls
 )
 
 const accountNavItems: NavigationItem[] = [
@@ -1155,7 +1165,7 @@ export const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Activity',
-    url: 'observe',
+    url: 'activity',
     icon: Activity,
     keywords: [
       'observe',
@@ -1493,8 +1503,13 @@ export function CommandPalette() {
   )
 
   const canViewAuditLogs = useCanViewAuditLogs()
-  const visibleObserveNavItems = useMemo(
-    () => filterRestrictedNavigationItems(observeNavItems, canViewAuditLogs),
+  // The audit log is a settings page only the administration roles see.
+  const visibleSettingsNavItems = useMemo(
+    () =>
+      filterRestrictedNavigationItems(
+        indexedSettingsNavItems,
+        canViewAuditLogs
+      ),
     [canViewAuditLogs]
   )
 
@@ -1505,17 +1520,13 @@ export function CommandPalette() {
         ...item,
         category: 'Navigation',
       })),
-      ...indexedSettingsNavItems.map((item) => ({
+      ...visibleSettingsNavItems.map((item) => ({
         ...item,
         category: 'Settings',
       })),
       ...extensionSettingsNavItems.map((item) => ({
         ...item,
         category: 'Settings',
-      })),
-      ...visibleObserveNavItems.map((item) => ({
-        ...item,
-        category: 'Observe',
       })),
       ...accountNavItems.map((item) => ({ ...item, category: 'Account' })),
       ...pluginNavItems.map((item) => ({ ...item, category: 'Plugins' })),
@@ -1541,7 +1552,7 @@ export function CommandPalette() {
     currentProject,
     pluginNavItems,
     projectPluginNavItems,
-    visibleObserveNavItems,
+    visibleSettingsNavItems,
     extensionSettingsNavItems,
   ])
 
@@ -1624,8 +1635,7 @@ export function CommandPalette() {
 
     return {
       navigation: indexedMainNavItems,
-      settings: [...indexedSettingsNavItems, ...extensionSettingsNavItems],
-      observe: visibleObserveNavItems,
+      settings: [...visibleSettingsNavItems, ...extensionSettingsNavItems],
       account: accountNavItems,
       plugins: pluginNavItems,
       projectNav: projectNavigation,
@@ -1640,7 +1650,7 @@ export function CommandPalette() {
     projectPluginNavItems,
     currentProjectSlug,
     currentProject,
-    visibleObserveNavItems,
+    visibleSettingsNavItems,
     extensionSettingsNavItems,
   ])
 
@@ -1665,9 +1675,6 @@ export function CommandPalette() {
       ),
       ...browseResults.settings.map((item) =>
         destination(`settings:${item.url}`, item, 'Instance settings')
-      ),
-      ...browseResults.observe.map((item) =>
-        destination(`observe:${item.url}`, item, 'Observe')
       ),
       ...browseResults.account.map((item) =>
         destination(`account:${item.url}`, item, 'Account')
@@ -1988,9 +1995,8 @@ export function CommandPalette() {
     if (search) return []
     const allNavItems: NavigationItem[] = [
       ...indexedMainNavItems,
-      ...indexedSettingsNavItems,
+      ...visibleSettingsNavItems,
       ...extensionSettingsNavItems,
-      ...visibleObserveNavItems,
       ...accountNavItems,
       ...pluginNavItems,
     ]
@@ -2067,7 +2073,7 @@ export function CommandPalette() {
     groups,
     projects,
     canViewAuditLogs,
-    visibleObserveNavItems,
+    visibleSettingsNavItems,
     extensionSettingsNavItems,
     navigate,
   ])
@@ -2293,30 +2299,6 @@ export function CommandPalette() {
                     <CommandItem
                       key={item.url}
                       value={`settings-${item.url}`}
-                      onSelect={() =>
-                        runWithFrecency(item.url, () => navigate(item.url))
-                      }
-                      className="flex items-center gap-2"
-                    >
-                      <item.icon className="h-4 w-4" />
-                      <span>{item.title}</span>
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
-                <CommandSeparator />
-              </>
-            )}
-
-          {/* Observe Navigation */}
-          {showFullBrowseCatalog &&
-            !search &&
-            browseResults.observe.length > 0 && (
-              <>
-                <CommandGroup heading="Observe">
-                  {browseResults.observe.map((item) => (
-                    <CommandItem
-                      key={item.url}
-                      value={`observe-${item.url}`}
                       onSelect={() =>
                         runWithFrecency(item.url, () => navigate(item.url))
                       }

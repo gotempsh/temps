@@ -69,7 +69,6 @@ describe('which project pages apply', () => {
       'domains',
       'variables',
       'databases',
-      'backups',
     ] as const)
       expect(sectionAvailability([monitored], section).applicable).toBe(false)
     for (const section of ['logs', 'errors', 'traces', 'analytics'] as const)

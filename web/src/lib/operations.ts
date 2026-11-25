@@ -390,6 +390,26 @@ export function operationsTriggerLabel(runningCount: number): string {
     : 'Operations'
 }
 
+/**
+ * Whether the top bar shows the operations button. It stands there only
+ * while it has something to say: work running here or on the server, work
+ * waiting for review, or the tray opened from elsewhere (a toast's "View",
+ * the command palette). Idle, the top bar keeps to the assistant.
+ */
+export function operationsTrayShown({
+  open,
+  runningCount,
+  localCount,
+  waitingCount,
+}: {
+  open: boolean
+  runningCount: number
+  localCount: number
+  waitingCount: number
+}): boolean {
+  return open || runningCount > 0 || localCount > 0 || waitingCount > 0
+}
+
 /** Badge text: hidden at zero, capped at 9+. */
 export function operationsBadgeText(runningCount: number): string | null {
   if (runningCount <= 0) return null

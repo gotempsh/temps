@@ -139,6 +139,7 @@ import {
   UntrustedInlineCode,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
+import { markdownTable } from '@/components/markdown/table'
 import { ProjectChip, useProjectReference } from './ProjectReference'
 import { QueuedMessages } from './QueuedMessages'
 import { CopyButton } from '@/components/ui/copy-button'
@@ -164,7 +165,7 @@ import { toast } from 'sonner'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAiAssistant } from './AiAssistantContext'
-import { AskBeforeChangesToggle } from './AskBeforeChangesToggle'
+import { AssistantPermissionSelect } from './AssistantPermissionSelect'
 import { AssistantModelChip } from './AssistantModelPicker'
 import {
   assistantRuntimeSelection,
@@ -220,7 +221,6 @@ import {
 } from './chat-message-parts'
 import {
   failedToolCount,
-  standaloneResultId,
   groupAssistantParts,
   liveWorkSegmentKey,
   liveWorkStatus,
@@ -235,17 +235,12 @@ import {
   restoredHistoryScrollTop,
   shouldLoadEarlierMessages,
 } from './chat-history-pagination'
-import {
-  isTempsReadTool,
-  projectCollectionFromApplicationProjectWrite,
-  projectCollectionFromTool,
-} from './tool-result-presentation'
+import { projectCollectionFromApplicationProjectWrite } from './tool-result-presentation'
 import {
   ASSISTANT_ATTACHMENT_LIMITS,
   WORKSPACE_ATTACHMENT_LIMITS,
   assistantAttachTitle,
   assistantImageError,
-  attachHint,
   attachmentSelectionError,
   createPendingAttachment,
   revokeAttachmentPreviews,
@@ -676,38 +671,6 @@ function SandboxDeployToolPart({
         createdAt={createdAt}
         summary={sandboxDeploySummary(started)}
         statusLabel="Queued"
-      />
-      <details className="group border-t">
-        <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground sm:px-4">
-          <ChevronRight className="size-3.5 transition-transform group-open:rotate-90" />
-          Request details
-        </summary>
-        <div className="min-w-0 space-y-2 border-t px-3 py-2.5 sm:px-4">
-          <div className="min-w-0 space-y-1">
-            <div className="font-medium text-muted-foreground">Arguments</div>
-            <ToolBlock value={tool.arguments} />
-          </div>
-          <div className="min-w-0 space-y-1">
-            <div className="font-medium text-muted-foreground">Result</div>
-            <ToolBlock value={tool.result ?? ''} />
-          </div>
-        </div>
-      </details>
-    </div>
-  )
-}
-
-/** Deterministic native presentations for trusted read operations. Unknown
- * operations keep the transparent generic tool card instead of guessing. */
-function ReadToolResultCard({ tool }: { tool: ToolCall }) {
-  const projectCollection = projectCollectionFromTool(tool)
-  if (!projectCollection) return <ToolCard tool={tool} />
-
-  return (
-    <div className="min-w-0 overflow-hidden rounded-lg border border-border bg-background text-xs">
-      <GeneratedProjectCollection
-        presentation={projectCollection}
-        framed={false}
       />
       <details className="group border-t">
         <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-muted/40 hover:text-foreground sm:px-4">
@@ -1729,6 +1692,7 @@ const markdownComponents: Components = {
   // with every other renderer of untrusted Markdown — see the module for why.
   ...untrustedMarkdownImage,
   ...untrustedMarkdownLink,
+  ...markdownTable,
   code: ChatInlineCode,
 }
 
@@ -2077,13 +2041,8 @@ export function AssistantBody({
       <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
     ) : null
   }
-  const standaloneResult = standaloneResultId(
-    parts,
-    (tool) => isTempsReadTool(tool.name),
-    (tool) => projectCollectionFromTool(tool) !== null
-  )
   const segments = groupAssistantParts(parts, (tool) =>
-    isFoldableTool(tool, conversationPublicId, standaloneResult)
+    isFoldableTool(tool, conversationPublicId)
   )
   const liveWorkKey = liveWorkSegmentKey(segments, streaming)
 
@@ -2144,14 +2103,14 @@ export function AssistantBody({
           isSandboxScopedTool(part.tool.name)) &&
         conversationPublicId ? (
         <Fragment key={part.tool.id}>
-          <ReadToolResultCard tool={part.tool} />
+          <ToolCard tool={part.tool} />
           <SandboxStatusRefresher
             conversationPublicId={conversationPublicId}
             done={part.tool.result != null}
           />
         </Fragment>
       ) : (
-        <ReadToolResultCard key={part.tool.id} tool={part.tool} />
+        <ToolCard key={part.tool.id} tool={part.tool} />
       )
     ) : part.type === 'permission' ? (
       answeredQuestions.has(part.permission.id) ? null : (
@@ -2195,14 +2154,12 @@ export function AssistantBody({
 
 /**
  * Whether a tool's card can fold into a work group: everything except the
- * cards that ask the user for something, and the project list an answer that
- * only looked things up stands on. A project list looked up mid-build is the
- * model's own check, not news for the user, so it folds with the work.
+ * cards that ask the user for something. What a lookup found is told by the
+ * answer's own text, so every read folds with the work, a project list too.
  */
 function isFoldableTool(
   tool: ToolCall,
-  conversationPublicId: string | null,
-  standaloneResult: string | null
+  conversationPublicId: string | null
 ): boolean {
   if (isTempsWriteToolName(tool.name)) return false
   if (isAskUserTool(tool.name)) return false
@@ -2219,10 +2176,7 @@ function isFoldableTool(
     parseSecretRequest(tool.result)
   )
     return false
-  if (isSandboxOfferTool(tool.name) && conversationPublicId) return false
-  return (
-    projectCollectionFromTool(tool) === null || tool.id !== standaloneResult
-  )
+  return !(isSandboxOfferTool(tool.name) && conversationPublicId)
 }
 
 /**
@@ -4625,11 +4579,6 @@ function DebugChatPanelBody({
             void uploadAttachments(event.clipboardData.files)
           }}
         >
-          {userScoped && publicId && persistentAttachments && (
-            <p className="hidden truncate px-3 pt-2 text-xs text-muted-foreground @[32rem]:block">
-              {attachHint(isAssistantChat, modelImageSupport, attachmentLimits)}
-            </p>
-          )}
           {(pendingAttachments.length > 0 || attachmentUploads > 0) && (
             <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
               <ChatAttachments
@@ -4780,7 +4729,7 @@ function DebugChatPanelBody({
                       }}
                     />
                     {runtimeSelection.permissionModeId !== null ? (
-                      <AskBeforeChangesToggle
+                      <AssistantPermissionSelect
                         permissionModeId={runtimeSelection.permissionModeId}
                         disabled={starting || turnActive}
                         onChange={(permissionModeId) =>
