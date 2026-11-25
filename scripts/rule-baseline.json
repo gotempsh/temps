@@ -211,7 +211,7 @@
       "unguarded_require_auth": 1,
       "files_over_3000_lines": 3,
       "functions_over_300_lines": 5,
-      "provider_named_outside_module": 35
+      "provider_named_outside_module": 20
     },
     "temps-kv": {
       "lazy_error_variants": 6
