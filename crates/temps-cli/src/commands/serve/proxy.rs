@@ -62,6 +62,21 @@ fn cluster_dns_wanted(read: Option<bool>, previous: bool) -> bool {
     read.unwrap_or(previous)
 }
 
+/// Why no resolver can run on this host, after looking up the app network's
+/// gateway: a gateway found is probed, while a failed lookup (Docker briefly
+/// unreachable) says nothing about where the gateway lives, so the previous
+/// answer stands rather than turning an unsupported host into an outage.
+fn unsupported_after_lookup<E>(
+    lookup: &Result<std::net::IpAddr, E>,
+    previous: Option<&str>,
+    probe: impl FnOnce(std::net::IpAddr) -> Option<String>,
+) -> Option<String> {
+    match lookup {
+        Ok(gateway) => probe(*gateway),
+        Err(_) => previous.map(str::to_string),
+    }
+}
+
 /// Whether node 0 may report now. While enabled, not before the first
 /// attempt to start the resolver: until then nothing is known, and a report
 /// would say "not running" (an outage) on every start, even on a host that
@@ -183,6 +198,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                     if wanted { "starting" } else { "stopping" }
                 );
                 enabled = wanted;
+                reporter.expire();
             }
             if !enabled {
                 last_error = None;
@@ -234,10 +250,11 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             .await
             .unwrap_or(Err(ProxyDnsBootstrapError::NetworkTimeout));
 
-            let now_unsupported = gateway
-                .as_ref()
-                .ok()
-                .and_then(|gateway| temps_dns::control_plane_resolver_unsupported(*gateway));
+            let now_unsupported = unsupported_after_lookup(
+                &gateway,
+                unsupported.as_deref(),
+                temps_dns::control_plane_resolver_unsupported,
+            );
             if now_unsupported != unsupported {
                 match &now_unsupported {
                     Some(reason) => warn!(
@@ -250,6 +267,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                     None => {}
                 }
                 unsupported = now_unsupported;
+                reporter.expire();
             }
             let served = gateway
                 .as_ref()
@@ -779,6 +797,30 @@ mod tests {
         // A failed read keeps whatever the previous pass acted on.
         assert!(cluster_dns_wanted(None, true));
         assert!(!cluster_dns_wanted(None, false));
+    }
+
+    #[test]
+    fn a_failed_gateway_lookup_keeps_an_unsupported_host_unsupported() {
+        let gateway: std::net::IpAddr = [172, 20, 0, 1].into();
+        let not_here = |_| Some("not an address of this machine".to_string());
+        let local = |_| None;
+        let failed: Result<std::net::IpAddr, ()> = Err(());
+
+        // Docker unreachable: nothing is learnt, the classification stands.
+        assert_eq!(
+            unsupported_after_lookup(&failed, Some("VM gateway"), local).as_deref(),
+            Some("VM gateway")
+        );
+        assert_eq!(unsupported_after_lookup(&failed, None, not_here), None);
+        // A gateway found is probed, either way.
+        assert_eq!(
+            unsupported_after_lookup(&Ok::<_, ()>(gateway), None, not_here).as_deref(),
+            Some("not an address of this machine")
+        );
+        assert_eq!(
+            unsupported_after_lookup(&Ok::<_, ()>(gateway), Some("VM gateway"), local),
+            None
+        );
     }
 
     #[test]

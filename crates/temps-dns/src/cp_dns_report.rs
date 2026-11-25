@@ -66,11 +66,36 @@ pub fn control_plane_outcome(
     }
 }
 
+/// When node 0 is due to report: at most once per [`CP_REPORT_INTERVAL`],
+/// and at once after [`ReportGate::expire`].
+#[derive(Debug, Default)]
+struct ReportGate {
+    last: Option<Instant>,
+}
+
+impl ReportGate {
+    /// Whether a report is due at `now`; if so, it counts as made.
+    fn take(&mut self, now: Instant) -> bool {
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < CP_REPORT_INTERVAL)
+        {
+            return false;
+        }
+        self.last = Some(now);
+        true
+    }
+
+    fn expire(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Reports node 0 at most once per [`CP_REPORT_INTERVAL`].
 pub struct ControlPlaneDnsReporter {
     observer: Arc<DnsObserver>,
     service: Arc<DnsObservabilityService>,
-    last: Option<Instant>,
+    gate: ReportGate,
 }
 
 impl ControlPlaneDnsReporter {
@@ -80,8 +105,16 @@ impl ControlPlaneDnsReporter {
         Self {
             observer: DnsObserver::spawn(),
             service,
-            last: None,
+            gate: ReportGate::default(),
         }
+    }
+
+    /// Make the next [`maybe_report`](Self::maybe_report) store a report
+    /// without waiting out the interval: called when what node 0 would say
+    /// changed (cluster DNS turned on or off, the host found able or unable
+    /// to run a resolver), so the stored report never describes the old state.
+    pub fn expire(&mut self) {
+        self.gate.expire();
     }
 
     /// The observer every control-plane resolver start must be given.
@@ -102,13 +135,9 @@ impl ControlPlaneDnsReporter {
         unsupported: Option<&str>,
         internal_proxy: Option<serde_json::Value>,
     ) {
-        if self
-            .last
-            .is_some_and(|last| last.elapsed() < CP_REPORT_INTERVAL)
-        {
+        if !self.gate.take(Instant::now()) {
             return;
         }
-        self.last = Some(Instant::now());
         let outcome = control_plane_outcome(&self.observer, resolver, bootstrap_error, unsupported);
         match self
             .service
@@ -144,6 +173,22 @@ impl ControlPlaneDnsReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_once_per_interval_unless_expired() {
+        let start = Instant::now();
+        let mut gate = ReportGate::default();
+        assert!(gate.take(start), "the first report is due at once");
+        assert!(!gate.take(start + Duration::from_secs(5)));
+        assert!(gate.take(start + CP_REPORT_INTERVAL));
+
+        // A change of state is reported on the next pass, not an interval later.
+        let changed = start + CP_REPORT_INTERVAL + Duration::from_secs(5);
+        assert!(!gate.take(changed));
+        gate.expire();
+        assert!(gate.take(changed));
+        assert!(!gate.take(changed + Duration::from_secs(5)));
+    }
 
     #[tokio::test]
     async fn a_stopped_resolver_reports_why() {
