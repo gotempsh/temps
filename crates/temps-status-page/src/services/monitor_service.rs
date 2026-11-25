@@ -661,9 +661,8 @@ impl MonitorService {
             validate_check_path(path)?;
         }
 
-        let now = Utc::now();
         let mut update = status_monitors::Entity::update_many()
-            .col_expr(status_monitors::Column::UpdatedAt, Expr::value(now));
+            .col_expr(status_monitors::Column::UpdatedAt, Expr::value(Utc::now()));
         if let Some(name) = name {
             update = update.col_expr(status_monitors::Column::Name, Expr::value(name));
         }
@@ -707,14 +706,8 @@ impl MonitorService {
                     .one(&txn)
                     .await?
                     .ok_or(StatusPageError::NotFound)?;
-                record_interval_change(
-                    &txn,
-                    monitor_id,
-                    current.check_interval_seconds,
-                    interval,
-                    now,
-                )
-                .await?;
+                record_interval_change(&txn, monitor_id, current.check_interval_seconds, interval)
+                    .await?;
                 update.exec(&txn).await?;
                 txn.commit().await?;
             }
@@ -1202,7 +1195,9 @@ impl MonitorService {
         //
         // `intervals` turns the recorded changes into disjoint spans
         // `[valid_from, valid_until)`, each with the interval that ran
-        // during it; the first span is open at the start. A check after the
+        // during it; the first span is open at the start. Changes are taken
+        // in `id` order, the order their transactions held the monitor's row
+        // lock (see `interval_history`). A check after the
         // last change matches no span and uses the current interval ($4).
         // Previous intervals are stored normalised, like the current one.
         let row = CoverageRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
@@ -1211,7 +1206,7 @@ impl MonitorService {
             WITH intervals AS (
                 SELECT
                     previous_interval_seconds::float8 * 2 + 60 AS grace_secs,
-                    LAG(changed_at) OVER (ORDER BY changed_at, id) AS valid_from,
+                    LAG(changed_at) OVER (ORDER BY id) AS valid_from,
                     changed_at AS valid_until
                 FROM status_monitor_interval_changes
                 WHERE monitor_id = $1
@@ -1807,23 +1802,30 @@ mod tests {
         let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
         let log = db.into_transaction_log();
         // The replaced interval is recorded in the transaction that locks the
-        // row and writes the new one, so past windows keep their coverage.
-        let interval_txn = log
+        // row and writes the new one, so past windows keep their coverage:
+        // the lock, the history row and the monitor UPDATE are statements of
+        // one transaction, in that order.
+        let statements: Vec<String> = log
             .iter()
-            .map(|transaction| format!("{:?}", transaction.statements()))
-            .find(|statements| statements.contains("FOR UPDATE"))
-            .expect("the monitor row is locked before the interval changes");
-        assert!(
-            interval_txn.contains("status_monitor_interval_changes"),
-            "{interval_txn}"
-        );
-        assert!(interval_txn.contains("UPDATE"), "{interval_txn}");
-        let update = log
+            .find(|transaction| format!("{transaction:?}").contains("FOR UPDATE"))
+            .expect("the monitor row is locked before the interval changes")
+            .statements()
             .iter()
-            .flat_map(|transaction| transaction.statements())
             .map(|statement| format!("{statement:?}"))
-            .find(|statement| statement.contains("UPDATE \\\"status_monitors\\\""))
-            .expect("an UPDATE statement was issued");
+            .collect();
+        let position = |needle: &str| {
+            statements
+                .iter()
+                .position(|statement| statement.contains(needle))
+                .unwrap_or_else(|| {
+                    panic!("no `{needle}` in the locked transaction: {statements:?}")
+                })
+        };
+        let lock = position("FOR UPDATE");
+        let history = position("INSERT INTO \\\"status_monitor_interval_changes\\\"");
+        let update_at = position("UPDATE \\\"status_monitors\\\"");
+        assert!(lock < history && history < update_at, "{statements:?}");
+        let update = statements[update_at].clone();
         assert!(update.contains(r#"\"name\" = $"#), "{update}");
         assert!(
             update.contains(r#"String(Some("API health"))"#),
@@ -2992,13 +2994,117 @@ mod tests {
         .unwrap();
     }
 
+    /// A migrated database, or `None` (with a message) when no container
+    /// runtime is available. Any other setup failure, a failed migration
+    /// included, fails the test instead of skipping its assertions.
+    async fn migrated_test_db() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(test_db) => Some(test_db),
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Skipping: no container runtime for TestDatabase: {error}");
+                None
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        }
+    }
+
+    /// An interval edit that waited for the monitor's row lock behind another
+    /// edit is recorded after it, even though its request arrived first: the
+    /// change is stamped under the lock, and changes are read in lock order.
+    /// Stamped at request time, the waiting edit's row sorted first and gave
+    /// checks before both edits the grace of the middle interval.
+    #[tokio::test]
+    async fn an_edit_that_waited_for_the_lock_is_recorded_after_the_one_holding_it() {
+        use temps_entities::status_monitor_interval_changes as changes;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = Arc::new(MonitorService::new(
+            db.clone(),
+            create_mock_config_service(&db),
+        ));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        insert_check(&db, monitor_id, "operational", start).await;
+
+        // Another edit holds the row lock.
+        let holder = db.begin().await.unwrap();
+        let locked = status_monitors::Entity::find_by_id(monitor_id)
+            .lock_exclusive()
+            .one(&holder)
+            .await
+            .unwrap()
+            .expect("monitor exists");
+
+        // This request arrives now and waits for the lock.
+        let waiting = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .update_monitor(
+                        monitor_id,
+                        UpdateMonitorRequest {
+                            check_interval_seconds: Some(3_600),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the edit waits for the row lock");
+
+        // The holder changes 60 s to 300 s and commits first.
+        record_interval_change(&holder, monitor_id, locked.check_interval_seconds, 300)
+            .await
+            .unwrap();
+        status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::CheckIntervalSeconds,
+                Expr::value(300),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor_id))
+            .exec(&holder)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+        waiting.await.unwrap().unwrap();
+
+        let recorded = changes::Entity::find()
+            .filter(changes::Column::MonitorId.eq(monitor_id))
+            .order_by_asc(changes::Column::ChangedAt)
+            .order_by_asc(changes::Column::Id)
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|change| change.previous_interval_seconds)
+                .collect::<Vec<_>>(),
+            vec![60, 300],
+            "changes in the order they held the lock"
+        );
+        // The check before both edits still ran under 60 s.
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(
+            (status.monitored_seconds, status.unknown_seconds),
+            (180, 3_420)
+        );
+    }
+
     /// Issue #2039: the coverage of a window that has ended must not move
     /// when the monitor's check interval changes afterwards, in either
     /// direction.
     #[tokio::test]
     async fn interval_change_does_not_rewrite_coverage_of_a_completed_window() {
-        let Ok(test_db) = TestDatabase::with_migrations().await else {
-            println!("Skipping: Docker is not available for TestDatabase");
+        let Some(test_db) = migrated_test_db().await else {
             return;
         };
         let db = test_db.connection_arc();
@@ -3056,8 +3162,7 @@ mod tests {
     /// current interval applies only from the last change on.
     #[tokio::test]
     async fn each_check_vouches_for_the_interval_it_ran_under() {
-        let Ok(test_db) = TestDatabase::with_migrations().await else {
-            println!("Skipping: Docker is not available for TestDatabase");
+        let Some(test_db) = migrated_test_db().await else {
             return;
         };
         let db = test_db.connection_arc();

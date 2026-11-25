@@ -383,14 +383,8 @@ impl TargetMonitorService {
         // Past checks keep the interval they ran under, so coverage of a
         // window that has ended does not move with this change.
         if let Some(seconds) = request.check_interval_seconds {
-            record_interval_change(
-                &txn,
-                monitor_id,
-                locked.check_interval_seconds,
-                seconds,
-                chrono::Utc::now(),
-            )
-            .await?;
+            record_interval_change(&txn, monitor_id, locked.check_interval_seconds, seconds)
+                .await?;
         }
         let model = active.update(&txn).await?;
         txn.commit().await?;
