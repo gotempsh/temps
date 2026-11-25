@@ -143,6 +143,27 @@ export interface AudienceCard {
   entries: AudienceChoice[]
 }
 
+/**
+ * The audiences that cannot work here, one group per reason (they usually
+ * share one), in the order they are listed, so the page says each reason once.
+ */
+export function unavailableByReason(
+  cards: readonly AudienceCard[]
+): { audiences: PageAudience[]; blocked: PlanBlocked | null }[] {
+  const groups = new Map<
+    string,
+    { audiences: PageAudience[]; blocked: PlanBlocked | null }
+  >()
+  for (const card of cards) {
+    if (card.available) continue
+    const key = card.blocked?.reason ?? ''
+    const group = groups.get(key) ?? { audiences: [], blocked: card.blocked }
+    group.audiences.push(card.audience)
+    groups.set(key, group)
+  }
+  return [...groups.values()]
+}
+
 /** The cards in the order the backend lists audiences. */
 export function audienceCards(choices: AudienceChoice[]): AudienceCard[] {
   const cards: AudienceCard[] = []

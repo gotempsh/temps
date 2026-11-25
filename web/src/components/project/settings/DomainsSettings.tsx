@@ -30,7 +30,8 @@ import { DomainDeliveryBindings } from '@/components/domains/DomainDeliveryBindi
 import { DomainDeliverySetup } from '@/components/domains/DomainDeliverySetup'
 import { ProjectDeliverySettings } from '@/components/domains/ProjectDeliverySettings'
 import { deliveryError } from '@/components/domains/delivery-errors'
-import { HostnameTunnelStatus } from '@/components/domains/TunnelHostnames'
+import { CustomDomainRow } from '@/components/domains/CustomDomainParts'
+import { HostnameTunnelMenu } from '@/components/domains/TunnelHostnames'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -128,11 +129,53 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
       },
     })
   }
+  const domains = customDomains?.domains ?? []
+  const servedByTemps =
+    project.hosting !== 'external' && project.source_type !== 'external'
+  const domainMenu = (domain: CustomDomainResponse) => (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="-my-1 h-8 w-8 shrink-0"
+          aria-label={`Actions for ${domain.domain}`}
+        >
+          <EllipsisVertical className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem
+          onClick={() => {
+            setEditingDomain(domain)
+            setIsEditDialogOpen(true)
+          }}
+        >
+          Edit
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() =>
+            configureDelivery(domain.domain, domain.environment?.id)
+          }
+        >
+          Configure delivery
+        </DropdownMenuItem>
+        <HostnameTunnelMenu hostname={domain.domain} />
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          className="text-destructive"
+          onClick={() => setDomainToDelete(domain)}
+        >
+          Delete
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="Domains"
-        description="Custom domains for this service. Each one points at an environment and can redirect."
         actions={
           <>
             <RefreshButton
@@ -155,9 +198,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         }
       />
 
-      {isPending ? (
-        <Skeleton className="h-24 w-full" />
-      ) : error ? (
+      {error ? (
         <Alert variant="destructive">
           <AlertDescription>
             {deliveryError(error)}{' '}
@@ -166,73 +207,29 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             </Button>
           </AlertDescription>
         </Alert>
-      ) : customDomains && customDomains?.domains?.length > 0 ? (
-        <div className="space-y-4">
-          {customDomains.domains.map((domain) => (
-            <div
+      ) : servedByTemps ? (
+        // Each custom domain appears once, on the address it is, in its
+        // environment's list.
+        <EnvironmentReachabilityList
+          projectId={project.id}
+          projectSlug={project.slug}
+          domains={domains}
+          domainMenu={domainMenu}
+        />
+      ) : isPending ? (
+        <Skeleton className="h-24 w-full" />
+      ) : domains.length > 0 ? (
+        // An app hosted elsewhere is never served by Temps' ingress, so its
+        // domains have no reachability to show.
+        <ul className="divide-y rounded-lg border">
+          {domains.map((domain) => (
+            <CustomDomainRow
               key={domain.id}
-              className="flex items-center justify-between gap-4 p-4 rounded-lg border"
-            >
-              <div className="min-w-0">
-                <p className="break-all font-medium">{domain.domain}</p>
-                {domain.status === 'hostname_conflict' && (
-                  <p className="text-sm text-destructive">{domain.message}</p>
-                )}
-                {domain.environment && (
-                  <p className="text-sm text-muted-foreground">
-                    Environment: {domain.environment.slug}
-                  </p>
-                )}
-                {domain.service_name && (
-                  <p className="text-sm text-muted-foreground">
-                    Service: {domain.service_name}
-                  </p>
-                )}
-                {domain.redirect_to && (
-                  <p className="text-sm text-muted-foreground">
-                    Redirects to: {domain.redirect_to} ({domain.status_code})
-                  </p>
-                )}
-                <HostnameTunnelStatus hostname={domain.domain} />
-              </div>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label={`Actions for ${domain.domain}`}
-                  >
-                    <EllipsisVertical className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuItem
-                    onClick={() =>
-                      configureDelivery(domain.domain, domain.environment?.id)
-                    }
-                  >
-                    Configure delivery
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onClick={() => {
-                      setEditingDomain(domain)
-                      setIsEditDialogOpen(true)
-                    }}
-                  >
-                    Edit
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    className="text-destructive"
-                    onClick={() => setDomainToDelete(domain)}
-                  >
-                    Delete
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
+              domain={domain}
+              menu={domainMenu}
+            />
           ))}
-        </div>
+        </ul>
       ) : (
         <EmptyState
           icon={Globe}
@@ -244,16 +241,6 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
               <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
             </Button>
           }
-        />
-      )}
-
-      {/* Domains lead the page (DESIGN.md); each environment's reachability
-          follows them. An app hosted elsewhere is never served by Temps'
-          ingress. */}
-      {project.hosting !== 'external' && project.source_type !== 'external' && (
-        <EnvironmentReachabilityList
-          projectId={project.id}
-          projectSlug={project.slug}
         />
       )}
 
