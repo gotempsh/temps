@@ -330,13 +330,17 @@ fn recent_principals(turns: &RecentTurns, within: Duration, now: Instant) -> Vec
 ///
 /// The update runs in a detached task that owns this guard, so a client that
 /// disconnects mid-update can neither strand the flag nor cancel the install.
-/// Dropping also discards the cached check, unless the version was read
-/// after the install finished (`keep_checked_status`): a failed or
-/// interrupted update may have changed what is installed, so the next read
-/// looks inside the workspace again.
+/// Dropping also discards the cached check once the installer may have run
+/// (`installer_started`), unless an installed version was read after the
+/// install finished (`keep_checked_status`): a failed or interrupted install
+/// may have changed what is installed, so the next read looks inside the
+/// workspace again. An update refused before the installer ran (the
+/// workspace busy with a turn, an owner probe that could not tell) changed
+/// nothing, and the cached check stays.
 struct HarnessUpdateGuard {
     states: HarnessUpdates,
     principal_id: i32,
+    installer_started: bool,
     keep_checked_status: bool,
 }
 
@@ -348,7 +352,7 @@ impl Drop for HarnessUpdateGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(state) = states.get_mut(&self.principal_id) {
             state.updating = false;
-            if !self.keep_checked_status {
+            if self.installer_started && !self.keep_checked_status {
                 state.status = None;
                 state.checked_at = None;
                 state.discarded_at = Some(Instant::now());
@@ -2091,7 +2095,7 @@ impl AgentCliAiService {
         &self,
         principal_id: i32,
         package: crate::harness_update::HarnessPackage,
-        guard: HarnessUpdateGuard,
+        mut guard: HarnessUpdateGuard,
     ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
         use crate::harness_update as hu;
 
@@ -2178,6 +2182,8 @@ impl AgentCliAiService {
         // the caller keeps both through the version check below: nothing may
         // run in the workspace, or start another update, until the installed
         // version has been read.
+        // From here on the binary may change, confirmed or not.
+        guard.installer_started = true;
         let task = tokio::spawn(async move {
             let outcome = if as_root {
                 tokio::time::timeout(
@@ -2228,8 +2234,14 @@ impl AgentCliAiService {
         // catalog; the caller refreshes models right after this returns.
         self.workspace_models.lock().await.remove(&principal_id);
         let status = self.check_workspace_harness(principal_id, package).await;
-        // Read after the install finished: it describes what is installed now.
-        guard.keep_checked_status = status.is_ok();
+        // Read after the install finished, it describes what is installed
+        // now, but only if it read a version: a check that could not (the
+        // binary failed to run) is returned with its `detail` and not kept.
+        // A failed registry lookup does not matter here; the installed
+        // version is what the install changed.
+        guard.keep_checked_status = status
+            .as_ref()
+            .is_ok_and(|status| status.installed_version.is_some());
         status
     }
 
@@ -5575,6 +5587,7 @@ impl AiService for AgentCliAiService {
             HarnessUpdateGuard {
                 states: self.harness_updates.clone(),
                 principal_id,
+                installer_started: false,
                 keep_checked_status: false,
             }
         };
@@ -8312,9 +8325,70 @@ mod tests {
             drop(HarnessUpdateGuard {
                 states,
                 principal_id: 42,
+                installer_started: true,
                 keep_checked_status: false,
             });
         }));
+    }
+
+    #[tokio::test]
+    async fn an_update_refused_before_the_installer_ran_keeps_the_cached_check() {
+        // The owner probe cannot tell (exit 5): nothing is installed.
+        let harness = harness_update_service(5, false);
+        harness
+            .service
+            .workspace_harness_update_status("claude_cli", 42, true)
+            .await
+            .expect("the workspace is read");
+        harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await
+            .expect_err("an inconclusive probe refuses the update");
+        assert_eq!(harness.user_updates.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.root_updates.load(Ordering::SeqCst), 0);
+        let cached = harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider")
+            .expect("nothing changed, so the check is kept");
+        assert_eq!(cached.installed_version.as_deref(), Some("2.1.296"));
+        assert!(!cached.updating);
+        let states = harness.service.harness_updates.lock().expect("lock");
+        assert!(
+            states.get(&42).expect("state").discarded_at.is_none(),
+            "a refused update must not overtake checks in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_install_whose_version_cannot_be_read_is_reported_but_not_kept() {
+        let harness = harness_update_service(0, false);
+        // After the install, `--version` prints nothing a version parses from.
+        *harness.installed.lock().expect("installed lock") = String::new();
+        let status = harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await
+            .expect("the install itself succeeded");
+        assert!(status.installed_version.is_none());
+        assert!(
+            status
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("could not be read")),
+            "{status:?}"
+        );
+        assert!(
+            harness
+                .service
+                .cached_workspace_harness_update_status("claude_cli", 42)
+                .await
+                .expect("a supported provider")
+                .is_none(),
+            "an unconfirmed install leaves nothing cached"
+        );
     }
 
     #[tokio::test]
@@ -8365,6 +8439,7 @@ mod tests {
                 drop(HarnessUpdateGuard {
                     states: harness_states.clone(),
                     principal_id: 42,
+                    installer_started: true,
                     keep_checked_status: false,
                 });
                 rearm(harness_states, next_hook, left - 1);
@@ -10883,6 +10958,7 @@ mod tests {
         drop(HarnessUpdateGuard {
             states: states.clone(),
             principal_id: 7,
+            installer_started: true,
             keep_checked_status: false,
         });
         let mut states = states.lock().expect("lock");
@@ -10900,6 +10976,41 @@ mod tests {
             SettledCheck::Published(_)
         ));
         assert!(state.status.is_some());
+    }
+
+    #[test]
+    fn a_guard_dropped_before_the_installer_ran_only_clears_the_flag() {
+        let started = Instant::now();
+        let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        states.lock().expect("lock").insert(
+            7,
+            HarnessUpdateState {
+                status: Some(temps_ai::HarnessUpdateStatus {
+                    provider_id: "claude_cli".to_string(),
+                    installed_version: Some("2.1.263".to_string()),
+                    latest_version: Some("2.1.296".to_string()),
+                    update_available: true,
+                    updating: false,
+                    checked_at: None,
+                    detail: None,
+                }),
+                checked_at: Some(started),
+                discarded_at: None,
+                updating: true,
+            },
+        );
+        // Refused as busy before anything ran in the workspace.
+        drop(HarnessUpdateGuard {
+            states: states.clone(),
+            principal_id: 7,
+            installer_started: false,
+            keep_checked_status: false,
+        });
+        let states = states.lock().expect("lock");
+        let state = states.get(&7).expect("state kept");
+        assert!(!state.updating);
+        assert!(state.status.is_some() && state.checked_at == Some(started));
+        assert!(state.discarded_at.is_none());
     }
 
     #[test]
@@ -10927,6 +11038,7 @@ mod tests {
         drop(HarnessUpdateGuard {
             states: states.clone(),
             principal_id: 7,
+            installer_started: true,
             keep_checked_status: false,
         });
 

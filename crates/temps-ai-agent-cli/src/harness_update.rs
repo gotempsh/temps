@@ -88,7 +88,10 @@ pub fn harness_package(provider_id: &str) -> Option<HarnessPackage> {
 
 /// Shell prelude that resolves the binary that actually runs and decides
 /// which installer owns it, in `$where`: `npm` for a copy inside npm's
-/// global prefix, `home` for one in the vendor installer's directory under
+/// global package tree (`$prefix/lib/node_modules`, where npm's `bin` links
+/// resolve to; not anything else below the prefix, which may be `~/.local`
+/// and hold a vendor installer's copy too), `home` for one in the vendor
+/// installer's directory under
 /// the sandbox user's home ([`HarnessPackage::home_install`]), `other`
 /// otherwise. Exits 4 when the binary is not on `PATH`. npm is asked for its
 /// prefix only after that, and a missing or failing npm only means no copy
@@ -99,7 +102,7 @@ pub fn harness_package(provider_id: &str) -> Option<HarnessPackage> {
 /// first one shadows on `PATH`.
 fn locate(package: HarnessPackage) -> String {
     format!(
-        r#"bin="$(command -v {binary})" || exit 4; bin="$(readlink -f "$bin")" || exit 4; prefix="$(npm config get prefix 2>/dev/null)" || prefix=""; where=other; if [ -n "$prefix" ]; then case "$bin" in "$prefix"/*) where=npm;; esac; fi; if [ "$where" = other ] && [ -n "$HOME" ]; then case "$bin" in "$HOME"/{home_install}/*) where=home;; esac; fi;"#,
+        r#"bin="$(command -v {binary})" || exit 4; bin="$(readlink -f "$bin")" || exit 4; prefix="$(npm config get prefix 2>/dev/null)" || prefix=""; where=other; if [ -n "$prefix" ]; then case "$bin" in "$prefix"/lib/node_modules/*) where=npm;; esac; fi; if [ "$where" = other ] && [ -n "$HOME" ]; then case "$bin" in "$HOME"/{home_install}/*) where=home;; esac; fi;"#,
         binary = package.binary,
         home_install = package.home_install,
     )
@@ -538,6 +541,44 @@ mod tests {
         assert_eq!(status, 0, "{recorded}");
         assert!(
             recorded.contains("npm install -g @openai/codex@latest"),
+            "{recorded}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_owns_its_package_tree_not_everything_below_its_prefix() {
+        // npm's prefix is ~/.local, which also holds Claude Code's native
+        // install: that copy is the vendor installer's, not npm's.
+        let claude = harness_package("claude_cli").expect("claude");
+        let (status, recorded) = run_script_at(
+            &update_command(claude)[6],
+            "claude",
+            ".local/share/claude/versions",
+            Some("~/.local"),
+        );
+        assert_eq!(status, 0, "{recorded}");
+        assert_eq!(recorded.trim(), "claude update");
+        let (status, _) = run_script_at(
+            &install_writable_probe_command(claude)[6],
+            "claude",
+            ".local/share/claude/versions",
+            Some("~/.local"),
+        );
+        assert_eq!(
+            install_owner_from_probe(status),
+            Some(InstallOwner::SandboxUser)
+        );
+        // A copy in npm's package tree under the same prefix is still npm's.
+        let (status, recorded) = run_script_at(
+            &update_command(claude)[6],
+            "claude",
+            ".local/lib/node_modules/@anthropic-ai/claude-code/bin",
+            Some("~/.local"),
+        );
+        assert_eq!(status, 0, "{recorded}");
+        assert!(
+            recorded.contains("npm install -g @anthropic-ai/claude-code@latest"),
             "{recorded}"
         );
     }
