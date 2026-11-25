@@ -67,10 +67,21 @@ def package_tag(key, package, version):
     return f"{package['path']}/v{version}" if package['kind'] == 'go' else f'sdk/{key}/v{version}'
 
 
+# How a catalog package picks its release versions (`versioning`, default 'server'):
+# 'server' releases with every beta and stable server tag at the tag's version;
+# 'independent' keeps its own line, bumped from its Conventional Commits;
+# 'until-server-passes' is independent until the server version is above every
+# version the package has published, then follows the server.
+VERSIONING = ('server', 'independent', 'until-server-passes')
+
+
 def catalog_packages(root=ROOT):
     catalog = read_json(root / '.github/releases/packages.json')
     packages = []
     for key, package in catalog.items():
+        if package.get('versioning', 'server') not in VERSIONING:
+            raise ValueError(f"{key}: unknown versioning {package['versioning']!r}; "
+                             f"use one of {', '.join(VERSIONING)}")
         actual = manifest(package, root)
         if actual['name'] != package['name']:
             raise ValueError(f'{key}: catalog name disagrees with manifest')
@@ -343,7 +354,7 @@ def check_dependencies(packages, kind, fetch=registry_json):
             if not local or name in selected:
                 continue
             if name not in catalog:
-                raise ValueError(f"{p['name']}: uncatalogued local dependency {name}")
+                raise ValueError(f"{p['name']}: uncataloged local dependency {name}")
             dependency = catalog[name]
             encoded = urllib.parse.quote(name, safe='')
             url = (f"https://registry.npmjs.org/{encoded}/{dependency['version']}" if kind == 'npm'

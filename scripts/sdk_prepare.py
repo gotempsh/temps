@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""Prepare SDK release versions for a server tag from Conventional Commits.
+"""Prepare SDK release versions for a server tag.
 
-For every catalog package this derives the next version from the commits that
-touched it since its last package tag, bumps the manifests, the lockfiles and
-`.github/releases/prepared.json`, and leaves publication to `release.yml`.
+SDKs follow the server: every catalog package releases with every beta and stable
+server tag, at the tag's version (`v0.1.0-beta.64` releases `0.1.0-beta.64`, or
+`0.1.0b64` on PyPI). A package whose catalog entry sets `versioning` keeps its own
+version line instead, derived from the Conventional Commits that touched it since
+its last package tag (see `sdk_release.VERSIONING`). Preparation bumps the manifests, the
+lockfiles and `.github/releases/prepared.json`, and leaves publication to `release.yml`.
 It reads git and the public registries only: it never publishes, pushes or
 creates tags. The same repository state and registry contents always produce
 the same files, so running it twice changes nothing.
@@ -103,6 +106,47 @@ def next_core(base, level):
     if level == 'minor':
         return Version(major, minor, 0) if patch == 0 else Version(major, minor + 1, 0)
     return base.core
+
+
+def server_version(tag):
+    """The version a server tag gives the SDKs that follow it."""
+    try:
+        return Version.parse(tag.removeprefix('v'), 'npm')
+    except ValueError:
+        raise ValueError(f'{tag}: SDKs release at the server version, which must be X.Y.Z or '
+                         f'X.Y.Z-(alpha|beta|rc).N') from None
+
+
+def follows_server(state, server):
+    """Whether a package releases at the server version `server` (catalog `versioning`)."""
+    mode = state.package.get('versioning', 'server')
+    if mode == 'until-server-passes':
+        # Already ahead of the server (the CLI shipped 0.1.38 before SDKs followed it):
+        # keep its own line until the server version is above everything it published.
+        return not at_or_above(state, server, inclusive=True)
+    return mode == 'server'
+
+
+def at_or_above(state, version, *, inclusive):
+    """Package-tag and registry versions of the package above `version` (or equal, when inclusive).
+
+    Both are ordered by the registry's own rules, so a version `Version` cannot
+    represent (an npm `0.3.0-canary.1`, a PyPI `0.2.0.dev1`) still counts, and one
+    differing only in build metadata (`0.1.0-beta.64+build.5`) is equal. A version
+    that cannot be ordered at all stops preparation.
+    """
+    kind, name = state.package['kind'], state.package['name']
+    key = precedence(version.format(kind), kind)
+    found = []
+    for source, texts in (('package tag', state.tag_texts), ('registry version', state.registry_texts)):
+        for text in sorted(texts):
+            other = precedence(text, kind)
+            if other is None:
+                raise ValueError(f'{name}: cannot order {source} {text!r} against {version.format(kind)}; '
+                                 f'resolve it before preparing')
+            if other > key or (inclusive and other == key):
+                found.append(text)
+    return found
 
 
 class GitHistory:
@@ -206,6 +250,45 @@ def published_versions(package, fetch=release.registry_json):
 
 PEP440 = re.compile(r'v?(\d+(?:\.\d+)*)(?:[-_.]?(a|b|rc|alpha|beta|c|pre|preview)[-_.]?(\d*))?'
                     r'(?:[-_.]?(post|rev|r)[-_.]?(\d*)|-(\d+))?(?:[-_.]?dev[-_.]?(\d*))?', re.I)
+
+
+SEMVER_PRECEDENCE = re.compile(r'v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)'
+                               r'(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?')
+INF = float('inf')
+
+
+def precedence(text, kind):
+    """A sort key that orders any registry version as its registry does, or None.
+
+    SemVer 2.0 precedence for npm, crates.io and Go (any prerelease identifiers,
+    build metadata ignored); PEP 440 for PyPI (`.devN` before its pre-releases,
+    `.postN` after its release, `1.0` equal to `1.0.0`).
+    """
+    text = text.strip()
+    if kind != 'pypi':
+        match = SEMVER_PRECEDENCE.fullmatch(text)
+        if not match:
+            return None
+        core = tuple(int(part) for part in match.group(1, 2, 3))
+        if match[4] is None:
+            return (core, (1,))
+        identifiers = tuple((0, int(part), '') if part.isdigit() else (1, 0, part) for part in match[4].split('.'))
+        return (core, (0, identifiers))
+    match = PEP440.fullmatch(text)
+    if not match:
+        return None
+    release = [int(part) for part in match[1].split('.')]
+    while len(release) > 1 and release[-1] == 0:
+        release.pop()
+    label = (match[2] or '').lower()
+    has_post = bool(match[4]) or match[6] is not None
+    post = int((match[5] if match[4] else match[6]) or 0) if has_post else None
+    dev = int(match[7] or 0) if match[7] is not None else None
+    if label:
+        pre = ({'a': 0, 'alpha': 0, 'b': 1, 'beta': 1}.get(label, 2), int(match[3] or 0))
+    else:
+        pre = (-INF,) if dev is not None and post is None else (INF,)
+    return (tuple(release), pre, (-INF,) if post is None else (post,), (INF,) if dev is None else (dev,))
 
 
 def registry_version(text, kind):
@@ -359,12 +442,22 @@ class Assessment:
     level: str | None = None
     dependencies: list = field(default_factory=list)
     version: Version | None = None
+    server: Version | None = None  # set when the package releases at the server version
+    tag_texts: set = field(default_factory=set)  # this package's release tags, as versions spelled in the tag
+    registry_texts: set = field(default_factory=set)  # every registry version, as the registry spells it
 
     def selected(self, target):
         graduation = target == 'stable' and self.previous is not None and self.previous.pre is not None
-        return self.unreleased or self.level is not None or graduation or bool(self.dependencies)
+        return (self.server is not None or self.unreleased or self.level is not None or graduation
+                or bool(self.dependencies))
 
     def reason(self, target):
+        if self.server is not None:
+            reasons = ['server version']
+            if self.commits:
+                count = len(self.commits)
+                reasons.append(f"{count} commit{'s' if count != 1 else ''} ({self.level})")
+            return '; '.join(reasons)
         reasons = []
         if self.unreleased:
             reasons.append('first release (never published)')
@@ -382,14 +475,17 @@ def assess(package, catalog, history, published):
     kind = package['kind']
     current = Version.parse(package['version'], kind)
     prefix = release.package_tag(package['key'], package, '')
-    tagged = {}
+    tagged, tag_texts = {}, set()
     for tag in history.tags(prefix):
+        tag_texts.add(tag.removeprefix(prefix))
         try:
             tagged[tag] = Version.parse(tag.removeprefix(prefix), kind)
         except ValueError:
             continue
-    registry = parse_all(published(package), kind)
-    state = Assessment(package, current, known=registry | set(tagged.values()), published=registry)
+    texts = set(published(package))
+    registry = parse_all(texts, kind)
+    state = Assessment(package, current, known=registry | set(tagged.values()), published=registry,
+                       tag_texts=tag_texts, registry_texts=texts)
     if tagged:
         tag, state.previous = max(tagged.items(), key=lambda item: item[1].key())
         base = f'refs/tags/{tag}'
@@ -418,6 +514,20 @@ def next_beta(core, known, floor=0):
 
 def choose_version(state, target):
     package, kind = state.package, state.package['kind']
+    if state.server is not None:
+        candidate = state.server
+        name = f"{package['name']} {candidate.format(kind)}"
+        # Equal precedence counts as taken: registries refuse a version that differs only in build metadata.
+        if candidate in state.known or at_or_above(state, candidate, inclusive=True) != at_or_above(
+                state, candidate, inclusive=False):
+            raise ValueError(f'{name} is already published or tagged; reconcile the registry and package tags first')
+        if ahead := at_or_above(state, candidate, inclusive=False):
+            raise ValueError(f"{name}: {', '.join(ahead)} {'is' if len(ahead) == 1 else 'are'} already published "
+                             f"or tagged, above the "
+                             f"server version; set \"versioning\": \"until-server-passes\" in its catalog entry")
+        if kind == 'go' and candidate.major >= 2:
+            raise ValueError(f'{name}: Go v2+ requires a new /v2 module path and catalog entry')
+        return candidate
     if state.unreleased:
         core = state.current.core
         if target == 'stable':
@@ -687,9 +797,13 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
     elif history.tag_exists(tag):
         raise ValueError(f'{tag} is already tagged; prepare SDK releases for the next server tag')
     target = 'beta' if '-' in tag else 'stable'
+    server = server_version(tag)
     catalog = release.catalog_packages(root)
     by_key = {package['key']: package for package in catalog}
     states = {package['key']: assess(package, catalog, history, published) for package in catalog}
+    for key, state in states.items():
+        if follows_server(state, server):
+            state.server = server
     depends = {key: local_dependencies(by_key[key], catalog, root) for key in by_key}
     # Re-release dependents so registry consumers get the new dependency, to a fixed point.
     changed = True
@@ -777,20 +891,33 @@ def verify_tag(tag, root=release.ROOT, *, history=None, published=None):
     hidden_tags = {entry['tag'] for entry in planned}
     # By catalog key: packages on different registries can share a name (the Python and
     # Rust plugin SDKs are both `temps-plugin-sdk`).
-    hidden = {entry['key']: {Version.parse(entry['version'], entry['kind'])} for entry in planned}
+    # Each hidden version by `Version` and by registry precedence, so a later release
+    # `Version` cannot represent (an npm canary) is hidden too.
+    hidden = {}
+
+    def hide(key, text, kind):
+        versions, keys = hidden.setdefault(key, (set(), set()))
+        if (order := precedence(text, kind)) is not None:
+            keys.add(order)
+        try:
+            versions.add(Version.parse(text, kind))
+        except ValueError:
+            pass
+
+    for entry in planned:
+        hide(entry['key'], entry['version'], entry['kind'])
     reachable = history.reachable_tags()
     for package in release.catalog_packages(root):
         prefix = release.package_tag(package['key'], package, '')
         for later in (tag for tag in history.tags(prefix) if tag not in reachable):
             hidden_tags.add(later)
-            try:
-                hidden.setdefault(package['key'], set()).add(Version.parse(later.removeprefix(prefix), package['kind']))
-            except ValueError:
-                continue
+            hide(package['key'], later.removeprefix(prefix), package['kind'])
 
     def before_release(package):
-        versions = published(package)
-        return {text for text in versions if registry_version(text, package['kind']) not in hidden.get(package['key'], ())}
+        versions, keys = hidden.get(package['key'], (set(), set()))
+        kind = package['kind']
+        return {text for text in published(package)
+                if registry_version(text, kind) not in versions and precedence(text, kind) not in keys}
 
     _, files = prepare(tag, root, history=BeforeRelease(history, hidden_tags), published=before_release,
                        write=False, at_tag=True)
@@ -856,7 +983,9 @@ def summary(tag, report):
         f'Merging this records the selection in `.github/releases/prepared.json`. The `release.yml` run for '
         f'{inline(tag)} then tests, publishes and tags exactly these versions; this PR publishes nothing.',
         '',
-        'Before 1.0.0 a breaking change bumps the minor version and a feature bumps the patch.',
+        'SDKs release at the server version. A package whose catalog entry sets `versioning` keeps its own '
+        'version line, bumped from its commits: before 1.0.0 a breaking change bumps the minor version and '
+        'a feature bumps the patch.',
         '',
         '| Package | Registry | Previous | Next | Why |',
         '| --- | --- | --- | --- | --- |',

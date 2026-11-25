@@ -216,9 +216,68 @@ const PROVIDER_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 struct HarnessUpdateState {
     status: Option<temps_ai::HarnessUpdateStatus>,
+    /// When the check behind `status` started reading the workspace.
     checked_at: Option<Instant>,
+    /// When the cached check was last discarded (an install that did not
+    /// confirm its result): a check that started before then may have read
+    /// the version from before the install and is not published.
+    discarded_at: Option<Instant>,
     updating: bool,
 }
+
+/// What became of a finished workspace check, see
+/// [`HarnessUpdateState::settle_check`].
+#[derive(Debug, PartialEq)]
+enum SettledCheck {
+    /// The check was recorded; it is the current status.
+    Published(temps_ai::HarnessUpdateStatus),
+    /// A check that started later had already published; this is its status.
+    Superseded(temps_ai::HarnessUpdateStatus),
+    /// An install ended without confirming its result after this check
+    /// started, and no later check has published: what this check read may
+    /// predate the install, so it is no answer at all.
+    Discarded,
+}
+
+impl HarnessUpdateState {
+    /// Record a check that started reading the workspace at `started`, unless
+    /// a check that started later has already published: an earlier check can
+    /// finish last (its registry lookup stalled) and must not replace, say,
+    /// the version read after an install with the one read before it. Nor is
+    /// a check recorded when an unconfirmed install was discarded after it
+    /// started. Statuses returned carry the current `updating` flag.
+    fn settle_check(
+        &mut self,
+        started: Instant,
+        status: temps_ai::HarnessUpdateStatus,
+    ) -> SettledCheck {
+        let superseded = self.checked_at.is_some_and(|newer| newer > started);
+        let discarded = self
+            .discarded_at
+            .is_some_and(|discarded| discarded > started);
+        if superseded || discarded {
+            return match self.status.as_ref() {
+                Some(newer) if self.checked_at.is_some_and(|at| at > started) => {
+                    SettledCheck::Superseded(temps_ai::HarnessUpdateStatus {
+                        updating: self.updating,
+                        ..newer.clone()
+                    })
+                }
+                _ => SettledCheck::Discarded,
+            };
+        }
+        self.status = Some(status.clone());
+        self.checked_at = Some(started);
+        SettledCheck::Published(temps_ai::HarnessUpdateStatus {
+            updating: self.updating,
+            ..status
+        })
+    }
+}
+
+/// How many times a workspace check reads again after an unconfirmed install
+/// overtook it, before reporting that the workspace kept changing.
+const HARNESS_CHECK_ATTEMPTS: usize = 2;
 
 type HarnessUpdates = Arc<std::sync::Mutex<HashMap<i32, HarnessUpdateState>>>;
 
@@ -271,11 +330,18 @@ fn recent_principals(turns: &RecentTurns, within: Duration, now: Instant) -> Vec
 ///
 /// The update runs in a detached task that owns this guard, so a client that
 /// disconnects mid-update can neither strand the flag nor cancel the install.
-/// Dropping also discards the cached check: whatever finished (or failed)
-/// changed what is installed, so the next read looks inside the workspace again.
+/// Dropping also discards the cached check once the installer may have run
+/// (`installer_started`), unless an installed version was read after the
+/// install finished (`keep_checked_status`): a failed or interrupted install
+/// may have changed what is installed, so the next read looks inside the
+/// workspace again. An update refused before the installer ran (the
+/// workspace busy with a turn, an owner probe that could not tell) changed
+/// nothing, and the cached check stays.
 struct HarnessUpdateGuard {
     states: HarnessUpdates,
     principal_id: i32,
+    installer_started: bool,
+    keep_checked_status: bool,
 }
 
 impl Drop for HarnessUpdateGuard {
@@ -286,8 +352,11 @@ impl Drop for HarnessUpdateGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(state) = states.get_mut(&self.principal_id) {
             state.updating = false;
-            state.status = None;
-            state.checked_at = None;
+            if self.installer_started && !self.keep_checked_status {
+                state.status = None;
+                state.checked_at = None;
+                state.discarded_at = Some(Instant::now());
+            }
         }
     }
 }
@@ -2026,7 +2095,7 @@ impl AgentCliAiService {
         &self,
         principal_id: i32,
         package: crate::harness_update::HarnessPackage,
-        guard: HarnessUpdateGuard,
+        mut guard: HarnessUpdateGuard,
     ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
         use crate::harness_update as hu;
 
@@ -2113,6 +2182,8 @@ impl AgentCliAiService {
         // the caller keeps both through the version check below: nothing may
         // run in the workspace, or start another update, until the installed
         // version has been read.
+        // From here on the binary may change, confirmed or not.
+        guard.installer_started = true;
         let task = tokio::spawn(async move {
             let outcome = if as_root {
                 tokio::time::timeout(
@@ -2129,7 +2200,7 @@ impl AgentCliAiService {
             };
             (outcome, slot, guard)
         });
-        let (outcome, _slot, _guard) = task.await.map_err(|error| AiError::Provider {
+        let (outcome, _slot, mut guard) = task.await.map_err(|error| AiError::Provider {
             purpose: purpose.to_string(),
             reason: format!("the update task ended unexpectedly: {error}"),
         })?;
@@ -2162,12 +2233,74 @@ impl AgentCliAiService {
         // New models only appear after the next discovery, so drop the cached
         // catalog; the caller refreshes models right after this returns.
         self.workspace_models.lock().await.remove(&principal_id);
-        self.check_workspace_harness(principal_id, package).await
+        let status = self.check_workspace_harness(principal_id, package).await;
+        // Read after the install finished, it describes what is installed
+        // now, but only if it read a version: a check that could not (the
+        // binary failed to run) is returned with its `detail` and not kept.
+        // A failed registry lookup does not matter here; the installed
+        // version is what the install changed.
+        guard.keep_checked_status = status
+            .as_ref()
+            .is_ok_and(|status| status.installed_version.is_some());
+        status
     }
 
     /// Read the installed and latest versions inside the workspace and cache
     /// the result. A failed lookup is reported in `detail`, never as a guess.
+    ///
+    /// When an install that did not confirm its result ends while a check is
+    /// reading, what the check read may predate the install: it is never
+    /// returned. The workspace is read again (the install has finished by
+    /// then), and if that keeps happening the caller gets an error asking
+    /// to check again instead of a version that may be stale.
     async fn check_workspace_harness(
+        &self,
+        principal_id: i32,
+        package: crate::harness_update::HarnessPackage,
+    ) -> Result<temps_ai::HarnessUpdateStatus, AiError> {
+        for attempt in 1..=HARNESS_CHECK_ATTEMPTS {
+            let started = Instant::now();
+            let status = self.read_workspace_harness(principal_id, package).await?;
+            let mut states = self
+                .harness_updates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match states
+                .entry(principal_id)
+                .or_default()
+                .settle_check(started, status)
+            {
+                SettledCheck::Published(status) => return Ok(status),
+                SettledCheck::Superseded(newer) => {
+                    tracing::debug!(
+                        provider = self.provider.name(),
+                        principal_id,
+                        "a newer harness check already published; returning it instead of this one"
+                    );
+                    return Ok(newer);
+                }
+                SettledCheck::Discarded => tracing::debug!(
+                    provider = self.provider.name(),
+                    principal_id,
+                    attempt,
+                    "an unconfirmed install ended during the harness check; reading the workspace again"
+                ),
+            }
+        }
+        Err(AiError::Provider {
+            purpose: "provider.harness.update.check".to_string(),
+            reason: format!(
+                "the {} version in workspace of principal {principal_id} changed while it was \
+                 being checked ({HARNESS_CHECK_ATTEMPTS} attempts overtaken by updates that \
+                 did not confirm their result); check again",
+                self.provider.name()
+            ),
+        })
+    }
+
+    /// One read of the installed and latest versions inside the workspace,
+    /// not yet recorded.
+    async fn read_workspace_harness(
         &self,
         principal_id: i32,
         package: crate::harness_update::HarnessPackage,
@@ -2220,7 +2353,7 @@ impl AgentCliAiService {
             (Some(installed), Some(latest)) => hu::is_newer(latest, installed),
             _ => false,
         };
-        let status = temps_ai::HarnessUpdateStatus {
+        Ok(temps_ai::HarnessUpdateStatus {
             provider_id: self.provider.name().to_string(),
             installed_version,
             latest_version,
@@ -2230,17 +2363,6 @@ impl AgentCliAiService {
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             ),
             detail,
-        };
-        let mut states = self
-            .harness_updates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = states.entry(principal_id).or_default();
-        state.status = Some(status.clone());
-        state.checked_at = Some(Instant::now());
-        Ok(temps_ai::HarnessUpdateStatus {
-            updating: state.updating,
-            ..status
         })
     }
 
@@ -5397,6 +5519,43 @@ impl AiService for AgentCliAiService {
         self.check_workspace_harness(principal_id, package).await
     }
 
+    async fn cached_workspace_harness_update_status(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<Option<temps_ai::HarnessUpdateStatus>, AiError> {
+        use crate::harness_update as hu;
+
+        if provider != self.provider.name() || hu::harness_package(provider).is_none() {
+            return Err(AiError::Provider {
+                purpose: "provider.harness.update".into(),
+                reason: format!("harness updates are unavailable for '{provider}'"),
+            });
+        }
+        let states = self
+            .harness_updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(states.get(&principal_id).and_then(|state| {
+            match (state.status.as_ref(), state.updating) {
+                (Some(status), updating) => Some(temps_ai::HarnessUpdateStatus {
+                    updating,
+                    ..status.clone()
+                }),
+                (None, true) => Some(temps_ai::HarnessUpdateStatus {
+                    provider_id: provider.to_string(),
+                    installed_version: None,
+                    latest_version: None,
+                    update_available: false,
+                    updating: true,
+                    checked_at: None,
+                    detail: None,
+                }),
+                (None, false) => None,
+            }
+        }))
+    }
+
     async fn update_workspace_harness(
         &self,
         provider: &str,
@@ -5428,6 +5587,8 @@ impl AiService for AgentCliAiService {
             HarnessUpdateGuard {
                 states: self.harness_updates.clone(),
                 principal_id,
+                installer_started: false,
+                keep_checked_status: false,
             }
         };
         self.run_workspace_harness_update(principal_id, package, guard)
@@ -7881,7 +8042,14 @@ mod tests {
         probe_fails_to_run: bool,
         user_updates: Arc<AtomicUsize>,
         root_updates: Arc<AtomicUsize>,
+        /// The version `--version` reports.
+        installed: Arc<std::sync::Mutex<String>>,
+        version_reads: Arc<AtomicUsize>,
+        /// Runs once, during the next registry lookup.
+        on_latest_lookup: LatestLookupHook,
     }
+
+    type LatestLookupHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 
     impl HarnessUpdateSandbox {
         fn answer(&self, command: &[String]) -> temps_sandbox_providers::SandboxExecResult {
@@ -7889,9 +8057,15 @@ mod tests {
             let (exit_code, stdout) = if joined.contains("test -w") {
                 (self.probe_exit_code, String::new())
             } else if joined.contains("npm view") {
+                let hook = self.on_latest_lookup.lock().expect("hook lock").take();
+                if let Some(hook) = hook {
+                    hook();
+                }
                 (0, "2.1.296\n".to_string())
             } else if joined.contains("--version") {
-                (0, "2.1.296 (Claude Code)\n".to_string())
+                self.version_reads.fetch_add(1, Ordering::SeqCst);
+                let installed = self.installed.lock().expect("installed lock").clone();
+                (0, format!("{installed} (Claude Code)\n"))
             } else {
                 (0, String::new())
             };
@@ -8038,15 +8212,46 @@ mod tests {
         probe_exit_code: i32,
         probe_fails_to_run: bool,
     ) -> (Result<temps_ai::HarnessUpdateStatus, AiError>, usize, usize) {
+        let harness = harness_update_service(probe_exit_code, probe_fails_to_run);
+        let result = harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await;
+        (
+            result,
+            harness.user_updates.load(Ordering::SeqCst),
+            harness.root_updates.load(Ordering::SeqCst),
+        )
+    }
+
+    struct HarnessUpdateHarness {
+        service: AgentCliAiService,
+        user_updates: Arc<AtomicUsize>,
+        root_updates: Arc<AtomicUsize>,
+        /// How many times the workspace was resolved (created or woken).
+        resolutions: Arc<AtomicUsize>,
+        installed: Arc<std::sync::Mutex<String>>,
+        version_reads: Arc<AtomicUsize>,
+        on_latest_lookup: LatestLookupHook,
+        _scratch: tempfile::TempDir,
+    }
+
+    fn harness_update_service(
+        probe_exit_code: i32,
+        probe_fails_to_run: bool,
+    ) -> HarnessUpdateHarness {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let workspace_root = scratch.path().join("ai-applications");
         let workspace_path = workspace_root.join("global-user-42");
         std::fs::create_dir_all(&workspace_path).expect("managed workspace path");
         let handle = test_sandbox_handle();
         let resolver = SandboxWorkspaceResolverSlot::new();
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolved = resolutions.clone();
         assert!(resolver.set(Arc::new(move |principal_id| {
             let handle = handle.clone();
             let workspace_path = workspace_path.clone();
+            resolved.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 assert_eq!(principal_id, 42);
                 Ok(ResolvedSandboxWorkspace {
@@ -8061,11 +8266,17 @@ mod tests {
         })));
         let user_updates = Arc::new(AtomicUsize::new(0));
         let root_updates = Arc::new(AtomicUsize::new(0));
+        let installed = Arc::new(std::sync::Mutex::new("2.1.296".to_string()));
+        let version_reads = Arc::new(AtomicUsize::new(0));
+        let on_latest_lookup: LatestLookupHook = Arc::new(std::sync::Mutex::new(None));
         let sandbox: Arc<dyn SandboxProvider> = Arc::new(HarnessUpdateSandbox {
             probe_exit_code,
             probe_fails_to_run,
             user_updates: user_updates.clone(),
             root_updates: root_updates.clone(),
+            installed: installed.clone(),
+            version_reads: version_reads.clone(),
+            on_latest_lookup: on_latest_lookup.clone(),
         });
         let service = AgentCliAiService::new(
             Arc::new(CountingClaudeProvider {
@@ -8084,12 +8295,228 @@ mod tests {
             Arc::new(SandboxModelRelayService::new().expect("model relay")),
             resolver,
         );
-        let result = service.update_workspace_harness("claude_cli", 42).await;
-        (
-            result,
-            user_updates.load(Ordering::SeqCst),
-            root_updates.load(Ordering::SeqCst),
-        )
+        HarnessUpdateHarness {
+            service,
+            user_updates,
+            root_updates,
+            resolutions,
+            installed,
+            version_reads,
+            on_latest_lookup,
+            _scratch: scratch,
+        }
+    }
+
+    /// Simulates an install that replaced the binary with `version` and ended
+    /// without confirming its result, the next time the registry is looked
+    /// up, i.e. while a check that already read the installed version waits.
+    fn interrupt_with_unconfirmed_install(harness: &HarnessUpdateHarness, version: &str) {
+        let states = harness.service.harness_updates.clone();
+        let installed = harness.installed.clone();
+        let version = version.to_string();
+        *harness.on_latest_lookup.lock().expect("hook lock") = Some(Box::new(move || {
+            *installed.lock().expect("installed lock") = version;
+            states
+                .lock()
+                .expect("states lock")
+                .entry(42)
+                .or_default()
+                .updating = true;
+            drop(HarnessUpdateGuard {
+                states,
+                principal_id: 42,
+                installer_started: true,
+                keep_checked_status: false,
+            });
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_update_refused_before_the_installer_ran_keeps_the_cached_check() {
+        // The owner probe cannot tell (exit 5): nothing is installed.
+        let harness = harness_update_service(5, false);
+        harness
+            .service
+            .workspace_harness_update_status("claude_cli", 42, true)
+            .await
+            .expect("the workspace is read");
+        harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await
+            .expect_err("an inconclusive probe refuses the update");
+        assert_eq!(harness.user_updates.load(Ordering::SeqCst), 0);
+        assert_eq!(harness.root_updates.load(Ordering::SeqCst), 0);
+        let cached = harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider")
+            .expect("nothing changed, so the check is kept");
+        assert_eq!(cached.installed_version.as_deref(), Some("2.1.296"));
+        assert!(!cached.updating);
+        let states = harness.service.harness_updates.lock().expect("lock");
+        assert!(
+            states.get(&42).expect("state").discarded_at.is_none(),
+            "a refused update must not overtake checks in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_install_whose_version_cannot_be_read_is_reported_but_not_kept() {
+        let harness = harness_update_service(0, false);
+        // After the install, `--version` prints nothing a version parses from.
+        *harness.installed.lock().expect("installed lock") = String::new();
+        let status = harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await
+            .expect("the install itself succeeded");
+        assert!(status.installed_version.is_none());
+        assert!(
+            status
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("could not be read")),
+            "{status:?}"
+        );
+        assert!(
+            harness
+                .service
+                .cached_workspace_harness_update_status("claude_cli", 42)
+                .await
+                .expect("a supported provider")
+                .is_none(),
+            "an unconfirmed install leaves nothing cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_check_overtaken_by_an_unconfirmed_install_reads_the_workspace_again() {
+        let harness = harness_update_service(0, false);
+        *harness.installed.lock().expect("installed lock") = "2.1.263".to_string();
+        interrupt_with_unconfirmed_install(&harness, "2.1.296");
+
+        let status = harness
+            .service
+            .workspace_harness_update_status("claude_cli", 42, true)
+            .await
+            .expect("the check is answered after reading again");
+
+        assert_eq!(
+            status.installed_version.as_deref(),
+            Some("2.1.296"),
+            "the version read before the install is never returned"
+        );
+        assert!(!status.update_available && !status.updating);
+        assert_eq!(harness.version_reads.load(Ordering::SeqCst), 2);
+        let cached = harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider")
+            .expect("the second read is cached");
+        assert_eq!(cached.installed_version.as_deref(), Some("2.1.296"));
+    }
+
+    #[tokio::test]
+    async fn a_check_overtaken_on_every_attempt_is_an_error_not_a_stale_version() {
+        let harness = harness_update_service(0, false);
+        *harness.installed.lock().expect("installed lock") = "2.1.263".to_string();
+        // Every read is overtaken: re-arm the interruption on each lookup.
+        fn rearm(harness_states: HarnessUpdates, hook: LatestLookupHook, left: usize) {
+            if left == 0 {
+                return;
+            }
+            let next_hook = hook.clone();
+            *hook.lock().expect("hook lock") = Some(Box::new(move || {
+                harness_states
+                    .lock()
+                    .expect("states lock")
+                    .entry(42)
+                    .or_default()
+                    .updating = true;
+                drop(HarnessUpdateGuard {
+                    states: harness_states.clone(),
+                    principal_id: 42,
+                    installer_started: true,
+                    keep_checked_status: false,
+                });
+                rearm(harness_states, next_hook, left - 1);
+            }));
+        }
+        rearm(
+            harness.service.harness_updates.clone(),
+            harness.on_latest_lookup.clone(),
+            HARNESS_CHECK_ATTEMPTS,
+        );
+
+        let error = harness
+            .service
+            .workspace_harness_update_status("claude_cli", 42, true)
+            .await
+            .expect_err("no read survived, so there is nothing to report");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("changed while it was being checked"),
+            "{message}"
+        );
+        assert!(message.contains("principal 42"), "{message}");
+        assert_eq!(
+            harness.version_reads.load(Ordering::SeqCst),
+            HARNESS_CHECK_ATTEMPTS
+        );
+        assert!(harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_cached_harness_status_never_creates_or_wakes_the_workspace() {
+        let harness = harness_update_service(0, false);
+
+        let before = harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider");
+        assert!(before.is_none(), "nothing has been read yet: {before:?}");
+        assert_eq!(
+            harness.resolutions.load(Ordering::SeqCst),
+            0,
+            "a cached read must not resolve (create or start) the workspace"
+        );
+
+        harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await
+            .expect("update succeeds");
+        let resolved_by_update = harness.resolutions.load(Ordering::SeqCst);
+        assert!(resolved_by_update > 0);
+
+        let after = harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider")
+            .expect("the update's own check is cached");
+        assert_eq!(after.installed_version.as_deref(), Some("2.1.296"));
+        assert!(!after.updating);
+        assert_eq!(
+            harness.resolutions.load(Ordering::SeqCst),
+            resolved_by_update,
+            "reading the cache again must not touch the workspace"
+        );
+        assert!(harness
+            .service
+            .cached_workspace_harness_update_status("codex_cli", 42)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -10463,6 +10890,130 @@ mod tests {
     }
 
     #[test]
+    fn an_earlier_check_finishing_last_never_replaces_a_later_one() {
+        let status = |installed: &str| temps_ai::HarnessUpdateStatus {
+            provider_id: "codex_cli".to_string(),
+            installed_version: Some(installed.to_string()),
+            latest_version: Some("1.1.0".to_string()),
+            update_available: installed != "1.1.0",
+            updating: false,
+            checked_at: None,
+            detail: None,
+        };
+        let refresh_started = Instant::now();
+        let after_install = refresh_started + Duration::from_secs(5);
+        let mut state = HarnessUpdateState::default();
+        // The post-install check read 1.1.0 and published first.
+        assert!(matches!(
+            state.settle_check(after_install, status("1.1.0")),
+            SettledCheck::Published(_)
+        ));
+        // A refresh that read 1.0.0 before the install finishes later and
+        // answers with the newer check.
+        let SettledCheck::Superseded(newer) = state.settle_check(refresh_started, status("1.0.0"))
+        else {
+            panic!("an earlier check must not publish");
+        };
+        assert_eq!(newer.installed_version.as_deref(), Some("1.1.0"));
+        assert_eq!(
+            state
+                .status
+                .as_ref()
+                .and_then(|status| status.installed_version.as_deref()),
+            Some("1.1.0")
+        );
+        assert_eq!(state.checked_at, Some(after_install));
+        // A check that started later still replaces it.
+        let later = after_install + Duration::from_secs(5);
+        assert!(matches!(
+            state.settle_check(later, status("1.0.0")),
+            SettledCheck::Published(_)
+        ));
+        assert_eq!(state.checked_at, Some(later));
+    }
+
+    #[test]
+    fn a_check_from_before_a_discarded_install_is_not_published() {
+        let status = temps_ai::HarnessUpdateStatus {
+            provider_id: "codex_cli".to_string(),
+            installed_version: Some("1.0.0".to_string()),
+            latest_version: Some("1.1.0".to_string()),
+            update_available: true,
+            updating: false,
+            checked_at: None,
+            detail: None,
+        };
+        let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        states.lock().expect("lock").insert(
+            7,
+            HarnessUpdateState {
+                updating: true,
+                ..Default::default()
+            },
+        );
+        // A refresh reads 1.0.0 and stalls on the registry lookup.
+        let refresh_started = Instant::now();
+        // The install replaced the binary, but its caller went away before
+        // the post-install check: the guard drops without confirming.
+        drop(HarnessUpdateGuard {
+            states: states.clone(),
+            principal_id: 7,
+            installer_started: true,
+            keep_checked_status: false,
+        });
+        let mut states = states.lock().expect("lock");
+        let state = states.get_mut(&7).expect("state");
+        // With nothing newer to answer with, the pre-install read is no
+        // answer either: it is neither recorded nor returned.
+        assert_eq!(
+            state.settle_check(refresh_started, status.clone()),
+            SettledCheck::Discarded
+        );
+        assert!(state.status.is_none(), "the pre-install read stays out");
+        // A check that starts after the discard is published.
+        assert!(matches!(
+            state.settle_check(Instant::now(), status),
+            SettledCheck::Published(_)
+        ));
+        assert!(state.status.is_some());
+    }
+
+    #[test]
+    fn a_guard_dropped_before_the_installer_ran_only_clears_the_flag() {
+        let started = Instant::now();
+        let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        states.lock().expect("lock").insert(
+            7,
+            HarnessUpdateState {
+                status: Some(temps_ai::HarnessUpdateStatus {
+                    provider_id: "claude_cli".to_string(),
+                    installed_version: Some("2.1.263".to_string()),
+                    latest_version: Some("2.1.296".to_string()),
+                    update_available: true,
+                    updating: false,
+                    checked_at: None,
+                    detail: None,
+                }),
+                checked_at: Some(started),
+                discarded_at: None,
+                updating: true,
+            },
+        );
+        // Refused as busy before anything ran in the workspace.
+        drop(HarnessUpdateGuard {
+            states: states.clone(),
+            principal_id: 7,
+            installer_started: false,
+            keep_checked_status: false,
+        });
+        let states = states.lock().expect("lock");
+        let state = states.get(&7).expect("state kept");
+        assert!(!state.updating);
+        assert!(state.status.is_some() && state.checked_at == Some(started));
+        assert!(state.discarded_at.is_none());
+    }
+
+    #[test]
     fn dropping_the_update_guard_clears_the_flag_and_the_stale_check() {
         let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
         states.lock().expect("lock").insert(
@@ -10478,6 +11029,7 @@ mod tests {
                     detail: None,
                 }),
                 checked_at: Some(Instant::now()),
+                discarded_at: None,
                 updating: true,
             },
         );
@@ -10486,6 +11038,8 @@ mod tests {
         drop(HarnessUpdateGuard {
             states: states.clone(),
             principal_id: 7,
+            installer_started: true,
+            keep_checked_status: false,
         });
 
         let states = states.lock().expect("lock");
@@ -10495,5 +11049,6 @@ mod tests {
             state.status.is_none() && state.checked_at.is_none(),
             "what is installed changed, so the cached check is discarded"
         );
+        assert!(state.discarded_at.is_some(), "and the discard is ordered");
     }
 }

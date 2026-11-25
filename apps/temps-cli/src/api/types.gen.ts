@@ -23621,9 +23621,12 @@ export type ModelCatalogEntry = {
     provider: string;
     release_date?: string | null;
     source_url: string;
-    supports_reasoning: boolean;
-    supports_tools: boolean;
-    supports_vision: boolean;
+    supports_reasoning?: boolean | null;
+    /**
+     * `null` when the catalog does not say.
+     */
+    supports_tools?: boolean | null;
+    supports_vision?: boolean | null;
 };
 
 /**
@@ -101843,6 +101846,12 @@ export type GetAiProviderHarnessUpdateData = {
          * Look inside the workspace again instead of returning the cached check.
          */
         refresh?: boolean;
+        /**
+         * Return only what was last read, never looking inside the workspace
+         * (which could create or wake it). Not checked yet: every version field
+         * and `checked_at` are null. Ignored when `refresh` is set.
+         */
+        cached_only?: boolean;
     };
     url: '/settings/ai-providers/{provider_id}/harness-update';
 };

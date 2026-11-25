@@ -485,7 +485,10 @@ impl TempsPlugin for AiGatewayPlugin {
                 provider_model_service.clone(),
             ));
             context.register_service(model_catalog_service.clone());
-            model_catalog_service.clone().spawn_background();
+            // Aborted if a later step fails; registered below once every
+            // step has succeeded.
+            let mut background = crate::background::GatewayBackgroundTasks::default();
+            background.push(model_catalog_service.clone().spawn_background());
 
             bootstrap_provider_models(&provider_key_service, &provider_model_service).await;
 
@@ -702,7 +705,7 @@ impl TempsPlugin for AiGatewayPlugin {
                 audit_service.clone(),
             ));
             context.register_service(coding_agent_service.clone());
-            coding_agent_service.clone().spawn_background();
+            background.push(coding_agent_service.clone().spawn_background());
             let project_access_checker =
                 context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
@@ -728,6 +731,7 @@ impl TempsPlugin for AiGatewayPlugin {
             )
             .await;
             context.register_service(app_state);
+            context.register_service(Arc::new(background));
 
             tracing::debug!("AI Gateway plugin services registered successfully");
             Ok(())

@@ -30,7 +30,11 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { formatPerMillion, formatTokens } from '@/lib/ai-model-catalog'
+import {
+  clampPage,
+  formatPerMillion,
+  formatTokens,
+} from '@/lib/ai-model-catalog'
 import { useQuery } from '@tanstack/react-query'
 import { TriangleAlert } from 'lucide-react'
 import { useState } from 'react'
@@ -133,6 +137,17 @@ export function CatalogModelsTable() {
 
   const total = Number(entries.data?.total ?? 0)
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  // A refresh can shrink the catalog under the page being shown: go to the
+  // last page that exists instead of an empty one with no pager. Adjusted
+  // during render, so the empty page is never painted. Only against a total
+  // read for this very page and not being re-read: another page's placeholder
+  // or this page's cached answer from before a refresh may be out of date.
+  const totalIsCurrent =
+    entries.isSuccess && !entries.isPlaceholderData && !entries.isFetching
+  const reachablePage = totalIsCurrent
+    ? clampPage(page, total, PAGE_SIZE)
+    : page
+  if (reachablePage !== page) setPage(reachablePage)
 
   return (
     <Card>
@@ -242,6 +257,15 @@ export function CatalogModelsTable() {
                       <div className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
                         {entry.provider} · {entry.model_id}
                         {entry.deprecated ? ' · deprecated' : ''}
+                      </div>
+                      {/* The columns a narrow card hides, under the name. */}
+                      <div className="text-xs text-muted-foreground @2xl:hidden">
+                        <span className="@xl:hidden">
+                          Cache read{' '}
+                          {formatPerMillion(entry.cache_read_per_million)}{' '}
+                          ·{' '}
+                        </span>
+                        Context {formatTokens(entry.context_window)}
                       </div>
                     </TableCell>
                     <TableCell className="text-right">

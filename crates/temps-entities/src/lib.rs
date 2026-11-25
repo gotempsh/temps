@@ -250,6 +250,7 @@ pub mod source_maps;
 pub mod status_checks;
 pub mod status_incident_updates;
 pub mod status_incidents;
+pub mod status_monitor_interval_changes;
 pub mod status_monitors;
 pub mod status_page_domains;
 pub mod status_page_maintenance_monitors;

@@ -225,7 +225,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(catalog['cli'], {
             'kind': 'npm', 'path': 'apps/temps-cli', 'name': '@temps-sdk/cli',
             'stamped': ['skills/temps-cli/references/COMMANDS.md'],
-            'channel_pinned': ['skills/**/*.md', 'skills/**/*.json']})
+            'channel_pinned': ['skills/**/*.md', 'skills/**/*.json'],
+            # 0.1.38 and 0.2.0-beta.1 shipped before SDKs followed the server version.
+            'versioning': 'until-server-passes'})
+        # Every other SDK releases at the server version.
+        self.assertEqual({key for key, entry in catalog.items() if entry.get('versioning', 'server') != 'server'},
+                         {'cli'})
         package = next(p for p in release.catalog_packages() if p['key'] == 'cli')
         self.assertEqual(release.plan(package['tag']), [package])
         # The generated command reference names the current CLI version, so `prepare` can move it.
@@ -655,8 +660,14 @@ class PrepareTests(unittest.TestCase):
     def read(self, path):
         return (self.root / path).read_text()
 
-    def add(self, key, kind, version, *, name=None, path=None, deps=(), published=(), **extra):
-        """Add a catalog package whose manifest an initial commit records at `version`."""
+    def add(self, key, kind, version, *, name=None, path=None, deps=(), published=(), versioning='independent',
+            **extra):
+        """Add a catalog package whose manifest an initial commit records at `version`.
+
+        Fixtures default to `independent` so the commit-derived bumps can be tested
+        against any server tag; server-versioned tests pass `versioning='server'`.
+        """
+        extra['versioning'] = versioning
         name = name or {'crate': key, 'go': 'github.com/gotempsh/temps/sdks/go/' + key}.get(kind, '@temps-sdk/' + key)
         path = path or {'npm': f'sdks/node/packages/{key}', 'crate': f'crates/{key}',
                         'pypi': f'sdks/{key}', 'go': f'sdks/go/{key}'}[kind]
@@ -728,6 +739,183 @@ class PrepareTests(unittest.TestCase):
     def selection(self, tag='v9.0.0'):
         report, _ = self.prepare(tag)
         return {entry['key']: entry['version'] for entry in report}
+
+    def test_sdks_release_at_the_server_version_with_every_server_release(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'}, versioning='server')
+        self.add('react-analytics', 'npm', '0.0.9', deps=['analytics-core'], published={'0.0.9'}, versioning='server')
+        self.add('temps-plugin-protocol', 'crate', '0.1.0-beta.62', published={'0.1.0-beta.62'}, versioning='server')
+        self.add('temps-plugin-sdk', 'crate', '0.1.0-beta.62', deps=['temps-plugin-protocol'],
+                 published={'0.1.0-beta.62'}, versioning='server')
+        self.add('py', 'pypi', '0.1.0b1', name='temps-sample', published={'0.1.0b1'}, versioning='server')
+        self.add('workflows', 'go', '0.1.0-beta.1', published={'0.1.0-beta.1'}, versioning='server')
+        for key in self.catalog:
+            self.release_tag(key, self.version(key))
+        # Nothing changed since the last release: every SDK still follows the server.
+        report, _ = self.prepare('v0.1.0-beta.64')
+        self.assertEqual({e['key']: e['version'] for e in report}, {
+            'analytics-core': '0.1.0-beta.64', 'react-analytics': '0.1.0-beta.64',
+            'temps-plugin-protocol': '0.1.0-beta.64', 'temps-plugin-sdk': '0.1.0-beta.64',
+            'py': '0.1.0b64', 'workflows': '0.1.0-beta.64'})
+        self.assertEqual({e['reason'] for e in report}, {'server version'})
+        self.assertEqual([e['key'] for e in report][:2], ['analytics-core', 'temps-plugin-protocol'])
+        self.assertIn('temps-plugin-protocol = { path = "../temps-plugin-protocol", version = "=0.1.0-beta.64" }',
+                      self.read('crates/temps-plugin-sdk/Cargo.toml'))
+        self.assertIn('name = "temps-plugin-sdk"\nversion = "0.1.0-beta.64"\n', self.read('Cargo.lock'))
+        self.assertIn('version = "0.1.0b64"', self.read('sdks/py/uv.lock'))
+        self.assertEqual(self.read('sdks/go/workflows/VERSION'), '0.1.0-beta.64\n')
+        self.assertEqual(release.channel(self.version('py'), 'pypi'), 'beta')
+        self.assertEqual([(p['key'], p['version']) for p in release.plan('v0.1.0-beta.64', self.root)],
+                         [(e['key'], e['version']) for e in report])
+        # A stable server release takes every SDK stable at the same version.
+        self.assertEqual(set(self.selection('v0.1.0').values()), {'0.1.0'})
+        self.assertEqual(self.version('py'), '0.1.0')
+
+    def test_commits_are_listed_but_do_not_change_a_server_version(self):
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'}, versioning='server')
+        self.release_tag('kv', '0.0.4')
+        self.change('kv', 'feat(kv)!: drop the v1 client')
+        report, _ = self.prepare('v0.1.0-beta.64')
+        self.assertEqual((report[0]['version'], report[0]['reason']), ('0.1.0-beta.64', 'server version; 1 commit (major)'))
+        self.assertEqual([c['subject'] for c in report[0]['commits']], ['feat(kv)!: drop the v1 client'])
+
+    def test_a_server_version_already_published_or_passed_fails_closed(self):
+        for published, message in [({'0.1.0-beta.64'}, r'@temps-sdk/kv 0\.1\.0-beta\.64 is already published'),
+                                   ({'0.1.38'}, r'0\.1\.38 is already published or tagged, above the server version; '
+                                                r'set "versioning": "until-server-passes"')]:
+            with self.subTest(published=published):
+                self.setUp()
+                self.add('kv', 'npm', '0.0.4', published=published, versioning='server')
+                with self.assertRaisesRegex(ValueError, message):
+                    self.prepare('v0.1.0-beta.64')
+                self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
+                self.assertEqual(self.version('kv'), '0.0.4')
+
+    def test_a_package_ahead_of_the_server_keeps_its_own_line_until_the_server_passes_it(self):
+        self.write('skills/cli/SKILL.md', 'Run `bunx @temps-sdk/cli@beta --help`.\n')
+        self.add('cli', 'npm', '0.2.0-beta.1', published={'0.1.38', '0.2.0-beta.1'},
+                 versioning='until-server-passes', channel_pinned=['skills/**/*.md'])
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'}, versioning='server')
+        self.release_tag('cli', '0.2.0-beta.1')
+        # The server (0.1.0-beta.64) is behind the CLI's 0.2.0-beta.1: no CLI change, no CLI release.
+        self.assertEqual(self.selection('v0.1.0-beta.64'), {'kv': '0.1.0-beta.64'})
+        self.change('cli', 'fix: retry logins')
+        self.assertEqual(self.selection('v0.1.0-beta.65'), {'cli': '0.2.0-beta.2', 'kv': '0.1.0-beta.65'})
+        self.release_tag('cli', '0.2.0-beta.2')
+        # Equal is not past: 0.2.0-beta.2 is already the CLI's, so it keeps its own line.
+        self.assertEqual(self.selection('v0.2.0-beta.2'), {'kv': '0.2.0-beta.2'})
+        # Once the server is above everything the CLI published, it follows the server, changes or not.
+        report, _ = self.prepare('v0.2.0-beta.3')
+        self.assertEqual({e['key']: (e['version'], e['reason']) for e in report},
+                         {'cli': ('0.2.0-beta.3', 'server version'), 'kv': ('0.2.0-beta.3', 'server version')})
+
+    def test_registry_versions_are_ordered_by_each_registry_s_rules(self):
+        semver = ['0.1.0-beta.64', '1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta', '1.0.0-beta', '1.0.0-beta.2',
+                  '1.0.0-beta.11', '1.0.0-canary.1', '1.0.0-rc.1', '1.0.0', '1.0.1-0', '1.0.1']
+        pep440 = ['0.1.0b64', '1.0.dev1', '1.0a1', '1.0b1.dev1', '1.0b1', '1.0b1.post1', '1.0rc1',
+                  '1.0.post1.dev1', '1.0.post1', '1.1.dev1']
+        for kind, ordered in [('npm', semver), ('crate', semver), ('go', semver), ('pypi', pep440)]:
+            with self.subTest(kind=kind):
+                keys = [sdk_prepare.precedence(text, kind) for text in ordered]
+                self.assertEqual(sorted(keys), keys)
+                self.assertEqual(len(set(keys)), len(keys))
+        self.assertEqual(sdk_prepare.precedence('1.0', 'pypi'), sdk_prepare.precedence('1.0.0', 'pypi'))
+        self.assertEqual(sdk_prepare.precedence('1.0.0+build.5', 'npm'), sdk_prepare.precedence('1.0.0', 'npm'))
+        self.assertLess(sdk_prepare.precedence('1.0rc1', 'pypi'), sdk_prepare.precedence('1.0', 'pypi'))
+        for text, kind in [('1!0.1.0', 'pypi'), ('01.0.0', 'npm'), ('1.0', 'npm'), ('latest', 'crate')]:
+            with self.subTest(text=text):
+                self.assertIsNone(sdk_prepare.precedence(text, kind))
+
+    def test_a_registry_prerelease_prepare_cannot_parse_still_counts_as_published(self):
+        # npm accepts any SemVer prerelease label; 0.3.0-canary.1 is above the server's 0.2.0-beta.1.
+        self.add('cli', 'npm', '0.1.38', published={'0.1.38', '0.3.0-canary.1'}, versioning='until-server-passes')
+        self.release_tag('cli', '0.1.38')
+        self.assertEqual(self.selection('v0.2.0-beta.1'), {})
+        # canary sorts above beta of the same core, so 0.3.0-beta.1 has not passed it either.
+        self.assertEqual(self.selection('v0.3.0-beta.1'), {})
+        self.assertEqual(self.selection('v0.3.0'), {'cli': '0.3.0'})
+        self.setUp()
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4', '0.3.0-canary.1'}, versioning='server')
+        with self.assertRaisesRegex(ValueError, r'@temps-sdk/kv 0\.2\.0-beta\.1: 0\.3\.0-canary\.1 is already '
+                                                r'published or tagged, above the server version'):
+            self.prepare('v0.2.0-beta.1')
+
+    def test_a_pypi_development_release_above_the_server_version_fails_closed(self):
+        self.add('py', 'pypi', '0.1.0b1', name='temps-sample', published={'0.1.0b1', '0.2.0.dev1'},
+                 versioning='server')
+        with self.assertRaisesRegex(ValueError, r'temps-sample 0\.1\.0b64: 0\.2\.0\.dev1 is already published'):
+            self.prepare('v0.1.0-beta.64')
+        self.assertEqual(self.version('py'), '0.1.0b1')
+        # A development release below the server version (0.1.0.dev1 precedes 0.1.0b64) is no obstacle.
+        self.registry['temps-sample'] = {'0.1.0b1', '0.1.0.dev1'}
+        self.assertEqual(self.selection('v0.1.0-beta.64'), {'py': '0.1.0b64'})
+
+    def test_a_registry_version_that_cannot_be_ordered_stops_preparation(self):
+        self.add('py', 'pypi', '0.1.0b1', name='temps-sample', published={'0.1.0b1', '1!0.0.1'}, versioning='server')
+        with self.assertRaisesRegex(ValueError, r"temps-sample: cannot order registry version '1!0\.0\.1' "
+                                                r'against 0\.1\.0b64'):
+            self.prepare('v0.1.0-beta.64')
+        self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
+
+    def test_a_package_tag_prepare_cannot_parse_still_keeps_the_own_line(self):
+        # A tag whose upload never happened: 0.3.0-canary.1 is above the server's 0.2.0-beta.1.
+        self.add('cli', 'npm', '0.1.38', published={'0.1.38'}, versioning='until-server-passes')
+        self.release_tag('cli', '0.1.38')
+        self.release_tag('cli', '0.3.0-canary.1')
+        self.assertEqual(self.selection('v0.2.0-beta.1'), {})
+        self.assertEqual(self.selection('v0.3.0'), {'cli': '0.3.0'})
+        self.release_tag('cli', 'next')
+        with self.assertRaisesRegex(ValueError, r"@temps-sdk/cli: cannot order package tag 'next' against 0\.3\.1"):
+            self.prepare('v0.3.1')
+
+    def test_a_registry_version_differing_only_in_build_metadata_is_taken(self):
+        self.add('temps-plugin-protocol', 'crate', '0.1.0-beta.62',
+                 published={'0.1.0-beta.62', '0.1.0-beta.64+build.5'}, versioning='server')
+        with self.assertRaisesRegex(ValueError, r'temps-plugin-protocol 0\.1\.0-beta\.64 is already published'):
+            self.prepare('v0.1.0-beta.64')
+        self.assertEqual(self.selection('v0.1.0-beta.65'), {'temps-plugin-protocol': '0.1.0-beta.65'})
+
+    def test_an_older_tag_is_verified_without_a_later_release_prepare_cannot_parse(self):
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'}, versioning='server')
+        self.prepare_and_tag('v0.1.0-beta.64')
+        self.registry['@temps-sdk/kv'].add('0.1.0-beta.64')
+        self.release_tag('kv', '0.1.0-beta.64')
+        # A later release, from a commit after this tag, published a canary.
+        self.registry['@temps-sdk/kv'].add('0.3.0-canary.1')
+        self.release_tag('kv', '0.3.0-canary.1')
+        self.history.unreachable.add('sdk/kv/v0.3.0-canary.1')
+        self.history.tag('v0.1.0-beta.64')
+        self.assertEqual(self.verify('v0.1.0-beta.64'), ([], ['kv']))
+        # A canary no release tagged is still above the server version and stops the check.
+        self.registry['@temps-sdk/kv'].add('0.2.0-canary.1')
+        with self.assertRaisesRegex(ValueError, r'0\.2\.0-canary\.1 is already published or tagged, above'):
+            self.verify('v0.1.0-beta.64')
+
+    def test_independent_packages_are_not_released_by_the_server_version(self):
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'})
+        self.release_tag('kv', '0.0.4')
+        self.assertEqual(self.selection('v0.1.0-beta.64'), {})
+
+    def test_server_tags_sdks_cannot_follow_are_refused(self):
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'}, versioning='server')
+        with self.assertRaisesRegex(ValueError, r'v9\.0\.0-test: SDKs release at the server version'):
+            self.prepare('v9.0.0-test')
+
+    def test_unknown_versioning_mode_is_rejected(self):
+        self.add('kv', 'npm', '0.0.4', versioning='sometimes')
+        with self.assertRaisesRegex(ValueError, "kv: unknown versioning 'sometimes'; use one of server, independent, "
+                                                'until-server-passes'):
+            release.catalog_packages(self.root)
+
+    def test_server_versioned_selection_is_verified_at_its_tag(self):
+        self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'}, versioning='server')
+        self.add('kv', 'npm', '0.0.4', published={'0.0.4'}, versioning='server')
+        self.prepare_and_tag('v0.1.0-beta.64')
+        self.assertEqual(self.verify('v0.1.0-beta.64'), ([], []))
+        # A re-run after kv was published still verifies against the registry as it was before.
+        self.registry['@temps-sdk/kv'].add('0.1.0-beta.64')
+        self.release_tag('kv', '0.1.0-beta.64')
+        self.history.tag('v0.1.0-beta.64')
+        self.assertEqual(self.verify('v0.1.0-beta.64'), ([], ['kv']))
 
     def test_conventional_commit_levels(self):
         for subject, body, level in [
@@ -1612,7 +1800,7 @@ class SdkReleasePrepWorkflowTests(unittest.TestCase):
         self.assertIn('release/v*', self.workflow)
 
     def test_release_branch_pushes_reject_sdk_commits_missing_from_main(self):
-        prepare = self.workflow.index('name: Prepare SDK versions from Conventional Commits')
+        prepare = self.workflow.index('name: Prepare SDK versions for the server tag')
         step = self.workflow[prepare:self.workflow.index('- name:', prepare + 1)]
         self.assertIn('candidate=(--candidate "refs/remotes/origin/${REF_NAME}")', step)
         self.assertIn('"${candidate[@]}"', step)

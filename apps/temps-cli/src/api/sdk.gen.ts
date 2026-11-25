@@ -10688,12 +10688,17 @@ export const updateEdgeRule = <ThrowOnError extends boolean = false>(options: Op
 /**
  * Get environment variables for a project, optionally filtered by environment
  */
-export const getEnvironmentVariables = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentVariablesData, ThrowOnError>): RequestResult<GetEnvironmentVariablesResponses, GetEnvironmentVariablesErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentVariablesResponses, GetEnvironmentVariablesErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars', ...options });
+export const getEnvironmentVariables = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentVariablesData, ThrowOnError>): RequestResult<GetEnvironmentVariablesResponses, GetEnvironmentVariablesErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentVariablesResponses, GetEnvironmentVariablesErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/env-vars',
+    ...options
+});
 
 /**
  * Create a new environment variable
  */
 export const createEnvironmentVariable = <ThrowOnError extends boolean = false>(options: Options<CreateEnvironmentVariableData, ThrowOnError>): RequestResult<CreateEnvironmentVariableResponses, CreateEnvironmentVariableErrors, ThrowOnError> => (options.client ?? client).post<CreateEnvironmentVariableResponses, CreateEnvironmentVariableErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/env-vars',
     ...options,
     headers: {
@@ -10715,7 +10720,11 @@ export const createEnvironmentVariable = <ThrowOnError extends boolean = false>(
  * endpoint for regular plaintext values (audit-logged). Marked secrets
  * cannot be revealed.
  */
-export const getResolvedEnvironmentVariables = <ThrowOnError extends boolean = false>(options: Options<GetResolvedEnvironmentVariablesData, ThrowOnError>): RequestResult<GetResolvedEnvironmentVariablesResponses, GetResolvedEnvironmentVariablesErrors, ThrowOnError> => (options.client ?? client).get<GetResolvedEnvironmentVariablesResponses, GetResolvedEnvironmentVariablesErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars/resolved', ...options });
+export const getResolvedEnvironmentVariables = <ThrowOnError extends boolean = false>(options: Options<GetResolvedEnvironmentVariablesData, ThrowOnError>): RequestResult<GetResolvedEnvironmentVariablesResponses, GetResolvedEnvironmentVariablesErrors, ThrowOnError> => (options.client ?? client).get<GetResolvedEnvironmentVariablesResponses, GetResolvedEnvironmentVariablesErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/env-vars/resolved',
+    ...options
+});
 
 /**
  * Reveal the plaintext value of a resolved environment variable.
@@ -10732,7 +10741,11 @@ export const getResolvedEnvironmentVariables = <ThrowOnError extends boolean = f
  * Returns 403 for a manual variable marked secret, and 404 when neither a
  * manual var nor an integration produces the key.
  */
-export const getResolvedEnvironmentVariableValue = <ThrowOnError extends boolean = false>(options: Options<GetResolvedEnvironmentVariableValueData, ThrowOnError>): RequestResult<GetResolvedEnvironmentVariableValueResponses, GetResolvedEnvironmentVariableValueErrors, ThrowOnError> => (options.client ?? client).get<GetResolvedEnvironmentVariableValueResponses, GetResolvedEnvironmentVariableValueErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars/resolved/{key}/value', ...options });
+export const getResolvedEnvironmentVariableValue = <ThrowOnError extends boolean = false>(options: Options<GetResolvedEnvironmentVariableValueData, ThrowOnError>): RequestResult<GetResolvedEnvironmentVariableValueResponses, GetResolvedEnvironmentVariableValueErrors, ThrowOnError> => (options.client ?? client).get<GetResolvedEnvironmentVariableValueResponses, GetResolvedEnvironmentVariableValueErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/env-vars/resolved/{key}/value',
+    ...options
+});
 
 export const detectEnvCredential = <ThrowOnError extends boolean = false>(options: Options<DetectEnvCredentialData, ThrowOnError>): RequestResult<DetectEnvCredentialResponses, DetectEnvCredentialErrors, ThrowOnError> => (options.client ?? client).post<DetectEnvCredentialResponses, DetectEnvCredentialErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
@@ -10749,12 +10762,20 @@ export const listVariableHistory = <ThrowOnError extends boolean = false>(option
 /**
  * Get a regular environment variable value by key. Marked secrets return 403.
  */
-export const getEnvironmentVariableValue = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentVariableValueData, ThrowOnError>): RequestResult<GetEnvironmentVariableValueResponses, GetEnvironmentVariableValueErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentVariableValueResponses, GetEnvironmentVariableValueErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars/{key}/value', ...options });
+export const getEnvironmentVariableValue = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentVariableValueData, ThrowOnError>): RequestResult<GetEnvironmentVariableValueResponses, GetEnvironmentVariableValueErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentVariableValueResponses, GetEnvironmentVariableValueErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/env-vars/{key}/value',
+    ...options
+});
 
 /**
  * Delete an environment variable
  */
-export const deleteEnvironmentVariable = <ThrowOnError extends boolean = false>(options: Options<DeleteEnvironmentVariableData, ThrowOnError>): RequestResult<DeleteEnvironmentVariableResponses, DeleteEnvironmentVariableErrors, ThrowOnError> => (options.client ?? client).delete<DeleteEnvironmentVariableResponses, DeleteEnvironmentVariableErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars/{var_id}', ...options });
+export const deleteEnvironmentVariable = <ThrowOnError extends boolean = false>(options: Options<DeleteEnvironmentVariableData, ThrowOnError>): RequestResult<DeleteEnvironmentVariableResponses, DeleteEnvironmentVariableErrors, ThrowOnError> => (options.client ?? client).delete<DeleteEnvironmentVariableResponses, DeleteEnvironmentVariableErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/env-vars/{var_id}',
+    ...options
+});
 
 /**
  * Get one environment variable of a project by its ID
@@ -10774,6 +10795,7 @@ export const getEnvironmentVariable = <ThrowOnError extends boolean = false>(opt
  * Update an environment variable
  */
 export const updateEnvironmentVariable = <ThrowOnError extends boolean = false>(options: Options<UpdateEnvironmentVariableData, ThrowOnError>): RequestResult<UpdateEnvironmentVariableResponses, UpdateEnvironmentVariableErrors, ThrowOnError> => (options.client ?? client).put<UpdateEnvironmentVariableResponses, UpdateEnvironmentVariableErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/env-vars/{var_id}',
     ...options,
     headers: {
@@ -10797,12 +10819,17 @@ export const dismissEnvironmentVariableSecretSuggestion = <ThrowOnError extends 
 /**
  * Get all environments for a project
  */
-export const getEnvironments = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentsData, ThrowOnError>): RequestResult<GetEnvironmentsResponses, GetEnvironmentsErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentsResponses, GetEnvironmentsErrors, ThrowOnError>({ url: '/projects/{project_id}/environments', ...options });
+export const getEnvironments = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentsData, ThrowOnError>): RequestResult<GetEnvironmentsResponses, GetEnvironmentsErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentsResponses, GetEnvironmentsErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/environments',
+    ...options
+});
 
 /**
  * Create a new environment for a project
  */
 export const createEnvironment = <ThrowOnError extends boolean = false>(options: Options<CreateEnvironmentData, ThrowOnError>): RequestResult<CreateEnvironmentResponses, CreateEnvironmentErrors, ThrowOnError> => (options.client ?? client).post<CreateEnvironmentResponses, CreateEnvironmentErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/environments',
     ...options,
     headers: {
@@ -10820,12 +10847,20 @@ export const createEnvironment = <ThrowOnError extends boolean = false>(options:
  * Warning: This action is permanent and cannot be undone.
  * Active deployments are automatically cancelled before deletion.
  */
-export const deleteEnvironment = <ThrowOnError extends boolean = false>(options: Options<DeleteEnvironmentData, ThrowOnError>): RequestResult<DeleteEnvironmentResponses, DeleteEnvironmentErrors, ThrowOnError> => (options.client ?? client).delete<DeleteEnvironmentResponses, DeleteEnvironmentErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}', ...options });
+export const deleteEnvironment = <ThrowOnError extends boolean = false>(options: Options<DeleteEnvironmentData, ThrowOnError>): RequestResult<DeleteEnvironmentResponses, DeleteEnvironmentErrors, ThrowOnError> => (options.client ?? client).delete<DeleteEnvironmentResponses, DeleteEnvironmentErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/environments/{env_id}',
+    ...options
+});
 
 /**
  * Get a specific environment by ID or slug
  */
-export const getEnvironment = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentData, ThrowOnError>): RequestResult<GetEnvironmentResponses, GetEnvironmentErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentResponses, GetEnvironmentErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}', ...options });
+export const getEnvironment = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentData, ThrowOnError>): RequestResult<GetEnvironmentResponses, GetEnvironmentErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentResponses, GetEnvironmentErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/environments/{env_id}',
+    ...options
+});
 
 export const getEnvironmentCrons = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentCronsData, ThrowOnError>): RequestResult<GetEnvironmentCronsResponses, GetEnvironmentCronsErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentCronsResponses, GetEnvironmentCronsErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}/crons', ...options });
 
@@ -10836,12 +10871,17 @@ export const getCronExecutions = <ThrowOnError extends boolean = false>(options:
 /**
  * Get all environment domains for a specific environment
  */
-export const getEnvironmentDomains = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentDomainsData, ThrowOnError>): RequestResult<GetEnvironmentDomainsResponses, GetEnvironmentDomainsErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentDomainsResponses, GetEnvironmentDomainsErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}/domains', ...options });
+export const getEnvironmentDomains = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentDomainsData, ThrowOnError>): RequestResult<GetEnvironmentDomainsResponses, GetEnvironmentDomainsErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentDomainsResponses, GetEnvironmentDomainsErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/environments/{env_id}/domains',
+    ...options
+});
 
 /**
  * Add a new environment domain
  */
 export const addEnvironmentDomain = <ThrowOnError extends boolean = false>(options: Options<AddEnvironmentDomainData, ThrowOnError>): RequestResult<AddEnvironmentDomainResponses, AddEnvironmentDomainErrors, ThrowOnError> => (options.client ?? client).post<AddEnvironmentDomainResponses, AddEnvironmentDomainErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/environments/{env_id}/domains',
     ...options,
     headers: {
@@ -10853,7 +10893,11 @@ export const addEnvironmentDomain = <ThrowOnError extends boolean = false>(optio
 /**
  * Delete an environment domain
  */
-export const deleteEnvironmentDomain = <ThrowOnError extends boolean = false>(options: Options<DeleteEnvironmentDomainData, ThrowOnError>): RequestResult<DeleteEnvironmentDomainResponses, DeleteEnvironmentDomainErrors, ThrowOnError> => (options.client ?? client).delete<DeleteEnvironmentDomainResponses, DeleteEnvironmentDomainErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}/domains/{domain_id}', ...options });
+export const deleteEnvironmentDomain = <ThrowOnError extends boolean = false>(options: Options<DeleteEnvironmentDomainData, ThrowOnError>): RequestResult<DeleteEnvironmentDomainResponses, DeleteEnvironmentDomainErrors, ThrowOnError> => (options.client ?? client).delete<DeleteEnvironmentDomainResponses, DeleteEnvironmentDomainErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/environments/{env_id}/domains/{domain_id}',
+    ...options
+});
 
 export const getIngressSettings = <ThrowOnError extends boolean = false>(options: Options<GetIngressSettingsData, ThrowOnError>): RequestResult<GetIngressSettingsResponses, GetIngressSettingsErrors, ThrowOnError> => (options.client ?? client).get<GetIngressSettingsResponses, GetIngressSettingsErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
@@ -10872,6 +10916,7 @@ export const updateIngressSettings = <ThrowOnError extends boolean = false>(opti
 });
 
 export const updateEnvironmentSettings = <ThrowOnError extends boolean = false>(options: Options<UpdateEnvironmentSettingsData, ThrowOnError>): RequestResult<UpdateEnvironmentSettingsResponses, UpdateEnvironmentSettingsErrors, ThrowOnError> => (options.client ?? client).put<UpdateEnvironmentSettingsResponses, UpdateEnvironmentSettingsErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/environments/{env_id}/settings',
     ...options,
     headers: {
@@ -10886,7 +10931,11 @@ export const updateEnvironmentSettings = <ThrowOnError extends boolean = false>(
  * Manually put an on-demand environment to sleep. Stops containers and sets
  * `sleeping = true`. If no OnDemandWaker is available, falls back to DB flag only.
  */
-export const sleepEnvironment = <ThrowOnError extends boolean = false>(options: Options<SleepEnvironmentData, ThrowOnError>): RequestResult<SleepEnvironmentResponses, SleepEnvironmentErrors, ThrowOnError> => (options.client ?? client).post<SleepEnvironmentResponses, SleepEnvironmentErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}/sleep', ...options });
+export const sleepEnvironment = <ThrowOnError extends boolean = false>(options: Options<SleepEnvironmentData, ThrowOnError>): RequestResult<SleepEnvironmentResponses, SleepEnvironmentErrors, ThrowOnError> => (options.client ?? client).post<SleepEnvironmentResponses, SleepEnvironmentErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/environments/{env_id}/sleep',
+    ...options
+});
 
 /**
  * Rename the auto-managed subdomain for an environment.
@@ -10896,6 +10945,7 @@ export const sleepEnvironment = <ThrowOnError extends boolean = false>(options: 
  * Custom domains attached to the environment are unaffected.
  */
 export const updateEnvironmentSubdomain = <ThrowOnError extends boolean = false>(options: Options<UpdateEnvironmentSubdomainData, ThrowOnError>): RequestResult<UpdateEnvironmentSubdomainResponses, UpdateEnvironmentSubdomainErrors, ThrowOnError> => (options.client ?? client).patch<UpdateEnvironmentSubdomainResponses, UpdateEnvironmentSubdomainErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/environments/{env_id}/subdomain',
     ...options,
     headers: {
@@ -10917,7 +10967,11 @@ export const teardownEnvironment = <ThrowOnError extends boolean = false>(option
  * `sleeping = false`. If no OnDemandWaker is available (proxy not running
  * in same process), falls back to setting the DB flag only.
  */
-export const wakeEnvironment = <ThrowOnError extends boolean = false>(options: Options<WakeEnvironmentData, ThrowOnError>): RequestResult<WakeEnvironmentResponses, WakeEnvironmentErrors, ThrowOnError> => (options.client ?? client).post<WakeEnvironmentResponses, WakeEnvironmentErrors, ThrowOnError>({ url: '/projects/{project_id}/environments/{env_id}/wake', ...options });
+export const wakeEnvironment = <ThrowOnError extends boolean = false>(options: Options<WakeEnvironmentData, ThrowOnError>): RequestResult<WakeEnvironmentResponses, WakeEnvironmentErrors, ThrowOnError> => (options.client ?? client).post<WakeEnvironmentResponses, WakeEnvironmentErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/environments/{env_id}/wake',
+    ...options
+});
 
 /**
  * Purge cached static assets for a specific environment.
@@ -13387,7 +13441,11 @@ export const revokeSandboxService = <ThrowOnError extends boolean = false>(optio
 /**
  * List project secrets (metadata only — values never returned).
  */
-export const listProjectSecrets = <ThrowOnError extends boolean = false>(options: Options<ListProjectSecretsData, ThrowOnError>): RequestResult<ListProjectSecretsResponses, ListProjectSecretsErrors, ThrowOnError> => (options.client ?? client).get<ListProjectSecretsResponses, ListProjectSecretsErrors, ThrowOnError>({ url: '/projects/{project_id}/secrets', ...options });
+export const listProjectSecrets = <ThrowOnError extends boolean = false>(options: Options<ListProjectSecretsData, ThrowOnError>): RequestResult<ListProjectSecretsResponses, ListProjectSecretsErrors, ThrowOnError> => (options.client ?? client).get<ListProjectSecretsResponses, ListProjectSecretsErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/secrets',
+    ...options
+});
 
 /**
  * Create a new secret. The value is encrypted before storage and will be
@@ -13395,6 +13453,7 @@ export const listProjectSecrets = <ThrowOnError extends boolean = false>(options
  * The plaintext value is NOT returned — the response carries only metadata.
  */
 export const createProjectSecret = <ThrowOnError extends boolean = false>(options: Options<CreateProjectSecretData, ThrowOnError>): RequestResult<CreateProjectSecretResponses, CreateProjectSecretErrors, ThrowOnError> => (options.client ?? client).post<CreateProjectSecretResponses, CreateProjectSecretErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/secrets',
     ...options,
     headers: {
@@ -13407,7 +13466,11 @@ export const createProjectSecret = <ThrowOnError extends boolean = false>(option
  * Delete a project secret. Running containers keep their mounted secret files
  * until they are redeployed.
  */
-export const deleteProjectSecret = <ThrowOnError extends boolean = false>(options: Options<DeleteProjectSecretData, ThrowOnError>): RequestResult<DeleteProjectSecretResponses, DeleteProjectSecretErrors, ThrowOnError> => (options.client ?? client).delete<DeleteProjectSecretResponses, DeleteProjectSecretErrors, ThrowOnError>({ url: '/projects/{project_id}/secrets/{secret_id}', ...options });
+export const deleteProjectSecret = <ThrowOnError extends boolean = false>(options: Options<DeleteProjectSecretData, ThrowOnError>): RequestResult<DeleteProjectSecretResponses, DeleteProjectSecretErrors, ThrowOnError> => (options.client ?? client).delete<DeleteProjectSecretResponses, DeleteProjectSecretErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/secrets/{secret_id}',
+    ...options
+});
 
 /**
  * Update a project secret. Value rotation requires a redeploy to take effect —
@@ -13415,6 +13478,7 @@ export const deleteProjectSecret = <ThrowOnError extends boolean = false>(option
  * deployment.
  */
 export const updateProjectSecret = <ThrowOnError extends boolean = false>(options: Options<UpdateProjectSecretData, ThrowOnError>): RequestResult<UpdateProjectSecretResponses, UpdateProjectSecretErrors, ThrowOnError> => (options.client ?? client).put<UpdateProjectSecretResponses, UpdateProjectSecretErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
     url: '/projects/{project_id}/secrets/{secret_id}',
     ...options,
     headers: {

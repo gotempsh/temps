@@ -170,52 +170,16 @@ impl GatewayAiService {
             .ok()
             .flatten();
         if let Some(key) = key {
-            if let Some(m) = key
-                .default_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                let catalog_is_empty = temps_entities::ai_provider_models::Entity::find()
-                    .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-                    .one(self.db.as_ref())
-                    .await
-                    .ok()?
-                    .is_none();
-                if catalog_is_empty {
-                    return Some(m.to_string());
-                }
-                let pinned_is_enabled = temps_entities::ai_provider_models::Entity::find()
-                    .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-                    .filter(temps_entities::ai_provider_models::Column::ModelId.eq(m))
-                    .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
-                    .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
-                    .one(self.db.as_ref())
-                    .await
-                    .ok()?
-                    .is_some();
-                if pinned_is_enabled {
-                    return Some(m.to_string());
-                }
-            }
-            let catalog_models = temps_entities::ai_provider_models::Entity::find()
-                .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-                .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
-                .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
-                .filter(
-                    temps_entities::ai_provider_models::Column::ModelId
-                        .not_like("text-embedding-%"),
-                )
-                .order_by_asc(temps_entities::ai_provider_models::Column::ModelId)
-                .all(self.db.as_ref())
-                .await
-                .ok()?;
-            let catalog_ids: Vec<String> = catalog_models
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect();
-            if let Some(model) = catalog_default_model(&key.provider, &catalog_ids) {
-                return Some(model);
+            let routed = key_routed_model(
+                self.db.as_ref(),
+                key.id,
+                &key.provider,
+                key.default_model.as_deref(),
+            )
+            .await
+            .ok()?;
+            if routed.is_some() {
+                return routed;
             }
         }
         self.gateway
@@ -317,6 +281,55 @@ fn completion_error(purpose: &str, model: &str, error: AiGatewayError) -> AiErro
 /// administrator picked from the server's own listing.
 fn default_model_for_provider(provider: &str) -> Option<String> {
     crate::providers::low_cost_default_model(provider).map(str::to_string)
+}
+
+/// The model internal calls go to through provider key `key_id` when it is
+/// the key routing picks and `pin` is its default model: the pin, when the
+/// key's catalog is empty (never refreshed) or has the pin enabled and
+/// available; otherwise the catalog's default ([`catalog_default_model`]).
+/// `None` when nothing names a model (a self-hosted key with no pin and an
+/// empty catalog). Key rotation verifies a replacement on this same model.
+pub(crate) async fn key_routed_model(
+    db: &DatabaseConnection,
+    key_id: i32,
+    provider: &str,
+    pin: Option<&str>,
+) -> Result<Option<String>, sea_orm::DbErr> {
+    use temps_entities::ai_provider_models::{Column, Entity};
+
+    if let Some(pin) = pin.map(str::trim).filter(|pin| !pin.is_empty()) {
+        let catalog_is_empty = Entity::find()
+            .filter(Column::ProviderKeyId.eq(key_id))
+            .one(db)
+            .await?
+            .is_none();
+        if catalog_is_empty {
+            return Ok(Some(pin.to_string()));
+        }
+        let pin_is_enabled = Entity::find()
+            .filter(Column::ProviderKeyId.eq(key_id))
+            .filter(Column::ModelId.eq(pin))
+            .filter(Column::IsEnabled.eq(true))
+            .filter(Column::IsAvailable.eq(true))
+            .one(db)
+            .await?
+            .is_some();
+        if pin_is_enabled {
+            return Ok(Some(pin.to_string()));
+        }
+    }
+    let catalog_ids: Vec<String> = Entity::find()
+        .filter(Column::ProviderKeyId.eq(key_id))
+        .filter(Column::IsEnabled.eq(true))
+        .filter(Column::IsAvailable.eq(true))
+        .filter(Column::ModelId.not_like("text-embedding-%"))
+        .order_by_asc(Column::ModelId)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|model| model.model_id)
+        .collect();
+    Ok(catalog_default_model(provider, &catalog_ids))
 }
 
 /// The internal-call model for a key with no pin, given its enabled and

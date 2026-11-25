@@ -12,9 +12,10 @@ import {
   deleteIpAccessControl,
   checkIpBlocked,
 } from '../../api/sdk.gen.js'
-import type { IpAccessControlResponse } from '../../api/types.gen.js'
+import type { IpAccessControlResponse, UpdateIpAccessControlRequest } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { registerProjectIpAccessCommands } from './project.js'
+import { saveWithConfirmations } from './confirmations.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue, formatRelativeTime } from '../../ui/output.js'
@@ -28,6 +29,8 @@ interface CreateOptions {
   action?: string
   description?: string
   yes?: boolean
+  confirmBroadRange?: boolean
+  acknowledgeLockout?: boolean
 }
 
 interface ShowOptions {
@@ -40,7 +43,12 @@ interface UpdateOptions {
   ip?: string
   action?: string
   description?: string
+  confirmBroadRange?: boolean
+  acknowledgeLockout?: boolean
 }
+
+const CONFIRM_BROAD_RANGE_HELP = 'Save a block range wider than /8 (IPv4) or /16 (IPv6)'
+const ACKNOWLEDGE_LOCKOUT_HELP = 'Save a block rule even if it matches the address you are calling from'
 
 interface RemoveOptions {
   id: string
@@ -87,7 +95,9 @@ export function registerIpAccessCommands(program: Command): void {
     .option('--ip <ip_or_cidr>', 'IPv4 or IPv6 address or CIDR range (e.g., "192.168.1.1", "10.0.0.0/24", or "2001:db8::/32")')
     .option('--action <action>', 'Action to take: "allow" or "deny"')
     .option('--description <desc>', 'Optional description/reason for the rule')
-    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
+    .option('--confirm-broad-range', CONFIRM_BROAD_RANGE_HELP)
+    .option('--acknowledge-lockout', ACKNOWLEDGE_LOCKOUT_HELP)
+    .option('-y, --yes', 'Skip prompts (for automation); does not confirm a broad range or a lockout')
     .action(createIpAccessAction)
 
   ipAccess
@@ -104,6 +114,8 @@ export function registerIpAccessCommands(program: Command): void {
     .option('--ip <ip>', 'New IP address or CIDR range')
     .option('--action <action>', 'New action: "allow" or "deny"')
     .option('--description <desc>', 'New description/reason')
+    .option('--confirm-broad-range', CONFIRM_BROAD_RANGE_HELP)
+    .option('--acknowledge-lockout', ACKNOWLEDGE_LOCKOUT_HELP)
     .action(updateIpAccessAction)
 
   ipAccess
@@ -210,20 +222,29 @@ async function createIpAccessAction(options: CreateOptions): Promise<void> {
     }) || null
   }
 
-  const rule = await withSpinner('Creating IP access control rule...', async () => {
-    const { data, error } = await createIpAccessControl({
-      client,
-      body: {
-        ip_address: ipAddress,
-        action,
-        reason,
-      },
-    })
-    if (error) {
-      throw new Error(getErrorMessage(error))
+  const result = await saveWithConfirmations(
+    'Creating IP access control rule...',
+    (confirmations) =>
+      createIpAccessControl({
+        client,
+        body: {
+          ip_address: ipAddress,
+          action,
+          reason,
+          ...confirmations,
+        },
+      }),
+    {
+      confirmBroadRange: options.confirmBroadRange,
+      acknowledgeLockout: options.acknowledgeLockout,
+      interactive: !options.yes,
     }
-    return data
-  })
+  )
+  if (result === undefined) {
+    info('Cancelled')
+    return
+  }
+  const rule = result.saved
 
   success(`IP access control rule created (ID: ${rule?.id})`)
   info(`${ipAddress} -> ${action}`)
@@ -276,7 +297,7 @@ async function updateIpAccessAction(options: UpdateOptions): Promise<void> {
     return
   }
 
-  const body: Record<string, unknown> = {}
+  const body: UpdateIpAccessControlRequest = {}
 
   if (options.ip) {
     body.ip_address = options.ip
@@ -300,17 +321,24 @@ async function updateIpAccessAction(options: UpdateOptions): Promise<void> {
     return
   }
 
-  await withSpinner('Updating rule...', async () => {
-    const { data, error } = await updateIpAccessControl({
-      client,
-      path: { id },
-      body,
-    })
-    if (error) {
-      throw new Error(getErrorMessage(error))
+  const result = await saveWithConfirmations(
+    'Updating rule...',
+    (confirmations) =>
+      updateIpAccessControl({
+        client,
+        path: { id },
+        body: { ...body, ...confirmations },
+      }),
+    {
+      confirmBroadRange: options.confirmBroadRange,
+      acknowledgeLockout: options.acknowledgeLockout,
+      interactive: true,
     }
-    return data
-  })
+  )
+  if (result === undefined) {
+    info('Cancelled')
+    return
+  }
 
   success(`Rule #${id} updated`)
 

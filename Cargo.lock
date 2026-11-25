@@ -12293,6 +12293,7 @@ dependencies = [
  "temps-workload",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "utoipa",
  "yaml_serde",
