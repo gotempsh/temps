@@ -14210,6 +14210,51 @@ export type EffectivePolicyResponse = {
 export type EgressMode = 'internet' | 'restricted';
 
 /**
+ * Whether a sandbox records its outbound connections, and whether it can.
+ */
+export type EgressRecordingStatus = {
+    /**
+     * Recording can work for this sandbox now: it has a project, OTel
+     * storage is enabled and its node reports that it can record. When
+     * `enabled` is true and this is false, nothing is being recorded.
+     */
+    configured: boolean;
+    /**
+     * The owner turned recording on.
+     */
+    enabled: boolean;
+    /**
+     * Console path of the project's logs, filtered to this sandbox's
+     * records. `None` without a project.
+     */
+    logs_path?: string | null;
+    /**
+     * The sandbox's node; `None` is the control plane.
+     */
+    node_id?: number | null;
+    node_name: string;
+    project_id?: number | null;
+    /**
+     * The same, in a sentence that names what is missing.
+     */
+    reason?: string | null;
+    /**
+     * Why recording cannot work, when `configured` is false: one of
+     * `no_project`, `otel_unavailable`, `unsupported_platform`,
+     * `proxy_not_serving`, `node_not_reporting`, `agent_predates_recording`.
+     */
+    reason_code?: string | null;
+    /**
+     * The sandbox's public id.
+     */
+    sandbox_id: string;
+    /**
+     * Console path that fixes it, when one does.
+     */
+    setup_path?: string | null;
+};
+
+/**
  * One allowed destination. Exactly one of `host` or `cidr` is set.
  */
 export type EgressRule = {
@@ -33330,6 +33375,12 @@ export type SandboxInner = {
      * Which outside destinations the sandbox may reach (temps-native).
      */
     egress_policy: SandboxEgressPolicy;
+    /**
+     * Whether every outbound connection is recorded as an OpenTelemetry
+     * log record of the sandbox's project. See
+     * `GET /v1/sandboxes/{id}/egress-recording` for whether it can be.
+     */
+    egress_recording: boolean;
     id: string;
     image?: string | null;
     /**
@@ -35740,6 +35791,13 @@ export type SetChatWorkspaceRequest = {
 
 export type SetConnectorNodesRequest = {
     node_ids: Array<number>;
+};
+
+/**
+ * Turn recording of the sandbox's outbound connections on or off.
+ */
+export type SetEgressRecordingBody = {
+    enabled: boolean;
 };
 
 /**
@@ -107917,6 +107975,102 @@ export type SetEgressPolicyResponses = {
 };
 
 export type SetEgressPolicyResponse = SetEgressPolicyResponses[keyof SetEgressPolicyResponses];
+
+export type GetEgressRecordingData = {
+    body?: never;
+    path: {
+        /**
+         * Sandbox id (`sbx_...`)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/egress-recording';
+};
+
+export type GetEgressRecordingErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetEgressRecordingError = GetEgressRecordingErrors[keyof GetEgressRecordingErrors];
+
+export type GetEgressRecordingResponses = {
+    /**
+     * Recording status
+     */
+    200: EgressRecordingStatus;
+};
+
+export type GetEgressRecordingResponse = GetEgressRecordingResponses[keyof GetEgressRecordingResponses];
+
+export type SetEgressRecordingData = {
+    body: SetEgressRecordingBody;
+    path: {
+        /**
+         * Sandbox id (`sbx_...`)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/egress-recording';
+};
+
+export type SetEgressRecordingErrors = {
+    /**
+     * Invalid body
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Recording cannot work for this sandbox: no project, or its node cannot record
+     */
+    422: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * OpenTelemetry storage is not enabled
+     */
+    503: ProblemDetails;
+};
+
+export type SetEgressRecordingError = SetEgressRecordingErrors[keyof SetEgressRecordingErrors];
+
+export type SetEgressRecordingResponses = {
+    /**
+     * Recording updated
+     */
+    200: EgressRecordingStatus;
+};
+
+export type SetEgressRecordingResponse = SetEgressRecordingResponses[keyof SetEgressRecordingResponses];
 
 export type ListEventsData = {
     body?: never;

@@ -30005,6 +30005,76 @@
         ],
         "type": "string"
       },
+      "EgressRecordingStatus": {
+        "description": "Whether a sandbox records its outbound connections, and whether it can.",
+        "properties": {
+          "configured": {
+            "description": "Recording can work for this sandbox now: it has a project, OTel\nstorage is enabled and its node reports that it can record. When\n`enabled` is true and this is false, nothing is being recorded.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "The owner turned recording on.",
+            "type": "boolean"
+          },
+          "logs_path": {
+            "description": "Console path of the project's logs, filtered to this sandbox's\nrecords. `None` without a project.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "description": "The sandbox's node; `None` is the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "The same, in a sentence that names what is missing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason_code": {
+            "description": "Why recording cannot work, when `configured` is false: one of\n`no_project`, `otel_unavailable`, `unsupported_platform`,\n`proxy_not_serving`, `node_not_reporting`, `agent_predates_recording`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sandbox_id": {
+            "description": "The sandbox's public id.",
+            "type": "string"
+          },
+          "setup_path": {
+            "description": "Console path that fixes it, when one does.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "enabled",
+          "configured",
+          "node_name"
+        ],
+        "type": "object"
+      },
       "EgressRule": {
         "additionalProperties": false,
         "description": "One allowed destination. Exactly one of `host` or `cidr` is set.",
@@ -70982,6 +71052,10 @@
             "$ref": "#/components/schemas/SandboxEgressPolicy",
             "description": "Which outside destinations the sandbox may reach (temps-native)."
           },
+          "egress_recording": {
+            "description": "Whether every outbound connection is recorded as an OpenTelemetry\nlog record of the sandbox's project. See\n`GET /v1/sandboxes/{id}/egress-recording` for whether it can be.",
+            "type": "boolean"
+          },
           "id": {
             "type": "string"
           },
@@ -71098,7 +71172,8 @@
           "preview_allowed_cidrs",
           "lifecycle",
           "node_name",
-          "egress_policy"
+          "egress_policy",
+          "egress_recording"
         ],
         "type": "object"
       },
@@ -76417,6 +76492,19 @@
         },
         "required": [
           "node_ids"
+        ],
+        "type": "object"
+      },
+      "SetEgressRecordingBody": {
+        "additionalProperties": false,
+        "description": "Turn recording of the sandbox's outbound connections on or off.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
         ],
         "type": "object"
       },
@@ -199196,6 +199284,202 @@
           }
         ],
         "summary": "Replace which outside destinations the sandbox may reach.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/{id}/egress-recording": {
+      "get": {
+        "description": "`configured: false` says recording cannot work for this sandbox now, with\n`reason_code`, `reason` and, when the console can fix it, `setup_path`.\nRecords are OpenTelemetry log records of the sandbox's project\n(`logs_path` opens them, filtered to this sandbox).",
+        "operationId": "get_egress_recording",
+        "parameters": [
+          {
+            "description": "Sandbox id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressRecordingStatus"
+                }
+              }
+            },
+            "description": "Recording status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the sandbox records its outbound connections, and whether it can.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "description": "With recording on, every outbound connection the sandbox makes through\nthe per-node egress proxy produces one OpenTelemetry log record of the\nsandbox's project when it ends, allowed or refused: destination\n(`server.address`, `server.port`; method and path without the query for\nplain HTTP), outcome and refusal reason, bytes each way and duration.\nNever headers, bodies or query strings. Off by default. Turning it on\nfails with 422 when the sandbox has no project or its node cannot\nrecord, naming the sandbox, the node and what is missing.",
+        "operationId": "set_egress_recording",
+        "parameters": [
+          {
+            "description": "Sandbox id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEgressRecordingBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressRecordingStatus"
+                }
+              }
+            },
+            "description": "Recording updated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recording cannot work for this sandbox: no project, or its node cannot record"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "OpenTelemetry storage is not enabled"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn recording of the sandbox's outbound connections on or off.",
         "tags": [
           "Sandboxes"
         ],
