@@ -268,6 +268,7 @@ export function parsePageSize(value: string | null | undefined): number {
 function answers(resolver: DnsResolverEntry): boolean {
   return (
     resolver.health !== 'no_local_resolver' &&
+    resolver.health !== 'unsupported' &&
     resolver.health !== 'off' &&
     resolver.health !== 'node_unavailable'
   )
@@ -431,6 +432,13 @@ function lookupsFacet(resolver: DnsResolverEntry): DnsFacet {
       return { tone: 'idle', label: 'Node unavailable', reason, why: null }
     case 'no_local_resolver':
       return { tone: 'idle', label: 'Not needed', reason: null, why: reason }
+    case 'unsupported':
+      return {
+        tone: 'warn',
+        label: 'Not available here',
+        reason,
+        why: `Apps on ${node} use Docker's own DNS, so they cannot reach other services by *.temps.local name.`,
+      }
   }
 }
 
@@ -565,6 +573,15 @@ export function nodeDnsHealth(
       noteWhy: lookups.why,
       routing: null,
     }
+  if (resolver.health === 'unsupported')
+    return {
+      ...base,
+      tone: 'warn',
+      label: 'Not available here',
+      note: 'Cluster DNS cannot run where Docker runs on this node',
+      noteWhy: lookups.reason,
+      routing: null,
+    }
   if (resolver.health === 'node_unavailable')
     return {
       ...base,
@@ -652,6 +669,18 @@ export function dnsSummary(
   const directOnly = attention.every(
     (n) => n.lookups.tone !== 'warn' && n.routing?.label === 'Direct on port 80'
   )
+  // Docker in a VM or on another host: expected there, not a fault.
+  const unsupportedOnly = attention.every(
+    (n) => n.label === 'Not available here'
+  )
+  if (attention.length > 0 && unsupportedOnly)
+    return {
+      tone: 'warn',
+      label: `Not available on ${nodes(attention.length)}`,
+      detail: `Docker runs where Temps cannot answer DNS on ${names(attention)}, so apps there cannot reach other services by *.temps.local name.`,
+      affected: attention,
+      nodes: all,
+    }
   if (attention.length > 0 && directOnly)
     return {
       tone: 'warn',

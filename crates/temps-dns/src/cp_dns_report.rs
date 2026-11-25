@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use crate::cp_resolver::ControlPlaneResolver;
 use crate::services::observability::{
-    DnsObservabilityService, ReportOutcome, CONTROL_PLANE_NODE_ID,
+    DnsObservabilityService, ReportOutcome, ReportState, CONTROL_PLANE_NODE_ID,
 };
 
 /// How often node 0 reports. The console pulls workers on the monitoring
@@ -43,6 +43,27 @@ pub fn control_plane_report(
     };
     // The ring is small; ingest skips what it already stored.
     DnsReport::assemble(observer.snapshot(None, None), BUILD_VERSION, state)
+}
+
+/// What node 0 stores: its resolver's report, or, when it cannot run one
+/// where it runs (`unsupported` says why), that instead of an outage.
+pub fn control_plane_outcome(
+    observer: &DnsObserver,
+    resolver: Option<&ControlPlaneResolver>,
+    bootstrap_error: Option<&str>,
+    unsupported: Option<&str>,
+) -> ReportOutcome {
+    match unsupported {
+        Some(reason) => ReportOutcome::Failed {
+            state: ReportState::Unsupported,
+            reason: reason.to_string(),
+        },
+        None => ReportOutcome::Report(Box::new(control_plane_report(
+            observer,
+            resolver,
+            bootstrap_error,
+        ))),
+    }
 }
 
 /// Reports node 0 at most once per [`CP_REPORT_INTERVAL`].
@@ -72,11 +93,13 @@ impl ControlPlaneDnsReporter {
     ///
     /// `internal_proxy` is how the control plane serves `*.temps.local` HTTP
     /// calls to its own containers (ADR-104 D4), in the heartbeat document's
-    /// shape; `None` while it does not run the proxy.
+    /// shape; `None` while it does not run the proxy. `unsupported` is set
+    /// when no resolver can run on this host, and says why.
     pub async fn maybe_report(
         &mut self,
         resolver: Option<&ControlPlaneResolver>,
         bootstrap_error: Option<&str>,
+        unsupported: Option<&str>,
         internal_proxy: Option<serde_json::Value>,
     ) {
         if self
@@ -86,14 +109,10 @@ impl ControlPlaneDnsReporter {
             return;
         }
         self.last = Some(Instant::now());
-        let report = control_plane_report(&self.observer, resolver, bootstrap_error);
+        let outcome = control_plane_outcome(&self.observer, resolver, bootstrap_error, unsupported);
         match self
             .service
-            .ingest(
-                CONTROL_PLANE_NODE_ID,
-                ReportOutcome::Report(Box::new(report)),
-                chrono::Utc::now(),
-            )
+            .ingest(CONTROL_PLANE_NODE_ID, outcome, chrono::Utc::now())
             .await
         {
             Ok(summary) => debug!(
@@ -141,5 +160,28 @@ mod tests {
         let off = control_plane_report(&observer, None, None);
         assert!(!off.resolver.running);
         assert_eq!(off.resolver.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_cannot_run_a_resolver_reports_unsupported_not_down() {
+        let observer = DnsObserver::spawn();
+        let why = "172.20.0.1 is not an address of this machine";
+        match control_plane_outcome(&observer, None, Some("bind failed"), Some(why)) {
+            ReportOutcome::Failed { state, reason } => {
+                assert_eq!(state, ReportState::Unsupported);
+                assert_eq!(reason, why);
+            }
+            ReportOutcome::Report(_) => panic!("expected an unsupported outcome"),
+        }
+        match control_plane_outcome(&observer, None, Some("bind failed"), None) {
+            ReportOutcome::Report(report) => {
+                assert_eq!(report.resolver.last_error.as_deref(), Some("bind failed"));
+            }
+            ReportOutcome::Failed { .. } => panic!("a failure on a capable host is a report"),
+        }
+        assert_eq!(
+            ReportState::parse("unsupported"),
+            Some(ReportState::Unsupported)
+        );
     }
 }

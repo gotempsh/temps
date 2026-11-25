@@ -32010,7 +32010,7 @@ export type ResolverCoverageHost = {
 /**
  * What a resolver looks like right now.
  */
-export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting' | 'no_local_resolver';
+export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting' | 'no_local_resolver' | 'unsupported';
 
 /**
  * Quick count of resources involved in the migration

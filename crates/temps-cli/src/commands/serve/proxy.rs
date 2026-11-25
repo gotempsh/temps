@@ -62,6 +62,14 @@ fn cluster_dns_wanted(read: Option<bool>, previous: bool) -> bool {
     read.unwrap_or(previous)
 }
 
+/// Whether node 0 may report now. While enabled, not before the first
+/// attempt to start the resolver: until then nothing is known, and a report
+/// would say "not running" (an outage) on every start, even on a host that
+/// cannot run one.
+fn cluster_dns_reportable(enabled: bool, attempted: bool) -> bool {
+    !enabled || attempted
+}
+
 /// What the control plane needs to serve `*.temps.local` HTTP calls to its
 /// own containers next to its resolver (ADR-104): the route table it serves
 /// from and where the routes snapshot is kept. `None` in a standalone
@@ -150,6 +158,11 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             ))
         };
         let mut last_error: Option<String> = None;
+        // Why no resolver can run on this host at all (Docker in a VM, or on
+        // another host), reported instead of an outage.
+        let mut unsupported: Option<String> = None;
+        // Whether the resolver was tried since cluster DNS was last enabled.
+        let mut attempted = false;
         loop {
             let read = match config_service.get_settings().await {
                 Ok(settings) => Some(settings.cluster_dns.enabled),
@@ -173,13 +186,22 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             }
             if !enabled {
                 last_error = None;
+                unsupported = None;
+                attempted = false;
             }
-            let routing_report = routing
-                .as_ref()
-                .and_then(|_| super::internal_routing::ControlPlaneRouting::report());
-            reporter
-                .maybe_report(active.as_ref(), last_error.as_deref(), routing_report)
-                .await;
+            if cluster_dns_reportable(enabled, attempted) {
+                let routing_report = routing
+                    .as_ref()
+                    .and_then(|_| super::internal_routing::ControlPlaneRouting::report());
+                reporter
+                    .maybe_report(
+                        active.as_ref(),
+                        last_error.as_deref(),
+                        unsupported.as_deref(),
+                        routing_report,
+                    )
+                    .await;
+            }
             if !enabled {
                 if let Err(error) = publish_dns_gateway(&overlay_dns_slot, None) {
                     warn!(error = %error, "Could not clear the cluster DNS slot");
@@ -212,8 +234,37 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             .await
             .unwrap_or(Err(ProxyDnsBootstrapError::NetworkTimeout));
 
-            let served = gateway.as_ref().ok().copied();
+            let now_unsupported = gateway
+                .as_ref()
+                .ok()
+                .and_then(|gateway| temps_dns::control_plane_resolver_unsupported(*gateway));
+            if now_unsupported != unsupported {
+                match &now_unsupported {
+                    Some(reason) => warn!(
+                        reason = %reason,
+                        "Cluster DNS cannot run on this control plane; containers here keep Docker's embedded DNS"
+                    ),
+                    None if unsupported.is_some() => info!(
+                        "The app network's gateway is now an address of this machine; starting the control-plane resolver"
+                    ),
+                    None => {}
+                }
+                unsupported = now_unsupported;
+            }
+            let served = gateway
+                .as_ref()
+                .ok()
+                .copied()
+                .filter(|_| unsupported.is_none());
             let attempt = match gateway {
+                // Not an outage: it fails the same way on every attempt, so
+                // nothing is started and nothing is retried as a failure.
+                Ok(_) if unsupported.is_some() => {
+                    if let Some(resolver) = active.take() {
+                        resolver.shutdown().await;
+                    }
+                    publish_dns_gateway(&overlay_dns_slot, None)
+                }
                 Ok(gateway) => {
                     let healthy = if active.as_ref().is_some_and(|resolver| resolver.gateway() == gateway) {
                         temps_dns::probe_control_plane_resolver(std::net::SocketAddr::new(gateway, 53)).await
@@ -245,6 +296,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                 Err(error) => Err(error),
             };
             last_error = attempt.as_ref().err().map(ToString::to_string);
+            attempted = true;
             let now_served = attempt.as_ref().ok().and(served);
             // The proxy follows the resolver: same gateway, and only while it
             // answers there and no worker has a bridge, which is when the
@@ -727,6 +779,15 @@ mod tests {
         // A failed read keeps whatever the previous pass acted on.
         assert!(cluster_dns_wanted(None, true));
         assert!(!cluster_dns_wanted(None, false));
+    }
+
+    #[test]
+    fn an_enabled_resolver_is_not_reported_down_before_it_was_tried() {
+        // Enabled, not tried yet: nothing is known, so nothing is reported.
+        assert!(!cluster_dns_reportable(true, false));
+        assert!(cluster_dns_reportable(true, true));
+        // Off is known without trying.
+        assert!(cluster_dns_reportable(false, false));
     }
 
     #[test]

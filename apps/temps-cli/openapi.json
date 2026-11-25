@@ -67795,7 +67795,8 @@
           "node_unavailable",
           "agent_too_old",
           "not_reporting",
-          "no_local_resolver"
+          "no_local_resolver",
+          "unsupported"
         ],
         "type": "string"
       },

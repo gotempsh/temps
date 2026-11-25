@@ -97,6 +97,13 @@ const hostedControlPlane = resolver({
     'The control plane runs no resolver of its own: no containers run on it, so none was started.',
 })
 
+/** A control plane whose Docker runs in a VM: no resolver can run there. */
+const macControlPlane = resolver({
+  health: 'unsupported',
+  health_reason:
+    "Docker runs in a Linux VM on this Mac, so the app network's gateway 172.20.0.1 is not an address of this machine and the control plane cannot answer DNS there.",
+})
+
 describe('nodeDnsHealth', () => {
   test('working lookups and down routing make one "Not working" health', () => {
     const health = nodeDnsHealth(master, true)
@@ -120,6 +127,17 @@ describe('nodeDnsHealth', () => {
     expect(health.note).toBe('This control plane runs no apps')
     expect(health.noteWhy).toContain('no containers run on it')
     expect(health.problem).toBeNull()
+  })
+
+  test('a control plane whose Docker runs in a VM says why, without an outage', () => {
+    const health = nodeDnsHealth(macControlPlane, true)
+    expect(health.tone).toBe('warn')
+    expect(health.label).toBe('Not available here')
+    expect(health.note).toBe(
+      'Cluster DNS cannot run where Docker runs on this node'
+    )
+    expect(health.noteWhy).toContain('not an address of this machine')
+    expect(health.routing).toBeNull()
   })
 
   test('lookups down outrank routing down, and lead', () => {
@@ -336,6 +354,23 @@ describe('dnsSummary', () => {
       label: 'Cluster DNS is off',
       affected: [],
     })
+  })
+
+  test('a control plane that cannot run a resolver is named, not reported down', () => {
+    const worker = resolver({
+      node_id: 2,
+      node_name: 'worker-1',
+      is_control_plane: false,
+      listen_address: '10.205.0.1:53',
+      internal_proxy: { listening: true, address: '10.205.0.1:80' },
+    })
+    const summary = dnsSummary([macControlPlane, worker], true)
+    expect(summary.tone).toBe('warn')
+    expect(summary.label).toBe('Not available on 1 node')
+    expect(summary.detail).toContain('control-plane')
+    expect(summary.affected.map((n) => n.nodeId)).toEqual([0])
+    // Nothing to test resolution against there: default to the worker.
+    expect(defaultResolverNode([macControlPlane, worker])).toBe(2)
   })
 
   test('routing down on master: the badge names it and points at the row', () => {

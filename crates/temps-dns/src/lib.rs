@@ -53,7 +53,7 @@ pub mod services;
 // Re-export main types
 pub use cp_dns_report::{control_plane_report, ControlPlaneDnsReporter, CP_REPORT_INTERVAL};
 pub use cp_resolver::{
-    probe_control_plane_resolver, start_control_plane_resolver,
+    control_plane_resolver_unsupported, probe_control_plane_resolver, start_control_plane_resolver,
     start_control_plane_resolver_with_config, ControlPlaneResolver, OverlayDnsSlot,
 };
 pub use errors::DnsError;
