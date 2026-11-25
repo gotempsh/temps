@@ -234,7 +234,6 @@ describe('the prompt', () => {
   test('connects through the browser approval, never with a key', () => {
     const text = prompt(HANDOFF_SUBJECT_EXAMPLES.trace[0])
 
-    expect(text).toContain('   bunx skills add gotempsh/temps --skill temps')
     expect(text).toContain(
       `   bunx @temps-sdk/cli@${CLI} --target-context temps-example-com whoami --json`
     )
@@ -246,6 +245,21 @@ describe('the prompt', () => {
     )
     expect(text).toContain('Never ask me for a password or a key.')
     expect(text).not.toMatch(/--api-key|tk_[A-Za-z0-9]/)
+  })
+
+  test('offers the skill as optional, after the steps that are not', () => {
+    const lines = prompt(HANDOFF_SUBJECT_EXAMPLES.trace[0]).split('\n')
+    const install = lines.indexOf(
+      '   bunx skills add gotempsh/temps --skill temps'
+    )
+    expect(lines[install - 1]).toBe(
+      '   Optional: the Temps skill has the command reference. The commands below work without it.'
+    )
+    // Reading must not wait on it: it comes after the sign-in, in step 1.
+    expect(install).toBeGreaterThan(
+      lines.findIndex((line) => line.endsWith('--resume'))
+    )
+    expect(install).toBeLessThan(lines.indexOf('2. Read what I am looking at.'))
   })
 
   test('pins every CLI command to the given version and to this instance', () => {
@@ -364,6 +378,8 @@ describe('each subject reads exactly what the page shows', () => {
     expect(commands(HANDOFF_SUBJECT_EXAMPLES.error_group[0])).toEqual([
       `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com errors show --project-id 4 --group-id 128 --json`,
       `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com errors events --project-id 4 --group-id 128 --json`,
+      // Spelled out with every flag it requires, and a slot for the ID.
+      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com errors event --project-id 4 --group-id 128 --event-id <event-id> --json`,
     ])
   })
 
