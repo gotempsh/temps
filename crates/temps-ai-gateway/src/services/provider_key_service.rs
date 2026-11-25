@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -53,10 +53,6 @@ pub struct ProviderKeyUpdate<'a> {
     pub api_key: Option<&'a str>,
     pub base_url: Option<Option<&'a str>>,
     pub default_model: Option<Option<&'a str>>,
-    /// Pin this default only if the key still has none when the update is
-    /// written, so a default saved meanwhile by another request is kept.
-    /// Ignored when `default_model` is given.
-    pub default_model_if_unset: Option<&'a str>,
     pub is_active: Option<bool>,
     pub trust: Option<TrustChange>,
     pub capabilities: Option<SelfHostedCapabilities>,
@@ -423,32 +419,40 @@ impl ProviderKeyService {
             active.capabilities = Set(Some(capabilities.to_stored()));
         }
 
-        let pin = changes
-            .default_model_if_unset
-            .filter(|_| changes.default_model.is_none());
-        let txn = self.db.begin().await?;
-        let mut result = active.update(&txn).await?;
-        if let Some(model) = pin {
-            // Conditional on the row as it is now, not as it was read: a
-            // default another request saved in the meantime wins.
-            let pinned = ai_provider_keys::Entity::update_many()
-                .col_expr(ai_provider_keys::Column::DefaultModel, Expr::value(model))
-                .filter(ai_provider_keys::Column::Id.eq(id))
-                .filter(ai_provider_keys::Column::DefaultModel.is_null())
-                .exec(&txn)
-                .await?;
-            if pinned.rows_affected == 1 {
-                result.default_model = Some(model.to_string());
-            } else {
-                result = ai_provider_keys::Entity::find_by_id(id)
-                    .one(&txn)
-                    .await?
-                    .ok_or(AiGatewayError::ProviderKeyNotFound { key_id: id })?;
-            }
-        }
-        txn.commit().await?;
+        let result = active.update(self.db.as_ref()).await?;
 
         Ok(result)
+    }
+
+    /// A replacement credential must serve the model the key will route to.
+    ///
+    /// `effective_default` is the default the replacement was verified with
+    /// (the requested one, else the key's current one). With none, it was
+    /// verified on the provider's low-cost models, and the key routes to the
+    /// first of them; a credential that answered only on an older one would
+    /// fail every internal request. That is refused, naming the model to set as
+    /// the default, rather than saved or silently pinned: the administrator
+    /// chooses the default (and a silent write would race their own edits).
+    pub fn ensure_replacement_serves_default(
+        key: &ai_provider_keys::Model,
+        effective_default: Option<&str>,
+        verified_model: &str,
+    ) -> Result<(), AiGatewayError> {
+        if effective_default.is_some() {
+            return Ok(());
+        }
+        match crate::providers::low_cost_default_model(&key.provider) {
+            Some(routed) if routed != verified_model => Err(AiGatewayError::Validation {
+                message: format!(
+                    "The replacement API key for provider key {} ('{}') cannot use '{routed}', \
+                     the model this key uses by default; it answered only on '{verified_model}'. \
+                     The current key was kept. Set the default model to '{verified_model}' \
+                     (or another model the new key can use) in the same update.",
+                    key.id, key.display_name
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 
     pub async fn delete(&self, id: i32) -> Result<(), AiGatewayError> {
@@ -475,57 +479,55 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
 
-    /// A fallback pinned by a key rotation is written only if the key still
-    /// has no default, so a default another administrator saved while the
-    /// rotation was verifying is kept.
-    #[tokio::test]
-    async fn a_fallback_pin_never_overwrites_a_default_saved_meanwhile() {
-        use sea_orm::ConnectionTrait;
-        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
-            Ok(db) => db,
-            Err(error)
-                if temps_test_utils::is_container_runtime_unavailable(&format!("{error:#}")) =>
-            {
-                println!(
-                    "Skipping: no container runtime for the PostgreSQL test database: {error:#}"
+    #[test]
+    fn a_replacement_that_serves_only_an_older_model_is_refused_with_the_fix() {
+        let unpinned = sample_key();
+        // Verified on the model the key routes to: accepted.
+        let routed = crate::providers::low_cost_default_model("openai").unwrap();
+        assert!(
+            ProviderKeyService::ensure_replacement_serves_default(&unpinned, None, routed).is_ok()
+        );
+        // Only an older model answered: refused, naming the model to choose.
+        match ProviderKeyService::ensure_replacement_serves_default(&unpinned, None, "gpt-5-nano") {
+            Err(AiGatewayError::Validation { message }) => {
+                assert!(
+                    message.contains("provider key 1 ('OpenAI Production')"),
+                    "{message}"
                 );
-                return;
+                assert!(
+                    message.contains(&format!("cannot use '{routed}'")),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("Set the default model to 'gpt-5-nano'"),
+                    "{message}"
+                );
+                assert!(message.contains("current key was kept"), "{message}");
             }
-            Err(error) => panic!("test database setup failed: {error:#}"),
-        };
-        let db = test_db.connection_arc();
-        db.execute_unprepared(
-            "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active, default_model) VALUES \
-             (921, 'openai', 'Unpinned', 'enc', true, NULL), \
-             (922, 'openai', 'Pinned meanwhile', 'enc', true, 'example-chosen-model')",
-        )
-        .await
-        .unwrap();
-        let service = ProviderKeyService::new(db, test_encryption());
-        let rotate = || ProviderKeyUpdate {
-            api_key: Some("sk-example-replacement"),
-            default_model_if_unset: Some("example-fallback-model"),
-            ..Default::default()
-        };
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
 
-        let pinned = service.update(921, rotate()).await.unwrap();
-        assert_eq!(
-            pinned.default_model.as_deref(),
-            Some("example-fallback-model")
-        );
-        let kept = service.update(922, rotate()).await.unwrap();
-        assert_eq!(kept.default_model.as_deref(), Some("example-chosen-model"));
-        assert_eq!(
-            service
-                .get_by_id(922)
-                .await
-                .unwrap()
-                .default_model
-                .as_deref(),
-            Some("example-chosen-model")
-        );
-        // The credential itself was still replaced.
-        assert_ne!(kept.api_key_encrypted, "enc");
+    #[test]
+    fn a_replacement_verified_on_the_chosen_default_is_accepted() {
+        // The requested or current default is the only model verified, so
+        // whatever answered is the model the key will use.
+        let key = sample_key();
+        assert!(ProviderKeyService::ensure_replacement_serves_default(
+            &key,
+            Some("gpt-5-nano"),
+            "gpt-5-nano"
+        )
+        .is_ok());
+        // A provider with no low-cost default has nothing to compare with.
+        let mut compatible = sample_key();
+        compatible.provider = "openai_compatible".to_string();
+        assert!(ProviderKeyService::ensure_replacement_serves_default(
+            &compatible,
+            None,
+            "local-model"
+        )
+        .is_ok());
     }
 
     /// A failed page must be an error, never an empty page: discovery reads an

@@ -218,6 +218,10 @@ struct HarnessUpdateState {
     status: Option<temps_ai::HarnessUpdateStatus>,
     /// When the check behind `status` started reading the workspace.
     checked_at: Option<Instant>,
+    /// When the cached check was last discarded (an install that did not
+    /// confirm its result): a check that started before then may have read
+    /// the version from before the install and is not published.
+    discarded_at: Option<Instant>,
     updating: bool,
 }
 
@@ -228,7 +232,11 @@ impl HarnessUpdateState {
     /// the version read after an install with the one read before it.
     /// Returns whether `status` was recorded.
     fn publish_check(&mut self, started: Instant, status: temps_ai::HarnessUpdateStatus) -> bool {
-        if self.checked_at.is_some_and(|newer| newer > started) {
+        if self.checked_at.is_some_and(|newer| newer > started)
+            || self
+                .discarded_at
+                .is_some_and(|discarded| discarded > started)
+        {
             return false;
         }
         self.status = Some(status);
@@ -309,6 +317,7 @@ impl Drop for HarnessUpdateGuard {
             if !self.keep_checked_status {
                 state.status = None;
                 state.checked_at = None;
+                state.discarded_at = Some(Instant::now());
             }
         }
     }
@@ -10643,6 +10652,43 @@ mod tests {
     }
 
     #[test]
+    fn a_check_from_before_a_discarded_install_is_not_published() {
+        let status = temps_ai::HarnessUpdateStatus {
+            provider_id: "codex_cli".to_string(),
+            installed_version: Some("1.0.0".to_string()),
+            latest_version: Some("1.1.0".to_string()),
+            update_available: true,
+            updating: false,
+            checked_at: None,
+            detail: None,
+        };
+        let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        states.lock().expect("lock").insert(
+            7,
+            HarnessUpdateState {
+                updating: true,
+                ..Default::default()
+            },
+        );
+        // A refresh reads 1.0.0 and stalls on the registry lookup.
+        let refresh_started = Instant::now();
+        // The install replaced the binary, but its caller went away before
+        // the post-install check: the guard drops without confirming.
+        drop(HarnessUpdateGuard {
+            states: states.clone(),
+            principal_id: 7,
+            keep_checked_status: false,
+        });
+        let mut states = states.lock().expect("lock");
+        let state = states.get_mut(&7).expect("state");
+        assert!(!state.publish_check(refresh_started, status.clone()));
+        assert!(state.status.is_none(), "the pre-install read stays out");
+        // A check that starts after the discard is published.
+        assert!(state.publish_check(Instant::now(), status));
+        assert!(state.status.is_some());
+    }
+
+    #[test]
     fn dropping_the_update_guard_clears_the_flag_and_the_stale_check() {
         let states: HarnessUpdates = Arc::new(std::sync::Mutex::new(HashMap::new()));
         states.lock().expect("lock").insert(
@@ -10658,6 +10704,7 @@ mod tests {
                     detail: None,
                 }),
                 checked_at: Some(Instant::now()),
+                discarded_at: None,
                 updating: true,
             },
         );
@@ -10676,5 +10723,6 @@ mod tests {
             state.status.is_none() && state.checked_at.is_none(),
             "what is installed changed, so the cached check is discarded"
         );
+        assert!(state.discarded_at.is_some(), "and the discard is ordered");
     }
 }

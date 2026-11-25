@@ -28,7 +28,9 @@ use crate::handlers::provider_audit::{
 use crate::handlers::types::AiGatewayAppState;
 use crate::provider_url::KeyTrust;
 use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
-use crate::services::{NewProviderKey, ProviderKeyUpdate, TrustChange, TrustRequest};
+use crate::services::{
+    NewProviderKey, ProviderKeyService, ProviderKeyUpdate, TrustChange, TrustRequest,
+};
 use crate::types::DiscoveredModel;
 
 // ============================================================================
@@ -1007,7 +1009,6 @@ async fn update_provider_key(
 
     // A replacement key is verified like a new one, against the endpoint and
     // model it will be used with, before it overwrites a working key.
-    let mut pin_if_unset: Option<String> = None;
     if let Some(api_key) = request.api_key.as_ref() {
         let (base_url, default_model) = replacement_check_target(&before, &request);
         let check_trust = match request.trust_private_address {
@@ -1034,31 +1035,11 @@ async fn update_provider_key(
                     ),
                 },
             })?;
-        if let Some(fallback) = fallback_to_pin(
-            &before.provider,
-            request.default_model.as_ref(),
+        ProviderKeyService::ensure_replacement_serves_default(
+            &before,
             default_model,
-            verified_model,
-        ) {
-            // Pin only a model the administrator left selectable on this key;
-            // a disabled or unlisted one stays unpinned, as before.
-            match app_state
-                .provider_model_service
-                .ensure_selectable(id, &fallback)
-                .await
-            {
-                Ok(()) => pin_if_unset = Some(fallback),
-                Err(AiGatewayError::Validation { message }) => {
-                    tracing::warn!(
-                        provider_key_id = id,
-                        model = %fallback,
-                        reason = %message,
-                        "replacement key verified only on a model that is not selectable on this key; leaving the default unpinned"
-                    );
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
+            &verified_model,
+        )?;
     }
 
     let key = app_state
@@ -1070,7 +1051,6 @@ async fn update_provider_key(
                 api_key: request.api_key.as_ref().map(SecretString::expose),
                 base_url: request.base_url.as_ref().map(|o| o.as_deref()),
                 default_model: request.default_model.as_ref().map(|o| o.as_deref()),
-                default_model_if_unset: pin_if_unset.as_deref(),
                 is_active: request.is_active,
                 trust,
                 capabilities: request.capabilities,
@@ -1084,10 +1064,7 @@ async fn update_provider_key(
         ("display_name", request.display_name.is_some()),
         ("api_key", request.api_key.is_some()),
         ("base_url", request.base_url.is_some()),
-        (
-            "default_model",
-            request.default_model.is_some() || key.default_model != before.default_model,
-        ),
+        ("default_model", request.default_model.is_some()),
         ("is_active", request.is_active.is_some()),
         (
             "trusted_private_address",
@@ -1390,70 +1367,8 @@ fn default_after_verification(
     })
 }
 
-/// The model to pin as a key's default after its credential is replaced, if
-/// any.
-///
-/// `effective` is the default the replacement was verified with (the
-/// requested one, else the key's current one). When there was none and the
-/// request left `default_model` out, the credential was verified on the
-/// provider's low-cost models; if only an older one answered, it becomes the
-/// default, as for a new key, so internal requests do not go on picking the
-/// model the new credential refused. A request that sets or clears the default
-/// itself is never overridden.
-fn fallback_to_pin(
-    provider: &str,
-    requested: Option<&Option<String>>,
-    effective: Option<&str>,
-    verified: String,
-) -> Option<String> {
-    if requested.is_some() || effective.is_some() {
-        return None;
-    }
-    default_after_verification(provider, None, verified)
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_replacement_verified_on_a_fallback_model_pins_it() {
-        // Unpinned key; the new credential refused gpt-6-luna and
-        // gpt-5-nano answered.
-        assert_eq!(
-            super::fallback_to_pin("openai", None, None, "gpt-5-nano".into()),
-            Some("gpt-5-nano".to_string())
-        );
-        // Verified on the current low-cost default: nothing to pin.
-        assert_eq!(
-            super::fallback_to_pin("openai", None, None, "gpt-6-luna".into()),
-            None
-        );
-        // A default the key already has was the model verified.
-        assert_eq!(
-            super::fallback_to_pin("openai", None, Some("gpt-5.6-sol"), "gpt-5.6-sol".into()),
-            None
-        );
-        // A request that sets the default keeps its own choice.
-        assert_eq!(
-            super::fallback_to_pin(
-                "openai",
-                Some(&Some("gpt-5.6-sol".into())),
-                Some("gpt-5.6-sol"),
-                "gpt-5.6-sol".into()
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn an_explicit_request_to_clear_the_default_is_never_replaced_by_a_fallback() {
-        // `default_model: null` restores provider-default routing; a fallback
-        // that answered verification must not turn it back into a pin.
-        assert_eq!(
-            super::fallback_to_pin("openai", Some(&None), None, "gpt-5-nano".into()),
-            None
-        );
-    }
-
     #[test]
     fn a_key_verified_on_a_fallback_model_defaults_to_it() {
         // Verified on the current low-cost model: no default is pinned.
