@@ -50,8 +50,8 @@ use super::model::{
     PreviousChoice, ReachState, RunResource, RunState, RunStep, RunStepStatus, StepKind,
     UndoResult,
 };
+use super::model::{ServiceDefinition, ServiceHost};
 use super::plan::NamedId;
-use crate::providers::tailscale::{ServiceDefinition, ServiceHost, TailscaleCredential};
 
 /// A managed zone's state under one DNS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -746,6 +746,25 @@ pub struct RunInput {
     /// stored.
     #[serde(skip)]
     pub tailscale_credential: Option<TailscaleCredential>,
+}
+
+/// A Tailscale OAuth client, decrypted for the length of a call.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TailscaleCredential {
+    pub client_id: String,
+    pub client_secret: String,
+    /// The tailnet's API name, or `-` for the client's own.
+    pub tailnet: String,
+}
+
+impl std::fmt::Debug for TailscaleCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TailscaleCredential")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("tailnet", &self.tailnet)
+            .finish()
+    }
 }
 
 /// The Cloudflare Access application a run puts in front of its address.

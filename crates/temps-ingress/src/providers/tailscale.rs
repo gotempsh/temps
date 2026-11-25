@@ -39,6 +39,8 @@ use utoipa::ToSchema;
 
 use crate::error::IngressError;
 use crate::provider::{Capabilities, Origin, Reach};
+pub use crate::reachability::model::{ServiceDefinition, ServiceHost};
+pub use crate::reachability::run::TailscaleCredential;
 use crate::registry::{
     DnsHandling, FieldKind, ProviderDeps, ProviderInfo, ProviderSetup, SetupField,
 };
@@ -71,25 +73,6 @@ const TOKEN_MARGIN: Duration = Duration::from_secs(60);
 /// Largest answer read: a Service, a token or an error is a few hundred
 /// bytes; a device list of a large tailnet stays well under this.
 const MAX_BODY: usize = 8 * 1024 * 1024;
-
-/// A Tailscale OAuth client, decrypted for the length of a call.
-#[derive(Clone, PartialEq, Eq)]
-pub struct TailscaleCredential {
-    pub client_id: String,
-    pub client_secret: String,
-    /// The tailnet's API name, or `-` for the client's own.
-    pub tailnet: String,
-}
-
-impl std::fmt::Debug for TailscaleCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TailscaleCredential")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"***")
-            .field("tailnet", &self.tailnet)
-            .finish()
-    }
-}
 
 impl TailscaleCredential {
     /// The credential from a setup form's answers.
@@ -185,22 +168,6 @@ impl TailscaleApiError {
             | TailscaleApiError::NotUnderstood { .. } => false,
         }
     }
-}
-
-/// A Tailscale Service as the API returns it, with the fields D4 compares.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
-pub struct ServiceDefinition {
-    /// `svc:myapp`.
-    pub name: String,
-    /// The TailVIPs Tailscale assigned.
-    #[serde(default)]
-    pub addrs: Vec<String>,
-    #[serde(default)]
-    pub comment: String,
-    #[serde(default)]
-    pub ports: Vec<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
 }
 
 impl ServiceDefinition {
@@ -324,19 +291,6 @@ pub fn ownership(service: &ServiceDefinition, install: &str) -> Ownership {
         Some((owner, creator_run_id)) if owner == install => Ownership::Ours { creator_run_id },
         _ => Ownership::Foreign,
     }
-}
-
-/// One device advertising a Service, as the API lists it: a device, no
-/// address (D4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ServiceHost {
-    /// The stable node id (`nXXXXCNTRL`), matching tailscaled's `Self.ID`.
-    pub node_id: Option<String>,
-    /// The machine's MagicDNS name or host name.
-    pub name: Option<String>,
-    /// Whether the tailnet admin approved it; `None` when the answer does not
-    /// say.
-    pub approved: Option<bool>,
 }
 
 impl ServiceHost {

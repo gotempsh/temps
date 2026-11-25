@@ -807,7 +807,7 @@ pub enum RunResource {
         /// The run whose marker it carries.
         creator_run_id: i32,
         /// As read back once the step was done, with its addresses.
-        definition: crate::providers::tailscale::ServiceDefinition,
+        definition: ServiceDefinition,
     },
     /// A tunnel whose environment hosts the run turned on (ADR 068 D3):
     /// undo turns them off, which withdraws every host it generated.
@@ -1446,7 +1446,7 @@ pub struct JournalEntry {
     /// to delete it (ADR 065 D4): the delete goes ahead only while a read
     /// made immediately before it still equals this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shown_service: Option<crate::providers::tailscale::ServiceDefinition>,
+    pub shown_service: Option<ServiceDefinition>,
 }
 
 impl JournalEntry {
@@ -1507,4 +1507,33 @@ pub struct RunView {
     pub updated_at: temps_core::DBDateTime,
     #[schema(value_type = Option<String>, format = DateTime)]
     pub finished_at: Option<temps_core::DBDateTime>,
+}
+
+/// A Tailscale Service as the API returns it, with the fields D4 compares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+pub struct ServiceDefinition {
+    /// `svc:myapp`.
+    pub name: String,
+    /// The TailVIPs Tailscale assigned.
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    #[serde(default)]
+    pub comment: String,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// One device advertising a Service, as the API lists it: a device, no
+/// address (D4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ServiceHost {
+    /// The stable node id (`nXXXXCNTRL`), matching tailscaled's `Self.ID`.
+    pub node_id: Option<String>,
+    /// The machine's MagicDNS name or host name.
+    pub name: Option<String>,
+    /// Whether the tailnet admin approved it; `None` when the answer does not
+    /// say.
+    pub approved: Option<bool>,
 }
