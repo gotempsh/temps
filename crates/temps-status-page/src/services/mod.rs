@@ -5,6 +5,7 @@ pub mod checks;
 mod db_retry;
 pub mod health_check_service;
 pub mod incident_service;
+mod interval_history;
 pub mod maintenance;
 pub mod monitor_service;
 pub mod outbound;

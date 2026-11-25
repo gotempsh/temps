@@ -31,6 +31,7 @@ use super::types::{
     CreateTargetMonitorRequest, ProbeLocationView, ProbeLocationsResponse,
     UpdateTargetMonitorRequest,
 };
+use crate::services::interval_history::record_interval_change;
 use crate::services::types::{normalize_check_interval_seconds, DEFAULT_CHECK_INTERVAL_SECS};
 
 /// Target monitors one project may have. Each probes at most every 30 s.
@@ -378,6 +379,18 @@ impl TargetMonitorService {
             .ok_or(TargetMonitorError::NotFound { monitor_id })?;
         if locked.updated_at != read_at {
             return Ok(None);
+        }
+        // Past checks keep the interval they ran under, so coverage of a
+        // window that has ended does not move with this change.
+        if let Some(seconds) = request.check_interval_seconds {
+            record_interval_change(
+                &txn,
+                monitor_id,
+                locked.check_interval_seconds,
+                seconds,
+                chrono::Utc::now(),
+            )
+            .await?;
         }
         let model = active.update(&txn).await?;
         txn.commit().await?;
