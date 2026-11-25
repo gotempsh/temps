@@ -92,6 +92,11 @@ pub enum ResolverHealth {
     /// host without a container runtime). Expected, so it never alarms;
     /// each worker's resolver serves the containers on that worker.
     NoLocalResolver,
+    /// The node cannot run a resolver where it runs: the address its
+    /// containers would query is not one of its own (Docker in a VM, as on a
+    /// Mac, or on another host). Expected there, so it never alarms; the
+    /// reason says what its apps lose.
+    Unsupported,
 }
 
 impl ResolverHealth {
@@ -105,6 +110,7 @@ impl ResolverHealth {
             Self::AgentTooOld => "agent_too_old",
             Self::NotReporting => "not_reporting",
             Self::NoLocalResolver => "no_local_resolver",
+            Self::Unsupported => "unsupported",
         }
     }
 }
@@ -171,6 +177,28 @@ pub fn resolver_health(input: &HealthInput<'_>) -> (ResolverHealth, Option<Strin
             };
         }
         Some(ReportState::Ok) => {}
+        // Told on every pass while it holds; an old one means the reporter
+        // stopped, which is an outage again.
+        Some(ReportState::Unsupported) => {
+            return if input.now - report.reported_at < stale_after {
+                (
+                    ResolverHealth::Unsupported,
+                    Some(
+                        report.last_error.clone().unwrap_or_else(|| {
+                            "This node cannot run a resolver where it runs".into()
+                        }),
+                    ),
+                )
+            } else {
+                (
+                    ResolverHealth::NotReporting,
+                    Some(format!(
+                        "No DNS report for {} seconds",
+                        (input.now - report.reported_at).num_seconds()
+                    )),
+                )
+            };
+        }
         _ => {
             let fresh = report
                 .last_ok_at
@@ -1985,6 +2013,48 @@ mod tests {
             health(0, "active", Some(&old), now).0,
             ResolverHealth::NotReporting
         );
+    }
+
+    #[test]
+    fn a_control_plane_that_cannot_run_a_resolver_where_it_runs_never_alarms() {
+        // Docker in a VM: the gateway is not this machine's, so the reporter
+        // says so instead of reporting a resolver that failed to start.
+        let now = Utc::now();
+        let mut unsupported = report("unsupported", now - chrono::Duration::seconds(10));
+        unsupported.running = false;
+        unsupported.tasks_alive = false;
+        unsupported.last_error = Some("Docker runs in a Linux VM on this Mac".into());
+        let (h, reason) = health(0, "active", Some(&unsupported), now);
+        assert_eq!(h, ResolverHealth::Unsupported);
+        assert_eq!(h.as_str(), "unsupported");
+        assert_eq!(
+            reason.as_deref(),
+            Some("Docker runs in a Linux VM on this Mac")
+        );
+        let none = RecentFailures::default();
+        assert_eq!(
+            evaluate_alerts(h, reason.as_deref(), 10, true, &none),
+            AlertDecision::default()
+        );
+
+        // A reporter that stopped telling it is an outage again.
+        unsupported.reported_at = now - chrono::Duration::seconds(120);
+        assert_eq!(
+            health(0, "active", Some(&unsupported), now).0,
+            ResolverHealth::NotReporting
+        );
+        // And it means nothing while cluster DNS is off.
+        unsupported.reported_at = now;
+        let off = resolver_health(&HealthInput {
+            node_id: 0,
+            cluster_dns_enabled: false,
+            node_status: "active",
+            report: Some(&unsupported),
+            heartbeat_running: None,
+            interval_secs: 30,
+            now,
+        });
+        assert_eq!(off.0, ResolverHealth::Off);
     }
 
     #[test]

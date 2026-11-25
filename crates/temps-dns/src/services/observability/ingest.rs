@@ -69,6 +69,10 @@ pub enum ReportState {
     Rejected,
     /// The report could not be read or broke a bound.
     Invalid,
+    /// The node cannot run a resolver where it runs: the address its
+    /// containers would query is not one of its own (Docker in a VM, or on
+    /// another host). Expected there, not an outage; the reason says why.
+    Unsupported,
 }
 
 impl ReportState {
@@ -79,6 +83,7 @@ impl ReportState {
             Self::Unreachable => "unreachable",
             Self::Rejected => "rejected",
             Self::Invalid => "invalid",
+            Self::Unsupported => "unsupported",
         }
     }
 
@@ -89,6 +94,7 @@ impl ReportState {
             Self::Unreachable,
             Self::Rejected,
             Self::Invalid,
+            Self::Unsupported,
         ]
         .into_iter()
         .find(|s| s.as_str() == value)
@@ -461,6 +467,12 @@ impl DnsObservabilityService {
         row.report_state = Set(state.as_str().to_string());
         row.reported_at = Set(received_at);
         row.last_error = Set(Some(truncate(reason, MAX_ERROR_LEN)));
+        if state == ReportState::Unsupported {
+            // Nothing runs, whatever an earlier report said.
+            row.running = Set(false);
+            row.tasks_alive = Set(false);
+            row.listen_address = Set(None);
+        }
         save(row, self.db.as_ref()).await
     }
 
