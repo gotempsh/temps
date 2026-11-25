@@ -2578,8 +2578,14 @@ async fn update_user(
 
     info!("Admin {} updating user {}", auth.user_id(), user_id);
 
+    let username = update_req.requested_username().map_err(|reason| {
+        temps_core::error_builder::bad_request()
+            .detail(format!("Cannot update user {user_id}: {reason}"))
+            .build()
+    })?;
+
     // Don't allow empty updates
-    if update_req.email.is_none() && update_req.username.is_none() {
+    if update_req.email.is_none() && username.is_none() {
         return Err(temps_core::error_builder::bad_request()
             .detail("No fields to update")
             .build());
@@ -2587,11 +2593,7 @@ async fn update_user(
 
     let updated_user = app_state
         .user_service
-        .update_user(
-            user_id,
-            update_req.email.clone(),
-            update_req.username.clone(),
-        )
+        .update_user(user_id, update_req.email.clone(), username.clone())
         .await?;
     info!("Successfully updated user {}", user_id);
 
@@ -2607,7 +2609,7 @@ async fn update_user(
         username: updated_user.user.name.clone(),
         new_values: UpdatedFields {
             email: update_req.email,
-            name: update_req.username,
+            name: username,
         },
     };
 
@@ -3826,8 +3828,22 @@ mod tests {
     fn update_user_takes_username_keeps_name_as_alias_and_rejects_unknown_fields() {
         let current: UpdateUserRequest = serde_json::from_str(r#"{"username":"renamed"}"#).unwrap();
         assert_eq!(current.username.as_deref(), Some("renamed"));
+        assert_eq!(
+            current.requested_username(),
+            Ok(Some("renamed".to_string()))
+        );
         let legacy: UpdateUserRequest = serde_json::from_str(r#"{"name":"renamed"}"#).unwrap();
-        assert_eq!(legacy.username.as_deref(), Some("renamed"));
+        assert_eq!(legacy.requested_username(), Ok(Some("renamed".to_string())));
+        let both: UpdateUserRequest =
+            serde_json::from_str(r#"{"username":"renamed","name":"renamed"}"#).unwrap();
+        assert_eq!(both.requested_username(), Ok(Some("renamed".to_string())));
+        let conflicting: UpdateUserRequest =
+            serde_json::from_str(r#"{"username":"one","name":"other"}"#).unwrap();
+        let reason = conflicting.requested_username().unwrap_err();
+        assert!(
+            reason.contains("'one'") && reason.contains("'other'"),
+            "{reason}"
+        );
         assert!(
             serde_json::from_str::<UpdateUserRequest>(r#"{"user_name":"renamed"}"#).is_err(),
             "a misspelt field is an error, not a silent no-op"
@@ -4003,6 +4019,7 @@ mod tests {
                 Json(UpdateUserRequest {
                     email: Some("changed@example.com".to_string()),
                     username: None,
+                    name: None,
                 }),
             )
             .await;
@@ -4318,6 +4335,7 @@ mod tests {
                 Json(UpdateUserRequest {
                     email: Some("changed@example.com".to_string()),
                     username: None,
+                    name: None,
                 }),
             )
             .await;
@@ -4889,6 +4907,23 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["user"]["username"], "legacy-name", "{body}");
+
+            let (status, body) = send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({"username": "one", "name": "other"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("disagree"),
+                "{body}"
+            );
 
             let (status, _) = send(
                 &app,

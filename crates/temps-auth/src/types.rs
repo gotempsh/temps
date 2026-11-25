@@ -131,11 +131,30 @@ pub struct CreateUserRequest {
 pub struct UpdateUserRequest {
     #[schema(example = "john.doe@example.com")]
     pub email: Option<String>,
-    /// The new username, as in `CreateUserRequest`. The deprecated field
-    /// name `name` is still accepted as an alias.
-    #[serde(default, alias = "name")]
+    /// The new username, as in `CreateUserRequest`.
+    #[serde(default)]
     #[schema(example = "john.doe")]
     pub username: Option<String>,
+    /// Deprecated: the old name of `username`, still accepted. Sending both
+    /// with different values is refused.
+    #[serde(default)]
+    #[schema(deprecated, example = "john.doe")]
+    pub name: Option<String>,
+}
+
+impl UpdateUserRequest {
+    /// The username the request asks for: `username`, or the deprecated
+    /// `name`. Both set to different values is an error naming the two.
+    pub fn requested_username(&self) -> Result<Option<String>, String> {
+        match (&self.username, &self.name) {
+            (Some(username), Some(name)) if username != name => Err(format!(
+                "username '{username}' and the deprecated name '{name}' disagree; \
+                 send only username"
+            )),
+            (Some(username), _) => Ok(Some(username.clone())),
+            (None, name) => Ok(name.clone()),
+        }
+    }
 }
 
 // Add a new route for self-modification
