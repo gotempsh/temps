@@ -13,9 +13,16 @@ import {
   isUserObject,
 } from '../../lib/api-client.js'
 import { getCurrentUser } from '../../api/sdk.gen.js'
-import { AuthenticationError } from '../../utils/errors.js'
+import { AuthenticationError, CliError } from '../../utils/errors.js'
 import { hostname, platform } from 'node:os'
 import { spawn } from 'node:child_process'
+import {
+  clearPendingLogin,
+  getPendingLogin,
+  pendingLoginExpired,
+  savePendingLogin,
+  type PendingLogin,
+} from './pending-login.js'
 
 interface LoginOptions {
   /** Pre-minted API key from the dashboard's Settings → API Keys page. Use this for headless / CI. */
@@ -26,6 +33,60 @@ interface LoginOptions {
   url?: string
   /** Emit verbose request/response logging for diagnosing connection issues. */
   debug?: boolean
+  /**
+   * `false` (`--no-wait`): print the approval link and exit instead of
+   * waiting. Finish with `--resume`.
+   */
+  wait?: boolean
+  /** Finish a sign-in started with `--no-wait`. */
+  resume?: boolean
+  /** With `--resume`: seconds to wait for the approval before giving up. */
+  waitSecs?: string
+}
+
+/** How long `--resume` waits by default: under a typical two-minute tool timeout. */
+export const DEFAULT_RESUME_WAIT_SECS = 90
+
+/** Exit code of `--resume` when the person has not approved yet. */
+export const LOGIN_STILL_PENDING_EXIT_CODE = 2
+
+export type DeviceLoginMode = 'wait' | 'start' | 'resume'
+
+/**
+ * Which half of the browser sign-in this invocation runs. `--no-wait` and
+ * `--resume` split it for callers that cannot keep a command open while a
+ * person approves: an agent's shell tool returns output only when the
+ * command exits, so a login that prints the link and then blocks never shows
+ * the link to anyone.
+ */
+export function resolveDeviceLoginMode(
+  options: Pick<LoginOptions, 'wait' | 'resume' | 'apiKey'>,
+): DeviceLoginMode {
+  const start = options.wait === false
+  const resume = options.resume === true
+  if (start && resume) {
+    throw new AuthenticationError(
+      '--no-wait and --resume cannot be combined: --no-wait prints the approval link and exits, --resume waits for that approval.',
+    )
+  }
+  if ((start || resume) && options.apiKey !== undefined) {
+    throw new AuthenticationError(
+      `${start ? '--no-wait' : '--resume'} applies to the browser sign-in only; an --api-key login needs no approval.`,
+    )
+  }
+  if (start) return 'start'
+  return resume ? 'resume' : 'wait'
+}
+
+/** Parse `--wait-secs`; a missing value is the default. */
+export function parseResumeWaitSecs(value: string | undefined): number {
+  if (value === undefined) return DEFAULT_RESUME_WAIT_SECS
+  if (!/^[1-9]\d*$/.test(value.trim())) {
+    throw new AuthenticationError(
+      `--wait-secs must be a whole number of seconds greater than zero, got "${value}".`,
+    )
+  }
+  return Number(value.trim())
 }
 
 /**
@@ -139,6 +200,7 @@ export async function login(options: LoginOptions): Promise<void> {
   newline()
 
   const method = resolveLoginMethod(options)
+  const deviceMode = resolveDeviceLoginMode(options)
 
   const debug = debugEnabled(options)
   if (debug) {
@@ -173,23 +235,38 @@ export async function login(options: LoginOptions): Promise<void> {
 
   // Interactive path: browser-based device-authorization. Credentials are
   // always entered in the web app — the CLI never prompts for a password.
+  if (deviceMode === 'start') {
+    await startDeviceLogin({ url: options.url, context: options.context, debug })
+    return
+  }
+  if (deviceMode === 'resume') {
+    await resumeDeviceLogin({
+      url: options.url,
+      context: options.context,
+      waitSecs: parseResumeWaitSecs(options.waitSecs),
+      debug,
+    })
+    return
+  }
   await loginWithDevice({ url: options.url, context: options.context, debug })
 }
 
+interface DeviceSession {
+  apiBaseUrl: string
+  webBaseUrl: string
+  start: DeviceStartResponse
+  /** Absolute URL the person opens to approve. */
+  verificationUrl: string
+}
+
 /**
- * Browser-based device-authorization flow. The CLI requests a `device_code`
- * + `user_code` from the server, opens the matching browser URL, and polls
- * until the user approves the device in the web UI. The user never types
- * their password into the terminal — they confirm in the regular web login
- * screen, which is critical for:
- *   - sandbox / workspace environments where prompting for a password is wrong;
- *   - SSO / magic-link accounts that have no password at all;
- *   - keeping the credential surface area in the browser, not the shell.
+ * Ask the server for a device code. Shared by the blocking login and by
+ * `--no-wait`.
  */
-export async function loginWithDevice(
-  opts: { url?: string; context?: string; debug?: boolean } = {},
-): Promise<void> {
-  const debug = debugEnabled(opts)
+async function requestDeviceSession(
+  opts: { url?: string; debug: boolean },
+): Promise<DeviceSession> {
+  const { debug } = opts
   // `apiBaseUrl` is the `/api`-prefixed URL the auth plugin actually lives at
   // (since `temps-core` nests plugin routes under `/api`). `webBaseUrl` is the
   // frontend root, used to resolve `/cli-login` URLs the user opens in a browser.
@@ -197,9 +274,6 @@ export async function loginWithDevice(
     ? serverBaseUrl(opts.url)
     : serverBaseUrl(config.get('apiUrl'))
   const webBaseUrl = apiBaseUrl.replace(/\/api$/, '')
-  if (opts.url) {
-    config.set('apiUrl', apiBaseUrl)
-  }
   if (debug) {
     debugLog(`resolved apiBaseUrl: ${apiBaseUrl}`)
     debugLog(`resolved webBaseUrl: ${webBaseUrl}`)
@@ -214,7 +288,6 @@ export async function loginWithDevice(
     }
   })()
 
-  // 1. Start a device session.
   const startUrl = `${apiBaseUrl}/auth/cli/device/start`
   const start = await withSpinner(
     'Requesting device authorization...',
@@ -252,7 +325,211 @@ export async function loginWithDevice(
 
   // `verification_uri{,_complete}` are frontend paths (e.g. `/cli-login/CODE`),
   // so they must resolve against the web root, NOT the `/api` base.
-  const fullUrl = absoluteVerificationUri(webBaseUrl, start)
+  return {
+    apiBaseUrl,
+    webBaseUrl,
+    start,
+    verificationUrl: absoluteVerificationUri(webBaseUrl, start),
+  }
+}
+
+/** Save the credentials an approved device session delivered. */
+async function persistDeviceLogin(
+  success: ApprovedDevicePollResponse,
+  contextName: string,
+  apiBaseUrl: string,
+): Promise<void> {
+  // We store the `/api`-prefixed URL since that's what the rest of the CLI
+  // (and `normalizeApiUrl`) expects as `apiUrl`.
+  await upsertContext({
+    name: contextName,
+    url: apiBaseUrl,
+    apiKey: success.api_key,
+    email: success.email,
+    keyPrefix: success.key_prefix,
+    expiresAt: success.expires_at ?? undefined,
+  })
+  config.set('apiUrl', apiBaseUrl)
+  await credentials.setAll({
+    apiKey: success.api_key,
+    userId: success.user_id,
+    email: success.email,
+  })
+
+  displayWelcome(success.email, contextName, apiBaseUrl, {
+    role: success.role,
+    key_prefix: success.key_prefix,
+    expires_at: success.expires_at,
+  })
+}
+
+/**
+ * The lines `--no-wait` prints. Plain text with the link alone on its line,
+ * no box and no colour: the reader is as likely to be an agent relaying the
+ * link to a person as a person, and either must be able to lift it out.
+ */
+export function formatPendingLoginInstructions(
+  pending: Pick<PendingLogin, 'verificationUrl' | 'userCode' | 'context' | 'expiresAt' | 'apiBaseUrl'>,
+  now: number,
+): string[] {
+  const minutes = Math.max(1, Math.round((Date.parse(pending.expiresAt) - now) / 60_000))
+  const webBaseUrl = pending.apiBaseUrl.replace(/\/api$/, '')
+  return [
+    'Approve this sign-in in a browser where you are signed in to Temps:',
+    '',
+    `  ${pending.verificationUrl}`,
+    '',
+    `Code: ${pending.userCode} (valid for ${minutes} minute${minutes === 1 ? '' : 's'})`,
+    'Nothing is signed in yet. After approving, finish with:',
+    '',
+    `  temps login ${webBaseUrl} --context ${pending.context} --resume`,
+  ]
+}
+
+/**
+ * First half of the split sign-in (`--no-wait`): request a device code,
+ * print the approval link, remember the code, and exit without waiting.
+ */
+export async function startDeviceLogin(
+  opts: { url?: string; context?: string; debug?: boolean } = {},
+): Promise<void> {
+  const debug = debugEnabled(opts)
+  const session = await requestDeviceSession({ url: opts.url, debug })
+  const now = Date.now()
+  const pending: PendingLogin = {
+    context: opts.context ?? defaultContextName(session.apiBaseUrl),
+    apiBaseUrl: session.apiBaseUrl,
+    deviceCode: session.start.device_code,
+    userCode: session.start.user_code,
+    verificationUrl: session.verificationUrl,
+    intervalSecs: session.start.interval ?? 2,
+    expiresAt: new Date(now + (session.start.expires_in ?? 900) * 1000).toISOString(),
+  }
+  await savePendingLogin(pending, now)
+  newline()
+  for (const line of formatPendingLoginInstructions(pending, now)) {
+    console.log(line)
+  }
+}
+
+/**
+ * Thrown by `--resume` when the wait ran out before the person approved. Its
+ * own exit code, so a caller can tell "not yet, run it again" from a sign-in
+ * that failed.
+ */
+export class LoginStillPendingError extends CliError {
+  constructor(pending: Pick<PendingLogin, 'verificationUrl' | 'context'>, waitedSecs: number) {
+    super(
+      `Still waiting for approval after ${waitedSecs}s. Nothing is signed in yet. ` +
+        `Approve ${pending.verificationUrl} in the browser, then run the same command again ` +
+        `(context "${pending.context}").`,
+      'LOGIN_PENDING',
+      LOGIN_STILL_PENDING_EXIT_CODE,
+    )
+    this.name = 'LoginStillPendingError'
+  }
+}
+
+/**
+ * Second half of the split sign-in (`--resume`): wait for the approval of
+ * the sign-in `--no-wait` started for this context, then save the
+ * credentials. The wait is bounded so a caller with a command timeout gets a
+ * clean "not yet" (exit code 2) and can run it again; the started sign-in
+ * stays on disk until it is approved, denied or expired.
+ */
+export async function resumeDeviceLogin(
+  opts: { url?: string; context?: string; waitSecs?: number; debug?: boolean } = {},
+): Promise<void> {
+  const debug = debugEnabled(opts)
+  const requestedBase = opts.url ? serverBaseUrl(opts.url) : undefined
+  const contextName =
+    opts.context ?? defaultContextName(requestedBase ?? serverBaseUrl(config.get('apiUrl')))
+  const pending = await getPendingLogin(contextName)
+  const restart = `temps login ${opts.url ?? '<url>'} --context ${contextName} --no-wait`
+  if (!pending) {
+    throw new AuthenticationError(
+      `No sign-in is waiting for context "${contextName}". Start one with: ${restart}`,
+    )
+  }
+  if (requestedBase && requestedBase !== pending.apiBaseUrl) {
+    throw new AuthenticationError(
+      `The sign-in waiting for context "${contextName}" was started against ${pending.apiBaseUrl}, not ${requestedBase}. ` +
+        `Start a new one with: ${restart}`,
+    )
+  }
+  const now = Date.now()
+  if (pendingLoginExpired(pending, now)) {
+    await clearPendingLogin(contextName)
+    throw new AuthenticationError(
+      `The sign-in started for context "${contextName}" expired before it was approved. Start a new one with: ${restart}`,
+    )
+  }
+
+  const waitSecs = opts.waitSecs ?? DEFAULT_RESUME_WAIT_SECS
+  const remainingSecs = Math.max(1, Math.floor((Date.parse(pending.expiresAt) - now) / 1000))
+  const boundedByWait = waitSecs < remainingSecs
+  const pollUrl = `${pending.apiBaseUrl}/auth/cli/device/poll`
+  let success: ApprovedDevicePollResponse
+  try {
+    success = await withSpinner(
+      `Waiting for browser approval (code ${pending.userCode})...`,
+      () =>
+        pollForDeviceApproval({
+          pollUrl,
+          intervalSecs: pending.intervalSecs,
+          expiresInSecs: Math.min(waitSecs, remainingSecs),
+          timeoutError: boundedByWait
+            ? () => new LoginStillPendingError(pending, waitSecs)
+            : undefined,
+          poll: () =>
+            debugFetch(
+              pollUrl,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_code: pending.deviceCode }),
+              },
+              debug,
+            ),
+        }),
+      { successText: 'Browser approval received' },
+    )
+  } catch (err) {
+    // Still pending is not a failure of the sign-in: keep it so the caller
+    // can run --resume again. Anything else (denied, expired, rejected by
+    // the server) means this device code is dead.
+    if (!(err instanceof LoginStillPendingError)) {
+      await clearPendingLogin(contextName)
+    }
+    throw err
+  }
+
+  await clearPendingLogin(contextName)
+  await persistDeviceLogin(success, contextName, pending.apiBaseUrl)
+}
+
+/**
+ * Browser-based device-authorization flow. The CLI requests a `device_code`
+ * + `user_code` from the server, opens the matching browser URL, and polls
+ * until the user approves the device in the web UI. The user never types
+ * their password into the terminal — they confirm in the regular web login
+ * screen, which is critical for:
+ *   - sandbox / workspace environments where prompting for a password is wrong;
+ *   - SSO / magic-link accounts that have no password at all;
+ *   - keeping the credential surface area in the browser, not the shell.
+ */
+export async function loginWithDevice(
+  opts: { url?: string; context?: string; debug?: boolean } = {},
+): Promise<void> {
+  const debug = debugEnabled(opts)
+
+  if (opts.url) {
+    config.set('apiUrl', serverBaseUrl(opts.url))
+  }
+
+  // 1. Start a device session.
+  const { apiBaseUrl, webBaseUrl, start, verificationUrl: fullUrl } =
+    await requestDeviceSession({ url: opts.url, debug })
 
   // 2. Tell the user what to do.
   newline()
@@ -296,29 +573,9 @@ export async function loginWithDevice(
     { successText: 'Browser approval received' },
   )
 
-  // 5. Persist credentials. We store the `/api`-prefixed URL since that's
-  // what the rest of the CLI (and `normalizeApiUrl`) expects as `apiUrl`.
+  // 5. Persist credentials.
   const contextName = opts.context ?? defaultContextName(apiBaseUrl)
-  await upsertContext({
-    name: contextName,
-    url: apiBaseUrl,
-    apiKey: success.api_key,
-    email: success.email,
-    keyPrefix: success.key_prefix,
-    expiresAt: success.expires_at ?? undefined,
-  })
-  config.set('apiUrl', apiBaseUrl)
-  await credentials.setAll({
-    apiKey: success.api_key,
-    userId: success.user_id,
-    email: success.email,
-  })
-
-  displayWelcome(success.email, contextName, apiBaseUrl, {
-    role: success.role,
-    key_prefix: success.key_prefix,
-    expires_at: success.expires_at,
-  })
+  await persistDeviceLogin(success, contextName, apiBaseUrl)
 }
 
 export interface DeviceStartResponse {
@@ -364,6 +621,12 @@ export interface PollForDeviceApprovalOptions {
   sleep?: (ms: number) => Promise<void>
   /** Injectable for tests. */
   now?: () => number
+  /**
+   * The error to throw when the wait runs out with the login still pending.
+   * `--resume` passes one: its wait is shorter than the session, so running
+   * out of it means "not approved yet", not "start again".
+   */
+  timeoutError?: () => Error
 }
 
 /**
@@ -449,6 +712,7 @@ export async function pollForDeviceApproval(
         return body
     }
   }
+  if (opts.timeoutError) throw opts.timeoutError()
   throw new AuthenticationError(
     throttledLastPoll
       ? `Timed out waiting for browser approval: the server kept rate limiting ${opts.pollUrl} (HTTP 429). ` +

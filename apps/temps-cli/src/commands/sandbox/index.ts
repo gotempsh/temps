@@ -524,7 +524,7 @@ export function registerSandboxCommands(program: Command): void {
 
   sandbox
     .command('show <id>')
-    .description('Show details for a sandbox')
+    .description('Show a sandbox: status, image, node, expiry, preview access and outbound policy')
     .option('--json', 'Output as JSON')
     .action(showAction)
 
@@ -591,7 +591,9 @@ export function registerSandboxCommands(program: Command): void {
 
   sandbox
     .command('exec <id> [args...]')
-    .description('Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`')
+    .description(
+      'Run a command inside a sandbox, print its output and exit with its exit code. Put `--` before the command: `exec ID -- ls -la`',
+    )
     .option('--detach', 'Start in background and print a job ID instead of waiting')
     .option('--cwd <path>', 'Working directory inside the sandbox')
     .option(
@@ -603,7 +605,7 @@ export function registerSandboxCommands(program: Command): void {
 
   sandbox
     .command('logs <id> <jobId>')
-    .description('Stream logs from a detached job (SSE)')
+    .description('Print the output of a job started with `exec --detach`, following it until the job ends')
     .action(logsAction)
 
   sandbox
