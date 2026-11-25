@@ -95,6 +95,7 @@ use crate::services::secret_service::SecretService;
         definitions::create_skill,
         definitions::get_skill,
         definitions::update_skill,
+        definitions::update_skill_put,
         definitions::delete_skill,
         definitions::upload_skill,
         definitions::download_skill_archive,
@@ -103,6 +104,7 @@ use crate::services::secret_service::SecretService;
         definitions::get_mcp,
         definitions::reveal_mcp_config,
         definitions::update_mcp,
+        definitions::update_mcp_put,
         definitions::delete_mcp,
 
         // Skills + MCP definitions (global / settings)
@@ -110,6 +112,7 @@ use crate::services::secret_service::SecretService;
         definitions::create_global_skill,
         definitions::get_global_skill,
         definitions::update_global_skill,
+        definitions::update_global_skill_put,
         definitions::delete_global_skill,
         definitions::upload_global_skill,
         definitions::download_global_skill_archive,
@@ -118,6 +121,7 @@ use crate::services::secret_service::SecretService;
         definitions::get_global_mcp,
         definitions::reveal_global_mcp_config,
         definitions::update_global_mcp,
+        definitions::update_global_mcp_put,
         definitions::delete_global_mcp,
 
         // AI providers

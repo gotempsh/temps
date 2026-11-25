@@ -114,10 +114,15 @@ pub struct CreateSkillRequest {
     pub content: String,
 }
 
+/// Partial update of a skill: omitted or `null` fields keep their current value.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateSkillRequest {
+    /// New display name. Omit or send `null` to keep the current name.
     pub name: Option<String>,
+    /// New description. Omit or send `null` to keep the current description;
+    /// an empty string clears it (stored and returned as `null`).
     pub description: Option<String>,
+    /// New SKILL.md content. Omit or send `null` to keep the current content.
     pub content: Option<String>,
 }
 
@@ -130,16 +135,27 @@ pub struct CreateMcpRequest {
     pub config: serde_json::Value,
 }
 
+/// Partial update of an MCP server: omitted or `null` fields keep their
+/// current value.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateMcpRequest {
+    /// New display name. Omit or send `null` to keep the current name.
     pub name: Option<String>,
+    /// New description. Omit or send `null` to keep the current description;
+    /// an empty string clears it (stored and returned as `null`).
     pub description: Option<String>,
-    #[schema(value_type = Object)]
+    /// Replacement server config. Omit or send `null` to keep the current
+    /// config; masked (`***`) credential values keep the stored secret.
+    #[schema(value_type = Object, nullable)]
     pub config: Option<serde_json::Value>,
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 
+#[allow(
+    deprecated,
+    reason = "the PUT update routes stay mounted as deprecated aliases of PATCH"
+)]
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // Project-scoped skills
@@ -153,7 +169,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/skills/{slug}",
-            get(get_skill).put(update_skill).delete(delete_skill),
+            get(get_skill)
+                .patch(update_skill)
+                .put(update_skill_put)
+                .delete(delete_skill),
         )
         .route(
             "/projects/{project_id}/skills/{slug}/archive",
@@ -166,7 +185,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/mcp-servers/{slug}",
-            get(get_mcp).put(update_mcp).delete(delete_mcp),
+            get(get_mcp)
+                .patch(update_mcp)
+                .put(update_mcp_put)
+                .delete(delete_mcp),
         )
         .route(
             "/projects/{project_id}/mcp-servers/{slug}/config/{field}",
@@ -184,7 +206,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/settings/skills/{slug}",
             get(get_global_skill)
-                .put(update_global_skill)
+                .patch(update_global_skill)
+                .put(update_global_skill_put)
                 .delete(delete_global_skill),
         )
         .route(
@@ -199,7 +222,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/settings/mcp-servers/{slug}",
             get(get_global_mcp)
-                .put(update_global_mcp)
+                .patch(update_global_mcp)
+                .put(update_global_mcp_put)
                 .delete(delete_global_mcp),
         )
         .route(
@@ -418,7 +442,7 @@ pub async fn create_skill(
 
 #[utoipa::path(
     tag = "Agents",
-    put,
+    patch,
     path = "/projects/{project_id}/skills/{slug}",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
@@ -426,9 +450,11 @@ pub async fn create_skill(
     ),
     request_body = UpdateSkillRequest,
     responses(
-        (status = 200, body = SkillDefinitionResponse),
+        (status = 200, description = "Updated definition", body = SkillDefinitionResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Skill not found"),
+        (status = 500, description = "Internal server error"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -733,7 +759,7 @@ pub async fn create_mcp(
 
 #[utoipa::path(
     tag = "Agents",
-    put,
+    patch,
     path = "/projects/{project_id}/mcp-servers/{slug}",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
@@ -741,9 +767,11 @@ pub async fn create_mcp(
     ),
     request_body = UpdateMcpRequest,
     responses(
-        (status = 200, body = McpDefinitionResponse),
+        (status = 200, description = "Updated definition", body = McpDefinitionResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "MCP server not found"),
+        (status = 500, description = "Internal server error"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -952,14 +980,16 @@ pub async fn create_global_skill(
 
 #[utoipa::path(
     tag = "Agents",
-    put,
+    patch,
     path = "/settings/skills/{slug}",
     params(("slug" = String, Path, description = "Skill slug")),
     request_body = UpdateSkillRequest,
     responses(
-        (status = 200, body = SkillDefinitionResponse),
+        (status = 200, description = "Updated definition", body = SkillDefinitionResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Skill not found"),
+        (status = 500, description = "Internal server error"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1198,14 +1228,16 @@ pub async fn create_global_mcp(
 
 #[utoipa::path(
     tag = "Agents",
-    put,
+    patch,
     path = "/settings/mcp-servers/{slug}",
     params(("slug" = String, Path, description = "MCP server slug")),
     request_body = UpdateMcpRequest,
     responses(
-        (status = 200, body = McpDefinitionResponse),
+        (status = 200, description = "Updated definition", body = McpDefinitionResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "MCP server not found"),
+        (status = 500, description = "Internal server error"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1574,6 +1606,129 @@ pub async fn download_global_skill_archive(
     ))
 }
 
+// ── Deprecated PUT aliases ──────────────────────────────────────────────────
+//
+// These routes always behaved as partial updates. PATCH is the documented
+// method; PUT stays mounted so existing clients keep working.
+
+/// Deprecated alias of `PATCH /projects/{project_id}/skills/{slug}`: a partial update, where omitted
+/// or `null` fields keep their current value.
+#[utoipa::path(
+    tag = "Agents",
+    put,
+    path = "/projects/{project_id}/skills/{slug}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("slug" = String, Path, description = "Skill slug"),
+    ),
+    request_body = UpdateSkillRequest,
+    responses(
+        (status = 200, description = "Updated definition", body = SkillDefinitionResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Skill not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+#[deprecated(note = "use PATCH /projects/{project_id}/skills/{slug}")]
+pub async fn update_skill_put(
+    auth: RequireAuth,
+    state: State<Arc<AppState>>,
+    metadata: Extension<RequestMetadata>,
+    path: Path<(i32, String)>,
+    request: Json<UpdateSkillRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    update_skill(auth, state, metadata, path, request).await
+}
+
+/// Deprecated alias of `PATCH /projects/{project_id}/mcp-servers/{slug}`: a partial update, where omitted
+/// or `null` fields keep their current value.
+#[utoipa::path(
+    tag = "Agents",
+    put,
+    path = "/projects/{project_id}/mcp-servers/{slug}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("slug" = String, Path, description = "MCP server slug"),
+    ),
+    request_body = UpdateMcpRequest,
+    responses(
+        (status = 200, description = "Updated definition", body = McpDefinitionResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "MCP server not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+#[deprecated(note = "use PATCH /projects/{project_id}/mcp-servers/{slug}")]
+pub async fn update_mcp_put(
+    auth: RequireAuth,
+    state: State<Arc<AppState>>,
+    metadata: Extension<RequestMetadata>,
+    path: Path<(i32, String)>,
+    request: Json<UpdateMcpRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    update_mcp(auth, state, metadata, path, request).await
+}
+
+/// Deprecated alias of `PATCH /settings/skills/{slug}`: a partial update, where omitted
+/// or `null` fields keep their current value.
+#[utoipa::path(
+    tag = "Agents",
+    put,
+    path = "/settings/skills/{slug}",
+    params(("slug" = String, Path, description = "Skill slug")),
+    request_body = UpdateSkillRequest,
+    responses(
+        (status = 200, description = "Updated definition", body = SkillDefinitionResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Skill not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+#[deprecated(note = "use PATCH /settings/skills/{slug}")]
+pub async fn update_global_skill_put(
+    auth: RequireAuth,
+    state: State<Arc<AppState>>,
+    metadata: Extension<RequestMetadata>,
+    path: Path<String>,
+    request: Json<UpdateSkillRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    update_global_skill(auth, state, metadata, path, request).await
+}
+
+/// Deprecated alias of `PATCH /settings/mcp-servers/{slug}`: a partial update, where omitted
+/// or `null` fields keep their current value.
+#[utoipa::path(
+    tag = "Agents",
+    put,
+    path = "/settings/mcp-servers/{slug}",
+    params(("slug" = String, Path, description = "MCP server slug")),
+    request_body = UpdateMcpRequest,
+    responses(
+        (status = 200, description = "Updated definition", body = McpDefinitionResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "MCP server not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+#[deprecated(note = "use PATCH /settings/mcp-servers/{slug}")]
+pub async fn update_global_mcp_put(
+    auth: RequireAuth,
+    state: State<Arc<AppState>>,
+    metadata: Extension<RequestMetadata>,
+    path: Path<String>,
+    request: Json<UpdateMcpRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    update_global_mcp(auth, state, metadata, path, request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1636,6 +1791,55 @@ mod tests {
             scheme: "http".to_string(),
             host: "localhost".to_string(),
             is_secure: false,
+        }
+    }
+
+    #[test]
+    fn definition_updates_are_patch_with_deprecated_put_aliases() {
+        use utoipa::OpenApi;
+        let doc = crate::handlers::AgentsApiDoc::openapi();
+        for path in [
+            "/projects/{project_id}/skills/{slug}",
+            "/projects/{project_id}/mcp-servers/{slug}",
+            "/settings/skills/{slug}",
+            "/settings/mcp-servers/{slug}",
+        ] {
+            let item = doc
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} should be documented"));
+            let patch = item
+                .patch
+                .as_ref()
+                .unwrap_or_else(|| panic!("{path} should document PATCH"));
+            assert_ne!(
+                patch.deprecated,
+                Some(utoipa::openapi::Deprecated::True),
+                "PATCH {path} is the supported method"
+            );
+            let put = item
+                .put
+                .as_ref()
+                .unwrap_or_else(|| panic!("{path} should keep PUT"));
+            assert_eq!(
+                put.deprecated,
+                Some(utoipa::openapi::Deprecated::True),
+                "PUT {path} should be a deprecated alias"
+            );
+        }
+
+        let schemas = doc
+            .components
+            .as_ref()
+            .expect("the doc should have components");
+        for schema in ["UpdateSkillRequest", "UpdateMcpRequest"] {
+            let json =
+                serde_json::to_string(&schemas.schemas[schema]).expect("schema should serialize");
+            assert!(
+                json.contains("an empty string clears it"),
+                "{schema}.description should document clearing: {json}"
+            );
         }
     }
 
