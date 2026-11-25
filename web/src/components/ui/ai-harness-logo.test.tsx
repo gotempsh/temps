@@ -11,6 +11,15 @@ describe('AiHarnessLogo', () => {
     ['claude_cli', 'Claude Code logo', '/ai-harnesses/claude-code.svg'],
     ['codex_cli', 'Codex logo', '/ai-harnesses/codex.svg'],
     ['opencode', 'OpenCode logo', '/ai-harnesses/opencode.svg'],
+    ['cursor', 'Cursor logo', '/ai-harnesses/cursor.svg'],
+    [
+      'github_copilot',
+      'GitHub Copilot logo',
+      '/ai-harnesses/github-copilot.svg',
+    ],
+    ['windsurf', 'Windsurf logo', '/ai-harnesses/windsurf.svg'],
+    ['vscode', 'VS Code logo', '/ai-harnesses/vscode.svg'],
+    ['zed', 'Zed logo', '/ai-harnesses/zed.svg'],
   ])('renders the official %s SVG asset', (providerId, label, src) => {
     const markup = renderToStaticMarkup(
       <AiHarnessLogo providerId={providerId} />

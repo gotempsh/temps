@@ -53,6 +53,7 @@ import {
   withProjectSearch,
 } from '@/lib/project-list-pagination'
 import { serviceCount } from '@/lib/terminology'
+import { useWelcomeRedirect } from '@/components/welcome/useWelcomeRedirect'
 
 /** `/projects?new=project` opens the new-project dialog (command palette). */
 const CREATE_PARAM = 'new'
@@ -140,6 +141,13 @@ export function Projects() {
     ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
     : rawProjectsData
   const standaloneTotal = projectsData?.total ?? 0
+  // A fresh console opens the welcome flow: only an unfiltered, fully loaded
+  // answer counts, so a search with no hits never redirects.
+  useWelcomeRedirect(
+    !normalizedProjectSearch && groupsLoaded && rawProjectsData
+      ? visibleAllGroups.length + standaloneTotal
+      : undefined
+  )
   const totalPages = projectPageCount(standaloneTotal, pageSize)
   const isPageOutOfRange = Boolean(standaloneTotal) && page > totalPages
 

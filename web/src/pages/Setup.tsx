@@ -35,6 +35,7 @@ import {
 import { useActivationSignals } from '@/hooks/useActivationSignals'
 import { nextIncompleteGettingStartedItem } from '@/components/dashboard/onboarding-next-step'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
+import { WELCOME_PATH } from '@/components/welcome/useWelcomeRedirect'
 
 // Per-step icon so the checklist reads visually, not just as text rows.
 const STEP_ICONS: Record<string, LucideIcon> = {
@@ -144,6 +145,7 @@ export function Setup() {
     allDone,
     isLoaded,
     markHarnessCompleted,
+    welcomeOpen,
   } = useGettingStarted()
   const signals = useActivationSignals()
 
@@ -167,6 +169,13 @@ export function Setup() {
       <PageHeader
         title="Finish setting up"
         description="A few one-time steps to get your platform production-ready."
+        actions={
+          welcomeOpen ? (
+            <Button asChild variant="outline" size="sm">
+              <Link to={WELCOME_PATH}>Continue the welcome</Link>
+            </Button>
+          ) : undefined
+        }
       />
 
       {!isLoaded ? (
@@ -295,6 +304,11 @@ export function Setup() {
                             {!item.done && (
                               <p className="text-xs text-muted-foreground mt-0.5">
                                 {item.description}
+                              </p>
+                            )}
+                            {!item.done && item.laterReason && (
+                              <p className="mt-0.5 text-xs text-muted-foreground">
+                                Left for later: {item.laterReason}
                               </p>
                             )}
                           </div>

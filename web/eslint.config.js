@@ -135,6 +135,28 @@ export default tseslint.config(
     },
   },
 
+  // The Claude app extension's server: a CommonJS program that the Claude app
+  // runs with Node on the user's computer. It ships as a file, not a module of
+  // the console, so it uses require() and has no dependencies.
+  {
+    files: ['src/lib/claude-extension/*.cjs'],
+    languageOptions: {
+      sourceType: 'commonjs',
+      globals: {
+        Buffer: 'readonly',
+        URL: 'readonly',
+        clearTimeout: 'readonly',
+        setTimeout: 'readonly',
+        module: 'writable',
+        process: 'readonly',
+        require: 'readonly',
+      },
+    },
+    rules: {
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
+
   // React Three Fiber intentionally exposes Three.js properties as JSX
   // intrinsic props; eslint-plugin-react only knows DOM property names.
   {

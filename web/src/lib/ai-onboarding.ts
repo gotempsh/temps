@@ -163,6 +163,8 @@ export function describeHarnessConnection(
       return `Authenticated with the “${AI_HARNESS_KEY_NAME}” key`
     case 'cli_login':
       return `Authenticated through a browser-approved CLI login (key ${via.key_prefix}…)`
+    case 'mcp_client':
+      return `Authenticated with an MCP client key (key ${via.key_prefix}…)`
   }
 }
 

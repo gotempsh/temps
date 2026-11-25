@@ -44,6 +44,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { ReachabilityRun } from '@/components/reachability/ReachabilityRun'
+import { ServePrivatelyAction } from '@/components/reachability/ServePrivatelyAction'
 import {
   reachabilityFormSchema,
   type ReachabilityFormValues,
@@ -1007,7 +1008,14 @@ function BlockedReason({ blocked }: { blocked: PlanBlocked }) {
   return (
     <div className="space-y-1 text-xs">
       <p>{blocked.reason}</p>
-      {blocked.action && <ActionLink action={blocked.action} />}
+      {blocked.action?.kind === 'serve_privately' ? (
+        <ServePrivatelyAction
+          action={blocked.action}
+          replanKey={['reachabilityPlan']}
+        />
+      ) : (
+        blocked.action && <ActionLink action={blocked.action} />
+      )}
     </div>
   )
 }

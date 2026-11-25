@@ -5,6 +5,11 @@ const HARNESS_NAMES: Record<string, string> = {
   claude_cli: 'Claude Code',
   codex_cli: 'Codex',
   opencode: 'OpenCode',
+  cursor: 'Cursor',
+  github_copilot: 'GitHub Copilot',
+  windsurf: 'Windsurf',
+  vscode: 'VS Code',
+  zed: 'Zed',
 }
 
 export function canonicalHarnessId(providerId: string): string {
@@ -16,6 +21,12 @@ export function canonicalHarnessId(providerId: string): string {
     return 'codex_cli'
   }
   if (normalized.includes('opencode')) return 'opencode'
+  if (normalized.includes('copilot')) return 'github_copilot'
+  if (normalized.includes('cursor')) return 'cursor'
+  if (normalized.includes('windsurf')) return 'windsurf'
+  if (['vscode', 'vs code', 'visual studio code'].includes(normalized)) {
+    return 'vscode'
+  }
   return normalized
 }
 
