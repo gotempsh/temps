@@ -12,6 +12,7 @@ use tracing::info;
 
 use super::run::TailscaleOps;
 use super::{ServiceDefinition, ServiceHost, TailscaleCredential};
+use crate::providers::tailscale;
 use crate::reachability::model::RunResource;
 use crate::reachability::run::{
     unrecorded_hosts, ServeClaim, ServeEntryStatus, ServeRelease, ServeWish, ServiceDeletion,
@@ -19,7 +20,6 @@ use crate::reachability::run::{
 };
 use crate::reachability::serve_entries;
 use crate::reachability::service::{load_tailscale_credential, record_of, LiveOps};
-use crate::tailscale;
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()

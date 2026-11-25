@@ -307,19 +307,25 @@ mod tests {
     #[test]
     fn credentials_and_tunnels_are_told_apart_by_the_provider_not_its_name() {
         let registry = ProviderRegistry::builtin();
-        assert!(registry.is_credential(crate::tailscale::KIND));
-        assert!(!registry.is_credential(crate::cloudflare::KIND));
+        assert!(registry.is_credential(crate::providers::tailscale::KIND));
+        assert!(!registry.is_credential(crate::providers::cloudflare::KIND));
         assert!(!registry.is_credential("not_a_provider"));
-        assert_eq!(registry.credential_kinds(), vec![crate::tailscale::KIND]);
+        assert_eq!(
+            registry.credential_kinds(),
+            vec![crate::providers::tailscale::KIND]
+        );
         let tunnels: Vec<String> = registry.infos().into_iter().map(|i| i.kind).collect();
-        assert_eq!(tunnels, vec![crate::cloudflare::KIND]);
-        let error = registry.get(crate::tailscale::KIND).err().expect("refused");
+        assert_eq!(tunnels, vec![crate::providers::cloudflare::KIND]);
+        let error = registry
+            .get(crate::providers::tailscale::KIND)
+            .err()
+            .expect("refused");
         assert!(
             error.to_string().contains("is a credential, not a tunnel"),
             "{error}"
         );
         let error = registry
-            .credential(crate::cloudflare::KIND)
+            .credential(crate::providers::cloudflare::KIND)
             .err()
             .expect("refused");
         assert!(

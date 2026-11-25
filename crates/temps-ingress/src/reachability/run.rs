@@ -51,7 +51,7 @@ use super::model::{
     UndoResult,
 };
 use super::plan::NamedId;
-use crate::tailscale::{ServiceDefinition, ServiceHost, TailscaleCredential};
+use crate::providers::tailscale::{ServiceDefinition, ServiceHost, TailscaleCredential};
 
 /// A managed zone's state under one DNS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3284,12 +3284,12 @@ pub async fn undo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::tailscale;
+    use crate::providers::tailscale::run::{still_ours, TailscaleOps};
     use crate::reachability::model::{AddressSource, Audience};
     use crate::reachability::token_check::{
         PermissionCheck, PermissionState, TokenCheckResult, TokenPermission,
     };
-    use crate::tailscale;
-    use crate::tailscale::run::{still_ours, TailscaleOps};
     use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT};
 
     /// [`super::decide`] with the providers every test run has.
@@ -3344,8 +3344,8 @@ mod tests {
     }
     use std::sync::Mutex;
 
-    use crate::cloudflare::edge_rules::{same_rule, EdgeRuleError, EdgeRuleSeen};
-    use crate::cloudflare::run::{EdgeRuleAt, EdgeRuleMade};
+    use crate::providers::cloudflare::edge_rules::{same_rule, EdgeRuleError, EdgeRuleSeen};
+    use crate::providers::cloudflare::run::{EdgeRuleAt, EdgeRuleMade};
     use crate::reachability::edge_rules::EdgeRulePurpose;
 
     /// Records every call; fails the ones named in `fail`.
@@ -3717,8 +3717,8 @@ mod tests {
 
         fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>> {
             vec![
-                Box::new(crate::cloudflare::run::CloudflareRun::new(self)),
-                Box::new(crate::tailscale::run::TailscaleRun::new(self)),
+                Box::new(crate::providers::cloudflare::run::CloudflareRun::new(self)),
+                Box::new(crate::providers::tailscale::run::TailscaleRun::new(self)),
             ]
         }
     }
@@ -3865,7 +3865,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::cloudflare::run::CloudflareOps for Fake {
+    impl crate::providers::cloudflare::run::CloudflareOps for Fake {
         async fn create_edge_rule(
             &self,
             run_id: i32,
@@ -3888,11 +3888,13 @@ mod tests {
                     rule.description.clone().unwrap_or_default(),
                 ));
             }
-            let reference = crate::cloudflare::edge_rules::rule_ref("abcd", run_id, purpose);
+            let reference =
+                crate::providers::cloudflare::edge_rules::rule_ref("abcd", run_id, purpose);
             // The rule as Cloudflare would return it: Temps' body, with an id.
-            let mut body = crate::cloudflare::edge_rules::rule_body(purpose, host, &reference);
+            let mut body =
+                crate::providers::cloudflare::edge_rules::rule_body(purpose, host, &reference);
             body["id"] = serde_json::json!(format!("rule-{}", rules.len() + 1));
-            let rule = crate::cloudflare::edge_rules::parse_rule(&body).expect("rule");
+            let rule = crate::providers::cloudflare::edge_rules::parse_rule(&body).expect("rule");
             rules.push((purpose, rule.clone()));
             Ok(EdgeRuleMade::Created(Box::new(RunResource::EdgeRule {
                 hostname: host.to_string(),
@@ -6172,12 +6174,12 @@ mod tests {
                 id: "user-https".into(),
                 reference: None,
                 description: Some("mine".into()),
-                expression: crate::cloudflare::edge_rules::expression(
+                expression: crate::providers::cloudflare::edge_rules::expression(
                     EdgeRulePurpose::HttpsRedirect,
                     "myapp.example.com",
                 ),
                 action: "redirect".into(),
-                action_parameters: crate::cloudflare::edge_rules::action_parameters(
+                action_parameters: crate::providers::cloudflare::edge_rules::action_parameters(
                     EdgeRulePurpose::HttpsRedirect,
                 ),
                 enabled: true,
@@ -6215,9 +6217,10 @@ mod tests {
             reachable: true,
             ..Default::default()
         };
-        let mut elsewhere =
-            crate::cloudflare::edge_rules::action_parameters(EdgeRulePurpose::HttpsRedirect)
-                .expect("redirect");
+        let mut elsewhere = crate::providers::cloudflare::edge_rules::action_parameters(
+            EdgeRulePurpose::HttpsRedirect,
+        )
+        .expect("redirect");
         elsewhere["from_value"]["target_url"]["expression"] =
             serde_json::json!("concat(\"http://elsewhere.example.net\", http.request.uri.path)");
         ops.edge_rules.lock().expect("lock").push((
@@ -6226,7 +6229,7 @@ mod tests {
                 id: "user-elsewhere".into(),
                 reference: None,
                 description: Some("mine".into()),
-                expression: crate::cloudflare::edge_rules::expression(
+                expression: crate::providers::cloudflare::edge_rules::expression(
                     EdgeRulePurpose::HttpsRedirect,
                     "myapp.example.com",
                 ),

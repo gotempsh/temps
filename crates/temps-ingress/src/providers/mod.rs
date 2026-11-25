@@ -6,6 +6,9 @@
 //! provider through [`crate::registry::ProviderRegistry`] and the provider
 //! traits.
 
+pub(crate) mod cloudflare;
+pub(crate) mod tailscale;
+
 use std::sync::Arc;
 
 use crate::registry::ProviderFactory;
@@ -13,7 +16,7 @@ use crate::registry::ProviderFactory;
 /// Every built-in provider, in the order the console lists them.
 pub fn builtin() -> Vec<Arc<dyn ProviderFactory>> {
     vec![
-        Arc::new(crate::cloudflare::CloudflareTunnelFactory),
-        Arc::new(crate::tailscale::TailscaleFactory),
+        Arc::new(crate::providers::cloudflare::CloudflareTunnelFactory),
+        Arc::new(crate::providers::tailscale::TailscaleFactory),
     ]
 }

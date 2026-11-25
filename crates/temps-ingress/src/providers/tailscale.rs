@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use temps_core::tailnet::{messages, valid_service_label};
+use temps_core::tailnet::messages;
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -292,11 +292,6 @@ pub fn service_name(name: &str) -> String {
         Some(_) => label,
         None => format!("svc:{label}"),
     }
-}
-
-/// `svc:myapp` → `myapp`, the DNS label of `myapp.<tailnet>.ts.net`.
-pub fn service_label(name: &str) -> &str {
-    name.strip_prefix("svc:").unwrap_or(name)
 }
 
 /// The marker a Service Temps makes carries (D4): ownership is the
@@ -1077,11 +1072,6 @@ pub fn auto_approvers_snippet(service: &str, tag: &str) -> String {
     )
 }
 
-/// Whether `name` can be a Service name.
-pub fn valid_name(name: &str) -> bool {
-    valid_service_label(name)
-}
-
 /// The `tailscale` provider in the ADR 058 D8 registry: a credential, not a
 /// tunnel. Its row holds the OAuth client sealed in `setup_secrets`.
 pub struct TailscaleFactory;
@@ -1203,6 +1193,7 @@ impl crate::registry::ProviderFactory for TailscaleFactory {
 mod tests {
     use super::*;
     use serde_json::json;
+    use temps_core::tailnet::valid_service_label;
 
     // Answers in the shape Tailscale's v2 API documents: errors are
     // `{"message": …}`, a Service is `{name, addrs, comment, annotations,
@@ -1441,8 +1432,8 @@ mod tests {
 
     #[test]
     fn the_probe_name_is_one_no_tailnet_accepts() {
-        assert!(!valid_name(PROBE_SERVICE));
-        assert!(valid_name("myapp-staging"));
+        assert!(!valid_service_label(PROBE_SERVICE));
+        assert!(valid_service_label("myapp-staging"));
     }
 
     #[test]

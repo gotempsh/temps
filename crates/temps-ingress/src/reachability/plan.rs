@@ -69,9 +69,9 @@ use super::model::{
     ActionKind, AddressAudience, Audience, AudienceChoice, PlanBlocked, PlanOption, PlanOptionKind,
     PlanStep, PlannedRecord, ReachAction, ReachabilityPlan, StepKind, WayInChoice,
 };
+use crate::providers::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 use crate::registry::{FieldChoice, FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
-use crate::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 
 /// Field keys of the apply request.
 pub const FIELD_ADDRESS: &str = "address";

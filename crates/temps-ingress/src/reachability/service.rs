@@ -88,13 +88,13 @@ use super::token_check::{
     check_token, check_token_matching, TokenCheckRequest, TokenCheckResult, ZoneMatch,
 };
 use crate::error::IngressError;
+use crate::providers::tailscale::{
+    self, ScopeCheck, ServiceDefinition, ServiceHost, TailnetApi, TailscaleClient,
+    TailscaleCredential,
+};
 use crate::registry::ProviderRegistry;
 use crate::service::{
     HostnameMode, IngressConnectorService, SetHostnameChoiceRequest, TunnelMoveGuard,
-};
-use crate::tailscale::{
-    self, ScopeCheck, ServiceDefinition, ServiceHost, TailnetApi, TailscaleClient,
-    TailscaleCredential,
 };
 
 /// The DNS controller stamped on records a run sets.
@@ -1066,10 +1066,10 @@ impl ReachabilityService {
         let tag = report
             .tags
             .iter()
-            .find(|t| t.as_str() == crate::tailscale::DEFAULT_TAG)
+            .find(|t| t.as_str() == crate::providers::tailscale::DEFAULT_TAG)
             .or_else(|| report.tags.first())
             .cloned()
-            .unwrap_or_else(|| crate::tailscale::DEFAULT_TAG.to_string());
+            .unwrap_or_else(|| crate::providers::tailscale::DEFAULT_TAG.to_string());
         let hosts = match self.cached_service_hosts(service).await {
             Ok(hosts) => hosts,
             Err(error) => {

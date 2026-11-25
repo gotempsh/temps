@@ -3107,7 +3107,7 @@ mod tests {
     #[test]
     fn a_new_tunnels_host_suffix_is_checked() {
         use crate::registry::ProviderFactory;
-        let info = crate::cloudflare::CloudflareTunnelFactory.info();
+        let info = crate::providers::cloudflare::CloudflareTunnelFactory.info();
         let zone = setup_with_domain(Some("example.com"));
         assert_eq!(host_suffix_for(&info, &zone, None).unwrap(), None);
         assert_eq!(host_suffix_for(&info, &zone, Some("  ")).unwrap(), None);
@@ -3377,7 +3377,7 @@ mod tests {
         let registry = ProviderRegistry::builtin();
         let mut model = connector_model(1, "example.com", true);
         assert!(registry.writes_dns(&model));
-        model.provider = crate::tailscale::KIND.into();
+        model.provider = crate::providers::tailscale::KIND.into();
         assert!(!registry.writes_dns(&model));
         model.provider = "another_provider".into();
         assert!(!registry.writes_dns(&model));
@@ -3547,7 +3547,7 @@ mod tests {
         #[async_trait::async_trait]
         impl TunnelProvider for FakeTunnels {
             fn kind(&self) -> &'static str {
-                crate::cloudflare::KIND
+                crate::providers::cloudflare::KIND
             }
             async fn ensure(&self, ctx: &TunnelContext<'_>) -> Result<TunnelHandle, IngressError> {
                 // A real provider recreates a tunnel deleted at the provider.
@@ -3569,7 +3569,7 @@ mod tests {
             fn connector_spec(&self, id: i32, _h: &TunnelHandle, port: u16) -> NodeConnectorSpec {
                 NodeConnectorSpec {
                     id,
-                    provider: crate::cloudflare::KIND.into(),
+                    provider: crate::providers::cloudflare::KIND.into(),
                     revision: String::new(),
                     edge_port: port,
                     client_address_header: None,
@@ -3616,7 +3616,7 @@ mod tests {
         impl crate::registry::ProviderFactory for FakeFactory {
             fn info(&self) -> ProviderInfo {
                 ProviderInfo {
-                    kind: crate::cloudflare::KIND.into(),
+                    kind: crate::providers::cloudflare::KIND.into(),
                     name: "Fake".into(),
                     summary: String::new(),
                     requirements: Vec::new(),
@@ -3631,7 +3631,7 @@ mod tests {
                 &self,
                 _connector: Option<&ingress_connectors::Model>,
             ) -> crate::provider::Capabilities {
-                crate::cloudflare::capabilities()
+                crate::providers::cloudflare::capabilities()
             }
             async fn validate(
                 &self,
@@ -3717,7 +3717,7 @@ mod tests {
             let now = Utc::now();
             let connector = ingress_connectors::ActiveModel {
                 name: Set("homelab".into()),
-                provider: Set(crate::cloudflare::KIND.into()),
+                provider: Set(crate::providers::cloudflare::KIND.into()),
                 dns_provider_id: Set(None),
                 domain: Set("example.com".into()),
                 external_id: Set(Some("tunnel-1".into())),

@@ -236,9 +236,13 @@ class ProviderBoundaryTests(unittest.TestCase):
             self.root,
             "temps-ingress",
             {
-                "src/cloudflare.rs": """\
+                "src/providers/cloudflare.rs": """\
                     pub const KIND: &str = "cloudflare_tunnel";
-                    fn own() { crate::cloudflare::KIND; }
+                    fn own() { crate::providers::cloudflare::KIND; }
+                    """,
+                # A provider's old place outside `providers/` is not its module.
+                "src/cloudflare.rs": """\
+                    fn stale() { crate::cloudflare::KIND; }
                     """,
                 "src/providers/tailscale/mod.rs": """\
                     pub const KIND: &str = "tailscale";
@@ -260,7 +264,7 @@ class ProviderBoundaryTests(unittest.TestCase):
         )
         write_crate(self.root, "temps-other", {"src/lib.rs": 'fn x() { tailscale::KIND; }\n'})
         found = counts(self.root)
-        self.assertEqual(found["temps-ingress"].get("provider_named_outside_module"), 2)
+        self.assertEqual(found["temps-ingress"].get("provider_named_outside_module"), 3)
         self.assertNotIn("provider_named_outside_module", found.get("temps-other", {}))
 
 

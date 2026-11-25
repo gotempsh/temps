@@ -807,7 +807,7 @@ pub enum RunResource {
         /// The run whose marker it carries.
         creator_run_id: i32,
         /// As read back once the step was done, with its addresses.
-        definition: crate::tailscale::ServiceDefinition,
+        definition: crate::providers::tailscale::ServiceDefinition,
     },
     /// A tunnel whose environment hosts the run turned on (ADR 068 D3):
     /// undo turns them off, which withdraws every host it generated.
@@ -1446,7 +1446,7 @@ pub struct JournalEntry {
     /// to delete it (ADR 065 D4): the delete goes ahead only while a read
     /// made immediately before it still equals this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shown_service: Option<crate::tailscale::ServiceDefinition>,
+    pub shown_service: Option<crate::providers::tailscale::ServiceDefinition>,
 }
 
 impl JournalEntry {

@@ -11,6 +11,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::providers::tailscale::{
+    self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential,
+};
 use crate::reachability::model::{
     Decision, Intent, JournalEntry, JournalState, RunResource, StepKind, UndoResult,
 };
@@ -19,7 +22,6 @@ use crate::reachability::run::{
     ProviderRun, ProviderUndo, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget, ServeWish,
     ServiceDeletion, ServiceEntryHost, ServicePlan, StepRun, Stop, UndoCheck, WriteError,
 };
-use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
 use temps_core::tailnet::messages as tailnet_messages;
 use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT, REPORT_ERROR};
 
