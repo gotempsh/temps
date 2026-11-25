@@ -56,10 +56,11 @@ use super::access_service::AccessProviderService;
 use super::compute::{
     address_reachability, control_plane_origin, is_local_only, needs_lookup, overall_state,
     summary, AddressFacts, AddressInput, ControlPlaneHost, ControlPlaneOrigin, DirectIngress,
-    InsideCheck, PrivateBinding, PrivateFacts, Resolution, ServeEntryState, ServiceHostsState,
-    TailnetFacts, TunnelState, PRIVATE_COMMAND,
+    InsideCheck, PrivateBinding, PrivateFacts, Resolution, ServeEntryState, TailnetFacts,
+    TunnelState, PRIVATE_COMMAND,
 };
 use super::edge_rules::HttpPolicy;
+use super::model::ServiceDefinition;
 use super::model::{
     AccessBinding, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
     DecideRequest, DnsRecordState, EnvironmentReachability, GateAllowList, GateKind, Intent,
@@ -75,24 +76,19 @@ use super::plan::{
     fingerprint, gate_allow_answer, guess_zone, place_http_policy_steps, plan, planned_record,
     private_worker, record_type_of, records_to_read, tunnel_domain_for, tunnel_route,
     unique_tunnel_name, zone_for, NamedId, PlanFacts, PrivateWorkerFact, ServeEntryFact,
-    ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact, ZoneFact, FIELD_ADDRESS,
-    FIELD_DNS_PROVIDER, FIELD_HTTP_POLICY, FIELD_TOKEN,
+    ServiceSeen, TailnetWorkerFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_HTTP_POLICY,
+    FIELD_TOKEN,
 };
 use super::run::{
-    created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
-    AccessRun, NewTunnel, ProviderRun, RunInput, RunOps, RunRecord, RunSink, ServeTarget,
-    ServicePlan, Stop, Timing, TunnelStatus, WriteError, ZoneState,
+    created, decide, execute, reconcile_journal, resume, undo, AccessRun, NewTunnel, ProviderRun,
+    RunInput, RunOps, RunRecord, RunSink, ServeTarget, ServicePlan, Stop, Timing, TunnelStatus,
+    WriteError, ZoneState,
 };
-use super::serve_entries;
 use super::token_check::{
     check_token, check_token_matching, TokenCheckRequest, TokenCheckResult, ZoneMatch,
 };
 use crate::error::IngressError;
-use crate::providers::tailscale::plan::{service_of, service_tag, service_worker};
-use crate::providers::tailscale::{
-    self, ScopeCheck, ServiceDefinition, ServiceHost, TailnetApi, TailscaleClient,
-    TailscaleCredential,
-};
+use crate::providers::Tailnet;
 use crate::registry::ProviderRegistry;
 use crate::service::{
     HostnameMode, IngressConnectorService, SetHostnameChoiceRequest, TunnelMoveGuard,
@@ -203,45 +199,13 @@ pub struct ReachabilityDeps {
 pub struct ReachabilityService {
     pub(super) deps: Arc<ReachabilityDeps>,
     http: reqwest::Client,
-    /// Tailscale's API, its access tokens in memory only (ADR 065 D2).
-    tailnet: Arc<dyn TailnetApi>,
-    /// The last scope check of the cluster's Tailscale credential, by row
-    /// id: planning proves the scopes without probing on every plan.
-    scopes: Arc<Mutex<Option<(i32, std::time::Instant, ScopeCheck)>>>,
-    /// Recent host reads of each Service, for the outside check.
-    hosts: Arc<Mutex<HashMap<String, CachedHosts>>>,
+    /// The tailnet planning and applying ask about (ADR 065 D2).
+    tailnet: Arc<Tailnet>,
     /// Environments with a run in progress: one at a time each.
     active: Arc<Mutex<HashSet<i32>>>,
     timing: Timing,
     /// The providers whose steps runs hand over (ADR-116 D3).
     providers: ProviderRegistry,
-}
-
-/// One Service's host read, and when it was made.
-type CachedHosts = (std::time::Instant, Result<Vec<ServiceHost>, String>);
-
-/// How long a scope check of the Tailscale credential is reused.
-const SCOPE_CHECK_TTL: Duration = Duration::from_secs(5 * 60);
-/// How long a Service's host read is reused by the outside check.
-const SERVICE_HOSTS_TTL: Duration = Duration::from_secs(30);
-/// At most this many Services' host reads are kept.
-const SERVICE_HOSTS_CACHED: usize = 256;
-
-/// The cluster's Tailscale credential (ADR 065 D2): `(row id, name, the
-/// OAuth client)`, decrypted for the call.
-pub(crate) async fn load_tailscale_credential(
-    connectors: &IngressConnectorService,
-) -> Result<Option<(i32, String, TailscaleCredential)>, String> {
-    let Some((row, settings, secrets)) = connectors
-        .credential(tailscale::KIND)
-        .await
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
-    };
-    let credential = TailscaleCredential::from_answers(&settings, &secrets)
-        .map_err(|e| format!("Tailscale OAuth client {} ('{}'): {e}", row.id, row.name))?;
-    Ok(Some((row.id, row.name, credential)))
 }
 
 /// The environment and project a request is about.
@@ -272,10 +236,8 @@ impl ReachabilityService {
             .unwrap_or_default();
         Self {
             deps: Arc::new(deps),
-            tailnet: Arc::new(TailscaleClient::new()),
+            tailnet: Arc::new(Tailnet::new()),
             http,
-            scopes: Arc::new(Mutex::new(None)),
-            hosts: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashSet::new())),
             timing: Timing::default(),
             providers: ProviderRegistry::builtin(),
@@ -291,83 +253,6 @@ impl ReachabilityService {
             project_id,
             environment_id,
         }
-    }
-
-    /// The cluster's Tailscale credential as a plan sees it, its scopes
-    /// proven at most every [`SCOPE_CHECK_TTL`] (ADR 065 D2).
-    async fn tailscale_credential_fact(&self) -> Option<TailscaleCredentialFact> {
-        let (id, name, credential) = match load_tailscale_credential(&self.deps.connectors).await {
-            Ok(Some(found)) => found,
-            Ok(None) => return None,
-            Err(error) => {
-                return Some(TailscaleCredentialFact {
-                    id: 0,
-                    name: String::new(),
-                    refusal: Some(format!(
-                        "Temps could not read the cluster's Tailscale OAuth client: {error}"
-                    )),
-                })
-            }
-        };
-        let cached = self.scopes.lock().ok().and_then(|cache| {
-            cache
-                .as_ref()
-                .filter(|(cached, at, _)| *cached == id && at.elapsed() < SCOPE_CHECK_TTL)
-                .map(|(_, _, check)| check.clone())
-        });
-        let check = match cached {
-            Some(check) => check,
-            None => {
-                let check = self.tailnet.check_scopes(&credential).await;
-                if let Ok(mut cache) = self.scopes.lock() {
-                    *cache = Some((id, std::time::Instant::now(), check.clone()));
-                }
-                check
-            }
-        };
-        Some(TailscaleCredentialFact {
-            id,
-            name,
-            refusal: check.refusal(),
-        })
-    }
-
-    /// The hosts advertising `service`, read at most every
-    /// [`SERVICE_HOSTS_TTL`] for the outside check (ADR 065 D5).
-    async fn cached_service_hosts(&self, service: &str) -> Result<Vec<ServiceHost>, String> {
-        if let Some(hit) = self.hosts.lock().ok().and_then(|cache| {
-            cache
-                .get(service)
-                .filter(|(at, _)| at.elapsed() < SERVICE_HOSTS_TTL)
-                .map(|(_, hosts)| hosts.clone())
-        }) {
-            return hit;
-        }
-        let read = match load_tailscale_credential(&self.deps.connectors).await {
-            Ok(Some((_, _, credential))) => self
-                .tailnet
-                .service_hosts(&credential, service)
-                .await
-                .map_err(|e| e.to_string()),
-            Ok(None) => Err(
-                "This cluster has no Tailscale OAuth client any more, so Temps cannot check which \
-                 machines host it."
-                    .to_string(),
-            ),
-            Err(error) => Err(error),
-        };
-        if let Ok(mut cache) = self.hosts.lock() {
-            if cache.len() >= SERVICE_HOSTS_CACHED {
-                cache.retain(|_, (at, _)| at.elapsed() < SERVICE_HOSTS_TTL);
-            }
-            if cache.len() < SERVICE_HOSTS_CACHED {
-                cache.insert(
-                    service.to_string(),
-                    (std::time::Instant::now(), read.clone()),
-                );
-            }
-        }
-        read
     }
 
     fn owned(&self, environment_id: Option<i32>) -> bool {
@@ -1049,59 +934,19 @@ impl ReachabilityService {
                 continue;
             };
             let state = self
-                .service_hosts_state(service, node_id, &binding.address_id, &tailnet.report)
+                .tailnet
+                .service_hosts_state(
+                    &self.deps.connectors,
+                    self.deps.db.as_ref(),
+                    service,
+                    node_id,
+                    &binding.address_id,
+                    &tailnet.report,
+                )
                 .await;
             tailnet.service = Some(state);
         }
         facts
-    }
-
-    /// What the outside check knows of `service`'s hosts (ADR 065 D5).
-    async fn service_hosts_state(
-        &self,
-        service: &str,
-        node_id: i32,
-        address_id: &str,
-        report: &TailscaleReport,
-    ) -> ServiceHostsState {
-        let tag = report
-            .tags
-            .iter()
-            .find(|t| t.as_str() == crate::providers::tailscale::DEFAULT_TAG)
-            .or_else(|| report.tags.first())
-            .cloned()
-            .unwrap_or_else(|| crate::providers::tailscale::DEFAULT_TAG.to_string());
-        let hosts = match self.cached_service_hosts(service).await {
-            Ok(hosts) => hosts,
-            Err(error) => {
-                return ServiceHostsState {
-                    name: service.to_string(),
-                    tag,
-                    unrecorded: Err(error),
-                    approved: None,
-                }
-            }
-        };
-        let entries = match serve_entries::for_service(self.deps.db.as_ref(), service).await {
-            Ok(entries) => entries,
-            Err(error) => {
-                return ServiceHostsState {
-                    name: service.to_string(),
-                    tag,
-                    unrecorded: Err(format!(
-                        "the Serve entries naming it could not be read: {error}"
-                    )),
-                    approved: None,
-                }
-            }
-        };
-        let approved = worker_approval(&hosts, &entries, node_id, address_id);
-        ServiceHostsState {
-            name: service.to_string(),
-            tag,
-            unrecorded: Ok(unrecorded_hosts(&hosts, &entries, Some(address_id))),
-            approved,
-        }
     }
 
     pub(super) async fn judge(
@@ -1577,7 +1422,7 @@ impl ReachabilityService {
         // ADR 065 D2: the Tailscale credential matters only where a worker
         // lets Temps use its tailscaled.
         let tailscale_credential = if tailnet_workers.iter().any(|w| w.report.consent) {
-            self.tailscale_credential_fact().await
+            self.tailnet.credential_fact(&self.deps.connectors).await
         } else {
             None
         };
@@ -1725,27 +1570,12 @@ impl ReachabilityService {
             }
             // ADR 065 D4: the plan reads the Service name first, and holds
             // the run to what it found.
-            if let (Some((service, _)), Some(credential)) = (
-                service_of(&facts, &address),
-                facts
-                    .tailscale_credential
-                    .as_ref()
-                    .filter(|c| c.refusal.is_none()),
-            ) {
-                let seen = match load_tailscale_credential(&self.deps.connectors).await {
-                    Ok(Some((id, _, oauth))) if id == credential.id => {
-                        match self.tailnet.get_service(&oauth, &service).await {
-                            Ok(None) => ServiceSeen::Absent,
-                            Ok(Some(definition)) => ServiceSeen::Found(definition),
-                            Err(error) => ServiceSeen::Unreadable(error.to_string()),
-                        }
-                    }
-                    Ok(_) => ServiceSeen::Unreadable(
-                        "the cluster's Tailscale OAuth client changed while planning".into(),
-                    ),
-                    Err(error) => ServiceSeen::Unreadable(error),
-                };
-                service_seen = Some((service, seen));
+            if let Some(seen) = self
+                .tailnet
+                .service_seen(&self.deps.connectors, &facts, &address)
+                .await
+            {
+                service_seen = Some(seen);
             }
         }
         Ok(PlanFacts {
@@ -1786,56 +1616,6 @@ impl ReachabilityService {
             facts.push(AccessProviderFact { id, name, covering });
         }
         Ok(facts)
-    }
-
-    /// ADR 065 3b: the worker that will host `service` must be a device of
-    /// the tailnet the credential creates it in. A credential's tailnet
-    /// `-` is whichever tailnet the OAuth client belongs to, so the worker is
-    /// looked up through it by its stable node id rather than by comparing
-    /// names. Not found, or not answerable, refuses before anything is made.
-    async fn check_worker_in_credentials_tailnet(
-        &self,
-        entered: Option<&TailscaleCredential>,
-        worker: &TailnetWorkerFact,
-        service: &str,
-    ) -> Result<(), ReachabilityError> {
-        let credential = match entered {
-            Some(credential) => credential.clone(),
-            None => match load_tailscale_credential(&self.deps.connectors).await {
-                Ok(Some((_, _, credential))) => credential,
-                Ok(None) => {
-                    return Err(ReachabilityError::Conflict(format!(
-                        "The cluster's Tailscale OAuth client is gone; plan `{service}` again."
-                    )))
-                }
-                Err(error) => return Err(ReachabilityError::Validation(error)),
-            },
-        };
-        let Some(node_id) = worker.report.node_id.as_deref().filter(|id| !id.is_empty()) else {
-            return Err(ReachabilityError::Validation(format!(
-                "{} has not reported its Tailscale node id yet, so Temps cannot check it is in \
-                 the tailnet `{service}` would be created in. Try again once its agent has \
-                 reported.",
-                worker.name
-            )));
-        };
-        match self.tailnet.has_device(&credential, node_id).await {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(ReachabilityError::Validation(format!(
-                "{} is not a device of the tailnet this Tailscale OAuth client manages \
-                 (`{}`), so `{service}` would be created where {} cannot host it. Use an OAuth \
-                 client of {}'s own tailnet.",
-                worker.name,
-                credential.tailnet,
-                worker.name,
-                worker.report.tailnet.as_deref().unwrap_or("the worker's"),
-            ))),
-            Err(error) => Err(ReachabilityError::Validation(format!(
-                "Temps could not check that {} is in the tailnet `{service}` would be created \
-                 in: {error}",
-                worker.name
-            ))),
-        }
     }
 
     async fn facts_for(
@@ -2264,45 +2044,24 @@ impl ReachabilityService {
             PlanOptionKind::TailscaleService | PlanOptionKind::TailscaleServiceWithCredential => {
                 // ADR 065 D1, D4: the Service the address names, on a worker
                 // that can host it now.
-                let (service, tailnet) = service_of(&facts, &address).ok_or_else(|| {
-                    ReachabilityError::Conflict(format!(
-                        "{address} is not a Tailscale Service name in your tailnet any more."
-                    ))
-                })?;
-                let worker = service_worker(&facts, &tailnet).ok_or_else(|| {
-                    ReachabilityError::Conflict(format!(
-                        "No worker on {tailnet} can host `{service}` any more."
-                    ))
-                })?;
-                let credential_name = if option.kind
-                    == PlanOptionKind::TailscaleServiceWithCredential
-                {
-                    let mut settings = std::collections::BTreeMap::new();
-                    let mut secrets = std::collections::BTreeMap::new();
-                    for key in [tailscale::FIELD_CLIENT_ID, tailscale::FIELD_TAILNET] {
-                        if let Some(value) = text(key) {
-                            settings.insert(key.to_string(), value);
-                        }
-                    }
-                    if let Some(value) = text(tailscale::FIELD_CLIENT_SECRET) {
-                        secrets.insert(tailscale::FIELD_CLIENT_SECRET.to_string(), value);
-                    }
-                    let credential = TailscaleCredential::from_answers(&settings, &secrets)?;
-                    // D2: nothing starts until every scope is proven.
-                    if let Some(refusal) = self.tailnet.check_scopes(&credential).await.refusal() {
-                        return Err(ReachabilityError::Validation(refusal));
-                    }
-                    input.tailscale_credential = Some(credential);
-                    self.unused_credential_name().await?
-                } else {
-                    String::new()
-                };
-                self.check_worker_in_credentials_tailnet(
-                    input.tailscale_credential.as_ref(),
-                    worker,
-                    &service,
-                )
-                .await?;
+                let choice = Tailnet::service_host(&facts, &address)?;
+                let (service, tailnet, worker) = (choice.service, choice.tailnet, choice.worker);
+                let credential_name =
+                    if option.kind == PlanOptionKind::TailscaleServiceWithCredential {
+                        let credential = self.tailnet.pasted_credential(text, false).await?;
+                        input.tailscale_credential = Some(credential);
+                        self.unused_credential_name().await?
+                    } else {
+                        String::new()
+                    };
+                self.tailnet
+                    .check_worker(
+                        &self.deps.connectors,
+                        input.tailscale_credential.as_ref(),
+                        worker,
+                        &service,
+                    )
+                    .await?;
                 let seen = match &facts.service_seen {
                     Some((name, ServiceSeen::Found(definition))) if *name == service => {
                         Some(definition.clone())
@@ -2312,7 +2071,7 @@ impl ReachabilityService {
                 input.tailscale_service = Some(ServicePlan {
                     name: service.clone(),
                     tailnet: tailnet.clone(),
-                    tag: service_tag(worker),
+                    tag: choice.tag,
                     install_id: facts.install_id.clone(),
                     seen,
                     credential_name,
@@ -2855,29 +2614,7 @@ impl ReachabilityService {
                     .filter(|t| !t.is_empty())
                     .map(str::to_string)
             };
-            let mut settings = std::collections::BTreeMap::new();
-            let mut secrets = std::collections::BTreeMap::new();
-            for key in [tailscale::FIELD_CLIENT_ID, tailscale::FIELD_TAILNET] {
-                if let Some(value) = answer(key) {
-                    settings.insert(key.to_string(), value);
-                }
-            }
-            match answer(tailscale::FIELD_CLIENT_SECRET) {
-                Some(value) => {
-                    secrets.insert(tailscale::FIELD_CLIENT_SECRET.to_string(), value);
-                }
-                None => {
-                    return Err(ReachabilityError::Validation(
-                        "Paste the Tailscale OAuth client again: Temps never stores it until the \
-                         run saves it."
-                            .into(),
-                    ))
-                }
-            }
-            let credential = TailscaleCredential::from_answers(&settings, &secrets)?;
-            if let Some(refusal) = self.tailnet.check_scopes(&credential).await.refusal() {
-                return Err(ReachabilityError::Validation(refusal));
-            }
+            let credential = self.tailnet.pasted_credential(answer, true).await?;
             input.tailscale_credential = Some(credential);
         }
         self.claim(environment_id, &scope.environment.name).await?;
@@ -3387,7 +3124,7 @@ pub struct LiveOps {
     pub(crate) http: reqwest::Client,
     /// The providers whose steps a run hands over.
     providers: ProviderRegistry,
-    pub(crate) tailnet: Arc<dyn TailnetApi>,
+    pub(crate) tailnet: Arc<Tailnet>,
     /// The ADR 031 ownership scope of the DNS records a run sets.
     project_id: Option<i32>,
     environment_id: Option<i32>,
@@ -4008,9 +3745,7 @@ impl RunOps for LiveOps {
         let service = ReachabilityService {
             deps: self.deps.clone(),
             http: self.http.clone(),
-            tailnet: self.tailnet.clone(),
-            scopes: Arc::new(Mutex::new(None)),
-            hosts: Arc::new(Mutex::new(HashMap::new())),
+            tailnet: Arc::new(self.tailnet.uncached()),
             active: Arc::new(Mutex::new(HashSet::new())),
             timing: Timing::default(),
             providers: self.providers.clone(),

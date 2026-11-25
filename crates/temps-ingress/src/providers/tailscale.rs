@@ -26,6 +26,7 @@
 pub mod live;
 pub mod plan;
 pub mod run;
+pub(crate) mod service;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};

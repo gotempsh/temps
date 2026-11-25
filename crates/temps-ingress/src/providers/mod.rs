@@ -9,6 +9,10 @@
 pub(crate) mod cloudflare;
 pub(crate) mod tailscale;
 
+/// What planning and applying ask of the tailnet: Tailscale's own state,
+/// which the engine holds and calls by method.
+pub(crate) use tailscale::service::Tailnet;
+
 use std::sync::Arc;
 
 use crate::registry::ProviderFactory;

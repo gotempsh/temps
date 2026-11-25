@@ -11,6 +11,7 @@ use temps_entities::{ingress_connectors, reachability_runs, tailnet_serve_entrie
 use tracing::info;
 
 use super::run::TailscaleOps;
+use super::service::load_credential;
 use super::{ServiceDefinition, ServiceHost, TailscaleCredential};
 use crate::providers::tailscale;
 use crate::reachability::model::RunResource;
@@ -19,7 +20,7 @@ use crate::reachability::run::{
     ServiceEntryHost, WriteError,
 };
 use crate::reachability::serve_entries;
-use crate::reachability::service::{load_tailscale_credential, record_of, LiveOps};
+use crate::reachability::service::{record_of, LiveOps};
 
 fn text(error: impl std::fmt::Display) -> String {
     error.to_string()
@@ -129,6 +130,7 @@ impl TailscaleOps for LiveOps {
     async fn read_service(&self, name: &str) -> Result<Option<ServiceDefinition>, String> {
         let credential = self.tailscale().await?;
         self.tailnet
+            .api
             .get_service(&credential, name)
             .await
             .map_err(text)
@@ -137,6 +139,7 @@ impl TailscaleOps for LiveOps {
     async fn create_service(&self, definition: &ServiceDefinition) -> Result<(), WriteError> {
         let credential = self.tailscale().await.map_err(WriteError::refused)?;
         self.tailnet
+            .api
             .create_service(&credential, definition)
             .await
             .map_err(|error| WriteError {
@@ -148,6 +151,7 @@ impl TailscaleOps for LiveOps {
     async fn service_hosts(&self, name: &str) -> Result<Vec<ServiceHost>, String> {
         let credential = self.tailscale().await?;
         self.tailnet
+            .api
             .service_hosts(&credential, name)
             .await
             .map_err(text)
@@ -212,6 +216,7 @@ impl TailscaleOps for LiveOps {
         }
         let hosts = self
             .tailnet
+            .api
             .service_hosts(&credential, name)
             .await
             .map_err(text)?;
@@ -223,6 +228,7 @@ impl TailscaleOps for LiveOps {
         }
         let current = match self
             .tailnet
+            .api
             .get_service(&credential, name)
             .await
             .map_err(text)?
@@ -242,6 +248,7 @@ impl TailscaleOps for LiveOps {
             )));
         }
         self.tailnet
+            .api
             .delete_service(&credential, name)
             .await
             .map_err(text)?;
@@ -254,7 +261,7 @@ impl TailscaleOps for LiveOps {
 impl LiveOps {
     /// The cluster's Tailscale OAuth client, for a run's API call.
     pub(crate) async fn tailscale(&self) -> Result<TailscaleCredential, String> {
-        load_tailscale_credential(&self.deps.connectors)
+        load_credential(&self.deps.connectors)
             .await?
             .map(|(_, _, credential)| credential)
             .ok_or_else(|| {
