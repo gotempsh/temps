@@ -12,7 +12,6 @@ import {
   linkServiceToProjectMutation,
   listProjectServicesOptions,
   listServicesOptions,
-  getProvidersMetadataOptions,
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { MetricSparkline } from '@/components/charts/metric-sparkline'
@@ -49,7 +48,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
-import { serviceCreateHref } from '@/lib/service-project-link'
+import { DatabaseTypeCards } from '@/components/storage/DatabaseTypeCards'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
@@ -69,7 +68,7 @@ import { toast } from 'sonner'
  * a linked service. Renders nothing when the service has no metric history
  * (monitoring disabled, service stopped) so unmonitored rows stay clean.
  */
-function ResourceSparkline({
+export function ResourceSparkline({
   serviceId,
   metric,
   historyMetric,
@@ -373,7 +372,6 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const [linkChange, setLinkChange] = useState<ServiceLinkChange | null>(null)
   const [serviceToUnlink, setServiceToUnlink] =
     useState<ExternalServiceInfo | null>(null)
-  const providers = useQuery({ ...getProvidersMetadataOptions(), retry: false })
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Databases' }])
@@ -488,76 +486,11 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     linkServiceMutation.isPending || unlinkServiceMutation.isPending
 
   const databaseTypes = (
-    <section
-      aria-label={linkedCount ? 'Create a new database' : 'Create a database'}
-      className="space-y-4"
-    >
-      <div>
-        <h2 className="text-lg font-semibold">
-          {linkedCount ? 'Create a new database' : 'Create a database'}
-        </h2>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Choose a database type to configure a new database linked to{' '}
-          {project.name}.
-        </p>
-      </div>
-      {providers.isPending ? (
-        <div
-          role="status"
-          aria-label="Loading database types"
-          className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
-        >
-          {Array.from({ length: 5 }, (_, index) => (
-            <div
-              key={index}
-              className="h-40 animate-pulse rounded-lg bg-muted"
-            />
-          ))}
-        </div>
-      ) : providers.isError ? (
-        <Alert variant="destructive">
-          <AlertTitle>Database types could not be loaded</AlertTitle>
-          <AlertDescription>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void providers.refetch()}
-            >
-              Retry database types
-            </Button>
-          </AlertDescription>
-        </Alert>
-      ) : providers.data?.length ? (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {providers.data.map((provider) => (
-            <Link
-              key={provider.service_type}
-              to={serviceCreateHref(provider.service_type, project.id)}
-              className="group flex min-w-0 flex-col items-start rounded-lg border bg-background p-5 transition-colors hover:border-foreground/30 hover:bg-muted/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
-            >
-              <div className="mb-4 flex size-10 items-center justify-center">
-                <ServiceLogo service={provider.service_type} />
-              </div>
-              <h3 className="font-medium">{provider.display_name}</h3>
-              <p className="mt-1 flex-1 text-sm text-muted-foreground">
-                {provider.description}
-              </p>
-              <span className="mt-5 inline-flex items-center gap-2 text-sm font-medium">
-                Create database{' '}
-                <ChevronRight
-                  aria-hidden="true"
-                  className="size-4 transition-transform group-hover:translate-x-0.5"
-                />
-              </span>
-            </Link>
-          ))}
-        </div>
-      ) : (
-        <p className="text-sm text-muted-foreground">
-          No database types are available.
-        </p>
-      )}
-    </section>
+    <DatabaseTypeCards
+      projectId={project.id}
+      heading={linkedCount ? 'Create a new database' : 'Create a database'}
+      description={`Choose a database type to configure a new database linked to ${project.name}.`}
+    />
   )
 
   const header = (
@@ -573,7 +506,9 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       actions={
         <div className="flex flex-wrap items-center gap-2">
           <Button asChild variant="outline" size="sm">
-            <Link to="/storage">All databases on this server</Link>
+            <Link to="/storage" title="Every database on this server">
+              All databases
+            </Link>
           </Button>
           <CreateServiceButton
             projectId={project.id}
@@ -600,7 +535,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
               className="ml-3"
               onClick={() => void refetchServicesLinked()}
             >
-              Retry databases
+              Retry
             </Button>
           </AlertDescription>
         </Alert>
@@ -701,8 +636,9 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                 variant="outline"
                 size="sm"
                 onClick={() => setPickerOpen(true)}
+                title="Choose from the databases on this server"
               >
-                Choose from this server
+                Choose database
               </Button>
             )}
           </div>

@@ -175,17 +175,45 @@ export function groupSectionHref(slug: string, section: GroupNavSection) {
 
 /**
  * The server-wide list each scoped project page links to, so an admin who
- * needs everything on the server has one explicit way there.
+ * needs everything on the server has one explicit way there. `label` is the
+ * button text, kept short; `title` is its tooltip and the palette entry.
  */
 export const SERVER_WIDE_LISTS = {
-  databases: { title: 'All databases on this server', url: '/storage' },
-  domains: { title: 'All domains on this server', url: '/domains' },
-  backups: { title: 'All backups on this server', url: '/backups' },
-  logs: { title: 'All logs on this server', url: '/logs' },
-  errors: { title: 'All errors on this server', url: '/errors' },
-  traces: { title: 'All traces on this server', url: '/traces' },
-  analytics: { title: 'Analytics for every service', url: '/analytics' },
+  databases: {
+    label: 'All databases',
+    title: 'Every database on this server',
+    url: '/storage',
+  },
+  domains: {
+    label: 'All domains',
+    title: 'Every domain on this server',
+    url: '/domains',
+  },
+  backups: {
+    label: 'All backups',
+    title: 'Every backup on this server',
+    url: '/backups',
+  },
+  logs: { label: 'All logs', title: 'Logs of every service', url: '/logs' },
+  errors: {
+    label: 'All errors',
+    title: 'Errors of every service',
+    url: '/errors',
+  },
+  traces: {
+    label: 'All traces',
+    title: 'Traces of every service',
+    url: '/traces',
+  },
+  analytics: {
+    label: 'All services',
+    title: 'Analytics of every service',
+    url: '/analytics',
+  },
 } as const
+
+export type ServerWideList =
+  (typeof SERVER_WIDE_LISTS)[keyof typeof SERVER_WIDE_LISTS]
 
 /** Former `?tab=` values of a project's overview, now pages of their own. */
 const LEGACY_GROUP_TABS: Record<string, string> = {

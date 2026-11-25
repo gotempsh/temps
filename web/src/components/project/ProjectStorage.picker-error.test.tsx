@@ -9,6 +9,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
@@ -60,9 +61,7 @@ test("a failed server-wide picker keeps the service's linked databases", async (
   expect(await screen.findByText('orders-db')).toBeTruthy()
   expect(serverCalls).toBe(0)
 
-  fireEvent.click(
-    screen.getByRole('button', { name: 'Choose from this server' })
-  )
+  fireEvent.click(screen.getByRole('button', { name: 'Choose database' }))
   expect(
     await screen.findByText('The databases on this server could not be loaded')
   ).toBeTruthy()
@@ -70,6 +69,9 @@ test("a failed server-wide picker keeps the service's linked databases", async (
   expect(screen.getByText('orders-db')).toBeTruthy()
   expect(screen.queryByText('Databases could not be loaded')).toBeNull()
 
-  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  const pickerAlert = screen
+    .getByText('The databases on this server could not be loaded')
+    .closest('[role="alert"]') as HTMLElement
+  fireEvent.click(within(pickerAlert).getByRole('button', { name: 'Retry' }))
   await waitFor(() => expect(serverCalls).toBe(2))
 })

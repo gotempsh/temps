@@ -59,3 +59,22 @@ test('it sizes to its options, and wraps them instead of scrolling or overflowin
   expect(classes).not.toContain('shrink-0')
   expect(classes.some((c) => /^(overflow|h-\d)/.test(c))).toBe(false)
 })
+
+test('an option shows its image before its label, which still names it', () => {
+  render(
+    <SegmentedControl
+      label="Service"
+      value="web"
+      onValueChange={() => {}}
+      options={[
+        {
+          value: 'web',
+          label: 'web',
+          media: <img alt="" data-testid="web-logo" src="logo.png" />,
+        },
+      ]}
+    />
+  )
+  const option = screen.getByRole('radio', { name: 'web' })
+  expect(option.firstElementChild).toBe(screen.getByTestId('web-logo'))
+})

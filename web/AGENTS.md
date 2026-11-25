@@ -31,6 +31,11 @@ manager is `bun`.
   hand-built initial or a media lookup of a page's own. Pages don't explain
   themselves: no paragraph under a page or section title; at most one short
   line the user needs to act (`DESIGN.md` "Pages don't explain themselves").
+- **Button labels** are a verb or a short noun, at most three words: "Add
+  domain", "Retry", "All databases", "Copy AI prompt". Never a phrase or a
+  sentence ("All databases on this server", "Add a domain to web", "Retry
+  databases") and never a record's name. Put the context in the section
+  heading, the surrounding line or the button's `title` tooltip.
 - **Interactions**: minimise interactions to reach a goal. A primary action
   does the whole job in one click, inline, and shows its result in place;
   never turn a primary button into a "review"/"continue" link or send the user

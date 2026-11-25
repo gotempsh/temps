@@ -20,6 +20,8 @@ import { SidebarProvider } from '@/components/ui/sidebar'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { GroupNav, ServiceScopeNav } from './ProjectScopeNav'
+import { SERVICE_PAGES_KEY } from './service-pages-preference'
+import { setProjectTourActive } from '@/lib/project-tour'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -84,14 +86,109 @@ describe('project scope', () => {
   })
 })
 
-describe('service inside a project', () => {
-  test('keeps the project sidebar and opens the service as a level in it', () => {
+describe('a project with different kinds of services', () => {
+  const app = {
+    ...web,
+    hosting: 'hosted',
+    source_type: 'git',
+    project_type: 'server',
+  }
+  const site = {
+    ...api,
+    name: 'landing',
+    slug: 'landing',
+    hosting: 'hosted',
+    source_type: 'static_files',
+    project_type: 'static',
+  }
+  const monitored = {
+    id: 13,
+    name: 'legacy',
+    slug: 'legacy',
+    preset: 'dockerfile',
+    hosting: 'external',
+    source_type: 'external',
+    project_type: 'server',
+  }
+  const withServices = (...projects: object[]) =>
+    ({ ...group, projects }) as unknown as ProjectGroupResponse
+
+  test('labels each service with its kind and says how many have a page', () => {
     mockApi({})
-    const service = {
-      ...api,
-      source_type: 'docker_image',
-    } as unknown as ProjectResponse
     const view = render(
+      <Shell at="/p/storefront">
+        <GroupNav
+          group={withServices(app, site, monitored)}
+          activeSection="overview"
+        />
+      </Shell>
+    )
+    const services = view.getByRole('list', { name: 'Services' })
+    expect(within(services).getByRole('link', { name: 'legacy (Monitored)' }))
+    expect(
+      within(services).getByRole('link', { name: 'landing (Static site)' })
+    )
+    expect(within(services).getByRole('link', { name: 'web (App)' }))
+    // Deployments: the app and the site, not the monitored service.
+    expect(
+      view.getByRole('link', { name: 'Deployments (2 of 3 services)' })
+    ).toBeTruthy()
+    // Databases: only the app can link one.
+    expect(view.getByRole('link', { name: 'Databases (1 of 3 services)' }))
+    // Errors: every kind sends them, so no count.
+    expect(view.getByRole('link', { name: 'Errors' }))
+  })
+
+  test('hides pages none of its services can have', () => {
+    mockApi({})
+    const view = render(
+      <Shell at="/p/storefront">
+        <GroupNav group={withServices(monitored)} activeSection="overview" />
+      </Shell>
+    )
+    const links = hrefs(view.container)
+    for (const url of [
+      '/p/storefront/deployments',
+      '/p/storefront/domains',
+      '/p/storefront/databases',
+      '/p/storefront/backups',
+      '/p/storefront/variables',
+    ])
+      expect(links).not.toContain(url)
+    // A group left with no pages goes too.
+    expect(view.queryByRole('list', { name: 'Resources' })).toBeNull()
+    for (const url of [
+      '/p/storefront',
+      '/p/storefront/logs',
+      '/p/storefront/errors',
+      '/p/storefront/traces',
+      '/p/storefront/analytics',
+      '/p/storefront/settings',
+    ])
+      expect(links).toContain(url)
+  })
+
+  test('a project of one kind gets no kind labels or counts', () => {
+    mockApi({})
+    const view = render(
+      <Shell at="/p/storefront">
+        <GroupNav group={group} activeSection="overview" />
+      </Shell>
+    )
+    expect(view.queryByText('App')).toBeNull()
+    expect(view.getByRole('link', { name: 'Deployments' }))
+  })
+})
+
+describe('service inside a project', () => {
+  afterEach(() => window.localStorage.removeItem(SERVICE_PAGES_KEY))
+
+  const service = {
+    ...api,
+    source_type: 'docker_image',
+  } as unknown as ProjectResponse
+  const renderService = () =>
+    render(
       <Shell at="/projects/api/runtime">
         <GroupNav
           group={group}
@@ -100,11 +197,42 @@ describe('service inside a project', () => {
         />
       </Shell>
     )
+
+  test("keeps the project sidebar, with the service's pages folded away", () => {
+    mockApi({})
+    const view = renderService()
     const links = hrefs(view.container)
-    // Still the project's sidebar…
     expect(links).toContain('/p/storefront/databases')
     expect(links).toContain('/projects/web')
-    // …with the open service's sections nested under it, and only its.
+    expect(links).toContain('/projects/api')
+    // Its pages are listed only when the user asks for them.
+    expect(view.queryByRole('list', { name: 'api sections' })).toBeNull()
+    const toggle = view.getByRole('button', { name: 'Show api pages' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    // Only the open service can be unfolded.
+    expect(view.queryByRole('button', { name: 'Show web pages' })).toBeNull()
+    // No project-level page is marked current while a service is open.
+    const projectDatabases = view.container.querySelector(
+      'a[href="/p/storefront/databases"]'
+    )
+    expect(projectDatabases?.hasAttribute('aria-current')).toBe(false)
+  })
+
+  test("shows the service's pages while its quick tour points at them", () => {
+    mockApi({})
+    setProjectTourActive(true)
+    try {
+      const view = renderService()
+      expect(view.getByRole('list', { name: 'api sections' })).toBeTruthy()
+    } finally {
+      setProjectTourActive(false)
+    }
+  })
+
+  test('unfolds the open service as a level in it, and remembers that', () => {
+    mockApi({})
+    const view = renderService()
+    fireEvent.click(view.getByRole('button', { name: 'Show api pages' }))
     const nested = view.getByRole('list', { name: 'api sections' })
     const nestedLinks = hrefs(nested)
     expect(nestedLinks).toContain('/projects/api/deployments')
@@ -118,11 +246,16 @@ describe('service inside a project', () => {
         .getByRole('link', { name: 'Logs' })
         .getAttribute('aria-current')
     ).toBe('page')
-    // No project-level page is marked current while a service is open.
-    const projectDatabases = view.container.querySelector(
-      'a[href="/p/storefront/databases"]'
-    )
-    expect(projectDatabases?.hasAttribute('aria-current')).toBe(false)
+    // The project's own pages are still there below it.
+    expect(hrefs(view.container)).toContain('/p/storefront/databases')
+
+    // The next service page opens the same way.
+    cleanup()
+    const next = renderService()
+    expect(next.getByRole('list', { name: 'api sections' })).toBeTruthy()
+    fireEvent.click(next.getByRole('button', { name: 'Hide api pages' }))
+    expect(next.queryByRole('list', { name: 'api sections' })).toBeNull()
+    expect(window.localStorage.getItem(SERVICE_PAGES_KEY)).toBeNull()
   })
 })
 
@@ -142,7 +275,8 @@ describe('ServiceScopeNav', () => {
         />
       </Shell>
     )
-    expect(await view.findByRole('list', { name: 'api sections' }))
+    expect(await view.findByRole('list', { name: 'Services' }))
+    expect(view.getByRole('button', { name: 'Show api pages' }))
     expect(view.queryByText('standalone menu')).toBeNull()
   })
 

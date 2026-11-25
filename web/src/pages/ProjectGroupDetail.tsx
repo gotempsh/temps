@@ -51,11 +51,11 @@ import {
 } from '@/components/ui/dropdown-menu'
 import {
   GroupBackupsPage,
-  GroupDatabasesPage,
   GroupDeploymentsPage,
   GroupDomainsPage,
   GroupObservePage,
 } from '@/components/project-groups/GroupScopedPages'
+import { GroupDatabasesPage } from '@/components/project-groups/GroupDatabasesPage'
 import { legacyGroupTabRedirect } from '@/lib/console-scope'
 
 /**

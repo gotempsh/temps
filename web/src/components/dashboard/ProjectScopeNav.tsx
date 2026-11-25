@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Check,
+  ChevronRight,
   ChevronsUpDown,
   FolderOpen,
   Plus,
@@ -25,6 +26,8 @@ import {
   SidebarGroupAction,
   SidebarGroupLabel,
   SidebarMenu,
+  SidebarMenuAction,
+  SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSkeleton,
@@ -58,8 +61,15 @@ import {
   type ProjectNavSection,
 } from '@/lib/project-navigation'
 import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
+import {
+  SERVICE_KIND_LABEL,
+  sectionAvailability,
+  serviceKind,
+} from '@/lib/service-kinds'
+import { useProjectTourActive } from '@/lib/project-tour'
 import { groupHref } from '@/lib/terminology'
 import { cn } from '@/lib/utils'
+import { useServicePagesShown } from './service-pages-preference'
 
 const ACTIVE = 'bg-sidebar-accent text-sidebar-accent-foreground'
 
@@ -255,9 +265,9 @@ function ServiceSections({
 }
 
 /**
- * A project's own sidebar: Overview, its services (the open one expanded to
- * its sections), then what is observed, owned and configured at project
- * level. The same sidebar stays while moving into and between its services.
+ * A project's own sidebar: Overview, its services (the open one's sections
+ * listed under it when the user unfolds them), then what is observed, owned
+ * and configured at project level. The same sidebar stays while moving into and between its services.
  */
 export function GroupNav({
   group,
@@ -273,14 +283,39 @@ export function GroupNav({
   serviceRoute?: string
 }) {
   const { compact, closeOnMobile } = useCompact()
-  const [overviewGroup, ...sectionGroups] = GROUP_NAV_GROUPS
+  // The open service's pages are listed only when the user asks for them.
+  const [servicePagesShown, setServicePagesShown] = useServicePagesShown()
+  // The service's quick tour points at those pages, so they show while it runs.
+  const tourActive = useProjectTourActive()
+  const [overviewGroup, ...groups] = GROUP_NAV_GROUPS
+  // Only the pages at least one of the project's services can have; a page
+  // only some of them have says how many.
+  const sectionGroups = groups
+    .map((navGroup) => ({
+      ...navGroup,
+      sections: navGroup.sections.filter(
+        (section) => sectionAvailability(group.projects, section.id).applicable
+      ),
+    }))
+    .filter((navGroup) => navGroup.sections.length > 0)
+  // Kinds are worth labelling only when the project mixes them.
+  const mixedKinds =
+    new Set(group.projects.map((member) => serviceKind(member))).size > 1
   const renderSection = (section: (typeof overviewGroup.sections)[number]) => {
     const isActive = !activeService && activeSection === section.id
+    const { count, total } = sectionAvailability(group.projects, section.id)
+    const partial = count > 0 && count < total
     return (
       <SidebarMenuItem key={section.id}>
         <SidebarMenuButton
           asChild
-          tooltip={compact ? section.title : undefined}
+          tooltip={
+            compact
+              ? partial
+                ? `${section.title} (${count} of ${total} services)`
+                : section.title
+              : undefined
+          }
           className={cn(
             compact ? 'justify-center' : 'justify-start',
             isActive && ACTIVE
@@ -293,8 +328,18 @@ export function GroupNav({
           >
             <section.icon />
             {!compact && <span>{section.title}</span>}
+            {partial && (
+              <span className="sr-only">
+                {` (${count} of ${total} services)`}
+              </span>
+            )}
           </Link>
         </SidebarMenuButton>
+        {partial && !compact && (
+          <SidebarMenuBadge aria-hidden className="text-muted-foreground">
+            {count}/{total}
+          </SidebarMenuBadge>
+        )}
       </SidebarMenuItem>
     )
   }
@@ -323,6 +368,7 @@ export function GroupNav({
         <SidebarMenu aria-label="Services">
           {group.projects.map((member) => {
             const open = activeService?.id === member.id
+            const expanded = open && (servicePagesShown || tourActive)
             return (
               <SidebarMenuItem key={member.id}>
                 <SidebarMenuButton
@@ -330,20 +376,58 @@ export function GroupNav({
                   tooltip={compact ? member.name : undefined}
                   className={cn(
                     compact ? 'justify-center' : 'justify-start',
-                    open && !compact && 'font-medium'
+                    open && !compact && 'font-medium',
+                    // Its pages folded away, the service itself marks where
+                    // the user is.
+                    open && !compact && !expanded && ACTIVE,
+                    open && !compact && 'pr-8'
                   )}
                 >
                   <Link
                     to={projectRoot(member.slug)}
                     aria-current={open && !serviceRoute ? 'page' : undefined}
-                    aria-expanded={open}
                     onClick={closeOnMobile}
                   >
                     <ServiceIcon service={member} size="sm" />
                     {!compact && <span>{member.name}</span>}
+                    {mixedKinds && (
+                      <span className="sr-only">
+                        {` (${SERVICE_KIND_LABEL[serviceKind(member)]})`}
+                      </span>
+                    )}
                   </Link>
                 </SidebarMenuButton>
-                {open && activeService && !compact && (
+                {mixedKinds && !compact && (
+                  <SidebarMenuBadge
+                    aria-hidden
+                    className={cn(
+                      'font-normal text-muted-foreground',
+                      open && 'right-7'
+                    )}
+                  >
+                    {SERVICE_KIND_LABEL[serviceKind(member)]}
+                  </SidebarMenuBadge>
+                )}
+                {open && !compact && (
+                  <SidebarMenuAction
+                    aria-expanded={expanded}
+                    aria-label={
+                      expanded
+                        ? `Hide ${member.name} pages`
+                        : `Show ${member.name} pages`
+                    }
+                    title={expanded ? 'Hide pages' : 'Show pages'}
+                    onClick={() => setServicePagesShown(!expanded)}
+                  >
+                    <ChevronRight
+                      className={cn(
+                        'transition-transform',
+                        expanded && 'rotate-90'
+                      )}
+                    />
+                  </SidebarMenuAction>
+                )}
+                {expanded && activeService && !compact && (
                   <ServiceSections
                     service={activeService}
                     route={serviceRoute}
@@ -360,7 +444,7 @@ export function GroupNav({
               <SidebarMenuButton asChild className="text-muted-foreground">
                 <Link to={newServiceInGroupHref(group.id)}>
                   <Plus />
-                  <span>Add a service</span>
+                  <span>Add service</span>
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>

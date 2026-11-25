@@ -27,8 +27,8 @@ function openingTagContaining(src: string, marker: string): string {
 
 test('the database type cards are named by their visible content', () => {
   const link = openingTagContaining(
-    read('components/project/ProjectStorage.tsx'),
-    'serviceCreateHref(provider.service_type, project.id)'
+    read('components/storage/DatabaseTypeCards.tsx'),
+    'serviceCreateHref(provider.service_type, projectId)'
   )
   expect(link).not.toContain('aria-label')
 })

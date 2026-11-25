@@ -33,22 +33,22 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { ServiceLogo } from '@/components/ui/service-logo'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { DeploymentStatusBadge } from '@/components/deployment/DeploymentStatusBadge'
-import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
-import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import {
   ServiceScopeProvider,
   scopedServiceId,
   type ServiceScope,
 } from '@/contexts/ServiceScopeContext'
-import { usePageTitle } from '@/hooks/usePageTitle'
-import { SERVER_WIDE_LISTS } from '@/lib/console-scope'
+import { useGroupPageChrome } from './useGroupPageChrome'
+import { SERVER_WIDE_LISTS, type ServerWideList } from '@/lib/console-scope'
 import { GROUP_FANOUT_LIMIT } from '@/lib/group-scoped-lists'
 import { formatBytesDecimal } from '@/lib/server-monitoring'
 import { projectRoot } from '@/lib/project-navigation'
+import { servicesWithSection } from '@/lib/service-kinds'
 import { groupHref } from '@/lib/terminology'
+import { newServiceInGroupHref } from './useJoinGroupAfterCreate'
 import {
   useGroupBackups,
   useGroupDatabases,
@@ -64,23 +64,67 @@ const GlobalAnalytics = lazy(
   () => import('@/pages/observability/GlobalAnalytics')
 )
 
-function useGroupPageChrome(group: ProjectGroupResponse, title: string) {
-  usePageTitle(`${title} · ${group.name}`)
-  const { setBreadcrumbs } = useBreadcrumbs()
-  useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Projects', href: '/projects' },
-      { label: group.name, href: groupHref(group.slug) },
-      { label: title },
-    ])
-  }, [group.name, group.slug, setBreadcrumbs, title])
-}
-
-function ServerWideButton({ to, children }: { to: string; children: string }) {
+export function ServerWideButton({ list }: { list: ServerWideList }) {
   return (
     <Button asChild variant="outline" size="sm">
-      <Link to={to}>{children}</Link>
+      <Link to={list.url} title={list.title}>
+        {list.label}
+      </Link>
     </Button>
+  )
+}
+
+/** Why a page applies to none of the project's services, by page. */
+const NOT_APPLICABLE: Record<
+  'deployments' | 'domains' | 'databases',
+  { title: string; description: string }
+> = {
+  deployments: {
+    title: "None of this project's services deploy here",
+    description:
+      'They are monitored only and run elsewhere. Add an app or a static site to deploy it from Temps.',
+  },
+  domains: {
+    title: "None of this project's services take a custom domain here",
+    description:
+      'They are monitored only, so their domains are managed where they run. Add an app or a static site to serve it on a domain.',
+  },
+  databases: {
+    title: "None of this project's services can use a database",
+    description:
+      'Databases link to apps. Static sites and monitored services run no process that could connect to one. Add an app to link a database.',
+  },
+}
+
+/**
+ * Shown instead of a list when the project's services are all of a kind
+ * this page does not apply to, so it reads as "not for these services",
+ * never as an empty or broken list.
+ */
+export function SectionNotApplicable({
+  group,
+  page,
+  icon,
+}: {
+  group: ProjectGroupResponse
+  page: keyof typeof NOT_APPLICABLE
+  icon: LucideIcon
+}) {
+  const copy = NOT_APPLICABLE[page]
+  return (
+    <div className="rounded-lg border bg-card">
+      <EmptyState
+        size="compact"
+        icon={icon}
+        title={copy.title}
+        description={copy.description}
+        action={
+          <Button asChild variant="outline">
+            <Link to={newServiceInGroupHref(group.id)}>Add service</Link>
+          </Button>
+        }
+      />
+    </div>
   )
 }
 
@@ -161,7 +205,7 @@ export function ScopedList({
             onClick={state.refetch}
           >
             <RefreshCw className="size-4" />
-            Retry {noun}
+            Retry
           </Button>
         )}
       </AlertDescription>
@@ -177,20 +221,21 @@ export function ScopedList({
 }
 
 function ServiceLink({
-  slug,
-  name,
+  service,
   sub,
 }: {
-  slug: string
-  name: string
+  service: { id: number; slug: string; name: string }
   sub?: string
 }) {
   return (
     <Link
-      to={sub ? `${projectRoot(slug)}/${sub}` : projectRoot(slug)}
-      className="hover:underline"
+      to={
+        sub ? `${projectRoot(service.slug)}/${sub}` : projectRoot(service.slug)
+      }
+      className="inline-flex items-center gap-2 hover:underline"
     >
-      {name}
+      <ServiceIcon service={service} size="xs" />
+      {service.name}
     </Link>
   )
 }
@@ -201,231 +246,185 @@ export function GroupDeploymentsPage({
   group: ProjectGroupResponse
 }) {
   useGroupPageChrome(group, 'Deployments')
-  const { deployments, ...state } = useGroupDeployments(group.projects)
+  const members = servicesWithSection(group.projects, 'deployments')
+  const { deployments, ...state } = useGroupDeployments(members)
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title="Deployments"
         description="Recent deployments of this project's services."
       />
-      <ScopedList
-        state={state}
-        isEmpty={deployments.length === 0}
-        noun="deployments"
-        icon={GitBranch}
-        emptyTitle="No deployments in this project yet"
-        emptyDescription="Deploy one of its services to see it here."
-      >
-        <div className="@container rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Service</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead className="hidden @xl:table-cell">
-                  Environment
-                </TableHead>
-                <TableHead className="hidden @2xl:table-cell">Commit</TableHead>
-                <TableHead className="text-right">Started</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {deployments.map((deployment) => (
-                <RecordRow key={`${deployment.service.id}-${deployment.id}`}>
-                  <TableCell className="font-medium [overflow-wrap:anywhere]">
-                    <RecordLink
-                      to={`${projectRoot(deployment.service.slug)}/deployments/${deployment.id}`}
-                    >
-                      {deployment.service.name} #{deployment.id}
-                    </RecordLink>
-                    <span className="block text-xs text-muted-foreground @xl:hidden">
+      {group.projects.length > 0 && members.length === 0 ? (
+        <SectionNotApplicable
+          group={group}
+          page="deployments"
+          icon={GitBranch}
+        />
+      ) : (
+        <ScopedList
+          state={state}
+          isEmpty={deployments.length === 0}
+          noun="deployments"
+          icon={GitBranch}
+          emptyTitle="No deployments in this project yet"
+          emptyDescription="Deploy one of its services to see it here."
+        >
+          <div className="@container rounded-lg border">
+            <Table density="compact">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Service</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead className="hidden @xl:table-cell">
+                    Environment
+                  </TableHead>
+                  <TableHead className="hidden @2xl:table-cell">
+                    Commit
+                  </TableHead>
+                  <TableHead className="text-right">Started</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {deployments.map((deployment) => (
+                  <RecordRow key={`${deployment.service.id}-${deployment.id}`}>
+                    <TableCell className="font-medium [overflow-wrap:anywhere]">
+                      <span className="flex items-center gap-2">
+                        <ServiceIcon service={deployment.service} size="sm" />
+                        <span className="min-w-0">
+                          <span className="flex flex-wrap items-center gap-x-1.5">
+                            <Link
+                              to={projectRoot(deployment.service.slug)}
+                              className="hover:underline"
+                            >
+                              {deployment.service.name}
+                            </Link>
+                            <RecordLink
+                              to={`${projectRoot(deployment.service.slug)}/deployments/${deployment.id}`}
+                              aria-label={`Deployment #${deployment.id} of ${deployment.service.name}`}
+                              className="text-muted-foreground"
+                            >
+                              #{deployment.id}
+                            </RecordLink>
+                          </span>
+                          <span className="block text-xs text-muted-foreground @xl:hidden">
+                            {deployment.environment.name}
+                          </span>
+                        </span>
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <DeploymentStatusBadge deployment={deployment} />
+                    </TableCell>
+                    <TableCell className="hidden @xl:table-cell">
                       {deployment.environment.name}
-                    </span>
-                  </TableCell>
-                  <TableCell>
-                    <DeploymentStatusBadge deployment={deployment} />
-                  </TableCell>
-                  <TableCell className="hidden @xl:table-cell">
-                    {deployment.environment.name}
-                  </TableCell>
-                  <TableCell className="hidden max-w-64 truncate text-muted-foreground @2xl:table-cell">
-                    {deployment.commit_message ?? deployment.tag ?? '—'}
-                  </TableCell>
-                  <TableCell className="text-right text-muted-foreground">
-                    <TimeAgo date={deployment.created_at} />
-                  </TableCell>
-                </RecordRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-        <p className="text-xs text-muted-foreground">
-          The latest deployments of each service. A service&apos;s full history
-          is on its Deployments page.
-        </p>
-      </ScopedList>
+                    </TableCell>
+                    <TableCell className="hidden max-w-64 truncate text-muted-foreground @2xl:table-cell">
+                      {deployment.commit_message ?? deployment.tag ?? '—'}
+                    </TableCell>
+                    <TableCell className="text-right text-muted-foreground">
+                      <TimeAgo date={deployment.created_at} />
+                    </TableCell>
+                  </RecordRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            The latest deployments of each service. A service&apos;s full
+            history is on its Deployments page.
+          </p>
+        </ScopedList>
+      )}
     </PageContainer>
   )
 }
 
 export function GroupDomainsPage({ group }: { group: ProjectGroupResponse }) {
   useGroupPageChrome(group, 'Domains')
-  const { domains, ...state } = useGroupDomains(group.projects)
-  const first = group.projects[0]
+  const members = servicesWithSection(group.projects, 'domains')
+  const { domains, ...state } = useGroupDomains(members)
+  const first = members[0]
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title="Domains"
         description="Custom domains of this project's services."
-        actions={
-          <ServerWideButton to={SERVER_WIDE_LISTS.domains.url}>
-            {SERVER_WIDE_LISTS.domains.title}
-          </ServerWideButton>
-        }
+        actions={<ServerWideButton list={SERVER_WIDE_LISTS.domains} />}
       />
-      <ScopedList
-        state={state}
-        isEmpty={domains.length === 0}
-        noun="domains"
-        icon={Globe}
-        emptyTitle="No custom domains in this project yet"
-        emptyDescription="Domains are added to a service, per environment."
-        emptyAction={
-          first ? (
-            <Button asChild variant="outline">
-              <Link to={`${projectRoot(first.slug)}/domains`}>
-                Add a domain to {first.name}
-              </Link>
-            </Button>
-          ) : undefined
-        }
-      >
-        <div className="@container rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Domain</TableHead>
-                <TableHead className="hidden @xl:table-cell">Service</TableHead>
-                <TableHead className="hidden @2xl:table-cell">
-                  Environment
-                </TableHead>
-                <TableHead className="text-right">Status</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {domains.map((domain) => (
-                <RecordRow key={domain.id}>
-                  <TableCell className="font-medium [overflow-wrap:anywhere]">
-                    <RecordLink
-                      to={`${projectRoot(domain.service.slug)}/domains`}
-                    >
-                      {domain.domain}
-                    </RecordLink>
-                    <span className="block text-xs text-muted-foreground @xl:hidden">
-                      {domain.service.name}
-                    </span>
-                  </TableCell>
-                  <TableCell className="hidden @xl:table-cell">
-                    <ServiceLink
-                      slug={domain.service.slug}
-                      name={domain.service.name}
-                    />
-                  </TableCell>
-                  <TableCell className="hidden @2xl:table-cell">
-                    {domain.environment?.name ?? '—'}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <Badge variant="outline">{domain.status}</Badge>
-                  </TableCell>
-                </RecordRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      </ScopedList>
-    </PageContainer>
-  )
-}
-
-export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
-  useGroupPageChrome(group, 'Databases')
-  const { databases, ...state } = useGroupDatabases(group.projects)
-  return (
-    <PageContainer innerClassName="space-y-6">
-      <PageHeader
-        title="Databases"
-        description="Databases linked to this project's services."
-        actions={
-          <div className="flex flex-wrap items-center gap-2">
-            <ServerWideButton to={SERVER_WIDE_LISTS.databases.url}>
-              {SERVER_WIDE_LISTS.databases.title}
-            </ServerWideButton>
-            <CreateServiceButton label="Create database" />
-          </div>
-        }
-      />
-      <ScopedList
-        state={state}
-        isEmpty={databases.length === 0}
-        noun="databases"
-        icon={Database}
-        emptyTitle="No databases linked to this project's services yet"
-        emptyDescription="Create one here, or link an existing one from a service's Databases page."
-      >
-        <div className="@container rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Database</TableHead>
-                <TableHead className="hidden @xl:table-cell">Used by</TableHead>
-                <TableHead className="text-right">Status</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {databases.map((db) => (
-                <RecordRow key={db.id}>
-                  <TableCell className="font-medium">
-                    <span className="flex items-center gap-2">
-                      <ServiceLogo
-                        service={db.type}
-                        className="size-4 shrink-0"
-                      />
-                      <RecordLink to={`/storage/${db.id}`}>
-                        {db.name}
+      {group.projects.length > 0 && members.length === 0 ? (
+        <SectionNotApplicable group={group} page="domains" icon={Globe} />
+      ) : (
+        <ScopedList
+          state={state}
+          isEmpty={domains.length === 0}
+          noun="domains"
+          icon={Globe}
+          emptyTitle="No custom domains in this project yet"
+          emptyDescription="Domains are added to a service, per environment."
+          emptyAction={
+            first ? (
+              <Button asChild variant="outline">
+                <Link
+                  to={`${projectRoot(first.slug)}/domains`}
+                  title={`Add a domain to ${first.name}`}
+                >
+                  Add domain
+                </Link>
+              </Button>
+            ) : undefined
+          }
+        >
+          <div className="@container rounded-lg border">
+            <Table density="compact">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Domain</TableHead>
+                  <TableHead className="hidden @xl:table-cell">
+                    Service
+                  </TableHead>
+                  <TableHead className="hidden @2xl:table-cell">
+                    Environment
+                  </TableHead>
+                  <TableHead className="text-right">Status</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {domains.map((domain) => (
+                  <RecordRow key={domain.id}>
+                    <TableCell className="font-medium [overflow-wrap:anywhere]">
+                      <RecordLink
+                        to={`${projectRoot(domain.service.slug)}/domains`}
+                      >
+                        {domain.domain}
                       </RecordLink>
-                    </span>
-                    <span className="block text-xs text-muted-foreground @xl:hidden">
-                      Used by {db.usedBy.map((m) => m.name).join(', ')}
-                    </span>
-                  </TableCell>
-                  <TableCell className="hidden @xl:table-cell">
-                    {db.usedBy.map((member, index) => (
-                      <span key={member.id}>
-                        {index > 0 && ', '}
-                        <ServiceLink
-                          slug={member.slug}
-                          name={member.name}
-                          sub="storage"
-                        />
+                      <span className="block text-xs text-muted-foreground @xl:hidden">
+                        {domain.service.name}
                       </span>
-                    ))}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <Badge variant="outline">{db.status}</Badge>
-                  </TableCell>
-                </RecordRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      </ScopedList>
+                    </TableCell>
+                    <TableCell className="hidden @xl:table-cell">
+                      <ServiceLink service={domain.service} />
+                    </TableCell>
+                    <TableCell className="hidden @2xl:table-cell">
+                      {domain.environment?.name ?? '—'}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Badge variant="outline">{domain.status}</Badge>
+                    </TableCell>
+                  </RecordRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </ScopedList>
+      )}
     </PageContainer>
   )
 }
 
 export function GroupBackupsPage({ group }: { group: ProjectGroupResponse }) {
   useGroupPageChrome(group, 'Backups')
-  const { databases, ...databaseState } = useGroupDatabases(group.projects)
+  const members = servicesWithSection(group.projects, 'backups')
+  const { databases, ...databaseState } = useGroupDatabases(members)
   const { backups, ...backupState } = useGroupBackups(databases)
   const state: ScopedListState = {
     loading: databaseState.loading || backupState.loading,
@@ -441,67 +440,71 @@ export function GroupBackupsPage({ group }: { group: ProjectGroupResponse }) {
       <PageHeader
         title="Backups"
         description="Recent backups of the databases this project uses."
-        actions={
-          <ServerWideButton to={SERVER_WIDE_LISTS.backups.url}>
-            {SERVER_WIDE_LISTS.backups.title}
-          </ServerWideButton>
-        }
+        actions={<ServerWideButton list={SERVER_WIDE_LISTS.backups} />}
       />
-      <ScopedList
-        state={state}
-        isEmpty={backups.length === 0}
-        noun="backups"
-        fanoutOf="services or databases"
-        icon={DatabaseBackup}
-        emptyTitle={
-          databases.length === 0
-            ? "This project's services use no databases yet"
-            : "No backups of this project's databases yet"
-        }
-        emptyDescription="Backups are scheduled per database, from its page."
-      >
-        <div className="@container rounded-lg border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Database</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead className="hidden @xl:table-cell">
-                  Destination
-                </TableHead>
-                <TableHead className="hidden @2xl:table-cell">Size</TableHead>
-                <TableHead className="text-right">Started</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {backups.map((backup) => (
-                <RecordRow key={`${backup.database.id}-${backup.id}`}>
-                  <TableCell className="font-medium [overflow-wrap:anywhere]">
-                    <RecordLink to={`/storage/${backup.database.id}`}>
-                      {backup.database.name}
-                    </RecordLink>
-                    <span className="block text-xs text-muted-foreground @xl:hidden">
+      {group.projects.length > 0 && members.length === 0 ? (
+        <SectionNotApplicable
+          group={group}
+          page="databases"
+          icon={DatabaseBackup}
+        />
+      ) : (
+        <ScopedList
+          state={state}
+          isEmpty={backups.length === 0}
+          noun="backups"
+          fanoutOf="services or databases"
+          icon={DatabaseBackup}
+          emptyTitle={
+            databases.length === 0
+              ? "This project's services use no databases yet"
+              : "No backups of this project's databases yet"
+          }
+          emptyDescription="Backups are scheduled per database, from its page."
+        >
+          <div className="@container rounded-lg border">
+            <Table density="compact">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Database</TableHead>
+                  <TableHead>State</TableHead>
+                  <TableHead className="hidden @xl:table-cell">
+                    Destination
+                  </TableHead>
+                  <TableHead className="hidden @2xl:table-cell">Size</TableHead>
+                  <TableHead className="text-right">Started</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {backups.map((backup) => (
+                  <RecordRow key={`${backup.database.id}-${backup.id}`}>
+                    <TableCell className="font-medium [overflow-wrap:anywhere]">
+                      <RecordLink to={`/storage/${backup.database.id}`}>
+                        {backup.database.name}
+                      </RecordLink>
+                      <span className="block text-xs text-muted-foreground @xl:hidden">
+                        {backup.s3_source_name}
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="outline">{backup.state}</Badge>
+                    </TableCell>
+                    <TableCell className="hidden @xl:table-cell">
                       {backup.s3_source_name}
-                    </span>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="outline">{backup.state}</Badge>
-                  </TableCell>
-                  <TableCell className="hidden @xl:table-cell">
-                    {backup.s3_source_name}
-                  </TableCell>
-                  <TableCell className="hidden @2xl:table-cell">
-                    {formatBytesDecimal(backup.size_bytes)}
-                  </TableCell>
-                  <TableCell className="text-right text-muted-foreground">
-                    <TimeAgo date={backup.started_at} />
-                  </TableCell>
-                </RecordRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      </ScopedList>
+                    </TableCell>
+                    <TableCell className="hidden @2xl:table-cell">
+                      {formatBytesDecimal(backup.size_bytes)}
+                    </TableCell>
+                    <TableCell className="text-right text-muted-foreground">
+                      <TimeAgo date={backup.started_at} />
+                    </TableCell>
+                  </RecordRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </ScopedList>
+      )}
     </PageContainer>
   )
 }
@@ -533,7 +536,12 @@ export function GroupObservePage({
   const scope: ServiceScope = {
     label: group.name,
     href: groupHref(group.slug),
-    services: group.projects.map(({ id, name, slug }) => ({ id, name, slug })),
+    services: group.projects.map(({ id, name, slug, source_type }) => ({
+      id,
+      name,
+      slug,
+      source_type,
+    })),
     serverWide: SERVER_WIDE_LISTS[kind],
   }
   const effective = scopedServiceId(scope, requested, {
@@ -563,8 +571,11 @@ export function GroupObservePage({
           description="Add a service to see its data here."
           action={
             <Button asChild variant="outline">
-              <Link to={SERVER_WIDE_LISTS[kind].url}>
-                {SERVER_WIDE_LISTS[kind].title}
+              <Link
+                to={SERVER_WIDE_LISTS[kind].url}
+                title={SERVER_WIDE_LISTS[kind].title}
+              >
+                {SERVER_WIDE_LISTS[kind].label}
               </Link>
             </Button>
           }
