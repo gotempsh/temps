@@ -614,10 +614,7 @@ impl Lab {
             node,
             run: self.run.clone(),
         });
-        let source = Arc::new(StaticPolicySource::new(
-            NodeMode::Legacy,
-            snapshot_for(node),
-        ));
+        let source = Arc::new(StaticPolicySource::new(NodeMode::Off, snapshot_for(node)));
         let enforcer = NodeEnforcer::new(
             format!("node-{node}"),
             table,
@@ -658,7 +655,7 @@ impl Lab {
     async fn cleanup(&mut self) {
         let mut tables = Vec::new();
         for (enforcer, source) in &mut self.enforcers {
-            source.set_mode(NodeMode::Legacy);
+            source.set_mode(NodeMode::Off);
             // From `enforce` this removes the tables; otherwise it is a
             // no-op, so remove explicitly as well.
             let _ = enforcer.reconcile().await;
@@ -844,16 +841,16 @@ async fn run(lab: &mut Lab) {
 
     lab.enforcer("a").await;
     lab.enforcer("b").await;
-    assert_eq!(lab.set_mode(0, NodeMode::Legacy).await, PassOutcome::Legacy);
-    assert_eq!(lab.set_mode(1, NodeMode::Legacy).await, PassOutcome::Legacy);
-    // `legacy` filters nothing but still knows the node's workloads: each
+    assert_eq!(lab.set_mode(0, NodeMode::Off).await, PassOutcome::Off);
+    assert_eq!(lab.set_mode(1, NodeMode::Off).await, PassOutcome::Off);
+    // `off` filters nothing but still knows the node's workloads: each
     // node identified its own containers and reported them.
     let observed_a = lab.enforcers[0].1.last_observed();
     for workload in [sandbox(), victim(), attacker()] {
         assert_eq!(
             observed_a.addresses(&workload).count(),
             1,
-            "node A in legacy identifies {workload}"
+            "node A in off identifies {workload}"
         );
     }
     let observed_b = lab.enforcers[1].1.last_observed();
@@ -957,9 +954,9 @@ async fn run(lab: &mut Lab) {
 
     // ---- Rollback: legacy removes node A's tables. ----
     assert_eq!(
-        lab.set_mode(0, NodeMode::Legacy).await,
+        lab.set_mode(0, NodeMode::Off).await,
         PassOutcome::Removed {
-            mode: NodeMode::Legacy
+            mode: NodeMode::Off
         }
     );
     assert!(

@@ -11081,3 +11081,97 @@ async fn test_network_policy_revision_inputs_bump_and_reverse() -> anyhow::Resul
     assert_eq!(network_policy_revision(&db).await?, after_down);
     Ok(())
 }
+
+/// `off` is accepted next to `legacy` after the migration and rows are not
+/// rewritten; `down` turns `off` back into `legacy` and refuses `off` again.
+#[tokio::test]
+async fn test_network_policy_mode_off_is_accepted_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000003_network_policy_mode_off";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping network policy mode migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address) \
+         VALUES ('worker-1', 'x', 'https://10.201.0.9:3100', '10.201.0.9')",
+    )
+    .await?;
+    assert!(db
+        .execute_unprepared("UPDATE nodes SET network_policy_mode = 'off'")
+        .await
+        .is_err());
+
+    Migrator::up(&db, None).await?;
+    let stored = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT network_policy_mode FROM nodes".to_string(),
+        ))
+        .await?
+        .expect("row");
+    assert_eq!(
+        stored.try_get::<String>("", "network_policy_mode")?,
+        "legacy"
+    );
+    db.execute_unprepared(
+        "UPDATE nodes SET network_policy_mode = 'off'; \
+         UPDATE control_plane_node_settings SET network_policy_mode = 'off'",
+    )
+    .await?;
+    assert!(db
+        .execute_unprepared("UPDATE nodes SET network_policy_mode = 'paused'")
+        .await
+        .is_err());
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    for table in ["nodes", "control_plane_node_settings"] {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!("SELECT network_policy_mode FROM {table}"),
+            ))
+            .await?
+            .expect("row");
+        assert_eq!(
+            row.try_get::<String>("", "network_policy_mode")?,
+            "legacy",
+            "{table}"
+        );
+    }
+    assert!(db
+        .execute_unprepared("UPDATE control_plane_node_settings SET network_policy_mode = 'off'")
+        .await
+        .is_err());
+    Ok(())
+}

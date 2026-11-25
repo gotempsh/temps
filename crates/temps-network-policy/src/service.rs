@@ -82,7 +82,7 @@ pub struct NodeModeEntry {
     pub role: String,
     pub status: String,
     /// The stored mode. On a node without a live enforcer anything but
-    /// `legacy` is stale and is never counted as enforcing.
+    /// `off` is stale and is never counted as enforcing.
     pub mode: NodeMode,
     /// Whether the node runs an enforcer: always on node 0, on a worker
     /// when its agent reported one within [`ENFORCER_REPORT_TTL`].
@@ -171,14 +171,14 @@ struct ComputeSubnetRow {
 /// `max_workloads` (110 by default) containers, each with a few addresses.
 pub const MAX_REPORTED_ADDRESSES: usize = 4096;
 
-/// The workloads a node observed on its last pass outside `legacy`.
+/// The workloads a node observed on its last pass outside `off`.
 #[derive(Debug, Clone)]
 struct ObservedReport {
     identities: IdentityMap,
     seen: std::time::Instant,
-    /// The node's mode when it reported. Only a node outside `legacy` has
+    /// The node's mode when it reported. Only a node outside `off` has
     /// its workloads handed to other nodes as remote peers, as before
-    /// `legacy` nodes reported anything.
+    /// `off` nodes reported anything.
     mode: NodeMode,
 }
 
@@ -233,7 +233,7 @@ pub struct NetworkPolicyService {
     pub(crate) recording: crate::recording::RecordingReports,
     /// Whether node 0 (this process) can record.
     pub(crate) local_recording: std::sync::Mutex<temps_workload_netpol::EgressRecordingCapability>,
-    /// Built snapshots of `legacy` nodes ([`crate::idle`]).
+    /// Built snapshots of `off` nodes ([`crate::idle`]).
     pub(crate) snapshots: crate::idle::SnapshotCache,
 }
 
@@ -310,7 +310,7 @@ impl NetworkPolicyService {
             .iter()
             .filter(|(id, report)| {
                 **id != node_id
-                    && report.mode != NodeMode::Legacy
+                    && report.mode != NodeMode::Off
                     && report.seen.elapsed() <= ENFORCER_REPORT_TTL
             })
             .map(|(id, report)| (*id, report.identities.clone()))
@@ -715,7 +715,7 @@ impl NetworkPolicyService {
         // with the default.
         control_plane_node_settings::ActiveModel {
             id: Set(0),
-            network_policy_mode: Set(NodeMode::Legacy.as_str().to_string()),
+            network_policy_mode: Set(NodeMode::Off.stored_str().to_string()),
             updated_at: Set(Utc::now()),
         }
         .insert(self.db.as_ref())
@@ -771,7 +771,7 @@ impl NetworkPolicyService {
             let control = self.control_plane_mode().await?;
             let previous = parse_mode(node_id, &control.network_policy_mode)?;
             let mut active: control_plane_node_settings::ActiveModel = control.into();
-            active.network_policy_mode = Set(mode.as_str().to_string());
+            active.network_policy_mode = Set(mode.stored_str().to_string());
             active.updated_at = Set(now);
             active
                 .update(self.db.as_ref())
@@ -792,8 +792,8 @@ impl NetworkPolicyService {
             .await
             .map_err(NetworkPolicyError::db("read a node's network policy mode"))?
             .ok_or(NetworkPolicyError::NodeNotFound { node_id })?;
-        // `legacy` stays accepted so a stale stored mode can be cleared.
-        if mode != NodeMode::Legacy && !self.supports_enforcement(node_id) {
+        // `off` stays accepted so a stale stored mode can be cleared.
+        if mode != NodeMode::Off && !self.supports_enforcement(node_id) {
             return Err(NetworkPolicyError::WorkerEnforcementUnavailable {
                 node_id,
                 mode: mode.as_str().to_string(),
@@ -801,7 +801,7 @@ impl NetworkPolicyService {
         }
         let previous = parse_mode(node_id, &node.network_policy_mode)?;
         let mut active: node_network_policy_modes::ActiveModel = node.into();
-        active.network_policy_mode = Set(mode.as_str().to_string());
+        active.network_policy_mode = Set(mode.stored_str().to_string());
         active.updated_at = Set(now);
         let node = active
             .update(self.db.as_ref())
@@ -843,8 +843,8 @@ impl NetworkPolicyService {
     /// What `node_id` returns to its agent: its mode and its snapshot.
     /// Calling it is the agent's enforcer report.
     ///
-    /// Outside `legacy` the snapshot is built fresh every pass, as it
-    /// always was. In `legacy` it goes only to an agent that takes one
+    /// Outside `off` the snapshot is built fresh every pass, as it
+    /// always was. In `off` it goes only to an agent that takes one
     /// ([`PROTOCOL_SNAPSHOT_IN_EVERY_MODE`]); an older agent gets the mode
     /// alone, as before. It comes from the per-node cache, and an agent
     /// that already holds it gets `unchanged` instead ([`crate::idle`]).
@@ -857,19 +857,22 @@ impl NetworkPolicyService {
         self.record_enforcer_report(node_id, &report.backend);
         self.record_egress_recording(node_id, report.egress_recording);
         self.record_observed(node_id, report.identities, mode);
+        // The answer names the mode for the agent: `legacy` for `off` to an
+        // agent older than PROTOCOL_OFF_MODE.
+        let protocol = report.protocol;
         match mode {
             NodeMode::Shadow | NodeMode::Enforce => Ok(NodePolicy {
                 mode,
                 snapshot: Some(self.node_snapshot(node_id).await?),
+                protocol,
                 ..Default::default()
             }),
-            NodeMode::Legacy if report.protocol < PROTOCOL_SNAPSHOT_IN_EVERY_MODE => {
-                Ok(NodePolicy {
-                    mode,
-                    ..Default::default()
-                })
-            }
-            NodeMode::Legacy => {
+            NodeMode::Off if protocol < PROTOCOL_SNAPSHOT_IN_EVERY_MODE => Ok(NodePolicy {
+                mode,
+                protocol,
+                ..Default::default()
+            }),
+            NodeMode::Off => {
                 let (snapshot, digest) = self.cached_snapshot(node_id, revision).await?;
                 if report.held_snapshot.as_deref() == Some(digest.as_str()) {
                     return Ok(NodePolicy {
@@ -877,6 +880,7 @@ impl NetworkPolicyService {
                         snapshot: None,
                         snapshot_digest: Some(digest),
                         unchanged: true,
+                        protocol,
                     });
                 }
                 Ok(NodePolicy {
@@ -884,6 +888,7 @@ impl NetworkPolicyService {
                     snapshot: Some((*snapshot).clone()),
                     snapshot_digest: Some(digest),
                     unchanged: false,
+                    protocol,
                 })
             }
         }
@@ -1672,10 +1677,10 @@ mod tests {
         let service = Arc::new(NetworkPolicyService::new(conn.clone()));
         let c = conn.as_ref();
 
-        // Today's defaults: every node legacy.
+        // Today's defaults: every node off.
         let modes = service.node_modes().await.unwrap();
         assert_eq!(modes[0].node_id, 0);
-        assert!(modes.iter().all(|n| n.mode == NodeMode::Legacy));
+        assert!(modes.iter().all(|n| n.mode == NodeMode::Off));
 
         let project = exec(
             c,
@@ -1826,7 +1831,7 @@ mod tests {
 
         // The snapshot a node enforces.
         let source = DbPolicySource::new(service.clone(), CONTROL_PLANE_NODE_ID);
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
         let snapshot = source.snapshot().await.unwrap();
         let sandbox_policy = snapshot
             .policies
@@ -1858,7 +1863,7 @@ mod tests {
 
         // Modes: node 0 and a worker row; an unknown node is refused.
         let (previous, now) = service.set_node_mode(0, NodeMode::Shadow).await.unwrap();
-        assert_eq!((previous, now.mode), (NodeMode::Legacy, NodeMode::Shadow));
+        assert_eq!((previous, now.mode), (NodeMode::Off, NodeMode::Shadow));
         assert_eq!(source.mode().await.unwrap(), NodeMode::Shadow);
         let worker = exec(
             c,
@@ -1866,9 +1871,9 @@ mod tests {
              VALUES ('worker-1', 'x', 'https://10.201.0.9:3100', '10.201.0.9') RETURNING id",
         )
         .await as i32;
-        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Legacy);
+        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Off);
         // No enforcer runs on workers: shadow and enforce are refused, and
-        // legacy stays settable so a stale mode can be cleared.
+        // off stays settable so a stale mode can be cleared.
         for mode in [NodeMode::Enforce, NodeMode::Shadow] {
             let refused = service.set_node_mode(worker, mode).await;
             assert!(
@@ -1880,11 +1885,8 @@ mod tests {
                 "{refused:?}"
             );
         }
-        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Legacy);
-        service
-            .set_node_mode(worker, NodeMode::Legacy)
-            .await
-            .unwrap();
+        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Off);
+        service.set_node_mode(worker, NodeMode::Off).await.unwrap();
         // A worker `enforce` stored before the refusal is never reported
         // as enforcing; the control plane is.
         c.execute_unprepared(&format!(

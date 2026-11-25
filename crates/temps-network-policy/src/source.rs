@@ -18,10 +18,10 @@ use tracing::info;
 
 use crate::service::{NetworkPolicyService, CONTROL_PLANE_NODE_ID};
 
-/// How often node 0 re-checks its mode and, outside `legacy`, its policy.
+/// How often node 0 re-checks its mode and, outside `off`, its policy.
 pub const PASS_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Reads one node's mode every pass and, outside `legacy`, rebuilds the
+/// Reads one node's mode every pass and, outside `off`, rebuilds the
 /// snapshot every pass too.
 ///
 /// It is not cached by `network_policy_state.revision`: that revision only
@@ -35,7 +35,7 @@ pub struct DbPolicySource {
     service: Arc<NetworkPolicyService>,
     node_id: i32,
     /// The mode and policy revision the last `mode` call read, for
-    /// `legacy_snapshot` and `observed` in the same pass.
+    /// `off_snapshot` and `observed` in the same pass.
     last: std::sync::Mutex<(NodeMode, i64)>,
 }
 
@@ -74,7 +74,7 @@ impl PolicySource for DbPolicySource {
     }
 
     /// The cached snapshot: no query while nothing it depends on changed.
-    async fn legacy_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+    async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
         let (_, revision) = self.last();
         self.service
             .cached_snapshot(self.node_id, revision)
@@ -113,7 +113,7 @@ pub fn control_plane_table() -> Result<TableName, EnforcerError> {
     })
 }
 
-/// Starts node 0's enforcer. In `legacy` (the default) each pass reads the
+/// Starts node 0's enforcer. In `off` (the default) each pass reads the
 /// mode and does nothing else: no Docker call, no nftables.
 ///
 /// `dns` is the slot node 0's resolver answers restricted workloads from;

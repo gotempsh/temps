@@ -32,7 +32,7 @@
 | Per-workload egress/ingress profile: `open`, `restricted`, `none` | `network_policy_profiles` | Built |
 | Linking a service to a project or sandbox creates the allow rule (database triggers, `origin = link`) | same migration | Built |
 | Compile rules into one nftables transaction; a workload's addresses are a set keyed by identity | `crates/temps-workload-netpol/src/nft.rs`, `identity.rs` | Built |
-| Node enforcer loop with `legacy` → `shadow` → `enforce`; every mode observes the local workloads and publishes the egress-proxy table, only `enforce` filters; applies only when the transaction changed; leaving `enforce` removes the tables | `crates/temps-workload-netpol/src/enforcer.rs` | Built |
+| Node enforcer loop with `off` (formerly `legacy`) → `shadow` → `enforce`; every mode observes the local workloads and publishes the egress-proxy table, only `enforce` filters; applies only when the transaction changed; leaving `enforce` removes the tables | `crates/temps-workload-netpol/src/enforcer.rs` | Built |
 | DNS follows policy: the per-node resolver answers a restricted workload only for allowed names | `crates/temps-workload-netpol/src/dns.rs` (`DnsPolicy`) | Built |
 | Sandbox HTTP egress proxy with host/CIDR allow-list; private, loopback and metadata addresses always refused | `crates/temps-workload/src/egress.rs`, `crates/temps-workload-netpol/src/egress.rs` | Built |
 | Scoped credentials per sandbox (own database and role, never the admin password) for Postgres, MariaDB, MongoDB, Redis, S3 | `crates/temps-providers/src/sandbox_*.rs` | Built, control plane only |
@@ -125,7 +125,7 @@ ADR-052 says a sandbox joins the overlay as a restricted workload. With §4.3 th
 | Column | Meaning |
 |---|---|
 | `node_id`, `mode` | the mode in force |
-| `state` | `legacy`, `shadow_ok`, `enforced`, `failed`, `unavailable` |
+| `state` | `off`, `shadow_ok`, `enforced`, `failed`, `unavailable` |
 | `last_pass_at`, `last_applied_at`, `applied_digest` | freshness |
 | `last_error`, `last_error_at`, `consecutive_failures` | the most recent failure |
 | `unavailable_reason` | e.g. "the host uses cgroup v1" |
@@ -222,7 +222,7 @@ Network access is part of the workload spec, so it is chosen when the workload i
    - The agent's first pass fills `@identified` and the real chains in one transaction.
    - Effect: on an enforcing node, workloads, open ones included, have no outbound traffic for the seconds between Docker starting them and the agent's first pass. Nothing is ever open that should be restricted.
    - Without systemd, the agent loads the base table first thing at startup, and the node page states that the window exists.
-   - Nodes in `legacy` or `shadow` install nothing, so their boot is unchanged.
+   - Nodes in `off` or `shadow` install nothing, so their boot is unchanged.
 3. **Address churn on the overlay.** Other nodes' rules hold overlay addresses for cross-node peers, so a peer that restarts with a new address leaves those sets stale until they are updated.
    - Handled by push propagation (§4.3): the peer's node reports the new address, the control plane hints every node whose snapshot names that peer, and they update within about 2 s.
    - **The residual risk is on the open side, and bounded.** Until the update lands, a restricted workload elsewhere still allows the peer's *old* address. If another workload on the peer's node picks up that address within the window, the restricted workload could reach it for up to about 2 s.
@@ -406,7 +406,7 @@ Pinned under `/sys/fs/bpf/temps/netpol/`:
 | `ipcache_v4`, `ipcache_v6` | LPM trie | address prefix → identity, for: remote workloads, service members, the control plane, CIDR rule prefixes (one identity per distinct prefix), and DNS-learned addresses (§4.13; expiry handled in user space) |
 | `published` | hash | (address, port, protocol) → identity, for services reached on a worker's published port, where many services share one node address |
 | `policy_a`, `policy_b` | hash | (direction, subject, peer, protocol, port) → verdict and rule id. Port 0 means any port. A port range is expanded into exact keys up to 1,024 ports; a wider range is a typed error at save |
-| `config` | array | active policy map index, node mode (`legacy`, `shadow`, `enforce`) |
+| `config` | array | active policy map index, node mode (`off`, `shadow`, `enforce`; the program's constant keeps the name `MODE_LEGACY`) |
 | `counters` | per-CPU array | (identity, direction, verdict) → packets and connections, read once per pass |
 | `samples` | ring buffer, 256 KiB | blocked-flow samples, rate-limited in the program by a token bucket (5 per second per node) |
 
@@ -458,7 +458,7 @@ New projects and environments are always `open` (§11, decision 3). An environme
 
 | Setting | Values | Default | Notes |
 |---|---|---|---|
-| `network_policy_mode` | `legacy` / `shadow` / `enforce` | `legacy` | Exists. `enforce` is allowed only after 10 minutes in `shadow` with clean passes, and once every Temps container is under `temps.slice` (§11, decision 10) |
+| `network_policy_mode` | `off` / `shadow` / `enforce` (`off` was `legacy`, still accepted, and stored as `legacy` until no supported binary predates `off`) | `off` | Exists. `enforce` is allowed only after 10 minutes in `shadow` with clean passes, and once every Temps container is under `temps.slice` (§11, decision 10) |
 | `max_workloads` | 8 up to half the node's Temps-assigned range | 110 | Like kubelet `--max-pods`. Temps containers on the node, sandboxes included; the scheduler skips a full node (§4.8, gap 4) |
 | `netpol_ipcache_max` | 1,024–262,144 | 65,536 | Maximum known addresses. Takes effect on the next agent start, since map sizes are fixed at creation |
 | `netpol_policy_max` | 1,024–262,144 | 65,536 | Maximum rule entries per policy copy. Applied on the next policy swap |
@@ -632,7 +632,7 @@ Every row below is rendered where the user works: the workload's "Network access
 
 | Situation | What the console says | Fix offered |
 |---|---|---|
-| Workload is `restricted` on a node in `legacy` or `shadow` | "Restricted, but worker-1 does not enforce network policy yet. This app can still reach everything." | Button: "Turn on enforcement for worker-1" (opens the node's shadow → enforce flow) |
+| Workload is `restricted` on a node in `off` or `shadow` | "Restricted, but worker-1 does not enforce network policy yet. This app can still reach everything." | Button: "Turn on enforcement for worker-1" (opens the node's shadow → enforce flow) |
 | Node cannot enforce | "worker-2 cannot enforce network policy: the host uses cgroup v1." (or: no kernel BTF, missing capabilities, Docker's cgroupfs driver) | The exact fix for that requirement (e.g. boot with `systemd.unified_cgroup_hierarchy=1`, or set Docker's `exec-opts` to `native.cgroupdriver=systemd`), then "Re-check". The reason comes from the agent's probe, not a guess |
 | Last pass failed | "Applying network policy on worker-3 failed 2 min ago: `<nft error>`. The previous rules are still in force." | The error text, a link to the node's logs, and "Retry now" |
 | Agent has not received policy for longer than 3 passes | "worker-3 has not received policy updates for 5 min. It keeps enforcing the last rules it got." | Agent connectivity check from the node page |
@@ -666,7 +666,7 @@ Every row below is rendered where the user works: the workload's "Network access
 6. **Restarts and reboots** are covered in §4.8 and §4.15. In short: nothing address-bound is persisted across a reboot. `temps netpol boot` attaches the programs with an empty identity map before Docker starts, so nothing restricted is open between boot and the agent's first pass.
 7. **Agent restarts reconcile in place.** Programs, maps and links are pinned, so enforcement continues while the agent is down; the new agent reopens the pins and reconciles. Verified by the prototype (§4.16): the loader exits after every command and enforcement never stopped. This matches how Calico and Cilium treat agent restarts (§9).
 8. **Failsafe exceptions** keep the node manageable whatever the rules say (§4.11).
-9. **One-step rollback.** Setting the node to `legacy` detaches the programs and removes the pins on the next pass. Temps-assigned addresses stay as they are; they are harmless without enforcement.
+9. **One-step rollback.** Setting the node to `off` detaches the programs and removes the pins on the next pass. Temps-assigned addresses stay as they are; they are harmless without enforcement.
 10. **Bounded cost.**
    - A pass is O(local instances), with endpoint inspects cached by endpoint id.
    - The snapshot is limited to the node.
@@ -674,7 +674,7 @@ Every row below is rendered where the user works: the workload's "Network access
    - Blocked-flow samples are a 50-entry ring per node at most 5 per second.
    - On the 1 vCPU / 2 GB target this adds one loop per agent (event-driven, with a 15 s safety poll) and a few small queries on the control plane per node.
 11. **Upgrade safety.**
-   - Every node stays in `legacy`, and every existing workload stays `open`.
+   - Every node stays in `off`, and every existing workload stays `open`.
    - Sandboxes keep their current isolation until a node is put in `enforce`.
    - An upgrade test restores a database from the previous release and asserts that no row or container changed.
 
@@ -738,7 +738,7 @@ Days are engineering days for one person, including tests and review rounds, not
 - Injecting Temps-assigned addresses into Compose deployments is unexplored.
 - Firecracker TC is not covered by the prototype.
 
-Each phase is shippable on its own, and nodes stay in `legacy` until an operator moves them.
+Each phase is shippable on its own, and nodes stay in `off` until an operator moves them.
 
 ## 9. Prior art: Kubernetes network policy
 
@@ -874,11 +874,11 @@ Seven layers, cheapest first. Anything that needs Docker, root or a real kernel 
 | 4. Multi-node e2e | the VM cluster below | a restricted deployment on worker-1 reaches its linked database on worker-2 and not an unlinked one; a sandbox on worker-2 with internet off reaches only the Postgres cluster it was given; a peer restarted with a new address is reachable again within 2 s and its old address is in no map; an open workload is never blocked, and shadow reports zero "would block" for it |
 | 5. Failure | the VM cluster | reboot a worker: nothing restricted is open before the agent's first pass; kill the agent: enforcement continues; restart Docker: drift detected and re-applied; control plane down: the last policy stays, and no address is reused; a worker cut off past 10 minutes: distrusted until it catches up, and its node page says why; a 10-minute start/stop churn loop: no connection is ever admitted under a previous owner's identity |
 | 6. Performance | a 1 vCPU / 2 GB VM | `wrk` throughput and latency with no policy, eBPF and nftables; CPU per 100k connections; kernel and agent memory with a few hundred rules; time to apply 1,000 identities. Results written into §4.16 |
-| 7. Release safety | dev cluster and the VM cluster | upgrade test: restore a database from the previous release, assert no row or container changed, every node `legacy`, every workload `open`; frontend Bun tests for every §5 message and each create form; a written acceptance pass of console scenarios (written with phase 3); one node in `shadow` with real workloads for a few days before anything is enforced |
+| 7. Release safety | dev cluster and the VM cluster | upgrade test: restore a database from the previous release, assert no row or container changed, every node `off`, every workload `open`; frontend Bun tests for every §5 message and each create form; a written acceptance pass of console scenarios (written with phase 3); one node in `shadow` with real workloads for a few days before anything is enforced |
 
 **Environments:**
 
-- **The Colima dev cluster** keeps testing everything except the datapath (API, snapshots, console, admission) with nodes in `legacy` or `shadow`. Its Docker-in-Docker workers have no systemd, so workload slices and the programs probably cannot run there.
+- **The Colima dev cluster** keeps testing everything except the datapath (API, snapshots, console, admission) with nodes in `off` or `shadow`. Its Docker-in-Docker workers have no systemd, so workload slices and the programs probably cannot run there.
 - **A VM cluster on the maintainer-run Linux machine with KVM:** three VMs (control plane and two workers, or one control plane and three workers when sandbox placement is tested), each with systemd, cgroup v2 and BTF, joined with `temps join`. VMs can be rebooted and partitioned freely; the host itself is never rebooted without the maintainer's go-ahead.
 - **The machine itself** runs layers 2, 3 and 6.
 

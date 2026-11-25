@@ -8,9 +8,9 @@
 //! `/api/internal/nodes/{id}/network-policy` with the node token and gets
 //! the node's mode and snapshot back. The report tells the control plane
 //! which datapath this node enforces with, which is what allows an
-//! operator to move the node out of `legacy`, and which workloads it
+//! operator to move the node out of `off`, and which workloads it
 //! observed on its previous pass (in every mode), which is how every other
-//! node learns their addresses. In `legacy` the pass only observes the
+//! node learns their addresses. In `off` the pass only observes the
 //! local workloads and publishes the egress-proxy table: no rule applied,
 //! no program loaded. The digest of the snapshot it holds rides along, so
 //! a pass in which nothing changed brings back no snapshot.
@@ -237,7 +237,7 @@ impl PolicySource for AgentPolicySource {
         Ok(policy.mode)
     }
 
-    async fn legacy_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+    async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
         Ok(self.last.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
@@ -245,7 +245,7 @@ impl PolicySource for AgentPolicySource {
         let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         last.clone().ok_or_else(|| {
             self.source_error(
-                "the control plane sent a mode outside legacy without a snapshot".to_string(),
+                "the control plane sent a mode outside off without a snapshot".to_string(),
             )
         })
     }
@@ -483,45 +483,36 @@ mod tests {
     }
 
     /// A new agent asks with its protocol, holds the snapshot it gets in
-    /// `legacy`, sends its digest back, and keeps it on `unchanged`.
+    /// `off`, sends its digest back, and keeps it on `unchanged`.
     #[tokio::test]
-    async fn a_legacy_snapshot_is_held_and_an_unchanged_answer_keeps_it() {
+    async fn a_off_snapshot_is_held_and_an_unchanged_answer_keeps_it() {
         let mut snapshot = PolicySnapshot::default();
         snapshot
             .system_ingress
             .push("10.201.0.0/16".parse().unwrap());
         let full = serde_json::to_string(&NodePolicy {
-            mode: NodeMode::Legacy,
+            mode: NodeMode::Off,
             snapshot: Some(snapshot.clone()),
             snapshot_digest: Some("d1".into()),
             unchanged: false,
+            protocol: temps_workload_netpol::POLICY_PROTOCOL,
         })
         .unwrap();
         let unchanged = r#"{"mode":"legacy","snapshot_digest":"d1","unchanged":true}"#.to_string();
         let (addr, server) = scripted_control_plane(vec![full, unchanged]).await;
         let source = source(addr);
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
         assert_eq!(
-            source
-                .legacy_snapshot()
-                .await
-                .unwrap()
-                .unwrap()
-                .system_ingress,
+            source.off_snapshot().await.unwrap().unwrap().system_ingress,
             snapshot.system_ingress
         );
         source.observed(&IdentityMap::new().with(
             temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 1),
             "10.237.1.2".parse().unwrap(),
         ));
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
         assert_eq!(
-            source
-                .legacy_snapshot()
-                .await
-                .unwrap()
-                .unwrap()
-                .system_ingress,
+            source.off_snapshot().await.unwrap().unwrap().system_ingress,
             snapshot.system_ingress,
             "unchanged keeps the held snapshot"
         );
@@ -534,18 +525,18 @@ mod tests {
         assert_eq!(
             second.identities.workloads().count(),
             1,
-            "observations are reported in legacy"
+            "observations are reported in off"
         );
     }
 
-    /// An older control plane answers `legacy` with the mode alone: the
+    /// An older control plane answers `off` with the mode alone: the
     /// agent then has no snapshot, so its pass observes nothing, as today.
     #[tokio::test]
     async fn an_old_control_planes_legacy_answer_leaves_nothing_to_observe() {
         let (addr, server) = scripted_control_plane(vec![r#"{"mode":"legacy"}"#.into()]).await;
         let source = source(addr);
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
-        assert!(source.legacy_snapshot().await.unwrap().is_none());
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert!(source.off_snapshot().await.unwrap().is_none());
         server.await.unwrap();
     }
 
@@ -598,7 +589,7 @@ mod tests {
             "token".into(),
             "nftables",
         );
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
         let request = server.await.unwrap();
         let body = request.split_once("\r\n\r\n").unwrap().1;
         let report: NodePolicyReport = serde_json::from_str(body).unwrap();

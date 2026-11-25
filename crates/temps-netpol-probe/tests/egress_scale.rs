@@ -967,7 +967,7 @@ async fn measure(scale: &mut Scale) {
         sink_logs.matches("records received").count(),
     ));
 
-    source.set_mode(NodeMode::Legacy);
+    source.set_mode(NodeMode::Off);
     let rollback = enforcer
         .reconcile()
         .await
@@ -975,7 +975,7 @@ async fn measure(scale: &mut Scale) {
     assert_eq!(
         rollback,
         PassOutcome::Removed {
-            mode: NodeMode::Legacy
+            mode: NodeMode::Off
         }
     );
     let restored = scale.exec(&format!("{prefix}-sb-0"), &member(0, 1)).await;

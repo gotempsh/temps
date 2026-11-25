@@ -2,17 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! `POST /internal/nodes/{node_id}/network-policy`: a worker agent's
-//! enforcer report in, its mode and its policy snapshot out (in `legacy`
+//! enforcer report in, its mode and its policy snapshot out (in `off`
 //! only to agents that take one, and only when it changed: see
 //! [`crate::idle`]).
 //!
 //! Mounted next to route sync, outside the plugin router: it is
 //! authenticated by the node token, not a user session. The agent calls it
-//! on every enforcer pass, in `legacy` too. It says which datapath it
+//! on every enforcer pass, in `off` too. It says which datapath it
 //! enforces with, which is what lets an operator move the node out of
-//! `legacy` (see [`NetworkPolicyService::supports_enforcement`]), and which
+//! `off` (see [`NetworkPolicyService::supports_enforcement`]), and which
 //! workloads it runs, in every mode, which is how the other nodes learn the
-//! addresses of a node outside `legacy` (see
+//! addresses of a node outside `off` (see
 //! [`NetworkPolicyService::record_observed`]).
 
 use std::sync::Arc;

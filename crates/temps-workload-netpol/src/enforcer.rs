@@ -14,12 +14,12 @@
 //! 2. observes the instances on this node and identifies each one
 //!    ([`identify`]) from the plane's labels, the name the control plane
 //!    knows it by, or the legacy `sh.temps.environment` label, and
-//!    publishes the egress-proxy table. In `legacy` that is all: one
+//!    publishes the egress-proxy table. In `off` that is all: one
 //!    container list, **no nftables call, no eBPF change, no host-port
 //!    ruleset, no helper container**, and the DNS view stays open. (With
 //!    no snapshot, from a control plane that predates this, not even
 //!    that: nothing is observed, as before.)
-//! 3. outside `legacy`, compiles the policies of the local workloads
+//! 3. outside `off`, compiles the policies of the local workloads
 //!    ([`crate::compile`]) and the anti-spoofing binding of every local
 //!    bridge port ([`crate::compile_bindings`]) into one `nft -f`
 //!    transaction;
@@ -27,7 +27,7 @@
 //!    DNS view open. `enforce`: applies the transaction **only when it
 //!    changed**, then publishes the DNS view ([`DnsPolicy`]).
 //!
-//! Leaving `enforce` (to `shadow` or `legacy`) removes both tables in the
+//! Leaving `enforce` (to `shadow` or `off`) removes both tables in the
 //! next pass, so rolling back is one mode change.
 //!
 //! Control plane, not hot path: a pass is O(local instances) in memory
@@ -70,13 +70,18 @@ use crate::rule::{
 /// The legacy label deployment containers carry: the environment id.
 pub const ENVIRONMENT_LABEL: &str = labels::ENVIRONMENT;
 
-/// `nodes.network_policy_mode`.
+/// `nodes.network_policy_mode`: what the node's packet filter does. It
+/// governs the filter only; every node knows its workloads in every mode.
+///
+/// `off` was called `legacy`, and `legacy` is still read everywhere: in the
+/// API, on the wire and in the database (see [`NodeMode::stored_str`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeMode {
-    /// Nothing is compiled or applied: today's behaviour.
+    /// Nothing is filtered: no rules, no programs, an open DNS view.
     #[default]
-    Legacy,
+    #[serde(alias = "legacy")]
+    Off,
     /// Computed and logged, never applied.
     Shadow,
     /// Applied.
@@ -84,16 +89,41 @@ pub enum NodeMode {
 }
 
 impl NodeMode {
-    pub const ALL: [NodeMode; 3] = [NodeMode::Legacy, NodeMode::Shadow, NodeMode::Enforce];
+    pub const ALL: [NodeMode; 3] = [NodeMode::Off, NodeMode::Shadow, NodeMode::Enforce];
 
+    /// The name shown and sent: `off`, `shadow`, `enforce`.
     pub fn as_str(self) -> &'static str {
         match self {
-            NodeMode::Legacy => "legacy",
+            NodeMode::Off => "off",
             NodeMode::Shadow => "shadow",
             NodeMode::Enforce => "enforce",
         }
     }
+
+    /// The value written to the database. `off` is still stored as
+    /// `off`: a binary rolled back after an upgrade (a supported
+    /// recovery path) reads only `legacy`, and would fail on a node whose
+    /// mode was written as `off`. Both are read; a later release, once no
+    /// supported binary predates `off`, rewrites the rows.
+    pub fn stored_str(self) -> &'static str {
+        match self {
+            NodeMode::Off => LEGACY_NAME,
+            mode => mode.as_str(),
+        }
+    }
+
+    /// The name an agent of `protocol` understands: `legacy` for `off`
+    /// before [`PROTOCOL_OFF_MODE`].
+    pub fn wire_str(self, protocol: u32) -> &'static str {
+        match self {
+            NodeMode::Off if protocol < PROTOCOL_OFF_MODE => LEGACY_NAME,
+            mode => mode.as_str(),
+        }
+    }
 }
+
+/// The former name of [`NodeMode::Off`], still accepted everywhere.
+pub const LEGACY_NAME: &str = "legacy";
 
 impl std::fmt::Display for NodeMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,7 +132,7 @@ impl std::fmt::Display for NodeMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown network policy mode '{value}'; expected legacy, shadow or enforce")]
+#[error("unknown network policy mode '{value}'; expected off, shadow or enforce")]
 pub struct UnknownNodeMode {
     pub value: String,
 }
@@ -110,6 +140,9 @@ pub struct UnknownNodeMode {
 impl FromStr for NodeMode {
     type Err = UnknownNodeMode;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == LEGACY_NAME {
+            return Ok(NodeMode::Off);
+        }
         NodeMode::ALL
             .into_iter()
             .find(|m| m.as_str() == value)
@@ -245,33 +278,71 @@ pub struct PolicySnapshot {
 /// [`NodePolicyReport::protocol`] so the control plane never answers in a
 /// way an older agent cannot handle.
 ///
-/// - `0` (absent): an agent that expects no snapshot in `legacy`.
+/// - `0` (absent): an agent that expects no snapshot in `off`.
 /// - `2`: takes a snapshot in every mode, and a [`NodePolicy::unchanged`]
 ///   answer to the digest it holds.
-pub const POLICY_PROTOCOL: u32 = 2;
+/// - `3`: reads the mode `off`. Older agents are sent `legacy`, the only
+///   name their mode enum has.
+pub const POLICY_PROTOCOL: u32 = 3;
 
-/// The first protocol that takes a snapshot in `legacy`.
+/// The first protocol that reads the mode `off`.
+pub const PROTOCOL_OFF_MODE: u32 = 3;
+
+/// The first protocol that takes a snapshot in `off`.
 pub const PROTOCOL_SNAPSHOT_IN_EVERY_MODE: u32 = 2;
 
 /// A node's mode and its snapshot: the answer to
 /// `POST /internal/nodes/{node_id}/network-policy`.
 ///
-/// Outside `legacy` the snapshot is always sent, freshly built. In `legacy`
+/// Outside `off` the snapshot is always sent, freshly built. In `off`
 /// it is sent only to an agent of [`PROTOCOL_SNAPSHOT_IN_EVERY_MODE`] or
 /// later, and not at all when the agent already holds it: then
 /// `unchanged` is set, `snapshot` is `None` and the agent keeps what it has.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct NodePolicy {
+    /// Serialized by [`NodeMode::wire_str`] for `protocol`, so an agent
+    /// older than [`PROTOCOL_OFF_MODE`] reads `legacy`.
     pub mode: NodeMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The protocol of the agent this answer is for. Not sent.
+    #[serde(skip)]
+    pub protocol: u32,
+    #[serde(default)]
     pub snapshot: Option<PolicySnapshot>,
     /// The digest of the snapshot sent (or, with `unchanged`, held), for
     /// the agent to send back as [`NodePolicyReport::held_snapshot`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub snapshot_digest: Option<String>,
     /// The snapshot the agent holds is current; `snapshot` is `None`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     pub unchanged: bool,
+}
+
+impl Serialize for NodePolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        fn absent<T>(value: &&Option<T>) -> bool {
+            value.is_none()
+        }
+        fn not(value: &bool) -> bool {
+            !*value
+        }
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            mode: &'static str,
+            #[serde(skip_serializing_if = "absent")]
+            snapshot: &'a Option<PolicySnapshot>,
+            #[serde(skip_serializing_if = "absent")]
+            snapshot_digest: &'a Option<String>,
+            #[serde(skip_serializing_if = "not")]
+            unchanged: bool,
+        }
+        Wire {
+            mode: self.mode.wire_str(self.protocol),
+            snapshot: &self.snapshot,
+            snapshot_digest: &self.snapshot_digest,
+            unchanged: self.unchanged,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// The digest the control plane sends with a snapshot. Only the control
@@ -295,7 +366,7 @@ pub struct NodePolicyReport {
     pub backend: String,
     /// The workloads it observed on its last pass, with their addresses,
     /// in every mode. The control plane keeps the ones inside the node's
-    /// own compute subnet and, while the node is outside `legacy`, hands
+    /// own compute subnet and, while the node is outside `off`, hands
     /// them to every other node as remote peers.
     #[serde(default)]
     pub identities: IdentityMap,
@@ -321,17 +392,17 @@ fn is_zero(value: &u32) -> bool {
 pub trait PolicySource: Send + Sync {
     /// The node's mode. Called every pass, before anything else.
     async fn mode(&self) -> Result<NodeMode, EnforcerError>;
-    /// Only called outside `legacy`.
+    /// Only called outside `off`.
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError>;
-    /// In `legacy`: the snapshot, if the source has one. `None` (an older
-    /// control plane sends none in `legacy`) means the pass observes
+    /// In `off`: the snapshot, if the source has one. `None` (an older
+    /// control plane sends none in `off`) means the pass observes
     /// nothing, as before.
-    async fn legacy_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+    async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
         self.snapshot().await.map(Some)
     }
     /// The workloads this node observed on a pass, before remote peers are
     /// merged in: what other nodes need to know about this one. Called on
-    /// every pass outside `legacy`.
+    /// every pass outside `off`.
     fn observed(&self, _local: &IdentityMap) {}
     /// A pass succeeded with `outcome`: whatever it decided is in force.
     async fn applied(&self, _outcome: &PassOutcome) {}
@@ -372,8 +443,8 @@ pub fn identify(
 /// What one pass did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PassOutcome {
-    /// `legacy`: nothing compiled, nothing touched.
-    Legacy,
+    /// `off`: observed and published, nothing filtered.
+    Off,
     /// Left `enforce`: both tables removed.
     Removed { mode: NodeMode },
     /// Same transaction as last pass: nothing applied.
@@ -498,7 +569,7 @@ impl NodeEnforcer {
     }
 
     /// Enforces through the eBPF datapath instead of nftables. `opener` is
-    /// called by the first pass outside `legacy`, or by a `legacy` pass
+    /// called by the first pass outside `off`, or by a `off` pass
     /// that finds pins under `pin_dir` (a previous process enforced).
     pub fn with_datapath(mut self, opener: DatapathOpener, config: &DatapathConfig) -> Self {
         self.datapath = Some(DatapathSlot {
@@ -544,7 +615,7 @@ impl NodeEnforcer {
         if self.datapath.is_some() {
             return self.reconcile_datapath(mode).await;
         }
-        if mode == NodeMode::Legacy {
+        if mode == NodeMode::Off {
             self.sync_host_ports(None).await?;
             let outcome = match self.installed {
                 Installed::Enforced(_) => {
@@ -553,9 +624,9 @@ impl NodeEnforcer {
                 }
                 Installed::Unknown => {
                     self.clear_leftovers(mode).await?;
-                    PassOutcome::Legacy
+                    PassOutcome::Off
                 }
-                Installed::Nothing | Installed::Shadow(_) => PassOutcome::Legacy,
+                Installed::Nothing | Installed::Shadow(_) => PassOutcome::Off,
             };
             self.installed = Installed::Nothing;
             self.observe_only().await?;
@@ -571,7 +642,7 @@ impl NodeEnforcer {
             warnings: plan.warnings.clone(),
         };
         match mode {
-            NodeMode::Legacy => Ok(PassOutcome::Legacy),
+            NodeMode::Off => Ok(PassOutcome::Off),
             NodeMode::Shadow => {
                 self.sync_host_ports(None).await?;
                 match self.installed {
@@ -653,9 +724,9 @@ impl NodeEnforcer {
 
     /// One pass through the eBPF datapath.
     ///
-    /// `legacy` opens nothing unless a previous process left pins, in which
+    /// `off` opens nothing unless a previous process left pins, in which
     /// case the programs are switched to let everything through. Outside
-    /// `legacy` the maps are made to hold the compiled plan and the mode is
+    /// `off` the maps are made to hold the compiled plan and the mode is
     /// set, both only when something changed.
     async fn reconcile_datapath(&mut self, mode: NodeMode) -> Result<PassOutcome, EnforcerError> {
         let node = self.node.clone();
@@ -663,7 +734,7 @@ impl NodeEnforcer {
             node: node.clone(),
             source,
         };
-        if mode == NodeMode::Legacy {
+        if mode == NodeMode::Off {
             self.sync_host_ports(None).await?;
             let outcome = self.datapath_to_legacy().await.map_err(dp_err)?;
             self.observe_only().await?;
@@ -750,7 +821,7 @@ impl NodeEnforcer {
         }
 
         let Some(slot) = self.datapath.as_mut() else {
-            return Ok(PassOutcome::Legacy);
+            return Ok(PassOutcome::Off);
         };
         if slot.applied == Some((mode, digest)) {
             log_samples(&self.node, slot);
@@ -789,40 +860,40 @@ impl NodeEnforcer {
         })
     }
 
-    /// The datapath side of a `legacy` pass: opens nothing unless a
+    /// The datapath side of a `off` pass: opens nothing unless a
     /// previous process left pins, in which case the programs are switched
     /// to let everything through.
     async fn datapath_to_legacy(&mut self) -> Result<PassOutcome, DatapathError> {
         let Some(slot) = self.datapath.as_mut() else {
-            return Ok(PassOutcome::Legacy);
+            return Ok(PassOutcome::Off);
         };
-        if slot.applied.map(|(m, _)| m) == Some(NodeMode::Legacy) {
-            return Ok(PassOutcome::Legacy);
+        if slot.applied.map(|(m, _)| m) == Some(NodeMode::Off) {
+            return Ok(PassOutcome::Off);
         }
         if slot.open.is_none() && !slot.pin_dir.exists() {
-            slot.applied = Some((NodeMode::Legacy, 0));
-            return Ok(PassOutcome::Legacy);
+            slot.applied = Some((NodeMode::Off, 0));
+            return Ok(PassOutcome::Off);
         }
         let datapath = open_slot(slot)?;
-        datapath.set_mode(NodeMode::Legacy)?;
-        info!(node = %self.node, "network policy datapath switched to legacy: nothing is filtered");
-        slot.applied = Some((NodeMode::Legacy, 0));
+        datapath.set_mode(NodeMode::Off)?;
+        info!(node = %self.node, "network policy datapath switched to off: nothing is filtered");
+        slot.applied = Some((NodeMode::Off, 0));
         // A previous process enforced: drop its host-port rules too.
         self.clear_host_port_leftovers().await;
         self.dns.store(Arc::new(DnsPolicy::open()));
         Ok(PassOutcome::Removed {
-            mode: NodeMode::Legacy,
+            mode: NodeMode::Off,
         })
     }
 
-    /// The `legacy` half of a pass: observe the local workloads, report
+    /// The `off` half of a pass: observe the local workloads, report
     /// them, and publish the egress-proxy table. Nothing that filters:
     /// no nft, no datapath, no host ports, no DNS view. Without a
     /// snapshot (an older control plane) nothing is observed, as before.
     /// A failed observation leaves the table empty and the pass succeeds:
     /// observing must never make a node that does not filter fail.
     async fn observe_only(&mut self) -> Result<(), EnforcerError> {
-        let Some(snapshot) = self.policies.legacy_snapshot().await? else {
+        let Some(snapshot) = self.policies.off_snapshot().await? else {
             self.egress.store(Arc::new(EgressTable::default()));
             return Ok(());
         };
@@ -835,7 +906,7 @@ impl NodeEnforcer {
                     node = %self.node,
                     %error,
                     "could not observe this node's workloads; the egress-proxy table is empty \
-                     until the next pass (nothing is filtered in legacy)"
+                     until the next pass (nothing is filtered in off)"
                 );
                 self.egress.store(Arc::new(EgressTable::default()));
             }
@@ -1305,7 +1376,7 @@ impl NodeEnforcer {
             }
             match self.reconcile().await {
                 Ok(outcome) => {
-                    if !matches!(outcome, PassOutcome::Legacy | PassOutcome::Unchanged { .. }) {
+                    if !matches!(outcome, PassOutcome::Off | PassOutcome::Unchanged { .. }) {
                         debug!(node = %self.node, ?outcome, "network policy pass");
                     }
                     self.policies.applied(&outcome).await;
@@ -1515,7 +1586,7 @@ pub fn with_best_datapath(enforcer: NodeEnforcer, daemon_is_local: bool) -> Node
             info!(
                 node = %enforcer.node,
                 pin_dir = %config.pin_dir.display(),
-                "network policy backend: eBPF (loaded on the first pass outside legacy)"
+                "network policy backend: eBPF (loaded on the first pass outside off)"
             );
             enforcer.with_datapath(opener, &config)
         }
@@ -1822,8 +1893,47 @@ mod tests {
         for mode in NodeMode::ALL {
             assert_eq!(mode.as_str().parse::<NodeMode>(), Ok(mode));
         }
-        assert_eq!(NodeMode::default(), NodeMode::Legacy);
-        assert!("off".parse::<NodeMode>().is_err());
+        assert_eq!(NodeMode::default(), NodeMode::Off);
+        assert_eq!(
+            "legacy".parse::<NodeMode>(),
+            Ok(NodeMode::Off),
+            "the former name"
+        );
+        assert!("Off".parse::<NodeMode>().is_err());
+        assert_eq!(NodeMode::Off.stored_str(), "legacy", "stored as before");
+        assert_eq!(NodeMode::Enforce.stored_str(), "enforce");
+        for name in ["off", "legacy"] {
+            let mode: NodeMode = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(mode, NodeMode::Off);
+        }
+        assert_eq!(serde_json::to_string(&NodeMode::Off).unwrap(), r#""off""#);
+    }
+
+    /// The mode on the wire is named for the agent: `off` to an agent
+    /// older than protocol 3, whose enum has no `off`.
+    #[test]
+    fn the_mode_is_named_for_the_agents_protocol() {
+        let answer = |protocol| {
+            serde_json::to_value(NodePolicy {
+                mode: NodeMode::Off,
+                protocol,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(answer(0)["mode"], "legacy");
+        assert_eq!(answer(2)["mode"], "legacy");
+        assert_eq!(answer(PROTOCOL_OFF_MODE)["mode"], "off");
+        assert_eq!(answer(POLICY_PROTOCOL)["mode"], "off");
+        let enforce = NodePolicy {
+            mode: NodeMode::Enforce,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(enforce).unwrap()["mode"], "enforce");
+        assert!(
+            answer(0).get("protocol").is_none(),
+            "the recipient's protocol is not sent"
+        );
     }
 
     /// An old agent sends no protocol and no digest; its report still
@@ -1845,46 +1955,77 @@ mod tests {
         assert_eq!(json["held_snapshot"], "00ff");
     }
 
-    /// An old control plane answers `legacy` with the mode alone; a new
+    /// An old control plane answers `off` with the mode alone; a new
     /// agent reads it as no snapshot, not unchanged.
     #[test]
     fn an_old_control_planes_answer_has_no_snapshot_and_is_not_unchanged() {
         let policy: NodePolicy = serde_json::from_str(r#"{"mode":"legacy"}"#).unwrap();
-        assert_eq!(policy.mode, NodeMode::Legacy);
+        assert_eq!(policy.mode, NodeMode::Off);
         assert!(policy.snapshot.is_none());
         assert!(!policy.unchanged);
         assert_eq!(policy.snapshot_digest, None);
     }
 
-    /// A new control plane's answers parse in an old agent, whose
-    /// `NodePolicy` had only `mode` and `snapshot` and ignored the rest.
+    /// A new control plane's answers parse in an old agent: its
+    /// `NodePolicy` had only `mode` and `snapshot`, its mode enum only
+    /// `legacy`, `shadow` and `enforce` (strict), and it ignored the rest.
     #[test]
     fn a_new_control_planes_answers_parse_in_an_old_agent() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldNodeMode {
+            Legacy,
+            Shadow,
+            Enforce,
+        }
         #[derive(Deserialize)]
         struct OldNodePolicy {
-            mode: NodeMode,
+            mode: OldNodeMode,
             #[serde(default)]
             snapshot: Option<PolicySnapshot>,
         }
+        // What the control plane sends an old agent: protocol 0, `off`,
+        // and no snapshot in `off` (see `node_policy`).
+        let off = NodePolicy {
+            mode: NodeMode::Off,
+            protocol: 0,
+            ..Default::default()
+        };
+        let old: OldNodePolicy =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert_eq!(old.mode, OldNodeMode::Legacy);
+        assert!(old.snapshot.is_none());
+        let enforce = NodePolicy {
+            mode: NodeMode::Enforce,
+            snapshot: Some(harness_snapshot()),
+            protocol: 0,
+            ..Default::default()
+        };
+        let old: OldNodePolicy =
+            serde_json::from_str(&serde_json::to_string(&enforce).unwrap()).unwrap();
+        assert_eq!(old.mode, OldNodeMode::Enforce);
+        assert!(old.snapshot.is_some());
+        // Even a protocol-2 answer with a digest parses in an old agent.
         let unchanged = NodePolicy {
-            mode: NodeMode::Legacy,
-            snapshot: None,
+            mode: NodeMode::Off,
             snapshot_digest: Some("00ff".into()),
             unchanged: true,
+            protocol: 2,
+            ..Default::default()
         };
         let old: OldNodePolicy =
             serde_json::from_str(&serde_json::to_string(&unchanged).unwrap()).unwrap();
-        assert_eq!(old.mode, NodeMode::Legacy);
-        assert!(old.snapshot.is_none());
-        let full = NodePolicy {
-            mode: NodeMode::Legacy,
-            snapshot: Some(harness_snapshot()),
-            snapshot_digest: Some(snapshot_digest(&harness_snapshot())),
-            unchanged: false,
-        };
-        let old: OldNodePolicy =
-            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
-        assert!(old.snapshot.is_some());
+        assert_eq!(old.mode, OldNodeMode::Legacy);
+    }
+
+    /// A new agent reads either name, from a control plane of any age.
+    #[test]
+    fn a_new_agent_reads_off_and_legacy() {
+        for name in ["off", "legacy"] {
+            let policy: NodePolicy =
+                serde_json::from_str(&format!(r#"{{"mode":"{name}"}}"#)).unwrap();
+            assert_eq!(policy.mode, NodeMode::Off);
+        }
     }
 
     #[test]
@@ -1961,20 +2102,20 @@ mod tests {
         );
     }
 
-    /// `legacy` knows its workloads but never filters: the safety property
+    /// `off` knows its workloads but never filters: the safety property
     /// the early return used to give. One container list per pass, the
     /// egress table published and the observation reported, and nothing
     /// else: no nft apply (policy or host ports), no port resolution (no
     /// helper container), the DNS view open.
     #[tokio::test]
     async fn legacy_observes_and_publishes_but_never_filters() {
-        let mut h = harness(NodeMode::Legacy);
+        let mut h = harness(NodeMode::Off);
         // The first pass of a process clears what a previous one may have
         // left (see a_restarted_legacy_node_clears_tables_a_previous_process_left).
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         h.executor.applied.lock().await.clear();
         h.executor.host_ports.lock().await.clear();
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         assert!(h.executor.applied.lock().await.is_empty(), "no nft policy");
         assert!(
             h.executor.host_ports.lock().await.is_empty(),
@@ -1997,43 +2138,43 @@ mod tests {
                 .last_observed()
                 .addresses(&sandbox(1))
                 .any(|a| a == "10.237.1.2".parse::<IpAddr>().unwrap()),
-            "the observation is reported in legacy too"
+            "the observation is reported in off too"
         );
     }
 
-    /// A source with no snapshot in `legacy`: an older control plane.
-    struct NoLegacySnapshot(Arc<StaticPolicySource>);
+    /// A source with no snapshot in `off`: an older control plane.
+    struct NoOffSnapshot(Arc<StaticPolicySource>);
 
     #[async_trait]
-    impl PolicySource for NoLegacySnapshot {
+    impl PolicySource for NoOffSnapshot {
         async fn mode(&self) -> Result<NodeMode, EnforcerError> {
             self.0.mode().await
         }
         async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
             self.0.snapshot().await
         }
-        async fn legacy_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
             Ok(None)
         }
     }
 
     #[tokio::test]
     async fn legacy_without_a_snapshot_observes_nothing_as_before() {
-        let h = harness(NodeMode::Legacy);
+        let h = harness(NodeMode::Off);
         let mut enforcer = NodeEnforcer::new(
             "node-a",
             TableName::new("temps_netpol_t").unwrap(),
             h.executor.clone(),
             h.ports.clone(),
             h.instances.clone(),
-            Arc::new(NoLegacySnapshot(h.policies.clone())),
+            Arc::new(NoOffSnapshot(h.policies.clone())),
             h.dns.clone(),
             h.egress.clone(),
         );
-        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         // The first pass cleared leftovers; the second touches nothing.
         h.executor.applied.lock().await.clear();
-        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         assert_eq!(
             h.instances.observed.load(Ordering::Relaxed),
             0,
@@ -2060,7 +2201,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_observation_never_fails_a_legacy_pass() {
-        let h = harness(NodeMode::Legacy);
+        let h = harness(NodeMode::Off);
         let mut enforcer = NodeEnforcer::new(
             "node-a",
             TableName::new("temps_netpol_t").unwrap(),
@@ -2071,9 +2212,9 @@ mod tests {
             h.dns.clone(),
             h.egress.clone(),
         );
-        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         h.executor.applied.lock().await.clear();
-        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         assert!(
             h.egress.load().is_empty(),
             "the table is emptied, not kept stale"
@@ -2307,7 +2448,7 @@ mod tests {
             "an unchanged pass leaves the rules alone"
         );
 
-        h.policies.set_mode(NodeMode::Legacy);
+        h.policies.set_mode(NodeMode::Off);
         h.enforcer.reconcile().await.unwrap();
         let host_ports = h.executor.host_ports.lock().await;
         let last = host_ports.last().map(String::as_str).unwrap_or_default();
@@ -2321,11 +2462,11 @@ mod tests {
     async fn leaving_enforce_removes_both_tables() {
         let mut h = harness(NodeMode::Enforce);
         h.enforcer.reconcile().await.unwrap();
-        h.policies.set_mode(NodeMode::Legacy);
+        h.policies.set_mode(NodeMode::Off);
         assert_eq!(
             h.enforcer.reconcile().await.unwrap(),
             PassOutcome::Removed {
-                mode: NodeMode::Legacy
+                mode: NodeMode::Off
             }
         );
         let applied = h.executor.applied.lock().await;
@@ -2335,34 +2476,34 @@ mod tests {
         );
         assert_eq!(h.dns.load().restricted_sources(), 0);
         drop(applied);
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
     }
 
     #[tokio::test]
     async fn a_restarted_legacy_node_clears_tables_a_previous_process_left() {
         // The previous process enforced; this one starts with the node
-        // already switched back to legacy and must not keep its rules.
-        let mut h = harness(NodeMode::Legacy);
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        // already switched back to off and must not keep its rules.
+        let mut h = harness(NodeMode::Off);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         {
             let applied = h.executor.applied.lock().await;
             assert_eq!(
                 applied.as_slice(),
                 [node_removal_ruleset(h.enforcer.table())].as_slice(),
-                "the first legacy pass clears both tables"
+                "the first off pass clears both tables"
             );
         }
-        // Later legacy passes do not touch the kernel again.
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        // Later off passes do not touch the kernel again.
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         assert_eq!(h.executor.applied.lock().await.len(), 1);
     }
 
     #[tokio::test]
     async fn a_failed_leftover_clear_is_retried_on_the_next_pass() {
-        let mut h = harness(NodeMode::Legacy);
+        let mut h = harness(NodeMode::Off);
         h.executor.fail_next.store(true, Ordering::Relaxed);
         assert!(h.enforcer.reconcile().await.is_err());
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         assert_eq!(
             h.executor.applied.lock().await.as_slice(),
             [node_removal_ruleset(h.enforcer.table())].as_slice()
@@ -2614,9 +2755,9 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_never_opens_the_datapath_unless_a_previous_process_left_pins() {
-        let (mut h, record, _) = with_datapath(harness(NodeMode::Legacy), NO_PINS);
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        let (mut h, record, _) = with_datapath(harness(NodeMode::Off), NO_PINS);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         assert_eq!(
             record.lock().unwrap().opened,
             0,
@@ -2626,25 +2767,25 @@ mod tests {
         assert_eq!(
             h.instances.observed.load(Ordering::Relaxed),
             2,
-            "observing is the only thing legacy does"
+            "observing is the only thing off does"
         );
         assert!(egress_knows_sandbox_1(&h.egress));
         assert_eq!(h.dns.load().restricted_sources(), 0);
 
-        // Pins exist: a previous process enforced, so legacy is set once.
+        // Pins exist: a previous process enforced, so off is set once.
         let pins = std::env::temp_dir().join(format!("temps-netpol-pins-{}", std::process::id()));
         std::fs::create_dir_all(&pins).unwrap();
-        let (mut h, record, _) = with_datapath(harness(NodeMode::Legacy), pins.to_str().unwrap());
+        let (mut h, record, _) = with_datapath(harness(NodeMode::Off), pins.to_str().unwrap());
         let outcome = h.enforcer.reconcile().await.unwrap();
         let _ = std::fs::remove_dir_all(&pins);
         assert_eq!(
             outcome,
             PassOutcome::Removed {
-                mode: NodeMode::Legacy
+                mode: NodeMode::Off
             }
         );
-        assert_eq!(record.lock().unwrap().modes, vec![NodeMode::Legacy]);
-        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(record.lock().unwrap().modes, vec![NodeMode::Off]);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
         assert_eq!(record.lock().unwrap().modes.len(), 1);
     }
 
@@ -2660,16 +2801,16 @@ mod tests {
             0,
             "shadow keeps DNS open"
         );
-        h.policies.set_mode(NodeMode::Legacy);
+        h.policies.set_mode(NodeMode::Off);
         assert_eq!(
             h.enforcer.reconcile().await.unwrap(),
             PassOutcome::Removed {
-                mode: NodeMode::Legacy
+                mode: NodeMode::Off
             }
         );
         assert_eq!(
             record.lock().unwrap().modes,
-            vec![NodeMode::Enforce, NodeMode::Shadow, NodeMode::Legacy]
+            vec![NodeMode::Enforce, NodeMode::Shadow, NodeMode::Off]
         );
     }
 

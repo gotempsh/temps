@@ -36,7 +36,7 @@ pub enum NetworkPolicyError {
         "Cannot set node {node_id} to '{mode}': no network policy enforcer has reported from it \
          recently, so the mode would be reported without any policy being computed or applied \
          there. Upgrade and restart `temps agent` on the node, wait for it to report, then retry; \
-         'legacy' is always accepted"
+         'off' is always accepted"
     )]
     WorkerEnforcementUnavailable { node_id: i32, mode: String },
 

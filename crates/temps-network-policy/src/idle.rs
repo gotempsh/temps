@@ -5,8 +5,8 @@
 //!
 //! Every node gets its snapshot in every mode, so it knows its workloads
 //! and the egress proxy can identify a caller. Building a snapshot reads a
-//! dozen tables, which a node in `legacy` (the default for every install)
-//! must not pay every 15 seconds. So for `legacy`:
+//! dozen tables, which a node in `off` (the default for every install)
+//! must not pay every 15 seconds. So for `off`:
 //!
 //! - the node's mode and the policy revision come from **one query**
 //!   ([`NetworkPolicyService::mode_and_revision`]), as cheap as reading the
@@ -134,7 +134,7 @@ impl NetworkPolicyService {
     }
 
     /// A digest of what other nodes share with `node_id` (their live
-    /// observations outside `legacy`), which is part of its snapshot but
+    /// observations outside `off`), which is part of its snapshot but
     /// not of the database revision. In memory.
     fn observed_key(&self, node_id: i32) -> u64 {
         let mut elsewhere = self.observed_elsewhere(node_id);
@@ -182,7 +182,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{sql}: {e}"))
     }
 
-    /// A migrated database with one worker, in `legacy`, and two live
+    /// A migrated database with one worker, in `off`, and two live
     /// sandboxes on it (or `None` without Docker).
     async fn fixture() -> Option<(TestDatabase, i32)> {
         let db = match TestDatabase::with_migrations().await {
@@ -236,7 +236,7 @@ mod tests {
         serde_json::to_vec(policy).map(|b| b.len()).unwrap_or(0)
     }
 
-    /// The idle pass, measured. Before this change a `legacy` pass was one
+    /// The idle pass, measured. Before this change a `off` pass was one
     /// query (the mode) and a mode-only answer. Sending the snapshot every
     /// pass would cost a full build; the cache and the digest bring an
     /// unchanged pass back to one query and a mode-plus-digest answer.
@@ -277,7 +277,7 @@ mod tests {
         assert!(resent.snapshot.is_some());
 
         println!(
-            "idle legacy pass: before (old agent) {old_queries} queries, {} B answer; \
+            "idle off pass: before (old agent) {old_queries} queries, {} B answer; \
              full snapshot {build_queries} queries, {} B answer; \
              after (unchanged) {idle_queries} queries, {} B answer; \
              snapshot from the cache without a digest {resend_queries} queries, {} B",
@@ -371,7 +371,7 @@ mod tests {
             .await
             .unwrap();
         assert!(answer.unchanged);
-        // The opted-in sandbox is marked in the snapshot a legacy node holds.
+        // The opted-in sandbox is marked in the snapshot an `off` node holds.
         let snapshot = service.cached_snapshot(worker, before).await.unwrap().0;
         assert!(snapshot
             .egress
@@ -379,7 +379,7 @@ mod tests {
             .any(|p| p.subject == WorkloadRef::new(WorkloadKind::Sandbox, 8101) && p.record));
     }
 
-    /// A node outside `legacy` gets exactly what it got before: a freshly
+    /// A node outside `off` gets exactly what it got before: a freshly
     /// built snapshot every pass, never `unchanged`, never a digest.
     #[tokio::test]
     async fn shadow_and_enforce_nodes_are_answered_as_before() {
@@ -403,7 +403,7 @@ mod tests {
     }
 
     /// Observations are reported in every mode, but only a node outside
-    /// `legacy` has its workloads handed to other nodes, as before.
+    /// `off` has its workloads handed to other nodes, as before.
     #[tokio::test]
     async fn legacy_observations_are_not_shared_with_other_nodes() {
         let Some((db, worker)) = fixture().await else {
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(
             snapshot.remote.addresses(&sandbox).count(),
             0,
-            "a legacy node's workloads are not remote peers"
+            "an `off` node's workloads are not remote peers"
         );
         db.connection()
             .execute_unprepared(&format!(
@@ -445,7 +445,7 @@ mod tests {
     }
 
     /// Node 0 reads its mode and the revision in one query, and its
-    /// `legacy` snapshot comes from the cache: a steady pass is one query.
+    /// `off` snapshot comes from the cache: a steady pass is one query.
     #[tokio::test]
     async fn node_zero_in_legacy_takes_its_snapshot_from_the_cache() {
         use temps_workload_netpol::PolicySource;
@@ -454,15 +454,68 @@ mod tests {
         };
         let (service, queries) = counted(&db).await;
         let source = crate::source::DbPolicySource::new(Arc::new(service), CONTROL_PLANE_NODE_ID);
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
-        assert!(source.legacy_snapshot().await.unwrap().is_some());
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert!(source.off_snapshot().await.unwrap().is_some());
         queries.store(0, Ordering::Relaxed);
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
-        assert!(source.legacy_snapshot().await.unwrap().is_some());
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert!(source.off_snapshot().await.unwrap().is_some());
         assert_eq!(
             queries.load(Ordering::Relaxed),
             1,
             "one query per steady pass"
+        );
+    }
+
+    /// Version skew on the wire: each agent reads a mode its enum has. An
+    /// agent before protocol 3 gets `legacy`, and before protocol 2 no
+    /// snapshot; protocol 3 gets `off`. Setting `off` stores `legacy`, so a
+    /// rolled-back binary still reads it, and `off` rows are read too.
+    #[tokio::test]
+    async fn each_agent_reads_a_mode_its_version_knows() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        let (service, _) = counted(&db).await;
+        let wire = |policy: &NodePolicy| serde_json::to_value(policy).unwrap();
+        for (protocol, name, snapshot) in
+            [(0, "legacy", false), (2, "legacy", true), (3, "off", true)]
+        {
+            let report = NodePolicyReport {
+                protocol,
+                ..old_agent()
+            };
+            let answer = wire(&service.node_policy(worker, report).await.unwrap());
+            assert_eq!(answer["mode"], name, "protocol {protocol}");
+            assert_eq!(
+                answer.get("snapshot").is_some(),
+                snapshot,
+                "protocol {protocol}"
+            );
+        }
+        let (_, node) = service.set_node_mode(worker, NodeMode::Off).await.unwrap();
+        assert_eq!(node.mode, NodeMode::Off);
+        let stored: String = db
+            .connection()
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!("SELECT network_policy_mode FROM nodes WHERE id = {worker}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "network_policy_mode")
+            .unwrap();
+        assert_eq!(stored, "legacy", "stored under the name every binary reads");
+        db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE nodes SET network_policy_mode = 'off' WHERE id = {worker}"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Off);
+        assert_eq!(
+            service.mode_and_revision(worker).await.unwrap().0,
+            NodeMode::Off
         );
     }
 
@@ -480,6 +533,6 @@ mod tests {
             .mode_and_revision(CONTROL_PLANE_NODE_ID)
             .await
             .unwrap();
-        assert_eq!(mode, NodeMode::Legacy);
+        assert_eq!(mode, NodeMode::Off);
     }
 }

@@ -310,7 +310,7 @@ pub struct EffectivePolicyResponse {
     /// even when this workload's ingress is restricted.
     pub inbound_links: Vec<NetworkPolicyRuleResponse>,
     /// Nodes whose mode is `enforce`. Empty: the policy is shown but not
-    /// enforced anywhere yet (every node is `legacy` or `shadow`).
+    /// enforced anywhere yet (every node is `off` or `shadow`).
     pub enforcing_nodes: Vec<i32>,
     pub enforced: bool,
 }
@@ -343,13 +343,13 @@ pub struct NodeNetworkPolicyModeResponse {
     pub name: String,
     pub role: String,
     pub status: String,
-    /// `legacy` (today's behaviour), `shadow` (computed and logged, not
-    /// applied) or `enforce`.
-    #[schema(example = "legacy")]
+    /// `off` (nothing is filtered; the node still knows its workloads),
+    /// `shadow` (computed and logged, not applied) or `enforce`.
+    #[schema(example = "off")]
     pub mode: String,
     /// Whether this node can run `shadow` or `enforce`: always on the
     /// control plane, on a worker while its agent reports an enforcer. A
-    /// stored non-legacy mode on a node without one is never counted as
+    /// stored mode other than `off` on a node without one is never counted as
     /// enforcing.
     pub supports_enforcement: bool,
     /// Why `shadow`/`enforce` is unavailable, when `supports_enforcement`
@@ -378,6 +378,8 @@ pub struct NodeNetworkPolicyModeListResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetNodeNetworkPolicyModeRequest {
+    /// `off`, `shadow` or `enforce`. `legacy`, the former name of `off`, is
+    /// still accepted (for at least two releases) and means `off`.
     #[schema(example = "shadow")]
     pub mode: String,
 }
@@ -889,7 +891,7 @@ mod tests {
             name: "n".into(),
             role: "worker".into(),
             status: "active".into(),
-            mode: NodeMode::Legacy,
+            mode: NodeMode::Off,
             supports_enforcement: supports,
             enforcement_unavailable_reason: (!supports).then(|| "no enforcer".to_string()),
             backend: None,
