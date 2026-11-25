@@ -40,6 +40,16 @@ pub enum NetworkPolicyError {
     )]
     WorkerEnforcementUnavailable { node_id: i32, mode: String },
 
+    #[error(
+        "Cannot use {kind}/{id} in a network policy rule: {kind} workloads are not available on \
+         this instance (the '{table}' table does not exist, so the feature is not installed)"
+    )]
+    WorkloadKindUnavailable {
+        kind: &'static str,
+        id: i64,
+        table: &'static str,
+    },
+
     #[error("Stored network policy rule {rule_id} is invalid: {reason}")]
     InvalidStoredRule { rule_id: i64, reason: String },
 
