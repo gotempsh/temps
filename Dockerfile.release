@@ -29,6 +29,12 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
 # repository key that Debian's own signed postgresql-common package ships
 # (copied out so the helper package can be purged again). Fail the build if
 # the installed tools do not report that major version.
+#
+# postgresql-common depends on ssl-cert, whose install script generates a
+# self-signed "snakeoil" certificate and private key. Removing the package
+# leaves both behind; only a purge deletes them. Nothing in this image uses
+# them, and every copy of the image would share the same key, so purge
+# ssl-cert too and fail the build if any private key is left in the image.
 ARG PG_CLIENT_MAJOR=18
 RUN apt-get update && \
     apt-get install -y --no-install-recommends postgresql-common && \
@@ -39,8 +45,10 @@ RUN apt-get update && \
         > /etc/apt/sources.list.d/pgdg.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends "postgresql-client-${PG_CLIENT_MAJOR}" && \
-    apt-get purge -y postgresql-common && \
-    apt-get autoremove -y && \
+    apt-get purge -y postgresql-common ssl-cert && \
+    apt-get autoremove -y --purge && \
+    rm -f /etc/ssl/private/ssl-cert-snakeoil.key /etc/ssl/certs/ssl-cert-snakeoil.pem && \
+    test -z "$(find /etc/ssl/private -type f 2>/dev/null)" && \
     pg_dump --version | grep -Eq "^pg_dump \(PostgreSQL\) ${PG_CLIENT_MAJOR}\." && \
     pg_dumpall --version | grep -Eq "^pg_dumpall \(PostgreSQL\) ${PG_CLIENT_MAJOR}\." && \
     rm -rf /var/lib/apt/lists/*
