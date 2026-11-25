@@ -25,8 +25,9 @@ use async_trait::async_trait;
 use bollard::Docker;
 use temps_workload_netpol::{
     available_datapath, choose_executor, choose_port_resolver, spawn_container_wake,
-    DatapathConfig, DockerInstanceSource, EgressTable, EnforcerError, IdentityMap, NodeEnforcer,
-    NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PolicySnapshot, PolicySource, TableName,
+    DatapathConfig, DockerInstanceSource, EgressRecordingCapability, EgressTable, EnforcerError,
+    IdentityMap, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PolicySnapshot,
+    PolicySource, TableName,
 };
 use tracing::{info, warn};
 
@@ -65,6 +66,24 @@ pub struct AgentPolicySource {
     /// The last policy written to `cache`, to skip identical writes.
     cached: Mutex<Option<String>>,
     guard: Option<BootGuard>,
+    /// What this node says about recording outbound connections, on every
+    /// report. See [`egress_recording_capability`].
+    egress_recording: EgressRecordingCapability,
+}
+
+/// Whether this agent can record the outbound connections of sandboxes that
+/// opt in. Records are taken by the per-node egress proxy, which this agent
+/// does not serve yet: sandboxes still egress through their own sidecar
+/// (ADR-055 phase 7 moves them onto the per-node proxy). So a Linux agent
+/// reports [`RecordingUnavailable::ProxyNotServing`] and any other platform
+/// [`RecordingUnavailable::UnsupportedPlatform`], and the control plane
+/// refuses to turn recording on for its sandboxes, saying why. When the
+/// agent serves the proxy with a recorder, this becomes `detect(true)`.
+///
+/// [`RecordingUnavailable::ProxyNotServing`]: temps_workload_netpol::RecordingUnavailable::ProxyNotServing
+/// [`RecordingUnavailable::UnsupportedPlatform`]: temps_workload_netpol::RecordingUnavailable::UnsupportedPlatform
+pub fn egress_recording_capability() -> EgressRecordingCapability {
+    EgressRecordingCapability::detect(false)
 }
 
 impl AgentPolicySource {
@@ -86,6 +105,7 @@ impl AgentPolicySource {
             cache: None,
             cached: Mutex::new(None),
             guard: None,
+            egress_recording: egress_recording_capability(),
         }
     }
 
@@ -174,6 +194,7 @@ impl PolicySource for AgentPolicySource {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            egress_recording: Some(self.egress_recording.clone()),
         };
         let policy = match self.fetch(&report).await {
             Ok(policy) => {
@@ -348,5 +369,81 @@ mod tests {
             policy_url("https://cp.example:8081", 4),
             "https://cp.example:8081/api/internal/nodes/4/network-policy"
         );
+    }
+
+    #[test]
+    fn this_agent_reports_that_it_cannot_record_yet_and_why() {
+        let capability = egress_recording_capability();
+        assert!(!capability.is_available());
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            capability,
+            EgressRecordingCapability::Unavailable {
+                reason: temps_workload_netpol::RecordingUnavailable::ProxyNotServing
+            }
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            capability,
+            EgressRecordingCapability::Unavailable {
+                reason: temps_workload_netpol::RecordingUnavailable::UnsupportedPlatform { .. }
+            }
+        ));
+    }
+
+    /// Every pass's report carries the capability, so the control plane can
+    /// answer for this node.
+    #[tokio::test]
+    async fn the_policy_report_carries_the_recording_capability() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+            }
+            let answer = r#"{"mode":"legacy"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let source = AgentPolicySource::new(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            4,
+            "token".into(),
+            "nftables",
+        );
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        let request = server.await.unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let report: NodePolicyReport = serde_json::from_str(body).unwrap();
+        assert_eq!(report.egress_recording, Some(egress_recording_capability()));
     }
 }

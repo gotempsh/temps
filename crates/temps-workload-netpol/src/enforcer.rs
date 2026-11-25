@@ -253,6 +253,11 @@ pub struct NodePolicyReport {
     /// peers. Empty in `legacy`, where the node observes nothing.
     #[serde(default)]
     pub identities: IdentityMap,
+    /// Whether this node can record outbound connections of sandboxes that
+    /// opt in, and if not why. `None` from an agent that predates
+    /// recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_recording: Option<crate::egress::EgressRecordingCapability>,
 }
 
 #[async_trait]

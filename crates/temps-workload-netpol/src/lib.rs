@@ -46,8 +46,11 @@ pub use ebpf::{
     available_datapath, CgroupDatapath, CgroupTarget, DatapathConfig, DatapathError, DatapathOpener,
 };
 pub use egress::{
-    EgressPolicy, EgressProxy, EgressProxyConfig, EgressRule, EgressStats, EgressTable,
-    EgressTarget, HostPattern, RelayUpstream,
+    recording_channel, ConnectionKind, ConnectionOutcome, ConnectionRecord, EgressBatcher,
+    EgressPolicy, EgressProxy, EgressProxyConfig, EgressReason, EgressRecordBatch,
+    EgressRecordSink, EgressRecorder, EgressRecordingCapability, EgressRule, EgressStats,
+    EgressStatsSnapshot, EgressTable, EgressTarget, HostPattern, RecordSinkError,
+    RecordingUnavailable, RelayKind, RelayUpstream,
 };
 pub use enforcer::{
     identify, spawn_container_wake, with_best_datapath, DockerInstanceSource, EnforcerError,

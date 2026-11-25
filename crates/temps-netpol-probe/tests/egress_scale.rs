@@ -14,7 +14,11 @@
 //!
 //! It prints idle memory for each, the time to wire the proxy up, and for
 //! the shared layout the proxy's CPU and memory after 50 sandboxes make 20
-//! requests each through it at once. It asserts what the decision rests
+//! requests each through it at once. The shared load runs twice: through a
+//! proxy that records nothing, then through one that records every
+//! connection of every sandbox (plus a retry loop of refused requests,
+//! which collapses) and delivers the records to a stand-in control plane on
+//! the same network, so the cost of recording is measured in the same run. It asserts what the decision rests
 //! on: the shared layout blocks member-to-member traffic, every proxied
 //! request is answered, nothing is refused for saturation, and one Rust
 //! proxy uses less memory than the sidecars it replaces.
@@ -45,7 +49,7 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use futures::{FutureExt, StreamExt};
-use temps_netpol_probe::ServeConfig;
+use temps_netpol_probe::{RecordingConfig, ServeConfig};
 use temps_workload::{labels, WorkloadKind, WorkloadRef};
 use temps_workload_netpol::enforcer::{EnforcerError, ObservedContainer};
 use temps_workload_netpol::executor::HELPER_IMAGE;
@@ -70,6 +74,13 @@ const SCOPE: &str = "egress-scale";
 const SHARED_SUBNET: &str = "10.237.150.0/24";
 const PROXY_IP: &str = "10.237.150.2";
 const TARGET_IP: &str = "10.237.150.3";
+/// The recording phase's proxy and the stand-in control plane it delivers
+/// records to.
+const RECORDING_PROXY_IP: &str = "10.237.150.5";
+const RECORD_SINK_IP: &str = "10.237.150.4";
+/// Refused requests each sandbox makes in the recording phase (a port no
+/// rule allows), which collapse into one record per sandbox per batch.
+const REFUSED_EACH: usize = 5;
 const MIB: f64 = 1024.0 * 1024.0;
 
 /// Today's sidecar, verbatim from the sandbox provider.
@@ -413,7 +424,7 @@ fn mib(bytes: u64) -> f64 {
     bytes as f64 / MIB
 }
 
-fn proxy_config(identities: Vec<(WorkloadRef, IpAddr)>) -> ServeConfig {
+fn proxy_config(identities: Vec<(WorkloadRef, IpAddr)>, record: bool) -> ServeConfig {
     let egress = identities
         .iter()
         .map(|(w, _)| EgressPolicy {
@@ -438,6 +449,7 @@ fn proxy_config(identities: Vec<(WorkloadRef, IpAddr)>) -> ServeConfig {
                     action: Action::Allow,
                 },
             ],
+            record,
         })
         .collect();
     ServeConfig {
@@ -445,6 +457,12 @@ fn proxy_config(identities: Vec<(WorkloadRef, IpAddr)>) -> ServeConfig {
         identities,
         egress,
         stats_every_secs: Some(1),
+        recording: record.then(|| RecordingConfig {
+            url: format!("http://{RECORD_SINK_IP}:9000/api/internal/nodes/1/egress-records"),
+            token: "scale-node-token".to_string(),
+            max_batch_age_ms: None,
+            channel_capacity: None,
+        }),
         ..Default::default()
     }
 }
@@ -544,7 +562,7 @@ async fn measure(scale: &mut Scale) {
             (sandbox(i), addr)
         })
         .collect();
-    let config = serde_json::to_vec(&proxy_config(identities)).unwrap_or_default();
+    let config = serde_json::to_vec(&proxy_config(identities, false)).unwrap_or_default();
     std::fs::write(scale.config_dir.join("joined.json"), config)
         .unwrap_or_else(|e| panic!("write the joined config: {e}"));
     for i in 0..SANDBOXES {
@@ -635,7 +653,10 @@ async fn measure(scale: &mut Scale) {
             )
         })
         .collect();
-    let config = serde_json::to_vec(&proxy_config(identities)).unwrap_or_default();
+    let config = serde_json::to_vec(&proxy_config(identities.clone(), true)).unwrap_or_default();
+    std::fs::write(scale.config_dir.join("recording.json"), config)
+        .unwrap_or_else(|e| panic!("write the recording config: {e}"));
+    let config = serde_json::to_vec(&proxy_config(identities, false)).unwrap_or_default();
     std::fs::write(scale.config_dir.join("shared.json"), config)
         .unwrap_or_else(|e| panic!("write the shared config: {e}"));
     let started = Instant::now();
@@ -670,6 +691,38 @@ async fn measure(scale: &mut Scale) {
             vec!["/probe".into(), "sink".into(), "-".into(), "8080".into()],
             vec![],
             false,
+        )
+        .await;
+    let record_sink = format!("{prefix}-record-sink");
+    scale
+        .container(
+            &record_sink,
+            IMAGE,
+            None,
+            &shared_net,
+            Some(RECORD_SINK_IP.into()),
+            None,
+            vec!["/probe".into(), "record-sink".into(), "9000".into()],
+            vec![],
+            false,
+        )
+        .await;
+    let recording = format!("{prefix}-rust-recording");
+    scale
+        .container(
+            &recording,
+            IMAGE,
+            None,
+            &shared_net,
+            Some(RECORDING_PROXY_IP.into()),
+            None,
+            vec![
+                "/probe".into(),
+                "serve".into(),
+                "/config/recording.json".into(),
+            ],
+            vec![],
+            true,
         )
         .await;
     for i in 0..SANDBOXES {
@@ -713,13 +766,16 @@ async fn measure(scale: &mut Scale) {
                     rules: vec![],
                 })
                 .collect(),
-            system_peers: vec![SystemPeer {
-                cidr: format!("{PROXY_IP}/32")
-                    .parse()
-                    .unwrap_or_else(|e| panic!("{e:?}")),
-                ports: Some(PortRange::single(3128)),
-                protocol: L4Protocol::Tcp,
-            }],
+            system_peers: [PROXY_IP, RECORDING_PROXY_IP]
+                .into_iter()
+                .map(|proxy| SystemPeer {
+                    cidr: format!("{proxy}/32")
+                        .parse()
+                        .unwrap_or_else(|e| panic!("{e:?}")),
+                    ports: Some(PortRange::single(3128)),
+                    protocol: L4Protocol::Tcp,
+                })
+                .collect(),
             ..Default::default()
         },
     ));
@@ -815,6 +871,101 @@ async fn measure(scale: &mut Scale) {
         (after.cpu_ns.saturating_sub(before.cpu_ns)) as f64 / 1e3 / total as f64,
         mib(after.memory)
     ));
+
+    // ---- The same load through the recording proxy ----
+    let rec_before = scale.usage(&recording).await;
+    let rec_started = Instant::now();
+    let rec_load = format!(
+        "ok=0; for i in $(seq {REQUESTS_EACH}); do http_proxy=http://{RECORDING_PROXY_IP}:3128 wget -q -O - -Y on http://{TARGET_IP}:8080/ 2>/dev/null | grep -q ok && ok=$((ok+1)); done; \
+         for i in $(seq {REFUSED_EACH}); do http_proxy=http://{RECORDING_PROXY_IP}:3128 wget -q -O - -Y on http://{TARGET_IP}:9999/ >/dev/null 2>&1; done; echo ok=$ok"
+    );
+    let runs = (0..SANDBOXES).map(|i| {
+        let name = format!("{prefix}-sb-{i}");
+        let load = rec_load.clone();
+        let scale = &*scale;
+        async move { scale.exec(&name, &load).await }
+    });
+    let rec_outputs = futures::future::join_all(runs).await;
+    let rec_time = rec_started.elapsed();
+    let rec_after = scale.usage(&recording).await;
+    let rec_answered: usize = rec_outputs
+        .iter()
+        .filter_map(|o| {
+            o.trim()
+                .strip_prefix("ok=")
+                .and_then(|n| n.trim().parse::<usize>().ok())
+        })
+        .sum();
+    // One batch age (5 s) plus a stats interval, so every record is
+    // delivered and counted.
+    tokio::time::sleep(Duration::from_secs(7)).await;
+    let rec_logs = scale.logs(&recording).await;
+    let rec_stats_line = rec_logs
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("stats "))
+        .unwrap_or_default()
+        .to_string();
+    let rec_stats: serde_json::Value =
+        serde_json::from_str(rec_stats_line.trim_start_matches("stats ")).unwrap_or_default();
+    let sink_logs = scale.logs(&record_sink).await;
+    let (received, connections) = sink_logs
+        .lines()
+        .filter_map(|l| l.strip_prefix("records received "))
+        .fold((0u64, 0u64), |(r, c), rest| {
+            let mut words = rest.split_whitespace();
+            let n = words
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            let conns = words
+                .nth(1)
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0);
+            (r + n, c + conns)
+        });
+    let refused_total = (SANDBOXES * REFUSED_EACH) as u64;
+    let get = |k: &str| rec_stats[k].as_u64().unwrap_or(0);
+    assert_eq!(
+        rec_answered, total,
+        "recording slows or fails no proxied request: {rec_outputs:?}"
+    );
+    assert_eq!(get("refused_saturated"), 0, "{rec_stats_line}");
+    assert_eq!(
+        get("records_emitted") + get("records_dropped"),
+        total as u64 + refused_total,
+        "one record per connection, queued or counted as dropped: {rec_stats_line}"
+    );
+    assert_eq!(
+        connections,
+        get("records_emitted"),
+        "the stand-in control plane got every queued connection, collapsed or not: {sink_logs}"
+    );
+    assert_eq!(
+        received,
+        get("records_delivered"),
+        "{rec_stats_line} / {sink_logs}"
+    );
+    assert!(
+        received < get("records_emitted"),
+        "the refused retry loop collapsed: {received} records for {} connections",
+        get("records_emitted")
+    );
+    report.push(format!(
+        "shared, recording every connection: {total} requests + {refused_total} refused in {:.2}s, proxy CPU {:.3} CPU-s ({:.0} us/connection), memory after {:.1} MiB; {} records queued, {} dropped, {} collapsed, {} delivered in {} batches; proxy stats {rec_stats_line}",
+        rec_time.as_secs_f64(),
+        (rec_after.cpu_ns.saturating_sub(rec_before.cpu_ns)) as f64 / 1e9,
+        (rec_after.cpu_ns.saturating_sub(rec_before.cpu_ns)) as f64
+            / 1e3
+            / (total as f64 + refused_total as f64),
+        mib(rec_after.memory),
+        get("records_emitted"),
+        get("records_dropped"),
+        get("records_collapsed"),
+        received,
+        sink_logs.matches("records received").count(),
+    ));
+
     source.set_mode(NodeMode::Legacy);
     let rollback = enforcer
         .reconcile()

@@ -7,10 +7,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use temps_netpol_probe::{public_dns, read_config, serve, sink, ProbeError};
+use temps_netpol_probe::{public_dns, read_config, record_sink, serve, sink, ProbeError};
 
 const USAGE: &str =
-    "temps-netpol-probe serve <config.json> | sink <udp-port|-> <tcp-port,...|-> | public-dns <port>";
+    "temps-netpol-probe serve <config.json> | sink <udp-port|-> <tcp-port,...|-> | public-dns <port> | record-sink <port>";
 
 fn run(args: Vec<String>) -> Result<(), ProbeError> {
     let usage = || ProbeError::Usage {
@@ -51,6 +51,13 @@ fn run(args: Vec<String>) -> Result<(), ProbeError> {
                 .and_then(|p| p.parse::<u16>().ok())
                 .ok_or_else(usage)?;
             runtime.block_on(public_dns(port))
+        }
+        Some("record-sink") => {
+            let port = args
+                .get(2)
+                .and_then(|p| p.parse::<u16>().ok())
+                .ok_or_else(usage)?;
+            runtime.block_on(record_sink(port))
         }
         _ => Err(usage()),
     }
