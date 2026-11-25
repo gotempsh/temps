@@ -14187,7 +14187,7 @@ export type EffectivePolicyResponse = {
     enforced: boolean;
     /**
      * Nodes whose mode is `enforce`. Empty: the policy is shown but not
-     * enforced anywhere yet (every node is `legacy` or `shadow`).
+     * enforced anywhere yet (every node is `off` or `shadow`).
      */
     enforcing_nodes: Array<number>;
     /**
@@ -24650,8 +24650,8 @@ export type NodeNetworkPolicyModeResponse = {
      */
     enforcement_unavailable_reason?: string | null;
     /**
-     * `legacy` (today's behaviour), `shadow` (computed and logged, not
-     * applied) or `enforce`.
+     * `off` (nothing is filtered; the node still knows its workloads),
+     * `shadow` (computed and logged, not applied) or `enforce`.
      */
     mode: string;
     name: string;
@@ -24664,7 +24664,7 @@ export type NodeNetworkPolicyModeResponse = {
     /**
      * Whether this node can run `shadow` or `enforce`: always on the
      * control plane, on a worker while its agent reports an enforcer. A
-     * stored non-legacy mode on a node without one is never counted as
+     * stored mode other than `off` on a node without one is never counted as
      * enforcing.
      */
     supports_enforcement: boolean;
@@ -35572,6 +35572,10 @@ export type SetManagedRecordRequest = {
 };
 
 export type SetNodeNetworkPolicyModeRequest = {
+    /**
+     * `off`, `shadow` or `enforce`. `legacy`, the former name of `off`, is
+     * still accepted (for at least two releases) and means `off`.
+     */
     mode: string;
 };
 

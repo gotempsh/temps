@@ -29954,7 +29954,7 @@
             "type": "boolean"
           },
           "enforcing_nodes": {
-            "description": "Nodes whose mode is `enforce`. Empty: the policy is shown but not\nenforced anywhere yet (every node is `legacy` or `shadow`).",
+            "description": "Nodes whose mode is `enforce`. Empty: the policy is shown but not\nenforced anywhere yet (every node is `off` or `shadow`).",
             "items": {
               "format": "int32",
               "type": "integer"
@@ -52986,8 +52986,8 @@
             ]
           },
           "mode": {
-            "description": "`legacy` (today's behaviour), `shadow` (computed and logged, not\napplied) or `enforce`.",
-            "example": "legacy",
+            "description": "`off` (nothing is filtered; the node still knows its workloads),\n`shadow` (computed and logged, not applied) or `enforce`.",
+            "example": "off",
             "type": "string"
           },
           "name": {
@@ -53005,7 +53005,7 @@
             "type": "string"
           },
           "supports_enforcement": {
-            "description": "Whether this node can run `shadow` or `enforce`: always on the\ncontrol plane, on a worker while its agent reports an enforcer. A\nstored non-legacy mode on a node without one is never counted as\nenforcing.",
+            "description": "Whether this node can run `shadow` or `enforce`: always on the\ncontrol plane, on a worker while its agent reports an enforcer. A\nstored mode other than `off` on a node without one is never counted as\nenforcing.",
             "type": "boolean"
           }
         },
@@ -76732,6 +76732,7 @@
       "SetNodeNetworkPolicyModeRequest": {
         "properties": {
           "mode": {
+            "description": "`off`, `shadow` or `enforce`. `legacy`, the former name of `off`, is\nstill accepted (for at least two releases) and means `off`.",
             "example": "shadow",
             "type": "string"
           }
