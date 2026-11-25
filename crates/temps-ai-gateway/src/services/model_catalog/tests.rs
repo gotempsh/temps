@@ -1020,11 +1020,34 @@ async fn discovery_pages_through_active_key_ids_only() {
         )
         .unwrap(),
     );
-    let keys = ProviderKeyService::new(db, encryption);
+    let keys = ProviderKeyService::new(db.clone(), encryption);
+    // A pass reads where it ends once, before paging.
+    let through = keys.last_key_id().await.unwrap().expect("keys exist");
+    assert_eq!(through, 914);
+    // A key created during the pass waits for the next one.
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active) VALUES \
+         (915, 'openai', 'Created during the pass', 'enc', true)",
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        keys.active_key_ids_after(910, 2).await.unwrap(),
+        keys.active_key_ids_after(910, through, 2).await.unwrap(),
         vec![911, 913]
     );
-    assert_eq!(keys.active_key_ids_after(913, 2).await.unwrap(), vec![914]);
-    assert!(keys.active_key_ids_after(914, 2).await.unwrap().is_empty());
+    assert_eq!(
+        keys.active_key_ids_after(913, through, 2).await.unwrap(),
+        vec![914]
+    );
+    assert!(keys
+        .active_key_ids_after(914, through, 2)
+        .await
+        .unwrap()
+        .is_empty());
+    // The next pass reaches it.
+    let next = keys.last_key_id().await.unwrap().expect("keys exist");
+    assert_eq!(
+        keys.active_key_ids_after(914, next, 2).await.unwrap(),
+        vec![915]
+    );
 }

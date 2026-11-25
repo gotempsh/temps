@@ -878,15 +878,28 @@ impl ModelCatalogService {
         Ok((saved, pricing::install_catalog_prices(&prices)))
     }
 
-    /// Rediscover every active provider key's models, one key at a time.
+    /// Rediscover the models of every provider key active when the pass
+    /// starts, one key at a time. Keys created during the pass wait for the
+    /// next one, so a steady stream of new keys cannot keep this pass (and
+    /// the price refresh scheduled after it) from finishing.
     async fn discover_provider_models(&self) -> Result<(), ModelCatalogError> {
         let mut keys = 0usize;
         let mut refreshed = 0usize;
         let mut after_id = 0;
+        let through_id = match self.provider_key_service.last_key_id().await {
+            Ok(last) => last.unwrap_or(0),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Could not read the last provider key for AI model discovery"
+                );
+                return Ok(());
+            }
+        };
         loop {
             let page = match self
                 .provider_key_service
-                .active_key_ids_after(after_id, DISCOVERY_KEY_PAGE)
+                .active_key_ids_after(after_id, through_id, DISCOVERY_KEY_PAGE)
                 .await
             {
                 Ok(page) => page,
