@@ -382,19 +382,6 @@ pub trait RunOps: Send + Sync {
     async fn http_policy(&self, host: &str) -> Result<Option<Option<HttpPolicy>>, String>;
     /// Records the HTTPS-only choice of `host`; `None` forgets it.
     async fn set_http_policy(&self, host: &str, policy: Option<HttpPolicy>) -> Result<(), String>;
-    /// Access application `id` in `provider_id`'s account (ADR 065 D9);
-    /// `None` when it no longer exists.
-    async fn access_app(&self, provider_id: i32, id: &str) -> Result<Option<AccessApp>, String>;
-    /// Creates the Access application `name` protecting `host`, letting in
-    /// who `policy` says.
-    async fn create_access_app(
-        &self,
-        provider_id: i32,
-        name: &str,
-        host: &str,
-        policy: &AccessPolicyAnswer,
-    ) -> Result<AccessApp, WriteError>;
-    async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String>;
     /// Creates the `(node, address)` Serve entry with this run's reference,
     /// or adds a reference to the same one, in one transaction holding the
     /// entry's advisory lock (and the Service's first) (ADR 065 D4).
@@ -532,6 +519,9 @@ pub enum UndoCheck {
     Remove,
     /// Already gone: nothing to remove.
     Gone,
+    /// No longer the run's to remove, though still there; undo leaves it,
+    /// saying why.
+    Left(String),
     /// Someone changed it since; undo pauses on it, saying what it is now.
     Changed(String),
     /// It could not be read; undo stops, touching nothing from there on.
@@ -553,6 +543,8 @@ pub trait StepRun: Send {
     async fn finish(&mut self, key: &str, resource: Option<RunResource>);
     /// After a failed call that may have made something anyway.
     async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool);
+    /// The gate now in front of the address, which attaching it records.
+    fn protect_with(&mut self, binding: AccessBinding);
 }
 
 #[async_trait]
@@ -579,6 +571,10 @@ impl StepRun for Runner<'_> {
 
     async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool) {
         Runner::finish_failed(self, intent, maybe_applied).await
+    }
+
+    fn protect_with(&mut self, binding: AccessBinding) {
+        self.ctx.access = Some(binding);
     }
 }
 
@@ -1496,94 +1492,6 @@ impl Runner<'_> {
         let resolution = resolve_pending(entry, self.ops, run_id, chrono::Utc::now()).await;
         self.save().await;
         resolution
-    }
-
-    /// Put a Cloudflare Access app in front of `host` (ADR 065 D9): the
-    /// one the plan found, re-read so a deleted or moved app is not used,
-    /// or one this run creates and journals.
-    async fn access_app(&mut self, host: &str) -> Outcome {
-        let input = self.input;
-        let Some(access) = input.access.clone() else {
-            return Outcome::Failed(format!(
-                "This run has no Cloudflare Access app to put in front of {host}. Plan again."
-            ));
-        };
-        if let Some(existing) = &access.existing {
-            return match self.ops.access_app(access.provider_id, &existing.id).await {
-                Ok(Some(app)) if super::access::covers(&app, host) => {
-                    self.ctx.access = Some(AccessBinding {
-                        provider_id: access.provider_id,
-                        app_id: app.id.clone(),
-                        aud: app.aud.clone(),
-                    });
-                    Outcome::Skipped(format!(
-                        "Access app {} already protects {host}; used as it is.",
-                        app.name
-                    ))
-                }
-                Ok(Some(app)) => Outcome::Failed(format!(
-                    "Access app {} no longer protects {host} (it is for {}). Plan again.",
-                    app.name, app.domain
-                )),
-                Ok(None) => Outcome::Failed(format!(
-                    "Access app {} was deleted in Cloudflare after planning. Plan again.",
-                    existing.name
-                )),
-                Err(error) => Outcome::Failed(error),
-            };
-        }
-        let name = super::access::run_app_name(&access.name, input.run_id);
-        let intent = Intent::AccessApp {
-            provider_id: access.provider_id,
-            name: name.clone(),
-            hostname: host.to_string(),
-        };
-        let bind = |ctx: &mut Context, resource: &RunResource| {
-            if let RunResource::AccessApp {
-                provider_id,
-                id,
-                aud,
-                ..
-            } = resource
-            {
-                ctx.access = Some(AccessBinding {
-                    provider_id: *provider_id,
-                    app_id: id.clone(),
-                    aud: aud.clone(),
-                });
-            }
-        };
-        match self.begin(&intent).await {
-            Err(hold) => hold.into(),
-            Ok(Begin::Have(resource)) => {
-                bind(&mut self.ctx, &resource);
-                Outcome::Done(Some(format!("{} protects {host}.", resource.describe())))
-            }
-            Ok(Begin::Go) => match self
-                .ops
-                .create_access_app(access.provider_id, &name, host, &access.policy)
-                .await
-            {
-                Ok(app) => {
-                    let resource = RunResource::AccessApp {
-                        provider_id: access.provider_id,
-                        id: app.id,
-                        name: app.name,
-                        hostname: host.to_string(),
-                        aud: app.aud,
-                        policies: app.policies,
-                    };
-                    bind(&mut self.ctx, &resource);
-                    let detail = format!("{} protects {host}.", resource.describe());
-                    self.finish(&intent.key(input.run_id), Some(resource)).await;
-                    Outcome::Done(Some(detail))
-                }
-                Err(error) => {
-                    self.finish_failed(&intent, error.maybe_applied).await;
-                    Outcome::Failed(error.message)
-                }
-            },
-        }
     }
 
     /// Records on the address what it answers besides HTTPS (ADR 070 D1),
@@ -3175,8 +3083,7 @@ impl Runner<'_> {
                     },
                 }
             }
-            StepKind::AccessApp => self.access_app(&address).await,
-            StepKind::RedirectToHttps | StepKind::StandardPortsOnly => {
+            StepKind::AccessApp | StepKind::RedirectToHttps | StepKind::StandardPortsOnly => {
                 Outcome::Failed(format!("No provider runs {kind:?} steps here."))
             }
             StepKind::SetHttpPolicy => self.record_http_policy(&address).await,
@@ -3913,6 +3820,17 @@ pub async fn undo(
                     entry.at = now;
                     continue;
                 }
+                UndoCheck::Left(label) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    results.push(UndoResult {
+                        label,
+                        resource: resource.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                    continue;
+                }
                 UndoCheck::Changed(now_is) => return stop(results, pause(entry, now_is, now)),
                 UndoCheck::Unreadable(why) => return stop(results, Stop::Failed(why)),
             }
@@ -4142,59 +4060,6 @@ pub async fn undo(
                     )
                 }
             },
-            // An Access app goes only while it is still this address's
-            // app, and, unless the user said to delete it anyway, while its
-            // policies are what the run created (ADR 065 D9).
-            RunResource::AccessApp {
-                provider_id,
-                id,
-                name,
-                hostname,
-                policies,
-                ..
-            } => match ops.access_app(*provider_id, id).await {
-                Ok(None) => {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                    continue;
-                }
-                Ok(Some(app))
-                    if !app
-                        .domain
-                        .trim_end_matches('.')
-                        .eq_ignore_ascii_case(hostname.trim_end_matches('.')) =>
-                {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                    results.push(UndoResult {
-                        label: format!(
-                            "Left Access app {name}: it protects {} now, not {hostname}",
-                            app.domain
-                        ),
-                        resource: resource.clone(),
-                        ok: true,
-                        error: None,
-                    });
-                    continue;
-                }
-                Ok(Some(app)) if !checked && app.policies != *policies => {
-                    return stop(
-                        results,
-                        pause(entry, "its policies were changed".to_string(), now),
-                    )
-                }
-                Ok(Some(_)) => {}
-                Err(error) => {
-                    return stop(
-                        results,
-                        Stop::Failed(format!(
-                            "Temps could not read Access app {name} to check it is still the \
-                             one this run created, so it touched nothing from there on: \
-                             {error} Undo again to retry."
-                        )),
-                    )
-                }
-            },
             // A tunnel is checked for what else it serves, then marked
             // `deleting`, and that journaled, before any provider call:
             // sync then never brings it back, and an interrupted undo
@@ -4305,9 +4170,6 @@ pub async fn undo(
                     hostname, before, ..
                 } => ops.set_http_policy(hostname, *before).await,
                 RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
-                RunResource::AccessApp {
-                    provider_id, id, ..
-                } => ops.delete_access_app(*provider_id, id).await,
                 // Handled above, before anything is removed.
                 RunResource::TailscaleServe { .. }
                 | RunResource::TailscaleService { .. }
@@ -4316,7 +4178,7 @@ pub async fn undo(
                     ops.set_environment_hosts(*connector_id, false).await
                 }
                 // Only a provider removes its own resources.
-                RunResource::EdgeRule { .. } => Ok(()),
+                RunResource::EdgeRule { .. } | RunResource::AccessApp { .. } => Ok(()),
             },
         };
         let label = match &resource {
@@ -4823,46 +4685,6 @@ mod tests {
             *self.http_policy.lock().expect("lock") = policy;
             Ok(())
         }
-        async fn access_app(
-            &self,
-            _provider_id: i32,
-            id: &str,
-        ) -> Result<Option<AccessApp>, String> {
-            self.result("access_app")?;
-            Ok(self
-                .access_apps
-                .lock()
-                .expect("lock")
-                .iter()
-                .find(|a| a.id == id)
-                .cloned())
-        }
-        async fn create_access_app(
-            &self,
-            provider_id: i32,
-            name: &str,
-            host: &str,
-            policy: &AccessPolicyAnswer,
-        ) -> Result<AccessApp, WriteError> {
-            self.log(format!(
-                "create_access_app {provider_id} {name} {host} {}",
-                policy.emails.join(",")
-            ));
-            if self.fail.contains(&"create_access_app") {
-                return Err(WriteError::refused("Cloudflare refused it"));
-            }
-            let app = access_app_named("app-1", name, host, "policy-v1");
-            self.access_apps.lock().expect("lock").push(app.clone());
-            Ok(app)
-        }
-        async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
-            self.log(format!("delete_access_app {provider_id} {id}"));
-            self.access_apps
-                .lock()
-                .expect("lock")
-                .retain(|a| a.id != id);
-            Ok(())
-        }
         async fn claim_serve_entry(
             &self,
             _run_id: i32,
@@ -5082,6 +4904,60 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .retain(|(_, r)| r.id != rule.rule_id);
+            Ok(())
+        }
+
+        async fn find_access_app(
+            &self,
+            provider_id: i32,
+            name: &str,
+            host: &str,
+        ) -> Result<Option<RunResource>, String> {
+            self.find(&Intent::AccessApp {
+                provider_id,
+                name: name.to_string(),
+                hostname: host.to_string(),
+            })
+            .await
+        }
+        async fn access_app(
+            &self,
+            _provider_id: i32,
+            id: &str,
+        ) -> Result<Option<AccessApp>, String> {
+            self.result("access_app")?;
+            Ok(self
+                .access_apps
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|a| a.id == id)
+                .cloned())
+        }
+        async fn create_access_app(
+            &self,
+            provider_id: i32,
+            name: &str,
+            host: &str,
+            policy: &AccessPolicyAnswer,
+        ) -> Result<AccessApp, WriteError> {
+            self.log(format!(
+                "create_access_app {provider_id} {name} {host} {}",
+                policy.emails.join(",")
+            ));
+            if self.fail.contains(&"create_access_app") {
+                return Err(WriteError::refused("Cloudflare refused it"));
+            }
+            let app = access_app_named("app-1", name, host, "policy-v1");
+            self.access_apps.lock().expect("lock").push(app.clone());
+            Ok(app)
+        }
+        async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
+            self.log(format!("delete_access_app {provider_id} {id}"));
+            self.access_apps
+                .lock()
+                .expect("lock")
+                .retain(|a| a.id != id);
             Ok(())
         }
     }

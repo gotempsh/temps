@@ -51,7 +51,7 @@ use temps_projects::CustomDomainService;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use super::access::{self as access_api, AccessApp, AccessPolicyAnswer, ACCESS_TUNNEL_ONLY};
+use super::access::{self as access_api, AccessPolicyAnswer, ACCESS_TUNNEL_ONLY};
 use super::access_service::AccessProviderService;
 use super::compute::{
     address_reachability, control_plane_origin, is_local_only, needs_lookup, overall_state,
@@ -3559,23 +3559,10 @@ impl RunOps for LiveOps {
                 .map(|_| RunResource::Certificate {
                     domain: domain.clone(),
                 }),
-            Intent::AccessApp {
-                provider_id,
-                name,
-                hostname,
-            } => self
-                .deps
-                .access
-                .app_named(*provider_id, name, hostname)
-                .await?
-                .map(|app| RunResource::AccessApp {
-                    provider_id: *provider_id,
-                    id: app.id,
-                    name: app.name,
-                    hostname: hostname.clone(),
-                    aud: app.aud,
-                    policies: app.policies,
-                }),
+            // Looked up in the provider's account (cloudflare/run.rs `look`).
+            Intent::AccessApp { .. } => {
+                return Err("Access apps are looked up by Cloudflare.".to_string())
+            }
             Intent::TailscaleCredential { name } => ingress_connectors::Entity::find()
                 .filter(ingress_connectors::Column::Name.eq(name.clone()))
                 .filter(ingress_connectors::Column::Provider.eq(tailscale::KIND))
@@ -4227,31 +4214,6 @@ impl RunOps for LiveOps {
         let connectors = self.deps.connectors.clone();
         tokio::spawn(async move { connectors.reconcile_all().await });
         Ok(())
-    }
-
-    async fn access_app(&self, provider_id: i32, id: &str) -> Result<Option<AccessApp>, String> {
-        self.deps.access.app(provider_id, id).await
-    }
-
-    async fn create_access_app(
-        &self,
-        provider_id: i32,
-        name: &str,
-        host: &str,
-        policy: &AccessPolicyAnswer,
-    ) -> Result<AccessApp, WriteError> {
-        self.deps
-            .access
-            .create_app(provider_id, name, host, policy)
-            .await
-            .map_err(|error| WriteError {
-                message: error.message,
-                maybe_applied: error.maybe_applied,
-            })
-    }
-
-    async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
-        self.deps.access.delete_app(provider_id, id).await
     }
 
     async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String> {

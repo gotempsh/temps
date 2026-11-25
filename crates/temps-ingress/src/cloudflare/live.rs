@@ -11,8 +11,10 @@ use tracing::info;
 
 use super::edge_rules::{self, EdgeRuleCreated, EdgeRuleError, EdgeRuleSeen};
 use super::run::{CloudflareOps, EdgeRuleAt, EdgeRuleMade};
+use crate::reachability::access::{AccessApp, AccessPolicyAnswer};
 use crate::reachability::edge_rules::EdgeRulePurpose;
 use crate::reachability::model::RunResource;
+use crate::reachability::run::WriteError;
 use crate::reachability::service::LiveOps;
 
 fn text(error: impl std::fmt::Display) -> String {
@@ -131,6 +133,52 @@ impl CloudflareOps for LiveOps {
             &rule.rule_id,
         )
         .await
+    }
+
+    async fn find_access_app(
+        &self,
+        provider_id: i32,
+        name: &str,
+        host: &str,
+    ) -> Result<Option<RunResource>, String> {
+        Ok(self
+            .deps
+            .access
+            .app_named(provider_id, name, host)
+            .await?
+            .map(|app| RunResource::AccessApp {
+                provider_id,
+                id: app.id,
+                name: app.name,
+                hostname: host.to_string(),
+                aud: app.aud,
+                policies: app.policies,
+            }))
+    }
+
+    async fn access_app(&self, provider_id: i32, id: &str) -> Result<Option<AccessApp>, String> {
+        self.deps.access.app(provider_id, id).await
+    }
+
+    async fn create_access_app(
+        &self,
+        provider_id: i32,
+        name: &str,
+        host: &str,
+        policy: &AccessPolicyAnswer,
+    ) -> Result<AccessApp, WriteError> {
+        self.deps
+            .access
+            .create_app(provider_id, name, host, policy)
+            .await
+            .map_err(|error| WriteError {
+                message: error.message,
+                maybe_applied: error.maybe_applied,
+            })
+    }
+
+    async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
+        self.deps.access.delete_app(provider_id, id).await
     }
 }
 
