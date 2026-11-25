@@ -293,6 +293,7 @@ impl LbService {
         host: String,
         port: i32,
         route_type: Option<RouteType>,
+        enabled: bool,
     ) -> Result<temps_entities::custom_routes::Model, LbServiceError> {
         let domain = normalize_route_hostname(&domain).map_err(|source| {
             LbServiceError::InvalidHostname {
@@ -310,8 +311,8 @@ impl LbService {
             })?;
 
         info!(
-            "Creating new route for domain: {} (type: {:?})",
-            domain, route_type
+            "Creating new route for domain: {} (type: {:?}, enabled: {})",
+            domain, route_type, enabled
         );
         // Check if route already exists
         match self.get_route(&domain).await {
@@ -337,7 +338,7 @@ impl LbService {
             domain_id: Set(None),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
-            enabled: Set(true),
+            enabled: Set(enabled),
             route_type: Set(route_type.unwrap_or_default()),
             ..Default::default()
         };
