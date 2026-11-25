@@ -893,6 +893,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/me/mfa/setup", post(setup_mfa))
         .route("/users/me/mfa/verify", post(verify_and_enable_mfa))
         .route("/users/me/mfa", delete(disable_mfa))
+        .route("/users/{user_id}", get(crate::user_read_handler::get_user))
         .route("/users/{user_id}", delete(delete_user))
         .route("/users/{user_id}", patch(update_user))
         .route("/users/{user_id}/restore", post(restore_user))
@@ -1977,6 +1978,7 @@ impl From<UserServiceError> for Problem {
 #[openapi(
     paths(
         list_users,
+        crate::user_read_handler::get_user,
         create_user,
         delete_user,
         assign_role,

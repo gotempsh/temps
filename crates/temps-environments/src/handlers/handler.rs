@@ -32,8 +32,8 @@ use super::types::{
     CreateProjectSecretRequest, EnvVarIntegrationInfo, EnvironmentDomainResponse, EnvironmentInfo,
     EnvironmentResponse, EnvironmentVariableResponse, EnvironmentVariableValueResponse,
     GetEnvironmentVariablesQuery, GetProjectSecretsQuery, ProjectSecretEnvironmentInfo,
-    ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource, SecretSuggestionResponse,
-    UpdateEnvironmentSettingsRequest, UpdateEnvironmentSubdomainRequest,
+    ProjectSecretList, ProjectSecretResponse, ResolvedEnvVarResponse, ResolvedEnvVarSource,
+    SecretSuggestionResponse, UpdateEnvironmentSettingsRequest, UpdateEnvironmentSubdomainRequest,
     UpdateEnvironmentVariableRequest, UpdateProjectSecretRequest,
 };
 use crate::services::EnvironmentTeardownError;
@@ -360,8 +360,8 @@ pub async fn get_environments(
             main_url,
             subdomain: env.subdomain,
             current_deployment_id: env.current_deployment_id,
-            created_at: env.created_at.timestamp_millis(),
-            updated_at: env.updated_at.timestamp_millis(),
+            created_at: env.created_at,
+            updated_at: env.updated_at,
             branch: env.branch,
             is_preview: env.is_preview,
             deployment_config: env.deployment_config.clone(),
@@ -371,7 +371,7 @@ pub async fn get_environments(
             shield_mode: crate::handlers::types::stored_shield_mode(env.shield_mode.as_deref()),
             shield_exempt_paths: env.shield_exempt_paths.0.clone(),
             force_https: env.force_https,
-            last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
+            last_activity_at: env.last_activity_at,
             placement_warning: None,
             estimated_sleep_at: if !env.sleeping {
                 env.deployment_config
@@ -379,7 +379,7 @@ pub async fn get_environments(
                     .filter(|dc| dc.on_demand)
                     .and_then(|dc| {
                         env.last_activity_at.map(|last| {
-                            last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                            last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                         })
                     })
             } else {
@@ -436,8 +436,8 @@ pub async fn get_environment(
         main_url,
         subdomain: env.subdomain,
         current_deployment_id: env.current_deployment_id,
-        created_at: env.created_at.timestamp_millis(),
-        updated_at: env.updated_at.timestamp_millis(),
+        created_at: env.created_at,
+        updated_at: env.updated_at,
         branch: env.branch,
         is_preview: env.is_preview,
         deployment_config: env.deployment_config.clone(),
@@ -447,7 +447,7 @@ pub async fn get_environment(
         shield_mode: crate::handlers::types::stored_shield_mode(env.shield_mode.as_deref()),
         shield_exempt_paths: env.shield_exempt_paths.0.clone(),
         force_https: env.force_https,
-        last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
+        last_activity_at: env.last_activity_at,
         placement_warning,
         estimated_sleep_at: if !env.sleeping {
             env.deployment_config
@@ -455,7 +455,7 @@ pub async fn get_environment(
                 .filter(|dc| dc.on_demand)
                 .and_then(|dc| {
                     env.last_activity_at.map(|last| {
-                        last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                        last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                     })
                 })
         } else {
@@ -505,7 +505,7 @@ pub async fn get_environment_domains(
             id: d.id,
             environment_id: d.environment_id,
             domain: d.domain,
-            created_at: d.created_at.timestamp_millis(),
+            created_at: d.created_at,
             url,
         });
     }
@@ -566,7 +566,7 @@ pub async fn add_environment_domain(
         id: domain.id,
         environment_id: domain.environment_id,
         domain: domain.domain,
-        created_at: domain.created_at.timestamp_millis(),
+        created_at: domain.created_at,
         url,
     };
 
@@ -669,8 +669,8 @@ fn masked_variable_response(
         id: v.id,
         key: v.key,
         value,
-        created_at: v.created_at.timestamp_millis(),
-        updated_at: v.updated_at.timestamp_millis(),
+        created_at: v.created_at,
+        updated_at: v.updated_at,
         environments: v
             .environments
             .into_iter()
@@ -1122,8 +1122,8 @@ pub async fn create_environment_variable(
         id: var.id,
         key: var.key,
         value: var.value,
-        created_at: var.created_at.timestamp_millis(),
-        updated_at: var.updated_at.timestamp_millis(),
+        created_at: var.created_at,
+        updated_at: var.updated_at,
         environments: var
             .environments
             .into_iter()
@@ -1383,8 +1383,8 @@ pub async fn update_environment_variable(
         id: var.id,
         key: var.key,
         value: var.value,
-        created_at: var.created_at.timestamp_millis(),
-        updated_at: var.updated_at.timestamp_millis(),
+        created_at: var.created_at,
+        updated_at: var.updated_at,
         environments: var
             .environments
             .into_iter()
@@ -1786,8 +1786,8 @@ pub async fn update_environment_settings(
         main_url,
         subdomain: updated_environment.subdomain,
         current_deployment_id: updated_environment.current_deployment_id,
-        created_at: updated_environment.created_at.timestamp_millis(),
-        updated_at: updated_environment.updated_at.timestamp_millis(),
+        created_at: updated_environment.created_at,
+        updated_at: updated_environment.updated_at,
         branch: updated_environment.branch,
         is_preview: updated_environment.is_preview,
         deployment_config: updated_environment.deployment_config.clone(),
@@ -1799,9 +1799,7 @@ pub async fn update_environment_settings(
         ),
         shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
-        last_activity_at: updated_environment
-            .last_activity_at
-            .map(|t| t.timestamp_millis()),
+        last_activity_at: updated_environment.last_activity_at,
         placement_warning,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
@@ -1810,7 +1808,7 @@ pub async fn update_environment_settings(
                 .filter(|dc| dc.on_demand)
                 .and_then(|dc| {
                     updated_environment.last_activity_at.map(|last| {
-                        last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                        last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                     })
                 })
         } else {
@@ -1904,8 +1902,8 @@ pub async fn update_environment_subdomain(
         main_url,
         subdomain: updated_environment.subdomain,
         current_deployment_id: updated_environment.current_deployment_id,
-        created_at: updated_environment.created_at.timestamp_millis(),
-        updated_at: updated_environment.updated_at.timestamp_millis(),
+        created_at: updated_environment.created_at,
+        updated_at: updated_environment.updated_at,
         branch: updated_environment.branch,
         is_preview: updated_environment.is_preview,
         deployment_config: updated_environment.deployment_config.clone(),
@@ -1917,9 +1915,7 @@ pub async fn update_environment_subdomain(
         ),
         shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
-        last_activity_at: updated_environment
-            .last_activity_at
-            .map(|t| t.timestamp_millis()),
+        last_activity_at: updated_environment.last_activity_at,
         placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
@@ -1928,7 +1924,7 @@ pub async fn update_environment_subdomain(
                 .filter(|dc| dc.on_demand)
                 .and_then(|dc| {
                     updated_environment.last_activity_at.map(|last| {
-                        last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                        last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                     })
                 })
         } else {
@@ -2065,8 +2061,8 @@ pub async fn wake_environment(
         main_url,
         subdomain: updated_environment.subdomain,
         current_deployment_id: updated_environment.current_deployment_id,
-        created_at: updated_environment.created_at.timestamp_millis(),
-        updated_at: updated_environment.updated_at.timestamp_millis(),
+        created_at: updated_environment.created_at,
+        updated_at: updated_environment.updated_at,
         branch: updated_environment.branch,
         is_preview: updated_environment.is_preview,
         deployment_config: updated_environment.deployment_config.clone(),
@@ -2078,9 +2074,7 @@ pub async fn wake_environment(
         ),
         shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
-        last_activity_at: updated_environment
-            .last_activity_at
-            .map(|t| t.timestamp_millis()),
+        last_activity_at: updated_environment.last_activity_at,
         placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
@@ -2089,7 +2083,7 @@ pub async fn wake_environment(
                 .filter(|dc| dc.on_demand)
                 .and_then(|dc| {
                     updated_environment.last_activity_at.map(|last| {
-                        last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                        last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                     })
                 })
         } else {
@@ -2212,8 +2206,8 @@ pub async fn sleep_environment(
         main_url,
         subdomain: updated_environment.subdomain,
         current_deployment_id: updated_environment.current_deployment_id,
-        created_at: updated_environment.created_at.timestamp_millis(),
-        updated_at: updated_environment.updated_at.timestamp_millis(),
+        created_at: updated_environment.created_at,
+        updated_at: updated_environment.updated_at,
         branch: updated_environment.branch,
         is_preview: updated_environment.is_preview,
         deployment_config: updated_environment.deployment_config.clone(),
@@ -2225,9 +2219,7 @@ pub async fn sleep_environment(
         ),
         shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
-        last_activity_at: updated_environment
-            .last_activity_at
-            .map(|t| t.timestamp_millis()),
+        last_activity_at: updated_environment.last_activity_at,
         placement_warning: None,
         estimated_sleep_at: if !updated_environment.sleeping {
             updated_environment
@@ -2236,7 +2228,7 @@ pub async fn sleep_environment(
                 .filter(|dc| dc.on_demand)
                 .and_then(|dc| {
                     updated_environment.last_activity_at.map(|last| {
-                        last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                        last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                     })
                 })
         } else {
@@ -2448,8 +2440,8 @@ pub async fn create_environment(
             main_url,
             subdomain: environment.subdomain,
             current_deployment_id: environment.current_deployment_id,
-            created_at: environment.created_at.timestamp_millis(),
-            updated_at: environment.updated_at.timestamp_millis(),
+            created_at: environment.created_at,
+            updated_at: environment.updated_at,
             branch: environment.branch,
             is_preview: environment.is_preview,
             deployment_config: environment.deployment_config.clone(),
@@ -2461,7 +2453,7 @@ pub async fn create_environment(
             ),
             shield_exempt_paths: environment.shield_exempt_paths.0.clone(),
             force_https: environment.force_https,
-            last_activity_at: environment.last_activity_at.map(|t| t.timestamp_millis()),
+            last_activity_at: environment.last_activity_at,
             placement_warning: None,
             estimated_sleep_at: if !environment.sleeping {
                 environment
@@ -2470,7 +2462,7 @@ pub async fn create_environment(
                     .filter(|dc| dc.on_demand)
                     .and_then(|dc| {
                         environment.last_activity_at.map(|last| {
-                            last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                            last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                         })
                     })
             } else {
@@ -2491,21 +2483,26 @@ pub async fn create_environment(
 // the source of truth for reads.
 // ======================================================================
 
-/// List project secrets (metadata only — values never returned).
+/// List project secrets (metadata only — values never returned), newest first.
 #[utoipa::path(
     get,
     path = "/projects/{project_id}/secrets",
     tag = "Secrets",
     operation_id = "listProjectSecrets",
     responses(
-        (status = 200, description = "List of secrets (metadata only, no values)", body = Vec<ProjectSecretResponse>),
+        (status = 200, description = "One page of secrets (metadata only, no values), newest first", body = ProjectSecretList),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Project not found"),
         (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID"),
-        ("environment_id" = Option<i32>, Query, description = "Optional environment filter")
-    )
+        ("environment_id" = Option<i32>, Query, description = "Only secrets attached to this environment"),
+        ("page" = Option<u64>, Query, description = "Page number, starting at 1 (default 1)"),
+        ("page_size" = Option<u64>, Query, description = "Items per page (default 20, max 100)")
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn list_project_secrets(
     State(state): State<Arc<AppState>>,
@@ -2517,34 +2514,52 @@ pub async fn list_project_secrets(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    let secrets = state
+    let page = params.page();
+    let (secrets, total) = state
         .secret_service
-        .list(project_id, params.environment_id)
+        .list_page(project_id, params.environment_id, page)
         .await?;
 
-    let response: Vec<ProjectSecretResponse> = secrets
-        .into_iter()
-        .map(|s| ProjectSecretResponse {
-            id: s.id,
-            project_id: s.project_id,
-            key: s.key,
-            include_in_preview: s.include_in_preview,
-            created_at: s.created_at.timestamp_millis(),
-            updated_at: s.updated_at.timestamp_millis(),
-            environments: s
-                .environments
-                .into_iter()
-                .map(|env| ProjectSecretEnvironmentInfo {
-                    id: env.id,
-                    name: env.name,
-                    main_url: env.main_url,
-                })
-                .collect(),
-            compose_services: s.compose_services,
-        })
-        .collect();
+    Ok(Json(ProjectSecretList::new(
+        secrets
+            .into_iter()
+            .map(ProjectSecretResponse::from)
+            .collect(),
+        total,
+        page,
+    )))
+}
 
-    Ok(Json(response))
+/// Get one project secret (metadata only — the value is never returned).
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/secrets/{secret_id}",
+    tag = "Secrets",
+    operation_id = "getProjectSecret",
+    responses(
+        (status = 200, description = "The secret's metadata, without its value", body = ProjectSecretResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No secret with this ID in the project"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("secret_id" = i32, Path, description = "Secret ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_project_secret(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, secret_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<Json<ProjectSecretResponse>, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let secret = state.secret_service.get(project_id, secret_id).await?;
+    Ok(Json(ProjectSecretResponse::from(secret)))
 }
 
 /// Create a new secret. The value is encrypted before storage and will be
@@ -2610,8 +2625,8 @@ pub async fn create_project_secret(
         project_id: secret.project_id,
         key: secret.key,
         include_in_preview: secret.include_in_preview,
-        created_at: secret.created_at.timestamp_millis(),
-        updated_at: secret.updated_at.timestamp_millis(),
+        created_at: secret.created_at,
+        updated_at: secret.updated_at,
         environments: secret
             .environments
             .into_iter()
@@ -2724,8 +2739,8 @@ pub async fn update_project_secret(
         project_id: secret.project_id,
         key: secret.key,
         include_in_preview: secret.include_in_preview,
-        created_at: secret.created_at.timestamp_millis(),
-        updated_at: secret.updated_at.timestamp_millis(),
+        created_at: secret.created_at,
+        updated_at: secret.updated_at,
         environments: secret
             .environments
             .into_iter()
@@ -2879,7 +2894,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/secrets/{secret_id}",
-            put(update_project_secret).delete(delete_project_secret),
+            get(get_project_secret)
+                .put(update_project_secret)
+                .delete(delete_project_secret),
         )
 }
 
@@ -2907,6 +2924,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_environment_variable_value,
         get_resolved_environment_variable_value,
         list_project_secrets,
+        get_project_secret,
         create_project_secret,
         update_project_secret,
         delete_project_secret,
@@ -2934,6 +2952,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             CreateProjectSecretRequest,
             UpdateProjectSecretRequest,
             ProjectSecretResponse,
+            ProjectSecretList,
             ProjectSecretEnvironmentInfo,
             GetProjectSecretsQuery,
         )
@@ -4195,6 +4214,126 @@ mod tests {
                 .insert(test_auth_context(temps_auth::Role::Admin));
             let response = app.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        async fn get_json(
+            app: axum::Router,
+            uri: &str,
+            auth: Option<temps_auth::AuthContext>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value) {
+            let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, headers, body)
+        }
+
+        async fn insert_secret(test_db: &TestDatabase, project_id: i32, key: &str) -> i32 {
+            crate::services::SecretService::new(
+                test_db.connection_arc(),
+                Arc::new(EncryptionService::new(ENCRYPTION_KEY).unwrap()),
+            )
+            .create(
+                project_id,
+                vec![],
+                key.to_string(),
+                "s3cr3t-value".to_string(),
+                false,
+                vec![],
+            )
+            .await
+            .unwrap()
+            .id
+        }
+
+        /// Reading one secret, or the list, needs a token with
+        /// `environments:read`; nothing is read before the guards pass.
+        #[tokio::test]
+        async fn reading_secrets_needs_a_token_with_environments_read() {
+            for uri in ["/projects/3/secrets/9", "/projects/3/secrets?page=2"] {
+                let app = || {
+                    app(
+                        untouchable_db(),
+                        Arc::new(RecordingAuditLogger::default()),
+                        None,
+                    )
+                };
+                let (status, _, _) = get_json(app(), uri, None).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+
+                let (status, headers, _) = get_json(
+                    app(),
+                    uri,
+                    Some(test_api_key_context(vec![Permission::ProjectsRead])),
+                )
+                .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+                assert!(is_problem(&headers), "{uri}");
+            }
+        }
+
+        /// One secret reads back as the list shows it, never with its value;
+        /// another project's ID is a 404 naming it; the list is one page of
+        /// the newest first with the total.
+        #[tokio::test]
+        async fn one_secret_is_read_without_its_value_and_the_list_is_paginated() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let mut ids = Vec::new();
+            for key in ["FIRST_TOKEN", "SECOND_TOKEN", "THIRD_TOKEN"] {
+                ids.push(insert_secret(&test_db, project_id, key).await);
+            }
+            let app = app(
+                test_db.connection_arc(),
+                Arc::new(RecordingAuditLogger::default()),
+                None,
+            );
+            let reader = || Some(test_auth_context(temps_auth::Role::Reader));
+
+            let uri = format!("/projects/{project_id}/secrets/{}", ids[1]);
+            let (status, _, body) = get_json(app.clone(), &uri, reader()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["id"], ids[1]);
+            assert_eq!(body["key"], "SECOND_TOKEN");
+            assert!(body["created_at"].as_str().unwrap().ends_with('Z'));
+            assert!(!body.to_string().contains("s3cr3t-value"));
+
+            let uri = format!("/projects/{}/secrets/{}", project_id + 1000, ids[1]);
+            let (status, headers, body) = get_json(app.clone(), &uri, reader()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(is_problem(&headers));
+            assert!(body["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&ids[1].to_string()));
+
+            let uri = format!("/projects/{project_id}/secrets?page=1&page_size=2");
+            let (status, _, body) = get_json(app.clone(), &uri, reader()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["total"], 3);
+            assert_eq!(body["page"], 1);
+            assert_eq!(body["page_size"], 2);
+            let keys: Vec<&str> = body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["key"].as_str().unwrap())
+                .collect();
+            assert_eq!(keys, ["THIRD_TOKEN", "SECOND_TOKEN"]);
+
+            let uri = format!("/projects/{project_id}/secrets?page=2&page_size=2");
+            let (_, _, body) = get_json(app, &uri, reader()).await;
+            assert_eq!(body["items"].as_array().unwrap().len(), 1);
+            assert_eq!(body["items"][0]["key"], "FIRST_TOKEN");
         }
     }
 }

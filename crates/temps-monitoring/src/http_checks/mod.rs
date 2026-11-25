@@ -271,6 +271,10 @@ impl HttpChecksService {
             page_size,
         })
     }
+    /// One check of a project, as listed.
+    pub async fn get(&self, project_id: i32, id: i32) -> Result<HttpCheckView, HttpChecksError> {
+        self.row(project_id, id).await?.try_into()
+    }
     async fn row(&self, project_id: i32, id: i32) -> Result<http_checks::Model, HttpChecksError> {
         http_checks::Entity::find_by_id(id)
             .filter(http_checks::Column::ProjectId.eq(project_id))

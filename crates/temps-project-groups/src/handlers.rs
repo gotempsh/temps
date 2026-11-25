@@ -86,7 +86,9 @@ pub fn router(state: Arc<ProjectGroupsAppState>) -> Router {
         )
         .route(
             "/project-groups/{group_id}/env-vars/{var_id}",
-            axum::routing::patch(update_group_env_var).delete(delete_group_env_var),
+            get(get_group_env_var)
+                .patch(update_group_env_var)
+                .delete(delete_group_env_var),
         )
         .route(
             "/project-groups/{group_id}/routes",
@@ -1317,6 +1319,37 @@ pub async fn list_group_env_vars(
     ))
 }
 
+/// One variable every project in the group inherits, as listed: a plain
+/// value is masked and a secret's value is never returned.
+#[utoipa::path(
+    tag = "Project Groups",
+    get,
+    path = "/project-groups/{group_id}/env-vars/{var_id}",
+    operation_id = "get_group_env_var",
+    params(
+        ("group_id" = i32, Path, description = "Project group ID"),
+        ("var_id" = i32, Path, description = "Variable ID"),
+    ),
+    responses(
+        (status = 200, description = "The variable (value masked)", body = GroupEnvVarResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions on a member project"),
+        (status = 404, description = "Project group or variable not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_group_env_var(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProjectGroupsAppState>>,
+    Path((group_id, var_id)): Path<(i32, i32)>,
+) -> Result<Json<GroupEnvVarResponse>, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    authorize_group_env(&state, &auth, group_id, false).await?;
+    let var = state.env_vars.get(group_id, var_id).await?;
+    Ok(Json(GroupEnvVarResponse::masked(var)))
+}
+
 #[utoipa::path(
     tag = "Project Groups",
     post,
@@ -1997,6 +2030,7 @@ pub async fn delete_group_route(
         set_repository_inheritance,
         get_project_group_membership,
         list_group_env_vars,
+        get_group_env_var,
         create_group_env_var,
         update_group_env_var,
         delete_group_env_var,
@@ -2437,6 +2471,67 @@ mod tests {
     }
 
     const ENV_WRITE: &str = "environments:write";
+
+    /// One group variable reads back masked to a reader of every member; a
+    /// missing one is a 404 naming it; a caller without environment read on
+    /// a member is refused.
+    #[tokio::test]
+    async fn one_group_variable_reads_back_masked() {
+        let base = 9831;
+        let Some(fixture) = delete_fixture(base, None).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group variable read test");
+            return;
+        };
+        let members: HashSet<i32> = [base, base + 1].into();
+        let var = fixture
+            .state
+            .env_vars
+            .create_checked(
+                fixture.group_id,
+                &members,
+                crate::env_vars::CreateGroupEnvVarRequest {
+                    key: "SENTRY_ENVIRONMENT".to_string(),
+                    value: "plain-value".to_string(),
+                    is_secret: false,
+                    environment_slug: None,
+                    include_in_preview: false,
+                },
+            )
+            .await
+            .expect("create variable");
+        let read = |auth: AuthContext, var_id: i32| {
+            get_group_env_var(
+                RequireAuth(auth),
+                State(fixture.state.clone()),
+                Path((fixture.group_id, var_id)),
+            )
+        };
+
+        let Json(found) = read(user_auth(Role::Reader), var.id)
+            .await
+            .expect("a reader of every member reads the variable");
+        assert_eq!(found.id, var.id);
+        assert_eq!(found.key, "SENTRY_ENVIRONMENT");
+        assert_eq!(found.value.as_deref(), Some("***"));
+
+        let missing = var.id + 1000;
+        let not_found = read(user_auth(Role::Reader), missing)
+            .await
+            .expect_err("missing variable");
+        assert_eq!(not_found.status_code, StatusCode::NOT_FOUND);
+        let detail = not_found
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains(&missing.to_string()), "{detail}");
+
+        let forbidden = read(user_auth(Role::MetricsIngest), var.id)
+            .await
+            .expect_err("no environments:read");
+        assert_eq!(forbidden.status_code, StatusCode::FORBIDDEN);
+    }
 
     #[tokio::test]
     async fn deleting_a_group_requires_write_on_both_ends_of_each_route() {

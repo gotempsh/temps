@@ -1639,6 +1639,8 @@ pub async fn update_skill_put(
     path: Path<(i32, String)>,
     request: Json<UpdateSkillRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Refused here too, before the PATCH handler applies its full checks.
+    permission_guard!(auth.0, ProjectsWrite);
     update_skill(auth, state, metadata, path, request).await
 }
 
@@ -1670,6 +1672,8 @@ pub async fn update_mcp_put(
     path: Path<(i32, String)>,
     request: Json<UpdateMcpRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Refused here too, before the PATCH handler applies its full checks.
+    permission_guard!(auth.0, ProjectsWrite);
     update_mcp(auth, state, metadata, path, request).await
 }
 
@@ -1698,6 +1702,8 @@ pub async fn update_global_skill_put(
     path: Path<String>,
     request: Json<UpdateSkillRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Refused here too, before the PATCH handler applies its full checks.
+    permission_guard!(auth.0, SettingsWrite);
     update_global_skill(auth, state, metadata, path, request).await
 }
 
@@ -1726,6 +1732,8 @@ pub async fn update_global_mcp_put(
     path: Path<String>,
     request: Json<UpdateMcpRequest>,
 ) -> Result<impl IntoResponse, Problem> {
+    // Refused here too, before the PATCH handler applies its full checks.
+    permission_guard!(auth.0, SettingsWrite);
     update_global_mcp(auth, state, metadata, path, request).await
 }
 

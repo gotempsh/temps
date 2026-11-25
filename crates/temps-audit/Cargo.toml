@@ -17,7 +17,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-geo = { path = "../temps-geo" }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 serde = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }

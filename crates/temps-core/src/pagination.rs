@@ -85,7 +85,7 @@ impl PageQuery {
 macro_rules! paginated_response {
     ($(#[$meta:meta])* $name:ident, $item:ty) => {
         $(#[$meta])*
-        #[derive(Debug, ::serde::Serialize, ::serde::Deserialize, ::utoipa::ToSchema)]
+        #[derive(::serde::Serialize, ::utoipa::ToSchema)]
         pub struct $name {
             /// The items on this page.
             pub items: Vec<$item>,

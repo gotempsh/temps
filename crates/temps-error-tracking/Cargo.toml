@@ -64,6 +64,7 @@ temps-migrations = { path = "../temps-migrations" }
 axum-test = { workspace = true }
 serial_test = { workspace = true }
 semver = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true

@@ -369,18 +369,22 @@ impl IncidentService {
         Ok(incident.update(self.db.as_ref()).await?.into())
     }
 
-    /// Get incident updates
+    /// One page of an incident's updates, newest first, with the total.
     pub async fn get_incident_updates(
         &self,
         incident_id: i32,
-    ) -> Result<Vec<IncidentUpdateResponse>, StatusPageError> {
-        let updates = status_incident_updates::Entity::find()
+        page: temps_core::PageQuery,
+    ) -> Result<(Vec<IncidentUpdateResponse>, u64), StatusPageError> {
+        let (_, page_size) = page.normalize();
+        let paginator = status_incident_updates::Entity::find()
             .filter(status_incident_updates::Column::IncidentId.eq(incident_id))
             .order_by_desc(status_incident_updates::Column::CreatedAt)
-            .all(self.db.as_ref())
-            .await?;
+            .order_by_desc(status_incident_updates::Column::Id)
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        let updates = paginator.fetch_page(page.page_index()).await?;
 
-        Ok(updates.into_iter().map(|u| u.into()).collect())
+        Ok((updates.into_iter().map(|u| u.into()).collect(), total))
     }
 
     /// Delete an incident (soft delete by marking as resolved)

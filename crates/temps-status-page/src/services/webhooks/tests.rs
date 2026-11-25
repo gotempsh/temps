@@ -33,7 +33,9 @@ use super::{
     CreateStatusPageWebhookRequest, StatusPageWebhookService, TransportError,
     UpdateStatusPageWebhookRequest, WebhookError, WebhookTransport,
 };
-use crate::routes::webhooks::{create_webhook, create_webhook_router, WebhookRoutesState};
+use crate::routes::webhooks::{
+    create_webhook, create_webhook_router, get_webhook, WebhookRoutesState,
+};
 use crate::services::maintenance::{
     CreateMaintenanceRequest, StatusPageMaintenanceService, UpdateMaintenanceRequest,
 };
@@ -342,6 +344,7 @@ async fn a_new_event_is_posted_once_signed_with_the_secret_shown_at_creation() {
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
+                enabled: true,
             },
         )
         .await
@@ -418,6 +421,7 @@ async fn failures_are_retried_then_marked_failed_with_the_reason_shown() {
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
+                enabled: true,
             },
         )
         .await
@@ -493,6 +497,7 @@ async fn a_backlog_larger_than_one_insert_is_queued_and_sent_in_full() {
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
+                enabled: true,
             },
         )
         .await
@@ -522,6 +527,7 @@ async fn a_retry_sends_the_event_as_the_page_shows_it_now() {
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
+                enabled: true,
             },
         )
         .await
@@ -591,6 +597,7 @@ async fn a_disabled_webhook_gets_nothing_and_its_pending_events_are_cancelled() 
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
+                enabled: true,
             },
         )
         .await
@@ -639,6 +646,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: "http://hooks.example.test/".to_string(),
+                enabled: true,
             },
         )
         .await
@@ -653,6 +661,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
+                enabled: true,
             },
         )
         .await
@@ -666,7 +675,8 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
             .create(
                 9_999_999,
                 CreateStatusPageWebhookRequest {
-                    url: URL.to_string()
+                    url: URL.to_string(),
+                    enabled: true,
                 }
             )
             .await,
@@ -683,6 +693,7 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
                 fx.page_id,
                 CreateStatusPageWebhookRequest {
                     url: URL.to_string(),
+                    enabled: true,
                 },
             )
             .await
@@ -694,7 +705,8 @@ async fn registration_is_validated_bounded_and_scoped_to_the_page() {
             .create(
                 fx.page_id,
                 CreateStatusPageWebhookRequest {
-                    url: URL.to_string()
+                    url: URL.to_string(),
+                    enabled: true,
                 }
             )
             .await,
@@ -726,6 +738,7 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
         Path(fx.page_id),
         Json(CreateStatusPageWebhookRequest {
             url: URL.to_string(),
+            enabled: true,
         }),
     )
     .await
@@ -740,6 +753,7 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
         Path(fx.page_id),
         Json(CreateStatusPageWebhookRequest {
             url: URL.to_string(),
+            enabled: true,
         }),
     )
     .await
@@ -775,6 +789,7 @@ async fn the_handlers_authorize_return_the_secret_once_and_audit_without_it() {
     for (method, path) in [
         ("GET", base.clone()),
         ("POST", base.clone()),
+        ("GET", format!("{base}/1")),
         ("PATCH", format!("{base}/1")),
         ("DELETE", format!("{base}/1")),
     ] {
@@ -804,6 +819,7 @@ async fn one_webhook(fx: &Fx) -> i32 {
             fx.page_id,
             CreateStatusPageWebhookRequest {
                 url: URL.to_string(),
+                enabled: true,
             },
         )
         .await
@@ -927,6 +943,7 @@ async fn queueing_a_backlog_holds_one_insert_batch_at_a_time() {
                 fx.page_id,
                 CreateStatusPageWebhookRequest {
                     url: format!("https://hooks.example.test/{index}"),
+                    enabled: true,
                 },
             )
             .await
@@ -997,4 +1014,108 @@ async fn an_attempt_interrupted_after_its_claim_is_retried_and_then_given_up() {
         .last_error
         .as_deref()
         .is_some_and(|error| error.contains("interrupted")));
+}
+
+#[test]
+fn a_webhook_is_created_enabled_unless_told_otherwise() {
+    let request: CreateStatusPageWebhookRequest =
+        serde_json::from_str(r#"{"url":"https://hooks.example.test/status"}"#).expect("json");
+    assert!(request.enabled);
+    let request: CreateStatusPageWebhookRequest =
+        serde_json::from_str(r#"{"url":"https://hooks.example.test/status","enabled":false}"#)
+            .expect("json");
+    assert!(!request.enabled);
+}
+
+/// A webhook registered switched off is stored off, reads back as listed,
+/// and is sent nothing; reading one needs `status_page:read` and a webhook
+/// of another page is a 404 naming it.
+#[tokio::test]
+async fn a_webhook_created_switched_off_reads_back_and_receives_nothing() {
+    let Some(fx) = fixture().await else {
+        return;
+    };
+    let response = create_webhook(
+        auth(Role::Admin),
+        State(fx.state.clone()),
+        metadata(),
+        Path(fx.page_id),
+        Json(CreateStatusPageWebhookRequest {
+            url: URL.to_string(),
+            enabled: false,
+        }),
+    )
+    .await
+    .map_err(|p| format!("{:?}", p.body))
+    .expect("admin registers")
+    .into_response();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let created: super::StatusPageWebhookCreatedResponse =
+        serde_json::from_slice(&body).expect("json");
+    assert!(!created.webhook.enabled);
+    let entries = fx.audit.entries.lock().expect("audit").clone();
+    assert!(
+        entries[0].1.contains("\"enabled\":false"),
+        "{}",
+        entries[0].1
+    );
+
+    let Json(read) = get_webhook(
+        auth(Role::Reader),
+        State(fx.state.clone()),
+        Path((fx.page_id, created.webhook.id)),
+    )
+    .await
+    .map_err(|p| format!("{:?}", p.body))
+    .expect("a reader reads one webhook");
+    assert_eq!(read.id, created.webhook.id);
+    assert!(!read.enabled);
+    assert!(read.has_secret);
+    assert!(!serde_json::to_string(&read)
+        .expect("json")
+        .contains(&created.secret));
+
+    let missing = created.webhook.id + 1000;
+    let not_found = get_webhook(
+        auth(Role::Admin),
+        State(fx.state.clone()),
+        Path((fx.page_id, missing)),
+    )
+    .await
+    .err()
+    .expect("missing webhook");
+    assert_eq!(not_found.status_code, StatusCode::NOT_FOUND);
+    assert!(format!("{:?}", not_found.body).contains(&missing.to_string()));
+
+    let RequireAuth(session) = auth(Role::Admin);
+    let user = session.user.clone().expect("session user");
+    let key_without_read = RequireAuth(AuthContext::new_api_key(
+        user,
+        None,
+        Some(vec![temps_authz::Permission::ProjectsRead]),
+        "ci".to_string(),
+        7,
+    ));
+    let forbidden = get_webhook(
+        key_without_read,
+        State(fx.state.clone()),
+        Path((fx.page_id, created.webhook.id)),
+    )
+    .await
+    .err()
+    .expect("a key without status_page:read");
+    assert_eq!(forbidden.status_code, StatusCode::FORBIDDEN);
+
+    schedule(&fx, "Database upgrade").await;
+    fx.webhooks
+        .dispatch_tick(&mut WebhookDispatcherState::default(), Utc::now())
+        .await
+        .expect("tick");
+    assert!(
+        fx.transport.sent().is_empty(),
+        "a disabled webhook gets nothing"
+    );
 }

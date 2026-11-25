@@ -18,7 +18,7 @@ use rand::RngExt;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect,
+    QueryOrder,
 };
 use temps_entities::{analytics_ingest_keys, environments, projects};
 use tracing::{debug, warn};
@@ -333,30 +333,24 @@ impl AnalyticsIngestKeyService {
     pub async fn list(
         &self,
         project_id: i32,
-    ) -> Result<Vec<AnalyticsIngestKey>, AnalyticsIngestKeyError> {
-        // Unlike events/visitors, these rows are only ever created by an
-        // authenticated operator through the admin CRUD above — there is no
-        // ingest-triggered growth path — so real per-project cardinality is a
-        // handful of rows and true offset/limit pagination would add API
-        // surface (and a client-side page-through UI) nobody needs yet. This
-        // cap exists purely as a hot-path/memory backstop, not as
-        // user-facing pagination: if a project is ever near it, that is a
-        // signal to revisit this, not a limit an operator is expected to
-        // page through.
-        const MAX_KEYS_RETURNED: u64 = 500;
+        page: temps_core::PageQuery,
+    ) -> Result<(Vec<AnalyticsIngestKey>, u64), AnalyticsIngestKeyError> {
+        use sea_orm::PaginatorTrait;
 
-        let models = analytics_ingest_keys::Entity::find()
+        let (_, page_size) = page.normalize();
+        let paginator = analytics_ingest_keys::Entity::find()
             .filter(analytics_ingest_keys::Column::ProjectId.eq(project_id))
             .order_by_desc(analytics_ingest_keys::Column::CreatedAt)
             .order_by_desc(analytics_ingest_keys::Column::Id)
-            .limit(MAX_KEYS_RETURNED)
-            .all(self.db.as_ref())
-            .await?;
-
-        models
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        let keys = paginator
+            .fetch_page(page.page_index())
+            .await?
             .into_iter()
             .map(AnalyticsIngestKey::try_from_model)
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((keys, total))
     }
 
     /// Partially update a key's label, origin allowlist, or rate limit.
@@ -1116,6 +1110,14 @@ mod tests {
 
     // ── list ─────────────────────────────────────────────────────────────
 
+    /// The row a paginator's `COUNT(*)` query answers with.
+    fn count_row(n: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(n)),
+        )])
+    }
+
     #[tokio::test]
     async fn list_returns_active_and_revoked_keys() {
         let mut revoked = key_model(2, 1, None);
@@ -1123,10 +1125,15 @@ mod tests {
         revoked.revoked_at = Some(Utc::now());
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![count_row(2)]])
             .append_query_results([vec![key_model(3, 1, Some(4)), revoked]]);
         let service = service_with(db);
 
-        let keys = service.list(1).await.expect("list should succeed");
+        let (keys, total) = service
+            .list(1, temps_core::PageQuery::default())
+            .await
+            .expect("list should succeed");
+        assert_eq!(total, 2);
         assert_eq!(keys.len(), 2);
         assert!(keys[0].is_active);
         assert!(!keys[1].is_active);
@@ -1135,14 +1142,16 @@ mod tests {
     #[tokio::test]
     async fn list_of_a_project_without_keys_is_empty_not_an_error() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![count_row(0)]])
             .append_query_results([Vec::<analytics_ingest_keys::Model>::new()]);
         let service = service_with(db);
 
-        assert!(service
-            .list(1)
+        let (keys, total) = service
+            .list(1, temps_core::PageQuery::default())
             .await
-            .expect("list should succeed")
-            .is_empty());
+            .expect("list should succeed");
+        assert!(keys.is_empty());
+        assert_eq!(total, 0);
     }
 
     // ── update ───────────────────────────────────────────────────────────

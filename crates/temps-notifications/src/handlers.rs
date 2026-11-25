@@ -256,8 +256,8 @@ pub struct NotificationProviderResponse {
     pub provider_type: String,
     pub config: serde_json::Value,
     pub enabled: bool,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
@@ -620,8 +620,8 @@ async fn list_notification_providers(
                     provider_type: p.provider_type,
                     config,
                     enabled: p.enabled,
-                    created_at: p.created_at.timestamp_millis(),
-                    updated_at: p.updated_at.timestamp_millis(),
+                    created_at: p.created_at,
+                    updated_at: p.updated_at,
                 });
             }
             Ok((StatusCode::OK, Json(response_vec)))
@@ -678,8 +678,8 @@ async fn get_notification_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::OK, Json(response)).into_response())
         }
@@ -841,8 +841,8 @@ async fn create_notification_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
@@ -974,8 +974,8 @@ async fn update_notification_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::OK, Json(response)))
         }
@@ -1167,8 +1167,8 @@ async fn create_slack_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
@@ -1236,8 +1236,8 @@ async fn create_notification_email_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
@@ -1314,8 +1314,8 @@ async fn update_slack_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::OK, Json(response)))
         }
@@ -1399,8 +1399,8 @@ async fn update_notification_email_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::OK, Json(response)))
         }
@@ -1498,8 +1498,8 @@ async fn create_webhook_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
@@ -1597,8 +1597,8 @@ async fn update_webhook_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::OK, Json(response)))
         }
@@ -1676,8 +1676,8 @@ async fn create_cloudflare_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::CREATED, Json(response)))
         }
@@ -1754,8 +1754,8 @@ async fn update_cloudflare_provider(
                 provider_type: provider.provider_type,
                 config,
                 enabled: provider.enabled,
-                created_at: provider.created_at.timestamp_millis(),
-                updated_at: provider.updated_at.timestamp_millis(),
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
             };
             Ok((StatusCode::OK, Json(response)))
         }
@@ -1932,8 +1932,8 @@ fn provider_response(
         provider_type: provider.provider_type,
         config,
         enabled: provider.enabled,
-        created_at: provider.created_at.timestamp_millis(),
-        updated_at: provider.updated_at.timestamp_millis(),
+        created_at: provider.created_at,
+        updated_at: provider.updated_at,
     })
 }
 

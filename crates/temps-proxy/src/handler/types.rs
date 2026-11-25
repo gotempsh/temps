@@ -55,8 +55,8 @@ pub struct RouteResponse {
     pub enabled: bool,
     /// Route type: "http" or "tls"
     pub route_type: String,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<temps_entities::custom_routes::Model> for RouteResponse {
@@ -68,8 +68,8 @@ impl From<temps_entities::custom_routes::Model> for RouteResponse {
             port: route.port,
             enabled: route.enabled,
             route_type: route.route_type.to_string(),
-            created_at: route.created_at.timestamp_millis(),
-            updated_at: route.updated_at.timestamp_millis(),
+            created_at: route.created_at,
+            updated_at: route.updated_at,
         }
     }
 }
