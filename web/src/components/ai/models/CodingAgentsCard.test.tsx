@@ -78,7 +78,7 @@ test('opening the card never looks inside the workspace; Check workspace does', 
   )
 
   await view.findByText(/Not checked yet/)
-  const check = view.getByRole('button', { name: 'Check workspace' })
+  const check = view.getByRole('button', { name: 'Check Codex workspace' })
   const reads = requests.filter((url) =>
     url.pathname.endsWith('/harness-update')
   )
@@ -88,7 +88,7 @@ test('opening the card never looks inside the workspace; Check workspace does', 
     expect(url.searchParams.get('refresh')).toBeNull()
   }
   // Never read: there is nothing to update yet.
-  expect(view.queryByRole('button', { name: 'Update' })).toBeNull()
+  expect(view.queryByRole('button', { name: 'Update Codex' })).toBeNull()
 
   fireEvent.click(check)
   await waitFor(() => expect(view.getByText('Up to date')).toBeTruthy())
@@ -140,13 +140,13 @@ test('a workspace read earlier can be checked again and a downgrade found', asyn
 
   await waitFor(() => expect(view.getByText('Up to date')).toBeTruthy())
   expect(view.getByText(/^Checked/)).toBeTruthy()
-  const update = view.getByRole('button', { name: 'Update' })
+  const update = view.getByRole('button', { name: 'Update Codex' })
   expect(update.hasAttribute('disabled')).toBe(true)
 
-  fireEvent.click(view.getByRole('button', { name: 'Check workspace' }))
+  fireEvent.click(view.getByRole('button', { name: 'Check Codex workspace' }))
   await waitFor(() => expect(view.getByText('1.1.0 available')).toBeTruthy())
   expect(
-    view.getByRole('button', { name: 'Update' }).hasAttribute('disabled')
+    view.getByRole('button', { name: 'Update Codex' }).hasAttribute('disabled')
   ).toBe(false)
 })
 
@@ -182,7 +182,9 @@ test('a cached read still in flight cannot undo an explicit check', async () => 
     </QueryClientProvider>
   )
 
-  const check = await view.findByRole('button', { name: 'Check workspace' })
+  const check = await view.findByRole('button', {
+    name: 'Check Codex workspace',
+  })
   await waitFor(() => expect(releaseCachedRead).toBeDefined())
   fireEvent.click(check)
   await waitFor(() => expect(view.getByText('1.1.0 available')).toBeTruthy())
@@ -235,7 +237,7 @@ test('a cached read started during a check cannot undo it', async () => {
   )
 
   await view.findByText(/Not checked yet/)
-  fireEvent.click(view.getByRole('button', { name: 'Check workspace' }))
+  fireEvent.click(view.getByRole('button', { name: 'Check Codex workspace' }))
   await waitFor(() => expect(releaseLiveCheck).toBeDefined())
   // A refetch starts while the live check is running.
   void queries.refetchQueries({ type: 'all' })
@@ -284,7 +286,9 @@ test('a failed check before the first read finishes still shows the row', async 
     </QueryClientProvider>
   )
 
-  const check = await view.findByRole('button', { name: 'Check workspace' })
+  const check = await view.findByRole('button', {
+    name: 'Check Codex workspace',
+  })
   await waitFor(() => expect(cachedReads).toBe(1))
   fireEvent.click(check)
 

@@ -340,6 +340,8 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
             variant="outline"
             disabled={inspect.isPending || state.kind === 'updating'}
             onClick={() => inspect.mutate()}
+            // Every row has these buttons: the name says whose they are.
+            aria-label={`Check ${agent.name} workspace`}
           >
             {inspect.isPending ? (
               <Loader2 className="size-4 animate-spin" />
@@ -361,6 +363,7 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
                 workspace.isPending
               }
               onClick={() => update.mutate()}
+              aria-label={`Update ${agent.name}`}
             >
               {update.isPending || state.kind === 'updating' ? (
                 <Loader2 className="size-4 animate-spin" />
