@@ -84,6 +84,7 @@ When the user opts in:
 | Copy an existing database into a managed service | [howtos/managed-services.md](howtos/managed-services.md#import-an-existing-database-into-a-managed-service) |
 | Configure, verify, or restore backups | [howtos/backup-recovery.md](howtos/backup-recovery.md) |
 | Diagnose an unhealthy deployment | [howtos/diagnose-deployment.md](howtos/diagnose-deployment.md) |
+| Act on a "Hand off to agent" prompt pasted from the console: connect, read the record it names, change nothing | [howtos/agent-handoff.md](howtos/agent-handoff.md) |
 | Block, allow, challenge, redirect or log requests by path, header, country, IP or bot class (edge rules) | [howtos/edge-rules.md](howtos/edge-rules.md), then [references/commands/edge-rules.md](references/commands/edge-rules.md) |
 | Automate Temps from CI | [howtos/ci-automation.md](howtos/ci-automation.md) |
 | Add or review observability end to end | [howtos/observability-onboarding.md](howtos/observability-onboarding.md), then one framework guide |
