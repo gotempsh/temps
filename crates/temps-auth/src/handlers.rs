@@ -2192,9 +2192,11 @@ async fn assign_role(
         .get_user_by_id(target_user_id)
         .await?;
 
-    app_state
+    // The grant and the read-back of the user's roles commit together, so
+    // the response, the stored roles and the audit record agree.
+    let updated = app_state
         .user_service
-        .assign_role_by_type(target_user_id, role_type)
+        .assign_role_returning_user(target_user_id, role_type)
         .await?;
 
     info!("Role successfully assigned to user {}", target_user_id);
@@ -2217,10 +2219,6 @@ async fn assign_role(
         error!("Failed to create audit log: {}", e);
     }
 
-    let updated = app_state
-        .user_service
-        .get_user_with_roles(target_user_id)
-        .await?;
     Ok((StatusCode::OK, Json(RouteUserWithRoles::from(updated))).into_response())
 }
 

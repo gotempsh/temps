@@ -631,32 +631,43 @@ impl UserService {
         &self,
         user_id: i32,
     ) -> Result<UserWithRoles, UserServiceError> {
-        let user = temps_entities::users::Entity::find_by_id(user_id)
-            .one(self.db.as_ref())
+        user_with_roles_in(self.db.as_ref(), user_id).await
+    }
+
+    /// Grant `role_type` to `user_id` and return the user with every role
+    /// they now hold. The grant and the read-back are one transaction: when
+    /// the read fails the grant is rolled back, so a caller is never told an
+    /// assignment failed while it is in fact stored.
+    pub async fn assign_role_returning_user(
+        &self,
+        user_id: i32,
+        role_type: RoleType,
+    ) -> Result<UserWithRoles, UserServiceError> {
+        let role = self
+            .get_role_by_type(role_type.clone())
+            .await
+            .map_err(|_| {
+                UserServiceError::RoleNotFound(format!("Role {} not found", role_type.as_str()))
+            })?;
+        let txn = self.db.begin().await?;
+        temps_entities::users::Entity::find_by_id(user_id)
+            .one(&txn)
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
-
-        // Get all roles for this user
-        let user_role_entries = temps_entities::user_roles::Entity::find()
-            .filter(temps_entities::user_roles::Column::UserId.eq(user_id))
-            .all(self.db.as_ref())
-            .await?;
-
-        // One query for every role, not one per assignment.
-        let role_ids: Vec<i32> = user_role_entries.iter().map(|ur| ur.role_id).collect();
-        let user_roles = if role_ids.is_empty() {
-            Vec::new()
-        } else {
-            temps_entities::roles::Entity::find()
-                .filter(temps_entities::roles::Column::Id.is_in(role_ids))
-                .all(self.db.as_ref())
-                .await?
-        };
-
-        Ok(UserWithRoles {
-            user: user.into(),
-            roles: user_roles.into_iter().map(|r| r.into()).collect(),
-        })
+        let now = Utc::now();
+        temps_entities::user_roles::ActiveModel {
+            user_id: Set(user_id),
+            role_id: Set(role.id),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        let updated = user_with_roles_in(&txn, user_id).await?;
+        txn.commit().await?;
+        info!("Assigned role {} to user {}", role.id, user_id);
+        Ok(updated)
     }
 
     pub async fn assign_default_role(&self, user_id: i32) -> Result<(), UserServiceError> {
@@ -1533,6 +1544,37 @@ fn email_taken_or(error: sea_orm::DbErr, email: &str) -> UserServiceError {
     }
 }
 
+/// A user and every role they hold, read through `conn` (the pool or an
+/// open transaction). One query for every role, not one per assignment.
+async fn user_with_roles_in<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+) -> Result<UserWithRoles, UserServiceError> {
+    let user = temps_entities::users::Entity::find_by_id(user_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
+    let role_ids: Vec<i32> = temps_entities::user_roles::Entity::find()
+        .filter(temps_entities::user_roles::Column::UserId.eq(user_id))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|entry| entry.role_id)
+        .collect();
+    let roles = if role_ids.is_empty() {
+        Vec::new()
+    } else {
+        temps_entities::roles::Entity::find()
+            .filter(temps_entities::roles::Column::Id.is_in(role_ids))
+            .all(conn)
+            .await?
+    };
+    Ok(UserWithRoles {
+        user: user.into(),
+        roles: roles.into_iter().map(|r| r.into()).collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,6 +1638,69 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[tokio::test]
+    async fn a_role_grant_whose_read_back_fails_is_rolled_back() {
+        let now = Utc::now();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![role(RoleType::Admin)]])
+            .append_query_results([vec![user(false, None)]])
+            .append_query_results([vec![temps_entities::user_roles::Model {
+                id: 11,
+                user_id: 7,
+                role_id: 1,
+                created_at: now,
+                updated_at: now,
+            }]])
+            .append_query_errors([DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+        let db = Arc::new(db);
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
+
+        let result = service.assign_role_returning_user(7, RoleType::Admin).await;
+        assert!(result.is_err(), "a failed read-back is reported");
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("the service was the only other owner");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            log.contains("INSERT INTO") && log.contains("user_roles"),
+            "{log}"
+        );
+        assert!(
+            log.contains("ROLLBACK") && !log.contains("COMMIT"),
+            "the grant is rolled back, not committed, when the read-back fails: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_role_grant_returns_the_user_with_the_role() {
+        let now = Utc::now();
+        let grant = temps_entities::user_roles::Model {
+            id: 11,
+            user_id: 7,
+            role_id: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![role(RoleType::Admin)]])
+            .append_query_results([vec![user(false, None)]])
+            .append_query_results([vec![grant.clone()]])
+            .append_query_results([vec![user(false, None)]])
+            .append_query_results([vec![grant]])
+            .append_query_results([vec![role(RoleType::Admin)]])
+            .into_connection();
+        let service = UserService::new(Arc::new(db), crate::mfa_guard::test_support::encryption());
+
+        let updated = service
+            .assign_role_returning_user(7, RoleType::Admin)
+            .await
+            .unwrap();
+        assert_eq!(updated.user.id, 7);
+        assert_eq!(updated.roles.len(), 1);
+        assert_eq!(updated.roles[0].id, 1);
     }
 
     #[test]
