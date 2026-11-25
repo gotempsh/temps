@@ -412,6 +412,7 @@ impl AgentConfig {
                 http_port: self.public_ingress_http_port,
                 https_port: self.public_ingress_https_port,
                 tailscale_serve: false,
+                admit: Vec::new(),
             },
             None => LocalIngress::default(),
         }

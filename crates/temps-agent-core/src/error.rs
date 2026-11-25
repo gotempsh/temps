@@ -48,6 +48,24 @@ pub enum AgentError {
     #[error("AI CLI '{provider}' timed out after {timeout_secs} seconds")]
     AiCliTimeout { provider: String, timeout_secs: u64 },
 
+    /// ADR-115 D2: a model turn of an agent run failed in the AI gateway
+    /// (no provider configured, the provider refused, a limit was hit).
+    #[error("Agent run {run_id}: the AI gateway could not answer turn {turn}: {reason}")]
+    AgentModelFailed {
+        run_id: i32,
+        turn: u32,
+        reason: String,
+    },
+
+    /// ADR-115 D2: an agent run used its whole time budget before the model
+    /// gave its final answer.
+    #[error("Agent run {run_id} did not finish within {timeout_secs} seconds ({turns} turns)")]
+    AgentTimedOut {
+        run_id: i32,
+        timeout_secs: u64,
+        turns: u32,
+    },
+
     #[error("Git operation failed: {message}")]
     GitError { message: String },
 
@@ -571,6 +589,12 @@ impl From<AgentError> for Problem {
             }
             AgentError::AiCliTimeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("AI CLI Timeout")
+                .with_detail(error.to_string()),
+            AgentError::AgentModelFailed { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
+                .with_title("AI Gateway Failed")
+                .with_detail(error.to_string()),
+            AgentError::AgentTimedOut { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("Agent Run Timed Out")
                 .with_detail(error.to_string()),
             AgentError::GitError { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Git Error")

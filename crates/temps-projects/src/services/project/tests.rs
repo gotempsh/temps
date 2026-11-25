@@ -739,6 +739,7 @@ async fn an_external_project_is_not_deployed_on_creation() {
             memory_limit: None,
             is_public_repo: None,
             storage_service_ids: vec![],
+            storage_service_env_aliases: Default::default(),
             storage_service_claim_ids: vec![],
             storage_service_claim_user_id: None,
             source_type: temps_entities::source_type::SourceType::Git,
@@ -800,6 +801,7 @@ fn template_service_request(name: &str, slug: &str) -> CreateProjectRequest {
         memory_limit: None,
         is_public_repo: None,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -1377,6 +1379,7 @@ async fn test_update_project_emits_event() {
         memory_limit: None,
         is_public_repo: None,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -1941,6 +1944,7 @@ async fn test_update_project_event_includes_correct_data() {
         environment_variables: None,
         automatic_deploy: false,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         is_public_repo: None,
@@ -4360,6 +4364,7 @@ fn create_request(name: &str) -> CreateProjectRequest {
         memory_limit: None,
         is_public_repo: None,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -6736,6 +6741,7 @@ async fn test_create_project_rolls_back_on_invalid_storage_service() {
         cloudflare_enabled: None,
         delivery_provider: None,
         storage_service_ids: vec![999_999],
+        storage_service_env_aliases: Default::default(),
         ..create_request("rollback-test")
     };
 

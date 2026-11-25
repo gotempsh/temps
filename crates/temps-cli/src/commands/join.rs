@@ -1228,7 +1228,7 @@ impl JoinCommand {
             IngressFlag::Fixed => IngressMode::Fixed,
             IngressFlag::Delegated => IngressMode::Delegated,
             IngressFlag::Private => {
-                return super::agent_ingress::private(Some(&self.listen), self.tailscale_serve)
+                return super::agent_ingress::private(Some(&self.listen), &[], self.tailscale_serve)
                     .map(Some)
             }
         };

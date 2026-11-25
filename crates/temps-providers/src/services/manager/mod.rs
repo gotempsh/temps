@@ -20,6 +20,7 @@ pub(crate) use healthcheck::HEALTHCHECK_REGISTRY_TEST_LOCK;
 pub(crate) use healthcheck::{HEALTHCHECK_CHANNEL, HEALTHCHECK_WRITES};
 mod import;
 mod lifecycle;
+pub mod link_env_aliases;
 mod managed_s3;
 mod networking;
 mod persistence;

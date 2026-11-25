@@ -226,6 +226,9 @@ pub struct ExternalServiceProjectLinkedAudit {
     pub project_id: i32,
     pub database_provisioning_mode: crate::services::DatabaseProvisioningMode,
     pub custom_database_name: Option<String>,
+    /// Variable aliases set on the link (names only; never values).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env_aliases: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

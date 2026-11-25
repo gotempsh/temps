@@ -678,6 +678,7 @@ impl WorkloadImporter for DockerImporter {
             ),
             automatic_deploy: true,
             storage_service_ids: vec![],
+            storage_service_env_aliases: Default::default(),
             storage_service_claim_ids: vec![],
             storage_service_claim_user_id: None,
             is_public_repo: None,

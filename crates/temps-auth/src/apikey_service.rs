@@ -5,8 +5,8 @@ use crate::permissions::{Permission, Role};
 use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -693,25 +693,37 @@ impl ApiKeyService {
             .one(self.db.as_ref())
             .await?;
 
-        let cli_login_key = match &harness_key {
+        // The most recently used agent credential (device login or MCP
+        // client key) of this user. With a dedicated key, only one created
+        // after it counts (see `derive_ai_harness_status`); a used dedicated
+        // key or a deactivated one decides on its own.
+        let agent_key_query = || {
+            ApiKeyEntity::find()
+                .filter(Column::UserId.eq(user_id))
+                .filter(Column::IsActive.eq(true))
+                .filter(Column::ProjectId.is_null())
+                .filter(
+                    Condition::any()
+                        .add(Column::Name.starts_with(crate::ai_harness::CLI_DEVICE_KEY_PREFIX))
+                        .add(Column::Name.starts_with(crate::ai_harness::MCP_CLIENT_KEY_PREFIX)),
+                )
+                .filter(Column::LastUsedAt.is_not_null())
+                .order_by_desc(Column::LastUsedAt)
+        };
+        let agent_key = match &harness_key {
             Some(key) if key.is_active && key.last_used_at.is_none() => {
-                ApiKeyEntity::find()
-                    .filter(Column::UserId.eq(user_id))
-                    .filter(Column::IsActive.eq(true))
-                    .filter(Column::ProjectId.is_null())
-                    .filter(Column::Name.starts_with(crate::ai_harness::CLI_DEVICE_KEY_PREFIX))
+                agent_key_query()
                     .filter(Column::CreatedAt.gte(key.created_at))
-                    .filter(Column::LastUsedAt.is_not_null())
-                    .order_by_desc(Column::LastUsedAt)
                     .one(self.db.as_ref())
                     .await?
             }
-            _ => None,
+            Some(_) => None,
+            None => agent_key_query().one(self.db.as_ref()).await?,
         };
 
         Ok(crate::ai_harness::derive_ai_harness_status(
             harness_key.as_ref(),
-            cli_login_key.as_ref(),
+            agent_key.as_ref(),
         ))
     }
 
@@ -2081,6 +2093,37 @@ mod tests {
             crate::ai_harness::AiHarnessCredentialKind::CliLogin
         );
         assert_eq!(status.key_id, Some(harness.id));
+    }
+
+    /// The welcome step never creates the dedicated key: a device login, or
+    /// the Claude app's MCP key, connecting is what it waits for.
+    #[tokio::test]
+    async fn ai_harness_status_connects_without_a_dedicated_key_once_an_agent_key_is_used() {
+        let (_db, service, user) = setup_test_env().await;
+        let mut request = admin_key_request("mcp-claude-app-2026-11-25T10-00-00Z");
+        request.role_type = "reader".to_string();
+        let mcp = service.create_api_key(user.id, request).await.unwrap();
+        // A hand-made key in use proves nothing.
+        let manual = service
+            .create_api_key(user.id, admin_key_request("deploy from CI"))
+            .await
+            .unwrap();
+        service.validate_api_key(&manual.api_key).await.unwrap();
+
+        let before = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(before.status, crate::ai_harness::AiHarnessState::Missing);
+
+        service.validate_api_key(&mcp.api_key).await.unwrap();
+
+        let status = service.ai_harness_status(user.id).await.unwrap();
+        assert_eq!(status.status, crate::ai_harness::AiHarnessState::Connected);
+        let via = status.connected_via.unwrap();
+        assert_eq!(via.id, mcp.id);
+        assert_eq!(
+            via.kind,
+            crate::ai_harness::AiHarnessCredentialKind::McpClient
+        );
+        assert_eq!(status.key_id, None);
     }
 
     #[tokio::test]

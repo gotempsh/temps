@@ -178,6 +178,9 @@ pub struct PrivateWorkerFact {
     pub tailscale: bool,
     /// Why the listener is not running, as the worker reported it.
     pub error: Option<String>,
+    /// The ranges the listener admits (ADR-114 D8), `10.8.0.0/24`; `None`
+    /// from agents that predate it.
+    pub admit: Option<String>,
 }
 
 /// A worker's tailscaled as its agent last reported it (ADR 065 D2).
@@ -228,6 +231,15 @@ impl PrivateWorkerFact {
     pub fn ready(&self) -> Option<std::net::IpAddr> {
         self.listener.filter(|_| self.error.is_none())
     }
+
+    /// The range an address served by this listener at `ip` admits: what
+    /// the listener reports, or for an agent that predates it, the
+    /// listener's private block.
+    pub fn range(&self, ip: std::net::IpAddr) -> Option<String> {
+        self.admit
+            .clone()
+            .or_else(|| temps_core::worker_ingress::private_block(ip).map(str::to_string))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -249,6 +261,9 @@ pub struct PlanFacts {
     pub attached_here: Vec<String>,
     /// Custom domains of every other environment.
     pub taken_elsewhere: HashSet<String>,
+    /// The console's host and the public ingress host: never an app's
+    /// address (ADR-114 D5), whatever its audience.
+    pub platform_hosts: Vec<String>,
     pub tunnels: Vec<TunnelFact>,
     pub zones: Vec<ZoneFact>,
     /// Active Cloudflare DNS providers.
@@ -401,6 +416,10 @@ pub fn planned_address(facts: &PlanFacts) -> Result<Option<String>, String> {
             Ok(host) if is_local_only(&host) => Err(format!(
                 "{host} only resolves to the computer it is opened on. Use a hostname on a \
                  domain you own."
+            )),
+            Ok(host) if facts.platform_hosts.contains(&host) => Err(format!(
+                "{host} is this Temps console's own address, and an app is never served there. \
+                 Use another hostname."
             )),
             Ok(host) if facts.taken_elsewhere.contains(&host) => Err(format!(
                 "{host} is already attached to another environment. Remove it there first, or \
@@ -2840,6 +2859,18 @@ fn tailnet_users_ways(facts: &PlanFacts) -> ReachabilityPlan {
             let Some((worker, ip)) = private_worker(facts) else {
                 return false;
             };
+            // ADR-114 D7: the control plane does not check who a tailnet
+            // visitor is yet.
+            if worker.id == temps_core::CONTROL_PLANE_NODE_ID {
+                refusals.push((
+                    "This machine serves private addresses to everyone on your tailnet, but \
+                     cannot yet limit one to chosen people. Use “Only my private network”, or \
+                     deploy the app to a worker for that."
+                        .to_string(),
+                    None,
+                ));
+                return false;
+            }
             // D6: whois answers only for Tailscale peers, and asking it
             // needs the worker owner's consent.
             if !worker.tailscale {
@@ -3236,18 +3267,27 @@ fn plan_listener(
     let block = |reason: String, action: Option<ReachAction>| PlanBlocked { reason, action };
     let shown = address.clone().unwrap_or_else(|| "the address".to_string());
 
-    if facts.deployed && !facts.served_by_workers {
+    // ADR-114 D6: what the control plane runs, this machine serves, once
+    // the operator lets it.
+    let on_control_plane = facts.deployed && !facts.served_by_workers;
+    if on_control_plane && facts.private_workers.is_empty() {
         return blocked_plan(
             address,
             None,
             block(
                 format!(
-                    "{} runs on the control plane, and a private address is served by a \
-                     worker's private listener, which only carries what workers serve. Deploy \
-                     it to a worker first.",
+                    "{} runs on this machine, which serves private addresses only once you \
+                     allow it. Serve them from this machine on its private network (Tailscale, \
+                     WireGuard, your LAN…), then plan again.",
                     facts.environment_name
                 ),
-                None,
+                Some(
+                    ReachAction::new(
+                        ActionKind::ServePrivately,
+                        "Serve private addresses from this machine",
+                    )
+                    .with_command(crate::reachability::service::CONTROL_PLANE_PRIVATE_COMMAND),
+                ),
             ),
         );
     }
@@ -3259,6 +3299,15 @@ fn plan_listener(
             facts.private_workers.first(),
             &facts.suggested_private_worker,
         ) {
+            (Some(w), _) if w.id == temps_core::CONTROL_PLANE_NODE_ID => {
+                let reason = format!(
+                    "This machine is allowed to serve private addresses, but does not yet: {}",
+                    w.error
+                        .clone()
+                        .unwrap_or_else(|| "it is not bound on a private address.".to_string())
+                );
+                return blocked_plan(address, None, block(reason, None));
+            }
             (Some(w), _) => (
                 format!(
                     "{} is in private mode, but its private listener is not running: {}",
@@ -3315,11 +3364,14 @@ fn plan_listener(
             );
         }
     }
-    let range = temps_core::worker_ingress::private_block(ip).unwrap_or("its private network");
+    let range = worker
+        .range(ip)
+        .map(|r| r.replace(',', ", "))
+        .unwrap_or_else(|| "its private network".to_string());
     let network = if worker.tailscale {
         "Tailscale".to_string()
     } else {
-        range.to_string()
+        range.clone()
     };
 
     let Some(zone) = address
@@ -4989,6 +5041,7 @@ mod tests {
             listener: Some("100.101.102.103".parse().expect("ip")),
             tailscale: true,
             error: error.map(str::to_string),
+            admit: None,
         }
     }
 
@@ -5090,12 +5143,27 @@ mod tests {
         )];
         assert!(plan_of(&taken).options.is_empty());
 
-        // Where the environment runs on the control plane, no worker can.
+        // Where the environment runs on the control plane and the operator
+        // has not let it serve privately (ADR-114 D2), the plan asks for that
+        // consent, in one click or one command.
         let on_cp = plan_of(&PlanFacts {
             served_by_workers: false,
+            private_workers: Vec::new(),
             ..private_facts()
         });
         assert!(on_cp.options.is_empty());
+        let blocked = on_cp.blocked.expect("blocked");
+        assert!(
+            blocked.reason.contains("runs on this machine"),
+            "{}",
+            blocked.reason
+        );
+        let action = blocked.action.expect("action");
+        assert_eq!(action.kind, ActionKind::ServePrivately);
+        assert_eq!(
+            action.command.as_deref(),
+            Some(crate::reachability::service::CONTROL_PLANE_PRIVATE_COMMAND)
+        );
 
         // The fingerprint follows the listener.
         let mut moved = private_facts();
@@ -5103,6 +5171,104 @@ mod tests {
         assert_ne!(
             fingerprint(&facts, Some("internal.example.com")),
             fingerprint(&moved, Some("internal.example.com"))
+        );
+    }
+
+    fn control_plane_fact(error: Option<&str>) -> PrivateWorkerFact {
+        PrivateWorkerFact {
+            id: temps_core::CONTROL_PLANE_NODE_ID,
+            name: "this machine".into(),
+            listener: error
+                .is_none()
+                .then(|| "100.101.102.103".parse().expect("ip")),
+            tailscale: error.is_none(),
+            error: error.map(str::to_string),
+            admit: error
+                .is_none()
+                .then(|| "100.64.0.0/10,fd7a:115c:a1e0::/48".to_string()),
+        }
+    }
+
+    /// ADR-114 D5: the console's own host is never planned as an app's.
+    #[test]
+    fn the_console_host_is_never_an_apps_address() {
+        for audience in [Audience::Private, Audience::Public] {
+            let plan = plan_of(&PlanFacts {
+                audience,
+                requested: Some("Temps.Example.com".into()),
+                platform_hosts: vec!["temps.example.com".into()],
+                ..private_facts()
+            });
+            assert!(plan.options.is_empty(), "{audience:?}");
+            assert!(
+                plan.address_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("console's own address")),
+                "{audience:?}: {:?}",
+                plan.address_error
+            );
+        }
+    }
+
+    /// ADR-114 D6: an environment on the control plane is served privately
+    /// by this machine, through the same DNS-01 plan as a worker's.
+    #[test]
+    fn the_control_plane_serves_privately_what_it_runs() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            private_workers: vec![control_plane_fact(None)],
+            ..private_facts()
+        };
+        let plan = plan_of(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        let option = &plan.options[0];
+        assert_eq!(option.kind, PlanOptionKind::PrivateWorker);
+        assert_eq!(option.way_in, "private:this machine");
+        assert!(
+            option.title.contains("through this machine"),
+            "{}",
+            option.title
+        );
+        assert!(option.description.contains("100.101.102.103"));
+        assert!(
+            !option.description.contains("worker"),
+            "{}",
+            option.description
+        );
+
+        // Allowed, but the proxy does not cover the address: the plan says
+        // why, without a worker command.
+        let refused = plan_of(&PlanFacts {
+            private_workers: vec![control_plane_fact(Some(
+                "The proxy listens on 203.0.113.7:443 only.",
+            ))],
+            ..facts.clone()
+        });
+        assert!(refused.options.is_empty());
+        let blocked = refused.blocked.expect("blocked");
+        assert!(
+            blocked.reason.contains("203.0.113.7:443"),
+            "{}",
+            blocked.reason
+        );
+        assert!(blocked.action.is_none());
+
+        // ADR-114 D7: chosen tailnet users are not served from here yet.
+        let users = plan_of(&PlanFacts {
+            audience: Audience::TailnetUsers,
+            principals: vec![
+                temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").expect("a login"),
+            ],
+            ..facts
+        });
+        assert!(users.options.is_empty());
+        let blocked = users.blocked.expect("blocked");
+        assert!(
+            blocked
+                .reason
+                .contains("cannot yet limit one to chosen people"),
+            "{}",
+            blocked.reason
         );
     }
 

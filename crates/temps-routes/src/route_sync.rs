@@ -850,6 +850,25 @@ pub fn private_listener_of(
     Some(ip)
 }
 
+/// The ranges a worker's private listener admits, as it reported them
+/// (ADR-114 D8): `10.8.0.0/24,fd00:1::/64`. `None` when it reports none
+/// (an agent that predates it) or any it reports is not a private range,
+/// so the caller falls back to the listener's private block.
+pub fn private_admit_of(
+    row: Option<&temps_entities::node_public_ingress::Model>,
+) -> Option<String> {
+    let ranges: Vec<String> = row?
+        .listening
+        .as_ref()?
+        .get("admit")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<_>>()?;
+    let parsed = temps_core::private_network::parse_admits(&ranges).ok()?;
+    (!parsed.is_empty()).then(|| temps_core::private_network::admit_text(&parsed))
+}
+
 /// Whether the worker's last listener report names `capability` (ADR 065
 /// D6). Agents that predate capabilities report none.
 pub fn reports_capability(
@@ -1711,6 +1730,35 @@ pub(crate) mod tests {
             ))),
             cap
         ));
+    }
+
+    #[test]
+    fn a_listener_admits_what_it_reported_and_never_more() {
+        let row = |admit: serde_json::Value| {
+            ingress_row(Some(
+                serde_json::json!({"https": "10.8.0.1:443", "admit": admit}),
+            ))
+        };
+        assert_eq!(
+            private_admit_of(Some(&row(serde_json::json!([
+                "10.8.0.0/24",
+                "fd00:1::/64"
+            ])))),
+            Some("10.8.0.0/24,fd00:1::/64".to_string())
+        );
+        // An agent that predates it reports none.
+        assert_eq!(
+            private_admit_of(Some(&ingress_row(Some(
+                serde_json::json!({"https": "10.8.0.1:443"})
+            )))),
+            None
+        );
+        // A public range is never taken from a report.
+        assert_eq!(
+            private_admit_of(Some(&row(serde_json::json!(["0.0.0.0/0"])))),
+            None
+        );
+        assert_eq!(private_admit_of(Some(&row(serde_json::json!([])))), None);
     }
 
     fn held_route(host: &str) -> RouteEntryDto {

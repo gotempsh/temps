@@ -549,6 +549,9 @@ impl ProxyCommand {
             // The console is another process and runs no connector here
             // (ADR-107 D2), so nothing is bound for a tunnel.
             tunnel_origin: None,
+            // Private addresses on the control plane are served by the
+            // single-process `temps serve` only (ADR-114 D7).
+            private_ingress: None,
         };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),

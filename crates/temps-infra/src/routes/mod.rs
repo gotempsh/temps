@@ -5,9 +5,11 @@ use axum::Router;
 use std::sync::Arc;
 
 pub mod dns;
+pub mod host_facts;
 pub mod platform;
 
 pub use dns::*;
+pub use host_facts::{configure_host_facts_routes, HostFactsApiDoc};
 pub use platform::*;
 
 /// Configure all infrastructure routes (platform + DNS)

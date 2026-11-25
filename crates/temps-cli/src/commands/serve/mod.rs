@@ -8,6 +8,7 @@ pub mod console;
 mod internal_routing;
 mod node_api;
 pub(crate) mod on_demand_cert;
+mod private_ingress;
 pub(crate) mod proxy;
 pub(crate) mod self_update;
 mod shutdown;
@@ -1426,6 +1427,21 @@ impl ServeCommand {
             );
         }
 
+        // ADR-114: private addresses the control plane serves itself, on its
+        // proxy's own listener, so only with the proxy in this process. The
+        // loop is idle until the operator consents.
+        let private_ingress = (self.role == ServeRole::All)
+            .then(temps_core::private_ingress::ControlPlanePrivateIngress::new);
+        if let Some(runtime) = private_ingress.clone() {
+            let _runtime = rt.enter();
+            private_ingress::start_control_plane_private_ingress(
+                db.clone(),
+                runtime,
+                route_table.clone(),
+                docker_handle.clone(),
+            );
+        }
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -1459,6 +1475,7 @@ impl ServeCommand {
             profile: self.profile,
             startup_state: console_startup_state.clone(),
             control_plane_tunnels,
+            control_plane_private_ingress: private_ingress.clone(),
         };
 
         if self.role == ServeRole::Console {
@@ -1611,6 +1628,7 @@ impl ServeCommand {
             self.profile.local_workloads_enabled(),
             console_startup_state,
             tunnel_origin,
+            private_ingress,
         )
     }
 }

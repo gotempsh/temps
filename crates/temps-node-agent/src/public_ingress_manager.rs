@@ -340,7 +340,23 @@ async fn run(
             None
         };
 
+        // ADR-114 D8: who the private listener admits. A range over a
+        // container network, or no range to admit, stops the control plane
+        // from making new addresses private here, with the reason.
+        let admit = match bound.as_ref().filter(|b| b.private) {
+            Some(b) => match private_admit(&local, b.https.ip(), &local_networks()) {
+                Ok(admit) => admit,
+                Err(why) => {
+                    if error.is_none() {
+                        error = Some(why);
+                    }
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
         let report = ListenerReport {
+            admit,
             interfaces: host_interfaces(),
             http: bound.as_ref().map(|b| b.http.to_string()),
             https: bound.as_ref().map(|b| b.https.to_string()),
@@ -495,6 +511,66 @@ const NON_PUBLIC_INTERFACES: &[&str] = &[
 ];
 
 /// Every address on this host with its interface name.
+/// Every address on this host with its interface, prefix and whether it is
+/// Tailscale's (ADR-114 D8). The control plane reads its own the same way.
+pub fn local_networks() -> Vec<temps_core::private_network::LocalNetwork> {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces
+                .iter()
+                .map(|interface| {
+                    let prefix = match &interface.addr {
+                        if_addrs::IfAddr::V4(v4) => u32::from(v4.netmask).count_ones(),
+                        if_addrs::IfAddr::V6(v6) => u128::from(v6.netmask).count_ones(),
+                    } as u8;
+                    let address = interface.ip();
+                    temps_core::private_network::LocalNetwork {
+                        interface: interface.name.clone(),
+                        address,
+                        prefix,
+                        tailscale: temps_core::private_network::is_tailscale_interface(
+                            &interface.name,
+                            address,
+                            prefix,
+                        ),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What a private listener on `listener` admits (ADR-114 D8): the ranges
+/// its owner named, else the listen interface's subnet (Tailscale's ranges
+/// on Tailscale), never a range over one of this host's container bridges.
+pub fn private_admit(
+    local: &LocalIngress,
+    listener: IpAddr,
+    own: &[temps_core::private_network::LocalNetwork],
+) -> Result<Vec<String>, String> {
+    use temps_core::private_network::{
+        container_overlap, default_admit, is_container_interface, parse_admits,
+    };
+    let admit = if local.admit.is_empty() {
+        let network = own
+            .iter()
+            .find(|n| n.address == listener)
+            .ok_or_else(|| format!("{listener} is no longer an address of this worker"))?;
+        default_admit(network)?
+    } else {
+        parse_admits(&local.admit)?
+    };
+    let containers: Vec<(String, temps_core::private_network::IpNet)> = own
+        .iter()
+        .filter(|n| is_container_interface(&n.interface))
+        .filter_map(|n| Some((n.interface.clone(), n.subnet()?)))
+        .collect();
+    if let Some(why) = container_overlap(&admit, &containers) {
+        return Err(why.replace("`--admit`", "`temps agent ingress private --admit`"));
+    }
+    Ok(admit.iter().map(ToString::to_string).collect())
+}
+
 fn own_addresses() -> Vec<(String, IpAddr)> {
     if_addrs::get_if_addrs()
         .map(|interfaces| {
@@ -928,8 +1004,47 @@ mod tests {
             http_port: 80,
             https_port: 443,
             tailscale_serve: false,
+            admit: Vec::new(),
         };
         let (http, _) = resolve(&local, None).unwrap().unwrap();
         assert!(http.ip().is_unspecified());
+    }
+
+    #[test]
+    fn a_private_listener_admits_its_network_never_the_containers() {
+        use temps_core::private_network::LocalNetwork;
+        let net = |interface: &str, address: &str, prefix: u8, tailscale: bool| LocalNetwork {
+            interface: interface.into(),
+            address: address.parse().unwrap(),
+            prefix,
+            tailscale,
+        };
+        let own = vec![
+            net("wg0", "10.8.0.1", 24, false),
+            net("eth0", "172.20.0.5", 16, false),
+            net("docker0", "172.17.0.1", 16, false),
+            net("tailscale0", "100.101.102.103", 32, true),
+        ];
+        let local = |admit: &[&str]| LocalIngress {
+            mode: IngressMode::Private,
+            admit: admit.iter().map(|a| a.to_string()).collect(),
+            ..LocalIngress::default()
+        };
+        let ip = |t: &str| t.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            private_admit(&local(&[]), ip("10.8.0.1"), &own).unwrap(),
+            ["10.8.0.0/24"]
+        );
+        assert_eq!(
+            private_admit(&local(&[]), ip("100.101.102.103"), &own).unwrap(),
+            ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+        );
+        assert_eq!(
+            private_admit(&local(&["10.8.0.0/28"]), ip("10.8.0.1"), &own).unwrap(),
+            ["10.8.0.0/28"]
+        );
+        let why = private_admit(&local(&["172.16.0.0/12"]), ip("172.20.0.5"), &own).unwrap_err();
+        assert!(why.contains("container network docker0"), "{why}");
+        assert!(why.contains("temps agent ingress private --admit"), "{why}");
     }
 }

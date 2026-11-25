@@ -489,6 +489,7 @@ pub fn start_proxy_server(
     local_workloads_enabled: bool,
     console_startup: Arc<temps_core::console_startup::ConsoleStartupState>,
     tunnel_origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
+    private_ingress: Option<Arc<temps_core::private_ingress::ControlPlanePrivateIngress>>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
     let console_ingress_address = config.public_surface_address().map(str::to_string);
@@ -644,6 +645,8 @@ pub fn start_proxy_server(
         host_metrics: true,
         // ADR-107 D3: the loopback listener connectors on node 0 forward to.
         tunnel_origin,
+        // ADR-114 D3: node 0's private addresses, once consented.
+        private_ingress,
     };
 
     info!(

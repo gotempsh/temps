@@ -106,6 +106,8 @@ impl TempsPlugin for InfraPlugin {
                     }
                 });
 
+            let docker_handle_for_facts = Arc::new(docker_handle.clone());
+
             // The serve bootstrap is the only place that knows the profile;
             // absent (embedded/test contexts) means the historical
             // everything-enabled single-binary behaviour.
@@ -157,6 +159,19 @@ impl TempsPlugin for InfraPlugin {
                 PlatformInfoService::with_handle(Arc::new(docker_handle)).with_features(features),
             );
             context.register_service(platform_info_service.clone());
+
+            let server_config = config_service.get_server_config();
+            let temps_ports: Vec<u16> = std::iter::once(server_config.address.as_str())
+                .chain(server_config.tls_address.as_deref())
+                .filter_map(crate::services::host_facts::listener_port)
+                .collect();
+            let host_facts_service = Arc::new(crate::services::HostFactsService::new(
+                platform_info_service.clone(),
+                docker_handle_for_facts,
+                temps_ports,
+                config_service.data_dir(),
+            ));
+            context.register_service(host_facts_service);
             // Make it reachable asks the server for its public address
             // instead of resolving the console's hostname.
             let public_address: Arc<dyn temps_core::server_public_address::ServerPublicAddress> =
@@ -181,7 +196,10 @@ impl TempsPlugin for InfraPlugin {
         let infra_state = context.require_service::<InfraState>();
 
         // Configure infrastructure routes
-        let infra_routes = configure_routes::<InfraState>().with_state(infra_state);
+        let host_facts_service = context.require_service::<crate::services::HostFactsService>();
+        let infra_routes = configure_routes::<InfraState>()
+            .with_state(infra_state)
+            .merge(crate::routes::configure_host_facts_routes().with_state(host_facts_service));
 
         Some(PluginRoutes::new(infra_routes))
     }
@@ -189,6 +207,7 @@ impl TempsPlugin for InfraPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut platform_api = <PlatformInfoApiDoc as OpenApiTrait>::openapi();
         let dns_api = <DnsApiDoc as OpenApiTrait>::openapi();
+        platform_api.merge(<crate::routes::HostFactsApiDoc as OpenApiTrait>::openapi());
 
         // Merge DNS API paths into platform API
         platform_api.paths.paths.extend(dns_api.paths.paths);

@@ -179,13 +179,18 @@ pub struct ProjectList {
 pub struct ProjectEnvVarInput {
     /// Variable name, e.g. `DATABASE_URL`
     pub key: String,
-    /// Variable value
+    /// Variable value. Leave empty when `generate` is set.
+    #[serde(default)]
     pub value: String,
     /// Mark the variable as a secret. Secret values are encrypted at rest,
     /// masked in list responses, and revealable only through an audited,
     /// permission-checked endpoint. Defaults to `false`.
     #[serde(default)]
     pub is_secret: bool,
+    /// Ask the server to generate the value (always stored as a secret)
+    /// instead of sending one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<temps_environments::services::generated_value::GenerateValueRequest>,
 }
 
 /// Cloudflare availability and the default used by future project creation.
@@ -254,6 +259,13 @@ pub struct CreateProjectRequest {
     pub performance_metrics_enabled: bool,
     #[serde(default)]
     pub storage_service_ids: Vec<i32>,
+    /// Variable aliases for each linked storage service, keyed by service id
+    /// (as a string, JSON object keys being strings): app name → injected
+    /// name, such as `{"12": {"DATABASE_URL": "POSTGRES_URL"}}`. Set before
+    /// the first deployment is queued.
+    #[serde(default)]
+    pub storage_service_env_aliases:
+        std::collections::BTreeMap<i32, std::collections::BTreeMap<String, String>>,
     pub use_default_wildcard: Option<bool>,
     pub custom_domain: Option<String>,
     pub is_public_repo: Option<bool>,

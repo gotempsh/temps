@@ -115,7 +115,7 @@ impl TempsPlugin for ConfigPlugin {
         let encryption_service = context.require_service::<temps_core::EncryptionService>();
         let db = context.require_service::<sea_orm::DatabaseConnection>();
         let enrollment_token_service =
-            Arc::new(temps_config::enrollment_tokens::EnrollmentTokenService::new(db));
+            Arc::new(temps_config::enrollment_tokens::EnrollmentTokenService::new(db.clone()));
 
         // Get the route table refresher if available (it's registered by the proxy subsystem)
         let route_table_refresher =
@@ -133,6 +133,26 @@ impl TempsPlugin for ConfigPlugin {
         // Present only when ClickHouse is configured (see `register_services`).
         let clickhouse_health = context.get_service::<temps_clickhouse::ClickHouseHealth>();
 
+        let onboarding_state = Arc::new(crate::onboarding::OnboardingHandlerState {
+            onboarding_service: Arc::new(temps_config::onboarding::OnboardingService::new(
+                db.clone(),
+            )),
+            audit_service: audit_service.clone(),
+        });
+
+        // ADR-114 D2: the consent wakes the control plane's private-ingress
+        // loop when one runs in this process (`temps serve --role all`).
+        let private_ingress_state = Arc::new(crate::private_ingress::PrivateIngressHandlerState {
+            private_ingress_service: Arc::new(
+                temps_config::private_ingress::PrivateIngressService::new(
+                    db.clone(),
+                    context
+                        .get_service::<temps_core::private_ingress::ControlPlanePrivateIngress>(),
+                ),
+            ),
+            audit_service: audit_service.clone(),
+        });
+
         // Create SettingsState
         let settings_state = Arc::new(SettingsState {
             config_service,
@@ -147,13 +167,22 @@ impl TempsPlugin for ConfigPlugin {
         });
 
         // Configure routes with the state
-        let routes = configure_routes().with_state(settings_state);
+        let routes = configure_routes()
+            .with_state(settings_state)
+            .merge(crate::onboarding::configure_onboarding_routes().with_state(onboarding_state))
+            .merge(
+                crate::private_ingress::configure_private_ingress_routes()
+                    .with_state(private_ingress_state),
+            );
 
         Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(SettingsApiDoc::openapi())
+        let mut doc = SettingsApiDoc::openapi();
+        doc.merge(crate::onboarding::OnboardingApiDoc::openapi());
+        doc.merge(crate::private_ingress::PrivateIngressApiDoc::openapi());
+        Some(doc)
     }
 }
 
@@ -191,12 +220,16 @@ mod tests {
         let schema = ConfigPlugin::new(server_config)
             .openapi_schema()
             .expect("the config plugin publishes an OpenAPI document");
-        let expected = SettingsApiDoc::openapi();
+        let mut expected = SettingsApiDoc::openapi();
+        expected.merge(crate::onboarding::OnboardingApiDoc::openapi());
+        expected.merge(crate::private_ingress::PrivateIngressApiDoc::openapi());
         assert_eq!(
             schema.paths.paths.keys().collect::<Vec<_>>(),
             expected.paths.paths.keys().collect::<Vec<_>>()
         );
         assert!(schema.paths.paths.contains_key("/settings"));
+        assert!(schema.paths.paths.contains_key("/settings/onboarding"));
+        assert!(schema.paths.paths.contains_key("/settings/private-ingress"));
         assert!(schema
             .paths
             .paths

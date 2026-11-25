@@ -112,6 +112,9 @@ pub enum ActionKind {
     Wait,
     /// Run `command` on the machine it names.
     RunCommand,
+    /// Let this machine, the control plane, serve private addresses
+    /// (ADR-114 D2): one click in the console, or `command`.
+    ServePrivately,
 }
 
 /// What fixes it.

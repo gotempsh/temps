@@ -551,6 +551,25 @@ impl ReachabilityService {
         })
     }
 
+    /// Node 0 as a private worker (ADR-114 D6), when the operator lets the
+    /// control plane serve private addresses.
+    async fn control_plane_private_fact(
+        &self,
+    ) -> Result<Option<PrivateWorkerFact>, ReachabilityError> {
+        let consent =
+            temps_config::private_ingress::PrivateIngressService::new(self.deps.db.clone(), None)
+                .get()
+                .await
+                .map_err(|e| ReachabilityError::Settings(e.to_string()))?;
+        if consent.is_none() {
+            return Ok(None);
+        }
+        let row = node_public_ingress::Entity::find_by_id(temps_core::CONTROL_PLANE_NODE_ID)
+            .one(self.deps.db.as_ref())
+            .await?;
+        Ok(control_plane_private_fact(consent.as_ref(), row.as_ref()))
+    }
+
     pub(super) async fn settings(&self) -> Result<temps_config::AppSettings, ReachabilityError> {
         self.deps
             .config
@@ -1455,7 +1474,8 @@ impl ReachabilityService {
             .iter()
             .filter_map(|worker| {
                 let row = ingress_rows.iter().find(|r| r.node_id == worker.id)?;
-                (row.mode.as_deref() == Some("private")).then(|| private_worker_fact(worker, row))
+                (row.mode.as_deref() == Some("private"))
+                    .then(|| private_worker_fact(worker.id, &worker.name, row))
             })
             .collect();
         // ADR 065 D2: workers that report their tailscaled, and the Serve
@@ -1466,7 +1486,7 @@ impl ReachabilityService {
             .filter_map(|worker| {
                 let row = ingress_rows.iter().find(|r| r.node_id == worker.id)?;
                 let (report, minutes_ago) = tailscale_report_of(row, now)?;
-                let private = private_worker_fact(worker, row);
+                let private = private_worker_fact(worker.id, &worker.name, row);
                 Some(TailnetWorkerFact {
                     id: worker.id,
                     name: worker.name.clone(),
@@ -1569,6 +1589,16 @@ impl ReachabilityService {
             String::new()
         };
         let served_by_workers = attached_here.iter().any(|a| served.contains(a));
+        // ADR-114 D6: what the control plane runs, node 0 serves privately,
+        // once the operator allowed it; no worker can.
+        let mut private_workers = private_workers;
+        if audience.is_private() && gathered.deployed && !served_by_workers {
+            private_workers = self
+                .control_plane_private_fact()
+                .await?
+                .into_iter()
+                .collect();
+        }
         // Only a public or signed-in plan for an environment the control
         // plane serves alone is stopped by the control plane having no
         // public address, so only then is it said what its hosts resolve to.
@@ -1612,6 +1642,15 @@ impl ReachabilityService {
             served_by_workers,
             attached_here,
             taken_elsewhere,
+            platform_hosts: {
+                let settings = self.settings().await?;
+                settings
+                    .console_hostname()
+                    .into_iter()
+                    .chain(settings.public_ingress_hostname())
+                    .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+                    .collect()
+            },
             tunnels: tunnel_facts.tunnels,
             zones,
             cloudflare_accounts,
@@ -2164,7 +2203,7 @@ impl ReachabilityService {
                         "No worker's private listener is running any more.".into(),
                     )
                 })?;
-                let range = temps_core::worker_ingress::private_block(ip).ok_or_else(|| {
+                let range = worker.range(ip).ok_or_else(|| {
                     ReachabilityError::Conflict(format!(
                         "{}'s listener {ip} is not a private address.",
                         worker.name
@@ -2177,7 +2216,7 @@ impl ReachabilityService {
                 input.audience = Some((
                     AddressAudience {
                         audience: facts.audience,
-                        network_range: Some(range.to_string()),
+                        network_range: Some(range),
                         private_node_id: Some(worker.id),
                         private_listener: Some(ip.to_string()),
                         private_via: None,
@@ -4752,8 +4791,43 @@ fn set_address_audience_on(
 }
 
 /// A worker in private mode as its last report describes it.
+/// How plans and statuses name the control plane serving a private address.
+pub const CONTROL_PLANE_PRIVATE_NAME: &str = "this machine";
+
+/// The CLI form of the control plane's consent (ADR-114 D2).
+pub const CONTROL_PLANE_PRIVATE_COMMAND: &str =
+    "bunx @temps-sdk/cli ingress private --listen <this machine's private address, or tailscale>";
+
+/// Node 0 as a private worker (ADR-114 D6), from the consent and row 0.
+/// `None` without consent. With consent and no row yet, the loop has not
+/// applied it, or none runs in this process.
+pub fn control_plane_private_fact(
+    consent: Option<&temps_config::private_ingress::PrivateIngressConsent>,
+    row: Option<&node_public_ingress::Model>,
+) -> Option<PrivateWorkerFact> {
+    consent?;
+    let id = temps_core::CONTROL_PLANE_NODE_ID;
+    Some(match row {
+        Some(row) => private_worker_fact(id, CONTROL_PLANE_PRIVATE_NAME, row),
+        None => PrivateWorkerFact {
+            id,
+            name: CONTROL_PLANE_PRIVATE_NAME.to_string(),
+            listener: None,
+            tailscale: false,
+            admit: None,
+            error: Some(
+                "this machine has not applied the consent yet; it does within 15 seconds. If \
+                 it stays like this, the proxy runs in another process (`temps serve --role \
+                 console`), which cannot serve private addresses."
+                    .to_string(),
+            ),
+        },
+    })
+}
+
 pub fn private_worker_fact(
-    worker: &nodes::Model,
+    id: i32,
+    name: &str,
     row: &node_public_ingress::Model,
 ) -> PrivateWorkerFact {
     let listener = temps_routes::route_sync::private_listener_of(Some(row));
@@ -4776,8 +4850,8 @@ pub fn private_worker_fact(
             })
         });
     PrivateWorkerFact {
-        id: worker.id,
-        name: worker.name.clone(),
+        id,
+        name: name.to_string(),
         listener,
         tailscale: listener.is_some_and(|ip| {
             interfaces
@@ -4785,6 +4859,7 @@ pub fn private_worker_fact(
                 .any(|i| i.tailscale && parse_reported_ip(&i.address) == Some(ip))
         }),
         error,
+        admit: temps_routes::route_sync::private_admit_of(Some(row)),
     }
 }
 
@@ -4798,9 +4873,13 @@ pub fn private_facts_of(
     row: Option<&node_public_ingress::Model>,
     now: chrono::DateTime<Utc>,
 ) -> PrivateFacts {
-    let worker = node
-        .map(|n| n.name.clone())
-        .unwrap_or_else(|| format!("node {node_id}"));
+    let control_plane = node_id == temps_core::CONTROL_PLANE_NODE_ID;
+    let worker = if control_plane {
+        CONTROL_PLANE_PRIVATE_NAME.to_string()
+    } else {
+        node.map(|n| n.name.clone())
+            .unwrap_or_else(|| format!("node {node_id}"))
+    };
     let recorded = binding
         .listener
         .as_deref()
@@ -4812,7 +4891,14 @@ pub fn private_facts_of(
         .filter(|e| !e.trim().is_empty())
         .map(str::to_string);
     let bound = match (node, row) {
-        (None, _) => Err(format!("{worker} is no longer part of this cluster.")),
+        // ADR-114 D6: the control plane has no `nodes` row; its row 0 is
+        // there only while the operator lets it serve private addresses.
+        (_, None) if control_plane => Err(format!(
+            "This machine no longer serves private addresses. Serve them again from this \
+             address's reachability plan in the console, or with \
+             `{CONTROL_PLANE_PRIVATE_COMMAND}`."
+        )),
+        (None, _) if !control_plane => Err(format!("{worker} is no longer part of this cluster.")),
         (Some(n), _) if n.status != "active" => Err(format!(
             "{worker} is {}. Bring it back, or make the address reachable on another worker.",
             n.status

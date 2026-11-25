@@ -12879,6 +12879,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "if-addrs",
  "include_dir",
  "indicatif",
  "ipnet",
@@ -13128,6 +13129,7 @@ dependencies = [
 name = "temps-config-handlers"
 version = "0.1.0-beta.63"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
  "hex",
@@ -13710,6 +13712,7 @@ dependencies = [
  "axum",
  "chrono",
  "http 1.5.0",
+ "rand 0.10.3",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
@@ -14246,6 +14249,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "sysinfo",
  "temps-authz",
  "temps-config",
  "temps-core",

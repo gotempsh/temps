@@ -2850,6 +2850,15 @@ async fn link_service_to_project(
             .await?
     };
 
+    crate::services::validate_env_aliases(id, request.project_id, &request.env_aliases).map_err(
+        |error| {
+            bad_request()
+                .title("Invalid Variable Aliases")
+                .detail(error.to_string())
+                .build()
+        },
+    )?;
+
     match app_state
         .external_service_manager
         .link_service_to_project_with_provisioning(
@@ -2864,6 +2873,21 @@ async fn link_service_to_project(
         .await
     {
         Ok(info) => {
+            if !request.env_aliases.is_empty() {
+                app_state
+                    .external_service_manager
+                    .set_link_env_aliases(id, request.project_id, &request.env_aliases)
+                    .await
+                    .map_err(|error| {
+                        error!(service_id = id, project_id = request.project_id, %error, "failed to store variable aliases on a new link");
+                        internal_server_error()
+                            .detail(format!(
+                                "Service {id} was linked to project {}, but its variable aliases were not stored: {error}. Link it again to retry.",
+                                request.project_id
+                            ))
+                            .build()
+                    })?;
+            }
             let service_name = app_state
                 .external_service_manager
                 .get_service(id)
@@ -2881,6 +2905,7 @@ async fn link_service_to_project(
                 project_id: request.project_id,
                 database_provisioning_mode: info.database_provisioning_mode,
                 custom_database_name: info.custom_database_name.clone(),
+                env_aliases: request.env_aliases.clone(),
             };
             if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
                 error!(service_id = id, project_id = request.project_id, error = %error, "failed to audit service link");
@@ -4368,6 +4393,7 @@ mod tests {
             id: 1,
             database_provisioning_mode: "project_environment".to_string(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             project_id: 99,
             service_id: 17,
             created_at: now,
@@ -4429,6 +4455,7 @@ mod tests {
                 project_id: 7,
                 database_provisioning_mode: Default::default(),
                 custom_database_name: None,
+                env_aliases: Default::default(),
             }),
         )
         .await;
@@ -4488,6 +4515,7 @@ mod tests {
             id: 1,
             database_provisioning_mode: "project_environment".to_string(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             // `NarrowedServiceAccessChecker` grants only read in project 99.
             project_id: 99,
             service_id: 17,
@@ -5425,6 +5453,7 @@ mod tests {
             id: 1,
             database_provisioning_mode: "project_environment".to_string(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             project_id: 99,
             service_id: 17,
             created_at: now,

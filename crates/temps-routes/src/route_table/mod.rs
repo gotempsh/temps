@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 
 mod load;
 mod pinned_upstream;
+mod private_view;
 pub use pinned_upstream::{PinnedUpstream, UpstreamAddresses, REFRESH_INTERVAL};
 
 /// Look up the address a container's node publishes its ports on (see
@@ -1604,6 +1605,12 @@ pub struct CachedPeerTable {
     /// `temps proxy`) rather than read from the environment here — this crate
     /// does not parse configuration.
     traefik_discovery_network: RwLock<Option<String>>,
+
+    /// The control plane's private view (ADR-114 D3): a table holding only
+    /// the private addresses node `0` serves on its listener, republished
+    /// from every snapshot this table stores. Created on first use, so an
+    /// install that never serves a private address pays nothing.
+    private_view: std::sync::OnceLock<Arc<CachedPeerTable>>,
 }
 
 impl CachedPeerTable {
@@ -1732,6 +1739,7 @@ impl CachedPeerTable {
             // Off until the bootstrap says otherwise: label discovery is
             // opt-in, so the safe default is "adopt nothing".
             traefik_discovery_network: RwLock::new(None),
+            private_view: std::sync::OnceLock::new(),
         }
     }
 

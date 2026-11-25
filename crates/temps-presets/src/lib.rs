@@ -35,6 +35,10 @@ pub use mod_rs::env_example::{
     EnvExampleVariable, ENV_EXAMPLE_FILE_NAMES,
 };
 pub use mod_rs::registry_prefix::apply_registry_prefix;
+pub use mod_rs::service_needs::{
+    can_generate, env_aliases, kind_from_image, looks_secret, provided_by, suggest_services,
+    DatabaseKind, RepoFile, SuggestedService, MANIFEST_FILES,
+};
 pub use {
     all_presets, detect_all_presets_from_files, detect_node_framework,
     detect_node_framework_from_package_json, detect_preset_from_files, get_preset_by_slug,

@@ -819,6 +819,7 @@ mod tests {
             service_id,
             database_provisioning_mode: "project_environment".to_string(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             created_at: now,
             updated_at: now,
         }

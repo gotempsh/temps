@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use temps_core::problemdetails::Problem;
 use temps_core::UtcDateTime;
 use temps_entities::source_type::SourceType;
+use temps_environments::services::generated_value::{resolve_create_value, GenerateValueRequest};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize)]
@@ -342,6 +344,8 @@ pub struct ProjectSettingsUpdate {
 /// existed keep working unchanged:
 ///
 /// * object — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+/// * object asking the server for a value —
+///   `{"key": "SESSION_SECRET", "generate": {"kind": "secret"}}`
 /// * legacy tuple — `["API_KEY", "sk-..."]` (implies `is_secret: false`)
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateProjectEnvVar {
@@ -362,9 +366,12 @@ impl<'de> Deserialize<'de> for CreateProjectEnvVar {
         enum Repr {
             Object {
                 key: String,
-                value: String,
+                #[serde(default)]
+                value: Option<String>,
                 #[serde(default)]
                 is_secret: bool,
+                #[serde(default)]
+                generate: Option<GenerateValueRequest>,
             },
             Tuple(String, String),
         }
@@ -374,11 +381,25 @@ impl<'de> Deserialize<'de> for CreateProjectEnvVar {
                 key,
                 value,
                 is_secret,
-            } => CreateProjectEnvVar {
-                key,
-                value,
-                is_secret,
-            },
+                generate,
+            } => {
+                // A value is required unless the server is asked to make one.
+                if value.is_none() && generate.is_none() {
+                    return Err(serde::de::Error::custom(format!(
+                        "environment variable '{key}' needs a value or 'generate'"
+                    )));
+                }
+                // A generated secret is made here, on the server, so it never
+                // passes through the client; it is always stored as a secret.
+                let (value, is_secret) =
+                    resolve_create_value(&key, value.unwrap_or_default(), is_secret, generate)
+                        .map_err(serde::de::Error::custom)?;
+                CreateProjectEnvVar {
+                    key,
+                    value,
+                    is_secret,
+                }
+            }
             Repr::Tuple(key, value) => CreateProjectEnvVar {
                 key,
                 value,
@@ -415,6 +436,11 @@ pub struct CreateProjectRequest {
     pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: bool,
     pub storage_service_ids: Vec<i32>,
+    /// Variable aliases to set on each storage link, by service id: app name
+    /// → injected name (`{"DATABASE_URL": "POSTGRES_URL"}`). Set before the
+    /// first deployment is queued.
+    #[serde(default)]
+    pub storage_service_env_aliases: BTreeMap<i32, BTreeMap<String, String>>,
     /// Services whose authorization relied on their one-time creator claim.
     /// Internal only: handlers populate this after access checks.
     #[serde(default)]
@@ -763,6 +789,34 @@ mod tests {
 
         assert!(!parsed[0].is_secret);
         assert!(parsed[1].is_secret);
+    }
+
+    #[test]
+    fn create_project_env_var_generates_a_secret_on_request() {
+        let parsed: Vec<CreateProjectEnvVar> = serde_json::from_str(
+            r#"[{"key":"SESSION_SECRET","generate":{"kind":"secret"}},
+                {"key":"SHORT","generate":{"kind":"secret","bytes":16}}]"#,
+        )
+        .expect("generate is accepted without a value");
+        assert_eq!(parsed[0].key, "SESSION_SECRET");
+        assert_eq!(parsed[0].value.len(), 64);
+        assert!(parsed[0].value.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert!(parsed[0].is_secret, "a generated value is always secret");
+        assert_eq!(parsed[1].value.len(), 32);
+    }
+
+    #[test]
+    fn create_project_env_var_refuses_a_value_with_generate_or_a_bad_size() {
+        let both = serde_json::from_str::<CreateProjectEnvVar>(
+            r#"{"key":"K","value":"typed","generate":{"kind":"secret"}}"#,
+        )
+        .unwrap_err();
+        assert!(both.to_string().contains("not both"), "{both}");
+        let size = serde_json::from_str::<CreateProjectEnvVar>(
+            r#"{"key":"K","generate":{"kind":"secret","bytes":8}}"#,
+        )
+        .unwrap_err();
+        assert!(size.to_string().contains("not 8"), "{size}");
     }
 
     #[test]

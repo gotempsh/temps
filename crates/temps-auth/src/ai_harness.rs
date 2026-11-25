@@ -11,6 +11,11 @@
 //! used. Deriving the state here, from the key rows themselves, lets the
 //! console recognise that path instead of waiting forever on a key nothing
 //! will ever send.
+//!
+//! The welcome step never creates the dedicated key: it hands the agent a
+//! prompt that runs `temps login`, or the Claude app an extension with an MCP
+//! key ([`MCP_CLIENT_KEY_PREFIX`]). Without a dedicated key, the most recently
+//! used of those agent credentials is what proves an agent connected.
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -24,6 +29,10 @@ pub const AI_HARNESS_KEY_NAME: &str = "Temps AI harness";
 /// Name prefix of keys minted by the CLI's browser device-login flow
 /// (`temps login` without `--api-key`).
 pub const CLI_DEVICE_KEY_PREFIX: &str = "cli-device:";
+
+/// Name prefix of keys minted for an MCP client: by `temps mcp add`
+/// (`mcp-<client>-<date>`) and by the console for the Claude app extension.
+pub const MCP_CLIENT_KEY_PREFIX: &str = "mcp-";
 
 /// Console route where the harness connection is set up.
 pub const AI_HARNESS_SETUP_PATH: &str = "/setup/ai";
@@ -48,9 +57,38 @@ pub enum AiHarnessState {
 pub enum AiHarnessCredentialKind {
     /// The dedicated key the onboarding page created.
     DedicatedKey,
-    /// A key minted by a browser-approved `temps login` after the dedicated
-    /// key was created.
+    /// A key minted by a browser-approved `temps login`.
     CliLogin,
+    /// A key minted for an MCP client (`temps mcp add`, the Claude app
+    /// extension).
+    McpClient,
+}
+
+/// Which agent credential a key is, by the name its minting flow gives it.
+/// `None` for every other key: a key someone created by hand proves nothing.
+pub fn agent_credential_kind(name: &str) -> Option<AiHarnessCredentialKind> {
+    if name.starts_with(CLI_DEVICE_KEY_PREFIX) {
+        Some(AiHarnessCredentialKind::CliLogin)
+    } else if name.starts_with(MCP_CLIENT_KEY_PREFIX) {
+        Some(AiHarnessCredentialKind::McpClient)
+    } else {
+        None
+    }
+}
+
+/// The kind and last use of `candidate` when it is an agent credential that
+/// has authenticated a request: active, account-wide (an agent operating
+/// Temps is not confined to one project), minted by an agent flow, and used.
+fn used_agent_credential(
+    candidate: &api_keys::Model,
+) -> Option<(AiHarnessCredentialKind, UtcDateTime)> {
+    if !candidate.is_active || candidate.project_id.is_some() {
+        return None;
+    }
+    Some((
+        agent_credential_kind(&candidate.name)?,
+        candidate.last_used_at?,
+    ))
 }
 
 /// The credential that authenticated the harness. Never carries the secret,
@@ -81,22 +119,47 @@ pub struct AiHarnessStatusResponse {
     pub setup_path: Option<String>,
 }
 
-/// Derive the harness status from the dedicated key and, when the dedicated
-/// key has not been used, the most recently used device-login key created
-/// after it (see [`crate::apikey_service::ApiKeyService::ai_harness_status`]
-/// for the query that selects it).
+/// Derive the harness status from the dedicated key and an agent credential
+/// (a device-login or MCP-client key; see
+/// [`crate::apikey_service::ApiKeyService::ai_harness_status`] for the query
+/// that selects it).
+///
+/// With a dedicated key, only an agent credential created after it counts,
+/// so a login from before the setup started cannot finish it. Without one,
+/// the agent credential most recently used counts: the welcome step connects
+/// agents that way and never creates the dedicated key.
 pub fn derive_ai_harness_status(
     harness_key: Option<&api_keys::Model>,
-    cli_login_key: Option<&api_keys::Model>,
+    agent_key: Option<&api_keys::Model>,
 ) -> AiHarnessStatusResponse {
     let Some(key) = harness_key else {
+        // The caller selects the row for one user; there is no dedicated key
+        // here to compare its owner against.
+        if let Some((agent, (kind, last_used_at))) = agent_key
+            .and_then(|agent| used_agent_credential(agent).map(|used| (agent, used)))
+        {
+            return AiHarnessStatusResponse {
+                status: AiHarnessState::Connected,
+                key_id: None,
+                key_created_at: None,
+                connected_via: Some(AiHarnessCredential {
+                    id: agent.id,
+                    name: agent.name.clone(),
+                    key_prefix: agent.key_prefix.clone(),
+                    kind,
+                    last_used_at,
+                }),
+                reason: None,
+                setup_path: None,
+            };
+        }
         return AiHarnessStatusResponse {
             status: AiHarnessState::Missing,
             key_id: None,
             key_created_at: None,
             connected_via: None,
             reason: Some(format!(
-                "No '{AI_HARNESS_KEY_NAME}' API key exists yet; create one to connect a harness"
+                "No agent has logged in yet, and no '{AI_HARNESS_KEY_NAME}' API key exists"
             )),
             setup_path: Some(AI_HARNESS_SETUP_PATH.to_string()),
         };
@@ -149,15 +212,11 @@ pub fn derive_ai_harness_status(
 
     // The caller selects this row; re-check the invariants here so a broader
     // query can never turn an unrelated or earlier credential into proof.
-    if let Some(cli) = cli_login_key.filter(|cli| {
-        cli.user_id == key.user_id
-            && cli.is_active
-            && cli.project_id.is_none()
-            && cli.name.starts_with(CLI_DEVICE_KEY_PREFIX)
-            && cli.created_at >= key.created_at
-    }) {
-        if let Some(last_used_at) = cli.last_used_at {
-            return connected(cli, AiHarnessCredentialKind::CliLogin, last_used_at);
+    if let Some(agent) =
+        agent_key.filter(|agent| agent.user_id == key.user_id && agent.created_at >= key.created_at)
+    {
+        if let Some((kind, last_used_at)) = used_agent_credential(agent) {
+            return connected(agent, kind, last_used_at);
         }
     }
 
@@ -217,6 +276,83 @@ mod tests {
         assert_eq!(status.status, AiHarnessState::Missing);
         assert_eq!(status.key_id, None);
         assert_eq!(status.setup_path.as_deref(), Some(AI_HARNESS_SETUP_PATH));
+    }
+
+    /// The welcome step connects agents with `temps login` or an MCP key and
+    /// never creates the dedicated key.
+    #[test]
+    fn without_a_dedicated_key_a_used_agent_credential_is_connected() {
+        let mut login = key(2, "cli-device:laptop-1767225600");
+        login.last_used_at = Some(login.created_at);
+        let mut mcp = key(3, "mcp-claude-app-2026-11-25T10-00-00Z");
+        mcp.role_type = "reader".to_string();
+        mcp.last_used_at = Some(mcp.created_at);
+
+        for (agent, kind) in [
+            (login, AiHarnessCredentialKind::CliLogin),
+            (mcp, AiHarnessCredentialKind::McpClient),
+        ] {
+            let status = derive_ai_harness_status(None, Some(&agent));
+            assert_eq!(status.status, AiHarnessState::Connected, "{}", agent.name);
+            let via = status.connected_via.expect("connected names its credential");
+            assert_eq!(via.kind, kind);
+            assert_eq!(via.id, agent.id);
+            assert_eq!(status.key_id, None);
+            assert_eq!(status.reason, None);
+        }
+    }
+
+    #[test]
+    fn without_a_dedicated_key_unused_revoked_scoped_or_manual_keys_are_missing() {
+        let unused = key(2, "mcp-claude-app-2026-11-25T10-00-00Z");
+
+        let mut revoked = key(3, "cli-device:laptop-1");
+        revoked.last_used_at = Some(revoked.created_at);
+        revoked.is_active = false;
+
+        let mut scoped = key(4, "mcp-cursor-2026-11-25");
+        scoped.last_used_at = Some(scoped.created_at);
+        scoped.project_id = Some(4);
+
+        let mut manual = key(5, "ci deploy key");
+        manual.last_used_at = Some(manual.created_at);
+
+        for candidate in [unused, revoked, scoped, manual] {
+            let status = derive_ai_harness_status(None, Some(&candidate));
+            assert_eq!(
+                status.status,
+                AiHarnessState::Missing,
+                "{} must not mark an agent connected",
+                candidate.name
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_client_key_used_after_the_dedicated_key_counts_as_connected() {
+        let key = harness();
+        let mut mcp = cli_login_after(&key);
+        mcp.name = "mcp-claude-app-2026-11-25T10-00-00Z".to_string();
+        let status = derive_ai_harness_status(Some(&key), Some(&mcp));
+        assert_eq!(status.status, AiHarnessState::Connected);
+        assert_eq!(
+            status.connected_via.map(|via| via.kind),
+            Some(AiHarnessCredentialKind::McpClient)
+        );
+    }
+
+    #[test]
+    fn agent_credential_kind_follows_the_minting_flow_prefix() {
+        assert_eq!(
+            agent_credential_kind("cli-device:laptop-1"),
+            Some(AiHarnessCredentialKind::CliLogin)
+        );
+        assert_eq!(
+            agent_credential_kind("mcp-claude-desktop-2026-11-25"),
+            Some(AiHarnessCredentialKind::McpClient)
+        );
+        assert_eq!(agent_credential_kind(AI_HARNESS_KEY_NAME), None);
+        assert_eq!(agent_credential_kind("my mcp key"), None);
     }
 
     #[test]

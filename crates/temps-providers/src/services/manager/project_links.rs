@@ -644,6 +644,7 @@ mod tests {
                 service_id: 71,
                 database_provisioning_mode: mode.as_str().to_string(),
                 custom_database_name: name.clone(),
+                env_aliases: serde_json::json!({}),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             };
@@ -751,6 +752,7 @@ mod tests {
                 service_id: 17,
                 database_provisioning_mode: "project_environment".to_string(),
                 custom_database_name: None,
+                env_aliases: serde_json::json!({}),
                 created_at: now,
                 updated_at: now,
             },
@@ -760,6 +762,7 @@ mod tests {
                 service_id: 17,
                 database_provisioning_mode: "project_environment".to_string(),
                 custom_database_name: None,
+                env_aliases: serde_json::json!({}),
                 created_at: now,
                 updated_at: now,
             },

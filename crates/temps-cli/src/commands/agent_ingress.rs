@@ -54,6 +54,11 @@ pub struct PrivateArgs {
     /// Service), only its own, never Funnel. The agent must run as root.
     #[arg(long)]
     pub tailscale_serve: bool,
+    /// Who may connect: a private range such as 10.8.0.0/24, repeatable.
+    /// Default: the subnet of the interface `--listen` is on (Tailscale's
+    /// ranges on Tailscale). A range over a container network is refused.
+    #[arg(long, value_name = "CIDR")]
+    pub admit: Vec<String>,
     #[command(flatten)]
     pub target: Target,
 }
@@ -95,7 +100,7 @@ impl AgentIngressCommand {
             Self::Fixed(args) => (&args.target, fixed(args)?),
             Self::Private(args) => (
                 &args.target,
-                private(args.listen.as_deref(), args.tailscale_serve)?,
+                private(args.listen.as_deref(), &args.admit, args.tailscale_serve)?,
             ),
         };
         let path = config_path(target)?;
@@ -163,6 +168,7 @@ fn fixed(args: &FixedArgs) -> anyhow::Result<LocalIngress> {
         http_port: args.http_port,
         https_port: args.https_port,
         tailscale_serve: false,
+        admit: Vec::new(),
     })
 }
 
@@ -182,12 +188,19 @@ fn running_as_root() -> bool {
 /// `--listen` for private ingress: `tailscale`, or a private address, and
 /// `--tailscale-serve`, which may stand alone (ADR 065 D2). Used by `temps
 /// join --ingress private` too, so both refuse the same things.
-pub(crate) fn private(listen: Option<&str>, tailscale_serve: bool) -> anyhow::Result<LocalIngress> {
+pub(crate) fn private(
+    listen: Option<&str>,
+    admit: &[String],
+    tailscale_serve: bool,
+) -> anyhow::Result<LocalIngress> {
+    let ranges = temps_core::private_network::parse_admits(admit)
+        .map_err(|why| anyhow::anyhow!("--admit {why}"))?;
     let mut ingress = LocalIngress {
         mode: IngressMode::Private,
         http_port: PRIVATE_HTTP_PORT,
         https_port: PRIVATE_HTTPS_PORT,
         tailscale_serve,
+        admit: ranges.iter().map(ToString::to_string).collect(),
         ..LocalIngress::default()
     };
     match listen.unwrap_or_default().trim() {
@@ -236,7 +249,7 @@ fn describe(ingress: &LocalIngress) -> String {
                 (None, Some(ip)) => Some(ip.to_string()),
                 (None, None) => None,
             };
-            match (listener, ingress.tailscale_serve) {
+            let described = match (listener, ingress.tailscale_serve) {
                 (Some(listener), false) => format!(
                     "private on {listener} port 443 (80 redirects to it); serves only private \
                      addresses"
@@ -250,6 +263,12 @@ fn describe(ingress: &LocalIngress) -> String {
                         .to_string()
                 }
                 (None, false) => "private on no address".to_string(),
+            };
+            // ADR-114 D8: who may connect, when the owner named it.
+            if ingress.admit.is_empty() {
+                described
+            } else {
+                format!("{described}; admits {} only", ingress.admit.join(", "))
             }
         }
     }
@@ -355,7 +374,7 @@ mod tests {
 
     #[test]
     fn private_takes_tailscale_or_a_private_address_only() {
-        let private = |listen: &str| super::private(Some(listen), false);
+        let private = |listen: &str| super::private(Some(listen), &[], false);
         let tailscale = private("tailscale").unwrap();
         assert_eq!(tailscale.mode, IngressMode::Private);
         assert_eq!(tailscale.interface.as_deref(), Some("tailscale0"));
@@ -376,7 +395,7 @@ mod tests {
     // never set without being asked for.
     #[test]
     fn tailscale_serve_is_consent_saved_in_agent_json() {
-        let serve_only = private(None, true).unwrap();
+        let serve_only = private(None, &[], true).unwrap();
         assert_eq!(serve_only.mode, IngressMode::Private);
         assert!(serve_only.tailscale_serve);
         assert_eq!(
@@ -384,21 +403,48 @@ mod tests {
             (None, None)
         );
         assert!(describe(&serve_only).contains("Tailscale Serve only"));
-        let both = private(Some("tailscale"), true).unwrap();
+        let both = private(Some("tailscale"), &[], true).unwrap();
         assert!(both.tailscale_serve);
         assert_eq!(both.interface.as_deref(), Some("tailscale0"));
-        assert!(private(None, false).is_err());
+        assert!(private(None, &[], false).is_err());
 
         let saved = serde_json::to_value(&both).unwrap();
         assert_eq!(saved["tailscale_serve"], serde_json::json!(true));
         // Without consent the field is not written at all, so agent.json is
         // unchanged for every install that never opts in (ADR 065 D11).
-        let without = serde_json::to_value(private(Some("tailscale"), false).unwrap()).unwrap();
+        let without =
+            serde_json::to_value(private(Some("tailscale"), &[], false).unwrap()).unwrap();
         assert!(without.get("tailscale_serve").is_none());
         let old: LocalIngress = serde_json::from_value(
             serde_json::json!({"mode": "private", "interface": "tailscale0"}),
         )
         .unwrap();
         assert!(!old.tailscale_serve);
+    }
+
+    #[test]
+    fn admit_names_who_may_connect_and_only_private_ranges() {
+        let wg = private(Some("10.8.0.1"), &["10.8.0.7/24".to_string()], false).unwrap();
+        assert_eq!(wg.admit, ["10.8.0.0/24"]);
+        let saved = serde_json::to_value(&wg).unwrap();
+        assert_eq!(saved["admit"], serde_json::json!(["10.8.0.0/24"]));
+        // Default: the interface's own network, nothing saved.
+        let default = private(Some("10.8.0.1"), &[], false).unwrap();
+        assert!(serde_json::to_value(&default)
+            .unwrap()
+            .get("admit")
+            .is_none());
+        let error = private(Some("10.8.0.1"), &["0.0.0.0/0".to_string()], false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("--admit 0.0.0.0/0 is not a private range"),
+            "{error}"
+        );
+        assert!(
+            describe(&wg).ends_with("; admits 10.8.0.0/24 only"),
+            "{}",
+            describe(&wg)
+        );
     }
 }

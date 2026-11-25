@@ -13,6 +13,7 @@
 
 pub mod cloudflare;
 pub mod control_plane;
+pub mod control_plane_private;
 pub mod error;
 pub mod handlers;
 pub mod plugin;

@@ -1102,7 +1102,6 @@ impl TempsPlugin for AgentsPlugin {
             let executor = Arc::new(AgentExecutor::new(
                 db.clone(),
                 git_provider_manager.clone(),
-                encryption_service.clone(),
                 queue.clone(),
                 run_service.clone(),
                 config_service.clone(),
@@ -1229,6 +1228,16 @@ impl TempsPlugin for AgentsPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let executor = context.require_service::<AgentExecutor>();
+
+            // ADR-115 D1: agent turns go through the AI gateway.
+            if let Some(ai) = context.get_service::<dyn temps_ai::AiService>() {
+                executor.attach_ai_service(ai).await;
+            } else {
+                tracing::warn!(
+                    "Agents plugin: the AI gateway is not available; agent runs will fail \
+                     saying no AI provider is configured"
+                );
+            }
 
             if let Some(memory_provider) = context.get_service::<dyn WorkflowMemoryProvider>() {
                 executor.attach_memory_provider(memory_provider).await;

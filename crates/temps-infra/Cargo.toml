@@ -29,6 +29,7 @@ if-addrs = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }
 hickory-resolver = { workspace = true }
+sysinfo = { workspace = true }
 
 # Plugin system dependencies
 temps-core = { path = "../temps-core" }

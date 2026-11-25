@@ -20,6 +20,15 @@ pub(super) fn initial_deployment_config(
     }
 }
 
+/// The storage services a new project links, as the create request gives them.
+struct StorageLinks {
+    service_ids: Vec<i32>,
+    /// Per service, the variable names to expose under another name.
+    env_aliases: BTreeMap<i32, BTreeMap<String, String>>,
+    claim_ids: Vec<i32>,
+    claim_user_id: Option<i32>,
+}
+
 impl ProjectService {
     pub async fn create_project(
         &self,
@@ -476,9 +485,12 @@ impl ProjectService {
             .finalize_project_creation(
                 &project_found_db,
                 request.environment_variables,
-                request.storage_service_ids,
-                request.storage_service_claim_ids,
-                request.storage_service_claim_user_id,
+                StorageLinks {
+                    service_ids: request.storage_service_ids,
+                    env_aliases: request.storage_service_env_aliases,
+                    claim_ids: request.storage_service_claim_ids,
+                    claim_user_id: request.storage_service_claim_user_id,
+                },
                 delivery_profile_id,
             )
             .await
@@ -935,11 +947,24 @@ impl ProjectService {
         &self,
         project: &projects::Model,
         environment_variables: Option<Vec<CreateProjectEnvVar>>,
-        storage_service_ids: Vec<i32>,
-        storage_service_claim_ids: Vec<i32>,
-        storage_service_claim_user_id: Option<i32>,
+        storage: StorageLinks,
         delivery_profile_id: Option<i32>,
     ) -> Result<temps_entities::environments::Model, ProjectError> {
+        let StorageLinks {
+            service_ids: storage_service_ids,
+            env_aliases: storage_service_env_aliases,
+            claim_ids: storage_service_claim_ids,
+            claim_user_id: storage_service_claim_user_id,
+        } = storage;
+        if let Some(service_id) = storage_service_env_aliases
+            .keys()
+            .find(|id| !storage_service_ids.contains(id))
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Variable aliases were sent for service {service_id}, which project {} does not link",
+                project.id
+            )));
+        }
         let project_config = project.deployment_config.as_ref();
         let default_environment = self
             .environment_service
@@ -1018,6 +1043,21 @@ impl ProjectService {
                     service_ids: storage_service_ids,
                     reason: e.to_string(),
                 })?;
+            // Aliases are stored before the first deployment is queued, so it
+            // already sees DATABASE_URL for POSTGRES_URL.
+            for (service_id, aliases) in &storage_service_env_aliases {
+                if aliases.is_empty() {
+                    continue;
+                }
+                self.external_service_manager
+                    .set_link_env_aliases(*service_id, project.id, aliases)
+                    .await
+                    .map_err(|e| ProjectError::StorageLinksFailed {
+                        project_id: project.id,
+                        service_ids: vec![*service_id],
+                        reason: format!("storing variable aliases: {e}"),
+                    })?;
+            }
         }
 
         if let Some(profile_id) = delivery_profile_id {

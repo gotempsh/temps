@@ -13,6 +13,9 @@
 //!    (`X-Temps-Demo-Mode`, identity headers, the status-host tag).
 //!    Workflow executor paths are then refused before hostname routing,
 //!    wake, cache or upstream operations.
+//!    On the control plane's consented private address (ADR-114 D3), the
+//!    private path answers next: outside the range, an unknown host and
+//!    plain HTTP never reach a later stage.
 //! 2. Status-page hostname: answered here and nowhere else. A connection
 //!    negotiated for such a hostname cannot carry any other host (421).
 //! 3. Sandbox preview hostname. The public ingress hostname is never one.
@@ -62,6 +65,7 @@ mod inbound;
 mod order_tests;
 mod password_wall;
 mod path_route;
+pub(crate) mod private_ingress;
 mod project;
 mod redirects;
 mod static_content;
@@ -103,6 +107,11 @@ impl LoadBalancer {
     ) -> Result<Flow> {
         stage!(self.read_request_facts(session, ctx));
         Self::strip_inbound_trust_headers(session);
+
+        // ADR-114 D3: a connection on the control plane's private address is
+        // answered from node 0's private routes only, before anything else
+        // can match its host against the public maps.
+        stage!(self.private_ingress_stage(session, ctx));
 
         // No caller-supplied header or IP grants access to executor routes.
         // Orchestrator requests use direct replica endpoints instead.

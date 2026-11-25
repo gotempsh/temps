@@ -80,6 +80,7 @@ mod edge_rules;
 mod markdown;
 mod policy;
 mod request_filter;
+pub use request_filter::private_ingress::PrivateIngressPath;
 mod security_headers;
 mod static_serving;
 mod timeouts;
@@ -445,6 +446,10 @@ pub struct ProxyContext {
     /// The host is a signed-in address (ADR 065 D8): the app's response may
     /// not set the gate's cookies or pass for the gate.
     pub gated_host: bool,
+    /// Node `0`'s private route for this request, when it arrived on the
+    /// consented private address (ADR-114 D3). The request then goes to this
+    /// route and nowhere else: never the console.
+    pub private_route: Option<temps_routes::RouteInfo>,
     /// Who the gate admitted, for a signed-in address.
     pub gate_identity: Option<temps_core::gate::GateClaims>,
     /// What Shield's lists and signals say about the request (ADR 066 D1),
@@ -610,6 +615,9 @@ pub struct LoadBalancer {
     /// The signed-in gate (ADR 065 D8). `None` only in test harnesses that
     /// never serve a signed-in address; `setup_proxy_server` always sets it.
     gate: Option<Arc<crate::handler::gate::ProxyGate>>,
+    /// The control plane's private path (ADR-114 D3). `None` outside
+    /// `temps serve`: nothing is ever served privately here then.
+    private_ingress: Option<Arc<PrivateIngressPath>>,
 }
 
 /// Status recorded in proxy logs when the client disconnected before a
@@ -844,6 +852,7 @@ impl LoadBalancer {
             upstream_failures: Default::default(),
             console_unavailable: None,
             gate: None,
+            private_ingress: None,
         }
     }
 
@@ -1020,6 +1029,13 @@ impl LoadBalancer {
         origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
     ) -> Self {
         self.tunnel_origin = origin;
+        self
+    }
+
+    /// Serve node `0`'s private addresses on the consented private address
+    /// (ADR-114 D3).
+    pub fn with_private_ingress(mut self, path: Option<Arc<PrivateIngressPath>>) -> Self {
+        self.private_ingress = path;
         self
     }
 
@@ -3742,6 +3758,7 @@ impl ProxyHttp for LoadBalancer {
             preview_gateway_port: None,
             path_route: None,
             gated_host: false,
+            private_route: None,
             gate_identity: None,
             shield: None,
             shield_header: None,
@@ -4480,6 +4497,12 @@ impl ProxyHttp for LoadBalancer {
             }
             crate::services::peer_for_selection(
                 target.select_backend_avoiding(&ctx.failed_upstreams),
+            )?
+        } else if let Some(route) = ctx.private_route.as_ref() {
+            // ADR-114 D3: the private route admitted in `request_filter`, and
+            // nothing else; no fallback to the console.
+            crate::services::peer_for_selection(
+                route.select_backend_avoiding(&ctx.failed_upstreams),
             )?
         } else {
             // Use the upstream resolver trait

@@ -46,6 +46,8 @@ pub struct RepositoryEnvExampleDomain {
     /// Path of the detected env-example file, `None` if the repository has none.
     pub path: Option<String>,
     pub variables: Vec<EnvExampleVariableDomain>,
+    /// Databases the repository appears to need, strongest first.
+    pub suggested_services: Vec<temps_presets::SuggestedService>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

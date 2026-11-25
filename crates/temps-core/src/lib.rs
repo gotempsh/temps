@@ -53,6 +53,8 @@ pub mod openapi;
 pub mod payload_blobs;
 pub mod plugin;
 pub mod plugin_builder;
+pub mod private_ingress;
+pub mod private_network;
 pub mod problemdetails;
 pub mod project_access;
 pub mod project_deletion;

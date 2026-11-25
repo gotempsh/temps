@@ -2175,3 +2175,130 @@ async fn workflow_executor_block_precedes_gate_wake_and_routing() {
     }
     assert_eq!(lifecycle.starts.load(Ordering::SeqCst), 0);
 }
+
+const PRIVATE_HOST: &str = "internal.example.test";
+
+/// A proxy serving node 0's private addresses on `serving`, whose private
+/// view holds `PRIVATE_HOST` bounded by `range`. The public table routes
+/// `HOST` as usual.
+fn with_private_ingress(
+    f: Fixture,
+    serving: Option<temps_core::private_ingress::PrivateIngressServing>,
+    range: &str,
+) -> LoadBalancer {
+    f.route_host(|_, _| {});
+    f.routes.insert_private_route_for_test(
+        PRIVATE_HOST,
+        temps_routes::PrivateRoute {
+            route: route_for(OTHER_ENVIRONMENT, |_, _| {}),
+            address: temps_routes::PrivateAddress {
+                address_id: format!("environment:{OTHER_ENVIRONMENT}"),
+                range: Some(range.to_string()),
+                node_id: Some(temps_core::CONTROL_PLANE_NODE_ID),
+                listener: Some("127.0.0.1".into()),
+                via: Some("listener".into()),
+                principals: None,
+            },
+        },
+    );
+    let runtime = temps_core::private_ingress::ControlPlanePrivateIngress::new();
+    runtime.set_serving(serving);
+    f.lb.with_private_ingress(Some(Arc::new(crate::proxy::PrivateIngressPath::new(
+        runtime,
+        f.routes.private_view(),
+    ))))
+}
+
+/// Loopback stands in for the Tailscale address: the test socket's local
+/// address and peer are both 127.0.0.1.
+fn loopback_serving(range: &'static str) -> temps_core::private_ingress::PrivateIngressServing {
+    temps_core::private_ingress::PrivateIngressServing {
+        address: "127.0.0.1".parse().unwrap(),
+        admit: vec![range.parse().unwrap()],
+    }
+}
+
+/// ADR-114 D3: on the private address, plain HTTP for a private host only
+/// redirects to HTTPS, as on a worker's private listener.
+#[tokio::test]
+async fn a_private_host_on_the_private_address_is_redirected_to_https() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lb = with_private_ingress(
+        fixture(),
+        Some(loopback_serving("127.0.0.0/8")),
+        "127.0.0.0/8",
+    );
+    let reply = send_on_socket(&lb, &listener, &get_on(PRIVATE_HOST, "/a?b=1"), CLEAN_IP).await;
+    reply.assert_answered("private_https_redirect", "308");
+    assert!(
+        reply
+            .head
+            .to_ascii_lowercase()
+            .contains(&format!("location: https://{PRIVATE_HOST}/a?b=1")),
+        "{}",
+        reply.head
+    );
+}
+
+/// ADR-114 D3: a public host is unknown on the private address. It is never
+/// matched against the public maps there, and never falls through to the
+/// console.
+#[tokio::test]
+async fn a_public_host_on_the_private_address_has_no_route() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lb = with_private_ingress(
+        fixture(),
+        Some(loopback_serving("127.0.0.0/8")),
+        "127.0.0.0/8",
+    );
+    let reply = send_on_socket(&lb, &listener, &get("/"), CLEAN_IP).await;
+    reply.assert_answered("private_no_route", "404");
+    assert!(reply
+        .head
+        .to_ascii_lowercase()
+        .contains("x-temps-private-ingress: no-route"));
+}
+
+/// ADR-114 D3: a TCP peer outside the listener's range is refused, whatever
+/// host it asks for; so is one outside the address's own range.
+#[tokio::test]
+async fn a_peer_outside_the_range_is_refused_on_the_private_address() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // The listener's block is not loopback: the peer is outside it.
+    let lb = with_private_ingress(
+        fixture(),
+        Some(loopback_serving("10.0.0.0/8")),
+        "127.0.0.0/8",
+    );
+    let reply = send_on_socket(&lb, &listener, &get_on(PRIVATE_HOST, "/"), CLEAN_IP).await;
+    reply.assert_answered("private_outside_range", "403");
+    assert!(reply
+        .head
+        .to_ascii_lowercase()
+        .contains("x-temps-private-ingress: outside-range"));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lb = with_private_ingress(
+        fixture(),
+        Some(loopback_serving("127.0.0.0/8")),
+        "10.0.0.0/8",
+    );
+    send_on_socket(&lb, &listener, &get_on(PRIVATE_HOST, "/"), CLEAN_IP)
+        .await
+        .assert_answered("private_outside_range", "403");
+}
+
+/// Without consent nothing changes: the public host is routed as before,
+/// and the private host is still unknown to the public maps.
+#[tokio::test]
+async fn without_a_served_private_address_the_public_path_is_unchanged() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lb = with_private_ingress(fixture(), None, "127.0.0.0/8");
+    send_on_socket(&lb, &listener, &get("/"), CLEAN_IP)
+        .await
+        .assert_forwarded("routed");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let reply = send_on_socket(&lb, &listener, &get_on(PRIVATE_HOST, "/"), CLEAN_IP).await;
+    assert_ne!(reply.status(), "routed", "{}", reply.head);
+    assert!(reply.ctx.private_route.is_none());
+}

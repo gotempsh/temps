@@ -16,6 +16,10 @@ pub struct Model {
     pub service_id: i32,
     pub database_provisioning_mode: String,
     pub custom_database_name: Option<String>,
+    /// App variable name → the name the service injects
+    /// (`{"DATABASE_URL": "POSTGRES_URL"}`); the link injects both.
+    #[sea_orm(column_type = "JsonBinary")]
+    pub env_aliases: Json,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

@@ -76,6 +76,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         profile,
         startup_state,
         control_plane_tunnels,
+        control_plane_private_ingress,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -109,6 +110,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // Initialize plugin manager
     let mut plugin_manager = PluginManager::new();
+    // ADR-114: the consent endpoint wakes the control plane's private
+    // ingress when one runs beside this console.
+    if let Some(private_ingress) = control_plane_private_ingress {
+        plugin_manager
+            .service_context()
+            .register_service(private_ingress);
+    }
 
     let core_handles = register_core_services(
         plugin_manager.service_context(),

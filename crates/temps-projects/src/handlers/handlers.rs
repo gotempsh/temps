@@ -1150,6 +1150,7 @@ pub async fn create_project(
         automatic_deploy: project.hosting == temps_entities::types::Hosting::Hosted
             && project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids,
+        storage_service_env_aliases: project.storage_service_env_aliases,
         storage_service_claim_ids,
         storage_service_claim_user_id: Some(auth.user_id()),
         is_public_repo: project.is_public_repo,
@@ -1511,6 +1512,7 @@ pub async fn update_project(
         environment_variables: project.environment_variables.clone(),
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids.clone(),
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: Vec::new(),
         storage_service_claim_user_id: None,
         is_public_repo: None,               // Keep existing setting

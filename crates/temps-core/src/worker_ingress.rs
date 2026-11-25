@@ -205,6 +205,11 @@ pub struct LocalIngress {
     /// whois. Without it the agent never opens tailscaled's socket.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tailscale_serve: bool,
+    /// `private` only: who counts as inside (ADR-114 D8), private ranges
+    /// such as `10.8.0.0/24`. Empty admits the listen interface's subnet,
+    /// or Tailscale's ranges on Tailscale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admit: Vec<String>,
 }
 
 fn default_http_port() -> u16 {
@@ -224,6 +229,7 @@ impl Default for LocalIngress {
             http_port: 80,
             https_port: 443,
             tailscale_serve: false,
+            admit: Vec::new(),
         }
     }
 }
@@ -268,6 +274,11 @@ pub struct ListenerReport {
     /// An agent that predates the field reports none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// `private` mode: the ranges the listener admits (ADR-114 D8), such as
+    /// `10.8.0.0/24`. Empty from agents that predate it, whose addresses
+    /// keep the listener's private block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admit: Vec<String>,
 }
 
 /// The port a private listener serves HTTPS on, always (ADR 064 D5): a
@@ -331,18 +342,21 @@ pub fn check_private_listen(ip: IpAddr) -> Result<&'static str, String> {
     })
 }
 
-/// Whether `ip` is inside `range` (`100.64.0.0/10`, or a bare address).
-/// `false` when the range does not parse, so a broken range admits nobody.
+/// Whether `ip` is inside `range`: one range (`100.64.0.0/10`, or a bare
+/// address) or several separated by commas (`10.8.0.0/24,fd00:1::/64`,
+/// ADR-114 D8). A part that does not parse admits nobody.
 pub fn ip_in_range(ip: IpAddr, range: &str) -> bool {
     let ip = match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         v4 => v4,
     };
-    let range = range.trim();
-    if let Ok(net) = range.parse::<ipnet::IpNet>() {
-        return net.contains(&ip);
-    }
-    range.parse::<IpAddr>().is_ok_and(|single| single == ip)
+    range.split(',').any(|part| {
+        let part = part.trim();
+        if let Ok(net) = part.parse::<ipnet::IpNet>() {
+            return net.contains(&ip);
+        }
+        part.parse::<IpAddr>().is_ok_and(|single| single == ip)
+    })
 }
 
 /// The id a private address goes by between the control plane and the
@@ -471,6 +485,10 @@ mod private_tests {
         assert!(ip_in_range(ip("::ffff:100.90.1.2"), "100.64.0.0/10"));
         assert!(ip_in_range(ip("192.168.1.8"), "192.168.1.8"));
         assert!(!ip_in_range(ip("192.168.1.8"), "not a range"));
+        // ADR-114 D8: a node admits several ranges.
+        assert!(ip_in_range(ip("10.8.0.9"), "10.8.0.0/24, fd00:1::/64"));
+        assert!(ip_in_range(ip("fd00:1::9"), "10.8.0.0/24,fd00:1::/64"));
+        assert!(!ip_in_range(ip("10.9.0.9"), "10.8.0.0/24,fd00:1::/64"));
     }
 
     #[test]
