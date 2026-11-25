@@ -9,7 +9,7 @@
 //! on the command line.
 //!
 //! The control plane names the binary, but the agent decides whether to run
-//! it: only artifacts in [`TRUSTED_ARTIFACTS`], compiled into this agent, are
+//! it: only artifacts in [`trusted_artifacts`], compiled into this agent, are
 //! ever downloaded or executed. A compromised or impersonated control plane
 //! can choose among them, not hand the host an arbitrary program.
 
@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use temps_connector_pins::PinnedBinary;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -36,39 +37,19 @@ use super::{
 /// How long a connector may take to report ready before it counts as degraded.
 const STARTUP_GRACE: Duration = Duration::from_secs(45);
 
-/// A connector build this agent agrees to run.
-struct TrustedArtifact {
-    os: &'static str,
-    arch: &'static str,
-    url: &'static str,
-    sha256: &'static str,
+/// Every connector binary this agent will run: the pins in
+/// `temps-connector-pins`, compiled into this agent. The control plane hands
+/// out the same list, so the two cannot drift; moving to a new release means
+/// shipping an agent that trusts it.
+fn trusted_artifacts() -> impl Iterator<Item = &'static PinnedBinary> {
+    temps_connector_pins::binaries()
 }
 
-/// Every connector binary this agent will run: the control plane's pins
-/// (`temps-ingress/src/cloudflare.rs`), duplicated here because the agent
-/// does not depend on control-plane crates. A test keeps the two in step;
-/// moving the control plane to a new release means shipping an agent that
-/// trusts it.
-const TRUSTED_ARTIFACTS: &[TrustedArtifact] = &[
-    TrustedArtifact {
-        os: "linux",
-        arch: "x86_64",
-        url: "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-linux-amd64",
-        sha256: "3bfc539f45d2620c71debb7a86be0efa737ed5ccbad9eb85c787116900e5c586",
-    },
-    TrustedArtifact {
-        os: "linux",
-        arch: "aarch64",
-        url: "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-linux-arm64",
-        sha256: "2c65dfabf616c40efc7545d107d7a57ad5e21377e2964b7e88af19a238074a46",
-    },
-];
-
-/// Refuse any artifact not pinned in [`TRUSTED_ARTIFACTS`], matched on
+/// Refuse any artifact not pinned in [`trusted_artifacts`], matched on
 /// platform, exact URL and checksum together.
 fn ensure_trusted(artifact: &Artifact) -> Result<(), String> {
     let sha256 = artifact.sha256.to_ascii_lowercase();
-    let trusted = TRUSTED_ARTIFACTS.iter().any(|t| {
+    let trusted = trusted_artifacts().any(|t| {
         t.os == artifact.os
             && t.arch == artifact.arch
             && t.url == artifact.url
@@ -542,7 +523,7 @@ mod tests {
 
     #[test]
     fn only_pinned_artifacts_are_trusted() {
-        let pinned = &TRUSTED_ARTIFACTS[0];
+        let pinned = &temps_connector_pins::cloudflared::BINARIES[0];
         assert!(ensure_trusted(&cloudflared(pinned.arch, pinned.url, pinned.sha256)).is_ok());
         assert!(
             ensure_trusted(&cloudflared(
@@ -576,46 +557,23 @@ mod tests {
         assert!(ensure_trusted(&cloudflared(other_arch, pinned.url, pinned.sha256)).is_err());
     }
 
+    /// The control plane hands out what `temps-connector-pins` pins; the
+    /// agent must trust exactly those, or delegated workers refuse every
+    /// tunnel.
     #[test]
-    fn every_trusted_artifact_is_https() {
-        for artifact in TRUSTED_ARTIFACTS {
-            assert!(artifact.url.starts_with("https://"), "{}", artifact.url);
-        }
-    }
-
-    /// The control plane hands out what it pins in `temps-ingress`; the agent
-    /// must trust exactly those, or delegated workers refuse every tunnel.
-    #[test]
-    fn trusted_artifacts_match_the_control_plane_pins() {
-        let source = include_str!("../../../temps-ingress/src/cloudflare.rs");
-        let constant = |name: &str| -> String {
-            let at = source
-                .find(&format!("const {name}: &str ="))
-                .unwrap_or_else(|| panic!("{name} missing"));
-            let rest = &source[at..];
-            let open = rest.find('"').unwrap() + 1;
-            let close = open + rest[open..].find('"').unwrap();
-            rest[open..close].to_string()
-        };
-        let version = constant("CLOUDFLARED_VERSION");
-        let release =
-            format!("https://github.com/cloudflare/cloudflared/releases/download/{version}");
-        for (arch, file, sha) in [
-            (
-                "x86_64",
-                "cloudflared-linux-amd64",
-                constant("CLOUDFLARED_AMD64_SHA256"),
-            ),
-            (
-                "aarch64",
-                "cloudflared-linux-arm64",
-                constant("CLOUDFLARED_ARM64_SHA256"),
-            ),
-        ] {
-            let url = format!("{release}/{file}");
+    fn every_pinned_binary_is_trusted() {
+        for pin in temps_connector_pins::binaries() {
             assert!(
-                ensure_trusted(&cloudflared(arch, &url, &sha)).is_ok(),
-                "the control plane pins {url} ({sha}) but this agent does not trust it"
+                ensure_trusted(&Artifact {
+                    os: pin.os.into(),
+                    arch: pin.arch.into(),
+                    url: pin.url.into(),
+                    sha256: pin.sha256.into(),
+                })
+                .is_ok(),
+                "the control plane pins {} ({}) but this agent does not trust it",
+                pin.url,
+                pin.sha256
             );
         }
     }

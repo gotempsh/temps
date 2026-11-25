@@ -81,6 +81,7 @@ LAYERS: dict[str, str] = {
     "libsqlite3-sys": "library",
     "temps-captcha-wasm": "library",
     "temps-cloud-protocol": "library",
+    "temps-connector-pins": "library",
     "temps-credential-checks": "library",
     "temps-docker-util": "library",
     "temps-file-store": "library",

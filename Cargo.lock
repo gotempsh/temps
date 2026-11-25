@@ -13151,6 +13151,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-connector-pins"
+version = "0.1.0-beta.63"
+
+[[package]]
 name = "temps-core"
 version = "0.1.0-beta.63"
 dependencies = [
@@ -14278,6 +14282,7 @@ dependencies = [
  "sha2 0.11.1",
  "temps-auth",
  "temps-config",
+ "temps-connector-pins",
  "temps-core",
  "temps-dns",
  "temps-domains",
@@ -14629,6 +14634,7 @@ dependencies = [
  "tempfile",
  "temps-agent-core",
  "temps-authz",
+ "temps-connector-pins",
  "temps-core",
  "temps-deployer",
  "temps-docker-capture",
