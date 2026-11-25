@@ -77,7 +77,8 @@ test('opening the card never looks inside the workspace; Check workspace does', 
     </QueryClientProvider>
   )
 
-  const check = await view.findByRole('button', { name: 'Check workspace' })
+  await view.findByText(/Not checked yet/)
+  const check = view.getByRole('button', { name: 'Check workspace' })
   const reads = requests.filter((url) =>
     url.pathname.endsWith('/harness-update')
   )
@@ -86,7 +87,8 @@ test('opening the card never looks inside the workspace; Check workspace does', 
     expect(url.searchParams.get('cached_only')).toBe('true')
     expect(url.searchParams.get('refresh')).toBeNull()
   }
-  expect(view.getByText(/Not checked yet/)).toBeTruthy()
+  // Never read: there is nothing to update yet.
+  expect(view.queryByRole('button', { name: 'Update' })).toBeNull()
 
   fireEvent.click(check)
   await waitFor(() => expect(view.getByText('Up to date')).toBeTruthy())
@@ -97,4 +99,53 @@ test('opening the card never looks inside the workspace; Check workspace does', 
         url.searchParams.get('refresh') === 'true'
     )
   ).toBe(true)
+})
+
+test('a workspace read earlier can be checked again and a downgrade found', async () => {
+  // The cache says 1.1.0 (current), but the workspace was since recreated
+  // from an image with 1.0.0.
+  const cachedCurrent = {
+    ...notChecked,
+    installed_version: '1.1.0',
+    latest_version: '1.1.0',
+    checked_at: '2026-11-24T10:05:00Z',
+  }
+  client.setConfig({
+    baseUrl: 'http://temps.test',
+    fetch: (async (input: Request) => {
+      const url = new URL(input.url)
+      if (url.pathname.endsWith('/harness-update')) {
+        return json(
+          url.searchParams.get('refresh') === 'true'
+            ? {
+                ...cachedCurrent,
+                installed_version: '1.0.0',
+                update_available: true,
+                checked_at: '2026-11-25T09:00:00Z',
+              }
+            : cachedCurrent
+        )
+      }
+      return json(overview)
+    }) as typeof fetch,
+  })
+  const queries = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = render(
+    <QueryClientProvider client={queries}>
+      <CodingAgentsCard />
+    </QueryClientProvider>
+  )
+
+  await waitFor(() => expect(view.getByText('Up to date')).toBeTruthy())
+  expect(view.getByText(/^Checked/)).toBeTruthy()
+  const update = view.getByRole('button', { name: 'Update' })
+  expect(update.hasAttribute('disabled')).toBe(true)
+
+  fireEvent.click(view.getByRole('button', { name: 'Check workspace' }))
+  await waitFor(() => expect(view.getByText('1.1.0 available')).toBeTruthy())
+  expect(
+    view.getByRole('button', { name: 'Update' }).hasAttribute('disabled')
+  ).toBe(false)
 })

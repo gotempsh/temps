@@ -248,10 +248,13 @@ export interface Outcome {
 
 /**
  * What to tell the operator after Update returned. The installer exiting
- * zero is not enough: the version the workspace reports afterwards decides.
+ * zero is not enough: the version the workspace reports afterwards decides,
+ * compared with the newest release known from the workspace's own lookup or
+ * the registry check (the workspace lookup can fail, e.g. without npm).
  */
 export function updateOutcome(
   name: string,
+  release: AgentReleaseLike,
   status: WorkspaceHarnessLike
 ): Outcome {
   const installed = status.installed_version ?? null
@@ -263,12 +266,17 @@ export function updateOutcome(
       }`,
     }
   }
-  if (status.update_available) {
+  const state = agentVersionState(release, status)
+  if (state.kind === 'behind') {
     return {
       level: 'warning',
-      message: `${name} still reports ${installed}${
-        status.latest_version ? ` (latest ${status.latest_version})` : ''
-      }; another copy may come first on PATH`,
+      message: `${name} still reports ${installed} (latest ${state.latest}); another copy may come first on PATH`,
+    }
+  }
+  if (state.kind !== 'current') {
+    return {
+      level: 'warning',
+      message: `${name} now reports ${installed}, but the latest release could not be looked up to confirm it is current`,
     }
   }
   return { level: 'success', message: `${name} updated to ${installed}` }

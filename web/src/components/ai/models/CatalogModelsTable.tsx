@@ -139,8 +139,14 @@ export function CatalogModelsTable() {
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   // A refresh can shrink the catalog under the page being shown: go to the
   // last page that exists instead of an empty one with no pager. Adjusted
-  // during render, so the empty page is never painted.
-  const reachablePage = entries.data ? clampPage(page, total, PAGE_SIZE) : page
+  // during render, so the empty page is never painted. Only against a total
+  // read for this very page and not being re-read: another page's placeholder
+  // or this page's cached answer from before a refresh may be out of date.
+  const totalIsCurrent =
+    entries.isSuccess && !entries.isPlaceholderData && !entries.isFetching
+  const reachablePage = totalIsCurrent
+    ? clampPage(page, total, PAGE_SIZE)
+    : page
   if (reachablePage !== page) setPage(reachablePage)
 
   return (

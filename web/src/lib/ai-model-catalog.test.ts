@@ -298,16 +298,18 @@ describe('agentVersionState before the workspace was read', () => {
 })
 
 describe('updateOutcome', () => {
+  const release = { latest_version: '1.1.0', checked_at: null, error: null }
+
   it('is a success only when the workspace reports the new version', () => {
     expect(
-      updateOutcome('Codex', {
+      updateOutcome('Codex', release, {
         installed_version: '1.1.0',
         latest_version: '1.1.0',
         update_available: false,
         updating: false,
       })
     ).toEqual({ level: 'success', message: 'Codex updated to 1.1.0' })
-    const stillBehind = updateOutcome('Codex', {
+    const stillBehind = updateOutcome('Codex', release, {
       installed_version: '1.0.0',
       latest_version: '1.1.0',
       update_available: true,
@@ -315,7 +317,7 @@ describe('updateOutcome', () => {
     })
     expect(stillBehind.level).toBe('warning')
     expect(stillBehind.message).toContain('still reports 1.0.0')
-    const unreadable = updateOutcome('Codex', {
+    const unreadable = updateOutcome('Codex', release, {
       installed_version: null,
       latest_version: '1.1.0',
       update_available: false,
@@ -325,6 +327,46 @@ describe('updateOutcome', () => {
     expect(unreadable.level).toBe('warning')
     expect(unreadable.message).toContain('could not be read')
     expect(unreadable.message).not.toContain('latest release')
+  })
+
+  it('checks against the registry release when the workspace lookup failed', () => {
+    // A home install without npm: the updater exited zero, the workspace
+    // could not look up the latest release, and the CLI is still old.
+    const stale = updateOutcome('Codex', release, {
+      installed_version: '1.0.0',
+      latest_version: null,
+      update_available: false,
+      updating: false,
+      detail: 'the latest version could not be looked up (exit 127)',
+    })
+    expect(stale).toEqual({
+      level: 'warning',
+      message:
+        'Codex still reports 1.0.0 (latest 1.1.0); another copy may come first on PATH',
+    })
+    expect(
+      updateOutcome('Codex', release, {
+        installed_version: '1.1.0',
+        latest_version: null,
+        update_available: false,
+        updating: false,
+      })
+    ).toEqual({ level: 'success', message: 'Codex updated to 1.1.0' })
+  })
+
+  it('never claims success when no latest release is known at all', () => {
+    const unconfirmed = updateOutcome(
+      'Codex',
+      { latest_version: null, error: 'the registry did not answer' },
+      {
+        installed_version: '1.0.0',
+        latest_version: null,
+        update_available: false,
+        updating: false,
+      }
+    )
+    expect(unconfirmed.level).toBe('warning')
+    expect(unconfirmed.message).toContain('could not be looked up to confirm')
   })
 })
 

@@ -21,6 +21,7 @@ import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
+import { TimeAgo } from '@/components/utils/TimeAgo'
 import {
   Table,
   TableBody,
@@ -257,7 +258,7 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
     },
     onSuccess: (status) => {
       queryClient.setQueryData(workspaceKey, status)
-      announce(updateOutcome(agent.name, status))
+      announce(updateOutcome(agent.name, agent, status))
     },
     onError: (error) =>
       toast.error(problemMessage(error, `${agent.name} could not be updated`)),
@@ -289,7 +290,14 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
         {workspace.isPending ? (
           <Skeleton className="h-4 w-20" />
         ) : (
-          <VersionState state={state} />
+          <>
+            <VersionState state={state} />
+            {workspace.data?.checked_at && state.kind !== 'updating' ? (
+              <div className="text-xs text-muted-foreground">
+                Checked <TimeAgo date={workspace.data.checked_at} />
+              </div>
+            ) : null}
+          </>
         )}
       </TableCell>
       <TableCell className="hidden align-top @xl:table-cell">
@@ -301,11 +309,14 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
         ) : null}
       </TableCell>
       <TableCell className="text-right align-top">
-        {state.kind === 'unchecked' ? (
+        <div className="flex flex-wrap justify-end gap-2">
+          {/* Always offered: the last read can go stale (a workspace
+              recreated from an older image), and only a fresh read finds
+              out. */}
           <Button
             size="sm"
             variant="outline"
-            disabled={inspect.isPending}
+            disabled={inspect.isPending || state.kind === 'updating'}
             onClick={() => inspect.mutate()}
           >
             {inspect.isPending ? (
@@ -313,24 +324,26 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
             ) : null}
             Check workspace
           </Button>
-        ) : (
-          <Button
-            size="sm"
-            variant={state.kind === 'behind' ? 'default' : 'outline'}
-            disabled={
-              update.isPending ||
-              state.kind === 'updating' ||
-              state.kind === 'current' ||
-              workspace.isPending
-            }
-            onClick={() => update.mutate()}
-          >
-            {update.isPending || state.kind === 'updating' ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : null}
-            Update
-          </Button>
-        )}
+          {state.kind === 'unchecked' ? null : (
+            <Button
+              size="sm"
+              variant={state.kind === 'behind' ? 'default' : 'outline'}
+              disabled={
+                update.isPending ||
+                inspect.isPending ||
+                state.kind === 'updating' ||
+                state.kind === 'current' ||
+                workspace.isPending
+              }
+              onClick={() => update.mutate()}
+            >
+              {update.isPending || state.kind === 'updating' ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : null}
+              Update
+            </Button>
+          )}
+        </div>
       </TableCell>
     </TableRow>
   )
