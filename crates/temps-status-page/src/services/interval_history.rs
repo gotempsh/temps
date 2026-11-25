@@ -11,8 +11,8 @@
 //! `status_monitor_interval_changes`, and coverage credits each check with
 //! the interval in effect when it ran.
 
-use chrono::Utc;
-use sea_orm::{ConnectionTrait, DbErr, EntityTrait, Set};
+use chrono::{DateTime, Utc};
+use sea_orm::{ConnectionTrait, DbErr, EntityTrait, FromQueryResult, Set, Statement};
 use temps_entities::status_monitor_interval_changes;
 
 use super::types::normalize_check_interval_seconds;
@@ -49,6 +49,46 @@ pub(crate) async fn record_interval_change<C: ConnectionTrait>(
     .exec_without_returning(conn)
     .await?;
     Ok(true)
+}
+
+/// How many seconds before `start` coverage must read checks: the longest
+/// grace period of the current interval (`current_grace_secs`) and of every
+/// earlier interval whose checks could still vouch for `start`.
+///
+/// A check taken under an interval that ended at `changed_at` ran before
+/// then, so it vouches for nothing past `changed_at + grace`. Intervals that
+/// ended at least one grace period before `start` are left out: otherwise a
+/// single long interval, set once and reverted, would widen every later scan
+/// for good, back to the retention limit of `status_checks`.
+pub(crate) async fn coverage_lookback_secs<C: ConnectionTrait>(
+    conn: &C,
+    monitor_id: i32,
+    start: DateTime<Utc>,
+    current_grace_secs: f64,
+) -> Result<f64, DbErr> {
+    #[derive(FromQueryResult)]
+    struct Lookback {
+        secs: f64,
+    }
+
+    // The grace formula matches `coverage_grace_secs`; previous intervals
+    // are stored normalised.
+    let row = Lookback::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        r#"
+        SELECT GREATEST($3, COALESCE(MAX(grace_secs), 0))::float8 AS secs
+        FROM (
+            SELECT previous_interval_seconds::float8 * 2 + 60 AS grace_secs, changed_at
+            FROM status_monitor_interval_changes
+            WHERE monitor_id = $1
+        ) i
+        WHERE i.changed_at > $2 - make_interval(secs => i.grace_secs)
+        "#,
+        vec![monitor_id.into(), start.into(), current_grace_secs.into()],
+    ))
+    .one(conn)
+    .await?;
+    Ok(row.map_or(current_grace_secs, |r| r.secs))
 }
 
 #[cfg(test)]

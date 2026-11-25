@@ -1187,11 +1187,20 @@ impl MonitorService {
             monitored_secs: f64,
         }
 
+        // The lower bound reaches back the longest grace period of an
+        // interval whose checks can still cover `start`, so the check taken
+        // just before `start` covers the start of the window.
+        let lookback_secs = super::interval_history::coverage_lookback_secs(
+            self.db.as_ref(),
+            monitor.id,
+            start,
+            grace_secs,
+        )
+        .await?;
+
         // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
         // row (and a retired background-worker marker), which say nothing
-        // about whether the endpoint answered. The lower bound reaches back
-        // the longest grace period any interval of this monitor had, so the
-        // check taken just before `start` covers the start of the window.
+        // about whether the endpoint answered.
         //
         // `intervals` turns the recorded changes into disjoint spans
         // `[valid_from, valid_until)`, each with the interval that ran
@@ -1211,10 +1220,6 @@ impl MonitorService {
                 FROM status_monitor_interval_changes
                 WHERE monitor_id = $1
             ),
-            reach AS (
-                SELECT GREATEST($4, COALESCE(MAX(grace_secs), 0))::float8 AS secs
-                FROM intervals
-            ),
             checks AS (
                 SELECT
                     c.status,
@@ -1226,7 +1231,7 @@ impl MonitorService {
                   ON c.checked_at < i.valid_until
                  AND (i.valid_from IS NULL OR c.checked_at >= i.valid_from)
                 WHERE c.monitor_id = $1
-                  AND c.checked_at >= $2 - make_interval(secs => (SELECT secs FROM reach))
+                  AND c.checked_at >= $2 - make_interval(secs => $5)
                   AND c.checked_at < $3
                   AND c.status != 'unknown'
                   -- ADR 068: nobody could reach the environment, so nothing
@@ -1252,6 +1257,7 @@ impl MonitorService {
                 start.into(),
                 end.into(),
                 grace_secs.into(),
+                lookback_secs.into(),
             ],
         ))
         .one(self.db.as_ref())
@@ -3202,6 +3208,61 @@ mod tests {
         assert_eq!(status.monitored_seconds, 180 + 660 + 300);
         assert_eq!(status.downtime_seconds, 660);
         assert_eq!(status.unknown_seconds, 3_600 - (180 + 660 + 300));
+    }
+
+    /// The coverage scan reaches back only for intervals whose checks can
+    /// still cover the window. Taking the longest interval ever recorded let
+    /// a daily interval, set once and reverted, widen every later scan back
+    /// to the check retention limit.
+    #[tokio::test]
+    async fn an_interval_that_ended_long_ago_does_not_widen_the_coverage_scan() {
+        use super::super::interval_history::coverage_lookback_secs;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::days(30)).await;
+        let secs = chrono::Duration::seconds;
+        // The current interval is 60 s: a grace of 180 s.
+        let lookback = || coverage_lookback_secs(db.as_ref(), monitor_id, start, 180.0);
+        // (previous interval, when it ended, expected lookback afterwards)
+        let changes = [
+            // A daily interval that ended ten days ago.
+            (86_400, start - chrono::Duration::days(10), 180.0),
+            // An hourly one that ended exactly one grace (7,260 s) before
+            // `start`: its last check vouches for nothing past `start`.
+            (3_600, start - secs(7_260), 180.0),
+            // A 300 s one (grace 660 s) that ended ten minutes before `start`.
+            (300, start - secs(600), 660.0),
+        ];
+        for (previous, changed_at, expected) in changes {
+            temps_entities::status_monitor_interval_changes::ActiveModel {
+                monitor_id: Set(monitor_id),
+                previous_interval_seconds: Set(previous),
+                changed_at: Set(changed_at),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            assert_eq!(
+                lookback().await.unwrap(),
+                expected,
+                "after recording the end of a {previous}s interval"
+            );
+        }
+
+        // A check under the 300 s interval, 620 s before `start`, still
+        // vouches for the first 40 s of the window.
+        insert_check(&db, monitor_id, "operational", start - secs(620)).await;
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(status.monitored_seconds, 40);
+        assert_eq!(status.unknown_seconds, 3_560);
     }
 
     #[tokio::test]
