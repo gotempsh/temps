@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
 };
@@ -102,8 +102,10 @@ fn update_problem(provider_id: &str, error: &temps_ai::AiError) -> Problem {
         .with_detail(detail)
 }
 
-fn service(app_state: &AppState) -> Result<&Arc<dyn temps_ai::AiService>, Problem> {
-    app_state.ai_service.as_ref().ok_or_else(|| {
+fn service(
+    ai_service: Option<&Arc<dyn temps_ai::AiService>>,
+) -> Result<&Arc<dyn temps_ai::AiService>, Problem> {
+    ai_service.ok_or_else(|| {
         problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
             .with_title("Harness Update Unavailable")
             .with_detail("The AI harness service is not configured on this Temps instance.")
@@ -134,13 +136,24 @@ pub async fn get_ai_provider_harness_update(
     State(app_state): State<Arc<AppState>>,
     Path(provider_id): Path<String>,
     Query(query): Query<HarnessUpdateQuery>,
-) -> Result<impl IntoResponse, Problem> {
-    authorize(&auth, &provider_id)?;
-    let ai_service = service(&app_state)?;
-    let status = harness_status(ai_service.as_ref(), &provider_id, auth.user_id(), &query)
+) -> Result<Response, Problem> {
+    harness_status_response(&auth, app_state.ai_service.as_ref(), &provider_id, &query).await
+}
+
+/// The `GET` after authentication: authorized for the caller, then the
+/// caller's own workspace status, cached reads included.
+async fn harness_status_response(
+    auth: &temps_authz::AuthContext,
+    ai_service: Option<&Arc<dyn temps_ai::AiService>>,
+    provider_id: &str,
+    query: &HarnessUpdateQuery,
+) -> Result<Response, Problem> {
+    authorize(auth, provider_id)?;
+    let ai_service = service(ai_service)?;
+    let status = harness_status(ai_service.as_ref(), provider_id, auth.user_id(), query)
         .await
-        .map_err(|error| update_problem(&provider_id, &error))?;
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(status)))
+        .map_err(|error| update_problem(provider_id, &error))?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(status)).into_response())
 }
 
 /// The status the `GET` returns. `cached_only` never looks inside the
@@ -187,7 +200,7 @@ pub async fn update_ai_provider_harness(
     Path(provider_id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     authorize(&auth, &provider_id)?;
-    let ai_service = service(&app_state)?;
+    let ai_service = service(app_state.ai_service.as_ref())?;
     let before = ai_service
         .workspace_harness_update_status(&provider_id, auth.user_id(), false)
         .await
@@ -379,5 +392,155 @@ mod tests {
             update_problem("claude_cli", &failed).status_code,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    mod through_the_router {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request;
+        use temps_authz::{AuthContext, Role};
+        use tower::ServiceExt;
+
+        const PATH: &str = "/settings/ai-providers/codex_cli/harness-update?cached_only=true";
+
+        /// The `GET` route with the real `RequireAuth` extractor in front of
+        /// the handler body; the caller's identity arrives as the auth
+        /// middleware leaves it, in the request extensions.
+        fn router(ai_service: Option<Arc<RecordingAiService>>) -> Router {
+            let ai_service = ai_service.map(|service| service as Arc<dyn temps_ai::AiService>);
+            Router::new().route(
+                "/settings/ai-providers/{provider_id}/harness-update",
+                get(
+                    move |RequireAuth(auth): RequireAuth,
+                          Path(provider_id): Path<String>,
+                          Query(query): Query<HarnessUpdateQuery>| {
+                        let ai_service = ai_service.clone();
+                        async move {
+                            harness_status_response(
+                                &auth,
+                                ai_service.as_ref(),
+                                &provider_id,
+                                &query,
+                            )
+                            .await
+                        }
+                    },
+                ),
+            )
+        }
+
+        fn user(id: i32) -> temps_entities::users::Model {
+            let now = chrono::Utc::now();
+            temps_entities::users::Model {
+                id,
+                name: "Test User".to_string(),
+                email: format!("user{id}@example.test"),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: now,
+                updated_at: now,
+            }
+        }
+
+        async fn get_as(
+            service: &Arc<RecordingAiService>,
+            uri: &str,
+            auth: Option<AuthContext>,
+        ) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+            let mut request = Request::builder().uri(uri);
+            if let Some(auth) = auth {
+                request = request.extension(auth);
+            }
+            let response = router(Some(service.clone()))
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            (status, headers, serde_json::from_slice(&body).unwrap())
+        }
+
+        #[tokio::test]
+        async fn a_cached_read_without_a_session_is_401_and_reads_nothing() {
+            let service = Arc::new(RecordingAiService::default());
+            let (status, headers, body) = get_as(&service, PATH, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(headers[header::CONTENT_TYPE], "application/problem+json");
+            assert_eq!(body["title"], "Authentication Required");
+            assert!(service.calls.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_cached_read_without_the_permissions_is_403_and_reads_nothing() {
+            let service = Arc::new(RecordingAiService {
+                cached: Some(checked("1.1.0")),
+                ..Default::default()
+            });
+            for role in [Role::Reader, Role::User] {
+                let label = format!("{role:?}");
+                let (status, headers, body) = get_as(
+                    &service,
+                    PATH,
+                    Some(AuthContext::new_session(user(42), role)),
+                )
+                .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+                assert_eq!(headers[header::CONTENT_TYPE], "application/problem+json");
+                assert!(body["detail"].is_string(), "{body}");
+            }
+            assert!(
+                service.calls.lock().unwrap().is_empty(),
+                "a refused caller must not see any cached status"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_authorized_cached_read_returns_the_callers_own_status() {
+            let service = Arc::new(RecordingAiService {
+                cached: Some(checked("1.1.0")),
+                ..Default::default()
+            });
+            let (status, headers, body) = get_as(
+                &service,
+                PATH,
+                Some(AuthContext::new_session(user(42), Role::Admin)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+            assert_eq!(body["installed_version"], "1.1.0");
+            assert_eq!(body["checked_at"], "2026-11-25T09:00:00.000Z");
+            // The signed-in caller's workspace, read from the cache only.
+            assert_eq!(*service.calls.lock().unwrap(), vec!["cached user=42"]);
+        }
+
+        #[tokio::test]
+        async fn an_unknown_provider_is_a_404_problem() {
+            let service = Arc::new(RecordingAiService::default());
+            let (status, headers, body) = get_as(
+                &service,
+                "/settings/ai-providers/no_such_cli/harness-update?cached_only=true",
+                Some(AuthContext::new_session(user(42), Role::Admin)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(headers[header::CONTENT_TYPE], "application/problem+json");
+            assert_eq!(body["detail"], "Unknown AI provider 'no_such_cli'");
+            assert!(service.calls.lock().unwrap().is_empty());
+        }
     }
 }
