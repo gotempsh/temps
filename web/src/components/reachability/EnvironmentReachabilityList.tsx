@@ -267,6 +267,9 @@ function EnvironmentAddresses({
           <AddressRowSkeleton />
         </div>
       ) : (
+        // Empty only when both are known: with the domains unknown, one the
+        // check has not answered for yet could still be this environment's.
+        domainsKnown &&
         !reachability.isError && (
           <p className="text-sm text-muted-foreground">
             No address yet. Make it reachable gives it one.

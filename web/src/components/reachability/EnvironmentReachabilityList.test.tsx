@@ -259,6 +259,7 @@ test('domains still loading show a placeholder, not "No address yet"', async () 
         <EnvironmentReachabilityList
           projectId={7}
           projectSlug="example"
+          domains={domainsPending ? undefined : []}
           domainsPending={domainsPending}
         />
       </MemoryRouter>
@@ -277,5 +278,43 @@ test('domains still loading show a placeholder, not "No address yet"', async () 
   expect(view.container.querySelector('.animate-pulse')).not.toBeNull()
 
   view.rerender(list(false))
+  await view.findByText(/No address yet/)
+})
+
+test('domains that failed to load never make an environment read as empty', async () => {
+  const api = mockApi({
+    'GET /projects/7/environments': () =>
+      jsonResponse([{ id: 3, name: 'production', slug: 'production' }]),
+    'GET /projects/7/environments/3/reachability': () =>
+      jsonResponse({ state: 'unreachable', summary: '', addresses: [] }),
+    'GET /projects/7/environments/3/reachability/runs': () => jsonResponse([]),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  // No `domains`: their request failed, so they are unknown.
+  const list = (domains?: ReturnType<typeof domain>[]) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <EnvironmentReachabilityList
+          projectId={7}
+          projectSlug="example"
+          domains={domains as never}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const view = render(list())
+  await view.findByRole('link', { name: 'Make it reachable' })
+  await waitFor(() =>
+    expect(api.called('GET', '/projects/7/environments/3/reachability')).toBe(
+      true
+    )
+  )
+  await act(() => new Promise((resolve) => setTimeout(resolve, 50)))
+  expect(view.queryByText(/No address yet/)).toBeNull()
+
+  // Known to have none: now it is empty.
+  view.rerender(list([]))
   await view.findByText(/No address yet/)
 })
