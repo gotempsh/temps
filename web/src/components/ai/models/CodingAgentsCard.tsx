@@ -39,7 +39,7 @@ import {
 } from '@/lib/ai-model-catalog'
 import { extractProblemDetails } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2, RefreshCw } from 'lucide-react'
+import { Download, Loader2, RefreshCw, ScanSearch } from 'lucide-react'
 import { toast } from 'sonner'
 import { CODING_AGENTS_QUERY_KEY } from './query-keys'
 
@@ -229,7 +229,13 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
       query.state.data?.updating ? UPDATING_POLL_MS : false,
   })
 
+  // A cached read still in flight answers with what was known before this
+  // action; cancelled so it cannot overwrite the result written here.
+  const cancelPendingRead = () =>
+    queryClient.cancelQueries({ queryKey: workspaceKey })
+
   const inspect = useMutation({
+    onMutate: cancelPendingRead,
     mutationFn: async () => {
       const { data } = await getAiProviderHarnessUpdate({
         path: { provider_id: agent.provider_id },
@@ -249,6 +255,7 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
   })
 
   const update = useMutation({
+    onMutate: cancelPendingRead,
     mutationFn: async () => {
       const { data } = await updateAiProviderHarness({
         path: { provider_id: agent.provider_id },
@@ -321,8 +328,11 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
           >
             {inspect.isPending ? (
               <Loader2 className="size-4 animate-spin" />
-            ) : null}
-            Check workspace
+            ) : (
+              <ScanSearch className="size-4" />
+            )}
+            {/* Icon-only on a phone: two labelled buttons do not fit the row. */}
+            <span className="max-sm:sr-only">Check workspace</span>
           </Button>
           {state.kind === 'unchecked' ? null : (
             <Button
@@ -339,8 +349,10 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
             >
               {update.isPending || state.kind === 'updating' ? (
                 <Loader2 className="size-4 animate-spin" />
-              ) : null}
-              Update
+              ) : (
+                <Download className="size-4" />
+              )}
+              <span className="max-sm:sr-only">Update</span>
             </Button>
           )}
         </div>

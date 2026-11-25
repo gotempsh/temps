@@ -149,3 +149,46 @@ test('a workspace read earlier can be checked again and a downgrade found', asyn
     view.getByRole('button', { name: 'Update' }).hasAttribute('disabled')
   ).toBe(false)
 })
+
+test('a cached read still in flight cannot undo an explicit check', async () => {
+  let releaseCachedRead: (() => void) | undefined
+  client.setConfig({
+    baseUrl: 'http://temps.test',
+    fetch: (async (input: Request) => {
+      const url = new URL(input.url)
+      if (!url.pathname.endsWith('/harness-update')) return json(overview)
+      if (url.searchParams.get('refresh') === 'true') {
+        return json({
+          ...notChecked,
+          installed_version: '1.0.0',
+          latest_version: '1.1.0',
+          update_available: true,
+          checked_at: '2026-11-25T09:00:00Z',
+        })
+      }
+      // The page's cached read: answered only after the explicit check.
+      await new Promise<void>((resolve) => {
+        releaseCachedRead = resolve
+      })
+      return json(notChecked)
+    }) as typeof fetch,
+  })
+  const queries = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = render(
+    <QueryClientProvider client={queries}>
+      <CodingAgentsCard />
+    </QueryClientProvider>
+  )
+
+  const check = await view.findByRole('button', { name: 'Check workspace' })
+  await waitFor(() => expect(releaseCachedRead).toBeDefined())
+  fireEvent.click(check)
+  await waitFor(() => expect(view.getByText('1.1.0 available')).toBeTruthy())
+
+  releaseCachedRead?.()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(view.getByText('1.1.0 available')).toBeTruthy()
+  expect(view.queryByText(/Not checked yet/)).toBeNull()
+})
