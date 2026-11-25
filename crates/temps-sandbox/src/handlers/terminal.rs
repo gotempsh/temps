@@ -301,6 +301,15 @@ fn terminal_unavailable_hint(backend: temps_sandbox_providers::SandboxBackend) -
     }
 }
 
+/// Where a Docker sandbox's original environment can be read from inside
+/// it: the container's PID 1, started by Docker with exactly the
+/// environment Temps gave the container.
+const CONTAINER_ENVIRON: &str = "/proc/1/environ";
+
+/// Variables the shell keeps as the terminal agent set them (`TERM`,
+/// `PATH`, `HOME`) or maintains itself, never taken from PID 1.
+const KEEP_SHELL_VARS: &str = "TERM|PATH|HOME|PWD|OLDPWD|SHLVL|_";
+
 /// Wrap the requested program so the PTY is in a sane line discipline before
 /// it starts.
 ///
@@ -333,11 +342,32 @@ fn terminal_unavailable_hint(backend: temps_sandbox_providers::SandboxBackend) -
 /// program), and `npm start` never ran. Nesting in an inner `sh -c` hands the
 /// original string to a shell verbatim, so it parses exactly as the caller
 /// wrote it.
-fn wrap_with_sane_termios(cmd: &str) -> String {
-    // Single-quote the whole command and escape any embedded single quote by
-    // the standard `'\''` dance: close, emit an escaped quote, reopen.
+///
+/// # The container's environment
+///
+/// With `environ` (a Docker sandbox), the shell first exports the
+/// container's environment read from it.
+///
+/// The PTY agent inside sandbox images built before it learned to pass on
+/// its own environment starts every shell with only `TERM`, `PATH` and
+/// `HOME`. That drops `HTTP(S)_PROXY`/`NO_PROXY` (and their lowercase
+/// forms): on a managed sandbox network the only way out is that proxy, so
+/// `curl`, `git` and package managers fail with "could not resolve host",
+/// and the variables the sandbox owner set are lost too. The agent ships in
+/// the image, so the server cannot rely on it; it brings the environment in
+/// itself. With a current agent the values are already there and the
+/// import changes nothing.
+fn wrap_shell(cmd: &str, environ: Option<&str>) -> String {
     let quoted = cmd.replace('\'', r"'\''");
-    format!("stty sane 2>/dev/null; exec /bin/sh -c '{quoted}'")
+    let import = match environ {
+        Some(path) => format!(
+            "if [ -r {path} ]; then while IFS= read -r kv; do case \"${{kv%%=*}}\" in \
+             {KEEP_SHELL_VARS}|\"\"|*[!A-Za-z0-9_]*) ;; *) export \"$kv\" 2>/dev/null ;; esac; \
+             done <<TEMPS_ENVIRON\n$(tr '\\000' '\\n' < {path})\nTEMPS_ENVIRON\nfi; "
+        ),
+        None => String::new(),
+    };
+    format!("{import}stty sane 2>/dev/null; exec /bin/sh -c '{quoted}'")
 }
 
 /// Attach an interactive terminal to a sandbox.
@@ -439,7 +469,13 @@ pub async fn terminal(
 
     let service = state.sandbox_service.clone();
     let timeout_secs = row.timeout_secs;
-    let cmd = wrap_with_sane_termios(&params.cmd.unwrap_or_else(default_shell_cmd));
+    // A Docker sandbox's shell gets the container's environment even from
+    // an image whose terminal agent predates passing it on (see
+    // `wrap_shell`). A microVM's PID 1 is its guest init, not the sandbox's
+    // entrypoint, so nothing is imported there.
+    let environ = (handle.backend == temps_sandbox_providers::SandboxBackend::Docker)
+        .then_some(CONTAINER_ENVIRON);
+    let cmd = wrap_shell(&params.cmd.unwrap_or_else(default_shell_cmd), environ);
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
     // Take the working directory from the provider handle, not the DB row.
@@ -1031,13 +1067,83 @@ mod tests {
         // off; without this wrapper the user types blind on every one of
         // them, and rebuilding the image is not something they can do from
         // inside a shell that does not work.
-        let wrapped = wrap_with_sane_termios(&default_shell_cmd());
+        let wrapped = wrap_shell(&default_shell_cmd(), None);
         assert!(wrapped.starts_with("stty sane"), "{wrapped}");
         assert!(wrapped.contains("exec bash -l"), "{wrapped}");
         assert!(wrapped.contains("exec sh -l"), "{wrapped}");
         // The default has no single quotes, so wrapping it leaves the inner
         // command in one piece for the nested `sh -c`.
         assert_eq!(wrapped.matches('\'').count(), 2, "{wrapped}");
+    }
+
+    /// What the shell sees: `script` from [`wrap_shell`] importing `environ`,
+    /// run as an old agent runs it (only TERM, PATH, HOME set).
+    fn shell_env_after_import(environ: &[(&str, &str)]) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("environ");
+        let mut bytes = Vec::new();
+        for (key, value) in environ {
+            bytes.extend_from_slice(format!("{key}={value}").as_bytes());
+            bytes.push(0);
+        }
+        std::fs::write(&path, bytes).expect("write environ");
+        let script = wrap_shell("env", Some(path.to_str().expect("utf-8 path")));
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("TERM", "xterm-256color")
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/home/temps")
+            .output()
+            .expect("run the wrapped shell");
+        assert!(output.status.success(), "{script}: {output:?}");
+        String::from_utf8(output.stdout).expect("utf-8")
+    }
+
+    /// A shell from an old terminal agent gets the container's proxy and
+    /// owner variables, keeps the agent's TERM, PATH and HOME, and values
+    /// with spaces, quotes and `=` survive.
+    #[test]
+    fn the_shell_imports_the_container_environment() {
+        let env = shell_env_after_import(&[
+            ("HTTP_PROXY", "http://temps-sandbox-egress-proxy:3128"),
+            ("http_proxy", "http://temps-sandbox-egress-proxy:3128"),
+            ("https_proxy", "http://temps-sandbox-egress-proxy:3128"),
+            ("no_proxy", "localhost,127.0.0.1,::1"),
+            ("OWNER_SETTING", "a value with spaces, 'quotes' and = signs"),
+            ("PATH", "/minimal"),
+            ("HOME", "/"),
+            ("TERM", "linux"),
+        ]);
+        for expected in [
+            "http_proxy=http://temps-sandbox-egress-proxy:3128",
+            "https_proxy=http://temps-sandbox-egress-proxy:3128",
+            "HTTP_PROXY=http://temps-sandbox-egress-proxy:3128",
+            "no_proxy=localhost,127.0.0.1,::1",
+            "OWNER_SETTING=a value with spaces, 'quotes' and = signs",
+            "PATH=/usr/bin:/bin",
+            "HOME=/home/temps",
+            "TERM=xterm-256color",
+        ] {
+            assert!(
+                env.lines().any(|l| l == expected),
+                "missing {expected} in:\n{env}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_environ_still_gives_a_shell() {
+        let script = wrap_shell("echo ok", Some("/nonexistent/environ"));
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
     }
 
     /// Run `default_shell_cmd()` under `/bin/sh -c` with `PATH` restricted to
@@ -1080,7 +1186,7 @@ mod tests {
         // statement level bound the caller's operators to the *wrapper*:
         // `exec cd /app && npm start` ran `exec cd` (which fails — `cd` is a
         // builtin, not a program) and never reached `npm start`.
-        let wrapped = wrap_with_sane_termios("cd /app && npm start");
+        let wrapped = wrap_shell("cd /app && npm start", None);
         assert!(
             wrapped.contains("'cd /app && npm start'"),
             "the command must reach an inner shell intact: {wrapped}"
@@ -1095,7 +1201,7 @@ mod tests {
     fn wrapping_escapes_embedded_single_quotes() {
         // Otherwise a quote in the command closes our quoting early and the
         // rest is reinterpreted by the outer shell.
-        let wrapped = wrap_with_sane_termios("echo 'hi there'");
+        let wrapped = wrap_shell("echo 'hi there'", None);
         assert!(wrapped.contains(r"'\''hi there'\''"), "{wrapped}");
         // The wrapper's own quoting must still be balanced.
         assert_eq!(
@@ -1108,7 +1214,7 @@ mod tests {
     #[test]
     fn wrapping_preserves_a_custom_command_verbatim() {
         // `--cmd claude` must still start claude, arguments intact.
-        let wrapped = wrap_with_sane_termios("claude --resume");
+        let wrapped = wrap_shell("claude --resume", None);
         assert!(wrapped.ends_with("'claude --resume'"), "{wrapped}");
         // `exec` matters: the wrapper shell must be replaced, not left as a
         // parent, or signals and exit codes get an extra hop.
@@ -1120,7 +1226,7 @@ mod tests {
         // A minimal image with no `stty` must still get a shell, not a tab
         // that dies on the first command.
         assert!(
-            wrap_with_sane_termios("sh").contains("2>/dev/null"),
+            wrap_shell("sh", None).contains("2>/dev/null"),
             "stty failure must be swallowed"
         );
     }
