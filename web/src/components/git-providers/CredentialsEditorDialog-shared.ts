@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ProviderResponse } from '@/api/client/types.gen'
-import { type UpdateProviderCredentialsBody } from '@/lib/git-providers'
+import type {
+  ProviderResponse,
+  UpdateProviderCredentialsRequest,
+} from '@/api/client/types.gen'
+
+/** The credential fields the editor can send (the generated request body). */
+export type UpdateProviderCredentialsBody = UpdateProviderCredentialsRequest
 
 export interface FieldSpec {
   key: keyof UpdateProviderCredentialsBody

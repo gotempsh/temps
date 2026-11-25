@@ -3,7 +3,10 @@
 
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { getGitProviderQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getGitProviderQueryKey,
+  updateGitProviderCredentialsMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -18,14 +21,12 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Info, RefreshCw } from 'lucide-react'
-import {
-  updateGitProviderCredentials,
-  type UpdateProviderCredentialsBody,
-} from '@/lib/git-providers'
+import { problemDetail } from '@/lib/api-problem'
 import {
   credentialFieldErrors,
   fieldsForProvider,
   type Props,
+  type UpdateProviderCredentialsBody,
 } from './CredentialsEditorDialog-shared'
 
 export function CredentialsEditorDialog({
@@ -44,8 +45,7 @@ export function CredentialsEditorDialog({
   }
 
   const mutation = useMutation({
-    mutationFn: (body: UpdateProviderCredentialsBody) =>
-      updateGitProviderCredentials(provider.id, body),
+    ...updateGitProviderCredentialsMutation(),
     onSuccess: () => {
       toast.success('Credentials updated')
       setValues({})
@@ -56,8 +56,10 @@ export function CredentialsEditorDialog({
       })
       onOpenChange(false)
     },
-    onError: (err: Error) => {
-      toast.error(`Failed to update credentials: ${err.message}`)
+    onError: (error) => {
+      toast.error('Failed to update credentials', {
+        description: problemDetail(error, 'Check the values and try again.'),
+      })
     },
   })
 
@@ -83,7 +85,7 @@ export function CredentialsEditorDialog({
       return
     }
     if (hasErrors) return
-    mutation.mutate(body)
+    mutation.mutate({ path: { provider_id: provider.id }, body })
   }
 
   return (
