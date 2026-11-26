@@ -2323,6 +2323,24 @@ impl WorkflowExecutionService {
         environment_id: i32,
         current_deployment: &deployments::Model,
     ) -> Result<Option<String>, WorkflowExecutionError> {
+        self.teardown_superseded(project_id, environment_id, current_deployment, false)
+            .await
+    }
+
+    /// [`Self::teardown_previous_deployment`]; with `reachable_only`, the
+    /// capped selection of superseded deployments keeps only those with a live
+    /// container on the control plane or on a node that is not offline. The
+    /// periodic cleanup of superseded containers uses it: deployments whose
+    /// only containers sit on a node that is still down cannot be removed yet,
+    /// and would otherwise fill the cap on every pass, so an older deployment
+    /// with a removable container would never be reached.
+    pub(super) async fn teardown_superseded(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        current_deployment: &deployments::Model,
+        reachable_only: bool,
+    ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
         // Find active deployments that are chronologically older than the
@@ -2340,7 +2358,18 @@ impl WorkflowExecutionService {
         // uncapped active-row query below. "failed"/"stopped" remain excluded
         // here to avoid repeatedly scanning historical deployments.
         const MAX_TEARDOWN_DEPLOYMENTS: u64 = 25;
-        let previous_deployments = deployments::Entity::find()
+        const HAS_REACHABLE_LIVE_CONTAINER: &str = r#"EXISTS (
+            SELECT 1 FROM deployment_containers dc
+            LEFT JOIN nodes n ON n.id = dc.node_id
+            WHERE dc.deployment_id = "deployments"."id"
+              AND dc.deleted_at IS NULL
+              AND (dc.node_id IS NULL OR n.status <> 'offline'))"#;
+        let mut previous_deployments = deployments::Entity::find();
+        if reachable_only {
+            previous_deployments =
+                previous_deployments.filter(Expr::cust(HAS_REACHABLE_LIVE_CONTAINER));
+        }
+        let previous_deployments = previous_deployments
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
             .filter(
@@ -5512,6 +5541,129 @@ mod tests {
             "a container on a node that is still offline stays for a later pass"
         );
         assert!(reread(serving_container.id).await?.deleted_at.is_none());
+        Ok(())
+    }
+
+    /// More superseded deployments stuck on an offline worker than one
+    /// teardown selects must not keep an older one, whose container is on a
+    /// reachable host, from ever being removed.
+    #[tokio::test]
+    async fn test_deployments_stuck_on_an_offline_worker_do_not_starve_an_older_removable_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel};
+        use temps_entities::{deployment_containers, nodes};
+
+        if !temps_test_utils::docker_available().await {
+            eprintln!("Skipping superseded cleanup starvation test: Docker unavailable");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+        let settled = Utc::now() - chrono::Duration::hours(1);
+        deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("completed"))
+            .col_expr(deployments::Column::UpdatedAt, Expr::value(settled))
+            .filter(deployments::Column::Id.eq(current_deployment.id))
+            .exec(db.as_ref())
+            .await?;
+        let mut serving = environment.clone().into_active_model();
+        serving.current_deployment_id = Set(Some(current_deployment.id));
+        serving.update(db.as_ref()).await?;
+
+        let offline = nodes::ActiveModel {
+            name: Set("down-worker".to_string()),
+            token_hash: Set("unused".to_string()),
+            address: Set("https://127.0.0.1:39998".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("offline".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let deployment_with_container =
+            |slug: String, minutes: i64, container: String, node_id: Option<i32>| {
+                let db = db.clone();
+                let (project_id, environment_id) = (project.id, environment.id);
+                async move {
+                    let deployment = deployments::ActiveModel {
+                        project_id: Set(project_id),
+                        environment_id: Set(environment_id),
+                        slug: Set(slug),
+                        state: Set("completed".to_string()),
+                        metadata: Set(Some(
+                            temps_entities::deployments::DeploymentMetadata::default(),
+                        )),
+                        created_at: Set(Utc::now() - chrono::Duration::minutes(minutes)),
+                        updated_at: Set(settled),
+                        ..Default::default()
+                    }
+                    .insert(db.as_ref())
+                    .await?;
+                    deployment_containers::ActiveModel {
+                        deployment_id: Set(deployment.id),
+                        container_id: Set(container.clone()),
+                        container_name: Set(container),
+                        container_port: Set(Some(3000)),
+                        status: Set(Some("running".to_string())),
+                        node_id: Set(node_id),
+                        deployed_at: Set(Utc::now()),
+                        ..Default::default()
+                    }
+                    .insert(db.as_ref())
+                    .await
+                }
+            };
+        // Newer than the removable one, and more than one teardown selects.
+        for i in 0..30 {
+            deployment_with_container(
+                format!("stuck-{i}"),
+                10 + i,
+                format!("stuck-{i}"),
+                Some(offline.id),
+            )
+            .await?;
+        }
+        let removable =
+            deployment_with_container("oldest".to_string(), 120, "removable-old".to_string(), None)
+                .await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service.clone(),
+            Arc::new(ScreenshotService::new(config_service).await?),
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
+        );
+
+        let pass = service.remove_superseded_containers(0).await;
+        assert_eq!(pass.environments, 1, "{pass:?}");
+        let row = deployment_containers::Entity::find_by_id(removable.id)
+            .one(db.as_ref())
+            .await?
+            .expect("row exists");
+        assert!(
+            row.deleted_at.is_some(),
+            "the reachable container of the oldest superseded deployment is removed"
+        );
         Ok(())
     }
 

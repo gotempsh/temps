@@ -16,7 +16,7 @@
 //! on a node that is reachable again (or on the control plane) and runs the
 //! same teardown a deploy would, so every guard of that path applies: the
 //! environment's lifecycle lock, the re-check that each deployment is still
-//! one to sweep, the claim on each container row, the project's stop grace
+//! one to sweep (and not one a rollback made serving again), the claim on each container row, the project's stop grace
 //! and Docker's ownership labels. The query reads only container rows a
 //! teardown has not finished with, so it is O(leaked containers), and each
 //! pass handles at most [`MAX_ENVIRONMENTS_PER_PASS`] environments,
@@ -166,7 +166,7 @@ impl WorkflowExecutionService {
                  reachable node"
             );
             match self
-                .teardown_previous_deployment(target.project_id, target.environment_id, &current)
+                .teardown_superseded(target.project_id, target.environment_id, &current, true)
                 .await
             {
                 Ok(Some(_)) => pass.removed += 1,
