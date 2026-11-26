@@ -14,7 +14,9 @@ use super::types::GitAppState as AppState;
 use super::types::GitAppState;
 use crate::services::connection_health::ConnectionHealthError;
 use crate::services::git_provider::GitProviderError;
-use crate::services::git_provider_manager::{GitProviderManager, GitProviderManagerError};
+use crate::services::git_provider_manager::{
+    GitProviderManager, GitProviderManagerError, ProviderCredentialsUpdate,
+};
 use crate::services::repository::RepositoryServiceError;
 use crate::services::{
     git_provider::{AuthMethod, GitProviderType, RepositoryListParams},
@@ -131,6 +133,12 @@ impl From<GitProviderManagerError> for Problem {
                 problem_new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Configuration")
                     .with_detail(msg)
+            }
+            GitProviderManagerError::InvalidCredentials { provider_id, .. } => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Credentials")
+                    .with_detail(error.to_string())
+                    .with_value("provider_id", provider_id)
             }
             GitProviderManagerError::ComposePreview { path, source } => {
                 problem_new(StatusCode::BAD_REQUEST)
@@ -547,6 +555,25 @@ pub struct UpdateProviderCredentialsRequest {
     pub redirect_uri: Option<String>,
     /// PAT for PAT-type providers.
     pub token: Option<SecretString>,
+    /// Username of a basic-auth provider (generic Git server, Bitbucket app
+    /// password). Omit to keep the stored username.
+    pub username: Option<String>,
+    /// Password or app password of a basic-auth provider.
+    pub password: Option<SecretString>,
+    /// SSH public key (one OpenSSH line) of an SSH-key provider. Replaced
+    /// together with `private_key`, which then carries the SSH private key.
+    pub public_key: Option<String>,
+}
+
+/// Result of a credential update: the provider and the names of the
+/// credential fields that were replaced. Credential values are never returned.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateProviderCredentialsResponse {
+    #[serde(flatten)]
+    pub provider: ProviderResponse,
+    /// Names of the fields that were replaced, e.g. `["password"]`. Fields
+    /// that do not apply to the provider's auth method are not listed.
+    pub updated_fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -2562,6 +2589,7 @@ fn git_connect_failure_code(error: &GitProviderManagerError) -> OperationFailure
             OperationFailureCode::PermissionDenied
         }
         GitProviderManagerError::InvalidConfiguration(_)
+        | GitProviderManagerError::InvalidCredentials { .. }
         | GitProviderManagerError::ProviderError(GitProviderError::InvalidConfiguration(_)) => {
             OperationFailureCode::InvalidConfiguration
         }
@@ -2776,6 +2804,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             CreateBitbucketRequest,
             CreateGenericRequest,
             UpdateProviderCredentialsRequest,
+            UpdateProviderCredentialsResponse,
             ProjectUsageInfoResponse,
             ProviderDeletionCheckResponse,
             UpdateTokenRequest,
@@ -3282,8 +3311,12 @@ pub async fn create_generic_provider(
 }
 
 /// Partially update credentials for an existing git provider. Only the fields
-/// you send are replaced; omitted fields keep their stored values. Fields that
-/// don't apply to the provider's auth method are ignored on the service side.
+/// you send are replaced; omitted fields keep their stored values. Basic-auth
+/// providers rotate `username`/`password`, SSH-key providers `private_key` and
+/// `public_key` together; both refuse fields of another auth method. For the
+/// other auth methods, fields that don't apply are ignored. A new token or
+/// password is also written to the provider's connections. The response names
+/// the replaced fields, never their values.
 #[utoipa::path(
     patch,
     path = "/git-providers/{provider_id}/credentials",
@@ -3292,8 +3325,8 @@ pub async fn create_generic_provider(
     ),
     request_body = UpdateProviderCredentialsRequest,
     responses(
-        (status = 200, description = "Credentials updated", body = ProviderResponse),
-        (status = 400, description = "Bad request"),
+        (status = 200, description = "Credentials updated", body = UpdateProviderCredentialsResponse),
+        (status = 400, description = "Invalid credentials for the provider's auth method"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Provider not found"),
@@ -3314,30 +3347,26 @@ pub async fn update_git_provider_credentials(
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersWrite);
 
-    let credentials_set: Vec<&'static str> = [
-        ("client_secret", request.client_secret.is_some()),
-        ("app_secret", request.app_secret.is_some()),
-        ("private_key", request.private_key.is_some()),
-        ("webhook_secret", request.webhook_secret.is_some()),
-        ("token", request.token.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(name, set)| set.then_some(name))
-    .collect();
-    let provider = state
+    let updated = state
         .git_provider_manager
         .update_provider_credentials(
             provider_id,
-            request.client_id,
-            request.client_secret.map(SecretString::into_exposed),
-            request.app_id,
-            request.app_secret.map(SecretString::into_exposed),
-            request.private_key.map(SecretString::into_exposed),
-            request.webhook_secret.map(SecretString::into_exposed),
-            request.redirect_uri,
-            request.token.map(SecretString::into_exposed),
+            ProviderCredentialsUpdate {
+                client_id: request.client_id,
+                client_secret: request.client_secret.map(SecretString::into_exposed),
+                app_id: request.app_id,
+                app_secret: request.app_secret.map(SecretString::into_exposed),
+                private_key: request.private_key.map(SecretString::into_exposed),
+                webhook_secret: request.webhook_secret.map(SecretString::into_exposed),
+                redirect_uri: request.redirect_uri,
+                token: request.token.map(SecretString::into_exposed),
+                username: request.username,
+                password: request.password.map(SecretString::into_exposed),
+                public_key: request.public_key,
+            },
         )
         .await?;
+    let provider = updated.provider;
     record_git_provider_credentials(
         &state,
         &auth,
@@ -3345,22 +3374,29 @@ pub async fn update_git_provider_credentials(
         ai_call.is_some(),
         "GIT_PROVIDER_CREDENTIALS_UPDATED",
         &provider,
-        credentials_set,
+        updated.updated_fields.clone(),
     )
     .await;
 
     Ok((
         StatusCode::OK,
-        Json(ProviderResponse {
-            id: provider.id,
-            name: provider.name,
-            provider_type: provider.provider_type,
-            base_url: provider.base_url,
-            auth_method: provider.auth_method,
-            is_active: provider.is_active,
-            is_default: provider.is_default,
-            created_at: provider.created_at,
-            updated_at: provider.updated_at,
+        Json(UpdateProviderCredentialsResponse {
+            provider: ProviderResponse {
+                id: provider.id,
+                name: provider.name,
+                provider_type: provider.provider_type,
+                base_url: provider.base_url,
+                auth_method: provider.auth_method,
+                is_active: provider.is_active,
+                is_default: provider.is_default,
+                created_at: provider.created_at,
+                updated_at: provider.updated_at,
+            },
+            updated_fields: updated
+                .updated_fields
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         }),
     ))
 }

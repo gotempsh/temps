@@ -51,6 +51,8 @@ futures-util = { workspace = true }
 utoipa = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
+# Parses rotated SSH key pairs (already used by temps-nodes for node SSH).
+russh = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
 # Keep this aligned with Octocrab's public GitHub App key type.

@@ -398,15 +398,50 @@ impl NetworkPolicyService {
         Ok(row.is_some())
     }
 
+    /// Whether a table is present in the current search path. The
+    /// `functions` table belongs to an optional feature, so an instance
+    /// without it must not turn a rule naming a function into a raw
+    /// "relation does not exist" database error.
+    async fn table_present(&self, table: &'static str) -> Result<bool, NetworkPolicyError> {
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                [table.into()],
+            ))
+            .await
+            .map_err(NetworkPolicyError::db("check that a workload table exists"))?;
+        match row {
+            Some(row) => row
+                .try_get::<bool>("", "present")
+                .map_err(NetworkPolicyError::db("check that a workload table exists")),
+            None => Ok(false),
+        }
+    }
+
     /// Whether the product object behind a workload exists. Jobs have no
-    /// table of their own and are accepted.
+    /// table of their own and are accepted without an existence check: a
+    /// job rule applies to the job's runs whenever they start. Function
+    /// workloads fail with [`NetworkPolicyError::WorkloadKindUnavailable`]
+    /// on an instance where functions are not installed.
     async fn workload_exists(&self, workload: WorkloadRef) -> Result<bool, NetworkPolicyError> {
         // `functions.id` is a BIGINT; the other tables key on INTEGER.
         let (sql, int4_key) = match workload.kind {
             WorkloadKind::Deployment => ("SELECT 1 FROM environments WHERE id = $1", true),
             WorkloadKind::Sandbox => ("SELECT 1 FROM sandboxes WHERE id = $1", true),
             WorkloadKind::Service => ("SELECT 1 FROM external_services WHERE id = $1", true),
-            WorkloadKind::Function => ("SELECT 1 FROM functions WHERE id = $1", false),
+            WorkloadKind::Function => {
+                const TABLE: &str = "functions";
+                if !self.table_present(TABLE).await? {
+                    return Err(NetworkPolicyError::WorkloadKindUnavailable {
+                        kind: WorkloadKind::Function.as_str(),
+                        id: workload.id,
+                        table: TABLE,
+                    });
+                }
+                ("SELECT 1 FROM functions WHERE id = $1", false)
+            }
             WorkloadKind::Job => return Ok(true),
         };
         if int4_key && workload.id > i64::from(i32::MAX) {
@@ -1294,6 +1329,67 @@ mod remote_tests {
         assert!(!service.supports_enforcement(3));
     }
 
+    fn function_rule(id: i64) -> NewRule {
+        NewRule {
+            subject: WorkloadRef::new(WorkloadKind::Function, id),
+            direction: Direction::Egress,
+            peer: PeerSpec::Cidr("192.0.2.0/24".parse().unwrap()),
+            ports: None,
+            protocol: L4Protocol::Tcp,
+            action: Action::Deny,
+            description: None,
+        }
+    }
+
+    fn presence(present: bool) -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+        vec![std::collections::BTreeMap::from([(
+            "present",
+            sea_orm::Value::Bool(Some(present)),
+        )])]
+    }
+
+    /// Without the `functions` table a function subject is a typed 400,
+    /// never the raw "relation does not exist" database error (#2044).
+    #[tokio::test]
+    async fn a_function_rule_without_functions_installed_is_a_typed_error() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([presence(false)])
+            .into_connection();
+        let service = NetworkPolicyService::new(Arc::new(db));
+        let err = service
+            .create_rule(function_rule(1), None)
+            .await
+            .expect_err("functions are not installed");
+        match &err {
+            NetworkPolicyError::WorkloadKindUnavailable { kind, id, table } => {
+                assert_eq!((*kind, *id, *table), ("function", 1, "functions"));
+            }
+            other => panic!("expected WorkloadKindUnavailable, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(message.contains("function/1"), "{message}");
+        assert!(!message.contains("relation"), "{message}");
+    }
+
+    /// With the table present, a missing function is the usual
+    /// "does not exist" validation error.
+    #[tokio::test]
+    async fn a_missing_function_with_functions_installed_is_a_validation_error() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([presence(true)])
+            .append_query_results([Vec::<std::collections::BTreeMap<&str, sea_orm::Value>>::new()])
+            .into_connection();
+        let service = NetworkPolicyService::new(Arc::new(db));
+        let err = service
+            .create_rule(function_rule(7), None)
+            .await
+            .expect_err("function 7 does not exist");
+        assert!(
+            matches!(&err, NetworkPolicyError::Validation { message } if message.contains("function/7")),
+            "{err:?}"
+        );
+    }
+
     fn ip(value: &str) -> std::net::IpAddr {
         value.parse().unwrap()
     }
@@ -1592,6 +1688,28 @@ mod tests {
              RETURNING id",
         )
         .await;
+        // The core schema has no `functions` table: a function subject is a
+        // typed error, not a database failure (#2044).
+        let function = WorkloadRef::new(WorkloadKind::Function, 1);
+        let err = service
+            .create_rule(
+                rule(
+                    function,
+                    Direction::Egress,
+                    PeerSpec::Cidr("192.0.2.0/24".parse().unwrap()),
+                ),
+                None,
+            )
+            .await
+            .expect_err("functions are not installed");
+        assert!(
+            matches!(
+                err,
+                NetworkPolicyError::WorkloadKindUnavailable { id: 1, .. }
+            ),
+            "{err:?}"
+        );
+
         let deployment = WorkloadRef::new(WorkloadKind::Deployment, env);
         let sandbox_ref = WorkloadRef::new(WorkloadKind::Sandbox, sandbox);
         let db_ref = WorkloadRef::new(WorkloadKind::Service, db_id);

@@ -28,6 +28,12 @@ pub enum GitProviderManagerError {
     #[error("Connection not found: {0}")]
     ConnectionNotFound(String),
 
+    #[error("Cannot update the {auth_method} credentials of git provider {provider_id}: {reason}")]
+    InvalidCredentials {
+        provider_id: i32,
+        auth_method: &'static str,
+        reason: String,
+    },
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
     #[error("Compose preview for '{path}' could not be rendered: {source}")]

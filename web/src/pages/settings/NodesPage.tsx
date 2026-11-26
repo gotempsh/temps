@@ -19,6 +19,7 @@ import {
   type ClusterNetworkNode,
 } from '@/lib/cluster-network'
 import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
+import { MeshTurnOffCard } from '@/components/nodes/MeshTurnOffCard'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
 import { NetworkIdAction } from '@/components/nodes/NetworkIdAction'
 import { NodeAddressRanges } from '@/components/nodes/NodeAddressRanges'
@@ -2023,7 +2024,7 @@ export function NodesPage() {
         >
           <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
             <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
-            Advanced: mesh hub, cluster network, DNS and trust
+            Advanced: mesh hub and turn-off, cluster network, DNS and trust
           </CollapsibleTrigger>
           <CollapsibleContent className="mt-6 space-y-6">
             <div id="mesh-hub" className="scroll-mt-20">
@@ -2034,6 +2035,9 @@ export function NodesPage() {
                 onRetry={() => void refetchMesh()}
                 retrying={meshFetching}
               />
+            </div>
+            <div id="mesh-turn-off" className="scroll-mt-20">
+              <MeshTurnOffCard mesh={mesh} />
             </div>
             <div id="cluster-network" className="scroll-mt-20">
               <ClusterNetworkCard />

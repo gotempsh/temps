@@ -41,8 +41,10 @@ pub enum SensitiveAction {
         node_id: i32,
     },
     /// Turn on the cluster's WireGuard mesh: every node's firewall and
-    /// underlay change, and it cannot be turned off again from the API.
+    /// underlay change.
     EnableWireguardMesh,
+    /// Turn the cluster's WireGuard mesh off; refused while anything uses it.
+    DisableWireguardMesh,
     /// Pair a node the control plane dials (ADR 048 D2b): whoever runs the
     /// returned command at the given address joins the cluster.
     CreateNodePairing,
@@ -197,6 +199,7 @@ impl SensitiveAction {
             Self::DrainNode { .. } => "drain_node",
             Self::RemoveNode { .. } => "remove_node",
             Self::EnableWireguardMesh => "enable_wireguard_mesh",
+            Self::DisableWireguardMesh => "disable_wireguard_mesh",
             Self::CreateNodePairing => "create_node_pairing",
             Self::AddNodeOverSsh => "add_node_over_ssh",
             Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
