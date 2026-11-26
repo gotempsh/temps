@@ -210,12 +210,25 @@ pub async fn egress_network_gateway(
         .find_map(|gateway| gateway.parse().ok()))
 }
 
+/// A running sandbox egress proxy, as Docker lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressProxyEndpoint {
+    /// The sandbox container it serves.
+    pub sandbox: String,
+    /// Its address on [`SANDBOX_EGRESS_NETWORK`].
+    pub address: std::net::IpAddr,
+    /// Whether it was started handing outbound traffic to the egress
+    /// recorder ([`SANDBOX_EGRESS_RECORDING_LABEL`]).
+    pub hands_off: bool,
+}
+
 /// Every running sandbox egress proxy on this host: the sandbox it serves
 /// (container name, as [`egress_proxy_sandbox`] establishes it from what
-/// only Docker records) and its address on [`SANDBOX_EGRESS_NETWORK`].
+/// only Docker records), its address on [`SANDBOX_EGRESS_NETWORK`], and
+/// whether it hands its traffic to the recorder.
 pub async fn egress_proxy_endpoints(
     docker: &Docker,
-) -> Result<Vec<(String, std::net::IpAddr)>, bollard::errors::Error> {
+) -> Result<Vec<EgressProxyEndpoint>, bollard::errors::Error> {
     let containers = docker
         .list_containers(Some(bollard::query_parameters::ListContainersOptions {
             filters: Some(HashMap::from([(
@@ -248,7 +261,16 @@ pub async fn egress_proxy_endpoints(
         else {
             continue;
         };
-        endpoints.push((sandbox, address));
+        let hands_off = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
+            .is_some_and(|value| !value.is_empty());
+        endpoints.push(EgressProxyEndpoint {
+            sandbox,
+            address,
+            hands_off,
+        });
     }
     Ok(endpoints)
 }
@@ -468,6 +490,11 @@ pub(super) const SANDBOX_INTERNAL_PROXY_ENV: &str = "TEMPS_INTERNAL_PROXY_ADDRES
 /// Where the egress proxy of a sandbox that records its outbound
 /// connections hands that traffic; absent or empty when it does not.
 pub(super) const SANDBOX_EGRESS_RECORDING_ENV: &str = "TEMPS_EGRESS_RECORDING_PROXY_ADDRESS";
+/// The same address as a label, so a container list (which does not show
+/// the environment) tells which sidecars hand their traffic to the
+/// recorder: one still doing so after its sandbox stopped recording is
+/// let through unrecorded instead of refused as unknown.
+pub const SANDBOX_EGRESS_RECORDING_LABEL: &str = "sh.temps.sandbox-egress-recording";
 
 pub(super) const SANDBOX_MCP_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
@@ -1006,9 +1033,16 @@ function recordedReason(error) {
 // Tell the recorder of a request this sandbox's policy refused, so it is
 // recorded like a refusal made there: the same request, marked refused,
 // which the recorder refuses and records without opening anything. The
-// client is answered here and never waits for it; a recorder that does
-// not answer costs one socket for at most five seconds.
+// client is answered here and never waits for it. At most
+// MAX_REFUSAL_NOTES are open at once, each for at most five seconds: past
+// that a refusal is still refused, only not recorded, so a burst of
+// refusals against a slow recorder cannot use up the descriptors the
+// sandbox's allowed traffic needs.
+const MAX_REFUSAL_NOTES = 16;
+let refusalNotes = 0;
 function noteRefusal(method, target, host, error) {
+  if (refusalNotes >= MAX_REFUSAL_NOTES) return;
+  refusalNotes += 1;
   const socket = net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {
     socket.end(
       `${method} ${target} HTTP/1.1\r\nHost: ${host}\r\n` +
@@ -1019,6 +1053,7 @@ function noteRefusal(method, target, host, error) {
   socket.on("error", () => socket.destroy());
   socket.on("data", () => {});
   socket.on("end", () => socket.destroy());
+  socket.on("close", () => { refusalNotes -= 1; });
 }
 
 async function handleRequest(request, response) {
@@ -1232,9 +1267,17 @@ impl DockerSandboxProvider {
             );
             let host_gateway_matches = container_has_extra_host(info, SANDBOX_HOST_GATEWAY);
             let internal_proxy_matches = container_has_internal_proxy(info, &internal_proxy);
+            // The label says the same as the environment, so a list can
+            // tell a hand-off; one without it is recreated once to get it.
             let recording_matches = container_environment_value(info, SANDBOX_EGRESS_RECORDING_ENV)
                 .unwrap_or("")
-                == recording;
+                == recording
+                && info
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.labels.as_ref())
+                    .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
+                    .map_or(recording.is_empty(), |label| *label == recording);
             let rules_match = egress.is_carried_by(info, sandbox_container_name);
             // A stopped proxy is always recreated rather than started: it
             // was parked with its sandbox, and its endpoint still names the
@@ -1399,6 +1442,10 @@ impl DockerSandboxProvider {
                 (
                     SANDBOX_EGRESS_RULES_LABEL.to_string(),
                     egress.digest.clone(),
+                ),
+                (
+                    SANDBOX_EGRESS_RECORDING_LABEL.to_string(),
+                    recording.to_string(),
                 ),
             ])),
             host_config: Some(bollard::models::HostConfig {
@@ -1591,6 +1638,9 @@ mod identity_tests {
         assert!(script.contains("noteRefusal(request.method, target.href, target.host, error)"));
         assert!(script.contains("noteRefusal(\"CONNECT\", request.url, request.url, error)"));
         assert!(script.contains("delete headers[\"x-temps-egress-refused\"]"));
+        // Bounded: a burst of refusals opens a fixed number of sockets.
+        assert!(script.contains("if (refusalNotes >= MAX_REFUSAL_NOTES) return;"));
+        assert!(script.contains("socket.on(\"close\", () => { refusalNotes -= 1; });"));
         assert_eq!(
             temps_workload_netpol::egress::REFUSED_BY_SENDER,
             "x-temps-egress-refused",

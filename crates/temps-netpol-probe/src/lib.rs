@@ -134,7 +134,7 @@ impl HttpRecordSink {
         })
     }
 
-    async fn post(&self, body: &[u8]) -> Result<u16, String> {
+    async fn post(&self, body: &[u8]) -> Result<(u16, String), String> {
         let mut stream = tokio::time::timeout(
             Duration::from_secs(5),
             tokio::net::TcpStream::connect(&self.authority),
@@ -165,11 +165,37 @@ impl HttpRecordSink {
             .nth(1)
             .and_then(|code| code.parse::<u16>().ok())
             .ok_or_else(|| format!("unreadable response: {}", text.lines().next().unwrap_or("")))?;
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or("")
+            .to_string();
         if !(200..300).contains(&status) {
-            let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
             println!("records rejected {status} {}", body.trim());
         }
-        Ok(status)
+        Ok((status, body))
+    }
+}
+
+/// What the control plane's ingest says it did with a batch.
+#[derive(Debug, Default, serde::Deserialize)]
+struct IngestAnswer {
+    #[serde(default)]
+    not_recording: u64,
+    #[serde(default)]
+    not_placed: u64,
+}
+
+/// The [`Delivered`](temps_workload_netpol::Delivered) of a batch of
+/// `records` ingest accepted with `answer`: what it took but did not store
+/// (the workload stopped recording, or is not placed on this node) is
+/// discarded, not delivered. An answer it cannot read counts nothing as
+/// discarded.
+fn delivered_from(records: usize, answer: &str) -> temps_workload_netpol::Delivered {
+    let answer: IngestAnswer = serde_json::from_str(answer.trim()).unwrap_or_default();
+    temps_workload_netpol::Delivered {
+        discarded: (answer.not_recording + answer.not_placed).min(records as u64),
+        ..Default::default()
     }
 }
 
@@ -187,11 +213,16 @@ impl EgressRecordSink for HttpRecordSink {
         };
         let body = serde_json::to_vec(&batch).map_err(|e| failed(e.to_string()))?;
         match self.post(&body).await {
-            Ok(status) if (200..300).contains(&status) => {
-                println!("records delivered {records}");
-                Ok(temps_workload_netpol::Delivered::default())
+            Ok((status, answer)) if (200..300).contains(&status) => {
+                let delivered = delivered_from(records, &answer);
+                println!(
+                    "records delivered {} discarded {}",
+                    records as u64 - delivered.discarded,
+                    delivered.discarded
+                );
+                Ok(delivered)
             }
-            Ok(status) => Err(failed(format!("answered {status}"))),
+            Ok((status, _)) => Err(failed(format!("answered {status}"))),
             Err(reason) => Err(failed(reason)),
         }
     }
@@ -484,6 +515,22 @@ pub async fn public_dns(port: u16) -> Result<(), ProbeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ingest's 200 for a batch whose workload stopped recording stores
+    /// nothing: those records are discarded, not delivered.
+    #[test]
+    fn records_ingest_did_not_store_are_discarded() {
+        assert_eq!(
+            delivered_from(3, r#"{"stored":0,"not_recording":3,"not_placed":0}"#).discarded,
+            3
+        );
+        assert_eq!(
+            delivered_from(5, r#"{"stored":2,"not_recording":1,"not_placed":2}"#).discarded,
+            3
+        );
+        assert_eq!(delivered_from(2, "not json").discarded, 0);
+        assert_eq!(delivered_from(1, r#"{"not_recording":9}"#).discarded, 1);
+    }
 
     #[test]
     fn configs_round_trip() {

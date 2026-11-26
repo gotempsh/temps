@@ -26,7 +26,8 @@ pub(crate) mod tests;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use temps_entities::sandboxes;
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::LocalEgressRecorder;
@@ -154,22 +155,21 @@ impl WorkloadEgressAdapter for SandboxEgressAdapter {
         &self,
         workload: WorkloadRef,
         enabled: bool,
-    ) -> Result<(), EgressRecordingError> {
+    ) -> Result<bool, EgressRecordingError> {
         let id = i32::try_from(workload.id).map_err(|_| EgressRecordingError::NotFound {
             noun: NOUN,
             id: workload.id.to_string(),
         })?;
-        sandboxes::ActiveModel {
-            id: Set(id),
-            egress_recording: Set(enabled),
-            ..Default::default()
-        }
-        .update(self.db.as_ref())
-        .await
-        .map_err(EgressRecordingError::db(
-            "updating a sandbox's egress recording",
-        ))?;
-        Ok(())
+        let result = sandboxes::Entity::update_many()
+            .col_expr(sandboxes::Column::EgressRecording, Expr::value(enabled))
+            .filter(sandboxes::Column::Id.eq(id))
+            .filter(sandboxes::Column::EgressRecording.ne(enabled))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(EgressRecordingError::db(
+                "updating a sandbox's egress recording",
+            ))?;
+        Ok(result.rows_affected == 1)
     }
 
     /// The table and the published set follow at once, and a sandbox of

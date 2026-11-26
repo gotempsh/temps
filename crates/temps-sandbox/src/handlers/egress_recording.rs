@@ -130,6 +130,16 @@ pub async fn set_egress_recording(
                 "sandbox egress recording: failed to write audit log: {e}"
             );
         }
+    } else {
+        // A build without the audit plugin still records the change here,
+        // so it is never made without a trace.
+        tracing::warn!(
+            user_id,
+            sandbox_id = %id,
+            from = previous,
+            to = status.enabled,
+            "sandbox egress recording changed with no audit logger configured; not audited"
+        );
     }
     Ok(Json(status))
 }
@@ -181,6 +191,8 @@ pub async fn list_egress_records(
     Ok(Json(page))
 }
 
+/// The routes carry the same API version header as every other sandbox
+/// route: they are merged outside the layer that adds it to those.
 pub fn routes() -> Router<Arc<EgressRecordingAppState>> {
     Router::new()
         .route(
@@ -191,6 +203,9 @@ pub fn routes() -> Router<Arc<EgressRecordingAppState>> {
             "/v1/sandboxes/{id}/egress-records",
             get(list_egress_records),
         )
+        .layer(axum::middleware::from_fn(
+            super::version_header::inject_version_header,
+        ))
 }
 
 #[cfg(test)]
@@ -297,6 +312,34 @@ mod tests {
 
     fn uri(id: &str) -> String {
         format!("/v1/sandboxes/{id}/egress-recording")
+    }
+
+    /// Every recording response names the sandbox API version, like every
+    /// other sandbox route, refusals included.
+    #[tokio::test]
+    async fn recording_responses_carry_the_api_version() {
+        let Some(f) = fixture().await else { return };
+        let app = routes().with_state(Arc::new(EgressRecordingAppState {
+            service: f.with_otel().sandboxes,
+            audit_service: None,
+        }));
+        for auth in [None, Some(AuthContext::new_session(owner(), Role::Reader))] {
+            let mut request = Request::builder()
+                .uri(uri(ON_WORKER.1))
+                .body(Body::empty())
+                .unwrap();
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert!(
+                response
+                    .headers()
+                    .contains_key(&super::super::version_header::VERSION_HEADER),
+                "{}",
+                response.status()
+            );
+        }
     }
 
     #[tokio::test]

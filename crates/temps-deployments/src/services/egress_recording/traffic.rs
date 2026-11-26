@@ -84,8 +84,9 @@ pub fn observe_policy(subject: WorkloadRef, record: bool) -> EgressPolicy {
     }
 }
 
-/// A steered container: the environment Docker says it belongs to, and its
-/// address on the deployment network.
+/// A steered container: the environment Docker says it belongs to, and one
+/// of its addresses on the deployment network (one entry per address: an
+/// IPv4 one, a global IPv6 one, or both on a dual-stack network).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SteeredContainer {
     pub environment_id: i32,
@@ -103,23 +104,33 @@ pub fn steered_containers(
 ) -> Vec<SteeredContainer> {
     containers
         .iter()
-        .filter_map(|container| {
-            let labels = container.labels.as_ref()?;
-            if !steered_by(labels.get(STEERED_LABEL)?, installation) {
-                return None;
-            }
-            let environment_id = labels.get(ENVIRONMENT_LABEL)?.parse().ok()?;
-            let address = container
-                .network_settings
-                .as_ref()?
-                .networks
-                .as_ref()?
-                .get(network)?
-                .ip_address
-                .as_deref()?
-                .parse()
-                .ok()?;
-            Some(SteeredContainer {
+        .flat_map(|container| {
+            let steered = || -> Option<(i32, Vec<IpAddr>)> {
+                let labels = container.labels.as_ref()?;
+                if !steered_by(labels.get(STEERED_LABEL)?, installation) {
+                    return None;
+                }
+                let environment_id = labels.get(ENVIRONMENT_LABEL)?.parse().ok()?;
+                let endpoint = container
+                    .network_settings
+                    .as_ref()?
+                    .networks
+                    .as_ref()?
+                    .get(network)?;
+                // An IPv6-only network leaves the IPv4 field empty: the
+                // replica calls from its global IPv6 address instead.
+                let addresses: Vec<IpAddr> = [
+                    endpoint.ip_address.as_deref(),
+                    endpoint.global_ipv6_address.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(|address| address.parse().ok())
+                .collect();
+                Some((environment_id, addresses))
+            };
+            let (environment_id, addresses) = steered().unwrap_or_default();
+            addresses.into_iter().map(move |address| SteeredContainer {
                 environment_id,
                 address,
             })
@@ -223,6 +234,7 @@ impl DeploymentTraffic {
                 deployments::Relation::Environment.def(),
             )
             .filter(deployment_containers::Column::DeletedAt.is_null())
+            .filter(super::running_container())
             .filter(deployment_containers::Column::NodeId.is_null())
             .filter(environments::Column::EgressRecording.eq(true))
             .filter(environments::Column::DeletedAt.is_null())
@@ -439,6 +451,43 @@ mod tests {
                 address: "172.18.0.5".parse().unwrap(),
             }]
         );
+    }
+
+    /// On an IPv6-only network a replica's IPv4 field is empty and it calls
+    /// from its global IPv6 address; on a dual-stack one it may call from
+    /// either. Both speak for its environment.
+    #[test]
+    fn a_steered_container_speaks_from_its_ipv6_address_too() {
+        let ours = InstallationId::from_bytes([1; 8]);
+        let label = temps_workload_egress::steering::steered_label(
+            ours,
+            "[fd00::1]:13128".parse().unwrap(),
+        );
+        let endpoint = |v4: Option<&str>, v6: Option<&str>| {
+            let mut summary = container(
+                &[(STEERED_LABEL, label.as_str()), (ENVIRONMENT_LABEL, "7")],
+                &[(NETWORK, "")],
+            );
+            let networks = summary
+                .network_settings
+                .as_mut()
+                .and_then(|settings| settings.networks.as_mut())
+                .unwrap();
+            let settings = networks.get_mut(NETWORK).unwrap();
+            settings.ip_address = v4.map(str::to_string);
+            settings.global_ipv6_address = v6.map(str::to_string);
+            summary
+        };
+        let only_v6 = [endpoint(Some(""), Some("fd00::5"))];
+        assert_eq!(
+            steered_containers(&only_v6, NETWORK, ours),
+            vec![SteeredContainer {
+                environment_id: 7,
+                address: "fd00::5".parse().unwrap(),
+            }]
+        );
+        let dual = [endpoint(Some("172.18.0.5"), Some("fd00::5"))];
+        assert_eq!(steered_containers(&dual, NETWORK, ours).len(), 2);
     }
 
     /// Every steered container is in the table, so one whose environment

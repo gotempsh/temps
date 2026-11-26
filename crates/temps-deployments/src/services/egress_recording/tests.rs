@@ -697,3 +697,78 @@ async fn a_microvm_environment_says_it_cannot_record() {
     );
     assert!(!f.recording(PRODUCTION).await, "nothing was written");
 }
+
+/// A replica stopped from the console keeps its row, but no longer places
+/// its environment on that node: an environment whose only replica was
+/// stopped on a node that cannot record is no longer refused for it, and
+/// can opt in for its next deployment.
+#[tokio::test]
+async fn a_stopped_replica_no_longer_places_its_environment() {
+    let Some(f) = fixture().await else { return };
+    let wired = f.wired();
+    let before = wired
+        .environments
+        .status(OTHER_PROJECT, ELSEWHERE)
+        .await
+        .unwrap();
+    assert_eq!(before.reason_code.as_deref(), Some("unsupported_platform"));
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE deployment_containers SET status = 'stopped', finished_at = now() \
+             WHERE node_id = {}",
+            f.mac
+        ))
+        .await
+        .unwrap();
+    let after = wired
+        .environments
+        .status(OTHER_PROJECT, ELSEWHERE)
+        .await
+        .unwrap();
+    assert!(after.nodes.is_empty(), "{after:?}");
+    assert_ne!(after.reason_code.as_deref(), Some("unsupported_platform"));
+}
+
+/// A static site's deployments publish files and start no container, so
+/// nothing is ever steered: it says it cannot record instead of accepting
+/// the setting and recording nothing.
+#[tokio::test]
+async fn a_static_site_says_it_cannot_record() {
+    let Some(f) = fixture().await else { return };
+    let wired = f.wired();
+    // A preset that builds static output: published as files, no replica.
+    for preset in ["vite"] {
+        f.db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE projects SET preset = '{preset}' WHERE id = {PROJECT}"
+            ))
+            .await
+            .unwrap();
+        let status = wired
+            .environments
+            .status(PROJECT, PRODUCTION)
+            .await
+            .unwrap();
+        assert_eq!(
+            status.reason_code.as_deref(),
+            Some("not_recordable"),
+            "{preset}: {status:?}"
+        );
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("static site")),
+            "{preset}: {status:?}"
+        );
+    }
+    let refused = wired
+        .environments
+        .set_enabled(PROJECT, PRODUCTION, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, EgressRecordingError::NotRecordable { .. }),
+        "{refused:?}"
+    );
+}

@@ -1348,12 +1348,16 @@ where
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
             Ok(Ok(n)) => n,
         };
-        if writer.write_all(&buf[..n]).await.is_err() {
-            break;
+        // A side that stops reading would hold the write, and with it the
+        // connection's slot and buffers, for ever: it has the same idle
+        // deadline as a side that stops sending.
+        match tokio::time::timeout(idle, writer.write_all(&buf[..n])).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => break,
         }
         total += n as u64;
     }
-    let _ = writer.shutdown().await;
+    let _ = tokio::time::timeout(idle, writer.shutdown()).await;
     total
 }
 

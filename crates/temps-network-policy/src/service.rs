@@ -911,8 +911,11 @@ impl NetworkPolicyService {
                 // The mode is known whatever happens to the snapshot: an
                 // agent leaving enforcement must hear `off` and remove its
                 // rules even when a row its snapshot reads cannot be read.
-                let (snapshot, digest) = match self.cached_snapshot(node_id, revision).await {
-                    Ok(built) => built,
+                let answer = match self
+                    .off_snapshot(node_id, revision, report.held_snapshot.as_deref())
+                    .await
+                {
+                    Ok(answer) => answer,
                     Err(error) => {
                         tracing::warn!(
                             node_id,
@@ -927,21 +930,21 @@ impl NetworkPolicyService {
                         });
                     }
                 };
-                if report.held_snapshot.as_deref() == Some(digest.as_str()) {
-                    return Ok(NodePolicy {
+                Ok(match answer {
+                    crate::idle::OffSnapshot::Held(digest) => NodePolicy {
                         mode,
                         snapshot: None,
                         snapshot_digest: Some(digest),
                         unchanged: true,
                         protocol,
-                    });
-                }
-                Ok(NodePolicy {
-                    mode,
-                    snapshot: Some((*snapshot).clone()),
-                    snapshot_digest: Some(digest),
-                    unchanged: false,
-                    protocol,
+                    },
+                    crate::idle::OffSnapshot::Fresh(snapshot, digest) => NodePolicy {
+                        mode,
+                        snapshot: Some((*snapshot).clone()),
+                        snapshot_digest: Some(digest),
+                        unchanged: false,
+                        protocol,
+                    },
                 })
             }
         }

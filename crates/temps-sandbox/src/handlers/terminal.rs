@@ -369,10 +369,11 @@ fn wrap_shell(cmd: &str, environ: Option<&str>) -> String {
             "if [ -r {path} ]; then temps_soh=$(printf '\\001'); \
              while IFS= read -r kv; do case \"${{kv%%=*}}\" in \
              {KEEP_SHELL_VARS}|\"\"|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; \
+             eval \"temps_set=\\${{${{kv%%=*}}+x}}\"; [ -n \"$temps_set\" ] && continue; \
              case \"$kv\" in *\"$temps_soh\"*) kv=$(printf '%sx' \"$kv\" | tr '\\001' '\\n'); \
              kv=${{kv%x}} ;; esac; export \"$kv\" 2>/dev/null; \
              done <<TEMPS_ENVIRON\n$(tr '\\n\\000' '\\001\\n' < {path})\nTEMPS_ENVIRON\n\
-             unset kv temps_soh; fi; "
+             unset kv temps_soh temps_set; fi; "
         ),
         None => String::new(),
     };
@@ -1170,6 +1171,21 @@ mod tests {
                 "missing {expected} in:\n{env}"
             );
         }
+    }
+
+    /// A variable the shell already has (a newer agent passes the
+    /// environment on) is left as it is: the import cannot tell a value's
+    /// own SOH byte from an encoded newline, so it must never replace a
+    /// value that arrived whole. One the shell lacks is still imported.
+    #[test]
+    fn an_inherited_value_is_never_replaced() {
+        let value = "a\u{1}b";
+        let out = shell_output_after_import(
+            &[("SAMPLE", value), ("MISSING", "imported")],
+            "printf '[%s][%s]' \"$SAMPLE\" \"$MISSING\"",
+            &[("SAMPLE", value)],
+        );
+        assert_eq!(out, format!("[{value}][imported]"));
     }
 
     /// A name a process environment can hold but a shell cannot export

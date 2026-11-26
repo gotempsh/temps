@@ -32,9 +32,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter,
-    QuerySelect, RelationTrait, Set,
+    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter, QuerySelect, RelationTrait,
 };
 use temps_entities::environment_workload_isolation::{self, EnvironmentWorkloadIsolation};
 use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
@@ -119,6 +119,24 @@ impl RecordedEgress {
     }
 }
 
+/// Whether `project` deploys as files rather than a running container: its
+/// preset has nothing to build, or builds static output. What the planner
+/// decides from; an unreadable preset is treated as a container.
+fn serves_files(project: &projects::Model) -> bool {
+    match temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref()) {
+        Ok(Some(preset)) => !preset.needs_container_build() || preset.static_output_dir().is_some(),
+        _ => false,
+    }
+}
+
+/// A container row that runs, or has not said yet: not stopped, exited,
+/// being removed or retired.
+pub(crate) fn running_container() -> sea_orm::Condition {
+    sea_orm::Condition::any()
+        .add(deployment_containers::Column::Status.is_null())
+        .add(deployment_containers::Column::Status.eq("running"))
+}
+
 /// The environments in `rows` as the recording service sees workloads,
 /// with the nodes their live containers are on (one query for all).
 async fn recorded(
@@ -139,6 +157,10 @@ async fn recorded(
         )
         .filter(deployments::Column::EnvironmentId.is_in(rows.iter().map(|row| row.id)))
         .filter(deployment_containers::Column::DeletedAt.is_null())
+        // Only a running replica places the environment on a node: one
+        // stopped from the console keeps its row, and neither blocks nor
+        // allows recording on the node it no longer runs on.
+        .filter(running_container())
         .into_tuple()
         .all(db)
         .await
@@ -148,19 +170,25 @@ async fn recorded(
     // A Compose stack's containers are started by Compose, not by the
     // deploy path that steers replicas to the recorder: nothing would ever
     // reach it, so such an environment cannot record at all.
-    let compose: HashSet<i32> = projects::Entity::find()
-        .select_only()
-        .column(projects::Column::Id)
+    // A static site is published as files and served by the proxy: its
+    // deployment starts no replica, so nothing is ever steered either. The
+    // same preset checks the deployment planner makes.
+    let mut compose: HashSet<i32> = HashSet::new();
+    let mut static_sites: HashSet<i32> = HashSet::new();
+    for project in projects::Entity::find()
         .filter(projects::Column::Id.is_in(rows.iter().map(|row| row.project_id)))
-        .filter(projects::Column::Preset.eq(Preset::DockerCompose))
-        .into_tuple::<i32>()
         .all(db)
         .await
         .map_err(EgressRecordingError::db(
             "reading how an environment is deployed",
         ))?
-        .into_iter()
-        .collect();
+    {
+        if project.preset == Preset::DockerCompose {
+            compose.insert(project.id);
+        } else if serves_files(&project) {
+            static_sites.insert(project.id);
+        }
+    }
     // Only `enforce` honours an environment's isolation, and a replica in a
     // microVM is never a container on the deployment network: the recorder
     // cannot tell its connections apart, so it is never steered and could
@@ -213,6 +241,13 @@ async fn recorded(
                         "a Docker Compose environment's containers are started by Compose, \
                          which does not send them through the egress proxy; only image \
                          deployments record"
+                            .to_string(),
+                    )
+                } else if static_sites.contains(&row.project_id) {
+                    Some(
+                        "a static site is published as files and served by the proxy: its \
+                         deployments start no container to make outbound connections, so \
+                         there is nothing to record"
                             .to_string(),
                     )
                 } else {
@@ -289,22 +324,21 @@ impl WorkloadEgressAdapter for EnvironmentEgressAdapter {
         &self,
         workload: WorkloadRef,
         enabled: bool,
-    ) -> Result<(), EgressRecordingError> {
+    ) -> Result<bool, EgressRecordingError> {
         let id = i32::try_from(workload.id).map_err(|_| EgressRecordingError::NotFound {
             noun: NOUN,
             id: workload.id.to_string(),
         })?;
-        environments::ActiveModel {
-            id: Set(id),
-            egress_recording: Set(enabled),
-            ..Default::default()
-        }
-        .update(self.db.as_ref())
-        .await
-        .map_err(EgressRecordingError::db(
-            "updating an environment's egress recording",
-        ))?;
-        Ok(())
+        let result = environments::Entity::update_many()
+            .col_expr(environments::Column::EgressRecording, Expr::value(enabled))
+            .filter(environments::Column::Id.eq(id))
+            .filter(environments::Column::EgressRecording.ne(enabled))
+            .exec(self.db.as_ref())
+            .await
+            .map_err(EgressRecordingError::db(
+                "updating an environment's egress recording",
+            ))?;
+        Ok(result.rows_affected == 1)
     }
 
     /// Containers already going through the recorder start or stop being

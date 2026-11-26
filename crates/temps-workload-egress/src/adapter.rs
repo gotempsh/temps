@@ -55,15 +55,20 @@ pub trait WorkloadEgressAdapter: Send + Sync {
     /// that does not exist is left out.
     async fn load(&self, ids: &[i64]) -> Result<Vec<RecordedWorkload>, EgressRecordingError>;
 
-    /// Stores the opt-in on the row it configures.
+    /// Stores the opt-in on the row it configures, only where it differs,
+    /// and says whether this write changed it. Of two requests racing to
+    /// the same value only one changes it, and only that one is a change.
     async fn set_enabled(
         &self,
         workload: WorkloadRef,
         enabled: bool,
-    ) -> Result<(), EgressRecordingError>;
+    ) -> Result<bool, EgressRecordingError>;
 
-    /// Called after the opt-in changed, with the workload as it is now: the
-    /// place to steer its traffic to or away from the recorder on this
-    /// host. Nothing by default.
+    /// Called after every write of the opt-in, changed or not, with the
+    /// workload as it is now: the place to steer its traffic to or away
+    /// from the recorder on this host. It must be safe to repeat: setting
+    /// the same value again repairs a change that was stored but not
+    /// followed (the control plane stopped in between). Nothing by
+    /// default.
     async fn changed(&self, _workload: &RecordedWorkload) {}
 }

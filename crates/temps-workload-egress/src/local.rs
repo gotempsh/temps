@@ -235,7 +235,11 @@ pub struct LocalEgressRecorder {
     refreshed: Mutex<Refreshed>,
     /// This installation, named in what it steers here.
     installation: crate::steering::InstallationId,
-    wake: Notify,
+    wake: Arc<Notify>,
+    /// Every task this recorder started, aborted when it is dropped: its
+    /// loops hold it only weakly, so dropping the last reference stops them
+    /// and frees its listeners.
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -263,7 +267,8 @@ impl LocalEgressRecorder {
             last: Mutex::new(HashMap::new()),
             reported: Mutex::new(None),
             refreshed: Mutex::new(Refreshed::default()),
-            wake: Notify::new(),
+            wake: Arc::new(Notify::new()),
+            tasks: Mutex::new(Vec::new()),
             installation,
         })
     }
@@ -302,11 +307,23 @@ impl LocalEgressRecorder {
             sources.len() == 1
         };
         if first {
-            let recorder = self.clone();
-            tokio::spawn(async move { recorder.refresh_loop().await });
+            self.own(tokio::spawn(Self::refresh_loop(
+                Arc::downgrade(self),
+                self.wake.clone(),
+            )));
         }
-        let recorder = self.clone();
-        tokio::spawn(async move { recorder.listen_loop(source, proxy).await });
+        self.own(tokio::spawn(Self::listen_loop(
+            Arc::downgrade(self),
+            source,
+            proxy,
+        )));
+    }
+
+    /// Keeps `task` to abort when this recorder is dropped.
+    fn own<T>(&self, task: tokio::task::JoinHandle<T>) {
+        let mut tasks = lock(&self.tasks);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task.abort_handle());
     }
 
     /// The proxy and its batcher, created once. `None` when the proxy
@@ -333,12 +350,12 @@ impl LocalEgressRecorder {
                             Arc::new(LocalRecordSink::new(self.service.clone())),
                             proxy.stats().clone(),
                         );
-                        tokio::spawn(confirmation.clone().run());
-                        tokio::spawn(EgressBatcher::default().run(
+                        self.own(tokio::spawn(confirmation.clone().run()));
+                        self.own(tokio::spawn(EgressBatcher::default().run(
                             records,
                             confirmation,
                             proxy.stats().clone(),
-                        ));
+                        )));
                         Some(Running { proxy })
                     }
                     Err(error) => {
@@ -388,7 +405,15 @@ impl LocalEgressRecorder {
         }
     }
 
-    async fn listen_loop(self: Arc<Self>, source: Arc<dyn LocalTraffic>, proxy: Arc<EgressProxy>) {
+    /// Listens for `source`'s kind, restarting when the listener stops.
+    /// Holds the recorder only for each step, never while it waits: a
+    /// recorder dropped meanwhile ends the loop at its next step (and its
+    /// `Drop` aborts it, and the listener, at once).
+    async fn listen_loop(
+        recorder: std::sync::Weak<Self>,
+        source: Arc<dyn LocalTraffic>,
+        proxy: Arc<EgressProxy>,
+    ) {
         let kind = source.kind();
         let mut waiting_logged = false;
         loop {
@@ -399,16 +424,24 @@ impl LocalEgressRecorder {
                         info!(%kind, "egress recording waits for this kind's network on this host");
                         waiting_logged = true;
                     }
-                    self.set_serving(
+                    let Some(this) = recorder.upgrade() else {
+                        return;
+                    };
+                    this.set_serving(
                         kind,
                         Err("its network does not exist on this host yet".to_string()),
                     );
+                    drop(this);
                     tokio::time::sleep(REFRESH_INTERVAL).await;
                     continue;
                 }
                 Err(error) => {
                     warn!(%kind, %error, "egress recording: could not find where to listen");
-                    self.set_serving(kind, Err(error));
+                    let Some(this) = recorder.upgrade() else {
+                        return;
+                    };
+                    this.set_serving(kind, Err(error));
+                    drop(this);
                     tokio::time::sleep(REFRESH_INTERVAL).await;
                     continue;
                 }
@@ -418,17 +451,24 @@ impl LocalEgressRecorder {
                     let address = listener
                         .local_addr()
                         .unwrap_or_else(|_| SocketAddr::new(host, RECORDING_PROXY_PORT));
-                    // The table first, then the capability, then the
-                    // source: nothing is steered here before it is known.
-                    self.set_serving(kind, Ok(address));
-                    self.refresh().await;
-                    self.report_capability();
-                    info!(%kind, %address, "egress recording proxy serving the control plane's workloads");
-                    // Accepting before the source is told: what it steers
-                    // here must find the proxy already answering.
-                    let serving = tokio::spawn(proxy.clone().serve(listener));
-                    source.started(address).await;
-                    self.wake();
+                    let serving = {
+                        let Some(this) = recorder.upgrade() else {
+                            return;
+                        };
+                        // The table first, then the capability, then the
+                        // source: nothing is steered here before it is known.
+                        this.set_serving(kind, Ok(address));
+                        this.refresh().await;
+                        this.report_capability();
+                        info!(%kind, %address, "egress recording proxy serving the control plane's workloads");
+                        // Accepting before the source is told: what it steers
+                        // here must find the proxy already answering.
+                        let serving = tokio::spawn(proxy.clone().serve(listener));
+                        this.own_abort(serving.abort_handle());
+                        source.started(address).await;
+                        this.wake();
+                        serving
+                    };
                     match serving.await {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
@@ -438,21 +478,29 @@ impl LocalEgressRecorder {
                             warn!(%kind, %address, %error, "egress recording proxy task ended");
                         }
                     }
+                    let Some(this) = recorder.upgrade() else {
+                        return;
+                    };
                     warn!(%kind, %address, "egress recording proxy stopped; restarting it");
-                    self.set_serving(
+                    this.set_serving(
                         kind,
                         Err(format!(
                             "its listener on {address} stopped and is restarting"
                         )),
                     );
-                    self.report_capability();
-                    self.refresh().await;
+                    this.report_capability();
+                    this.refresh().await;
+                    drop(this);
                     source.stopped().await;
                 }
                 Err(error) => {
                     warn!(%kind, %error, "egress recording proxy could not start");
-                    self.set_serving(kind, Err(error));
-                    self.report_capability();
+                    let Some(this) = recorder.upgrade() else {
+                        return;
+                    };
+                    this.set_serving(kind, Err(error));
+                    this.report_capability();
+                    drop(this);
                     // Workloads stop handing traffic to a proxy that is
                     // not there, so they keep their way out.
                     source.stopped().await;
@@ -462,14 +510,24 @@ impl LocalEgressRecorder {
         }
     }
 
-    async fn refresh_loop(self: Arc<Self>) {
+    /// Keeps `task` to abort when this recorder is dropped.
+    fn own_abort(&self, task: tokio::task::AbortHandle) {
+        let mut tasks = lock(&self.tasks);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    async fn refresh_loop(recorder: std::sync::Weak<Self>, wake: Arc<Notify>) {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(REFRESH_INTERVAL) => {}
-                _ = self.wake.notified() => {}
+                _ = wake.notified() => {}
             }
-            self.refresh().await;
-            let sources: Vec<Arc<dyn LocalTraffic>> = lock(&self.sources).clone();
+            let Some(this) = recorder.upgrade() else {
+                return;
+            };
+            this.refresh().await;
+            let sources: Vec<Arc<dyn LocalTraffic>> = lock(&this.sources).clone();
             // Served or not: a source that was told to stop may still have
             // work to finish (a sidecar to re-point without the hand-off).
             for source in sources {
@@ -585,6 +643,16 @@ impl LocalEgressRecorder {
         }
         for kind in read {
             refreshed.read.insert(kind, started);
+        }
+    }
+}
+
+impl Drop for LocalEgressRecorder {
+    /// Stops everything it started: its loops, its listeners (so the port
+    /// is free for a replacement) and its batcher.
+    fn drop(&mut self) {
+        for task in lock(&self.tasks).drain(..) {
+            task.abort();
         }
     }
 }
@@ -988,6 +1056,36 @@ mod tests {
             vec![true, false],
             "node 0 can record exactly while something is served"
         );
+    }
+
+    /// Dropping the last reference to a recorder stops what it started:
+    /// its loops hold it only weakly, and its `Drop` aborts them (the
+    /// listener with them), so nothing keeps running against the old
+    /// service and nothing keeps its port.
+    #[tokio::test]
+    async fn a_dropped_recorder_stops_its_tasks() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let Some(f) = fixture().await else { return };
+        let (recorder, _) = recorder(&f);
+        let source = Source::new(WorkloadKind::Sandbox, "172.30.0.5");
+        recorder.add_source(source.clone()).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!lock(&recorder.tasks).is_empty(), "it started tasks");
+        assert!(Arc::strong_count(&source) > 1, "a task holds the source");
+        let weak = Arc::downgrade(&recorder);
+        drop(recorder);
+        assert!(weak.upgrade().is_none(), "no task kept the recorder alive");
+        for _ in 0..50 {
+            if Arc::strong_count(&source) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(Arc::strong_count(&source), 1, "its listen loop was aborted");
     }
 
     /// The recorder serves only its own port: when it is taken there is no

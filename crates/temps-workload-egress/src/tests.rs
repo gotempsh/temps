@@ -92,11 +92,14 @@ impl WorkloadEgressAdapter for FakeAdapter {
         &self,
         workload: WorkloadRef,
         enabled: bool,
-    ) -> Result<(), EgressRecordingError> {
-        if let Some(row) = self.rows.lock().unwrap().get_mut(&workload.id) {
-            row.enabled = enabled;
-        }
-        Ok(())
+    ) -> Result<bool, EgressRecordingError> {
+        Ok(match self.rows.lock().unwrap().get_mut(&workload.id) {
+            Some(row) if row.enabled != enabled => {
+                row.enabled = enabled;
+                true
+            }
+            _ => false,
+        })
     }
 
     async fn changed(&self, workload: &RecordedWorkload) {
@@ -406,9 +409,25 @@ async fn an_owner_turns_recording_on_and_off_and_the_kind_is_told() {
     assert!(!f.row(ON_WORKER).enabled);
     assert_eq!(
         *f.adapter.changed.lock().unwrap(),
-        vec![(ON_WORKER, true), (ON_WORKER, false)],
-        "the kind steers traffic once per change, not per call"
+        vec![(ON_WORKER, true), (ON_WORKER, true), (ON_WORKER, false)],
+        "the kind is told on every write, so setting a value again repairs a change it \
+         did not follow"
     );
+}
+
+/// Two requests that both read the workload off and both turn it on: only
+/// the one whose write changed the row reports a change; the other is
+/// audited as no change, never as a second off-to-on.
+#[tokio::test]
+async fn of_two_racing_opt_ins_only_one_is_a_change() {
+    let Some(f) = fixture().await else { return };
+    let (service, _) = f.service();
+    let stale = f.row(ON_WORKER);
+    assert!(!stale.enabled);
+    let (first, _) = service.set_enabled(&stale, true).await.unwrap();
+    let (second, _) = service.set_enabled(&stale, true).await.unwrap();
+    assert!(!first, "the first changed it from off");
+    assert!(second, "the second found it already on");
 }
 
 #[tokio::test]

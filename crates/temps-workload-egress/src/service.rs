@@ -411,7 +411,6 @@ impl EgressRecordingService {
         enabled: bool,
     ) -> Result<(bool, EgressRecordingStatus), EgressRecordingError> {
         let adapter = self.adapter(workload.workload.kind)?;
-        let previous = workload.enabled;
         let nodes = self.nodes_of(adapter.as_ref(), workload).await?;
         if enabled {
             if let Some(blocker) = self.blocker(workload, &nodes) {
@@ -440,10 +439,12 @@ impl EgressRecordingService {
             ..workload.clone()
         };
         let status = self.status_of(adapter.as_ref(), &now, nodes).await?;
-        if previous != enabled {
-            adapter.set_enabled(workload.workload, enabled).await?;
-            adapter.changed(&now).await;
-        }
+        // What the row held before is what this write found, not what the
+        // caller read earlier: a request racing another to the same value
+        // changes nothing, and is audited as no change.
+        let changed = adapter.set_enabled(workload.workload, enabled).await?;
+        let previous = if changed { !enabled } else { enabled };
+        adapter.changed(&now).await;
         tracing::info!(
             workload = %workload.workload,
             id = %workload.public_id,

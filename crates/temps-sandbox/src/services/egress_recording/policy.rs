@@ -78,6 +78,33 @@ fn parse_cidr(value: &str) -> Option<Cidr> {
     value.parse::<std::net::IpAddr>().ok().map(Cidr::host)
 }
 
+/// What a sidecar still handing its traffic to the recorder is held to once
+/// its sandbox no longer records (an opt-out the sidecar has not followed
+/// yet): any public destination, on any port, never recorded. The sidecar
+/// applies its sandbox's own policy before handing anything over, so this
+/// widens nothing; it only keeps the sandbox's way out until the sidecar is
+/// re-pointed.
+pub fn stray_policy(subject: WorkloadRef) -> EgressPolicy {
+    let rules = match HostPattern::parse("*") {
+        Ok(any) => vec![EgressRule {
+            id: 0,
+            target: EgressTarget::Host(any),
+            ports: Some(PortRange {
+                start: 1,
+                end: u16::MAX,
+            }),
+            action: Action::Allow,
+        }],
+        Err(_) => Vec::new(),
+    };
+    EgressPolicy {
+        subject,
+        rules,
+        record: false,
+        public_only: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -37,9 +37,9 @@ use sea_orm::{
     QueryFilter, Statement,
 };
 use temps_entities::sandboxes;
+use temps_sandbox_providers::docker::EgressProxyEndpoint;
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::{LocalTraffic, RecordedTraffic};
-use temps_workload_netpol::IdentityMap;
 use tracing::warn;
 
 use super::policy;
@@ -85,6 +85,17 @@ pub fn container_name(public_id: &str) -> String {
     )
 }
 
+/// The container of `row` as the Docker provider names it: after its agent
+/// run for a sandbox an agent run started, after its public id otherwise.
+/// Its sidecar is named after it, so a name built from the wrong one never
+/// matches and the sandbox would record nothing.
+pub fn row_container_name(row: &sandboxes::Model) -> String {
+    match row.agent_run_id {
+        Some(run_id) => format!("{SANDBOX_CONTAINER_PREFIX}{run_id}"),
+        None => container_name(&row.public_id),
+    }
+}
+
 /// A sandbox whose sidecar this host manages and can replace now.
 fn steerable(row: &sandboxes::Model) -> bool {
     row.node_id.is_none() && (row.status == "running" || row.status == "stopped")
@@ -93,12 +104,59 @@ fn steerable(row: &sandboxes::Model) -> bool {
 /// Each sandbox's sidecar addresses on the egress network, by sandbox
 /// container name: one pass over the endpoints, so matching rows against
 /// them costs one lookup each instead of a scan.
-fn endpoints_by_sandbox(endpoints: Vec<(String, IpAddr)>) -> HashMap<String, Vec<IpAddr>> {
-    let mut by_sandbox: HashMap<String, Vec<IpAddr>> = HashMap::with_capacity(endpoints.len());
-    for (sandbox, address) in endpoints {
-        by_sandbox.entry(sandbox).or_default().push(address);
+fn endpoints_by_sandbox(endpoints: &[EgressProxyEndpoint]) -> HashMap<&str, Vec<IpAddr>> {
+    let mut by_sandbox: HashMap<&str, Vec<IpAddr>> = HashMap::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        by_sandbox
+            .entry(endpoint.sandbox.as_str())
+            .or_default()
+            .push(endpoint.address);
     }
     by_sandbox
+}
+
+/// Who a stray hand-off speaks for in the table: no sandbox (ids start at
+/// 1), and never recorded.
+pub const STRAY: WorkloadRef = WorkloadRef {
+    kind: WorkloadKind::Sandbox,
+    id: 0,
+};
+
+/// The table entries for the recorded `rows` and the sidecars listed, and
+/// whether any listed sidecar hands its traffic to the recorder for a
+/// sandbox that no longer records. Those are let through unrecorded
+/// ([`policy::stray_policy`]): an opt-out the sidecar has not followed yet
+/// (the control plane stopped between storing it and replacing the
+/// sidecar) must not leave the sandbox refused as unknown.
+fn traffic_from(
+    rows: &[sandboxes::Model],
+    endpoints: &[EgressProxyEndpoint],
+) -> (RecordedTraffic, bool) {
+    let by_sandbox = endpoints_by_sandbox(endpoints);
+    let mut traffic = RecordedTraffic::default();
+    let mut recorded: HashSet<String> = HashSet::with_capacity(rows.len());
+    for row in rows {
+        let name = row_container_name(row);
+        let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(row.id));
+        for address in by_sandbox.get(name.as_str()).into_iter().flatten() {
+            traffic.identities.insert(subject, *address);
+        }
+        traffic
+            .policies
+            .push(policy::proxy_policy(subject, &row.egress_policy.0));
+        recorded.insert(name);
+    }
+    let mut strays = false;
+    for endpoint in endpoints {
+        if endpoint.hands_off && !recorded.contains(&endpoint.sandbox) {
+            traffic.identities.insert(STRAY, endpoint.address);
+            strays = true;
+        }
+    }
+    if strays {
+        traffic.policies.push(policy::stray_policy(STRAY));
+    }
+    (traffic, strays)
 }
 
 /// The recorded sandboxes of this host, and their sidecars.
@@ -126,6 +184,9 @@ pub struct SandboxTraffic {
     /// sandbox is created, removed, or changes status, opt-in, node or id.
     /// A policy change does not move it, so it reloads by discovering.
     rows: std::sync::Mutex<Option<(i64, Arc<Vec<sandboxes::Model>>)>>,
+    /// Whether the last list found a sidecar handing off for a sandbox that
+    /// no longer records. Starts true: a restart does not know.
+    strays_seen: std::sync::atomic::AtomicBool,
 }
 
 impl SandboxTraffic {
@@ -142,6 +203,7 @@ impl SandboxTraffic {
             resync: std::sync::atomic::AtomicBool::new(false),
             published: std::sync::atomic::AtomicBool::new(false),
             rows: std::sync::Mutex::new(None),
+            strays_seen: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -193,20 +255,37 @@ impl SandboxTraffic {
     /// The recorded rows: read again on `discover` or when the revision
     /// moved, otherwise the last read. O(changes): a refresh with nothing
     /// changed costs one one-row query, not every opted-in row.
+    ///
+    /// A discovery drops the cache before it reads, and a read that fails
+    /// leaves none: a policy change the revision does not follow is never
+    /// answered from rows read before it, even when the read that should
+    /// have followed it failed.
     async fn current_rows(
         &self,
         discover: bool,
     ) -> Result<Arc<Vec<sandboxes::Model>>, sea_orm::DbErr> {
-        let revision = self.revision().await?;
-        if !discover {
+        if discover {
+            self.forget_rows();
+        }
+        let read = async {
+            let revision = self.revision().await?;
             let cached = self.rows.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some((_, rows)) = cached.filter(|(at, _)| *at == revision) {
                 return Ok(rows);
             }
+            let rows = Arc::new(self.recorded_rows().await?);
+            *self.rows.lock().unwrap_or_else(|e| e.into_inner()) = Some((revision, rows.clone()));
+            Ok(rows)
+        };
+        let rows = read.await;
+        if rows.is_err() {
+            self.forget_rows();
         }
-        let rows = Arc::new(self.recorded_rows().await?);
-        *self.rows.lock().unwrap_or_else(|e| e.into_inner()) = Some((revision, rows.clone()));
-        Ok(rows)
+        rows
+    }
+
+    fn forget_rows(&self) {
+        *self.rows.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Replaces sandbox `id`'s sidecar so it matches the recorder's state,
@@ -341,34 +420,25 @@ impl LocalTraffic for SandboxTraffic {
                 return Err(format!("could not read the recorded sandboxes: {e}"));
             }
         };
-        let names: HashSet<String> = rows.iter().map(|r| container_name(&r.public_id)).collect();
+        let names: HashSet<String> = rows.iter().map(row_container_name).collect();
         temps_sandbox_providers::docker::publish_egress_recording(Some((address, names)));
         self.published
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let mut traffic = RecordedTraffic::default();
-        if rows.is_empty() {
-            return Ok(traffic);
+        // With nothing recording the sidecars are listed only while one may
+        // still hand off (the last list found one, or a restart cannot
+        // know) or on a discovery: a quiet host costs no Docker call.
+        if rows.is_empty()
+            && !discover
+            && !self.strays_seen.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(RecordedTraffic::default());
         }
-        let endpoints = endpoints_by_sandbox(
-            temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker)
-                .await
-                .map_err(|e| format!("could not list the sandbox egress proxies: {e}"))?,
-        );
-        let mut identities = IdentityMap::new();
-        for row in rows.iter() {
-            let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(row.id));
-            for address in endpoints
-                .get(&container_name(&row.public_id))
-                .into_iter()
-                .flatten()
-            {
-                identities.insert(subject, *address);
-            }
-            traffic
-                .policies
-                .push(policy::proxy_policy(subject, &row.egress_policy.0));
-        }
-        traffic.identities = identities;
+        let endpoints = temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker)
+            .await
+            .map_err(|e| format!("could not list the sandbox egress proxies: {e}"))?;
+        let (traffic, strays) = traffic_from(&rows, &endpoints);
+        self.strays_seen
+            .store(strays, std::sync::atomic::Ordering::Relaxed);
         Ok(traffic)
     }
 
@@ -528,6 +598,55 @@ mod tests {
         traffic.maintain().await;
         assert_eq!(sidecars.applied_to(), vec![ON_CONTROL_PLANE.1.to_string()]);
         assert!(traffic.pending.lock().unwrap().is_empty());
+    }
+
+    /// A policy change whose discovery failed to read is still followed: the
+    /// next ordinary refresh reads the rows again instead of answering from
+    /// the ones read before the change (the revision does not move with a
+    /// policy).
+    #[tokio::test]
+    async fn a_failed_discovery_is_not_answered_from_old_rows() {
+        let Some(f) = fixture().await else { return };
+        let conn = f.db.connection();
+        conn.execute_unprepared(&format!(
+            "UPDATE sandboxes SET egress_recording = true WHERE id = {}",
+            ON_CONTROL_PLANE.0
+        ))
+        .await
+        .unwrap();
+        let traffic = traffic(f.db.connection_arc(), FlakySidecars::failing(0));
+        if refreshed(&traffic, false).await.is_none() {
+            return;
+        }
+        conn.execute_unprepared(&format!(
+            "UPDATE sandboxes SET egress_policy = jsonb_set(egress_policy::jsonb, '{{mode}}', '\"restricted\"') WHERE id = {}",
+            ON_CONTROL_PLANE.0
+        ))
+        .await
+        .unwrap();
+        conn.execute_unprepared("ALTER TABLE sandboxes RENAME TO sandboxes_unreadable")
+            .await
+            .unwrap();
+        assert!(traffic
+            .refresh(RECORDER.parse().unwrap(), true)
+            .await
+            .is_err());
+        conn.execute_unprepared("ALTER TABLE sandboxes_unreadable RENAME TO sandboxes")
+            .await
+            .unwrap();
+        let after = refreshed(&traffic, false).await.unwrap();
+        let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(ON_CONTROL_PLANE.0));
+        assert_eq!(
+            after.policies[0],
+            policy::proxy_policy(
+                subject,
+                &SandboxEgressPolicy {
+                    mode: EgressMode::Restricted,
+                    rules: Vec::new(),
+                }
+            ),
+            "the changed policy, not the rows read before it"
+        );
     }
 
     /// With nothing changed a refresh reuses the rows it read; a moved
@@ -731,12 +850,18 @@ mod tests {
     /// recorded sandboxes.
     #[test]
     fn endpoints_are_indexed_by_sandbox() {
+        let endpoint = |sandbox: &str, address: &str| EgressProxyEndpoint {
+            sandbox: sandbox.into(),
+            address: address.parse().unwrap(),
+            hands_off: true,
+        };
+        let endpoints = [
+            endpoint("temps-sandbox-a", "172.30.0.2"),
+            endpoint("temps-sandbox-b", "172.30.0.3"),
+            endpoint("temps-sandbox-a", "172.30.0.4"),
+        ];
+        let index = endpoints_by_sandbox(&endpoints);
         let address = |a: &str| a.parse::<IpAddr>().unwrap();
-        let index = endpoints_by_sandbox(vec![
-            ("temps-sandbox-a".into(), address("172.30.0.2")),
-            ("temps-sandbox-b".into(), address("172.30.0.3")),
-            ("temps-sandbox-a".into(), address("172.30.0.4")),
-        ]);
         assert_eq!(
             index["temps-sandbox-a"],
             vec![address("172.30.0.2"), address("172.30.0.4")]
@@ -745,11 +870,114 @@ mod tests {
         assert!(!index.contains_key("temps-sandbox-c"));
     }
 
+    /// A sidecar still handing off for a sandbox that no longer records
+    /// (its opt-out was stored, then the control plane stopped before the
+    /// sidecar was replaced) gets through unrecorded instead of refused as
+    /// unknown. One that does not hand off is not in the table at all.
+    #[test]
+    fn a_stray_hand_off_is_let_through_unrecorded() {
+        let recorded = sandboxes::Model {
+            id: 7,
+            public_id: "sbx_aaaa".into(),
+            ..sandbox_row()
+        };
+        let endpoints = [
+            EgressProxyEndpoint {
+                sandbox: "temps-sandbox-aaaa".into(),
+                address: "172.30.0.2".parse().unwrap(),
+                hands_off: true,
+            },
+            EgressProxyEndpoint {
+                sandbox: "temps-sandbox-bbbb".into(),
+                address: "172.30.0.3".parse().unwrap(),
+                hands_off: true,
+            },
+            EgressProxyEndpoint {
+                sandbox: "temps-sandbox-cccc".into(),
+                address: "172.30.0.4".parse().unwrap(),
+                hands_off: false,
+            },
+        ];
+        let (traffic, strays) = traffic_from(&[recorded], &endpoints);
+        assert!(strays);
+        let table =
+            temps_workload_netpol::EgressTable::build(&traffic.policies, &traffic.identities);
+        let at = |a: &str| {
+            table
+                .lookup(a.parse().unwrap())
+                .map(|rules| (rules.workload, rules.record))
+        };
+        assert_eq!(
+            at("172.30.0.2"),
+            Some((WorkloadRef::new(WorkloadKind::Sandbox, 7), true))
+        );
+        assert_eq!(
+            at("172.30.0.3"),
+            Some((STRAY, false)),
+            "through, never recorded"
+        );
+        assert_eq!(at("172.30.0.4"), None);
+        let (_, none) = traffic_from(&[], &endpoints[2..]);
+        assert!(!none, "nothing hands off: nothing to keep listing for");
+    }
+
     #[test]
     fn container_names_follow_the_sandbox_public_id() {
         assert_eq!(
             container_name("sbx_10a5f86bd8ff859d"),
             "temps-sandbox-10a5f86bd8ff859d"
         );
+    }
+
+    /// A sandbox an agent run started is named after the run, as the
+    /// Docker provider names it, not after its random public id: a name
+    /// built from the public id would never match its sidecar.
+    #[test]
+    fn an_agent_run_sandbox_is_named_after_its_run() {
+        let row = |agent_run_id| sandboxes::Model {
+            public_id: "sbx_10a5f86bd8ff859d".to_string(),
+            agent_run_id,
+            ..sandbox_row()
+        };
+        assert_eq!(row_container_name(&row(Some(42))), "temps-sandbox-42");
+        assert_eq!(
+            row_container_name(&row(None)),
+            "temps-sandbox-10a5f86bd8ff859d"
+        );
+        assert_eq!(
+            temps_sandbox_providers::docker::SANDBOX_NAME_PREFIX,
+            SANDBOX_CONTAINER_PREFIX,
+            "the provider's prefix"
+        );
+    }
+
+    fn sandbox_row() -> sandboxes::Model {
+        let now = chrono::Utc::now();
+        sandboxes::Model {
+            id: 1,
+            public_id: String::new(),
+            user_id: None,
+            agent_run_id: None,
+            name: String::new(),
+            status: "running".into(),
+            lifecycle: String::new(),
+            project_id: None,
+            source_repo_url: None,
+            image: None,
+            work_dir: String::new(),
+            timeout_secs: 0,
+            metadata: None,
+            backend: None,
+            node_id: None,
+            egress_policy: Default::default(),
+            egress_recording: true,
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: None,
+            preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+        }
     }
 }

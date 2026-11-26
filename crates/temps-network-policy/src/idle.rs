@@ -38,14 +38,26 @@ use crate::service::{parse_mode, NetworkPolicyService, CONTROL_PLANE_NODE_ID};
 /// The longest a cached snapshot is reused, whatever the revision says.
 pub const SNAPSHOT_CACHE_MAX_AGE: Duration = Duration::from_secs(300);
 
-/// A node's built snapshot and what it was built from.
+/// What a node's snapshot was built from, its digest, and, for the control
+/// plane's own node only, the snapshot itself. A worker's snapshot holds
+/// every workload in the cluster: keeping one per polling worker would grow
+/// as workers × workloads. A worker that holds the current snapshot is
+/// answered from the digest alone; one that does not gets it built.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedSnapshot {
     revision: i64,
     observed: u64,
     built: Instant,
-    snapshot: Arc<PolicySnapshot>,
+    snapshot: Option<Arc<PolicySnapshot>>,
     digest: String,
+}
+
+/// What an `off` node is answered: that it holds the current snapshot, or
+/// the snapshot to hold.
+#[derive(Debug, Clone)]
+pub enum OffSnapshot {
+    Held(String),
+    Fresh(Arc<PolicySnapshot>, String),
 }
 
 pub(crate) type SnapshotCache = std::sync::Mutex<SnapshotEntries>;
@@ -107,12 +119,32 @@ impl NetworkPolicyService {
 
     /// `node_id`'s snapshot and its digest, rebuilt only when the revision,
     /// the observations shared by other nodes, or [`SNAPSHOT_CACHE_MAX_AGE`]
-    /// says so.
+    /// says so (for a worker, when it does not hold the current one).
     pub async fn cached_snapshot(
         &self,
         node_id: i32,
         revision: i64,
     ) -> Result<(Arc<PolicySnapshot>, String), NetworkPolicyError> {
+        match self.off_snapshot(node_id, revision, None).await? {
+            OffSnapshot::Fresh(snapshot, digest) => Ok((snapshot, digest)),
+            // Never with nothing held; built so the caller gets one.
+            OffSnapshot::Held(_) => {
+                let snapshot = Arc::new(self.node_snapshot(node_id).await?);
+                let digest = snapshot_digest(&snapshot);
+                Ok((snapshot, digest))
+            }
+        }
+    }
+
+    /// What `off` node `node_id`, holding the snapshot of digest `held`, is
+    /// answered. Built only when nothing cached says whether it is current,
+    /// or the node does not hold it and no copy is kept.
+    pub async fn off_snapshot(
+        &self,
+        node_id: i32,
+        revision: i64,
+        held: Option<&str>,
+    ) -> Result<OffSnapshot, NetworkPolicyError> {
         let observed = self.observed_key(node_id);
         {
             let cache = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
@@ -121,7 +153,12 @@ impl NetworkPolicyService {
                     && c.observed == observed
                     && c.built.elapsed() < SNAPSHOT_CACHE_MAX_AGE
             }) {
-                return Ok((hit.snapshot.clone(), hit.digest.clone()));
+                if held == Some(hit.digest.as_str()) {
+                    return Ok(OffSnapshot::Held(hit.digest.clone()));
+                }
+                if let Some(snapshot) = &hit.snapshot {
+                    return Ok(OffSnapshot::Fresh(snapshot.clone(), hit.digest.clone()));
+                }
             }
         }
         let snapshot = Arc::new(self.node_snapshot(node_id).await?);
@@ -134,11 +171,15 @@ impl NetworkPolicyService {
                 revision,
                 observed,
                 built: Instant::now(),
-                snapshot: snapshot.clone(),
+                snapshot: (node_id == CONTROL_PLANE_NODE_ID).then(|| snapshot.clone()),
                 digest: digest.clone(),
             },
         );
-        Ok((snapshot, digest))
+        Ok(if held == Some(digest.as_str()) {
+            OffSnapshot::Held(digest)
+        } else {
+            OffSnapshot::Fresh(snapshot, digest)
+        })
     }
 
     /// A digest of what other nodes share with `node_id` (their live
@@ -191,7 +232,7 @@ mod tests {
             revision: 1,
             observed: 0,
             built,
-            snapshot: Arc::new(PolicySnapshot::default()),
+            snapshot: None,
             digest: "d".into(),
         }
     }
@@ -211,6 +252,38 @@ mod tests {
         let mut held: Vec<i32> = cache.entries.keys().copied().collect();
         held.sort();
         assert_eq!(held, vec![8, 9]);
+    }
+
+    /// A worker's entry keeps its digest, never its snapshot (which holds
+    /// every workload in the cluster): N polling workers cost N digests.
+    /// The control plane's own node keeps its snapshot, read every pass.
+    #[tokio::test]
+    async fn only_the_control_plane_keeps_its_snapshot_cached() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        let (service, queries) = counted(&db).await;
+        let first = service.node_policy(worker, new_agent(None)).await.unwrap();
+        let held = first.snapshot_digest.clone().expect("a digest");
+        let _ = service
+            .cached_snapshot(CONTROL_PLANE_NODE_ID, 0)
+            .await
+            .unwrap();
+        {
+            let cache = service.snapshots.lock().unwrap();
+            assert!(cache.entries[&worker].snapshot.is_none(), "a digest only");
+            assert!(cache.entries[&CONTROL_PLANE_NODE_ID].snapshot.is_some());
+        }
+        queries.store(0, std::sync::atomic::Ordering::Relaxed);
+        let again = service
+            .node_policy(worker, new_agent(Some(&held)))
+            .await
+            .unwrap();
+        assert!(again.unchanged);
+        assert!(
+            queries.load(std::sync::atomic::Ordering::Relaxed) <= 1,
+            "answered from the digest"
+        );
     }
 
     /// Eviction is a sweep at most once per cache age, not a scan on every
@@ -347,7 +420,9 @@ mod tests {
         assert!(idle.unchanged && idle.snapshot.is_none());
         assert_eq!(idle.snapshot_digest.as_deref(), Some(digest.as_str()));
 
-        // Without the digest the cache still saves the build.
+        // Without the digest (an agent that restarted) it is built again: a
+        // worker's snapshot holds every workload, so none is kept per
+        // worker, only its digest.
         queries.store(0, Ordering::Relaxed);
         let resent = service.node_policy(worker, new_agent(None)).await.unwrap();
         let resend_queries = queries.load(Ordering::Relaxed);
@@ -357,7 +432,7 @@ mod tests {
             "idle off pass: before (old agent) {old_queries} queries, {} B answer; \
              full snapshot {build_queries} queries, {} B answer; \
              after (unchanged) {idle_queries} queries, {} B answer; \
-             snapshot from the cache without a digest {resend_queries} queries, {} B",
+             snapshot again without a digest {resend_queries} queries, {} B",
             bytes(&old),
             bytes(&first),
             bytes(&idle),
@@ -368,7 +443,10 @@ mod tests {
             "an old agent's pass is one query, as before"
         );
         assert_eq!(idle_queries, 1, "an unchanged pass is one query");
-        assert_eq!(resend_queries, 1, "a cached snapshot is not rebuilt");
+        assert_eq!(
+            resend_queries, build_queries,
+            "a worker's snapshot is not kept: built again for one that lost it"
+        );
         assert!(
             build_queries > 5,
             "a build reads many tables: {build_queries}"

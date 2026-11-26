@@ -1273,3 +1273,21 @@ fn a_public_only_policy_refuses_private_addresses_even_inside_an_allowed_cidr() 
         Ok(())
     );
 }
+
+/// A side that stops reading (a client that leaves a large response
+/// unread, its socket open) releases the pump, and with it the
+/// connection's slot and buffers, at the idle deadline instead of never.
+#[tokio::test(start_paused = true)]
+async fn a_side_that_stops_reading_releases_the_pump_at_the_idle_deadline() {
+    let (mut source, mut reader) = tokio::io::duplex(64);
+    // A peer that never reads: its buffer fills after eight bytes.
+    let (mut writer, _never_reads) = tokio::io::duplex(8);
+    source.write_all(&[7u8; 64]).await.unwrap();
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64];
+        pump(&mut reader, &mut writer, &mut buf, Duration::from_secs(5)).await
+    });
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(task.is_finished(), "still blocked on a write nobody reads");
+    drop(source);
+}
