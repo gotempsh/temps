@@ -633,10 +633,7 @@ impl ExternalServiceManager {
         })?;
 
         let pg_cluster = match service_type {
-            ServiceType::Postgres => {
-                let docker = self.require_docker()?;
-                PostgresClusterService::new(service.name.clone(), docker)
-            }
+            ServiceType::Postgres => PostgresClusterService::new(service.name.clone()),
             _ => {
                 return Err(ExternalServiceError::ParameterValidationFailed {
                     service_id,

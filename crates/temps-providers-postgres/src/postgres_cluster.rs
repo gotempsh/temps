@@ -3,11 +3,9 @@
 
 use super::error::{EngineError, Result};
 use async_trait::async_trait;
-use bollard::Docker;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::info;
 
 use super::{
@@ -27,10 +25,13 @@ pub const DEFAULT_CLUSTER_IMAGE: &str = "gotempsh/postgres-ha:18-bookworm-walg";
 ///
 /// Each member is a separate Docker container that can run on different worker nodes.
 /// pg_autoctl handles replication setup, health monitoring, and automatic failover.
+///
+/// The service only builds member specifications and scripts; it never talks
+/// to a Docker daemon itself. Members are created by the provider manager on
+/// the engine of the node each one is placed on, so building it needs no
+/// local Docker handle (a `--profile control-plane` server has none).
 pub struct PostgresClusterService {
     name: String,
-    #[allow(dead_code)] // injected but not used yet
-    docker: Arc<Docker>,
 }
 
 /// Configuration for a PostgreSQL HA cluster.
@@ -659,8 +660,8 @@ impl AuthUpgradeStep {
 }
 
 impl PostgresClusterService {
-    pub fn new(name: String, docker: Arc<Docker>) -> Self {
-        Self { name, docker }
+    pub fn new(name: String) -> Self {
+        Self { name }
     }
 
     /// Container name for the monitor member.
@@ -1653,13 +1654,7 @@ rm -f "$HBA""#
 
     #[test]
     fn test_container_naming() {
-        let service = PostgresClusterService::new(
-            "my-db".to_string(),
-            Arc::new(Docker::connect_with_defaults().unwrap_or_else(|_| {
-                // Fallback for tests without Docker
-                Docker::connect_with_local_defaults().unwrap()
-            })),
-        );
+        let service = PostgresClusterService::new("my-db".to_string());
 
         assert_eq!(service.monitor_container_name(), "postgres-my-db-monitor");
         assert_eq!(service.node_container_name(1), "postgres-my-db-1");
@@ -1668,9 +1663,7 @@ rm -f "$HBA""#
 
     #[test]
     fn test_valid_cluster_roles() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
         assert!(service.supports_cluster());
         assert_eq!(
             service.valid_cluster_roles(),
@@ -1717,9 +1710,7 @@ rm -f "$HBA""#
 
     #[test]
     fn test_cluster_connection_string() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
 
         let members = vec![
             ClusterMemberInfo {
@@ -1793,10 +1784,7 @@ exit 0
         std::fs::set_permissions(gosu, std::fs::Permissions::from_mode(0o755)).unwrap();
         // The command generator never contacts Docker; use an HTTP client
         // constructor that does not require a local socket to exist.
-        let docker =
-            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
-                .unwrap();
-        let service = PostgresClusterService::new("test".into(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".into());
         let script = service.monitor_command()[2].replace(
             "/var/lib/postgresql/monitor",
             dir.path().join("monitor").to_str().unwrap(),
@@ -2164,10 +2152,7 @@ exit 0
     /// `pg_autoctl run` to start PostgreSQL on a freshly initialized primary.
     #[test]
     fn entrypoint_keeps_waiting_for_postgres_before_setting_the_replicator_password() {
-        let docker =
-            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
-                .unwrap();
-        let service = PostgresClusterService::new("test".into(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".into());
         let entrypoint = &service.node_command()[2];
         assert!(!entrypoint.contains("TEMPS_AUTH_UPGRADE=1"));
         for step in [AuthUpgradeStep::NodePrepare, AuthUpgradeStep::NodeEnforce] {
@@ -2218,8 +2203,7 @@ exit 0
 
     #[test]
     fn member_commands_clear_stale_pidfiles_before_running() {
-        let docker = Docker::connect_with_local_defaults().unwrap();
-        let svc = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        let svc = PostgresClusterService::new("ha-pg".to_string());
         for script in [&svc.monitor_command()[2], &svc.node_command()[2]] {
             let cleanup = script
                 .find(STALE_PIDFILE_CLEANUP)
@@ -2370,9 +2354,7 @@ exit 0
 
     #[test]
     fn test_monitor_command_contains_ssl() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
         let cmd = service.monitor_command();
         let script = &cmd[2];
         assert!(script.contains("gosu postgres pg_autoctl create monitor"));
@@ -2391,9 +2373,7 @@ exit 0
 
     #[test]
     fn test_node_command_contains_monitor_uri() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
         let cmd = service.node_command();
         let script = &cmd[2];
         assert!(script.contains("gosu postgres pg_autoctl create postgres"));
@@ -2419,10 +2399,7 @@ exit 0
 
     /// Service whose command generators never contact Docker.
     fn offline_service() -> PostgresClusterService {
-        let docker =
-            Docker::connect_with_http("http://127.0.0.1:1", 120, bollard::API_DEFAULT_VERSION)
-                .unwrap();
-        PostgresClusterService::new("test".into(), Arc::new(docker))
+        PostgresClusterService::new("test".into())
     }
 
     /// The `pg_hba` lines a script appends for the application catch-all.
@@ -2732,9 +2709,7 @@ host app_db app_user 10.0.0.0/8 md5
 
     #[test]
     fn test_build_member_params_monitor() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("my-db".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("my-db".to_string());
         let config = PostgresClusterConfig {
             database: "postgres".to_string(),
             username: "postgres".to_string(),
@@ -2802,9 +2777,7 @@ host app_db app_user 10.0.0.0/8 md5
     fn ipv6_monitor_address_yields_a_parseable_monitor_uri() {
         use std::str::FromStr;
 
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("ha-pg".to_string());
         let config: PostgresClusterConfig =
             serde_json::from_value(serde_json::json!({ "password": "secret" })).unwrap();
         let spec = ClusterMemberSpec {
@@ -2840,9 +2813,7 @@ host app_db app_user 10.0.0.0/8 md5
     fn ipv6_members_yield_a_parseable_cluster_connection_string() {
         use std::str::FromStr;
 
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("ha-pg".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("ha-pg".to_string());
         let member = |hostname: &str, port: i32| ClusterMemberInfo {
             role: "replica".to_string(),
             hostname: hostname.to_string(),
@@ -2877,9 +2848,7 @@ host app_db app_user 10.0.0.0/8 md5
 
     #[test]
     fn test_build_member_params_data_node() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("my-db".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("my-db".to_string());
         let config = PostgresClusterConfig {
             database: "myapp".to_string(),
             username: "admin".to_string(),
@@ -2949,7 +2918,9 @@ mod scram_docker_tests {
         CreateContainerOptionsBuilder, LogsOptions, RemoveContainerOptions, RenameContainerOptions,
         StartContainerOptions, StopContainerOptions,
     };
+    use bollard::Docker;
     use futures::{FutureExt, StreamExt};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     const MONITOR_PGDATA: &str = "/var/lib/postgresql/monitor";
@@ -3415,7 +3386,7 @@ mod scram_docker_tests {
             return;
         };
         let suffix = &fx.network[fx.network.len() - 8..];
-        let svc = PostgresClusterService::new(format!("scramit{suffix}"), fx.docker.clone());
+        let svc = PostgresClusterService::new(format!("scramit{suffix}"));
         let auth = ClusterAuthSecrets::generate();
         let config = PostgresClusterConfig {
             database: "appdb".to_string(),
@@ -3655,7 +3626,7 @@ mod scram_docker_tests {
             let mut env = auth.env();
             env.insert("MONITOR_HOSTNAME".into(), monitor.clone());
             env.insert("MONITOR_PORT".into(), "5432".into());
-            let svc = PostgresClusterService::new("test".into(), fx.docker.clone());
+            let svc = PostgresClusterService::new("test".into());
             fx.recreate_with_volume(&monitor, &env, svc.monitor_command()).await;
             fx.wait_for(&monitor, &n1, "primary", Duration::from_secs(120)).await;
             fx.wait_for(&monitor, &n2, "secondary", Duration::from_secs(120)).await;
