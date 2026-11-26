@@ -15210,6 +15210,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sqlx 0.8.6",
+ "stringprep",
  "tar",
  "tempfile",
  "temps-core",

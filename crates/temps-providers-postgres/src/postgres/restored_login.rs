@@ -8,13 +8,14 @@
 //! restored server rejects the destination's configured login, and the
 //! restore cannot be verified. Before verifying, Temps connects over the
 //! container's local socket (which the image trusts) and sets the configured
-//! user's password, creating the user when the backup has none by that name.
+//! user's password, creating the user when the backup has none by that name,
+//! and creates the configured database when the backup has none by that name.
 //! Every other role keeps the password it had.
 //!
-//! The password reaches PostgreSQL as a SCRAM-SHA-256 verifier computed here,
-//! so the statement never carries it in plain text, even if the restored
-//! configuration logs every statement. The session also turns statement
-//! logging off before the change.
+//! The password reaches PostgreSQL as a SCRAM-SHA-256 verifier computed here
+//! from its SASLprep form, as PostgreSQL computes it, so the statement never
+//! carries it in plain text, even if the restored configuration logs every
+//! statement. The session also turns statement logging off before the change.
 
 use super::*;
 use crate::externalsvc::exec_util::run_exec_as;
@@ -35,6 +36,10 @@ const RESTORED_LOGIN_WAIT_SECONDS: u32 = 90;
 /// Prefix of the lines the login script prints, one per restored login role.
 const RESTORED_ROLE_LINE: &str = "temps-restored-role ";
 
+/// Prefix of the line the login script prints when it created the configured
+/// database.
+const CREATED_DATABASE_LINE: &str = "temps-created-database ";
+
 /// Prefix of the line that ends the login script: `set`, `no-local-login`
 /// or `still-recovering`. A failed SQL statement exits non-zero instead.
 const OUTCOME_LINE: &str = "temps-login-outcome ";
@@ -43,7 +48,10 @@ const OUTCOME_LINE: &str = "temps-login-outcome ";
 /// configured user, `postgres` or a role named in the restored catalogs, a
 /// superuser preferred) and leave recovery, then sets the
 /// configured user's password from `$TEMPS_LOGIN_SECRET`, creating the user
-/// as a superuser when the backup has none by that name. Prints every role
+/// as a superuser when the backup has none by that name, and creates the
+/// configured database `$TEMPS_LOGIN_DATABASE`, owned by that user, when the
+/// backup has none by that name (printing [`CREATED_DATABASE_LINE`]): the
+/// restore is verified, and Temps connects, through it. Prints every role
 /// that can log in, prefixed with [`RESTORED_ROLE_LINE`], then its
 /// [`OUTCOME_LINE`]. Values arrive in the environment and as psql variables,
 /// never in the script text.
@@ -119,7 +127,8 @@ while :; do
 done
 rm -f "$err"
 psql -X -w -qAt -v ON_ERROR_STOP=1 -U "$who" -d template1 \
-  -v role="$TEMPS_LOGIN_ROLE" -v secret="$TEMPS_LOGIN_SECRET" <<'SQL' || exit $?
+  -v role="$TEMPS_LOGIN_ROLE" -v secret="$TEMPS_LOGIN_SECRET" \
+  -v database="$TEMPS_LOGIN_DATABASE" <<'SQL' || exit $?
 SET log_statement = 'none';
 SET log_min_duration_statement = -1;
 SET log_min_duration_sample = -1;
@@ -130,6 +139,13 @@ SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role')
   THEN format('ALTER ROLE %I WITH LOGIN PASSWORD %L', :'role', :'secret')
   ELSE format('CREATE ROLE %I WITH SUPERUSER LOGIN PASSWORD %L', :'role', :'secret')
 END
+\gexec
+SELECT 'temps-created-database ' || :'database'
+  WHERE :'database' <> ''
+    AND NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database');
+SELECT format('CREATE DATABASE %I OWNER %I', :'database', :'role')
+  WHERE :'database' <> ''
+    AND NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'database')
 \gexec
 SELECT 'temps-restored-role ' || rolname FROM pg_roles
   WHERE rolcanlogin AND rolname !~ '^pg_' ORDER BY rolname;
@@ -159,17 +175,18 @@ impl From<RestoredLoginError> for EngineError {
 /// `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` (RFC 5802,
 /// RFC 7677).
 ///
-/// PostgreSQL normalises a password with SASLprep before hashing it, which
-/// changes nothing for ASCII. A non-ASCII password returns `None`, and the
-/// caller lets the server hash it instead.
+/// The password is hashed in the form PostgreSQL hashes it
+/// ([`scram_password`]). `None` only for a password SASLprep maps to nothing,
+/// which the caller leaves to the server to hash.
 pub(super) fn scram_sha256_verifier(
     password: &str,
     salt: &[u8],
     iterations: u32,
 ) -> Option<String> {
-    if !password.is_ascii() || iterations == 0 {
+    if iterations == 0 {
         return None;
     }
+    let password = scram_password(password)?;
     let salted = pbkdf2_hmac_sha256(password.as_bytes(), salt, iterations)?;
     let client_key = hmac_sha256(&salted, b"Client Key")?;
     let stored_key = Sha256::digest(client_key);
@@ -180,6 +197,22 @@ pub(super) fn scram_sha256_verifier(
         BASE64.encode(stored_key),
         BASE64.encode(server_key),
     ))
+}
+
+/// What PostgreSQL hashes for `password` (`pg_saslprep` in its
+/// `src/common/saslprep.c`), and what libpq and sqlx send when signing in:
+/// ASCII as it is; otherwise its SASLprep form (RFC 4013), or the password
+/// itself when SASLprep refuses it (a prohibited or unassigned character).
+/// `None` when SASLprep maps it to nothing.
+fn scram_password(password: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if password.is_ascii() {
+        return Some(std::borrow::Cow::Borrowed(password));
+    }
+    match stringprep::saslprep(password) {
+        Ok(prepared) if prepared.is_empty() => None,
+        Ok(prepared) => Some(prepared),
+        Err(_) => Some(std::borrow::Cow::Borrowed(password)),
+    }
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> Option<[u8; 32]> {
@@ -205,9 +238,9 @@ fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32) -> Option<[
     Some(result)
 }
 
-/// What the login step sends as the new password: a verifier for an ASCII
-/// password, or the password itself for the server to hash (see
-/// [`scram_sha256_verifier`]).
+/// What the login step sends as the new password: a verifier, or, for a
+/// password SASLprep maps to nothing, the password itself for the server to
+/// hash (see [`scram_sha256_verifier`]).
 fn login_secret(password: &str) -> std::result::Result<String, String> {
     let mut salt = [0u8; 16];
     use rand::TryRng;
@@ -216,6 +249,13 @@ fn login_secret(password: &str) -> std::result::Result<String, String> {
         .map_err(|error| format!("could not generate a password salt: {error}"))?;
     Ok(scram_sha256_verifier(password, &salt, SCRAM_ITERATIONS)
         .unwrap_or_else(|| password.to_string()))
+}
+
+/// The database the login script created, when it created one.
+fn created_database(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .find_map(|line| line.trim_end().strip_prefix(CREATED_DATABASE_LINE))
 }
 
 /// The roles the login script reported, in its order.
@@ -256,6 +296,7 @@ impl PostgresService {
         let env = vec![
             format!("TEMPS_LOGIN_ROLE={}", config.username),
             format!("TEMPS_LOGIN_SECRET={secret}"),
+            format!("TEMPS_LOGIN_DATABASE={}", config.database),
         ];
         let script = set_login_script();
         let result = run_exec_as(
@@ -270,6 +311,14 @@ impl PostgresService {
         let output = result.map_err(|error| failed(error.to_string()))?.output;
         match login_outcome(&output) {
             Some("set") => {
+                if let Some(database) = created_database(&output) {
+                    info!(
+                        service = %self.name,
+                        container = container_name,
+                        database,
+                        "The restored data had no configured database: created it empty"
+                    );
+                }
                 let roles = restored_roles(&output);
                 info!(
                     service = %self.name,
@@ -335,12 +384,35 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_passwords_are_left_to_the_server_to_hash() {
-        assert_eq!(scram_sha256_verifier("contraseña", b"salt", 4096), None);
-        assert_eq!(login_secret("contraseña").as_deref(), Ok("contraseña"));
-        assert!(login_secret("plain-ascii")
-            .expect("salt")
-            .starts_with("SCRAM-SHA-256$4096:"));
+    fn non_ascii_passwords_are_hashed_in_their_saslprep_form() {
+        // Fullwidth letters and a no-break space normalise to the plain
+        // password, as PostgreSQL and libpq normalise them.
+        let salt = b"0123456789abcdef";
+        let plain = scram_sha256_verifier("contraseña pass", salt, 4096);
+        assert!(plain.is_some());
+        assert_eq!(
+            scram_sha256_verifier("ｃｏｎｔｒａｓｅñａ\u{a0}pass", salt, 4096),
+            plain
+        );
+        // A soft hyphen maps to nothing.
+        assert_eq!(
+            scram_sha256_verifier("contra\u{ad}seña pass", salt, 4096),
+            plain
+        );
+        // SASLprep refuses a private-use character: the password is hashed
+        // as it is, as PostgreSQL does.
+        assert_eq!(
+            scram_password("clé\u{e000}").as_deref(),
+            Some("clé\u{e000}")
+        );
+        // Nothing left after SASLprep: the server hashes it.
+        assert_eq!(scram_sha256_verifier("\u{ad}", salt, 4096), None);
+
+        for password in ["contraseña", "plain-ascii"] {
+            let secret = login_secret(password).expect("salt");
+            assert!(secret.starts_with("SCRAM-SHA-256$4096:"), "{password}");
+            assert!(!secret.contains(password));
+        }
     }
 
     #[test]
@@ -361,6 +433,15 @@ mod tests {
             Some("no-local-login")
         );
         assert_eq!(login_outcome("psql: error"), None);
+    }
+
+    #[test]
+    fn a_created_database_is_read_from_its_marked_line() {
+        assert_eq!(
+            created_database("temps-created-database appdb\ntemps-login-outcome set\n"),
+            Some("appdb")
+        );
+        assert_eq!(created_database("temps-login-outcome set\n"), None);
     }
 
     #[test]
@@ -389,6 +470,7 @@ mod tests {
         }
         assert!(script.contains(":'secret'"));
         assert!(script.contains("\"$TEMPS_LOGIN_SECRET\""));
+        assert!(script.contains("\"$TEMPS_LOGIN_DATABASE\""));
     }
 
     fn hex_string(bytes: &[u8]) -> String {
@@ -557,6 +639,37 @@ mod tests {
             )
             .await?;
             assert!(stored.trim().starts_with("SCRAM-SHA-256$4096:"), "{stored}");
+
+            // A non-ASCII password: PostgreSQL accepts it as typed and in
+            // its normalised form, so the verifier was computed the way the
+            // server and libpq compute it.
+            config.password = "ｃｏｎｔｒａｓｅñａ-clé".to_string();
+            service
+                .set_configured_login(&container, &config)
+                .await
+                .map_err(|error| error.to_string())?;
+            assert!(tcp_login(&docker, &container, "manager", "ｃｏｎｔｒａｓｅñａ-clé").await);
+            assert!(tcp_login(&docker, &container, "manager", "contraseña-clé").await);
+            assert!(!tcp_login(&docker, &container, "manager", "manager-secret").await);
+
+            // A configured database the backup does not have is created,
+            // owned by the configured user; the existing ones are untouched.
+            config.database = "shop_app".to_string();
+            service
+                .set_configured_login(&container, &config)
+                .await
+                .map_err(|error| error.to_string())?;
+            let owner = sh(
+                &docker,
+                &container,
+                "psql -X -qAt -U origin-admin -d appdb -c \"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'shop_app'\"",
+            )
+            .await?;
+            assert_eq!(owner.trim(), "manager");
+            service
+                .set_configured_login(&container, &config)
+                .await
+                .map_err(|error| format!("a second run keeps the database: {error}"))?;
             Ok::<(), String>(())
         }
         .await;

@@ -22,7 +22,7 @@ use std::time::Duration;
 use temps_entities::{environments, project_services, projects};
 
 /// The most databases, and separately the most login roles, an inventory
-/// keeps. A larger list is cut and marked `truncated`.
+/// keeps. A larger list is cut and marked truncated.
 pub const MAX_INVENTORY_ENTRIES: usize = 1000;
 
 /// How long reading the inventory may take, per attempt.
@@ -31,19 +31,18 @@ const INVENTORY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest psql error kept in an [`InventoryError`].
 const MAX_ERROR_OUTPUT: usize = 400;
 
-const DATABASE_MARKER: &str = "temps-database ";
-const SUPERUSER_MARKER: &str = "temps-role super ";
-const USER_MARKER: &str = "temps-role user ";
-
-/// Every non-template database, then every role that can log in (without
-/// PostgreSQL's own `pg_*` roles), one marked line each. Each half asks for
-/// one more row than is kept, so a cut list is detected.
-const INVENTORY_SQL: &str = "(SELECT 'temps-database ' || datname FROM pg_catalog.pg_database \
-     WHERE NOT datistemplate ORDER BY datname LIMIT 1001) \
-     UNION ALL \
-     (SELECT 'temps-role ' || CASE WHEN rolsuper THEN 'super ' ELSE 'user ' END || rolname \
-     FROM pg_catalog.pg_roles WHERE rolcanlogin AND rolname !~ '^pg_' \
-     ORDER BY rolname LIMIT 1001)";
+/// Every non-template database and every role that can log in (without
+/// PostgreSQL's own `pg_*` roles), as one JSON object, so a name holding a
+/// newline or any other character comes back intact. Each list asks for one
+/// more row than is kept, so a cut list is detected.
+const INVENTORY_SQL: &str = "SELECT jsonb_build_object(\
+     'databases', COALESCE((SELECT jsonb_agg(datname ORDER BY datname) FROM \
+     (SELECT datname FROM pg_catalog.pg_database WHERE NOT datistemplate \
+     ORDER BY datname LIMIT 1001) d), '[]'::jsonb), \
+     'roles', COALESCE((SELECT jsonb_agg(jsonb_build_object('name', rolname, \
+     'superuser', rolsuper) ORDER BY rolname) FROM \
+     (SELECT rolname, rolsuper FROM pg_catalog.pg_roles \
+     WHERE rolcanlogin AND rolname !~ '^pg_' ORDER BY rolname LIMIT 1001) r), '[]'::jsonb))";
 
 /// The databases and login roles a PostgreSQL service holds. Names only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,9 +51,21 @@ pub struct PostgresInventory {
     pub databases: Vec<String>,
     /// Roles that can log in, sorted by name.
     pub roles: Vec<InventoryRole>,
-    /// A list held more than [`MAX_INVENTORY_ENTRIES`] names and was cut.
+    /// The server held more than [`MAX_INVENTORY_ENTRIES`] databases and
+    /// the list was cut.
     #[serde(default)]
-    pub truncated: bool,
+    pub databases_truncated: bool,
+    /// The server held more than [`MAX_INVENTORY_ENTRIES`] login roles and
+    /// the list was cut.
+    #[serde(default)]
+    pub roles_truncated: bool,
+}
+
+impl PostgresInventory {
+    /// Either list was cut.
+    pub fn truncated(&self) -> bool {
+        self.databases_truncated || self.roles_truncated
+    }
 }
 
 /// One role that can log in.
@@ -137,9 +148,27 @@ pub struct ServiceLinkedDatabases {
     pub links: Vec<LinkedDatabase>,
 }
 
-/// The psql command that prints the inventory, over the local socket or, as
-/// a fallback, local TCP.
-fn inventory_command(user: &str, over_tcp: bool) -> Vec<String> {
+/// The databases the inventory query connects to, in order: `template1`,
+/// then the service's configured database, then `postgres`. A physical backup
+/// can bring back a `template1` that refuses connections; any database
+/// reaches the same cluster-wide catalogs.
+fn inventory_databases(configured_database: Option<&str>) -> Vec<&str> {
+    let mut databases = vec!["template1"];
+    for database in configured_database
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .chain(["postgres"])
+    {
+        if !databases.contains(&database) {
+            databases.push(database);
+        }
+    }
+    databases
+}
+
+/// The psql command that prints the inventory from `database`, over the
+/// local socket or, as a fallback, local TCP.
+fn inventory_command(user: &str, database: &str, over_tcp: bool) -> Vec<String> {
     let mut command: Vec<String> = ["psql", "-X", "-A", "-t", "-q", "-w"]
         .iter()
         .map(|arg| arg.to_string())
@@ -153,51 +182,53 @@ fn inventory_command(user: &str, over_tcp: bool) -> Vec<String> {
         "-U".to_string(),
         user.to_string(),
         "-d".to_string(),
-        "template1".to_string(),
+        database.to_string(),
         "-c".to_string(),
         INVENTORY_SQL.to_string(),
     ]);
     command
 }
 
-/// Read the marked lines psql printed. Unmarked lines (notices) are skipped.
-pub(crate) fn parse_inventory(output: &str) -> PostgresInventory {
-    let mut inventory = PostgresInventory::default();
-    for line in output.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if let Some(name) = line.strip_prefix(DATABASE_MARKER) {
-            if !name.is_empty() {
-                inventory.databases.push(name.to_string());
-            }
-        } else if let Some(name) = line.strip_prefix(SUPERUSER_MARKER) {
-            if !name.is_empty() {
-                inventory.roles.push(InventoryRole {
-                    name: name.to_string(),
-                    superuser: true,
-                });
-            }
-        } else if let Some(name) = line.strip_prefix(USER_MARKER) {
-            if !name.is_empty() {
-                inventory.roles.push(InventoryRole {
-                    name: name.to_string(),
-                    superuser: false,
-                });
-            }
-        }
-    }
-    inventory.databases.sort();
-    inventory.databases.dedup();
-    inventory.roles.sort_by(|a, b| a.name.cmp(&b.name));
-    inventory.roles.dedup_by(|a, b| a.name == b.name);
-    if inventory.databases.len() > MAX_INVENTORY_ENTRIES {
-        inventory.databases.truncate(MAX_INVENTORY_ENTRIES);
-        inventory.truncated = true;
-    }
-    if inventory.roles.len() > MAX_INVENTORY_ENTRIES {
-        inventory.roles.truncate(MAX_INVENTORY_ENTRIES);
-        inventory.truncated = true;
-    }
-    inventory
+/// What [`INVENTORY_SQL`] prints.
+#[derive(Deserialize)]
+struct RawInventory {
+    databases: Vec<String>,
+    roles: Vec<InventoryRole>,
+}
+
+/// Read the JSON object psql printed: sorted, without duplicates or empty
+/// names, each list cut at [`MAX_INVENTORY_ENTRIES`].
+pub(crate) fn parse_inventory(output: &str) -> Result<PostgresInventory, String> {
+    let raw: RawInventory = serde_json::from_str(output.trim()).map_err(|error| {
+        format!(
+            "psql printed an unreadable list ({error}): {}",
+            short(output)
+        )
+    })?;
+    let mut databases: Vec<String> = raw
+        .databases
+        .into_iter()
+        .filter(|name| !name.is_empty())
+        .collect();
+    databases.sort();
+    databases.dedup();
+    let mut roles: Vec<InventoryRole> = raw
+        .roles
+        .into_iter()
+        .filter(|role| !role.name.is_empty())
+        .collect();
+    roles.sort_by(|a, b| a.name.cmp(&b.name));
+    roles.dedup_by(|a, b| a.name == b.name);
+    let databases_truncated = databases.len() > MAX_INVENTORY_ENTRIES;
+    databases.truncate(MAX_INVENTORY_ENTRIES);
+    let roles_truncated = roles.len() > MAX_INVENTORY_ENTRIES;
+    roles.truncate(MAX_INVENTORY_ENTRIES);
+    Ok(PostgresInventory {
+        databases,
+        roles,
+        databases_truncated,
+        roles_truncated,
+    })
 }
 
 fn short(output: &str) -> String {
@@ -267,7 +298,9 @@ impl ExternalServiceManager {
     /// List the databases and login roles inside PostgreSQL service
     /// `service_id`, on whichever node runs it. Runs psql inside the
     /// service's container as its configured user: over the local socket
-    /// first, then over local TCP with the stored password. Read-only.
+    /// first, then over local TCP with the stored password, connected to
+    /// `template1`, else the configured database, else `postgres`.
+    /// Read-only.
     pub async fn read_postgres_inventory(
         &self,
         service_id: i32,
@@ -298,16 +331,26 @@ impl ExternalServiceManager {
         };
         let user = text("username").ok_or(InventoryError::NoConfiguredUser { service_id })?;
         let password = text("password").unwrap_or_default();
+        let configured_database = text("database");
         let container = self
             .service_metadata(service_id, &service.name, service_type, &parameters)?
             .container_name();
 
-        self.inventory_in_container(service_id, service.node_id, &container, &user, &password)
-            .await
+        self.inventory_in_container(
+            service_id,
+            service.node_id,
+            &container,
+            &user,
+            &password,
+            configured_database.as_deref(),
+        )
+        .await
     }
 
     /// Run the inventory query in `container` (on worker `node_id`, or on
-    /// this host) as `user`.
+    /// this host) as `user`, trying each database of
+    /// [`inventory_databases`] over the socket and then TCP until one
+    /// connection answers.
     async fn inventory_in_container(
         &self,
         service_id: i32,
@@ -315,39 +358,47 @@ impl ExternalServiceManager {
         container: &str,
         user: &str,
         password: &str,
+        configured_database: Option<&str>,
     ) -> Result<PostgresInventory, InventoryError> {
-        let mut last_failure = String::new();
-        for over_tcp in [false, true] {
-            let command = inventory_command(user, over_tcp);
-            let run = self.exec_for_inventory(node_id, container, command, password, service_id);
-            let (exit_code, stdout, stderr) =
-                match tokio::time::timeout(INVENTORY_TIMEOUT, run).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        return Err(InventoryError::TimedOut {
-                            service_id,
-                            container: container.to_string(),
-                            seconds: INVENTORY_TIMEOUT.as_secs(),
-                        })
-                    }
-                };
-            if exit_code == 0 {
-                return Ok(parse_inventory(&stdout));
+        let mut failures = Vec::new();
+        for database in inventory_databases(configured_database) {
+            for over_tcp in [false, true] {
+                let command = inventory_command(user, database, over_tcp);
+                let run =
+                    self.exec_for_inventory(node_id, container, command, password, service_id);
+                let (exit_code, stdout, stderr) =
+                    match tokio::time::timeout(INVENTORY_TIMEOUT, run).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(InventoryError::TimedOut {
+                                service_id,
+                                container: container.to_string(),
+                                seconds: INVENTORY_TIMEOUT.as_secs(),
+                            })
+                        }
+                    };
+                if exit_code == 0 {
+                    return parse_inventory(&stdout).map_err(|reason| InventoryError::Exec {
+                        service_id,
+                        container: container.to_string(),
+                        reason,
+                    });
+                }
+                failures.push(format!(
+                    "database '{database}' over {} exited with {exit_code}: {}",
+                    if over_tcp {
+                        "local TCP"
+                    } else {
+                        "the local socket"
+                    },
+                    short(&stderr)
+                ));
             }
-            last_failure = format!(
-                "psql exited with {exit_code} ({}): {}",
-                if over_tcp {
-                    "local TCP"
-                } else {
-                    "local socket"
-                },
-                short(&stderr)
-            );
         }
         Err(InventoryError::Exec {
             service_id,
             container: container.to_string(),
-            reason: last_failure,
+            reason: format!("psql could not connect: {}", failures.join("; ")),
         })
     }
 
@@ -418,7 +469,7 @@ impl ExternalServiceManager {
             .all(self.db.as_ref())
             .await?;
         let project_ids: Vec<i32> = linked.iter().map(|(link, _)| link.project_id).collect();
-        let environments = if project_ids.is_empty() {
+        let environments: Vec<environments::Model> = if project_ids.is_empty() {
             Vec::new()
         } else {
             environments::Entity::find()
@@ -429,12 +480,25 @@ impl ExternalServiceManager {
                 .await?
         };
 
+        let mut by_project: HashMap<i32, Vec<environments::Model>> = HashMap::new();
+        for environment in environments {
+            by_project
+                .entry(environment.project_id)
+                .or_default()
+                .push(environment);
+        }
+
         let mut links = Vec::new();
         for (link, project) in &linked {
             let Some(project) = project.as_ref().filter(|p| p.deleted_at.is_none()) else {
                 continue;
             };
-            links.extend(link_databases(link, project, &environments)?);
+            let project_environments = by_project.get(&project.id).map(Vec::as_slice);
+            links.extend(link_databases(
+                link,
+                project,
+                project_environments.unwrap_or(&[]),
+            )?);
         }
         Ok(ServiceLinkedDatabases {
             service_id,
@@ -523,16 +587,21 @@ mod tests {
     }
 
     #[test]
-    fn inventory_reads_marked_lines_sorted_and_skips_notices() {
-        let output = "NOTICE: something\n\
-                      temps-database shop_prod\n\
-                      temps-database postgres\n\
-                      temps-role user reader\n\
-                      temps-role super origin-admin\r\n\
-                      temps-database \n\
-                      unmarked line\n";
-        let inventory = parse_inventory(output);
-        assert_eq!(inventory.databases, vec!["postgres", "shop_prod"]);
+    fn inventory_reads_the_json_list_sorted_and_keeps_unusual_names_intact() {
+        let output = serde_json::json!({
+            "databases": ["shop_prod", "postgres", "line\nbreak", "", "shop_prod"],
+            "roles": [
+                {"name": "reader", "superuser": false},
+                {"name": "origin-admin", "superuser": true},
+                {"name": "", "superuser": false},
+            ],
+        })
+        .to_string();
+        let inventory = parse_inventory(&format!("{output}\n")).expect("inventory");
+        assert_eq!(
+            inventory.databases,
+            vec!["line\nbreak", "postgres", "shop_prod"]
+        );
         assert_eq!(
             inventory.roles,
             vec![
@@ -546,31 +615,77 @@ mod tests {
                 },
             ]
         );
-        assert!(!inventory.truncated);
+        assert!(!inventory.truncated());
     }
 
     #[test]
-    fn inventory_cuts_long_lists_and_says_so() {
-        let output: String = (0..=MAX_INVENTORY_ENTRIES)
-            .map(|i| format!("temps-database db_{i:05}\n"))
+    fn unreadable_psql_output_is_an_error_quoting_it() {
+        let error = parse_inventory("WARNING: something else").expect_err("not json");
+        assert!(error.contains("WARNING: something else"), "{error}");
+    }
+
+    #[test]
+    fn each_list_says_on_its_own_when_it_was_cut() {
+        let databases: Vec<String> = (0..=MAX_INVENTORY_ENTRIES)
+            .map(|i| format!("db_{i:05}"))
             .collect();
-        let inventory = parse_inventory(&output);
+        let output = serde_json::json!({ "databases": databases, "roles": [] }).to_string();
+        let inventory = parse_inventory(&output).expect("inventory");
         assert_eq!(inventory.databases.len(), MAX_INVENTORY_ENTRIES);
-        assert!(inventory.truncated);
+        assert!(inventory.databases_truncated);
+        assert!(!inventory.roles_truncated);
+
+        let roles: Vec<_> = (0..=MAX_INVENTORY_ENTRIES)
+            .map(|i| serde_json::json!({ "name": format!("role_{i:05}"), "superuser": false }))
+            .collect();
+        let output = serde_json::json!({ "databases": ["app"], "roles": roles }).to_string();
+        let inventory = parse_inventory(&output).expect("inventory");
+        assert_eq!(inventory.roles.len(), MAX_INVENTORY_ENTRIES);
+        assert!(!inventory.databases_truncated);
+        assert!(inventory.roles_truncated);
+        assert!(inventory.truncated());
+    }
+
+    #[test]
+    fn an_inventory_recorded_without_the_cut_flags_reads_as_complete() {
+        let inventory: PostgresInventory =
+            serde_json::from_value(serde_json::json!({ "databases": ["app"], "roles": [] }))
+                .expect("inventory");
+        assert!(!inventory.truncated());
     }
 
     #[test]
     fn inventory_command_is_read_only_and_never_prompts() {
-        let socket = inventory_command("app", false);
+        let socket = inventory_command("app", "template1", false);
         assert!(socket.contains(&"-w".to_string()), "never prompts");
         assert!(!socket.contains(&"-h".to_string()), "socket first");
-        let tcp = inventory_command("app", true);
+        assert!(socket.windows(2).any(|w| w == ["-d", "template1"]));
+        let tcp = inventory_command("app", "shop", true);
         assert!(tcp.windows(2).any(|w| w == ["-h", "127.0.0.1"]));
+        assert!(tcp.windows(2).any(|w| w == ["-d", "shop"]));
         let sql = tcp.last().expect("sql");
-        assert!(sql.starts_with("(SELECT"), "{sql}");
+        assert!(sql.starts_with("SELECT jsonb_build_object("), "{sql}");
         for word in ["INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP"] {
             assert!(!sql.to_uppercase().contains(word), "{word} in {sql}");
         }
+    }
+
+    #[test]
+    fn the_inventory_tries_template1_then_the_configured_database_then_postgres() {
+        assert_eq!(
+            inventory_databases(Some("shop")),
+            vec!["template1", "shop", "postgres"]
+        );
+        assert_eq!(inventory_databases(None), vec!["template1", "postgres"]);
+        assert_eq!(inventory_databases(Some("")), vec!["template1", "postgres"]);
+        assert_eq!(
+            inventory_databases(Some("postgres")),
+            vec!["template1", "postgres"]
+        );
+        assert_eq!(
+            inventory_databases(Some("template1")),
+            vec!["template1", "postgres"]
+        );
     }
 
     #[test]
@@ -637,7 +752,9 @@ mod tests {
 
     /// The real query, run in a PostgreSQL container through the manager's
     /// local exec: databases and login roles come back, templates and
-    /// PostgreSQL's own roles do not.
+    /// PostgreSQL's own roles do not, a name holding a newline comes back
+    /// intact, and a `template1` that refuses connections falls back to the
+    /// configured database.
     #[tokio::test]
     async fn docker_lists_the_databases_and_login_roles_of_a_running_server() {
         use bollard::models::ContainerCreateBody;
@@ -721,6 +838,8 @@ mod tests {
                 "CREATE ROLE reader LOGIN PASSWORD 'reader-secret'",
                 "CREATE ROLE no_login NOLOGIN",
                 "CREATE DATABASE \"blog\"",
+                "CREATE DATABASE \"line\nbreak\"",
+                "ALTER DATABASE template1 ALLOW_CONNECTIONS false",
             ] {
                 let (code, _, err) = manager
                     .exec_in_local_container(&container, &sql(statement), None)
@@ -731,7 +850,14 @@ mod tests {
                 }
             }
             manager
-                .inventory_in_container(1, None, &container, "origin-admin", "origin-secret")
+                .inventory_in_container(
+                    1,
+                    None,
+                    &container,
+                    "origin-admin",
+                    "origin-secret",
+                    Some("shop_prod"),
+                )
                 .await
                 .map_err(|error| error.to_string())
         }
@@ -740,18 +866,26 @@ mod tests {
         let _ = docker
             .remove_container(
                 &container,
-                Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                Some(
+                    RemoveContainerOptionsBuilder::new()
+                        .force(true)
+                        .v(true)
+                        .build(),
+                ),
             )
             .await;
 
         let inventory = outcome.expect("inventory");
-        assert_eq!(inventory.databases, vec!["blog", "postgres", "shop_prod"]);
+        assert_eq!(
+            inventory.databases,
+            vec!["blog", "line\nbreak", "postgres", "shop_prod"]
+        );
         let roles: Vec<_> = inventory
             .roles
             .iter()
             .map(|role| (role.name.as_str(), role.superuser))
             .collect();
         assert_eq!(roles, vec![("origin-admin", true), ("reader", false)]);
-        assert!(!inventory.truncated);
+        assert!(!inventory.truncated());
     }
 }

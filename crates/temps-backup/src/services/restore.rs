@@ -2088,8 +2088,9 @@ fn set_configured_login_step(configured_user: Option<&str>) -> String {
     );
     format!(
         "Before verifying, set the password of {user} inside the restored data to the one \
-         Temps stores for this service (creating the user if the backup has none); every \
-         other user keeps its password from the backup"
+         Temps stores for this service (creating the user if the backup has none), and \
+         create this service's database, empty, if the backup has none; every other user \
+         keeps its password from the backup"
     )
 }
 
@@ -5903,6 +5904,10 @@ mod tests {
         ];
         insert_after_start_step(&mut steps, set_configured_login_step(Some("app")));
         assert!(steps[2].contains("set the password of 'app'"), "{steps:?}");
+        assert!(
+            steps[2].contains("create this service's database, empty, if the backup has none"),
+            "{steps:?}"
+        );
         assert_eq!(steps[3], "Wait for container to report healthy");
 
         let mut clone = vec![

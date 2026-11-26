@@ -188,7 +188,10 @@ pub(super) async fn record_restored_inventory(
 }
 
 /// The latest completed restore into `service_id`, when it recorded what it
-/// brought back.
+/// brought back. A run with no target id restored into its source only when
+/// it was in place (no new-service name): a new-service run whose target was
+/// deleted since has its id cleared too, and its databases are not this
+/// service's.
 pub(super) async fn latest_restored_inventory(
     db: &DatabaseConnection,
     service_id: i32,
@@ -201,6 +204,7 @@ pub(super) async fn latest_restored_inventory(
                 .add(
                     Condition::all()
                         .add(restore_runs::Column::TargetServiceId.is_null())
+                        .add(restore_runs::Column::TargetServiceName.is_null())
                         .add(restore_runs::Column::SourceServiceId.eq(service_id)),
                 ),
         )
@@ -311,20 +315,26 @@ pub(super) fn build_report(
 
     // A linked database missing from the backup only matters while restored
     // data sits unused: otherwise the project is simply new on this server.
+    // A cut database list cannot tell; a cut role list does not matter here.
     let mut missing = Vec::new();
-    if !unused.is_empty() && !inventory.truncated {
+    if !unused.is_empty() && !inventory.databases_truncated {
+        let mut environment_names: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+        for link in &linked.links {
+            let names = environment_names.entry(link.project_id).or_default();
+            if let Some(environment) = &link.environment {
+                names.push(environment.name.clone());
+            }
+        }
         for link in linked
             .links
             .iter()
             .filter(|link| shown(link.project_id))
             .filter(|link| !restored.contains(link.database.as_str()))
         {
-            let environment_names = linked
-                .links
-                .iter()
-                .filter(|other| other.project_id == link.project_id)
-                .filter_map(|other| other.environment.as_ref().map(|e| e.name.clone()))
-                .collect();
+            let environment_names = environment_names
+                .get(&link.project_id)
+                .cloned()
+                .unwrap_or_default();
             missing.push(MissingLinkedDatabase {
                 project_id: link.project_id,
                 project_name: link.project_name.clone(),
@@ -338,6 +348,7 @@ pub(super) fn build_report(
         }
     }
 
+    let truncated = inventory.truncated();
     RestoredDatabasesReport {
         restore_run_id: run.id,
         restored_at: run.finished_at.unwrap_or(run.updated_at),
@@ -350,7 +361,7 @@ pub(super) fn build_report(
                 superuser: role.superuser,
             })
             .collect(),
-        truncated: inventory.truncated,
+        truncated,
         missing,
     }
 }
@@ -395,7 +406,8 @@ mod tests {
                 name: "origin-admin".into(),
                 superuser: true,
             }],
-            truncated: false,
+            databases_truncated: false,
+            roles_truncated: false,
         }
     }
 
@@ -560,9 +572,9 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_list_reports_nothing_missing() {
+    fn a_cut_database_list_reports_nothing_missing() {
         let mut cut = inventory(&["shop_prod"]);
-        cut.truncated = true;
+        cut.databases_truncated = true;
         let report = build_report(
             &run(),
             cut,
@@ -571,6 +583,24 @@ mod tests {
         );
         assert!(report.truncated);
         assert!(report.missing.is_empty());
+    }
+
+    #[test]
+    fn a_cut_role_list_still_reports_what_is_missing() {
+        let mut cut = inventory(&["shop_prod"]);
+        cut.roles_truncated = true;
+        let report = build_report(
+            &run(),
+            cut,
+            &linked(per_environment(1, "shop", &["production"])),
+            None,
+        );
+        assert!(report.truncated, "the role list is marked as cut");
+        assert_eq!(report.missing.len(), 1, "{report:?}");
+        assert_eq!(
+            report.missing[0].suggested_database.as_deref(),
+            Some("shop_prod")
+        );
     }
 
     #[test]
@@ -612,6 +642,10 @@ mod tests {
         let sql = log[0].statements()[0].to_string();
         assert!(sql.contains("\"status\" = 'completed'"), "{sql}");
         assert!(sql.contains("\"target_service_id\" IS NULL"), "{sql}");
+        assert!(
+            sql.contains("\"target_service_name\" IS NULL"),
+            "only an in-place run falls back to its source: {sql}"
+        );
         assert!(
             sql.contains("ORDER BY \"restore_runs\".\"finished_at\" DESC"),
             "{sql}"
