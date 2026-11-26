@@ -19,6 +19,7 @@ import {
 } from '../../api/sdk.gen.js'
 import { platformAlertRulesList, platformAlertRulesSet } from './alert-rules.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { registerPlatformExtraCommands } from './extra.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, info, keyValue, success, warning, error, formatDate } from '../../ui/output.js'
 
@@ -27,6 +28,7 @@ export function registerPlatformCommands(program: Command): void {
     .command('platform')
     .alias('plat')
     .description('View platform and server information')
+  registerPlatformExtraCommands(platform)
 
   platform
     .command('info')

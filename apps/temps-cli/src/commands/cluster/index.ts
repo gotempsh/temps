@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
+import { registerClusterAdminCommands } from './admin.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import type { ProblemDetails } from '../../api/types.gen.js'
@@ -95,6 +96,8 @@ export function registerClusterCommands(program: Command): void {
     )
     .option('--json', 'Output in JSON format')
     .action(dnsStatusAction)
+
+  registerClusterAdminCommands(cluster, dns)
 }
 
 // ============================================================================

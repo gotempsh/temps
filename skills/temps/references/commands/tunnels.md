@@ -56,6 +56,8 @@ Create a tunnel for a managed zone and run it on workers. The zone must already 
 | `--domain <domain>` | Zone (or subdomain of one) whose apps it publishes | - | Yes |
 | `--node <ids...>` | Worker node ids to run it on | - | Yes |
 | `--provider <kind>` | Tunnel provider kind | `cloudflare_tunnel` | No |
+| `--host-suffix <suffix>` | Name environment hosts <label>-<suffix>.<domain>, one level under the zone | - | No |
+| `--secrets-file <path>` | JSON object of the provider's credential fields by key (- reads stdin) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `tunnels hostnames`

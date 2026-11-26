@@ -24,6 +24,8 @@ export function registerTemplatesCommands(program: Command): void {
     .description("List available templates")
     .option("--json", "Output in JSON format")
     .option("--kind <kind>", "Filter by kind: starter or app")
+    .option("--featured", "Only featured templates")
+    .option("--tag <tag>", "Only templates with this tag (see: templates list-tags)")
     .action(listTemplatesAction);
 
   cmd
@@ -49,6 +51,7 @@ export function registerTemplatesCommands(program: Command): void {
     .option("--public-repo", "Make the new repository public (private by default)")
     .option("--no-auto-deploy", "Do not deploy on push to the new repository")
     .option("--idempotency-key <key>", "Reuse a key to get the same result instead of creating twice")
+    .option("--runtime-overrides <json>", 'Image, command, port, health check or limits per image service, e.g. {"api":{"exposed_port":8080}}')
     .option("--no-wait", "Return right away instead of waiting until it finishes")
     .option("--timeout <minutes>", "Stop waiting after this long (default 30); it keeps running on the server")
     .option("--json", "Output in JSON format")
@@ -78,12 +81,20 @@ export function registerTemplatesCommands(program: Command): void {
 async function listTemplatesAction(options: {
   json?: boolean;
   kind?: string;
+  featured?: boolean;
+  tag?: string;
 }): Promise<void> {
   await requireAuth();
   await setupClient();
 
   const templatesData = await withSpinner("Fetching templates...", async () => {
-    const { data, error } = await listProjectTemplates({ client });
+    const { data, error } = await listProjectTemplates({
+      client,
+      query: {
+        ...(options.featured && { featured: true }),
+        ...(options.tag !== undefined && { tag: options.tag }),
+      },
+    });
     if (error) {
       throw new Error(getErrorMessage(error));
     }

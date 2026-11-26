@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe, spyOn } from 'bun:test'
-import { resolveEmailProviderCredentials } from './index.js'
+import { resolveEmailProviderCredentials, smtpCredentials } from './index.js'
 import { registerEmailProvidersCommands } from './index.js'
 import { runWithApi } from '../../lib/mock-api.js'
 
@@ -55,11 +55,55 @@ describe('resolveEmailProviderCredentials', () => {
     })
   })
 
-  test('an unsupported provider type falls through to undefined rather than crashing', () => {
-    // The type-route union includes 'smtp', which this CLI does not implement
-    // a credential shape for — the caller rejects it earlier with a warning,
-    // so this function must not throw or fabricate credentials for it.
-    expect(resolveEmailProviderCredentials('smtp', { yes: true })).toBeUndefined()
+  describe('smtp', () => {
+    test('builds SMTP credentials; the port follows the encryption', () => {
+      expect(resolveEmailProviderCredentials('smtp', { smtpHost: 'mail.example.com', smtpUsername: 'app', smtpPassword: 'pw' })).toEqual({
+        ses_credentials: null,
+        scaleway_credentials: null,
+        smtp_credentials: { host: 'mail.example.com', port: 587, encryption: 'starttls', username: 'app', password: 'pw' },
+      })
+      expect(smtpCredentials({ smtpHost: 'mail.example.com', smtpEncryption: 'tls', smtpAcceptInvalidCerts: true })).toEqual({
+        host: 'mail.example.com',
+        port: 465,
+        encryption: 'tls',
+        accept_invalid_certs: true,
+      })
+      expect(smtpCredentials({ smtpHost: 'mail.example.com', smtpPort: '2525', smtpEncryption: 'none' }).port).toBe(2525)
+    })
+
+    test('a missing host, an unknown encryption or a bad port is refused', () => {
+      expect(() => smtpCredentials({ yes: true })).toThrow(/--smtp-host is required/)
+      expect(() => smtpCredentials({ smtpHost: 'h', smtpEncryption: 'ssl' })).toThrow(/--smtp-encryption must be one of starttls, tls, none/)
+      expect(() => smtpCredentials({ smtpHost: 'h', smtpPort: '70000' })).toThrow(/--smtp-port must be a port number/)
+    })
+  })
+})
+
+describe('email-providers create --type smtp', () => {
+  test('sends the SMTP server, with the password from stdin, and the SNS topic', async () => {
+    const run = await runWithApi(
+      registerEmailProvidersCommands,
+      ['email-providers', 'create', '--type', 'smtp', '--name', 'relay', '--smtp-host', 'mail.example.com', '--smtp-username', 'app', '--smtp-password-stdin', '--yes'],
+      { 'POST /email-providers': { id: 1 } },
+      { stdin: 'smtp-pw' },
+    )
+    expect(run.error).toBeUndefined()
+    expect(run.bodies[0]?.body).toEqual({
+      name: 'relay',
+      provider_type: 'smtp',
+      region: 'smtp',
+      ses_credentials: null,
+      scaleway_credentials: null,
+      smtp_credentials: { host: 'mail.example.com', port: 587, encryption: 'starttls', username: 'app', password: 'smtp-pw' },
+    })
+    const ses = await runWithApi(
+      registerEmailProvidersCommands,
+      ['email-providers', 'create', '--type', 'ses', '--name', 'aws', '--region', 'eu-west-1', '--access-key-id', 'AKIA', '--secret-access-key-stdin', '--sns-topic-arn', 'arn:aws:sns:eu-west-1:000000000000:bounces', '--yes'],
+      { 'POST /email-providers': { id: 2 } },
+      { stdin: 'secret' },
+    )
+    expect(ses.error).toBeUndefined()
+    expect(ses.bodies[0]?.body).toMatchObject({ sns_topic_arn: 'arn:aws:sns:eu-west-1:000000000000:bounces' })
   })
 })
 

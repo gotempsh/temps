@@ -35,6 +35,8 @@ import {
   keyValue, formatDate, box
 } from '../../ui/output.js'
 import { chooseDns01Route, waitForTxt, type Dns01Route, type ProviderZones } from './dns01.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { ListDomainsData, ListOrdersData } from '../../api/types.gen.js'
 
 // Exact match only — a case-insensitive or partial match here would let
 // `domains ssl`/`domains status` silently target the wrong domain.
@@ -134,12 +136,13 @@ export function registerDomainsCommands(program: Command): void {
     .alias('domain')
     .description('Manage custom domains')
 
-  domains
-    .command('list')
-    .alias('ls')
-    .description('List domains')
-    .option('--json', 'Output in JSON format')
-    .action(listDomains)
+  DOMAIN_LIST_QUERY.addTo(
+    domains
+      .command('list')
+      .alias('ls')
+      .description('List domains')
+      .option('--json', 'Output in JSON format'),
+  ).action(listDomains)
 
   domains
     .command('add')
@@ -196,12 +199,13 @@ export function registerDomainsCommands(program: Command): void {
     .alias('order')
     .description('Manage ACME orders for SSL certificate provisioning')
 
-  orders
-    .command('list')
-    .alias('ls')
-    .description('List all ACME orders')
-    .option('--json', 'Output in JSON format')
-    .action(listOrders)
+  ORDER_LIST_QUERY.addTo(
+    orders
+      .command('list')
+      .alias('ls')
+      .description('List all ACME orders')
+      .option('--json', 'Output in JSON format'),
+  ).action(listOrders)
 
   orders
     .command('show')
@@ -246,12 +250,22 @@ export function registerDomainsCommands(program: Command): void {
     .action(httpChallengeDebug)
 }
 
+const DOMAIN_LIST_QUERY = fieldFlags<NonNullable<ListDomainsData['query']>>(
+  {
+    search: { kind: 'string', help: 'Only domains whose name contains this' },
+    sort_by: { kind: 'string', help: 'Sort column (default created_at)', values: ['created_at', 'domain', 'status', 'expiration'] },
+    sort_order: { kind: 'string', help: 'Sort direction', values: ['asc', 'desc'] },
+  },
+  'query',
+)
+
 async function listDomains(options: { json?: boolean }): Promise<void> {
+  const query = await DOMAIN_LIST_QUERY.read(options)
   await requireAuth()
   await setupClient()
 
   const domains = await withSpinner('Fetching domains...', async () => {
-    const { data, error } = await listDomainsApi({ client })
+    const { data, error } = await listDomainsApi({ client, query })
     if (error) throw new Error(getErrorMessage(error))
     return data?.domains ?? []
   })
@@ -635,12 +649,21 @@ async function listRenewalAttempts(options: RenewalAttemptsOptions): Promise<voi
 
 // --- ACME Orders ---
 
+const ORDER_LIST_QUERY = fieldFlags<NonNullable<ListOrdersData['query']>>(
+  {
+    sort_by: { kind: 'string', help: 'Sort column (default created_at)' },
+    sort_order: { kind: 'string', help: 'Sort direction', values: ['asc', 'desc'] },
+  },
+  'query',
+)
+
 async function listOrders(options: { json?: boolean }): Promise<void> {
+  const query = await ORDER_LIST_QUERY.read(options)
   await requireAuth()
   await setupClient()
 
   const result = await withSpinner('Fetching ACME orders...', async () => {
-    const { data, error } = await listOrdersApi({ client })
+    const { data, error } = await listOrdersApi({ client, query })
     if (error) throw new Error(getErrorMessage(error))
     return data?.orders ?? []
   })

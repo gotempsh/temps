@@ -7,13 +7,15 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { nextPageHint, pageQuery, type PageFlags } from '../../lib/page-options.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import {
-  listAnalyticsIngestKeys,
   createAnalyticsIngestKey,
-  updateAnalyticsIngestKey,
-  rotateAnalyticsIngestKey,
-  revokeAnalyticsIngestKey,
+  getAnalyticsIngestKey,
   getProjectBySlug,
+  listAnalyticsIngestKeys,
+  revokeAnalyticsIngestKey,
+  rotateAnalyticsIngestKey,
+  updateAnalyticsIngestKey,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type {
   AnalyticsIngestKey,
   CreateAnalyticsIngestKeyRequest,
@@ -97,6 +99,12 @@ export function registerAnalyticsKeysCommands(analytics: Command): void {
     .description(
       'Manage analytics ingest keys (pa_...) for apps Temps does not deploy',
     )
+
+  endpoint(keys, getAnalyticsIngestKey, {
+    name: 'get',
+    description: 'Show one analytics ingest key',
+    path: { project_id: 'project', key_id: 'int' },
+  })
 
   keys
     .command('list')

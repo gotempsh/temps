@@ -42,6 +42,11 @@ Discover workloads from a source
 | `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
 | `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--name-pattern <value>` | Only workloads whose name matches this glob or pattern | - | No |
+| `--status-filter <value>` | Only workloads in this state, e.g. running (repeatable) (repeatable) | - | No |
+| `--workload-type-filter <value>` | Only workloads of this type, e.g. container or static-site (repeatable) (repeatable) | - | No |
+| `--label-filter <json>` | Only workloads with these labels, as a JSON object, e.g. {"env":"prod"} (JSON) | - | No |
+| `--limit <n>` | Return at most this many workloads | - | No |
 | `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -61,6 +66,12 @@ Discover a source, pick a workload, and show the import plan
 | `--username <name>` | Admin username (portainer source, defaults to "admin") | - | No |
 | `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
 | `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
+| `--name-pattern <value>` | Only workloads whose name matches this glob or pattern | - | No |
+| `--status-filter <value>` | Only workloads in this state, e.g. running (repeatable) (repeatable) | - | No |
+| `--workload-type-filter <value>` | Only workloads of this type, e.g. container or static-site (repeatable) (repeatable) | - | No |
+| `--label-filter <json>` | Only workloads with these labels, as a JSON object, e.g. {"env":"prod"} (JSON) | - | No |
+| `--limit <n>` | Return at most this many workloads | - | No |
+| `--repository-id <n>` | Connected repository to detect the build preset from | - | No |
 | `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -86,6 +97,12 @@ Guided end-to-end migration: discover, plan, review, and execute
 | `--branch <branch>` | Branch to deploy | `main` | No |
 | `--dry-run` | Plan only — do not create or deploy anything | - | No |
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--name-pattern <value>` | Only workloads whose name matches this glob or pattern | - | No |
+| `--status-filter <value>` | Only workloads in this state, e.g. running (repeatable) (repeatable) | - | No |
+| `--workload-type-filter <value>` | Only workloads of this type, e.g. container or static-site (repeatable) (repeatable) | - | No |
+| `--label-filter <json>` | Only workloads with these labels, as a JSON object, e.g. {"env":"prod"} (JSON) | - | No |
+| `--limit <n>` | Return at most this many workloads | - | No |
+| `--repository-id <n>` | Connected repository to detect the build preset from | - | No |
 | `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |

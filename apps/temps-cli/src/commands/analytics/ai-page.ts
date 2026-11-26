@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import chalk from 'chalk'
+import { ENVIRONMENT_FILTER } from './scope.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -105,6 +106,7 @@ export async function aiPage(
   path: string,
   options: AiPageOptions
 ): Promise<void> {
+  const environment = await ENVIRONMENT_FILTER.read(options)
   if (!path || !path.startsWith('/')) {
     throw new Error('Path must be a URL path starting with "/", e.g. /docs')
   }
@@ -149,6 +151,7 @@ export async function aiPage(
             project_id: projectId,
             start_time: startDate,
             end_time: endDate,
+            ...environment,
             limit,
             path,
           },
@@ -159,6 +162,7 @@ export async function aiPage(
             project_id: projectId,
             start_time: startDate,
             end_time: endDate,
+            ...environment,
             path,
             limit: 1,
           },

@@ -15,6 +15,8 @@ Manage and send emails
 - `show` - Show email details
 - `stats` - Get email statistics
 - `validate` - Validate an email address
+- `tracking` - Tracking commands
+- `resend` - Resend a captured email
 
 ### `emails list` (alias: `ls`)
 
@@ -45,6 +47,11 @@ Send an email
 | `--body <body>` | Email body | - | No |
 | `--from <email>` | Sender email address | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--cc <value>` | CC recipient (repeatable) (repeatable) | - | No |
+| `--bcc <value>` | BCC recipient (repeatable) (repeatable) | - | No |
+| `--reply-to <value>` | Reply-to address | - | No |
+| `--html <value>` | HTML body, sent alongside the text body | - | No |
+| `--headers <json>` | Extra headers as a JSON object, e.g. {"X-Campaign":"spring"} (JSON) | - | No |
 
 ### `emails show`
 
@@ -76,4 +83,88 @@ Validate an email address
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--email <email>` | Email address to validate | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `emails tracking`
+
+Tracking commands
+
+**Subcommands:**
+
+- `get-global-events` - GET /emails/events
+- `get-global-event-stats` - GET /emails/events/stats
+- `get` - Get email tracking summary
+- `get-events` - Get email tracking events
+- `get-links` - Get tracked links for an email
+
+#### `emails tracking get-global-events`
+
+GET /emails/events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--event-type <value>` | Filter by event type (open, click) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Page size (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get-global-event-stats`
+
+GET /emails/events/stats
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get`
+
+Get email tracking summary
+
+**Usage:** `emails tracking get <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get-events`
+
+Get email tracking events
+
+**Usage:** `emails tracking get-events <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--event-type <value>` | Filter by event type (open, click) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get-links`
+
+Get tracked links for an email
+
+**Usage:** `emails tracking get-links <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `emails resend`
+
+Resend a captured email
+
+**Usage:** `emails resend <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |

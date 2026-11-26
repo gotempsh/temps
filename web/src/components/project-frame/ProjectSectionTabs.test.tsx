@@ -10,17 +10,31 @@ import { installBrowserWindow } from '@/test/dom'
 import { ProjectSectionTabs } from './ProjectSectionTabs'
 
 installBrowserWindow()
+type HappyDomWindow = { happyDOM?: { setViewport(viewport: { width: number }): void } }
+// `window.innerWidth` is happy-dom's accessor on the global every test file
+// shares. Resize through happy-dom, as the other viewport tests do; when that
+// is unavailable, shadow the accessor and put the original descriptor back
+// after each test. Replacing it with a fixed value would stop later files'
+// `setViewport` calls from changing the width.
 const desktopWidth = window.innerWidth
+const originalInnerWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth')
 function setWidth(width: number) {
-  Object.defineProperty(window, 'innerWidth', {
-    value: width,
-    configurable: true,
-    writable: true,
-  })
+  const happyDOM = (window as unknown as HappyDomWindow).happyDOM
+  if (happyDOM) {
+    happyDOM.setViewport({ width })
+    return
+  }
+  Object.defineProperty(window, 'innerWidth', { value: width, configurable: true, writable: true })
+}
+function restoreWidth() {
+  const happyDOM = (window as unknown as HappyDomWindow).happyDOM
+  if (happyDOM) happyDOM.setViewport({ width: desktopWidth })
+  if (originalInnerWidth) Object.defineProperty(window, 'innerWidth', originalInnerWidth)
+  else Reflect.deleteProperty(window, 'innerWidth')
 }
 afterEach(() => {
   cleanup()
-  setWidth(desktopWidth)
+  restoreWidth()
   window.localStorage.clear()
 })
 

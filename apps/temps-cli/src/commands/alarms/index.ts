@@ -52,6 +52,7 @@ interface FilterOptions {
 }
 
 interface ListOptions extends ScopeOptions, FilterOptions {
+  serviceId?: string
   page?: string
   pageSize?: string
   json?: boolean
@@ -97,6 +98,7 @@ export function registerAlarmsCommands(program: Command): void {
       .alias('ls')
       .description('List alarms, newest first'),
   ))
+    .option('--service-id <id>', 'Only alarms of this external service')
     .option('--page <n>', 'Page number (default: 1)')
     .option('--page-size <n>', 'Items per page (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
@@ -259,6 +261,7 @@ async function listAlarmsAction(options: ListOptions): Promise<void> {
     ...(options.type && { alarm_type: options.type }),
     ...(options.environmentId && { environment_id: parseOptionalId(options.environmentId, '--environment-id') }),
     ...(options.deploymentId && { deployment_id: parseOptionalId(options.deploymentId, '--deployment-id') }),
+    ...(options.serviceId && { service_id: parseOptionalId(options.serviceId, '--service-id') }),
     ...(options.page && { page: parseOptionalId(options.page, '--page') }),
     ...(options.pageSize && { page_size: parseOptionalId(options.pageSize, '--page-size') }),
   }

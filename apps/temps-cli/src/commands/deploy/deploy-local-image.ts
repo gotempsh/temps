@@ -38,9 +38,13 @@ import { pipeline } from 'node:stream/promises'
 import { resolve, basename, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
+import type { GenerateDockerfileRequest } from '../../api/types.gen.js'
 
 interface DeployLocalImageOptions {
   image?: string
+  buildCommand?: string
+  installCommand?: string
+  outputDir?: string
   dockerfile?: string
   context?: string
   buildArg?: string[]
@@ -512,7 +516,7 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
 
     // Check if Dockerfile exists — if not, try to generate one from the project's preset
     if (!existsSync(resolvedDockerfile)) {
-      const generated = await tryGenerateDockerfile(options.project)
+      const generated = await tryGenerateDockerfile(options.project, dockerfileOverrides(options))
 
       if (generated) {
         resolvedDockerfile = generated.dockerfilePath
@@ -942,8 +946,20 @@ interface GeneratedDockerfile {
  * Try to generate a Dockerfile from the project's preset via the API.
  * Returns null if the project has no preset or generation fails.
  */
+/** The build settings `--build-command`, `--install-command` and `--output-dir` put in a generated Dockerfile. */
+export function dockerfileOverrides(
+  options: Pick<DeployLocalImageOptions, 'buildCommand' | 'installCommand' | 'outputDir'>
+): Pick<GenerateDockerfileRequest, 'build_command' | 'install_command' | 'output_dir'> {
+  return {
+    ...(options.buildCommand !== undefined && { build_command: options.buildCommand }),
+    ...(options.installCommand !== undefined && { install_command: options.installCommand }),
+    ...(options.outputDir !== undefined && { output_dir: options.outputDir }),
+  }
+}
+
 async function tryGenerateDockerfile(
-  projectSlug?: string
+  projectSlug: string | undefined,
+  overrides: Pick<GenerateDockerfileRequest, 'build_command' | 'install_command' | 'output_dir'>
 ): Promise<GeneratedDockerfile | null> {
   let slug = projectSlug
   if (!slug) {
@@ -988,6 +1004,7 @@ async function tryGenerateDockerfile(
         package_manager: packageManager,
         project_name: slug,
         use_buildkit: true,
+        ...overrides,
       },
     })
 

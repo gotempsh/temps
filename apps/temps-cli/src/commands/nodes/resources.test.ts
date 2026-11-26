@@ -135,3 +135,14 @@ describe('invalid flags fail before any request', () => {
     }
   })
 })
+
+describe('resources set --reset-reserved', () => {
+  test('sends reset_system_reserved and refuses it with an explicit reservation', () => {
+    const parsed = parseResourceFlags({ resetReserved: true })
+    expect(parsed).toEqual({ update: { resetReserved: true } })
+    if ('update' in parsed) expect(buildNodeResourcesRequest(parsed.update, undefined)).toEqual({ reset_system_reserved: true })
+    expect(parseResourceFlags({ resetReserved: true, reserveCpu: '500' })).toEqual({
+      error: 'Pass --reset-reserved or --reserve-cpu/--reserve-memory, not both',
+    })
+  })
+})

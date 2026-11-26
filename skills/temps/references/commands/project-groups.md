@@ -4,6 +4,22 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`project-groups list`](#project-groups-list-alias-ls)
+- [`project-groups show`](#project-groups-show-alias-get)
+- [`project-groups create`](#project-groups-create-alias-new)
+- [`project-groups update`](#project-groups-update-alias-edit)
+- [`project-groups delete`](#project-groups-delete-alias-rm)
+- [`project-groups add`](#project-groups-add)
+- [`project-groups remove`](#project-groups-remove)
+- [`project-groups repo`](#project-groups-repo)
+- [`project-groups import`](#project-groups-import)
+- [`project-groups follow`](#project-groups-follow)
+- [`project-groups unfollow`](#project-groups-unfollow)
+- [`project-groups routes`](#project-groups-routes)
+- [`project-groups vars`](#project-groups-vars)
+
 ## `project-groups` (alias: `pg`)
 
 Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
@@ -164,6 +180,8 @@ Scan the project's repository and add its apps as services that follow it
 | `-p, --path <dir...>` | Only these app directories (default: every app without a service) | - | No |
 | `--dry-run` | List what would be created without creating anything | - | No |
 | `--timeout <minutes>` | Stop waiting after this long (default 30); the import keeps running on the server | - | No |
+| `--fresh` | Scan a public repository again instead of using the cached scan | - | No |
+| `--base-url <url>` | HTTPS origin of the self-hosted GitLab a public repository lives on | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups follow`
@@ -231,10 +249,23 @@ Variables shared by every service in a project (group)
 
 **Subcommands:**
 
+- `get` - Show one shared variable (a secret value is never shown)
 - `list` (`ls`) - List shared variables (secret values are never shown)
 - `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 - `unset` - Remove a shared variable
+
+#### `project-groups vars get`
+
+Show one shared variable (a secret value is never shown)
+
+**Usage:** `project-groups vars get <group-id> <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `project-groups vars list` (alias: `ls`)
 

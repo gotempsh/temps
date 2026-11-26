@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import {
   detectLocalPackageManager,
+  dockerfileOverrides,
   formatFileSize,
   installInterruptHandlers,
   killChildOnAbort,
@@ -32,6 +33,17 @@ async function fixtureDirectory(): Promise<string> {
   temporaryDirectories.push(directory)
   return directory
 }
+
+describe('dockerfileOverrides', () => {
+  test('passes only the build settings given to the generated Dockerfile', () => {
+    expect(dockerfileOverrides({})).toEqual({})
+    expect(dockerfileOverrides({ buildCommand: 'bun run build', outputDir: 'dist' })).toEqual({
+      build_command: 'bun run build',
+      output_dir: 'dist',
+    })
+    expect(dockerfileOverrides({ installCommand: '' })).toEqual({ install_command: '' })
+  })
+})
 
 describe('formatFileSize', () => {
   test('renders bytes under 1 KB as whole bytes', () => {

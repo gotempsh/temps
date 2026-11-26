@@ -10,6 +10,10 @@ View platform and server information
 
 **Subcommands:**
 
+- `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+- `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
+- `geo` - Look up the location of an IP address in the server's geolocation database
+- `file` - Print a file from the server's static directory (or save it with -o)
 - `info` - Get platform information
 - `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
@@ -17,6 +21,55 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform operations` (alias: `ops`)
+
+List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <status>` | Which ones: running, waiting, finished, all (default: the server's) | - | No |
+| `--kind <kind>` | Only one kind: deployment, rollback, promotion, restore, backup, autofix | - | No |
+| `--project <id>` | Only this project ID | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Operations per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `platform maturity`
+
+Show the compatibility promise (stable, beta, experimental) for every feature
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform geo`
+
+Look up the location of an IP address in the server's geolocation database
+
+**Usage:** `platform geo <ip> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform file`
+
+Print a file from the server's static directory (or save it with -o)
+
+**Usage:** `platform file <path> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <file>` | Write it to a file instead of stdout | - | No |
 
 ### `platform info`
 

@@ -21,6 +21,8 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 import { addCredentialSources } from '../../lib/value-source.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { ListWebhooksData } from '../../api/types.gen.js'
 
 interface ListOptions {
   projectId: string
@@ -143,13 +145,14 @@ export function registerWebhooksCommands(program: Command): void {
     .alias('hooks')
     .description('Manage webhooks for project events')
 
-  webhooks
-    .command('list')
-    .alias('ls')
-    .description('List all webhooks for a project')
-    .requiredOption('--project-id <id>', 'Project ID')
-    .option('--json', 'Output in JSON format')
-    .action(listWebhooksAction)
+  WEBHOOK_LIST_QUERY.addTo(
+    webhooks
+      .command('list')
+      .alias('ls')
+      .description('List all webhooks for a project')
+      .requiredOption('--project-id <id>', 'Project ID')
+      .option('--json', 'Output in JSON format'),
+  ).action(listWebhooksAction)
 
   const createCommand = webhooks
     .command('create')
@@ -245,7 +248,18 @@ export function registerWebhooksCommands(program: Command): void {
     .action(retryDeliveryAction)
 }
 
+const WEBHOOK_LIST_QUERY = fieldFlags<NonNullable<ListWebhooksData['query']>>(
+  {
+    page: 'int',
+    page_size: { kind: 'int', help: 'Webhooks per page (max 100)' },
+    sort_by: { kind: 'string', help: 'Sort column (default created_at)' },
+    sort_order: { kind: 'string', help: 'Sort direction', values: ['asc', 'desc'] },
+  },
+  'query',
+)
+
 async function listWebhooksAction(options: ListOptions): Promise<void> {
+  const query = await WEBHOOK_LIST_QUERY.read(options)
   await requireAuth()
   await setupClient()
 
@@ -259,6 +273,7 @@ async function listWebhooksAction(options: ListOptions): Promise<void> {
     const { data, error } = await listWebhooks({
       client,
       path: { project_id: id },
+      query,
     })
     if (error) {
       throw new Error(getErrorMessage(error))

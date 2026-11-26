@@ -7,13 +7,15 @@ import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
-  listStatusPageWebhooks,
   createStatusPageWebhook,
-  updateStatusPageWebhook,
   deleteStatusPageWebhook,
   getStatusPagePassword,
+  getStatusPageWebhook,
+  listStatusPageWebhooks,
   setStatusPagePassword,
+  updateStatusPageWebhook,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type { UpdateStatusPageWebhookRequest, StatusPageWebhookResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable } from '../../ui/table.js'
@@ -159,6 +161,12 @@ export function registerWebhookCommands(pages: Command): void {
   const webhooks = pages
     .command('webhooks')
     .description('Post every public update of a status page to signed HTTPS webhooks')
+
+  endpoint(webhooks, getStatusPageWebhook, {
+    name: 'get',
+    description: 'Show one webhook of a status page',
+    path: { status_page_id: 'int', webhook_id: 'int' },
+  })
 
   webhooks
     .command('list')

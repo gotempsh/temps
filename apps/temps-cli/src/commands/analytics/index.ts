@@ -3,6 +3,7 @@
 
 import type { Command } from 'commander'
 import { overview } from './overview.js'
+import { BREAKDOWN_FILTERS, ENVIRONMENT_FILTER, FUNNEL_FILTERS, SCOPE_FILTERS } from './scope.js'
 import { breakdown } from './breakdown.js'
 import { funnelsOverview } from './funnels.js'
 import { aiAgents } from './ai-agents.js'
@@ -39,84 +40,90 @@ export function registerAnalyticsCommands(program: Command): void {
   registerAnalyticsConversionsCommands(analytics)
   registerAnalyticsIdentityCommands(analytics)
 
-  analytics
-    .command('overview')
-    .alias('o')
-    .description('Show analytics dashboard overview')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
-      '24h',
-    )
-    .option('--json', 'Output in JSON format')
-    .action(overview)
+  SCOPE_FILTERS.addTo(
+    analytics
+      .command('overview')
+      .alias('o')
+      .description('Show analytics dashboard overview')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+        '24h',
+      )
+      .option('--json', 'Output in JSON format')
+  ).action(overview)
 
-  analytics
-    .command('top <dimension>')
-    .description(
-      'Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign',
-    )
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
-      '24h',
-    )
-    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
-    .option('--json', 'Output in JSON format')
-    .action(breakdown)
+  BREAKDOWN_FILTERS.addTo(
+    analytics
+      .command('top <dimension>')
+      .description(
+        'Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign',
+      )
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+        '24h',
+      )
+      .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+      .option('--json', 'Output in JSON format')
+  ).action(breakdown)
 
-  analytics
-    .command('outbound')
-    .description('Show the outbound links visitors clicked (outbound_click events)')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
-      '7d',
-    )
-    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
-    .option('--json', 'Output in JSON format')
-    .action(outboundLinks)
+  ENVIRONMENT_FILTER.addTo(
+    analytics
+      .command('outbound')
+      .description('Show the outbound links visitors clicked (outbound_click events)')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+        '7d',
+      )
+      .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+      .option('--json', 'Output in JSON format')
+  ).action(outboundLinks)
 
-  analytics
-    .command('downloads')
-    .description('Show the files visitors downloaded (file_download events)')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
-      '7d',
-    )
-    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
-    .option('--json', 'Output in JSON format')
-    .action(fileDownloads)
+  ENVIRONMENT_FILTER.addTo(
+    analytics
+      .command('downloads')
+      .description('Show the files visitors downloaded (file_download events)')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+        '7d',
+      )
+      .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+      .option('--json', 'Output in JSON format')
+  ).action(fileDownloads)
 
-  analytics
-    .command('not-found')
-    .description('Show pages visitors could not find: 404s Temps answered and not_found events')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
-      '7d',
-    )
-    .option('--limit <n>', 'Number of results (default: 20, max: 100)')
-    .option('--json', 'Output in JSON format')
-    .action(notFound)
+  ENVIRONMENT_FILTER.addTo(
+    analytics
+      .command('not-found')
+      .description('Show pages visitors could not find: 404s Temps answered and not_found events')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+        '7d',
+      )
+      .option('--limit <n>', 'Number of results (default: 20, max: 100)')
+      .option('--json', 'Output in JSON format')
+  ).action(notFound)
 
-  analytics
-    .command('funnels')
-    .description('Show funnel conversion metrics for all funnels')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
-      '7d',
-    )
-    .option('--json', 'Output in JSON format')
-    .action(funnelsOverview)
+  FUNNEL_FILTERS.addTo(
+    analytics
+      .command('funnels')
+      .description('Show funnel conversion metrics for all funnels')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
+        '7d',
+      )
+      .option('--json', 'Output in JSON format')
+  ).action(funnelsOverview)
 
   analytics
     .command('performance')
@@ -156,64 +163,67 @@ export function registerAnalyticsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(performanceInsights)
 
-  analytics
-    .command('ai-agents')
-    .description(
-      'Show AI crawler / provider breakdown (web /analytics/ai-agents)',
-    )
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d)',
-      '24h',
-    )
-    .option('--limit <n>', 'Number of rows to fetch (default: 20, max: 100)')
-    .option(
-      '--group-by <mode>',
-      'Group rows by "agent" (default) or "provider"',
-      'agent',
-    )
-    .option('--path <path>', 'Restrict to one URL path (e.g. /docs)')
-    .option('--json', 'Output in JSON format')
-    .action(aiAgents)
+  ENVIRONMENT_FILTER.addTo(
+    analytics
+      .command('ai-agents')
+      .description(
+        'Show AI crawler / provider breakdown (web /analytics/ai-agents)',
+      )
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d)',
+        '24h',
+      )
+      .option('--limit <n>', 'Number of rows to fetch (default: 20, max: 100)')
+      .option(
+        '--group-by <mode>',
+        'Group rows by "agent" (default) or "provider"',
+        'agent',
+      )
+      .option('--path <path>', 'Restrict to one URL path (e.g. /docs)')
+      .option('--json', 'Output in JSON format')
+  ).action(aiAgents)
 
-  analytics
-    .command('ai-pages')
-    .description('Show pages crawled by AI agents, with distinct-agent counts')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d)',
-      '24h',
-    )
-    .option('--limit <n>', 'Number of pages to fetch (default: 20, max: 100)')
-    .option('--path <path>', 'Restrict to one URL path (returns just that row)')
-    .option(
-      '--with-agents',
-      'Also fetch and render the per-agent split for each page (slower)',
-    )
-    .option('--json', 'Output in JSON format')
-    .action(aiPages)
+  ENVIRONMENT_FILTER.addTo(
+    analytics
+      .command('ai-pages')
+      .description('Show pages crawled by AI agents, with distinct-agent counts')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d)',
+        '24h',
+      )
+      .option('--limit <n>', 'Number of pages to fetch (default: 20, max: 100)')
+      .option('--path <path>', 'Restrict to one URL path (returns just that row)')
+      .option(
+        '--with-agents',
+        'Also fetch and render the per-agent split for each page (slower)',
+      )
+      .option('--json', 'Output in JSON format')
+  ).action(aiPages)
 
-  analytics
-    .command('ai-page <path>')
-    .description(
-      'Show which agents/providers crawled a single page (e.g. /docs)',
-    )
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option(
-      '--period <period>',
-      'Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d)',
-      '24h',
-    )
-    .option('--limit <n>', 'Number of rows to fetch (default: 50, max: 100)')
-    .option(
-      '--group-by <mode>',
-      'Group rows by "agent" (default) or "provider"',
-      'agent',
-    )
-    .option('--json', 'Output in JSON format')
-    .action(aiPage)
+  ENVIRONMENT_FILTER.addTo(
+    analytics
+      .command('ai-page <path>')
+      .description(
+        'Show which agents/providers crawled a single page (e.g. /docs)',
+      )
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option(
+        '--period <period>',
+        'Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d)',
+        '24h',
+      )
+      .option('--limit <n>', 'Number of rows to fetch (default: 50, max: 100)')
+      .option(
+        '--group-by <mode>',
+        'Group rows by "agent" (default) or "provider"',
+        'agent',
+      )
+      .option('--json', 'Output in JSON format')
+  ).action(aiPage)
 
   analytics
     .command('api-overview')
@@ -353,6 +363,7 @@ export function registerAnalyticsCommands(program: Command): void {
       'Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m)',
       '24h',
     )
+    .option('--refresh', 'Generate a fresh summary instead of the cached one')
     .option('--json', 'Output in JSON format')
     .action(apiSummary)
 

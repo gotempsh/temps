@@ -36,6 +36,7 @@ Create a load balancer route
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain for the route | - | No |
 | `-t, --target <target>` | Target upstream URL | - | No |
+| `--type <type>` | http (default: match the Host header) or tls (match the SNI name, pass TCP through) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `load-balancer show`
@@ -59,6 +60,7 @@ Update a load balancer route
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain of the route | - | Yes |
 | `-t, --target <target>` | New target upstream URL | - | No |
+| `--type <type>` | http (match the Host header) or tls (match the SNI name, pass TCP through) | - | No |
 
 ### `load-balancer remove` (alias: `rm`)
 

@@ -14300,7 +14300,9 @@ version = "0.1.0-beta.63"
 dependencies = [
  "async-trait",
  "axum",
+ "bollard",
  "chrono",
+ "futures",
  "http 1.5.0",
  "redis",
  "schemars 1.2.3",
@@ -14316,6 +14318,7 @@ dependencies = [
  "tokio",
  "tracing",
  "utoipa",
+ "uuid",
 ]
 
 [[package]]

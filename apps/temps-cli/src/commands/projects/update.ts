@@ -17,10 +17,12 @@ import { promptText, promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, error, keyValue } from '../../ui/output.js'
 import { fetchGitConnections, findRepositoryByName } from '../../lib/git-connection.js'
 import { MICROCORES_PER_CORE, parseCores, type CpuParseResult } from '../../lib/cpu.js'
+import { DEPLOYMENT_CONFIG_EXTRA, GIT_EXTRA, SETTINGS_EXTRA, UPDATE_PROJECT_EXTRA } from './field-flags.js'
 
 export async function updateProjectAction(
   options: { project?: string; name?: string; json?: boolean; yes?: boolean }
 ): Promise<void> {
+  const extra = await UPDATE_PROJECT_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -82,6 +84,7 @@ export async function updateProjectAction(
         directory: project.directory,
         preset: project.preset ?? 'auto',
         storage_service_ids: [],
+        ...extra,
       },
     })
     if (error) {
@@ -112,6 +115,7 @@ export async function updateSettingsAction(
     yes?: boolean
   }
 ): Promise<void> {
+  const extra = await SETTINGS_EXTRA.read(options)
   // Validate arguments before authenticating or hitting the network, so a
   // typo'd flag fails immediately instead of after a project lookup.
   //
@@ -188,6 +192,7 @@ export async function updateSettingsAction(
     previewEnvs === undefined &&
     vulnerabilityScanning === undefined &&
     imageRetentionHours === undefined &&
+    Object.keys(extra).length === 0 &&
     !options.yes
   ) {
     newline()
@@ -232,6 +237,7 @@ export async function updateSettingsAction(
         attack_mode: attackMode ?? undefined,
         enable_preview_environments: previewEnvs ?? undefined,
         vulnerability_scanning_enabled: vulnerabilityScanning ?? undefined,
+        ...extra,
         // Only include the key when the user actually asked to change it —
         // sending `null` unconditionally would silently reset every project
         // to the system default.
@@ -299,6 +305,7 @@ export async function updateGitAction(
     yes?: boolean
   }
 ): Promise<void> {
+  const extra = await GIT_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -441,6 +448,7 @@ export async function updateGitAction(
         directory: directory || '',
         preset: preset || null,
         ...(connectionId !== undefined ? { git_provider_connection_id: connectionId } : {}),
+        ...extra,
       },
     })
     if (apiError) {
@@ -485,6 +493,7 @@ export async function updateConfigAction(
     yes?: boolean
   }
 ): Promise<void> {
+  const extra = await DEPLOYMENT_CONFIG_EXTRA.read(options)
   // Validate a --cpu-limit flag before any network call so a bad value fails
   // fast and non-zero. A value typed at the prompt is checked further down.
   if (options.cpuLimit) {
@@ -553,6 +562,7 @@ export async function updateConfigAction(
     requestTimeoutSeconds === undefined &&
     sseIdleTimeoutSeconds === undefined &&
     websocketIdleTimeoutSeconds === undefined &&
+    Object.keys(extra).length === 0 &&
     !options.yes
   ) {
     newline()
@@ -607,6 +617,7 @@ export async function updateConfigAction(
         requestTimeoutSeconds: requestTimeoutSeconds ?? undefined,
         sseIdleTimeoutSeconds: sseIdleTimeoutSeconds ?? undefined,
         websocketIdleTimeoutSeconds: websocketIdleTimeoutSeconds ?? undefined,
+        ...extra,
       },
     })
     if (error) {

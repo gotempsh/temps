@@ -18078,7 +18078,13 @@ export type GetRequest = {
  */
 export type GetResponse = {
     /**
-     * The value, or null if not found
+     * Whether the key exists, so a stored JSON `null` is not mistaken for a
+     * missing key
+     */
+    exists: boolean;
+    /**
+     * The value, or null if not found. A stored JSON `null` is also null
+     * here; `exists` tells the two apart.
      */
     value?: unknown;
 };
@@ -35980,9 +35986,10 @@ export type SetRequest = {
  */
 export type SetResponse = {
     /**
-     * Always "OK" on success
+     * "OK" when the value was written; null when an NX/XX condition did not
+     * hold and the key was left unchanged (the Redis reply)
      */
-    result: string;
+    result?: string | null;
 };
 
 /**
@@ -70055,7 +70062,7 @@ export type KvSetErrors = {
 
 export type KvSetResponses = {
     /**
-     * Value set
+     * Value set, or `result: null` when an NX/XX condition did not hold
      */
     200: SetResponse;
 };
