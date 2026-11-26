@@ -113,7 +113,7 @@ export function registerApiKeysCommands(program: Command): void {
     .option('-n, --name <name>', 'API key name')
     .option('-r, --role <role>', 'Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest)')
     .option('-e, --expires-in <days>', 'Expires in N days (7, 30, 90, 365)')
-    .option('-p, --permissions <permissions>', 'Comma-separated list of permissions')
+    .option('-p, --permissions <permissions>', 'Comma-separated list of the key\'s exact permissions (the key uses the custom role)')
     .option('--project-id <id>', 'Confine to one project’s deployment and environment APIs')
     .option('--environment-id <id>', 'Confine to one environment (requires --project-id)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
@@ -302,10 +302,18 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
           selectedPermissions = indices
             .filter(i => i >= 0 && i < permissionsList.length)
             .map(i => permissionsList[i]!.name)
-          roleType = roleTypeForPermissions(roleType, selectedPermissions)
         }
       }
     }
+  }
+
+  // An explicit permission list is the key's exact permissions, which only
+  // the custom role carries; a predefined role brings its own and the server
+  // refuses both together. Applies to --permissions and to the prompt alike.
+  const pickedRole = roleType
+  roleType = roleTypeForPermissions(roleType, selectedPermissions)
+  if (roleType !== pickedRole) {
+    info(`Using the custom role: the key gets exactly the permissions listed, not those of the ${pickedRole} role`)
   }
 
   const result = await withSpinner('Creating API key...', async () => {
