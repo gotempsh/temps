@@ -287,6 +287,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_schedule_runs",
     "list_restore_runs_for_service",
     "get_restore_capabilities",
+    // What the latest PostgreSQL restore brought back: database and user
+    // names, and which linked project reads each. Names only, no secrets.
+    "get_restored_databases",
     // ── Audit trail ──
     "list_audit_logs",
     "get_audit_log",
@@ -1130,6 +1133,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     //    unlinked / left running unused; nothing is deleted).
     "create_service",
     "link_service_to_project",
+    // Points an existing link at another database on the same service
+    // (for example the one a restore brought back). Takes a mode and a
+    // name, no credential; the apps read it from their next deployment,
+    // and it is undone by pointing the link back.
+    "update_link_database",
     // A cluster that failed while coming up is repaired in place; the
     // alternative is a second cluster beside the broken one. It carries no
     // credentials and only re-runs the creation the user asked for.
