@@ -72,11 +72,20 @@ pub struct ApiKeyListResponse {
 // Request DTOs
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateApiKeyRequest {
+    /// Up to 255 characters, unique among the caller's keys. Surrounding
+    /// whitespace is trimmed; a blank name is refused.
     pub name: String,
+    /// A predefined role (`admin`, `platform_admin`, `user`, `reader`,
+    /// `api_reader`) or `custom` for an explicit permission list.
     #[schema(example = "admin")]
     pub role_type: String,
+    /// The key's permissions, required with `role_type: custom` and refused
+    /// with any other role, which carries its own. Fixed once the key is
+    /// created.
     #[schema(example = json!(["projects:read", "deployments:read"]))]
     pub permissions: Option<Vec<String>>,
+    /// When the key stops working. Must be in the future. Defaults to one
+    /// year after creation when left out: API keys always expire.
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     /// Immutable optional deployment resource scope.
@@ -84,14 +93,27 @@ pub struct CreateApiKeyRequest {
     pub environment_id: Option<i32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpdateApiKeyRequest {
+    /// New name, trimmed; a blank name is refused. Leave it out to keep the
+    /// current one.
     pub name: Option<String>,
     pub is_active: Option<bool>,
+    /// A key's permissions are fixed when it is created. The key's current
+    /// permissions are accepted unchanged; any other list is refused with 400.
+    /// To change them, create a new key and delete this one.
     #[schema(example = json!(["projects:read", "deployments:read"]))]
     pub permissions: Option<Vec<String>>,
+    /// A new expiry, which must be in the future. API keys always expire, so
+    /// `null` is refused for a key that has an expiry. Leave it out to keep
+    /// the current one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::apikey_service::explicit_null"
+    )]
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
-    pub expires_at: Option<UtcDateTime>,
+    pub expires_at: Option<Option<UtcDateTime>>,
 }
 
 impl From<UpdateApiKeyRequest> for crate::apikey_service::UpdateApiKeyRequest {

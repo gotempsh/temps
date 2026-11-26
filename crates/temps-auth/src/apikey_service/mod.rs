@@ -102,14 +102,66 @@ pub struct CreateApiKeyRequest {
     pub environment_id: Option<i32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpdateApiKeyRequest {
     pub name: Option<String>,
     pub is_active: Option<bool>,
+    /// Must equal the key's current permissions: they are fixed at creation.
     #[schema(example = json!(["projects:read", "deployments:read"]))]
     pub permissions: Option<Vec<String>>,
+    /// `Some(Some(t))` sets a new future expiry, `Some(None)` is an explicit
+    /// `null` (refused for a key that has an expiry), `None` keeps it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "explicit_null"
+    )]
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
-    pub expires_at: Option<UtcDateTime>,
+    pub expires_at: Option<Option<UtcDateTime>>,
+}
+
+/// `Some(None)` for an explicit `null`, `None` when the field is absent.
+pub(crate) fn explicit_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// Longest accepted API key name, in characters.
+pub const API_KEY_NAME_MAX_CHARS: usize = 255;
+
+/// Trims a requested key name and checks it is usable.
+fn normalize_key_name(name: &str) -> Result<String, ApiKeyServiceError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(ApiKeyServiceError::InvalidName {
+            reason: "the name is blank",
+        });
+    }
+    if name.chars().count() > API_KEY_NAME_MAX_CHARS {
+        return Err(ApiKeyServiceError::InvalidName {
+            reason: "the name is longer than 255 characters",
+        });
+    }
+    Ok(name.to_string())
+}
+
+/// Refuses an expiry that has already passed: the key could never work.
+fn require_future_expiry(name: &str, expires_at: UtcDateTime) -> Result<(), ApiKeyServiceError> {
+    if expires_at <= Utc::now() {
+        return Err(ApiKeyServiceError::ExpiryInPast {
+            name: name.to_string(),
+            expires_at,
+        });
+    }
+    Ok(())
+}
+
+/// A permission list in a form two lists can be compared in.
+fn permission_set(permissions: &[String]) -> std::collections::BTreeSet<&str> {
+    permissions.iter().map(|p| p.trim()).collect()
 }
 
 #[derive(Error, Debug)]
@@ -131,6 +183,36 @@ pub enum ApiKeyServiceError {
 
     #[error("Internal server error: {0}")]
     InternalServerError(String),
+
+    #[error("API key name is invalid: {reason}")]
+    InvalidName { reason: &'static str },
+
+    #[error(
+        "expires_at {} is in the past; use a future time for API key '{name}'",
+        expires_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    )]
+    ExpiryInPast {
+        name: String,
+        expires_at: UtcDateTime,
+    },
+
+    #[error(
+        "permissions are only used with role_type custom; role '{role_type}' carries its own \
+         permissions, so leave permissions out or use role_type custom"
+    )]
+    PermissionsNeedCustomRole { role_type: String },
+
+    #[error(
+        "permissions of API key {api_key_id} cannot change after it is created; create a new \
+         key with the permissions it needs, then delete this one"
+    )]
+    PermissionsImmutable { api_key_id: i32 },
+
+    #[error(
+        "the expiry of API key {api_key_id} cannot be removed: API keys always expire; send a \
+         future expires_at to extend it"
+    )]
+    ExpiryRequired { api_key_id: i32 },
 }
 
 impl ApiKeyServiceError {
@@ -176,6 +258,30 @@ impl ApiKeyServiceError {
                     .value("error_code", "INTERNAL_SERVER_ERROR")
                     .build()
             }
+            ApiKeyServiceError::InvalidName { .. }
+            | ApiKeyServiceError::ExpiryInPast { .. }
+            | ApiKeyServiceError::PermissionsNeedCustomRole { .. } => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .type_("https://temps.sh/probs/validation-error")
+                    .title("Validation Error")
+                    .detail(self.to_string())
+                    .value("error_code", "VALIDATION_ERROR")
+                    .build()
+            }
+            ApiKeyServiceError::PermissionsImmutable { .. } => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .type_("https://temps.sh/probs/api-key-permissions-immutable")
+                    .title("API Key Permissions Cannot Change")
+                    .detail(self.to_string())
+                    .value("error_code", "API_KEY_PERMISSIONS_IMMUTABLE")
+                    .build()
+            }
+            ApiKeyServiceError::ExpiryRequired { .. } => ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .type_("https://temps.sh/probs/api-key-expiry-required")
+                .title("API Key Expiry Required")
+                .detail(self.to_string())
+                .value("error_code", "API_KEY_EXPIRY_REQUIRED")
+                .build(),
         }
     }
 }
@@ -267,6 +373,8 @@ impl ApiKeyService {
         user_id: i32,
         request: CreateApiKeyRequest,
     ) -> Result<CreateApiKeyResponse, ApiKeyServiceError> {
+        let name = normalize_key_name(&request.name)?;
+        let request = CreateApiKeyRequest { name, ..request };
         // Validate role type and permissions
         let permissions_json = if request.role_type == "custom" {
             // For custom role, validate that permissions are provided
@@ -303,18 +411,18 @@ impl ApiKeyService {
                     format!("Invalid role type: {}. Valid roles are: admin, platform_admin, user, reader, api_reader, or custom", request.role_type)
                 ));
             }
+            // A predefined role carries its own permissions; a list sent
+            // with it would otherwise be dropped without a word.
+            if request.permissions.as_ref().is_some_and(|p| !p.is_empty()) {
+                return Err(ApiKeyServiceError::PermissionsNeedCustomRole {
+                    role_type: request.role_type.clone(),
+                });
+            }
             None
         };
 
-        if request.project_id.is_some()
-            && request
-                .expires_at
-                .is_some_and(|expiry| expiry <= Utc::now())
-        {
-            return Err(ApiKeyServiceError::ValidationError(format!(
-                "Expiry for API key '{}' must be in the future",
-                request.name
-            )));
+        if let Some(expires_at) = request.expires_at {
+            require_future_expiry(&request.name, expires_at)?;
         }
         temps_authz::ApiKeyScope::from_ids(request.project_id, request.environment_id).map_err(
             |error| {
@@ -438,10 +546,44 @@ impl ApiKeyService {
             .filter(temps_entities::api_keys::Column::UserId.eq(user_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| ApiKeyServiceError::NotFound("API key not found".to_string()))?;
+            .ok_or_else(|| {
+                ApiKeyServiceError::NotFound(format!(
+                    "API key {api_key_id} not found for user {user_id}"
+                ))
+            })?;
+
+        let name = request
+            .name
+            .as_deref()
+            .map(normalize_key_name)
+            .transpose()?;
+        // Permissions are fixed at creation. Accepting a different list and
+        // answering 200 would report a change that never happened.
+        if let Some(requested) = request.permissions.as_deref() {
+            let stored: Vec<String> = api_key
+                .permissions
+                .as_deref()
+                .and_then(|p| serde_json::from_str(p).ok())
+                .unwrap_or_default();
+            if permission_set(requested) != permission_set(&stored) {
+                return Err(ApiKeyServiceError::PermissionsImmutable { api_key_id });
+            }
+        }
+        match request.expires_at {
+            Some(Some(expires_at)) => {
+                require_future_expiry(name.as_deref().unwrap_or(&api_key.name), expires_at)?
+            }
+            // Removing an expiry would make the key never expire, which
+            // creation does not allow either. `null` for a key without one
+            // changes nothing.
+            Some(None) if api_key.expires_at.is_some() => {
+                return Err(ApiKeyServiceError::ExpiryRequired { api_key_id });
+            }
+            Some(None) | None => {}
+        }
 
         // Check if new name conflicts with existing keys
-        if let Some(ref new_name) = request.name {
+        if let Some(ref new_name) = name {
             if new_name != &api_key.name {
                 let existing_key = ApiKeyEntity::find()
                     .filter(temps_entities::api_keys::Column::UserId.eq(user_id))
@@ -460,16 +602,15 @@ impl ApiKeyService {
 
         let mut api_key_active: ApiKeyActiveModel = api_key.into();
 
-        if let Some(name) = request.name {
+        if let Some(name) = name {
             api_key_active.name = Set(name);
         }
         if let Some(is_active) = request.is_active {
             api_key_active.is_active = Set(is_active);
         }
-        if let Some(expires_at) = request.expires_at {
+        if let Some(Some(expires_at)) = request.expires_at {
             api_key_active.expires_at = Set(Some(expires_at));
         }
-        // Note: We no longer support custom permissions, only standard roles
         api_key_active.updated_at = Set(Utc::now());
 
         let updated_api_key = api_key_active.update(self.db.as_ref()).await?;

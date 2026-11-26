@@ -524,7 +524,7 @@ async fn test_update_api_key_expiration() {
         name: None,
         is_active: None,
         permissions: None,
-        expires_at: Some(new_expiry),
+        expires_at: Some(Some(new_expiry)),
     };
 
     let response = api_key_service
@@ -798,13 +798,22 @@ async fn test_validate_api_key_expired() {
         name: "Expired Key".to_string(),
         role_type: "admin".to_string(),
         permissions: None,
-        expires_at: Some(Utc::now() - Duration::days(1)), // Already expired
+        expires_at: Some(Utc::now() + Duration::hours(1)),
     };
 
     let create_response = api_key_service
         .create_api_key(user.id, request)
         .await
         .unwrap();
+    // A past expiry is refused on create, so let the stored one lapse.
+    let stored = ApiKeyEntity::find_by_id(create_response.id)
+        .one(_db.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stored: ApiKeyActiveModel = stored.into();
+    stored.expires_at = Set(Some(Utc::now() - Duration::days(1)));
+    stored.update(_db.db.as_ref()).await.unwrap();
 
     let result = api_key_service
         .validate_api_key(&create_response.api_key)
@@ -1556,4 +1565,365 @@ async fn test_error_to_problem_conversion() {
     let conflict = ApiKeyServiceError::Conflict("Name exists".to_string());
     let problem = conflict.to_problem();
     assert_eq!(problem.status_code, StatusCode::CONFLICT);
+}
+
+// ---- input validation ----------------------------------------------------
+
+fn key_request(name: &str, role_type: &str) -> CreateApiKeyRequest {
+    CreateApiKeyRequest {
+        project_id: None,
+        environment_id: None,
+        name: name.to_string(),
+        role_type: role_type.to_string(),
+        permissions: None,
+        expires_at: None,
+    }
+}
+
+async fn key_count(db: &TestDatabase, user_id: i32) -> u64 {
+    ApiKeyEntity::find()
+        .filter(temps_entities::api_keys::Column::UserId.eq(user_id))
+        .count(db.db.as_ref())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn create_refuses_an_expiry_in_the_past_for_every_key() {
+    let (db, service, user) = setup_test_env().await;
+    let past = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+
+    let error = service
+        .create_api_key(
+            user.id,
+            CreateApiKeyRequest {
+                expires_at: Some(past),
+                ..key_request("b", "reader")
+            },
+        )
+        .await
+        .expect_err("a key that is already expired must be refused");
+
+    assert!(
+        matches!(&error, ApiKeyServiceError::ExpiryInPast { expires_at, .. } if *expires_at == past),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("expires_at 2020-01-01T00:00:00Z is in the past"),
+        "{error}"
+    );
+    assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(key_count(&db, user.id).await, 0);
+}
+
+#[tokio::test]
+async fn create_without_an_expiry_expires_in_one_year() {
+    let (_db, service, user) = setup_test_env().await;
+    let created = service
+        .create_api_key(user.id, key_request("defaulted", "reader"))
+        .await
+        .unwrap();
+    let expires_at = created.expires_at.expect("API keys always expire");
+    let in_a_year = Utc::now() + chrono::Duration::days(365);
+    assert!(
+        (expires_at - in_a_year).num_minutes().abs() < 5,
+        "{expires_at}"
+    );
+}
+
+#[tokio::test]
+async fn create_trims_the_name_and_refuses_a_blank_one() {
+    let (db, service, user) = setup_test_env().await;
+
+    for blank in ["", "   ", "\t\n"] {
+        let error = service
+            .create_api_key(user.id, key_request(blank, "reader"))
+            .await
+            .expect_err("a blank name must be refused");
+        assert!(
+            matches!(error, ApiKeyServiceError::InvalidName { .. }),
+            "{blank:?}: {error:?}"
+        );
+        assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+    }
+    let too_long = "k".repeat(API_KEY_NAME_MAX_CHARS + 1);
+    let error = service
+        .create_api_key(user.id, key_request(&too_long, "reader"))
+        .await
+        .expect_err("an over-long name must be refused");
+    assert!(matches!(error, ApiKeyServiceError::InvalidName { .. }));
+    assert!(!error.to_string().contains(&too_long));
+    assert_eq!(key_count(&db, user.id).await, 0);
+
+    let created = service
+        .create_api_key(user.id, key_request("  padded  ", "reader"))
+        .await
+        .unwrap();
+    assert_eq!(created.name, "padded");
+    let duplicate = service
+        .create_api_key(user.id, key_request("padded ", "reader"))
+        .await
+        .expect_err("the trimmed name is what must be unique");
+    assert!(matches!(duplicate, ApiKeyServiceError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn create_refuses_permissions_with_a_predefined_role() {
+    let (db, service, user) = setup_test_env().await;
+
+    let error = service
+        .create_api_key(
+            user.id,
+            CreateApiKeyRequest {
+                permissions: Some(vec!["projects:write".to_string()]),
+                ..key_request("e", "reader")
+            },
+        )
+        .await
+        .expect_err("a permission list a predefined role would drop must be refused");
+    match &error {
+        ApiKeyServiceError::PermissionsNeedCustomRole { role_type } => {
+            assert_eq!(role_type, "reader")
+        }
+        other => panic!("expected PermissionsNeedCustomRole, got {other:?}"),
+    }
+    assert!(error.to_string().contains("role_type custom"), "{error}");
+    assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(key_count(&db, user.id).await, 0);
+
+    // An empty list asks for nothing, so it is not refused.
+    let created = service
+        .create_api_key(
+            user.id,
+            CreateApiKeyRequest {
+                permissions: Some(vec![]),
+                ..key_request("reader-key", "reader")
+            },
+        )
+        .await
+        .expect("an empty list with a predefined role is accepted");
+    assert_eq!(created.permissions, None);
+}
+
+#[tokio::test]
+async fn create_explains_an_environment_scope_without_a_project() {
+    let (_db, service, user) = setup_test_env().await;
+
+    let error = service
+        .create_api_key(
+            user.id,
+            CreateApiKeyRequest {
+                environment_id: Some(1),
+                ..key_request("d", "reader")
+            },
+        )
+        .await
+        .expect_err("an environment needs its project");
+    let message = error.to_string();
+    assert!(
+        message.contains(
+            "environment_id 1 needs project_id: an API key scoped to an environment must also \
+             name its project"
+        ),
+        "{message}"
+    );
+    assert!(
+        !message.contains("Some(") && !message.contains("None"),
+        "{message}"
+    );
+    assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+}
+
+async fn custom_key(service: &ApiKeyService, user_id: i32, permissions: &[&str]) -> i32 {
+    service
+        .create_api_key(
+            user_id,
+            CreateApiKeyRequest {
+                permissions: Some(permissions.iter().map(|p| p.to_string()).collect()),
+                ..key_request("custom", "custom")
+            },
+        )
+        .await
+        .unwrap()
+        .id
+}
+
+fn permissions_update(permissions: &[&str]) -> UpdateApiKeyRequest {
+    UpdateApiKeyRequest {
+        permissions: Some(permissions.iter().map(|p| p.to_string()).collect()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn update_refuses_a_permission_change_instead_of_ignoring_it() {
+    let (_db, service, user) = setup_test_env().await;
+    let id = custom_key(&service, user.id, &["projects:read"]).await;
+
+    for requested in [
+        &["deployments:read", "nonsense:perm"][..],
+        &["projects:read", "deployments:read"],
+        &[],
+    ] {
+        let error = service
+            .update_api_key(user.id, id, permissions_update(requested))
+            .await
+            .expect_err("a permission change must be refused");
+        assert!(
+            matches!(error, ApiKeyServiceError::PermissionsImmutable { api_key_id } if api_key_id == id),
+            "{requested:?}: {error:?}"
+        );
+        let problem = error.to_problem();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            problem.body.get("error_code"),
+            Some(&serde_json::json!("API_KEY_PERMISSIONS_IMMUTABLE"))
+        );
+    }
+    let stored = service.get_api_key(user.id, id).await.unwrap();
+    assert_eq!(stored.permissions, Some(vec!["projects:read".to_string()]));
+
+    // Sending the key's own permissions back, with other changes, is fine.
+    let renamed = service
+        .update_api_key(
+            user.id,
+            id,
+            UpdateApiKeyRequest {
+                name: Some("renamed".to_string()),
+                ..permissions_update(&["projects:read"])
+            },
+        )
+        .await
+        .expect("unchanged permissions are not a change");
+    assert_eq!(renamed.name, "renamed");
+    assert_eq!(renamed.permissions, Some(vec!["projects:read".to_string()]));
+}
+
+#[tokio::test]
+async fn update_refuses_permissions_for_a_predefined_role_key() {
+    let (_db, service, user) = setup_test_env().await;
+    let created = service
+        .create_api_key(user.id, key_request("admin-key", "admin"))
+        .await
+        .unwrap();
+
+    let error = service
+        .update_api_key(user.id, created.id, permissions_update(&["projects:read"]))
+        .await
+        .expect_err("a role key cannot gain a permission list");
+    assert!(matches!(
+        error,
+        ApiKeyServiceError::PermissionsImmutable { .. }
+    ));
+    service
+        .update_api_key(user.id, created.id, permissions_update(&[]))
+        .await
+        .expect("an empty list matches a role key's permissions");
+}
+
+#[tokio::test]
+async fn update_keeps_or_extends_the_expiry_but_never_removes_it() {
+    let (db, service, user) = setup_test_env().await;
+    let created = service
+        .create_api_key(user.id, key_request("expiring", "reader"))
+        .await
+        .unwrap();
+    let stored_expiry = created.expires_at.expect("keys always expire");
+
+    // `null` would make the key never expire: refused, nothing changes.
+    let request: UpdateApiKeyRequest = serde_json::from_str(r#"{"expires_at":null}"#).unwrap();
+    assert_eq!(request.expires_at, Some(None));
+    let error = service
+        .update_api_key(user.id, created.id, request)
+        .await
+        .expect_err("removing the expiry must be refused");
+    assert!(
+        matches!(error, ApiKeyServiceError::ExpiryRequired { api_key_id } if api_key_id == created.id),
+        "{error:?}"
+    );
+    assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+
+    // A past expiry is refused too.
+    let error = service
+        .update_api_key(
+            user.id,
+            created.id,
+            UpdateApiKeyRequest {
+                expires_at: Some(Some(Utc::now() - Duration::minutes(1))),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a past expiry must be refused");
+    assert!(matches!(error, ApiKeyServiceError::ExpiryInPast { .. }));
+
+    // Leaving it out keeps it.
+    let request: UpdateApiKeyRequest = serde_json::from_str(r#"{"is_active":false}"#).unwrap();
+    assert_eq!(request.expires_at, None);
+    let updated = service
+        .update_api_key(user.id, created.id, request)
+        .await
+        .unwrap();
+    assert!(!updated.is_active);
+    assert_eq!(
+        updated.expires_at.map(|t| t.timestamp()),
+        Some(stored_expiry.timestamp())
+    );
+
+    // A key stored without an expiry may be sent `null`: nothing changes.
+    let mut model: ApiKeyActiveModel = ApiKeyEntity::find_by_id(created.id)
+        .one(db.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    model.expires_at = Set(None);
+    model.update(db.db.as_ref()).await.unwrap();
+    let request: UpdateApiKeyRequest = serde_json::from_str(r#"{"expires_at":null}"#).unwrap();
+    let unchanged = service
+        .update_api_key(user.id, created.id, request)
+        .await
+        .expect("null for a key without an expiry changes nothing");
+    assert_eq!(unchanged.expires_at, None);
+}
+
+#[tokio::test]
+async fn update_trims_the_name_and_refuses_a_blank_one() {
+    let (_db, service, user) = setup_test_env().await;
+    let created = service
+        .create_api_key(user.id, key_request("named", "reader"))
+        .await
+        .unwrap();
+
+    let error = service
+        .update_api_key(
+            user.id,
+            created.id,
+            UpdateApiKeyRequest {
+                name: Some("   ".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a blank name must be refused");
+    assert!(matches!(error, ApiKeyServiceError::InvalidName { .. }));
+    let stored = service.get_api_key(user.id, created.id).await.unwrap();
+    assert_eq!(stored.name, "named");
+
+    let renamed = service
+        .update_api_key(
+            user.id,
+            created.id,
+            UpdateApiKeyRequest {
+                name: Some("  trimmed ".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "trimmed");
 }
