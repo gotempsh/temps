@@ -1474,6 +1474,14 @@ impl AgentExecutor {
                     None,
                 )
                 .await?;
+            // ADR-116 D2: the run's tool loop offers the model the sandbox
+            // tools only. Say so rather than let a workflow that counts on
+            // these find out from a wrong answer.
+            let mut names: Vec<&str> = merged.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            self.run_service
+                .append_log(run_id, "warning", &mcp_not_offered_warning(&names), None)
+                .await?;
         }
 
         // ── Skills: resolve slugs from project definitions, write as
@@ -2638,6 +2646,7 @@ impl AgentExecutor {
                 project_id: project.id,
                 model: model.clone(),
                 prompt,
+                // 0 (persistent workflows) sets no cap; the time budget bounds it.
                 max_turns: u32::try_from(config.max_turns).unwrap_or(1),
                 timeout: Duration::from_secs(u64::try_from(config.timeout_seconds).unwrap_or(0)),
             },
@@ -2647,8 +2656,12 @@ impl AgentExecutor {
         let ai_result = AiRunResult {
             output: outcome.transcript.clone(),
             exit_code: 0,
-            tokens_input: None,
-            tokens_output: None,
+            tokens_input: outcome
+                .tokens_input
+                .map(|t| i32::try_from(t).unwrap_or(i32::MAX)),
+            tokens_output: outcome
+                .tokens_output
+                .map(|t| i32::try_from(t).unwrap_or(i32::MAX)),
             model,
             changed_files: None,
             session_id: None,
@@ -3976,6 +3989,18 @@ fn skipped_overlay_entries_message(
     ))
 }
 
+/// The run-log warning for MCP servers and custom tools an agent defines:
+/// they are installed in the sandbox, but the gateway tool loop (ADR-116 D2)
+/// does not offer them to the model.
+fn mcp_not_offered_warning(names: &[&str]) -> String {
+    format!(
+        "This agent defines MCP servers or custom tools ({}). Agents now run on the AI \
+         gateway's tool loop, which offers the model only its sandbox tools: these are \
+         installed in the sandbox but the agent cannot call them.",
+        names.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod scoped_token_git_env_tests {
     use super::{clone_with_scoped_token, scoped_token_git_env, ScopedCloneError};
@@ -4098,6 +4123,16 @@ mod scoped_token_git_env_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_the_loop_cannot_call_are_named_in_the_run_log() {
+        let warning = mcp_not_offered_warning(&["github", "temps-custom-tools"]);
+        assert!(
+            warning.contains("(github, temps-custom-tools)"),
+            "{warning}"
+        );
+        assert!(warning.contains("cannot call them"), "{warning}");
+    }
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
@@ -4258,11 +4293,13 @@ pub(crate) mod tests {
                                 .to_string(),
                         })
                         .collect(),
+                    usage: None,
                 });
             }
             Ok(temps_ai::ChatTurnResponse {
                 content: Some(self.output.clone()),
                 tool_calls: Vec::new(),
+                usage: None,
             })
         }
     }

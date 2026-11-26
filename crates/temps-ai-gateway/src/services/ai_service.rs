@@ -968,6 +968,10 @@ impl AiService for GatewayAiService {
                 reason: e.to_string(),
             })?;
 
+        let usage = resp.usage.as_ref().map(|u| temps_ai::ChatTurnUsage {
+            input_tokens: u64::try_from(u.prompt_tokens).unwrap_or(0),
+            output_tokens: u64::try_from(u.completion_tokens).unwrap_or(0),
+        });
         let choice = resp.choices.into_iter().next();
         let (content, tool_calls) = match choice {
             Some(c) => {
@@ -992,6 +996,7 @@ impl AiService for GatewayAiService {
         Ok(ChatTurnResponse {
             content,
             tool_calls,
+            usage,
         })
     }
 

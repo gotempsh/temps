@@ -121,7 +121,8 @@ pub struct AgentLoopRequest {
     /// A gateway model id; `None` uses the gateway's default model.
     pub model: Option<String>,
     pub prompt: String,
-    /// Most model turns (one gateway call each), at least 1.
+    /// Most model turns (one gateway call each). 0 sets no cap, as it did
+    /// for the coding CLIs: the time budget then bounds the run.
     pub max_turns: u32,
     /// The whole run's time budget.
     pub timeout: Duration,
@@ -137,6 +138,10 @@ pub struct AgentLoopOutcome {
     pub turns: u32,
     /// True when the run used every turn before giving a final message.
     pub exhausted_turns: bool,
+    /// Tokens the gateway reported across every turn; `None` when it
+    /// reported none.
+    pub tokens_input: Option<u64>,
+    pub tokens_output: Option<u64>,
 }
 
 /// The system prompt every agent run starts with.
@@ -218,7 +223,7 @@ pub async fn run_agent_loop(
     on_event: Option<OnEventCallback>,
 ) -> Result<AgentLoopOutcome, AgentError> {
     let deadline = Instant::now() + request.timeout;
-    let max_turns = request.max_turns.max(1);
+    let max_turns = request.max_turns;
     let tools = tools();
     let mut messages = vec![
         ChatMessage::system(system_prompt(sandbox.work_dir())),
@@ -226,8 +231,11 @@ pub async fn run_agent_loop(
     ];
     let mut transcript = Transcript::new(on_event);
     let mut last_text = String::new();
+    let mut usage = Usage::default();
+    let mut turn = 0u32;
 
-    for turn in 1..=max_turns {
+    while max_turns == 0 || turn < max_turns {
+        turn += 1;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(timed_out(&request, turn - 1));
@@ -249,6 +257,7 @@ pub async fn run_agent_loop(
                 turn,
                 reason: error.to_string(),
             })?;
+        usage.add(response.usage);
 
         let text = response.content.unwrap_or_default();
         if !text.trim().is_empty() {
@@ -267,6 +276,8 @@ pub async fn run_agent_loop(
                 final_text: last_text,
                 turns: turn,
                 exhausted_turns: false,
+                tokens_input: usage.input,
+                tokens_output: usage.output,
             });
         }
 
@@ -324,7 +335,26 @@ pub async fn run_agent_loop(
         final_text: last_text,
         turns: max_turns,
         exhausted_turns: true,
+        tokens_input: usage.input,
+        tokens_output: usage.output,
     })
+}
+
+/// The tokens a run's turns used, summed over the turns the gateway
+/// reported them for.
+#[derive(Default)]
+struct Usage {
+    input: Option<u64>,
+    output: Option<u64>,
+}
+
+impl Usage {
+    fn add(&mut self, turn: Option<temps_ai::ChatTurnUsage>) {
+        if let Some(turn) = turn {
+            self.input = Some(self.input.unwrap_or(0).saturating_add(turn.input_tokens));
+            self.output = Some(self.output.unwrap_or(0).saturating_add(turn.output_tokens));
+        }
+    }
 }
 
 fn timed_out(request: &AgentLoopRequest, turns: u32) -> AgentError {
@@ -654,6 +684,7 @@ mod tests {
         ChatTurnResponse {
             content: Some(text.to_string()),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
 
@@ -665,7 +696,16 @@ mod tests {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             }],
+            usage: None,
         }
+    }
+
+    fn with_usage(mut turn: ChatTurnResponse, input: u64, output: u64) -> ChatTurnResponse {
+        turn.usage = Some(temps_ai::ChatTurnUsage {
+            input_tokens: input,
+            output_tokens: output,
+        });
+        turn
     }
 
     fn request(max_turns: u32) -> AgentLoopRequest {
@@ -815,6 +855,7 @@ mod tests {
                     arguments: json!({ "path": "late.txt", "content": "x" }).to_string(),
                 },
             ],
+            usage: None,
         })]);
         let sandbox = MemorySandbox {
             exec_delay: Duration::from_secs(5),
@@ -988,5 +1029,55 @@ mod tests {
         assert!(bounded.ends_with(&"z".repeat(10)));
         assert!(bounded.contains("40 characters left out"));
         assert_eq!(bound("short", 20), "short");
+    }
+
+    /// A cap of 0 is no cap, as the coding CLIs read it: the run goes on
+    /// until the model gives a final message (or the time budget ends).
+    #[tokio::test]
+    async fn zero_turns_sets_no_cap() {
+        let ai = ScriptedAi::new(vec![
+            Ok(tool_turn(
+                "c1",
+                SANDBOX_EXEC_TOOL,
+                json!({ "command": "ls" }),
+            )),
+            Ok(tool_turn(
+                "c2",
+                SANDBOX_EXEC_TOOL,
+                json!({ "command": "ls" }),
+            )),
+            Ok(text_turn("done")),
+        ]);
+        let outcome = run_agent_loop(&ai, &MemorySandbox::default(), request(0), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.turns, 3);
+        assert!(!outcome.exhausted_turns);
+        assert_eq!(outcome.final_text, "done");
+    }
+
+    /// The run sums the tokens each turn reports, and reports none when the
+    /// gateway gave none.
+    #[tokio::test]
+    async fn the_run_reports_the_tokens_its_turns_used() {
+        let ai = ScriptedAi::new(vec![
+            Ok(with_usage(
+                tool_turn("c1", SANDBOX_EXEC_TOOL, json!({ "command": "ls" })),
+                1200,
+                40,
+            )),
+            Ok(with_usage(text_turn("done"), 1500, 60)),
+        ]);
+        let outcome = run_agent_loop(&ai, &MemorySandbox::default(), request(5), None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.tokens_input, Some(2700));
+        assert_eq!(outcome.tokens_output, Some(100));
+
+        let silent = ScriptedAi::new(vec![Ok(text_turn("done"))]);
+        let outcome = run_agent_loop(&silent, &MemorySandbox::default(), request(5), None)
+            .await
+            .unwrap();
+        assert_eq!((outcome.tokens_input, outcome.tokens_output), (None, None));
     }
 }
