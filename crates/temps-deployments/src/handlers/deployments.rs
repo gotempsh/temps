@@ -2081,7 +2081,7 @@ pub async fn get_deployment_container_log_content(
         service_name: row.service_name,
         size_bytes: row.size_bytes,
         truncated: row.truncated,
-        captured_at: row.captured_at.timestamp_millis(),
+        captured_at: row.captured_at,
         content,
     };
 

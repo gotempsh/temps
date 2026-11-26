@@ -55,7 +55,8 @@ const MAX_LINKS_SHOWN = 8
 interface CreatedLink {
   url: string
   port: number
-  expiresAt: number
+  /** ISO 8601. */
+  expiresAt: string
 }
 
 interface SandboxPreviewLinksCardProps {

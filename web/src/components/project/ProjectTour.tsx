@@ -72,7 +72,7 @@ const STEPS: TourStep[] = [
   },
   {
     route: 'metrics',
-    anchor: 'monitoring',
+    anchor: 'metrics',
     title: 'Metrics',
     body: 'Counters, histograms and gauges — with anomaly alerts.',
   },

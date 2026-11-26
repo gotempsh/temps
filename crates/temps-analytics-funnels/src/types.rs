@@ -12,6 +12,6 @@ pub use crate::services::{
 
 // Re-export handler layer HTTP types
 pub use crate::handlers::types::{
-    CreateFunnelResponse, EventType, EventTypesResponse, FunnelMetricsResponse, FunnelResponse,
-    GetFunnelMetricsQuery, StepConversionResponse,
+    EventType, EventTypesResponse, FunnelList, FunnelMetricsResponse, FunnelResponse,
+    FunnelStepResponse, GetFunnelMetricsQuery, StepConversionResponse,
 };

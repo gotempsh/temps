@@ -14,7 +14,7 @@ function deployment(
   overrides: Partial<DeploymentResponse> = {}
 ): DeploymentResponse {
   return {
-    created_at: 0,
+    created_at: '1970-01-01T00:00:00Z',
     environment: { domains: [], id: 1, name: 'production', slug: 'production' },
     environment_id: 1,
     id: 1,

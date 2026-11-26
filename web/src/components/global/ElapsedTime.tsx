@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 interface ElapsedTimeProps {
-  startedAt: number
-  endedAt?: number | null
+  /** Epoch milliseconds or an ISO 8601 timestamp. */
+  startedAt: number | string
+  endedAt?: number | string | null
 }
 
 import { useEffect, useState } from 'react'

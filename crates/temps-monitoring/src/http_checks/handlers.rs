@@ -198,6 +198,20 @@ pub async fn create(
     Ok(Json(result))
 }
 
+#[utoipa::path(get, path="/projects/{project_id}/http-checks/{check_id}", tag="HTTP Checks", operation_id="getHttpCheck",
+    params(("project_id"=i32,Path,description="Project ID"),("check_id"=i32,Path,description="Check ID")),
+    responses((status=200,description="The check, as listed (credentials are never returned)",body=HttpCheckView),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="No check with this ID in the project"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
+pub async fn get_one(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<HttpChecksState>>,
+    Path((project_id, check_id)): Path<(i32, i32)>,
+) -> Result<Json<HttpCheckView>, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    Ok(Json(state.service.get(project_id, check_id).await?))
+}
+
 #[utoipa::path(put, path="/projects/{project_id}/http-checks/{check_id}", tag="HTTP Checks", operation_id="updateHttpCheck",
     params(("project_id"=i32,Path,description="Project ID"),("check_id"=i32,Path,description="Check ID")),
     request_body=SaveHttpCheck,
@@ -404,7 +418,7 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
         )
         .route(
             "/projects/{project_id}/http-checks/{check_id}",
-            axum::routing::put(update).delete(delete).patch(set_enabled),
+            get(get_one).put(update).delete(delete).patch(set_enabled),
         )
         .route(
             "/projects/{project_id}/http-checks/{check_id}/run",
@@ -424,7 +438,7 @@ pub fn routes() -> Router<Arc<HttpChecksState>> {
         )
 }
 #[derive(OpenApi)]
-#[openapi(paths(list,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::LocalCheckSpec,temps_credential_checks::ExpiringArtifact,temps_credential_checks::ArtifactKind,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs")))]
+#[openapi(paths(list,get_one,presets,detect,create,update,run,delete,capabilities,set_enabled,history,detect_secret,secret_history),components(schemas(VariableHistoryDetails,VariableHistoryList,VariableHistoryEntry,HttpChecksCapabilities,SetHttpCheckEnabled,HttpCheckView,HttpCheckList,SaveHttpCheck,DetectionView,SecretDetectionView,temps_credential_checks::Candidate,temps_credential_checks::ProviderPreset,temps_credential_checks::HttpCheckSpec,temps_credential_checks::LocalCheckSpec,temps_credential_checks::ExpiringArtifact,temps_credential_checks::ArtifactKind,temps_credential_checks::CheckKind,temps_credential_checks::VerificationResult)),tags((name="HTTP Checks",description="Credential checks for environment variables and secrets: provider HTTP verification and local expiry of certificates, SSH certificates, OpenPGP keys, kubeconfigs and JWTs")))]
 pub struct HttpChecksApiDoc;
 
 fn authorize_check_toggle(auth: &temps_authz::AuthContext, enabled: bool) -> Result<(), Problem> {
@@ -444,7 +458,10 @@ mod tests {
 
     const TEST_KEY: &str = "test-only-not-a-live-credential";
     fn session(role: temps_authz::Role) -> temps_authz::AuthContext {
-        let user = temps_entities::users::Model {
+        temps_authz::AuthContext::new_session(test_user(), role)
+    }
+    fn test_user() -> temps_entities::users::Model {
+        temps_entities::users::Model {
             id: 1,
             name: "Test".into(),
             email: "test@example.com".into(),
@@ -463,8 +480,7 @@ mod tests {
             oidc_provider_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-        };
-        temps_authz::AuthContext::new_session(user, role)
+        }
     }
     #[test]
     fn resuming_requires_secret_permission_but_pausing_does_not() {
@@ -557,6 +573,82 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+    fn check_row(id: i32) -> temps_entities::http_checks::Model {
+        let now = Utc::now();
+        temps_entities::http_checks::Model {
+            id,
+            project_id: 10,
+            env_var_id: None,
+            secret_id: None,
+            kind: "http".into(),
+            name: "Example endpoint".into(),
+            automatic_provider: None,
+            encrypted_spec: "ciphertext".into(),
+            encrypted_credential: Some("ciphertext".into()),
+            enabled: true,
+            interval_seconds: 86400,
+            next_check_at: now,
+            lease_until: None,
+            lease_token: None,
+            last_result: None,
+            last_checked_at: None,
+            last_notified_fingerprint: String::new(),
+            consecutive_unknowns: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+    #[tokio::test]
+    async fn reading_one_check_requires_authentication_and_environments_read() {
+        let (status, _) = call(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            None,
+            "GET",
+            "/projects/10/http-checks/1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let no_read = temps_authz::AuthContext::new_api_key(
+            test_user(),
+            None,
+            Some(vec![temps_authz::Permission::EnvironmentsWrite]),
+            "ci".into(),
+            3,
+        );
+        let (status, _) = call(
+            MockDatabase::new(DatabaseBackend::Postgres),
+            Some(no_read),
+            "GET",
+            "/projects/10/http-checks/1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    #[tokio::test]
+    async fn reading_one_check_returns_it_or_a_404_naming_it() {
+        let (status, body) = call(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![check_row(1)]]),
+            Some(session(temps_authz::Role::User)),
+            "GET",
+            "/projects/10/http-checks/1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(view["id"], 1);
+        assert!(!body.contains("ciphertext"), "{body}");
+
+        let (status, body) = call(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::http_checks::Model>::new()]),
+            Some(session(temps_authz::Role::User)),
+            "GET",
+            "/projects/10/http-checks/7",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains('7') && body.contains("10"), "{body}");
     }
     #[tokio::test]
     async fn secret_endpoints_require_authentication() {

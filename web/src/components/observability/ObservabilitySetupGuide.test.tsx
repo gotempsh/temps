@@ -6,6 +6,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { getProjectOptions } from '@/api/client/@tanstack/react-query.gen'
+import { ingestSetupClient } from '@/components/project/setup/ingest-setup-cache.test-helpers'
+import { HAND_OFF_LABEL } from '@/lib/agent-handoff'
+import { ingestSetupFixture } from '@/lib/ingest-setup.fixture'
 import { QueryContent } from './GlobalPage'
 import { ObservabilitySetupGuide } from './ObservabilitySetupGuide'
 import {
@@ -57,7 +60,9 @@ describe('empty observability pages teach the setup', () => {
       for (const needle of needles) expect(html).toContain(needle)
       expect(html).toContain('<ol')
       // Without a service in scope, the guide asks for one.
-      expect(html).toContain('Choose a service')
+      expect(html).toContain('Choose service')
+      // The prompt needs a service's endpoints, so it waits for one.
+      expect(html).not.toContain(HAND_OFF_LABEL)
     })
   }
 
@@ -78,7 +83,30 @@ describe('empty observability pages teach the setup', () => {
       client
     )
     expect(html).toContain('href="/projects/storefront/errors/setup"')
-    expect(html).toContain('Open error tracking setup for Storefront')
+    // A short label; the service it opens is in the tooltip.
+    expect(html).toContain('title="Open setup for Storefront"')
+    expect(html).toContain('>Open setup<')
+  })
+
+  test('with a service in scope, the guide offers a prompt to set it up', () => {
+    // A coding agent can do the setup in the user's own app from this
+    // prompt, with this server's endpoints already filled in.
+    const client = ingestSetupClient(
+      { kind: 'loaded', data: ingestSetupFixture() },
+      7
+    )
+    client.setQueryData<object>(
+      getProjectOptions({ path: { id: 7 } }).queryKey,
+      { id: 7, name: 'Storefront', slug: 'storefront' }
+    )
+    for (const kind of ['traces', 'errors', 'logs', 'analytics'] as const) {
+      const html = render(
+        <ObservabilitySetupGuide kind={kind} projectId={7} />,
+        client
+      )
+      expect(html).toContain(HAND_OFF_LABEL)
+      expect(html).not.toContain('disabled=""')
+    }
   })
 
   test('manual trace export names the project, as API-key ingest requires', () => {

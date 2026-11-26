@@ -83,9 +83,9 @@ export async function status(options: StatusOptions): Promise<void> {
     Message: deployment.commit_message ?? '-',
     Duration: duration,
     URL: deployment.url ?? '-',
-    Created: formatDate(new Date(deployment.created_at * 1000).toISOString()),
-    Started: deployment.started_at ? formatDate(new Date(deployment.started_at * 1000).toISOString()) : '-',
-    Finished: deployment.finished_at ? formatDate(new Date(deployment.finished_at * 1000).toISOString()) : '-',
+    Created: formatDate(deployment.created_at),
+    Started: deployment.started_at ? formatDate(deployment.started_at) : '-',
+    Finished: deployment.finished_at ? formatDate(deployment.finished_at) : '-',
   })
 
   const serviceUrls = deployment.environment?.service_urls ?? []
@@ -116,8 +116,9 @@ export async function status(options: StatusOptions): Promise<void> {
   newline()
 }
 
-export function calculateDuration(startMs: number, endMs: number): string {
-  const diffMs = (endMs - startMs) * 1000
+/** The time between two ISO 8601 instants, as "Xm Ys" or "Ys". */
+export function calculateDuration(start: string, end: string): string {
+  const diffMs = Date.parse(end) - Date.parse(start)
   const seconds = Math.floor(diffMs / 1000)
   const minutes = Math.floor(seconds / 60)
 

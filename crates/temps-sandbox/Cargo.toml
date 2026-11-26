@@ -30,7 +30,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 chrono = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }

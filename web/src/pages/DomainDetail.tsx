@@ -553,7 +553,7 @@ export function DomainDetail() {
     }
   }
 
-  const isExpiringSoon = (expirationTime?: number | null) => {
+  const isExpiringSoon = (expirationTime?: string | null) => {
     if (!expirationTime) return false
     const expirationDate = new Date(expirationTime)
     const now = new Date()
@@ -1883,13 +1883,13 @@ type Domain = {
   status: string
   verification_method: string
   is_wildcard?: boolean
-  last_renewed?: number | null
-  expiration_time?: number | null
+  last_renewed?: string | null
+  expiration_time?: string | null
   certificate?: string | null
   last_error?: string | null
   last_error_type?: string | null
-  created_at: number
-  updated_at: number
+  created_at: string
+  updated_at: string
 }
 
 function ExpiringSoonAlert({
@@ -1899,7 +1899,7 @@ function ExpiringSoonAlert({
   onRenew,
   renewing,
 }: {
-  expirationTime?: number | null
+  expirationTime?: string | null
   canRenew: boolean
   renewLabel: string
   onRenew: () => void

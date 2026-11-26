@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'bun:test'
 import {
   mergeSettingsNavigationGroups,
+  resolveSettingsTab,
   settingsNavigationGroups,
 } from './settings-navigation'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
@@ -13,21 +14,66 @@ const labels = (groups: ReturnType<typeof mergeSettingsNavigationGroups>) =>
   groups.map((g) => g.label)
 
 describe('settingsNavigationGroups', () => {
-  it('does not list Worker Nodes — it belongs to the main navigation', () => {
-    // The page keeps its /settings/nodes URL but is reachable from
-    // "Build & deliver". Re-adding it here would list it twice in Cmd+K and
-    // swap the sidebar into settings mode on a main-nav page.
-    const urls = settingsNavigationGroups.flatMap((g) =>
-      g.items.map((i) => i.url)
-    )
-    expect(urls).not.toContain(WORKER_NODES_URL)
+  const items = settingsNavigationGroups.flatMap((g) => g.items)
+  const urls = items.map((i) => i.url)
+
+  it('groups settings by what they govern', () => {
+    expect(labels(settingsNavigationGroups)).toEqual([
+      // What the platform connects to and what agents may use come first.
+      'Platform',
+      'AI',
+      'Access',
+      'Security',
+      'Instance',
+      'Data',
+    ])
+    const group = (title: string) =>
+      settingsNavigationGroups.find((g) =>
+        g.items.some((i) => i.title === title)
+      )?.label
+    expect(group('Audit log')).toBe('Access')
+    expect(group('Sign-in')).toBe('Access')
+    expect(group('Limits')).toBe('Instance')
+    expect(group('Extensions')).toBe('Data')
   })
 
-  it('does not list Plugins — it belongs to the main navigation', () => {
-    const urls = settingsNavigationGroups.flatMap((g) =>
-      g.items.map((i) => i.url)
+  it('does not list the server areas that keep a /settings URL', () => {
+    // Servers, notification channels and the MCP server are areas of the
+    // server menu. Listing them here too would give them two homes and swap
+    // the sidebar away from the entry that is active.
+    expect(urls).not.toContain(WORKER_NODES_URL)
+    expect(urls).not.toContain('/settings/notifications')
+    expect(urls).not.toContain('/settings/mcp-server')
+  })
+
+  it('lists each page once, under one name', () => {
+    const all = items.flatMap((i) => [
+      ...new Set([i.url, ...(i.tabs ?? []).map((t) => t.url)]),
+    ])
+    expect(new Set(all).size).toBe(all.length)
+    expect(new Set(items.map((i) => i.title)).size).toBe(items.length)
+  })
+
+  it('says what every built-in page is for', () => {
+    for (const item of items)
+      expect(item.description?.length).toBeGreaterThan(0)
+  })
+
+  it('folds the three limit pages into one entry with tabs', () => {
+    const limits = items.find((i) => i.title === 'Limits')
+    expect(limits?.tabs?.map((t) => t.url)).toEqual([
+      '/settings/build-limits',
+      '/settings/request-timeouts',
+      '/settings/service-healthchecks',
+    ])
+    expect(limits?.url).toBe(limits?.tabs?.[0].url)
+    for (const url of ['/settings/request-timeouts', '/settings/build-limits'])
+      expect(resolveSettingsTab(url)?.item.title).toBe('Limits')
+    expect(resolveSettingsTab('/settings/request-timeouts')?.tab.title).toBe(
+      'Request timeouts'
     )
-    expect(urls).not.toContain('/settings/plugins')
+    expect(resolveSettingsTab('/settings/users')).toBeUndefined()
+    expect(resolveSettingsTab('/settings/build-limits/x')).toBeUndefined()
   })
 
   it('lists the on-demand TLS page the Certificates empty state links to', () => {

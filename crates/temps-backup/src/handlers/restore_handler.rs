@@ -303,7 +303,7 @@ async fn get_restore_capabilities(
     path = "/external-services/{id}/restore-runs",
     params(("id" = i32, Path, description = "External service id")),
     responses(
-        (status = 200, description = "Recent restore runs for the service", body = Vec<RestoreRunView>),
+        (status = 200, description = "The service's 50 most recent restore runs, newest first. Not paginated: bounded by design to recent history; older runs are not returned", body = Vec<RestoreRunView>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Service not found", body = ProblemDetails),

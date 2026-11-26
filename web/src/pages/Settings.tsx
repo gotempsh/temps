@@ -253,7 +253,7 @@ export function Settings() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <PageHeader title="Settings" />
+      <PageHeader title="Instance" />
       <div className="max-w-5xl space-y-10">
         <section
           aria-labelledby="platform-settings-heading"

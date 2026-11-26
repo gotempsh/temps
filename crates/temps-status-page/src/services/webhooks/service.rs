@@ -171,6 +171,16 @@ impl StatusPageWebhookService {
         })
     }
 
+    /// One webhook of a page, as listed (the secret is never returned).
+    pub async fn get(
+        &self,
+        status_page_id: i32,
+        webhook_id: i32,
+    ) -> Result<StatusPageWebhookResponse, WebhookError> {
+        self.ensure_page(status_page_id).await?;
+        Ok(self.find(status_page_id, webhook_id).await?.into())
+    }
+
     pub async fn create(
         &self,
         status_page_id: i32,
@@ -212,7 +222,7 @@ impl StatusPageWebhookService {
             status_page_id: Set(status_page_id),
             url: Set(url),
             secret_encrypted: Set(secret_encrypted),
-            enabled: Set(true),
+            enabled: Set(request.enabled),
             ..Default::default()
         }
         .insert(&txn)

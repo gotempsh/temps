@@ -51,7 +51,10 @@ pub async fn create_application_preview_link(
             port: request.port,
         })
         .await;
-    Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
+    Ok(Json(ApplicationPreviewLinkResponse {
+        url,
+        expires_at: preview_link_expiry(expires_at)?,
+    }))
 }
 
 /// Mint a short-lived preview URL for a port in the user's shared global AI
@@ -97,7 +100,25 @@ pub async fn create_global_workspace_preview_link(
             port: request.port,
         })
         .await;
-    Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
+    Ok(Json(ApplicationPreviewLinkResponse {
+        url,
+        expires_at: preview_link_expiry(expires_at)?,
+    }))
+}
+
+/// The expiry of a minted preview link, from the Unix seconds the sandbox
+/// service reports, as a timestamp.
+fn preview_link_expiry(unix_seconds: u64) -> Result<chrono::DateTime<chrono::Utc>, Problem> {
+    i64::try_from(unix_seconds)
+        .ok()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .ok_or_else(|| {
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Invalid Preview Link Expiry")
+                .with_detail(format!(
+                    "The preview link expiry {unix_seconds} is not a representable time"
+                ))
+        })
 }
 
 pub(super) fn require_console_preview_session(auth: &AuthContext) -> Result<(), Problem> {
@@ -237,5 +258,23 @@ pub async fn authorize_workspace_preview(
             })
             .await;
     }
-    Ok(Json(ApplicationPreviewLinkResponse { url, expires_at }))
+    Ok(Json(ApplicationPreviewLinkResponse {
+        url,
+        expires_at: preview_link_expiry(expires_at)?,
+    }))
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::preview_link_expiry;
+
+    #[test]
+    fn preview_link_expiry_is_an_iso_8601_timestamp() {
+        let expiry = preview_link_expiry(1_764_000_000).expect("a representable time");
+        assert_eq!(
+            serde_json::to_value(expiry).expect("serializes"),
+            serde_json::json!("2025-11-24T16:00:00Z")
+        );
+        assert!(preview_link_expiry(u64::MAX).is_err());
+    }
 }

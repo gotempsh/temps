@@ -18,6 +18,10 @@ import {
   useNavigate,
 } from 'react-router'
 import type { ProjectResponse, ProxyLogResponse } from '@/api/client'
+import {
+  createPageSubjectStore,
+  PageSubjectStoreContext,
+} from '@/components/agent-handoff/page-subject'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { REQUEST_LOG_COLUMNS_STORAGE_KEY } from '@/components/logs/request-log-columns'
@@ -90,22 +94,25 @@ function mount({
       queries: { retry: false, staleTime: Infinity, gcTime: Infinity },
     },
   })
+  const subjects = createPageSubjectStore()
   const view = render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[initial]}>
-        <Navigation />
-        <div data-console-scroll data-testid="scroller">
-          <Routes>
-            <Route
-              path="/projects/example/request-logs/*"
-              element={<RequestLogs project={project} />}
-            />
-          </Routes>
-        </div>
-      </MemoryRouter>
+      <PageSubjectStoreContext.Provider value={subjects}>
+        <MemoryRouter initialEntries={[initial]}>
+          <Navigation />
+          <div data-console-scroll data-testid="scroller">
+            <Routes>
+              <Route
+                path="/projects/example/request-logs/*"
+                element={<RequestLogs project={project} />}
+              />
+            </Routes>
+          </div>
+        </MemoryRouter>
+      </PageSubjectStoreContext.Provider>
     </QueryClientProvider>
   )
-  return { ...view, client, requests }
+  return { ...view, client, requests, subjects }
 }
 
 test.each(['Browser back', 'Back to logs'])(
@@ -313,6 +320,40 @@ test('invalid and out-of-range pagination is bounded', async () => {
   await waitFor(() => expect(view.requests).toHaveLength(2))
   expect(view.requests[0].searchParams.get('page_size')).toBe('25')
   expect(view.requests[1].searchParams.get('page')).toBe('4')
+  view.unmount()
+  view.client.clear()
+})
+
+test('one request declares itself for a handoff, and the list does not', async () => {
+  const view = mount({
+    initial: `${base}/request%2Fwith%20spaces?ts=2026-10-20T12:30:01Z`,
+  })
+  // Nothing is declared until the record itself is on screen.
+  expect(view.subjects.get()).toBeNull()
+  await view.findByRole('heading', { name: 'Request log' })
+  await waitFor(() =>
+    expect(view.subjects.get()).toEqual({
+      kind: 'proxy_log',
+      logId: 'request/with spaces',
+      project: { id: 42, slug: 'example', name: 'Example' },
+    })
+  )
+  await act(async () => {
+    fireEvent.click(view.getByRole('button', { name: 'Back to logs' }))
+  })
+  await view.findByRole('table')
+  expect(view.subjects.get()).toBeNull()
+  view.unmount()
+  view.client.clear()
+})
+
+test('a request that failed to load declares nothing', async () => {
+  const view = mount({
+    initial: `${base}/request%2Fwith%20spaces`,
+    readDetail: () => jsonResponse({ title: 'Unavailable' }, 503),
+  })
+  await view.findByText("Couldn't load log details")
+  expect(view.subjects.get()).toBeNull()
   view.unmount()
   view.client.clear()
 })

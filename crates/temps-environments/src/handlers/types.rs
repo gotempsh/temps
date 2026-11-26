@@ -110,8 +110,8 @@ pub struct EnvironmentVariableResponse {
     /// in list responses. Always `None` for marked secrets. Only regular
     /// variables can be read through the audited per-variable reveal endpoint.
     pub value: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub environments: Vec<EnvironmentInfo>,
     /// Include this environment variable in preview environments
     pub include_in_preview: bool,
@@ -177,8 +177,8 @@ pub struct EnvironmentResponse {
     /// this via the rename-subdomain endpoint, not the full URL.
     pub subdomain: String,
     pub current_deployment_id: Option<i32>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub branch: Option<String>,
     /// Indicates if this is a preview environment (auto-created per branch)
     /// For preview environments, 'branch' contains the feature branch name
@@ -211,14 +211,14 @@ pub struct EnvironmentResponse {
     /// environment, `false` never does. Always serialized (NOT skipped) so the
     /// UI can distinguish `null` from `false`.
     pub force_https: Option<bool>,
-    /// Last proxied request timestamp (epoch millis) for on-demand environments.
+    /// Last proxied request time (ISO 8601, UTC) for on-demand environments.
     /// NULL when on-demand is disabled or no traffic has been received yet.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_activity_at: Option<i64>,
-    /// Estimated time (epoch millis) when the environment will go to sleep
+    pub last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Estimated time (ISO 8601, UTC) when the environment will go to sleep
     /// based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_sleep_at: Option<i64>,
+    pub estimated_sleep_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Set when the settings can't be honoured as written: anti-affinity is on, but
     /// there are fewer eligible nodes than replicas, so some replicas will share a
     /// node. Deploys still go ahead. Reported when reading one environment and when
@@ -229,7 +229,7 @@ pub struct EnvironmentResponse {
 
 impl From<temps_entities::environments::Model> for EnvironmentResponse {
     fn from(env: temps_entities::environments::Model) -> Self {
-        let last_activity_at = env.last_activity_at.map(|t| t.timestamp_millis());
+        let last_activity_at = env.last_activity_at;
 
         // Compute estimated sleep time: last_activity + idle_timeout
         // Only when on-demand is enabled, env is awake, and we have activity data
@@ -239,7 +239,7 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
                 .filter(|dc| dc.on_demand)
                 .and_then(|dc| {
                     env.last_activity_at.map(|last| {
-                        last.timestamp_millis() + (dc.idle_timeout_seconds as i64 * 1000)
+                        last + chrono::Duration::seconds(dc.idle_timeout_seconds as i64)
                     })
                 })
         } else {
@@ -254,8 +254,8 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             main_url: env.subdomain.clone(),
             subdomain: env.subdomain,
             current_deployment_id: env.current_deployment_id,
-            created_at: env.created_at.timestamp_millis(),
-            updated_at: env.updated_at.timestamp_millis(),
+            created_at: env.created_at,
+            updated_at: env.updated_at,
             branch: env.branch,
             is_preview: env.is_preview,
             deployment_config: env.deployment_config,
@@ -277,7 +277,7 @@ pub struct EnvironmentDomainResponse {
     pub id: i32,
     pub environment_id: i32,
     pub domain: String,
-    pub created_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
     /// Full URL for this domain (e.g., https://buildtolearndev-production.example.com)
     #[schema(example = "https://buildtolearndev-production.example.com")]
     pub url: String,
@@ -732,8 +732,8 @@ pub struct ProjectSecretResponse {
     pub project_id: i32,
     pub key: String,
     pub include_in_preview: bool,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub environments: Vec<ProjectSecretEnvironmentInfo>,
     /// Compose services this secret is restricted to. Empty means every
     /// service in the stack.
@@ -750,7 +750,49 @@ pub struct ProjectSecretEnvironmentInfo {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct GetProjectSecretsQuery {
     pub environment_id: Option<i32>,
+    /// Page number, starting at 1 (default 1).
+    pub page: Option<u64>,
+    /// Items per page (default 20, max 100).
+    pub page_size: Option<u64>,
 }
+
+impl GetProjectSecretsQuery {
+    pub fn page(&self) -> temps_core::PageQuery {
+        temps_core::PageQuery {
+            page: self.page,
+            page_size: self.page_size,
+        }
+    }
+}
+
+impl From<crate::services::SecretWithEnvironments> for ProjectSecretResponse {
+    fn from(secret: crate::services::SecretWithEnvironments) -> Self {
+        Self {
+            id: secret.id,
+            project_id: secret.project_id,
+            key: secret.key,
+            include_in_preview: secret.include_in_preview,
+            created_at: secret.created_at,
+            updated_at: secret.updated_at,
+            environments: secret
+                .environments
+                .into_iter()
+                .map(|env| ProjectSecretEnvironmentInfo {
+                    id: env.id,
+                    name: env.name,
+                    main_url: env.main_url,
+                })
+                .collect(),
+            compose_services: secret.compose_services,
+        }
+    }
+}
+
+temps_core::paginated_response!(
+    /// One page of a project's secrets (metadata only), newest first.
+    ProjectSecretList,
+    ProjectSecretResponse
+);
 
 #[cfg(test)]
 mod tests {

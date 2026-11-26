@@ -15,12 +15,12 @@
 
 use sea_orm::{
     sea_query::LockType, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend,
-    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
-    TransactionTrait,
+    DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    Statement, TransactionTrait,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::EncryptionService;
+use temps_core::{EncryptionService, PageQuery};
 use temps_entities::{
     environments, secret_compose_services, secret_environments, secret_history, secrets,
 };
@@ -384,22 +384,70 @@ impl SecretService {
         Ok(())
     }
 
-    /// Lists secrets visible to a project, optionally filtered to a specific
-    /// environment via the junction table.
+    /// One page of the secrets visible to a project, newest first, optionally
+    /// only those attached to `environment_id` (and then reporting only that
+    /// environment), with the number of matching secrets.
     ///
     /// Values are NOT decrypted — callers that render to the UI must mask the
     /// value. Use `get_for_deploy` when plaintext is required.
-    pub async fn list(
+    pub async fn list_page(
         &self,
         project_id: i32,
         environment_id: Option<i32>,
-    ) -> Result<Vec<SecretWithEnvironments>, SecretError> {
-        let rows = secrets::Entity::find()
-            .filter(secrets::Column::ProjectId.eq(project_id))
-            .order_by_desc(secrets::Column::UpdatedAt)
-            .all(self.db.as_ref())
-            .await?;
+        page: PageQuery,
+    ) -> Result<(Vec<SecretWithEnvironments>, u64), SecretError> {
+        let mut query = secrets::Entity::find().filter(secrets::Column::ProjectId.eq(project_id));
+        if let Some(env_id) = environment_id {
+            query = query.filter(
+                secrets::Column::Id.in_subquery(
+                    sea_orm::sea_query::Query::select()
+                        .column(secret_environments::Column::SecretId)
+                        .from(secret_environments::Entity)
+                        .and_where(secret_environments::Column::EnvironmentId.eq(env_id))
+                        .to_owned(),
+                ),
+            );
+        }
+        let (_, page_size) = page.normalize();
+        let paginator = query
+            .order_by_desc(secrets::Column::CreatedAt)
+            .order_by_desc(secrets::Column::Id)
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        let rows = paginator.fetch_page(page.page_index()).await?;
+        Ok((self.with_environments(rows, environment_id).await?, total))
+    }
 
+    /// One secret of a project (metadata only, never the value).
+    pub async fn get(
+        &self,
+        project_id: i32,
+        secret_id: i32,
+    ) -> Result<SecretWithEnvironments, SecretError> {
+        let not_found = || SecretError::NotFound {
+            secret_id,
+            project_id,
+        };
+        let row = secrets::Entity::find_by_id(secret_id)
+            .filter(secrets::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(not_found)?;
+        self.with_environments(vec![row], None)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(not_found)
+    }
+
+    /// Attaches environments and compose-service scopes to `rows`, in two
+    /// queries whatever the number of rows. With `environment_id`, only that
+    /// environment is reported.
+    async fn with_environments(
+        &self,
+        rows: Vec<secrets::Model>,
+        environment_id: Option<i32>,
+    ) -> Result<Vec<SecretWithEnvironments>, SecretError> {
         let ids: Vec<i32> = rows.iter().map(|s| s.id).collect();
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -431,24 +479,19 @@ impl SecretService {
 
         let mut service_map = self.load_compose_services(&ids).await?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let envs = env_map.get(&row.id).cloned().unwrap_or_default();
-            if environment_id.is_some() && envs.is_empty() {
-                continue;
-            }
-            out.push(SecretWithEnvironments {
+        Ok(rows
+            .into_iter()
+            .map(|row| SecretWithEnvironments {
+                environments: env_map.remove(&row.id).unwrap_or_default(),
+                compose_services: service_map.remove(&row.id).unwrap_or_default(),
                 id: row.id,
                 project_id: row.project_id,
                 key: row.key,
                 include_in_preview: row.include_in_preview,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
-                environments: envs,
-                compose_services: service_map.remove(&row.id).unwrap_or_default(),
-            });
-        }
-        Ok(out)
+            })
+            .collect())
     }
 
     /// Compose-service scopes for a set of secrets, in a single query.
@@ -1111,17 +1154,57 @@ mod tests {
         assert!(matches!(err, SecretError::Database(_)));
     }
 
+    /// The row a paginator's `COUNT(*)` query answers with.
+    fn count_row(n: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(n)),
+        )])
+    }
+
     #[tokio::test]
     async fn test_list_empty_returns_empty() {
         let svc = make_encryption_service();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![count_row(0)]])
                 .append_query_results(vec![Vec::<secrets::Model>::new()])
                 .into_connection(),
         );
         let service = SecretService::new(db, svc);
-        let out = service.list(10, None).await.unwrap();
+        let (out, total) = service
+            .list_page(10, None, PageQuery::default())
+            .await
+            .unwrap();
         assert!(out.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn get_returns_one_secret_or_a_not_found_naming_it() {
+        let svc = make_encryption_service();
+        let row = make_secret_model(4, 10, "TOKEN", "ciphertext_blob");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![row]])
+                .append_query_results(vec![Vec::<(
+                    secret_environments::Model,
+                    Option<environments::Model>,
+                )>::new()])
+                .append_query_results(vec![Vec::<secret_compose_services::Model>::new()])
+                .append_query_results(vec![Vec::<secrets::Model>::new()])
+                .into_connection(),
+        );
+        let service = SecretService::new(db, svc);
+        let secret = service.get(10, 4).await.unwrap();
+        assert_eq!((secret.id, secret.key.as_str()), (4, "TOKEN"));
+        assert!(matches!(
+            service.get(10, 5).await,
+            Err(SecretError::NotFound {
+                secret_id: 5,
+                project_id: 10
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1132,6 +1215,7 @@ mod tests {
         let row = make_secret_model(1, 10, "TOKEN", "ciphertext_blob");
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![count_row(1)]])
                 .append_query_results(vec![vec![row]])
                 .append_query_results(vec![Vec::<(
                     secret_environments::Model,
@@ -1143,7 +1227,11 @@ mod tests {
                 .into_connection(),
         );
         let service = SecretService::new(db, svc);
-        let out = service.list(10, None).await.unwrap();
+        let (out, total) = service
+            .list_page(10, None, PageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].key, "TOKEN");
         assert!(
@@ -1544,8 +1632,8 @@ mod integration_tests {
             staging_values.get("SHARED_KEY").map(String::as_str),
             Some("original-staging")
         );
-        let unchanged = service
-            .list(project.id, Some(production.id))
+        let (unchanged, _) = service
+            .list_page(project.id, Some(production.id), PageQuery::default())
             .await
             .expect("the original metadata should remain readable");
         assert_eq!(unchanged.len(), 1);
@@ -1582,9 +1670,10 @@ mod integration_tests {
             } if environment_id == foreign_environment.id && project_id == owner.id
         ));
         assert!(service
-            .list(owner.id, None)
+            .list_page(owner.id, None, PageQuery::default())
             .await
             .expect("owner secrets should list")
+            .0
             .is_empty());
     }
 

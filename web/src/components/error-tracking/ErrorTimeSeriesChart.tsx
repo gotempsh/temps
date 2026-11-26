@@ -123,7 +123,6 @@ export function ErrorTimeSeriesChart({
     const fromMs = startDate.getTime()
     const toMs = endDate.getTime()
     // Timestamps come back in seconds; normalise to ms.
-    const toMs10 = (n: number) => (n < 1e12 ? n * 1000 : n)
     const bucketMs = chartData.map((p) => new Date(p.timestamp).getTime())
     // Multiple deploys can snap to the same bucket — recharts renders one
     // <ReferenceLine> per marker, and two labels at an identical x stack
@@ -135,7 +134,7 @@ export function ErrorTimeSeriesChart({
     >()
     for (const d of deploys) {
       const at = d.finished_at ?? d.started_at ?? d.created_at
-      const ts = toMs10(at)
+      const ts = Date.parse(at)
       if (ts < fromMs || ts > toMs) continue
       // Snap to the nearest bucket (the categorical x axis can't take a raw ts).
       let best = 0

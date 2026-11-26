@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, beforeEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
+import {
+  createPageSubjectStore,
+  PageSubjectStoreContext,
+  type PageSubjectStore,
+} from '@/components/agent-handoff/page-subject'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import LogViewer from './log-viewer'
@@ -42,7 +47,10 @@ const container = (id: string) => ({
   status: 'running',
 })
 
-function renderViewer(containers: ReturnType<typeof container>[]) {
+function renderViewer(
+  containers: ReturnType<typeof container>[],
+  subjects: PageSubjectStore = createPageSubjectStore()
+) {
   mockApi({
     'GET /projects/7/environments': () =>
       jsonResponse([
@@ -57,11 +65,13 @@ function renderViewer(containers: ReturnType<typeof container>[]) {
         new QueryClient({ defaultOptions: { queries: { retry: false } } })
       }
     >
-      <MemoryRouter>
-        <LogViewer
-          project={{ id: 7, slug: 'example' } as unknown as ProjectResponse}
-        />
-      </MemoryRouter>
+      <PageSubjectStoreContext.Provider value={subjects}>
+        <MemoryRouter>
+          <LogViewer
+            project={{ id: 7, slug: 'example' } as unknown as ProjectResponse}
+          />
+        </MemoryRouter>
+      </PageSubjectStoreContext.Provider>
     </QueryClientProvider>
   )
 }
@@ -157,4 +167,62 @@ test('an environment with no containers says so instead of connecting forever', 
   await view.findByText('No containers are running in this environment.')
   expect(view.queryByText('Connecting to log stream...')).toBeNull()
   expect(FakeWebSocket.opened).toHaveLength(0)
+})
+
+describe('what the viewer hands off', () => {
+  const MODE_KEY = 'temps:runtime-logs:mode:example'
+  afterEach(() => localStorage.removeItem(MODE_KEY))
+
+  test('Live hands off the container it tails', async () => {
+    const subjects = createPageSubjectStore()
+    renderViewer([container('a')], subjects)
+    await waitFor(() =>
+      expect(subjects.get()).toMatchObject({
+        kind: 'runtime_logs',
+        mode: 'live',
+        environmentId: 3,
+        containerId: 'a',
+      })
+    )
+  })
+
+  test('Interval polls the whole environment, so it hands off every container', async () => {
+    localStorage.setItem(
+      MODE_KEY,
+      JSON.stringify({ kind: 'interval', ms: 5000 })
+    )
+    mockApi({
+      'GET /projects/7/environments': () =>
+        jsonResponse([
+          { id: 3, name: 'production', slug: 'production', is_preview: false },
+        ]),
+      'GET /projects/7/environments/3/containers': () =>
+        jsonResponse({ containers: [container('a')] }),
+      'POST /logs/search': () => jsonResponse({ lines: [] }),
+    })
+    const subjects = createPageSubjectStore()
+    render(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <PageSubjectStoreContext.Provider value={subjects}>
+          <MemoryRouter>
+            <LogViewer
+              project={{ id: 7, slug: 'example' } as unknown as ProjectResponse}
+            />
+          </MemoryRouter>
+        </PageSubjectStoreContext.Provider>
+      </QueryClientProvider>
+    )
+    await waitFor(() =>
+      expect(subjects.get()).toMatchObject({
+        kind: 'runtime_logs',
+        mode: 'live',
+        environmentId: 3,
+        containerId: null,
+      })
+    )
+  })
 })

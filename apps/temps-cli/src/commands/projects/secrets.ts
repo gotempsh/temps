@@ -5,6 +5,7 @@ import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { findInPages, nextPageHint, pageQuery, type PageFlags } from '../../lib/page-options.js'
 import {
   getProjectBySlug,
   getEnvironments,
@@ -30,7 +31,7 @@ import {
 // secrets (a completely different store, referenced via ${TEMPS_SECRET:name}
 // in MCP config, unrelated to any specific project's own deployment).
 
-interface ListOptions {
+interface ListOptions extends PageFlags {
   project?: string
   environment?: string
   json?: boolean
@@ -124,9 +125,15 @@ async function resolveEnvironmentIds(projectId: number, names: string[]): Promis
 
 /** The update/delete APIs address secrets by numeric id, not key — list first. */
 async function findSecretByKey(projectId: number, key: string): Promise<ProjectSecretResponse> {
-  const { data, error } = await listProjectSecrets({ client, path: { project_id: projectId } })
-  if (error) throw new Error(getErrorMessage(error))
-  const found = (data ?? []).find((s) => s.key === key)
+  const found = await findInPages(
+    async (query) => {
+      const { data, error } = await listProjectSecrets({ client, path: { project_id: projectId }, query })
+      if (error) throw new Error(getErrorMessage(error))
+      if (!data) throw new Error(`Failed to list secrets of project ${projectId}: empty response`)
+      return data
+    },
+    (s) => s.key === key,
+  )
   if (!found) throw new Error(`Secret "${key}" not found in this project`)
   return found
 }
@@ -153,6 +160,8 @@ export function registerProjectSecretsCommands(projects: Command): void {
     .description('List secrets for a project (values are never returned)')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('-e, --environment <name>', 'Filter to one environment')
+    .option('--page <n>', 'Page number (default: 1)')
+    .option('--page-size <n>', 'Items per page (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
     .action(listAction)
 
@@ -226,7 +235,8 @@ async function listAction(options: ListOptions): Promise<void> {
     info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
   }
 
-  const items = await withSpinner('Fetching secrets...', async () => {
+  const pageParams = pageQuery(options)
+  const result = await withSpinner('Fetching secrets...', async () => {
     const projectId = await getProjectId(resolved.slug)
     let environmentId: number | undefined
     if (options.environment) {
@@ -235,19 +245,21 @@ async function listAction(options: ListOptions): Promise<void> {
     const { data, error } = await listProjectSecrets({
       client,
       path: { project_id: projectId },
-      query: environmentId !== undefined ? { environment_id: environmentId } : undefined,
+      query: { ...pageParams, ...(environmentId !== undefined ? { environment_id: environmentId } : {}) },
     })
     if (error) throw new Error(getErrorMessage(error))
-    return data ?? []
+    if (!data) throw new Error(`Failed to list secrets of project ${projectId}: empty response`)
+    return data
   })
 
   if (options.json) {
-    json(items)
+    json(result)
     return
   }
 
+  const items = result.items
   newline()
-  header(`${icons.info} Project secrets for ${resolved.slug} (${items.length})`)
+  header(`${icons.info} Project secrets for ${resolved.slug} (${items.length} of ${result.total})`)
 
   if (items.length === 0) {
     info('No secrets defined yet.')
@@ -269,6 +281,11 @@ async function listAction(options: ListOptions): Promise<void> {
         ? secret.compose_services.join(', ')
         : 'all services'
     console.log(`    ${colors.muted('Compose services:')} ${services}`)
+    newline()
+  }
+  const more = nextPageHint(result)
+  if (more) {
+    info(more)
     newline()
   }
 }

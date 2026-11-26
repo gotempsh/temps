@@ -524,7 +524,7 @@ export function registerSandboxCommands(program: Command): void {
 
   sandbox
     .command('show <id>')
-    .description('Show details for a sandbox')
+    .description('Show a sandbox: status, image, node, expiry, preview access and outbound policy')
     .option('--json', 'Output as JSON')
     .action(showAction)
 
@@ -591,7 +591,9 @@ export function registerSandboxCommands(program: Command): void {
 
   sandbox
     .command('exec <id> [args...]')
-    .description('Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`')
+    .description(
+      'Run a command inside a sandbox, print its output and exit with its exit code. Put `--` before the command: `exec ID -- ls -la`',
+    )
     .option('--detach', 'Start in background and print a job ID instead of waiting')
     .option('--cwd <path>', 'Working directory inside the sandbox')
     .option(
@@ -603,7 +605,7 @@ export function registerSandboxCommands(program: Command): void {
 
   sandbox
     .command('logs <id> <jobId>')
-    .description('Stream logs from a detached job (SSE)')
+    .description('Print the output of a job started with `exec --detach`, following it until the job ends')
     .action(logsAction)
 
   sandbox
@@ -1921,8 +1923,10 @@ async function execAction(
   if (res.stdout) process.stdout.write(res.stdout)
   if (res.stderr) process.stderr.write(res.stderr)
 
+  // Set, not `process.exit()`: exiting at once can cut off output still being
+  // written to a pipe, which is exactly when the output matters.
   if (res.exit_code !== 0) {
-    process.exit(res.exit_code)
+    process.exitCode = res.exit_code
   }
 }
 
@@ -2004,6 +2008,18 @@ async function logsAction(id: string, jobId: string): Promise<void> {
   } finally {
     reader.releaseLock()
   }
+  // The server ends every stream with `done` once the job has exited, so a
+  // stream that closes without it was cut (a proxy timeout, a restart): the
+  // job may still be running and its output above may be incomplete. Report
+  // it and set the status rather than throwing: the error handler calls
+  // `process.exit`, which can drop log lines still queued for a pipe.
+  console.error(
+    `${icons.error} ${colors.error(
+      `The log stream of job ${jobId} closed before the job ended, so the output above may be incomplete. ` +
+        `Run the same command again to keep following it; lines written while disconnected are not shown again.`,
+    )}`,
+  )
+  process.exitCode = 1
 }
 
 async function domainAction(id: string, options: { port: string }): Promise<void> {

@@ -14,7 +14,7 @@ import {
 import {
   isExternalProjectPage,
   PROJECT_NAV_SECTIONS,
-  projectNavGroupsFor,
+  projectNavSectionsFor,
 } from '@/lib/project-navigation'
 import { LEGACY_PROJECT_ROUTES } from '@/lib/project-settings-sections'
 
@@ -272,8 +272,8 @@ function duplicatePaths(routes: ParsedRoute[], prefix = ''): string[] {
 
 /** Every menu entry and tab a monitoring-only project is offered. */
 function externalSectionUrls(): string[] {
-  return projectNavGroupsFor({ source_type: 'external' }).flatMap((group) =>
-    group.sections.flatMap((section) => section.tabs.map((tab) => tab.url))
+  return projectNavSectionsFor({ source_type: 'external' }).flatMap((section) =>
+    section.tabs.map((tab) => tab.url)
   )
 }
 

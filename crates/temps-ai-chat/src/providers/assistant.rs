@@ -216,6 +216,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn views_are_a_playbook_read_when_a_result_is_drawn_not_seeded() {
+        let seed = AssistantChatProvider
+            .seed(None, "assistant_x")
+            .await
+            .expect("assistant ids are seeded");
+        // Task guidance lives in a playbook, read only by the turns that
+        // draw a view, not in every turn's instructions.
+        assert!(!seed.system.contains("## Views"));
+        assert!(!seed.system.contains("```spec"));
+        let playbooks = crate::harness::applicable(ASSISTANT_CONTEXT_TYPE, &[]);
+        let views = playbooks
+            .iter()
+            .find(|playbook| playbook.name == "show-results-as-views")
+            .expect("the assistant is offered the views playbook");
+        let index = crate::harness::index_section(&playbooks).expect("an index");
+        let entry = index
+            .lines()
+            .find(|line| line.starts_with("- `show-results-as-views`:"))
+            .expect("the index says when to read it");
+        assert!(entry.contains("list of records"));
+        assert!(views.body.contains("```spec"));
+        // A view reports on a real platform: nothing in it is made up.
+        assert!(views
+            .body
+            .contains("Show only values a tool returned in this conversation"));
+        assert!(!views.body.to_lowercase().contains("sample data"));
+        // Each component the console draws is listed with its props.
+        for component in [
+            "Stack",
+            "Stats",
+            "Stat",
+            "Status",
+            "KeyValues",
+            "Table",
+            "Trend",
+            "Bars",
+        ] {
+            assert!(
+                views.body.contains(&format!("\n- {component}: {{")),
+                "the views playbook does not list {component}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn seed_explains_repository_creation_and_committing_files() {
         let seed = AssistantChatProvider
             .seed(None, "assistant_x")

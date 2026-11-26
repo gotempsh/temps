@@ -7,9 +7,10 @@ import { DockBody } from '@/components/ai/AiAssistantDock'
 import { useAiAssistant } from '@/components/ai/AiAssistantContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useRememberShownChat } from '@/lib/assistant-entry'
 
 /**
- * The Temps assistant, full screen.
+ * The Temps assistant as a page of the console ("Ask").
  *
  * Same component as the dock (`DockBody`) with the whole content area instead
  * of a 28rem column. The top-bar AI button lands here: with no AI provider it
@@ -29,10 +30,13 @@ export function AiChat() {
     clearInitialContext()
   }, [clearInitialContext])
 
-  usePageTitle('Temps assistant')
+  // The chat shown is the one "Ask" comes back to.
+  useRememberShownChat()
+
+  usePageTitle('Ask')
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Temps assistant' }])
+    setBreadcrumbs([{ label: 'Ask' }])
   }, [setBreadcrumbs])
 
   // The dock and this page render the same assistant; showing both at once

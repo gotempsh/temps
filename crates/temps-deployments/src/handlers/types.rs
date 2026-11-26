@@ -121,9 +121,8 @@ pub struct DeploymentContainerLogResponse {
     pub node_id: Option<i32>,
     pub size_bytes: i64,
     pub truncated: bool,
-    /// Unix epoch milliseconds of when the logs were captured (just before
-    /// teardown). Matches the timestamp convention used by `DeploymentResponse`.
-    pub captured_at: i64,
+    /// When the logs were captured (just before teardown), ISO 8601 in UTC.
+    pub captured_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<temps_entities::deployment_container_logs::Model> for DeploymentContainerLogResponse {
@@ -137,7 +136,7 @@ impl From<temps_entities::deployment_container_logs::Model> for DeploymentContai
             node_id: m.node_id,
             size_bytes: m.size_bytes,
             truncated: m.truncated,
-            captured_at: m.captured_at.timestamp_millis(),
+            captured_at: m.captured_at,
         }
     }
 }
@@ -156,7 +155,7 @@ pub struct DeploymentContainerLogContentResponse {
     pub service_name: Option<String>,
     pub size_bytes: i64,
     pub truncated: bool,
-    pub captured_at: i64,
+    pub captured_at: chrono::DateTime<chrono::Utc>,
     /// The captured plain-text log content.
     pub content: String,
 }
@@ -277,12 +276,12 @@ pub struct DeploymentResponse {
     pub commit_message: Option<String>,
     pub branch: Option<String>,
     pub tag: Option<String>,
-    pub created_at: i64,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub screenshot_location: Option<String>,
     pub commit_author: Option<String>,
-    pub commit_date: Option<i64>,
+    pub commit_date: Option<chrono::DateTime<chrono::Utc>>,
     pub is_current: bool,
     pub cancelled_reason: Option<String>,
     /// Classified cause of a failed deployment: the stage it failed in, a
@@ -373,12 +372,12 @@ impl DeploymentResponse {
             commit_message: deployment.commit_message,
             branch: deployment.branch,
             tag: deployment.tag,
-            created_at: deployment.created_at.timestamp_millis(),
-            started_at: deployment.started_at.map(|d| d.timestamp_millis()),
-            finished_at: deployment.finished_at.map(|d| d.timestamp_millis()),
+            created_at: deployment.created_at,
+            started_at: deployment.started_at,
+            finished_at: deployment.finished_at,
             screenshot_location: deployment.screenshot_location,
             commit_author: deployment.commit_author,
-            commit_date: deployment.commit_date.map(|d| d.timestamp_millis()),
+            commit_date: deployment.commit_date,
             is_current: deployment.is_current,
             cancelled_reason: deployment.cancelled_reason,
             failure,
@@ -448,8 +447,8 @@ pub struct EnvironmentVariableResponse {
     pub id: i32,
     pub key: String,
     pub value: String,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub environments: Vec<EnvironmentInfo>,
 }
 
@@ -472,8 +471,8 @@ pub struct EnvironmentResponse {
     pub slug: String,
     pub main_url: String,
     pub current_deployment_id: Option<i32>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub cpu_request: Option<i32>,
     pub cpu_limit: Option<i32>,
     pub memory_request: Option<i32>,
@@ -491,8 +490,8 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             slug: env.slug,
             main_url: env.subdomain,
             current_deployment_id: env.current_deployment_id,
-            created_at: env.created_at.timestamp_millis(),
-            updated_at: env.updated_at.timestamp_millis(),
+            created_at: env.created_at,
+            updated_at: env.updated_at,
             cpu_request: env.deployment_config.as_ref().and_then(|c| c.cpu_request),
             cpu_limit: env.deployment_config.as_ref().and_then(|c| c.cpu_limit),
             memory_request: env
@@ -511,7 +510,7 @@ pub struct EnvironmentDomainResponse {
     pub id: i32,
     pub environment_id: i32,
     pub domain: String,
-    pub created_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -572,8 +571,8 @@ pub struct Pipeline {
     pub id: i32,
     pub project_id: i32,
     pub status: String,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub commit_hash: Option<String>,
     pub commit_message: Option<String>,
     pub branch: Option<String>,
@@ -586,8 +585,8 @@ impl From<crate::services::types::Pipeline> for Pipeline {
             id: pipeline.id,
             project_id: pipeline.project_id,
             status: pipeline.status,
-            created_at: pipeline.created_at.timestamp_millis(),
-            updated_at: pipeline.updated_at.timestamp_millis(),
+            created_at: pipeline.created_at,
+            updated_at: pipeline.updated_at,
             commit_hash: pipeline.commit_sha,
             commit_message: pipeline.commit_message,
             branch: pipeline.branch_ref,
@@ -705,10 +704,10 @@ pub struct DeploymentJobResponse {
     pub name: String,
     pub description: Option<String>,
     pub status: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub log_id: String,
     pub error_message: Option<String>,
     /// Internal workflow configuration is intentionally redacted. It can
@@ -762,10 +761,10 @@ impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {
             name: job.name,
             description: job.description,
             status: job.status.to_string(),
-            created_at: job.created_at.timestamp_millis(),
-            updated_at: job.updated_at.timestamp_millis(),
-            started_at: job.started_at.map(|t| t.timestamp_millis()),
-            finished_at: job.finished_at.map(|t| t.timestamp_millis()),
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            started_at: job.started_at,
+            finished_at: job.finished_at,
             log_id: job.log_id,
             error_message: job.error_message,
             // Job configuration is executor-internal. Returning it here would

@@ -95,7 +95,7 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
   },
   {
     id: 'openai_compatible',
-    name: 'OpenAI-compatible',
+    name: 'OpenAI API',
     tagline:
       'Any API that speaks the OpenAI protocol: DeepSeek, Groq, Together, or vLLM, Ollama and LM Studio on your network',
     models: 'Whatever models the server lists at /v1/models',

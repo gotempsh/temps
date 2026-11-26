@@ -232,7 +232,7 @@ async fn start_pg_upgrade(
     tag = "Postgres Upgrades",
     params(("service_id" = i32, Path, description = "External service id")),
     responses(
-        (status = 200, description = "Recent upgrades", body = Vec<PgUpgradeResponse>),
+        (status = 200, description = "The service's 50 most recent upgrades, newest first. Not paginated: bounded by design to recent history; older upgrades are not returned", body = Vec<PgUpgradeResponse>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal error")

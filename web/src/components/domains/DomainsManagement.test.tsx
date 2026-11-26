@@ -30,9 +30,9 @@ const domain: DomainResponse = {
   status: 'active',
   is_wildcard: false,
   verification_method: 'http-01',
-  created_at: 1_767_225_600_000,
-  updated_at: 1_767_225_600_000,
-  expiration_time: 1_798_761_600_000,
+  created_at: new Date(1_767_225_600_000).toISOString(),
+  updated_at: new Date(1_767_225_600_000).toISOString(),
+  expiration_time: new Date(1_798_761_600_000).toISOString(),
 }
 
 function DomainPage() {

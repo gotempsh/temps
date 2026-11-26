@@ -45,7 +45,7 @@ describe('permission-denial audit presentation', () => {
       createElement(AuditLogItemRow, {
         id: 1,
         operation_type: 'PERMISSION_DENIED',
-        audit_date: 0,
+        audit_date: '1970-01-01T00:00:00Z',
         data: {
           method: 'DELETE',
           route: '/projects/{project_id}',
@@ -81,7 +81,7 @@ describe('project group audit presentation', () => {
     const rendered = renderRow({
       id: 2,
       operation_type: 'PROJECT_GROUP_PROJECT_ADDED',
-      audit_date: 0,
+      audit_date: '1970-01-01T00:00:00Z',
       data: { group_id: 4, group_slug: 'commerce', project_id: 12 },
     })
     expect(rendered).toContain('Added service (ID: 12) to project')
@@ -92,7 +92,7 @@ describe('project group audit presentation', () => {
     const variable = renderRow({
       id: 3,
       operation_type: 'PROJECT_GROUP_ENV_VAR_CREATED',
-      audit_date: 0,
+      audit_date: '1970-01-01T00:00:00Z',
       data: { group_id: 4, group_slug: 'commerce', variable_key: 'API_URL' },
     })
     expect(variable).toContain('Created shared variable API_URL in project')
@@ -100,7 +100,7 @@ describe('project group audit presentation', () => {
     const deleted = renderRow({
       id: 4,
       operation_type: 'PROJECT_GROUP_DELETED',
-      audit_date: 0,
+      audit_date: '1970-01-01T00:00:00Z',
       data: { group_id: 4, group_slug: 'commerce', project_ids: [1, 2] },
     })
     expect(deleted).toContain(

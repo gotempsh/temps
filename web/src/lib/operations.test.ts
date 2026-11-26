@@ -25,6 +25,7 @@ import {
   operationsPollInterval,
   operationsTrayFeed,
   operationStatusVariant,
+  operationsTrayShown,
   operationsTriggerLabel,
   operationTimestamp,
   RUNNING_OPERATIONS_QUERY,
@@ -166,6 +167,22 @@ describe('trigger labels', () => {
     expect(operationsBadgeText(0)).toBeNull()
     expect(operationsBadgeText(3)).toBe('3')
     expect(operationsBadgeText(12)).toBe('9+')
+  })
+
+  test('the button is in the top bar only while it has something to say', () => {
+    const idle = {
+      open: false,
+      runningCount: 0,
+      localCount: 0,
+      waitingCount: 0,
+    }
+    expect(operationsTrayShown(idle)).toBe(false)
+    expect(operationsTrayShown({ ...idle, runningCount: 1 })).toBe(true)
+    // Work started in this tab, before the server lists it.
+    expect(operationsTrayShown({ ...idle, localCount: 1 })).toBe(true)
+    expect(operationsTrayShown({ ...idle, waitingCount: 2 })).toBe(true)
+    // Opened from a toast or the command palette while idle: its history.
+    expect(operationsTrayShown({ ...idle, open: true })).toBe(true)
   })
 
   test('accessible label always says Operations', () => {

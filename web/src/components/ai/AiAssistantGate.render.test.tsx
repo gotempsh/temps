@@ -105,7 +105,7 @@ test('opens the assistant when a local provider key is active', async () => {
   renderGate()
 
   await screen.findByText('assistant chat')
-  expect(screen.queryByText('Get things running on Temps by chat')).toBeNull()
+  expect(screen.queryByText('Connect an AI provider')).toBeNull()
 })
 
 test('opens the assistant when managed AI is available', async () => {
@@ -116,7 +116,7 @@ test('opens the assistant when managed AI is available', async () => {
   renderGate()
 
   await screen.findByText('assistant chat')
-  expect(screen.queryByText('Get things running on Temps by chat')).toBeNull()
+  expect(screen.queryByText('Connect an AI provider')).toBeNull()
 })
 
 test('a linked but unentitled instance onboards instead of opening the chat', async () => {
@@ -129,7 +129,7 @@ test('a linked but unentitled instance onboards instead of opening the chat', as
   })
   renderGate()
 
-  await screen.findByText('Get things running on Temps by chat')
+  await screen.findByText('Connect an AI provider')
   expect(screen.queryByText('assistant chat')).toBeNull()
   expect(
     screen
@@ -172,7 +172,7 @@ test('a failed capability check explains itself and recovers on retry', async ()
   available = true
   fireEvent.click(screen.getByRole('button', { name: 'Check again' }))
   await waitFor(() =>
-    expect(screen.getByText('Get things running on Temps by chat')).toBeTruthy()
+    expect(screen.getByText('Connect an AI provider')).toBeTruthy()
   )
   expect(screen.queryByText('assistant chat')).toBeNull()
 })

@@ -2,30 +2,51 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { platformToolGroups } from '@/components/platform/platform-tools'
+import { SERVER_AREAS } from '@/lib/server-navigation'
 import { settingsNavigationGroups } from '@/components/settings/settings-navigation'
 import {
   AUDIT_LOGS_URL,
   buildAccessibleNavigationMap,
   excludeNavigationUrls,
   filterRestrictedNavigationItems,
-  isSettingsNavigationUrl,
   mergeNavigationItems,
-  platformToolNavigationItems,
+  serverNavigationItems,
   settingsPageNavigationItems,
 } from './command-navigation-catalog'
 
 describe('command navigation catalog', () => {
-  test('indexes every platform tool from the page registry', () => {
-    const expectedUrls = platformToolGroups.flatMap((group) =>
-      group.items.map((item) => item.url)
-    )
-    const indexedUrls = new Set(
-      platformToolNavigationItems.map((item) => item.url)
-    )
+  test('indexes every server-wide page, set up or not', () => {
+    const expectedUrls = SERVER_AREAS.flatMap((area) => [
+      area.url,
+      ...(area.tabs ?? []).map((tab) => tab.url),
+    ])
+    const indexedUrls = serverNavigationItems.map((item) => item.url)
 
-    expect(expectedUrls.every((url) => indexedUrls.has(url))).toBe(true)
-    expect(indexedUrls.has('/certificates')).toBe(true)
+    expect(expectedUrls.every((url) => indexedUrls.includes(url))).toBe(true)
+    expect(new Set(indexedUrls).size).toBe(indexedUrls.length)
+    expect(indexedUrls).toContain('/certificates')
+    expect(indexedUrls).not.toContain('/tools')
+  })
+
+  test('names a tab with its area, and an area as the menu does', () => {
+    const titleOf = (url: string) =>
+      serverNavigationItems.find((item) => item.url === url)?.title
+
+    expect(titleOf('/storage')).toBe('Databases')
+    expect(titleOf('/backups')).toBe('Databases · Backups')
+    expect(titleOf('/proxy-logs')).toBe('Proxy · Requests')
+    expect(titleOf('/settings/notifications')).toBe('Alerts · Channels')
+    // The former parents were pages of their own; they are gone.
+    expect(titleOf('/resources')).toBeUndefined()
+    // A page listed in Settings is found by that word too.
+    expect(
+      serverNavigationItems.find((item) => item.url === '/git-providers')
+        ?.keywords
+    ).toContain('settings Platform')
+    expect(
+      serverNavigationItems.find((item) => item.url === '/settings/nodes')
+        ?.keywords
+    ).toContain('worker nodes')
   })
 
   test('indexes every page rendered by the settings sidebar', () => {
@@ -37,16 +58,25 @@ describe('command navigation catalog', () => {
     )
 
     expect(expectedUrls.every((url) => indexedUrls.has(url))).toBe(true)
+    // The pages behind the tabs of Limits are destinations of their own.
     for (const url of [
       '/settings/version',
       '/settings/request-timeouts',
       '/settings/service-healthchecks',
       '/settings/traefik-discovery',
-      '/settings/mcp-server',
       '/settings/otel-pipeline',
+      '/settings/plugins',
+      AUDIT_LOGS_URL,
     ]) {
       expect(indexedUrls.has(url)).toBe(true)
     }
+    expect(
+      settingsPageNavigationItems.find(
+        (item) => item.url === '/settings/request-timeouts'
+      )?.title
+    ).toBe('Limits · Request timeouts')
+    // An area of the server menu is not also a settings result.
+    expect(indexedUrls.has('/settings/mcp-server')).toBe(false)
   })
 
   test('keeps one result per URL and combines search keywords', () => {
@@ -70,6 +100,8 @@ describe('command navigation catalog', () => {
     expect(result.title).toBe('Platform settings')
     expect(result.keywords).toContain('configuration')
     expect(result.keywords).toContain('settings')
+    // The name the later list used is still a way to find the page.
+    expect(result.keywords).toContain(canonical.title)
   })
 
   test('keeps settings pages out of the main navigation category', () => {
@@ -77,18 +109,19 @@ describe('command navigation catalog', () => {
       settingsPageNavigationItems.map((item) => item.url)
     )
     const mainItems = excludeNavigationUrls(
-      platformToolNavigationItems,
+      [
+        ...serverNavigationItems,
+        { title: 'Platform settings', url: '/settings', icon: () => null },
+      ],
       settingsUrls
     )
 
     expect(mainItems.some((item) => item.url === '/settings')).toBe(false)
-    expect(mainItems.some((item) => item.url === '/settings/mcp-server')).toBe(
-      false
-    )
     expect(mainItems.some((item) => item.url === '/projects')).toBe(true)
-    expect(isSettingsNavigationUrl('/settings')).toBe(true)
-    expect(isSettingsNavigationUrl('/settings/mcp-server')).toBe(true)
-    expect(isSettingsNavigationUrl('/storage')).toBe(false)
+    // Connecting an agent is an AI page, wherever its URL sits.
+    expect(mainItems.some((item) => item.url === '/settings/mcp-server')).toBe(
+      true
+    )
   })
 
   test('removes restricted audit navigation for users without access', () => {

@@ -434,9 +434,9 @@ const SECTION_READY: Record<
   (typeof MONITORING_SECTIONS)[number]['id'],
   string
 > = {
+  alarms: 'Acknowledged',
+  rules: 'Add recommended alerts',
   alerts: 'Route monitoring',
-  rules: 'Monitoring & alerts',
-  alarms: 'Monitoring & alerts',
   notifications: 'Weekly digest',
 }
 

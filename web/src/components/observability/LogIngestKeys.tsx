@@ -7,9 +7,10 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { z } from 'zod'
-import { Send, Trash2 } from 'lucide-react'
+import { Plus, Trash2 } from 'lucide-react'
 import {
   createLogIngestKeyMutation,
+  getProjectOptions,
   listLogIngestKeysOptions,
   listLogIngestKeysQueryKey,
   revokeLogIngestKeyMutation,
@@ -19,6 +20,7 @@ import { Button } from '@/components/ui/button'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -39,6 +41,9 @@ import {
 } from '@/lib/log-ingest'
 import { PublicCallbackUrl } from '@/components/settings/PublicCallbackUrl'
 import { usePublicIngress } from '@/hooks/usePublicIngress'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
+import { LogServiceList } from './LogServiceList'
+import { useLogServices } from './use-log-services'
 
 const createSchema = z.object({
   name: z
@@ -54,33 +59,95 @@ const createSchema = z.object({
 type CreateForm = z.infer<typeof createSchema>
 
 /**
- * "Send logs": per-service keys for the NDJSON ingest endpoint, so a host,
- * database or app Temps did not deploy can ship logs through Vector, Fluent
- * Bit or plain HTTP.
+ * "Add log source": per-service keys for the NDJSON ingest endpoint, so a
+ * host, database or app Temps did not deploy can ship logs through Vector,
+ * Fluent Bit or plain HTTP. The page's add action: it brings in more of what
+ * the page lists.
  */
 export function LogIngestKeys({
   projectId,
 }: {
+  /** The service the page is filtered to, the default owner of a new key. */
   projectId: number | undefined
 }) {
   const [open, setOpen] = useState(false)
+  // The keys' service is the page's until another is chosen here. Choosing
+  // here leaves the page's filter alone: adding a host is not a search. The
+  // choice lasts one opening: opened again, perhaps after the page moved to
+  // another service, the dialog starts from the page's.
+  const [choice, setChoice] = useState<number | 'choosing' | undefined>()
+  const openDialog = (next: boolean) => {
+    if (next) setChoice(undefined)
+    setOpen(next)
+  }
+  const serviceId = choice === 'choosing' ? undefined : (choice ?? projectId)
+  const services = useLogServices(open && serviceId === undefined)
+  const service = useQuery({
+    ...getProjectOptions({ path: { id: serviceId ?? 0 } }),
+    enabled: open && serviceId !== undefined,
+    staleTime: 60_000,
+  })
   return (
     <>
       <Button
         size="sm"
         variant="outline"
         className="h-9 gap-2"
-        onClick={() => setOpen(true)}
+        onClick={() => openDialog(true)}
       >
-        <Send className="size-4" />
-        <span className="max-sm:sr-only">Send logs</span>
+        <Plus className="size-4" />
+        {/* The page's one action: named at every width, a bare plus says
+            nothing. */}
+        Add log source
       </Button>
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={openDialog}>
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Send logs from outside Temps</DialogTitle>
+            <DialogTitle>Add a log source</DialogTitle>
+            <DialogDescription>
+              Temps already collects logs from what it deploys. A key lets a
+              host, database or app it did not deploy send its logs here.
+            </DialogDescription>
           </DialogHeader>
-          <LogIngestKeysBody projectId={projectId} enabled={open} />
+          {serviceId === undefined ? (
+            <div className="space-y-2">
+              <p className="text-sm font-medium">
+                Which service do these logs belong to?
+              </p>
+              <LogServiceList
+                services={services}
+                onPick={setChoice}
+                className="-mx-2"
+              />
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 rounded-md border py-1.5 pl-3 pr-1.5 text-sm">
+              {service.data ? (
+                <>
+                  <ServiceIcon service={service.data} size="xs" />
+                  <span className="min-w-0 flex-1 truncate font-medium">
+                    {service.data.name}
+                  </span>
+                </>
+              ) : service.isError ? (
+                <span className="min-w-0 flex-1 truncate font-medium">
+                  Service #{serviceId}
+                </span>
+              ) : (
+                <Skeleton className="h-5 w-40" />
+              )}
+              <Button
+                size="sm"
+                variant="ghost"
+                className="ml-auto h-7"
+                title="Choose another service"
+                onClick={() => setChoice('choosing')}
+              >
+                Change
+              </Button>
+            </div>
+          )}
+          <LogIngestKeysBody projectId={serviceId} enabled={open} />
         </DialogContent>
       </Dialog>
     </>
@@ -88,8 +155,9 @@ export function LogIngestKeys({
 }
 
 /**
- * The dialog body. It stays mounted whatever the filter says; without a
- * service it explains how to pick one, and its state is kept.
+ * The dialog body. It stays mounted whatever the service is; without one it
+ * shows nothing (the dialog lists the services to choose from), and its
+ * state is kept.
  */
 export function LogIngestKeysBody({
   projectId,
@@ -150,15 +218,7 @@ export function LogIngestKeysBody({
   const url = ingress.baseUrl === null ? null : logIngestUrl(ingress.baseUrl)
   const active = (keys.data?.data ?? []).filter((key) => key.is_active)
 
-  if (projectId === undefined) {
-    return (
-      <p className="text-sm text-muted-foreground">
-        Keys belong to a service. Filter by a service (type{' '}
-        <code>project:</code> in the search) to create one, then point Vector,
-        Fluent Bit or any HTTP client at it.
-      </p>
-    )
-  }
+  if (projectId === undefined) return null
 
   return (
     <div className="space-y-5">

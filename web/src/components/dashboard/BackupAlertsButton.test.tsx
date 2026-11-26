@@ -13,6 +13,7 @@ import type { UserResponse } from '@/api/client/types.gen'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import {
   backupAlertsQueryOptions,
+  backupAlertsShown,
   listBackupAlertsOptions,
 } from '@/lib/backup-alerts'
 import { BackupAlertsButton } from './BackupAlertsButton'
@@ -103,12 +104,40 @@ test('a non-admin sees no backup alert bell', () => {
   }
 })
 
-test('an instance admin sees the bell with its alert count', () => {
+test('with every backup healthy the top bar shows no bell', () => {
   for (const role of ['admin', 'platform_admin']) {
     const client = createClient()
     client.setQueryData(listBackupAlertsOptions().queryKey, { alerts: [] })
+    expect(render(client, signedInAs(role))).toBe('')
+    client.clear()
+  }
+  expect(backupAlertsShown(0, false)).toBe(false)
+  // Its list stays up while it is open, even as the last alert resolves.
+  expect(backupAlertsShown(0, true)).toBe(true)
+})
+
+test('an instance admin sees the bell with its count while an alert is open', () => {
+  for (const role of ['admin', 'platform_admin']) {
+    const client = createClient()
+    client.setQueryData(listBackupAlertsOptions().queryKey, {
+      alerts: [
+        {
+          id: 1,
+          kind: 'overdue_schedule',
+          severity: 'critical',
+          message: 'The nightly schedule has not run.',
+          opened_at: '2026-01-01T00:00:00Z',
+          schedule_id: 4,
+          schedule_name: 'nightly',
+          schedule_s3_source_id: 2,
+          backup_id: null,
+          backup_s3_source_id: null,
+          job_id: null,
+        },
+      ],
+    })
     const html = render(client, signedInAs(role))
-    expect(html).toContain('Backup alerts (no alerts)')
+    expect(html).toContain('Backup alerts (1 open)')
     client.clear()
   }
 })

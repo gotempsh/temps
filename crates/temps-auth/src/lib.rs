@@ -45,6 +45,7 @@ pub mod sensitive_action;
 pub mod state;
 mod temps_middleware;
 mod types;
+mod user_read_handler;
 mod user_service;
 
 pub use middleware::*;

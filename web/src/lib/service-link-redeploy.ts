@@ -28,6 +28,11 @@ export type ServiceLinkChange = {
   kind: 'linked' | 'unlinked'
   /** Display name of the service whose link changed. */
   serviceName: string
+  /**
+   * The app it was linked to or unlinked from, named where one page covers
+   * several apps (a project's Databases page).
+   */
+  appName?: string
 }
 
 /**
@@ -94,7 +99,9 @@ export function serviceLinkRedeployMessage(
           ? ` Redeploy ${names[0]} to apply the change now.`
           : ` Redeploy ${names.length} environments (${names.join(', ')}) to apply the change now.`
   return {
-    title: `${change.serviceName} was ${verb}`,
+    title: change.appName
+      ? `${change.serviceName} was ${verb} ${change.kind === 'linked' ? 'to' : 'from'} ${change.appName}`
+      : `${change.serviceName} was ${verb}`,
     description: `${effect}${where}`,
   }
 }

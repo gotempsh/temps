@@ -6,10 +6,21 @@ import * as React from 'react'
 import { cn } from '@/lib/utils'
 import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 
+/**
+ * `compact` rows match the dense record lists (a project's services): about
+ * 40px instead of 56px, for lists scanned rather than read.
+ */
+const DENSITY = {
+  default: '',
+  compact: '[&_td]:px-3 [&_td]:py-2 [&_th]:h-9 [&_th]:px-3 [&_th]:text-xs',
+} as const
+
+export type TableDensity = keyof typeof DENSITY
+
 const Table = React.forwardRef<
   HTMLTableElement,
-  React.HTMLAttributes<HTMLTableElement>
->(({ className, ...props }, ref) => {
+  React.HTMLAttributes<HTMLTableElement> & { density?: TableDensity }
+>(({ className, density = 'default', ...props }, ref) => {
   // A wide table scrolls inside this wrapper. Once it overflows the wrapper
   // becomes a named, focusable region so keyboard users can scroll it.
   const region = useScrollableRegion<HTMLDivElement>()
@@ -24,7 +35,11 @@ const Table = React.forwardRef<
     >
       <table
         ref={ref}
-        className={cn('w-full caption-bottom text-sm', className)}
+        className={cn(
+          'w-full caption-bottom text-sm',
+          DENSITY[density],
+          className
+        )}
         {...props}
       />
     </div>

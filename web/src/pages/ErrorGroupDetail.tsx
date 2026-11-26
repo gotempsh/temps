@@ -56,7 +56,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { TimeAgo } from '@/components/utils/TimeAgo'
-import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -161,17 +161,26 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
     }
   }, [setBreadcrumbs, errorGroup, projectSlug])
 
-  // Tell the assistant which error the user is looking at.
-  const assistantContext = errorGroup
-    ? [
-        'The user is viewing an error group (error tracking) in the Temps console.',
-        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
-        `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
-        `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
-        'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
-      ].join('\n')
-    : null
-  useAssistantPageContext(assistantContext, 'this error')
+  // Declare what is on the page once, for "Hand off to agent" and the
+  // built-in assistant alike. The ID is the loaded group's, not the
+  // address's: `parseInt` and `Number` read a link like `2e2` differently.
+  usePageSubject(
+    errorGroup && Number.isSafeInteger(errorGroup.id) && errorGroup.id > 0
+      ? {
+          kind: 'error_group',
+          project: { id: project.id, slug: project.slug, name: project.name },
+          groupId: errorGroup.id,
+        }
+      : null,
+    {
+      assistantDetails: errorGroup
+        ? [
+            `Title: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
+            `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
+          ]
+        : [],
+    }
+  )
 
   const getSeverityColor = (level: string) => {
     switch (level?.toLowerCase()) {

@@ -196,7 +196,7 @@ pub fn configure_oidc_routes() -> Router<Arc<AuthState>> {
         .route("/admin/oidc/providers", get(list_oidc_providers))
         .route(
             "/admin/oidc/providers/{provider_id}",
-            axum::routing::patch(update_oidc_provider),
+            get(get_oidc_provider).patch(update_oidc_provider),
         )
         .route(
             "/admin/oidc/providers/{provider_id}",
@@ -963,6 +963,33 @@ pub async fn list_oidc_providers(
     Ok(Json(providers.iter().map(provider_to_response).collect()))
 }
 
+/// One OIDC provider, as listed; the client secret is masked.
+#[utoipa::path(
+    get,
+    path = "/admin/oidc/providers/{provider_id}",
+    operation_id = "get_oidc_provider",
+    params(("provider_id" = i32, Path, description = "OIDC provider ID")),
+    responses(
+        (status = 200, description = "The OIDC provider", body = OidcProviderResponse),
+        (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
+        (status = 404, description = "OIDC provider not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    tag = "Authentication",
+    security(("bearer_auth" = []))
+)]
+pub async fn get_oidc_provider(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AuthState>>,
+    Path(provider_id): Path<i32>,
+) -> Result<Json<OidcProviderResponse>, Problem> {
+    // The same permission as listing: provider configuration is admin-only.
+    permission_guard!(auth, SettingsWrite);
+    let provider = state.oidc_service.get_provider(provider_id).await?;
+    Ok(Json(provider_to_response(&provider)))
+}
+
 #[utoipa::path(
     patch,
     path = "/admin/oidc/providers/{provider_id}",
@@ -1140,10 +1167,13 @@ pub async fn test_oidc_provider(
     get,
     path = "/admin/oidc/providers/{provider_id}/users",
     params(
-        ("provider_id" = i32, Path, description = "OIDC provider ID")
+        ("provider_id" = i32, Path, description = "OIDC provider ID"),
+        temps_core::PageQuery
     ),
     responses(
-        (status = 200, description = "Users authenticated via this OIDC provider", body = Vec<OidcProviderUserResponse>),
+        (status = 200, description = "One page of the users who sign in through this OIDC provider, newest first", body = OidcProviderUserList),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Provider not found")
     ),
     tag = "Authentication",
@@ -1153,14 +1183,26 @@ pub async fn list_oidc_provider_users(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AuthState>>,
     Path(provider_id): Path<i32>,
-) -> Result<Json<Vec<OidcProviderUserResponse>>, Problem> {
+    Query(page): Query<temps_core::PageQuery>,
+) -> Result<Json<OidcProviderUserList>, Problem> {
     permission_guard!(auth, SettingsWrite);
-    let users = state
+    let (users, total) = state
         .oidc_service
-        .list_users_for_provider(provider_id)
+        .list_users_for_provider(provider_id, page)
         .await?;
-    Ok(Json(users.iter().map(provider_user_to_response).collect()))
+    Ok(Json(OidcProviderUserList::new(
+        users.iter().map(provider_user_to_response).collect(),
+        total,
+        page,
+    )))
 }
+
+temps_core::paginated_response!(
+    /// One page of the users who sign in through an OIDC provider, newest
+    /// first.
+    OidcProviderUserList,
+    OidcProviderUserResponse
+);
 
 #[utoipa::path(
     get,
@@ -1281,6 +1323,7 @@ pub async fn delete_oidc_role_mapping(
         oidc_callback,
         create_oidc_provider,
         list_oidc_providers,
+        get_oidc_provider,
         update_oidc_provider,
         delete_oidc_provider,
         test_oidc_provider,
@@ -1296,6 +1339,7 @@ pub async fn delete_oidc_role_mapping(
             OidcProviderResponse,
             OidcProviderSummary,
             OidcProviderUserResponse,
+            OidcProviderUserList,
             UpdateOidcProviderRequest,
             OidcTestConnectionResponse,
             OidcRoleMappingResponse,
@@ -2066,6 +2110,157 @@ mod login_binding_http_tests {
             let location = response.headers()["location"].to_str().unwrap();
             assert!(!location.contains("locked"), "{location}");
         }
+    }
+
+    /// A user who signs in through `provider_id`, created `offset` minutes
+    /// after a fixed point so the order is deterministic.
+    async fn oidc_provider_user(
+        db: &sea_orm::DatabaseConnection,
+        provider_id: i32,
+        email: &str,
+        offset: i64,
+    ) {
+        let at = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()
+            + chrono::Duration::minutes(offset);
+        temps_entities::users::ActiveModel {
+            email: Set(email.to_string()),
+            name: Set(email.to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            oidc_subject: Set(Some(format!("subject-{email}"))),
+            oidc_provider_id: Set(Some(provider_id)),
+            created_at: Set(at),
+            updated_at: Set(at),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert provider user");
+    }
+
+    /// An admin reads one provider with its secret masked; a missing one is
+    /// a 404 naming it; it needs a token and `settings:write`.
+    #[tokio::test]
+    async fn one_provider_is_read_masked_by_an_admin_only() {
+        let Some(db) = test_db().await else {
+            return;
+        };
+        let state = auth_state(db.db.clone());
+        let provider = state
+            .oidc_service
+            .create_provider(provider_request(
+                "Read Back",
+                "https://issuer.example.com",
+                true,
+            ))
+            .await
+            .expect("create provider");
+        let user =
+            crate::http_test_support::insert_user(db.db.as_ref(), "oidc-admin@example.test").await;
+        let app = Router::new()
+            .route(
+                "/admin/oidc/providers/{provider_id}",
+                get(get_oidc_provider),
+            )
+            .with_state(state);
+        let send = |uri: String, auth: Option<crate::AuthContext>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+                if let Some(auth) = auth {
+                    request.extensions_mut().insert(auth);
+                }
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                )
+            }
+        };
+        let admin = || {
+            Some(crate::AuthContext::new_session(
+                user.clone(),
+                crate::Role::Admin,
+            ))
+        };
+
+        let (status, body) = send(format!("/admin/oidc/providers/{}", provider.id), admin()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["id"], provider.id);
+        assert_eq!(body["name"], "Read Back");
+        assert_ne!(body["client_secret"], "secret", "the secret is masked");
+
+        let missing = provider.id + 1000;
+        let (status, body) = send(format!("/admin/oidc/providers/{missing}"), admin()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&missing.to_string()));
+
+        // Its users, a page at a time and newest first.
+        for (offset, email) in [
+            "first@example.test",
+            "second@example.test",
+            "third@example.test",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            oidc_provider_user(db.db.as_ref(), provider.id, email, offset as i64).await;
+        }
+        let users_app = Router::new()
+            .route(
+                "/admin/oidc/providers/{provider_id}/users",
+                get(list_oidc_provider_users),
+            )
+            .with_state(auth_state(db.db.clone()));
+        let mut request = Request::builder()
+            .uri(format!(
+                "/admin/oidc/providers/{}/users?page=1&page_size=2",
+                provider.id
+            ))
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(crate::AuthContext::new_session(
+                user.clone(),
+                crate::Role::Admin,
+            ));
+        let response = users_app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["total"], 3, "{body}");
+        assert_eq!(body["page_size"], 2);
+        let emails: Vec<&str> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["email"].as_str().unwrap())
+            .collect();
+        assert_eq!(emails, ["third@example.test", "second@example.test"]);
+
+        let (status, _) = send(format!("/admin/oidc/providers/{}", provider.id), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = send(
+            format!("/admin/oidc/providers/{}", provider.id),
+            Some(crate::AuthContext::new_session(
+                user.clone(),
+                crate::Role::User,
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
 

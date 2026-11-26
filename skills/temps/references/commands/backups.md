@@ -217,6 +217,8 @@ List backups for a schedule
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--schedule-id <id>` | Schedule ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `backups show`
