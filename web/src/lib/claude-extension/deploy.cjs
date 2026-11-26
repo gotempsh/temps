@@ -318,6 +318,17 @@ async function allowedRoot(input, folders, host = HOSTS.extension) {
       relative === '' ||
       (relative.split(path.sep)[0] !== '..' && !path.isAbsolute(relative))
     ) {
+      // A folder packing always leaves out (.git, node_modules) is never a
+      // project root either: deploying it would send what every other
+      // deploy keeps back, such as the repository's history and hooks.
+      const leftOut = relative
+        .split(path.sep)
+        .find((segment) => segment && alwaysLeftOut(segment, true))
+      if (leftOut) {
+        throw new Error(
+          `${requested} is inside ${leftOut}, which is never deployed. Give the folder of the project itself.`
+        )
+      }
       return root
     }
   }

@@ -10,6 +10,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs'
+import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -32,8 +33,23 @@ const WRAPPED_PATH = join(EXTENSION_DIR, 'host-wrapper.js')
 writeFileSync(WRAPPED_PATH, `require(${JSON.stringify(ENTRY_PATH)})\n`)
 afterAll(() => rmSync(EXTENSION_DIR, { recursive: true, force: true }))
 
+interface FakeSocket extends EventEmitter {
+  localAddress?: string
+  destroy(): void
+}
+
 interface Bridge {
   plainHttpAllowed(address: string): boolean
+  tailnetLocalAddresses(
+    interfaces: Record<string, { address: string }[]>
+  ): Set<string>
+  plainHttpSource(
+    origin: string,
+    address: string,
+    port: number,
+    local: Set<string>,
+    connect: (options: { host: string; port: number }) => FakeSocket
+  ): Promise<string | undefined>
   readConfig(
     env: Record<string, string | undefined>,
     argv?: string[]
@@ -80,6 +96,71 @@ describe('bridge settings', () => {
     ]) {
       expect(bridge.plainHttpAllowed(ip)).toBe(false)
     }
+  })
+
+  test('a Tailscale-range address is trusted only through the Tailscale interface', async () => {
+    // A CGNAT address from the ISP sits on an interface with no address in
+    // Tailscale's own IPv6 prefix; the Tailscale interface has one.
+    const local = bridge.tailnetLocalAddresses({
+      en0: [{ address: '100.72.1.9' }, { address: 'fe80::1%en0' }],
+      utun4: [
+        { address: '100.101.102.103' },
+        { address: 'fd7a:115c:a1e0::1a' },
+      ],
+    })
+    expect([...local].sort()).toEqual(['100.101.102.103', 'fd7a:115c:a1e0::1a'])
+    expect(
+      bridge.tailnetLocalAddresses({ en0: [{ address: '100.72.1.9' }] }).size
+    ).toBe(0)
+
+    const connectingFrom = (from: string) => () => {
+      const socket = new EventEmitter() as FakeSocket
+      socket.destroy = () => {}
+      setTimeout(() => {
+        socket.localAddress = from
+        socket.emit('connect')
+      }, 0)
+      return socket
+    }
+    const origin = 'http://100.64.0.5:3000'
+    // Reached through Tailscale: sent from (and bound to) the tailnet address.
+    await expect(
+      bridge.plainHttpSource(
+        origin,
+        '100.64.0.5',
+        3000,
+        local,
+        connectingFrom('::ffff:100.101.102.103')
+      )
+    ).resolves.toBe('100.101.102.103')
+    // Reached through the ISP's network: refused, nothing sent.
+    await expect(
+      bridge.plainHttpSource(
+        origin,
+        '100.64.0.5',
+        3000,
+        local,
+        connectingFrom('100.72.1.9')
+      )
+    ).rejects.toThrow('does not reach it through Tailscale')
+    // Not on a tailnet at all: refused without connecting.
+    await expect(
+      bridge.plainHttpSource(origin, '100.64.0.5', 3000, new Set(), () => {
+        throw new Error('must not connect')
+      })
+    ).rejects.toThrow('does not reach it through Tailscale')
+    // Loopback needs no check.
+    await expect(
+      bridge.plainHttpSource(
+        'http://127.0.0.1:3000',
+        '127.0.0.1',
+        3000,
+        new Set(),
+        () => {
+          throw new Error('must not connect')
+        }
+      )
+    ).resolves.toBeUndefined()
   })
 
   test('the endpoint is always /mcp on the server origin', () => {

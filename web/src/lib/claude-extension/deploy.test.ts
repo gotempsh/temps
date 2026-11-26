@@ -203,6 +203,18 @@ describe('which folders may be deployed', () => {
       'not a project folder'
     )
     expect(await refused('/', ['/'])).toContain('not a project folder')
+    // A folder packing leaves out is no project root, nor anything in it.
+    mkdirSync(join(allowed, 'app/.git/hooks'), { recursive: true })
+    mkdirSync(join(allowed, 'app/node_modules/pkg'), { recursive: true })
+    expect(await refused(join(allowed, 'app/.git'))).toContain(
+      'inside .git, which is never deployed'
+    )
+    expect(await refused(join(allowed, 'app/.git/hooks'))).toContain(
+      'inside .git'
+    )
+    expect(await refused(join(allowed, 'app/node_modules/pkg'))).toContain(
+      'inside node_modules'
+    )
   })
 
   test('for an app the Temps CLI set up, it says how to allow a folder there', async () => {

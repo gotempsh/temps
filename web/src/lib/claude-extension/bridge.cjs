@@ -20,6 +20,9 @@
  * - Plain HTTP is refused unless every address the server name resolves to
  *   is loopback or Tailscale (WireGuard encrypts tailnet traffic), and the
  *   connection goes to the address that was checked, so DNS cannot swap it.
+ *   A Tailscale address must also be reached through this computer's
+ *   Tailscale interface: `100.64.0.0/10` is shared address space that ISPs
+ *   (CGNAT) and other networks use too, where nothing encrypts it.
  * - HTTPS certificates are verified as usual.
  * - The key never appears in output or logs.
  * - Messages and responses are size-capped, and requests time out.
@@ -38,6 +41,7 @@ const http = require('node:http')
 const https = require('node:https')
 const dns = require('node:dns')
 const net = require('node:net')
+const os = require('node:os')
 const nodePath = require('node:path')
 const deploy = require('./deploy.cjs')
 
@@ -46,20 +50,100 @@ const REQUEST_TIMEOUT_MS = 5 * 60 * 1000
 const CONNECT_TIMEOUT_MS = 10 * 1000
 const USER_AGENT = 'temps-claude-extension/1'
 
-/** Whether an IP address is loopback or on a tailnet. */
-function plainHttpAllowed(address) {
+/** An address as compared here: no brackets, lower case, IPv4-mapped unwrapped. */
+function normalizeIp(address) {
   let ip = String(address).toLowerCase()
   if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1)
+  const zone = ip.indexOf('%')
+  if (zone !== -1) ip = ip.slice(0, zone)
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip)
-  if (mapped) ip = mapped[1]
+  return mapped ? mapped[1] : ip
+}
+
+function isLoopback(address) {
+  const ip = normalizeIp(address)
+  if (net.isIPv4(ip)) return ip.split('.')[0] === '127'
+  return ip === '::1'
+}
+
+/** Tailscale's own IPv6 prefix, which no other network hands out. */
+function inTailscaleIpv6(ip) {
+  return net.isIPv6(ip) && ip.startsWith('fd7a:115c:a1e0:')
+}
+
+/**
+ * Whether an IP address is loopback or in a range Tailscale uses. A
+ * Tailscale-range address is only a candidate: `send` then checks that this
+ * computer reaches it through its Tailscale interface.
+ */
+function plainHttpAllowed(address) {
+  const ip = normalizeIp(address)
+  if (isLoopback(ip)) return true
   if (net.isIPv4(ip)) {
     const [a, b] = ip.split('.').map(Number)
-    return a === 127 || (a === 100 && b >= 64 && b <= 127)
+    return a === 100 && b >= 64 && b <= 127
   }
-  if (net.isIPv6(ip)) {
-    return ip === '::1' || ip.startsWith('fd7a:115c:a1e0:')
+  return inTailscaleIpv6(ip)
+}
+
+/**
+ * This computer's addresses on its Tailscale interface: every address of an
+ * interface that holds one in Tailscale's own IPv6 prefix. A CGNAT address
+ * an ISP hands out is on an interface without one, so it is not here.
+ */
+function tailnetLocalAddresses(interfaces = os.networkInterfaces()) {
+  const local = new Set()
+  for (const addresses of Object.values(interfaces || {})) {
+    const list = (addresses || []).map((a) => normalizeIp(a.address))
+    if (list.some(inTailscaleIpv6)) for (const ip of list) local.add(ip)
   }
-  return false
+  return local
+}
+
+function notThroughTailscale(origin, address) {
+  return `The extension does not send your API key over plain HTTP to ${origin}: ${address} is in Tailscale's range, but this computer does not reach it through Tailscale, and other networks (an ISP's CGNAT) use that range unencrypted. Connect this computer to the tailnet, or serve Temps over HTTPS.`
+}
+
+/**
+ * The local address to send from, to reach `address` over plain HTTP: the
+ * one the system picks for it, which must be on the Tailscale interface,
+ * so the traffic is WireGuard's. Loopback needs none. A test connection
+ * shows what the system picks; the request is then bound to it.
+ */
+async function plainHttpSource(
+  origin,
+  address,
+  port,
+  local = tailnetLocalAddresses(),
+  connect = net.connect
+) {
+  if (isLoopback(address)) return undefined
+  if (local.size === 0) throw new Error(notThroughTailscale(origin, address))
+  const source = await new Promise((resolve, reject) => {
+    const socket = connect({ host: address, port })
+    const timer = setTimeout(() => {
+      socket.destroy()
+      const error = new Error(
+        `Could not connect to ${origin} within ${CONNECT_TIMEOUT_MS / 1000} seconds.`
+      )
+      error.code = 'ETIMEDOUT'
+      reject(error)
+    }, CONNECT_TIMEOUT_MS)
+    socket.once('connect', () => {
+      clearTimeout(timer)
+      const from = socket.localAddress
+      socket.destroy()
+      resolve(from)
+    })
+    socket.once('error', (error) => {
+      clearTimeout(timer)
+      socket.destroy()
+      reject(error)
+    })
+  })
+  const from = normalizeIp(source || '')
+  if (!local.has(from)) throw new Error(notThroughTailscale(origin, address))
+  return from
 }
 
 /**
@@ -184,9 +268,11 @@ async function send(config, method, path, headers, body) {
     )
   }
   const addresses = await resolvePlainHttp(config.endpoint)
+  const port = Number(config.endpoint.port || 80)
   for (let i = 0; ; i++) {
     try {
-      return await sendTo(config, addresses[i], request)
+      const source = await plainHttpSource(config.origin, addresses[i], port)
+      return await sendTo(config, addresses[i], request, source)
     } catch (error) {
       const code = error && typeof error === 'object' ? error.code : undefined
       if (i + 1 >= addresses.length || !UNREACHABLE.has(code)) throw error
@@ -211,7 +297,7 @@ function post(config, body, sessionId) {
   )
 }
 
-async function sendTo(config, hostname, request) {
+async function sendTo(config, hostname, request, localAddress) {
   const { endpoint } = config
   const secure = endpoint.protocol === 'https:'
   const headers = {
@@ -233,6 +319,7 @@ async function sendTo(config, hostname, request) {
     timeout: REQUEST_TIMEOUT_MS,
     agent: false,
   }
+  if (localAddress) options.localAddress = localAddress
 
   return new Promise((resolve, reject) => {
     const req = (secure ? https : http).request(options, (res) => {
@@ -532,6 +619,8 @@ function main(env = process.env, argv = process.argv.slice(2)) {
 
 module.exports = {
   plainHttpAllowed,
+  tailnetLocalAddresses,
+  plainHttpSource,
   readConfig,
   parseSse,
   statusError,
