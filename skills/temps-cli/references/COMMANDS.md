@@ -83,9 +83,11 @@ Use this index or search for a top-level command heading to load only the releva
 - [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
+- [`kv`](#kv) - Read and write a project's keys in the KV store, and manage the KV service
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
 - [`surveys`](#surveys) - Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
 - [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
+- [`blob`](#blob) - Upload, download and list a project's files in Blob storage, and manage the Blob service
 - [`dsn`](#dsn) - Manage Data Source Names (DSNs) for error tracking and analytics
 - [`scans`](#scans) - Manage vulnerability scans
 - [`custom-domains`](#custom-domains) - Manage project custom domains
@@ -6069,6 +6071,185 @@ Show pipeline counter trends over time (received/stored/dropped per signal)
 | `--end-time <iso>` | Explicit window end (RFC 3339) — overrides --period | - | No |
 | `--json` | Output in JSON format | - | No |
 
+## `kv`
+
+Read and write a project's keys in the KV store, and manage the KV service
+
+**Subcommands:**
+
+- `get` - Get the value of a key
+- `set` - Set a key; the value is a string unless --json-value
+- `del` (`delete`) - Delete one or more keys
+- `keys` (`ls`) - List keys matching a pattern (* and ? wildcards; default *)
+- `ttl` - Show how long until a key expires
+- `expire` - Expire a key after a number of seconds
+- `incr` - Increment a numeric key (creating it at 0 first)
+- `status` - Show whether the KV service is enabled and healthy on this instance
+- `enable` - Enable the KV service on this instance (starts its Redis container)
+- `update` - Change the Docker image the KV service runs (recreates its container)
+- `disable` - Disable the KV service on this instance (stops its container; every project loses KV access)
+- `container-name` - Show, or set with --container-name/--reset, the Docker container name of the KV service
+
+### `kv get`
+
+Get the value of a key
+
+**Usage:** `kv get <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv set`
+
+Set a key; the value is a string unless --json-value
+
+**Usage:** `kv set <key> [value] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json-value` | Parse the value as JSON (a number, object, array, true/false or null) | - | No |
+| `--ex <seconds>` | Expire the key after this many seconds | - | No |
+| `--px <milliseconds>` | Expire the key after this many milliseconds | - | No |
+| `--nx` | Only set the key if it does not exist | - | No |
+| `--xx` | Only set the key if it already exists | - | No |
+| `--json` | Output in JSON format | - | No |
+| `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
+
+### `kv del` (alias: `delete`)
+
+Delete one or more keys
+
+**Usage:** `kv del <keys...> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv keys` (alias: `ls`)
+
+List keys matching a pattern (* and ? wildcards; default *)
+
+**Usage:** `kv keys [pattern] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv ttl`
+
+Show how long until a key expires
+
+**Usage:** `kv ttl <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv expire`
+
+Expire a key after a number of seconds
+
+**Usage:** `kv expire <key> <seconds> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv incr`
+
+Increment a numeric key (creating it at 0 first)
+
+**Usage:** `kv incr <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--by <amount>` | Amount to add, may be negative (default 1) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv status`
+
+Show whether the KV service is enabled and healthy on this instance
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `kv enable`
+
+Enable the KV service on this instance (starts its Redis container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run (default: the one this Temps release pins) | - | No |
+| `--max-memory <size>` | Memory limit, e.g. 256mb or 1gb | - | No |
+| `--persistence` | Persist data to disk | - | No |
+| `--no-persistence` | Keep data in memory only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv update`
+
+Change the Docker image the KV service runs (recreates its container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run | - | Yes |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv disable`
+
+Disable the KV service on this instance (stops its container; every project loses KV access)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv container-name`
+
+Show, or set with --container-name/--reset, the Docker container name of the KV service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--container-name <name>` | New container name (must keep the required prefix) | - | No |
+| `--reset` | Go back to the default container name | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `flags` (alias: `flag`)
 
 Manage feature flags (runtime config that changes without a redeploy)
@@ -6550,6 +6731,170 @@ Read rows from an entity
 | `--offset <n>` | Rows to skip (default: 0) | - | No |
 | `--sort-by <field>` | Field to sort by | - | No |
 | `--sort-order <order>` | asc or desc (default: asc) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `blob`
+
+Upload, download and list a project's files in Blob storage, and manage the Blob service
+
+**Subcommands:**
+
+- `list` (`ls`) - List blobs, optionally under a pathname prefix
+- `put` (`upload`) - Upload a local file
+- `get` (`download`) - Download a blob to a file, or to stdout with -o -
+- `head` (`stat`) - Show a blob's metadata (size, content type, last modified) without downloading it
+- `copy` (`cp`) - Copy a blob (by pathname or URL) to a new pathname
+- `del` (`delete`) - Delete one or more blobs
+- `status` - Show whether the Blob service is enabled and healthy on this instance
+- `enable` - Enable the Blob service on this instance (starts its S3-compatible container)
+- `update` - Change the Docker image the Blob service runs (recreates its container)
+- `disable` - Disable the Blob service on this instance (stops its container; every project loses Blob access)
+- `container-name` - Show, or set with --container-name/--reset, the Docker container name of the Blob service
+
+### `blob list` (alias: `ls`)
+
+List blobs, optionally under a pathname prefix
+
+**Usage:** `blob list [prefix] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--limit <n>` | Blobs per page | - | No |
+| `--cursor <token>` | Continue from the cursor a previous page returned | - | No |
+| `--all` | Follow cursors to list everything (at most 100 pages) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob put` (alias: `upload`)
+
+Upload a local file
+
+**Usage:** `blob put <file> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--pathname <path>` | Where to store it (default: the file name) | - | No |
+| `--content-type <type>` | Content type (default: guessed from the extension) | - | No |
+| `--random-suffix` | Add a random suffix to the pathname so it never overwrites | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob get` (alias: `download`)
+
+Download a blob to a file, or to stdout with -o -
+
+**Usage:** `blob get <pathname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-o, --output <path>` | Where to write it (default: its file name in this directory; - for stdout) | - | No |
+
+### `blob head` (alias: `stat`)
+
+Show a blob's metadata (size, content type, last modified) without downloading it
+
+**Usage:** `blob head <pathname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob copy` (alias: `cp`)
+
+Copy a blob (by pathname or URL) to a new pathname
+
+**Usage:** `blob copy <from> <to> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob del` (alias: `delete`)
+
+Delete one or more blobs
+
+**Usage:** `blob del <pathnames...> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob status`
+
+Show whether the Blob service is enabled and healthy on this instance
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `blob enable`
+
+Enable the Blob service on this instance (starts its S3-compatible container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run (default: the one this Temps release pins) | - | No |
+| `--root-user <user>` | Root user for S3 access (default: generated) | - | No |
+| `--root-password <password>` | Root password for S3 access (prefer --root-password-stdin) | - | No |
+| `--json` | Output in JSON format | - | No |
+| `--root-password-file <path>` | Read the root password from a file (- reads stdin) instead of --root-password | - | No |
+| `--root-password-stdin` | Read the root password from stdin instead of --root-password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
+
+### `blob update`
+
+Change the Docker image the Blob service runs (recreates its container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run | - | Yes |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob disable`
+
+Disable the Blob service on this instance (stops its container; every project loses Blob access)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob container-name`
+
+Show, or set with --container-name/--reset, the Docker container name of the Blob service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--container-name <name>` | New container name (must keep the required prefix) | - | No |
+| `--reset` | Go back to the default container name | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `dsn`

@@ -42,7 +42,7 @@ export const SPEC_FILE = join(CLI_ROOT, 'openapi.json')
 export const SDK_FILE = join(CLI_ROOT, 'src/api/sdk.gen.ts')
 export const COMMANDS_DIR = join(CLI_ROOT, 'src/commands')
 
-const METHODS = ['get', 'put', 'post', 'delete', 'patch'] as const
+const METHODS = ['get', 'put', 'post', 'delete', 'patch', 'head'] as const
 type Method = (typeof METHODS)[number]
 
 export interface Operation {
@@ -150,7 +150,7 @@ export function sdkFunctionsByOperation(sdkSource: string): Map<string, string[]
   const exports = [...sdkSource.matchAll(/^export const (\w+) = /gm)]
   exports.forEach((match, index) => {
     const body = sdkSource.slice(match.index, exports[index + 1]?.index ?? sdkSource.length)
-    const call = body.match(/\)\.(?:sse\.)?(get|put|post|delete|patch)</)
+    const call = body.match(/\)\.(?:sse\.)?(get|put|post|delete|patch|head)</)
     const url = body.match(/url: '([^']+)'/)
     if (!call?.[1] || !url?.[1]) return
     const key = `${call[1].toUpperCase()} ${normalizePath(url[1])}`
@@ -162,7 +162,7 @@ export function sdkFunctionsByOperation(sdkSource: string): Map<string, string[]
 /** `METHOD /normalized-path` of every direct `client.<method>({ url })` call in a source. */
 export function directClientCalls(source: string): Set<string> {
   const calls = new Set<string>()
-  const pattern = /client\.(get|put|post|delete|patch)\s*(?:<[^(]*>)?\(\s*\{[\s\S]{0,400}?url:\s*(['`])(.*?)\2/g
+  const pattern = /client\.(get|put|post|delete|patch|head)\s*(?:<[^(]*>)?\(\s*\{[\s\S]{0,400}?url:\s*(['`])(.*?)\2/g
   for (const match of source.matchAll(pattern)) {
     calls.add(`${(match[1] as string).toUpperCase()} ${normalizePath(match[3] as string)}`)
   }
@@ -180,7 +180,7 @@ export function directClientCalls(source: string): Set<string> {
  *   statement, or GET when the literal is `fetch`'s first argument; a
  *   literal with neither is not counted, its method being unknown.
  */
-const MARKER = /api-coverage:\s*(GET|PUT|POST|DELETE|PATCH)\s+(\/\S*)/g
+const MARKER = /api-coverage:\s*(GET|PUT|POST|DELETE|PATCH|HEAD)\s+(\/\S*)/g
 
 export function rawFetchCalls(source: string, specPaths: ReadonlySet<string>): Set<string> {
   const calls = new Set<string>()
@@ -196,7 +196,7 @@ export function rawFetchCalls(source: string, specPaths: ReadonlySet<string>): S
     // The rest of this call: up to the end of the statement or the next request.
     const after = source.slice(start + match[0].length, start + match[0].length + 300).split(/;|\bfetch\(|\n\s*\n/)[0] ?? ''
     const method =
-      after.match(/method:\s*['"](GET|PUT|POST|DELETE|PATCH)['"]/)?.[1] ??
+      after.match(/method:\s*['"](GET|PUT|POST|DELETE|PATCH|HEAD)['"]/)?.[1] ??
       (/fetch\(\s*$/.test(source.slice(Math.max(0, start - 20), start)) ? 'GET' : undefined)
     if (method) calls.add(`${method} ${path}`)
   }
