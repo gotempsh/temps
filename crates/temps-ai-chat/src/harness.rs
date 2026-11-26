@@ -77,6 +77,14 @@ const SOURCES: &[(&str, &str)] = &[
         "track-app-usage.md",
         include_str!("../harness/track-app-usage.md"),
     ),
+    // Generated from the console's view catalog; do not edit it by hand:
+    // change the catalog under `web/src/components/ai/views/` and run
+    // `bun run scripts/write-assistant-views.ts` in `web/`. A console test
+    // fails when the two differ.
+    (
+        "show-results-as-views.md",
+        include_str!("../harness/show-results-as-views.md"),
+    ),
 ];
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -710,7 +718,8 @@ mod tests {
                 "connect-a-service",
                 "add-a-provider-credential",
                 "host-with-temps",
-                "debug-a-deployment"
+                "debug-a-deployment",
+                "show-results-as-views"
             ]
         );
 

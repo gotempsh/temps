@@ -1,3 +1,9 @@
+---
+name: show-results-as-views
+description: Read before answering with a list of records, a few figures, a measure over time or one record's facts, to draw it as a view the console renders instead of a Markdown table
+contexts: assistant
+---
+
 ## Views
 When an answer is a list of records, a few figures, a measure over time, or the facts of one record, draw it instead of writing a Markdown table: say in one sentence what it shows, then add a ```spec fenced block. The console draws the block with its own components. Reasons, explanations and next steps stay as prose, and prose does not repeat what the view shows.
 
@@ -20,7 +26,7 @@ Rules:
 - Use only the components below, with exactly the props listed. No other fields: no state, actions, repeat or visibility.
 - Show only values a tool returned in this conversation. Never invent, estimate, round up or pad a view; leave out what you did not read, and say in prose when a list is partial.
 - `tone` marks a state: healthy, in progress, degraded, failing, stopped. Leave it out of a plain count or measurement.
-- `href` is a console path beginning with `/`, built from the console links above with real ids or slugs. Anything else is shown as plain text.
+- `href` is a console path beginning with `/`, built from the console links in your instructions with real ids or slugs. Anything else is shown as plain text.
 - A Table holds at most 100 rows and 8 columns, and any one text 400 characters. When there is more, show the first and say in prose how many are left out.
 - At most one view in an answer. None for a one-line answer, for a question, or when a tool refused.
 

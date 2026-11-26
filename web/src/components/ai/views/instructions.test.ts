@@ -42,8 +42,15 @@ describe('what the assistant is told about views', () => {
     }
   })
 
-  test('stays short: it is sent with every turn', () => {
-    expect(instructions.length).toBeLessThan(5500)
+  test('stays short: it is read whole in each turn that draws a view', () => {
+    expect(instructions.length).toBeLessThan(5800)
+  })
+
+  test('is a playbook the assistant reads when a result is to be drawn', () => {
+    const header = /^---\n([\s\S]*?)\n---\n/.exec(instructions)?.[1] ?? ''
+    expect(header).toContain('name: show-results-as-views')
+    expect(header).toContain('contexts: assistant')
+    expect(header).toMatch(/^description: .*list of records/m)
   })
 
   test('its own example is a view the console draws whole', () => {
