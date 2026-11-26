@@ -256,13 +256,26 @@ impl LocalTraffic for DeploymentTraffic {
             .find_map(|gateway| gateway.parse().ok()))
     }
 
-    async fn refresh(&self, _address: SocketAddr) -> Result<RecordedTraffic, String> {
-        if !needs_listing(
-            !self.recording().await?.is_empty(),
-            self.steered_seen.load(Ordering::Relaxed),
-        ) {
+    /// With `discover`, the containers are listed whatever the last list
+    /// found: a replica steered while nothing recorded (recording was turned
+    /// off mid-deploy) is found all the same.
+    async fn refresh(
+        &self,
+        _address: SocketAddr,
+        discover: bool,
+    ) -> Result<RecordedTraffic, String> {
+        if !discover
+            && !needs_listing(
+                !self.recording().await?.is_empty(),
+                self.steered_seen.load(Ordering::Relaxed),
+            )
+        {
             return Ok(RecordedTraffic::default());
         }
+        // Not known until a list succeeds: a failed one keeps the next
+        // refreshes listing, so a replica a failed discovery missed is found
+        // once Docker answers again, not only when it calls.
+        self.steered_seen.store(true, Ordering::Relaxed);
         let recording = self.recorded_here().await?;
         let containers = self
             .docker
@@ -286,6 +299,32 @@ impl LocalTraffic for DeploymentTraffic {
 mod tests {
     use super::*;
     use bollard::models::{ContainerSummary, ContainerSummaryNetworkSettings, EndpointSettings};
+
+    /// A discovery whose list fails, after a list that found nothing and
+    /// with nothing recording any more (recording turned off mid-deploy),
+    /// leaves the next ordinary refreshes listing: the replica it missed is
+    /// found once Docker answers again.
+    #[tokio::test]
+    async fn a_failed_discovery_keeps_the_next_refreshes_listing() {
+        let Some(f) = crate::services::egress_recording::tests::fixture().await else {
+            return;
+        };
+        // Nothing listens on port 1: every Docker call fails at once.
+        let unreachable = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            2,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("a client is built without connecting");
+        let traffic = DeploymentTraffic::new(f.db.connection_arc(), unreachable, NETWORK.into());
+        traffic.steered_seen.store(false, Ordering::Relaxed);
+        let address: SocketAddr = "172.18.0.1:13128".parse().unwrap();
+        assert!(traffic.refresh(address, true).await.is_err());
+        assert!(
+            traffic.refresh(address, false).await.is_err(),
+            "an ordinary refresh lists again (and fails while Docker does)"
+        );
+    }
 
     const NETWORK: &str = "temps-network";
 

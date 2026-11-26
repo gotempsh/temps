@@ -4,7 +4,7 @@
 //! Why recording, ingest or reading records failed.
 
 use temps_otel::OtelError;
-use temps_workload::{WorkloadKind, WorkloadRef};
+use temps_workload::WorkloadKind;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EgressRecordingError {
@@ -51,12 +51,6 @@ pub enum EgressRecordingError {
 
     #[error("node {node_id} sent an invalid egress record: {reason}")]
     InvalidRecord { node_id: i32, reason: String },
-
-    #[error("node {node_id} sent egress records for {workload}, which is not placed on it")]
-    NotPlacedOnNode { node_id: i32, workload: WorkloadRef },
-
-    #[error("node {node_id} sent egress records for {workload}, which does not exist")]
-    UnknownWorkload { node_id: i32, workload: WorkloadRef },
 
     #[error(
         "OpenTelemetry storage is not enabled on this control plane; {records} egress records \

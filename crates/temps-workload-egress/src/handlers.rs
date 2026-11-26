@@ -96,16 +96,6 @@ impl From<EgressRecordingError> for Problem {
                     .with_title("Invalid Egress Record")
                     .with_detail(detail)
             }
-            EgressRecordingError::NotPlacedOnNode { .. } => {
-                problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Workload Not Placed On This Node")
-                    .with_detail(detail)
-            }
-            EgressRecordingError::UnknownWorkload { .. } => {
-                problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Unknown Workload")
-                    .with_detail(detail)
-            }
             EgressRecordingError::IngestUnavailable { .. } => {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("OpenTelemetry Storage Unavailable")

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use temps_workload_netpol::{EgressRecordBatch, EgressRecordSink, RecordSinkError};
+use temps_workload_netpol::{Delivered, EgressRecordBatch, EgressRecordSink, RecordSinkError};
 
 use crate::service::{EgressRecordingService, CONTROL_PLANE_NODE_ID};
 
@@ -25,12 +25,17 @@ impl LocalRecordSink {
 
 #[async_trait]
 impl EgressRecordSink for LocalRecordSink {
-    async fn deliver(&self, batch: EgressRecordBatch) -> Result<(), RecordSinkError> {
+    async fn deliver(&self, batch: EgressRecordBatch) -> Result<Delivered, RecordSinkError> {
         let records = batch.records.len();
         self.service
             .ingest(CONTROL_PLANE_NODE_ID, batch)
             .await
-            .map(|_| ())
+            // What ingest no longer stores (opted out, deleted, moved) is
+            // discarded, not delivered.
+            .map(|outcome| Delivered {
+                discarded: outcome.not_recording + outcome.not_placed,
+                ..Default::default()
+            })
             .map_err(|error| RecordSinkError::Delivery {
                 destination: "the control plane's egress record ingest".to_string(),
                 records,

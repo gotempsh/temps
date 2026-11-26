@@ -5,12 +5,15 @@
 //!
 //! The node said which workload each record is about (from the source
 //! address, inside its proxy). The control plane accepts that only for
-//! workloads placed on that node: a batch naming any other workload is
-//! refused whole, since a node that does that is broken or compromised.
-//! Then every workload's opt-in is checked again here, against its row
-//! now, so a record taken while recording was on but delivered after it
-//! was turned off is dropped, and ownership always comes from the row,
-//! never from the node.
+//! workloads placed on that node now: a record naming any other workload
+//! is dropped and counted ([`EgressIngestOutcome::not_placed`]), with a
+//! warning, while the rest of the batch is stored. A workload that moved
+//! or was deleted between the connection and the delivery is ordinary, and
+//! refusing the whole batch for it would lose every other workload's
+//! records with it. Then every workload's opt-in is checked again here,
+//! against its row now, so a record taken while recording was on but
+//! delivered after it was turned off is dropped, and ownership always comes
+//! from the row, never from the node.
 //!
 //! One implementation for every kind: the kind's adapter only loads the
 //! rows ([`crate::WorkloadEgressAdapter::load`]).
@@ -36,6 +39,9 @@ pub struct EgressIngestOutcome {
     /// Records dropped because their workload no longer records (turned
     /// off, destroyed or deleted).
     pub not_recording: u64,
+    /// Records dropped because their workload is not placed on the node
+    /// that sent them (it moved, or the node is wrong about it).
+    pub not_placed: u64,
 }
 
 impl EgressRecordingService {
@@ -106,23 +112,19 @@ impl EgressRecordingService {
             }
         }
 
-        // Placement first, for every workload, before anything is stored.
-        for (kind, kind_ids) in &ids {
-            for id in kind_ids {
-                let workload = WorkloadRef::new(*kind, *id);
-                let (row, _) = rows
-                    .get(&workload)
-                    .ok_or(EgressRecordingError::UnknownWorkload { node_id, workload })?;
-                if !row.nodes.contains(&node_id) {
-                    tracing::warn!(
-                        node_id,
-                        %workload,
-                        id = %row.public_id,
-                        placed_on = ?row.nodes,
-                        "refused egress records from a node for a workload it does not host"
-                    );
-                    return Err(EgressRecordingError::NotPlacedOnNode { node_id, workload });
-                }
+        // Placement, for every workload: a record of one the node does not
+        // host now is never stored, whatever else the batch holds.
+        let mut not_placed: BTreeSet<WorkloadRef> = BTreeSet::new();
+        for (workload, (row, _)) in &rows {
+            if !row.nodes.contains(&node_id) {
+                tracing::warn!(
+                    node_id,
+                    %workload,
+                    id = %row.public_id,
+                    placed_on = ?row.nodes,
+                    "dropped egress records from a node for a workload it does not host"
+                );
+                not_placed.insert(*workload);
             }
         }
 
@@ -135,8 +137,14 @@ impl EgressRecordingService {
         let mut logs = Vec::with_capacity(batch.records.len());
         for record in &batch.records {
             let Some((row, id_attribute)) = rows.get(&record.workload) else {
+                // Deleted since the connection.
+                outcome.not_recording += 1;
                 continue;
             };
+            if not_placed.contains(&record.workload) {
+                outcome.not_placed += 1;
+                continue;
+            }
             if !(row.enabled && row.live) {
                 outcome.not_recording += 1;
                 continue;

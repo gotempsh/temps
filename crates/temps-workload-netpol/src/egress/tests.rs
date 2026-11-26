@@ -597,6 +597,160 @@ async fn an_unknown_source_is_refused() {
     assert_eq!(proxy.stats().snapshot().refused_unknown_source, 1);
 }
 
+/// Learns of sandbox 1 at 127.0.0.1 when asked, as a recorder that has just
+/// listed a new workload would.
+struct Learns {
+    table: Arc<ArcSwap<EgressTable>>,
+    asked: std::sync::atomic::AtomicUsize,
+    rules: Vec<EgressRule>,
+}
+
+#[async_trait::async_trait]
+impl UnknownSource for Learns {
+    async fn unknown_source(&self, source: IpAddr) {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        let identities = IdentityMap::new().with(sandbox(1), source);
+        self.table.store(Arc::new(EgressTable::build(
+            &[EgressPolicy {
+                subject: sandbox(1),
+                rules: self.rules.clone(),
+                record: false,
+                public_only: false,
+            }],
+            &identities,
+        )));
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_source_is_admitted_once_the_handler_learns_of_it() {
+    let echo = echo_server().await;
+    let mut config = EgressProxyConfig::new("127.0.0.1:0".parse().unwrap());
+    config.max_connections = 2;
+    let table = Arc::new(ArcSwap::from_pointee(EgressTable::default()));
+    let proxy = EgressProxy::new(config, table.clone()).unwrap();
+    let learns = Arc::new(Learns {
+        table,
+        asked: std::sync::atomic::AtomicUsize::new(0),
+        rules: vec![cidr_rule(
+            1,
+            "127.0.0.0/8",
+            Some(echo.port()),
+            Action::Allow,
+        )],
+    });
+    proxy.set_unknown_source(learns.clone());
+    let listener = proxy.bind().await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(proxy.clone().serve(listener));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        status_line(&mut client).await,
+        "HTTP/1.1 200 Connection Established"
+    );
+    assert_eq!(learns.asked.load(Ordering::Relaxed), 1);
+    assert_eq!(proxy.stats().snapshot().refused_unknown_source, 0);
+}
+
+/// Never answers in time: a slow container list.
+struct Stalls;
+
+#[async_trait::async_trait]
+impl UnknownSource for Stalls {
+    async fn unknown_source(&self, _source: IpAddr) {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+/// A burst of unknown callers waiting for discovery cannot take the slots
+/// a known workload needs: a waiting caller holds a discovery slot, not a
+/// connection slot, and past the discovery slots the rest are told to retry
+/// (503, as at the connection limit), never refused as unknown: discovery
+/// might have found them.
+#[tokio::test]
+async fn unknown_callers_waiting_for_discovery_leave_slots_for_known_workloads() {
+    let echo = echo_server().await;
+    // One connection slot, one discovery slot.
+    let (proxy, addr) = start(
+        vec![cidr_rule(
+            1,
+            "127.0.0.1/32",
+            Some(echo.port()),
+            Action::Allow,
+        )],
+        1,
+    )
+    .await;
+    proxy.set_unknown_source(Arc::new(Stalls));
+    let unknown_peer = || async {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+        socket.connect(addr).await.unwrap()
+    };
+    let waiting = unknown_peer().await;
+    for _ in 0..50 {
+        if proxy.stats().snapshot().active == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The discovery slot is taken: told to retry, at once.
+    let mut over = unknown_peer().await;
+    let status = tokio::time::timeout(Duration::from_secs(1), status_line(&mut over))
+        .await
+        .expect("answered at once, not after waiting for discovery");
+    assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(proxy.stats().snapshot().refused_unknown_source, 0);
+    // The only connection slot is free for a known workload meanwhile.
+    let mut known = TcpStream::connect(addr).await.unwrap();
+    known
+        .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), status_line(&mut known))
+            .await
+            .expect("served while the unknown caller waits"),
+        "HTTP/1.1 200 Connection Established"
+    );
+    drop(waiting);
+}
+
+/// With connection slots to spare but every discovery slot taken, a caller
+/// the table does not know is told to retry, not refused as unknown.
+#[tokio::test]
+async fn a_caller_past_the_discovery_slots_is_told_to_retry() {
+    let (proxy, addr) = start(vec![], 4).await;
+    proxy.set_unknown_source(Arc::new(Stalls));
+    let unknown_peer = || async {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+        socket.connect(addr).await.unwrap()
+    };
+    let waiting = unknown_peer().await;
+    for _ in 0..50 {
+        if proxy.stats().snapshot().active == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut over = unknown_peer().await;
+    assert_eq!(
+        status_line(&mut over).await,
+        "HTTP/1.1 503 Service Unavailable"
+    );
+    let stats = proxy.stats().snapshot();
+    assert_eq!(stats.refused_unknown_source, 0);
+    assert_eq!(stats.refused_saturated, 1);
+    drop(waiting);
+}
+
 #[tokio::test]
 async fn at_the_connection_limit_new_connections_get_503_and_are_counted() {
     let (proxy, addr) = start(vec![], 1).await;

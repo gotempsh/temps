@@ -304,6 +304,8 @@ pub(crate) fn record(id: i64, host: &str, outcome: ConnectionOutcome) -> Connect
         bytes_sent: 10,
         bytes_received: 20,
         count: 1,
+        source: None,
+        recorded_at: None,
     }
 }
 
@@ -646,35 +648,47 @@ async fn ingest_stores_records_attributed_from_the_row() {
 }
 
 #[tokio::test]
-async fn ingest_refuses_a_worker_reporting_a_workload_not_placed_on_it() {
+async fn ingest_drops_only_the_records_of_workloads_not_placed_on_the_worker() {
     let Some(f) = fixture().await else { return };
     let (service, store) = f.service();
     service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
-    for (node, foreign) in [
-        (f.worker_a, ON_OTHER_WORKER),
-        (f.worker_a, ON_CONTROL_PLANE),
-        (f.worker_b, ON_WORKER),
-    ] {
-        let error = service
+    for foreign in [ON_OTHER_WORKER, ON_CONTROL_PLANE] {
+        let outcome = service
             .ingest(
-                node,
+                f.worker_a,
                 batch(vec![
                     record(ON_WORKER, "api.example.com", ConnectionOutcome::Allowed),
                     record(foreign, "api.example.com", ConnectionOutcome::Allowed),
                 ]),
             )
             .await
-            .unwrap_err();
-        assert!(
-            matches!(error, EgressRecordingError::NotPlacedOnNode { node_id, .. } if node_id == node),
-            "{error:?}"
+            .unwrap();
+        assert_eq!(
+            (outcome.stored, outcome.not_placed),
+            (1, 1),
+            "the node's own workload is stored, the foreign one dropped"
         );
     }
-    assert!(
-        store.0.lock().unwrap().is_empty(),
-        "a refused batch stores nothing, not even its legitimate records"
-    );
-    let error = service
+    let outcome = service
+        .ingest(
+            f.worker_b,
+            batch(vec![record(
+                ON_WORKER,
+                "api.example.com",
+                ConnectionOutcome::Allowed,
+            )]),
+        )
+        .await
+        .unwrap();
+    assert_eq!((outcome.stored, outcome.not_placed), (0, 1));
+    {
+        let stored = store.0.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored
+            .iter()
+            .all(|log| log.workload == Some(workload(ON_WORKER))));
+    }
+    let outcome = service
         .ingest(
             f.worker_a,
             batch(vec![record(
@@ -684,13 +698,11 @@ async fn ingest_refuses_a_worker_reporting_a_workload_not_placed_on_it() {
             )]),
         )
         .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            EgressRecordingError::UnknownWorkload { workload, .. } if workload == self::workload(999_999)
-        ),
-        "{error:?}"
+        .unwrap();
+    assert_eq!(
+        (outcome.stored, outcome.not_recording, outcome.not_placed),
+        (0, 1, 0),
+        "a deleted workload's record is dropped as no longer recording"
     );
 }
 
@@ -732,15 +744,18 @@ async fn node_zero_delivers_through_the_local_sink() {
     .await
     .unwrap();
     assert_eq!(store.0.lock().unwrap().len(), 1);
-    // Node 0 cannot write for a worker's workload either.
-    assert!(sink
+    // Node 0 cannot write for a worker's workload either: discarded, and
+    // said so, so it is not counted as delivered.
+    let delivered = sink
         .deliver(batch(vec![record(
             ON_WORKER,
             "api.example.com",
-            ConnectionOutcome::Allowed
+            ConnectionOutcome::Allowed,
         )]))
         .await
-        .is_err());
+        .unwrap();
+    assert_eq!(delivered.discarded, 1);
+    assert_eq!(store.0.lock().unwrap().len(), 1, "nothing stored for it");
 }
 
 /// A connection of workload `id` to `host`, `seconds` after a fixed start,

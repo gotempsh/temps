@@ -314,6 +314,8 @@ mod tests {
             bytes_sent: 1300,
             bytes_received: 4600,
             count: 1,
+            source: None,
+            recorded_at: None,
         }
     }
 

@@ -262,6 +262,8 @@ fn record(environment: i32, host: &str) -> ConnectionRecord {
         bytes_sent: 10,
         bytes_received: 20,
         count: 1,
+        source: None,
+        recorded_at: None,
     }
 }
 
@@ -458,10 +460,11 @@ async fn an_environments_records_come_from_its_nodes_and_are_read_from_its_page(
         .recording
         .ingest(f.mac, batch(vec![record(PRODUCTION, "api.example.com")]))
         .await
-        .unwrap_err();
-    assert!(
-        matches!(foreign, EgressRecordingError::NotPlacedOnNode { node_id, .. } if node_id == f.mac),
-        "{foreign:?}"
+        .unwrap();
+    assert_eq!(
+        (foreign.stored, foreign.not_placed),
+        (0, 1),
+        "a node that does not host the environment stores nothing for it"
     );
 
     let outcome = wired

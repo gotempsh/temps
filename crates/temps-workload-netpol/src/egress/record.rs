@@ -265,6 +265,26 @@ pub struct ConnectionRecord {
     pub bytes_received: u64,
     #[serde(default = "one")]
     pub count: u32,
+    /// The address the connection came from, which the workload was looked
+    /// up by. Kept so whoever stores the record can check that the address
+    /// still belongs to that workload: an address can pass to another
+    /// workload before the table follows. Never stored with the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<IpAddr>,
+    /// When this node's proxy made the record, on the monotonic clock: after
+    /// every connection it covers was accepted. What a refresh started
+    /// later than this saw is what the address belonged to then, whatever
+    /// the wall clock did. Set by [`EgressRecorder::record`]; never sent.
+    #[serde(skip)]
+    pub recorded_at: Option<Instant>,
+}
+
+impl ConnectionRecord {
+    /// This record, taken from a connection that came from `source`.
+    pub fn from_source(mut self, source: IpAddr) -> Self {
+        self.source = Some(source);
+        self
+    }
 }
 
 /// What a node delivers to the control plane: the body of
@@ -347,7 +367,8 @@ pub fn recording_channel(capacity: usize) -> (EgressRecorder, EgressRecordStream
 impl EgressRecorder {
     /// Queues `record` without waiting. A full (or closed) channel drops it
     /// and counts the drop; the caller's connection is unaffected.
-    pub fn record(&self, record: ConnectionRecord, stats: &EgressStats) {
+    pub fn record(&self, mut record: ConnectionRecord, stats: &EgressStats) {
+        record.recorded_at.get_or_insert_with(Instant::now);
         match self.tx.try_send(record) {
             Ok(()) => {
                 stats.records_emitted.fetch_add(1, Ordering::Relaxed);
@@ -373,13 +394,28 @@ pub enum RecordSinkError {
 /// straight into the ingest service on node 0.
 #[async_trait]
 pub trait EgressRecordSink: Send + Sync {
-    async fn deliver(&self, batch: EgressRecordBatch) -> Result<(), RecordSinkError>;
+    async fn deliver(&self, batch: EgressRecordBatch) -> Result<Delivered, RecordSinkError>;
+}
+
+/// What a sink did with a batch it accepted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Delivered {
+    /// Records of the batch the sink accepted but did not pass on, for a
+    /// reason of its own (node 0 discards a record whose source address it
+    /// cannot confirm, or that ingest no longer stores). Counted apart from
+    /// the delivered ones.
+    pub discarded: u64,
+    /// Records the sink took but has not passed on yet. The sink counts them
+    /// itself ([`EgressStats::records_delivered`] or
+    /// [`EgressStats::records_discarded`]) once it has.
+    pub deferred: u64,
 }
 
 /// What a refused or failed record collapses on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CollapseKey {
     workload: WorkloadRef,
+    source: Option<IpAddr>,
     kind: ConnectionKind,
     outcome: ConnectionOutcome,
     reason: Option<EgressReason>,
@@ -393,6 +429,7 @@ impl CollapseKey {
     fn of(record: &ConnectionRecord) -> Option<Self> {
         (record.outcome != ConnectionOutcome::Allowed).then(|| Self {
             workload: record.workload,
+            source: record.source,
             kind: record.kind,
             outcome: record.outcome,
             reason: record.reason,
@@ -427,6 +464,7 @@ impl PendingBatch {
                         .last_started_at_ms
                         .max(record.last_started_at_ms.max(record.started_at_ms));
                     first.duration_ms = first.duration_ms.max(record.duration_ms);
+                    first.recorded_at = first.recorded_at.max(record.recorded_at);
                     return true;
                 }
             }
@@ -491,6 +529,14 @@ impl EgressBatcher {
         let mut reported_dropped = 0u64;
         loop {
             let deadline = pending.deadline(self.max_age);
+            // The age is checked before the channel on every turn: a stream
+            // that is never empty (identical refusals, collapsed into one
+            // row) must not keep a full-age batch from being delivered.
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                self.flush(&mut pending, &sink, &stats, &mut reported_dropped)
+                    .await;
+                continue;
+            }
             let received = match deadline {
                 Some(deadline) => {
                     tokio::select! {
@@ -544,9 +590,16 @@ impl EgressBatcher {
             dropped: lost.saturating_sub(*reported_dropped),
         };
         match sink.deliver(batch).await {
-            Ok(()) => {
+            Ok(delivered) => {
                 *reported_dropped = lost;
-                stats.records_delivered.fetch_add(count, Ordering::Relaxed);
+                let discarded = delivered.discarded.min(count);
+                let deferred = delivered.deferred.min(count - discarded);
+                stats
+                    .records_delivered
+                    .fetch_add(count - discarded - deferred, Ordering::Relaxed);
+                stats
+                    .records_discarded
+                    .fetch_add(discarded, Ordering::Relaxed);
             }
             Err(error) => {
                 stats
@@ -655,6 +708,8 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
             count: 1,
+            source: None,
+            recorded_at: None,
         }
     }
 
@@ -670,11 +725,13 @@ mod tests {
     struct Collect {
         batches: Mutex<Vec<EgressRecordBatch>>,
         fail: bool,
+        /// Records of each batch it says it discarded.
+        discard: u64,
     }
 
     #[async_trait]
     impl EgressRecordSink for Collect {
-        async fn deliver(&self, batch: EgressRecordBatch) -> Result<(), RecordSinkError> {
+        async fn deliver(&self, batch: EgressRecordBatch) -> Result<Delivered, RecordSinkError> {
             let records = batch.records.len();
             self.batches.lock().unwrap().push(batch);
             if self.fail {
@@ -684,7 +741,10 @@ mod tests {
                     reason: "refused".into(),
                 });
             }
-            Ok(())
+            Ok(Delivered {
+                discarded: self.discard,
+                ..Default::default()
+            })
         }
     }
 
@@ -833,6 +893,65 @@ mod tests {
         let batches = sink.batches.lock().unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].records.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_past_its_age_goes_before_more_records_are_taken() {
+        // A channel that is never empty (identical refusals collapse, so the
+        // batch never fills) must not keep a full-age batch waiting.
+        let stats = Arc::new(EgressStats::default());
+        let sink = Arc::new(Collect::default());
+        let (recorder, stream) = recording_channel(128);
+        let batcher = EgressBatcher {
+            max_records: 1000,
+            max_age: Duration::from_secs(5),
+        };
+        let task = tokio::spawn(batcher.run(stream, sink.clone(), stats.clone()));
+        recorder.record(allowed(1, "first.example.com", 0), &stats);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        // Waiting now; the channel fills while the deadline passes.
+        for at in 1..64 {
+            recorder.record(allowed(1, &format!("h{at}.example.com"), at), &stats);
+        }
+        tokio::time::advance(Duration::from_secs(6)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        drop(recorder);
+        task.await.unwrap();
+        let batches = sink.batches.lock().unwrap();
+        assert!(
+            batches[0].records.len() <= 2,
+            "the aged batch went at once, got {} records",
+            batches[0].records.len()
+        );
+        let total: usize = batches.iter().map(|b| b.records.len()).sum();
+        assert_eq!(total, 64);
+    }
+
+    /// What the sink accepted but discarded is not counted as delivered.
+    #[tokio::test(start_paused = true)]
+    async fn records_the_sink_discards_are_not_counted_as_delivered() {
+        let stats = Arc::new(EgressStats::default());
+        let sink = Arc::new(Collect {
+            discard: 1,
+            ..Default::default()
+        });
+        let (recorder, stream) = recording_channel(64);
+        let batcher = EgressBatcher {
+            max_records: 100,
+            max_age: Duration::from_secs(5),
+        };
+        let task = tokio::spawn(batcher.run(stream, sink.clone(), stats.clone()));
+        recorder.record(allowed(1, "api.example.com", 0), &stats);
+        recorder.record(allowed(1, "api.example.com", 1), &stats);
+        drop(recorder);
+        task.await.unwrap();
+        let stats = stats.snapshot();
+        assert_eq!(stats.records_delivered, 1);
+        assert_eq!(stats.records_discarded, 1);
     }
 
     #[tokio::test(start_paused = true)]

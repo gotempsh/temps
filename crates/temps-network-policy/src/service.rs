@@ -255,7 +255,7 @@ impl NetworkPolicyService {
             local_recording: std::sync::Mutex::new(
                 temps_workload_netpol::EgressRecordingCapability::detect(false),
             ),
-            snapshots: std::sync::Mutex::new(HashMap::new()),
+            snapshots: std::sync::Mutex::new(Default::default()),
         }
     }
 

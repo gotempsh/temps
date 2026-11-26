@@ -707,7 +707,24 @@ impl TimescaleDbStorage {
 
     /// The caller claims optional adapter identities in the native transaction.
     /// Unidentified OTLP records retain their existing at-least-once semantics.
+    ///
+    /// One statement per [`LOG_ROWS_PER_STATEMENT`] records: PostgreSQL
+    /// binds at most 65,535 parameters in one statement. A caller with more
+    /// than that passes a transaction, so the batch is stored whole or not
+    /// at all.
     async fn batch_insert_logs<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        records: &[LogRecord],
+    ) -> StorageResult<u64> {
+        let mut stored = 0;
+        for chunk in records.chunks(LOG_ROWS_PER_STATEMENT) {
+            stored += self.insert_log_rows(db, chunk).await?;
+        }
+        Ok(stored)
+    }
+
+    async fn insert_log_rows<C: ConnectionTrait>(
         &self,
         db: &C,
         records: &[LogRecord],
@@ -943,7 +960,14 @@ impl OtelStorage for TimescaleDbStorage {
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
         if !records.iter().any(|r| r.ingest_identity.is_some()) {
-            return self.batch_insert_logs(self.db.as_ref(), &records).await;
+            if records.len() <= LOG_ROWS_PER_STATEMENT {
+                return self.batch_insert_logs(self.db.as_ref(), &records).await;
+            }
+            // Several statements: one transaction, so the batch is whole.
+            let tx = self.db.begin().await?;
+            let stored = self.batch_insert_logs(&tx, &records).await?;
+            tx.commit().await?;
+            return Ok(stored);
         }
         let tx = self.db.begin().await?;
         let indices = super::receipts::claim(
@@ -972,18 +996,8 @@ impl OtelStorage for TimescaleDbStorage {
         match &self.s3_client {
             Some(archiver) => {
                 // Group by project for separate S3 paths
-                let mut by_project: std::collections::HashMap<i32, Vec<LogRecord>> =
-                    std::collections::HashMap::new();
-                // The archive is laid out by project. Records the platform
-                // observed about a workload without one stay in the
-                // queryable store only, for its retention period.
-                let mut unowned = 0u64;
-                for record in records {
-                    match record.project_id {
-                        Some(project_id) => by_project.entry(project_id).or_default().push(record),
-                        None => unowned += 1,
-                    }
-                }
+                let (by_project, unowned) = archivable_logs(records);
+                let count = count - unowned;
                 if unowned > 0 {
                     debug!(
                         records = unowned,
@@ -4584,6 +4598,30 @@ fn parse_health_summary_row(row: &sea_orm::QueryResult) -> Result<HealthSummary,
     })
 }
 
+/// Records per log insert statement: PostgreSQL's 65,535 bind parameters
+/// over the 16 columns each row binds.
+pub(crate) const LOG_ROWS_PER_STATEMENT: usize = 65_535 / 16;
+const _: () = assert!(LOG_ROWS_PER_STATEMENT * 16 <= 65_535);
+
+/// `records` by project, the layout of the archive, and how many have no
+/// project: those the platform observed about a workload without one stay
+/// in the queryable store only, for its retention period, and are not
+/// counted as archived.
+fn archivable_logs(
+    records: Vec<LogRecord>,
+) -> (std::collections::HashMap<i32, Vec<LogRecord>>, u64) {
+    let mut by_project: std::collections::HashMap<i32, Vec<LogRecord>> =
+        std::collections::HashMap::new();
+    let mut unowned = 0u64;
+    for record in records {
+        match record.project_id {
+            Some(project_id) => by_project.entry(project_id).or_default().push(record),
+            None => unowned += 1,
+        }
+    }
+    (by_project, unowned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4595,6 +4633,40 @@ mod tests {
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
+    }
+
+    fn log_of(project_id: Option<i32>) -> LogRecord {
+        LogRecord {
+            workload: None,
+            ingest_identity: None,
+            attribute_types: Default::default(),
+            project_id,
+            deployment_id: None,
+            resource: ResourceInfo::default(),
+            timestamp: ts(0),
+            observed_timestamp: ts(0),
+            severity: crate::types::LogSeverity::Info,
+            severity_text: "INFO".into(),
+            body: "a line".into(),
+            trace_id: None,
+            span_id: None,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    /// Records without a project are not archived, so they are not counted
+    /// as archived either.
+    #[test]
+    fn records_without_a_project_are_left_out_of_the_archive_and_its_count() {
+        let (by_project, unowned) = archivable_logs(vec![
+            log_of(Some(1)),
+            log_of(None),
+            log_of(Some(2)),
+            log_of(Some(1)),
+        ]);
+        assert_eq!(unowned, 1);
+        assert_eq!(by_project[&1].len(), 2);
+        assert_eq!(by_project[&2].len(), 1);
     }
 
     /// Minimal span builder for fold tests.

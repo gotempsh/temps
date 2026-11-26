@@ -530,8 +530,10 @@ mod tests {
             dropped: 0,
         };
         let (status, body) = post_batch(app.clone(), f.worker_a, Some(NODE_TOKEN), &foreign).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(body["title"], "Workload Not Placed On This Node");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["stored"], 0);
+        assert_eq!(body["not_placed"], 1);
+        assert!(store.0.lock().unwrap().is_empty());
 
         let (status, body) = post_batch(app, f.worker_a, Some(NODE_TOKEN), &own).await;
         assert_eq!(status, StatusCode::OK, "{body}");

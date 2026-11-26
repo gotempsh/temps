@@ -64,9 +64,9 @@ use crate::identity::IdentityMap;
 use crate::rule::{Action, Cidr, PortRange};
 
 pub use record::{
-    recording_channel, ConnectionKind, ConnectionOutcome, ConnectionRecord, EgressBatcher,
-    EgressReason, EgressRecordBatch, EgressRecordSink, EgressRecordStream, EgressRecorder,
-    EgressRecordingCapability, RecordSinkError, RecordingUnavailable, RelayKind,
+    recording_channel, ConnectionKind, ConnectionOutcome, ConnectionRecord, Delivered,
+    EgressBatcher, EgressReason, EgressRecordBatch, EgressRecordSink, EgressRecordStream,
+    EgressRecorder, EgressRecordingCapability, RecordSinkError, RecordingUnavailable, RelayKind,
 };
 
 /// Ports a rule allows when it names none: today's sidecar allows exactly
@@ -562,6 +562,8 @@ pub struct EgressStats {
     pub records_delivered: AtomicU64,
     /// Records lost because their batch could not be delivered.
     pub records_undelivered: AtomicU64,
+    /// Records the sink accepted but discarded ([`Delivered::discarded`]).
+    pub records_discarded: AtomicU64,
     last_saturation_log: AtomicU64,
 }
 
@@ -585,6 +587,7 @@ pub struct EgressStatsSnapshot {
     pub records_collapsed: u64,
     pub records_delivered: u64,
     pub records_undelivered: u64,
+    pub records_discarded: u64,
 }
 
 impl EgressStats {
@@ -608,6 +611,7 @@ impl EgressStats {
             records_dropped: get(&self.records_dropped),
             records_collapsed: get(&self.records_collapsed),
             records_delivered: get(&self.records_delivered),
+            records_discarded: get(&self.records_discarded),
             records_undelivered: get(&self.records_undelivered),
         }
     }
@@ -705,6 +709,35 @@ pub struct EgressProxy {
     /// Where records of opted-in workloads go; `None`: nothing is recorded,
     /// whatever the policies say.
     recorder: Option<EgressRecorder>,
+    /// Asked once before a caller the table does not know is refused.
+    unknown_source: std::sync::OnceLock<Arc<dyn UnknownSource>>,
+    /// How many unknown callers may wait for [`UnknownSource`] at once
+    /// ([`unknown_waits`]). A waiting caller holds a connection slot, so
+    /// past this the rest are refused at once, and a burst of unknown
+    /// callers can never take the slots known workloads need.
+    unknown_waits: Arc<Semaphore>,
+}
+
+/// The unknown callers that may wait at once out of `max_connections`: one
+/// in sixteen, at least one.
+pub fn unknown_waits(max_connections: usize) -> usize {
+    (max_connections / 16).max(1)
+}
+
+/// The longest a connection from a caller the table does not know waits for
+/// [`UnknownSource::unknown_source`] before it is refused.
+pub const UNKNOWN_SOURCE_WAIT: Duration = Duration::from_secs(3);
+
+/// What the proxy asks before refusing a caller its table does not hold: a
+/// workload that has just started may be reaching the proxy before the
+/// table that names it was rebuilt. The proxy looks the caller up again
+/// afterwards and refuses only if it is still unknown.
+#[async_trait::async_trait]
+pub trait UnknownSource: Send + Sync {
+    /// Brings the table up to date if a new workload may hold `source`.
+    /// Bounded by [`UNKNOWN_SOURCE_WAIT`]; an implementation must also bound
+    /// how often it does real work, since any caller can trigger it.
+    async fn unknown_source(&self, source: IpAddr);
 }
 
 impl EgressProxy {
@@ -728,11 +761,18 @@ impl EgressProxy {
         Ok(Arc::new(Self {
             limit: Arc::new(Semaphore::new(config.max_connections)),
             pool: BufferPool::new(config.max_connections * 2, config.buffer_size),
+            unknown_waits: Arc::new(Semaphore::new(unknown_waits(config.max_connections))),
             config,
             table,
             stats: Arc::new(EgressStats::default()),
             recorder,
+            unknown_source: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Sets what is asked before an unknown caller is refused. Set once.
+    pub fn set_unknown_source(&self, handler: Arc<dyn UnknownSource>) {
+        let _ = self.unknown_source.set(handler);
     }
 
     /// Whether this proxy was built with a recorder.
@@ -790,11 +830,20 @@ impl EgressProxy {
             let proxy = self.clone();
             tokio::spawn(async move {
                 proxy.stats.active.fetch_add(1, Ordering::Relaxed);
-                proxy.handle(stream, peer).await;
+                proxy.handle(stream, peer, permit).await;
                 proxy.stats.active.fetch_sub(1, Ordering::Relaxed);
-                drop(permit);
             });
         }
+    }
+
+    /// No workload owns this source, so there is nobody to attribute a
+    /// record to and no opt-in to honour: counted, never recorded.
+    async fn refuse_unknown(&self, mut client: TcpStream, source: IpAddr) {
+        self.stats
+            .refused_unknown_source
+            .fetch_add(1, Ordering::Relaxed);
+        debug!(%source, reason = Refusal::UnknownSource.as_str(), "egress proxy refused");
+        let _ = client.write_all(FORBIDDEN).await;
     }
 
     fn refuse_saturated(&self, stream: TcpStream, peer: SocketAddr) {
@@ -827,11 +876,9 @@ impl EgressProxy {
                 if rules.record {
                     let now = record::unix_millis();
                     recorder.record(
-                        Ended::refused(None, EgressReason::Saturated).into_record(
-                            rules.workload,
-                            now,
-                            Duration::ZERO,
-                        ),
+                        Ended::refused(None, EgressReason::Saturated)
+                            .into_record(rules.workload, now, Duration::ZERO)
+                            .from_source(unmap(peer.ip())),
                         &self.stats,
                     );
                 }
@@ -850,17 +897,51 @@ impl EgressProxy {
         }
     }
 
-    async fn handle(&self, mut client: TcpStream, peer: SocketAddr) {
+    /// Serves one accepted connection, holding `permit` (its connection
+    /// slot) for as long as it is served.
+    async fn handle(
+        &self,
+        client: TcpStream,
+        peer: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let source = unmap(peer.ip());
-        let rules = self.table.load().lookup(source).cloned();
+        let mut rules = self.table.load().lookup(source).cloned();
+        // Held until the connection is served; given up while waiting.
+        let mut slot = Some(permit);
+        if rules.is_none() {
+            if let Some(handler) = self.unknown_source.get() {
+                // A workload that has just started can be here before the
+                // table naming it: ask once, briefly, then look again. The
+                // wait holds a discovery slot instead of a connection slot,
+                // so callers waiting can never take the slots known
+                // workloads need; with every discovery slot taken the caller
+                // is told to retry (503), as at the connection limit: it may
+                // well be a workload that discovery would have found.
+                let Ok(waiting) = self.unknown_waits.clone().try_acquire_owned() else {
+                    drop(slot);
+                    self.refuse_saturated(client, peer);
+                    return;
+                };
+                drop(slot.take());
+                let _ =
+                    tokio::time::timeout(UNKNOWN_SOURCE_WAIT, handler.unknown_source(source)).await;
+                drop(waiting);
+                rules = self.table.load().lookup(source).cloned();
+                if rules.is_none() {
+                    self.refuse_unknown(client, source).await;
+                    return;
+                }
+                let Ok(permit) = self.limit.clone().try_acquire_owned() else {
+                    self.refuse_saturated(client, peer);
+                    return;
+                };
+                slot = Some(permit);
+            }
+        }
+        let _slot = slot;
         let Some(rules) = rules else {
-            // No workload owns this source, so there is nobody to attribute
-            // a record to and no opt-in to honour: counted, never recorded.
-            self.stats
-                .refused_unknown_source
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(%source, reason = Refusal::UnknownSource.as_str(), "egress proxy refused");
-            let _ = client.write_all(FORBIDDEN).await;
+            self.refuse_unknown(client, source).await;
             return;
         };
         // The one branch recording costs a workload that has not opted in.
@@ -872,7 +953,9 @@ impl EgressProxy {
         let started_at_ms = record::unix_millis();
         let ended = self.serve_connection(client, source, &rules).await;
         recorder.record(
-            ended.into_record(rules.workload, started_at_ms, started.elapsed()),
+            ended
+                .into_record(rules.workload, started_at_ms, started.elapsed())
+                .from_source(source),
             &self.stats,
         );
     }
@@ -1205,6 +1288,8 @@ impl Ended {
             bytes_sent: self.bytes_sent,
             bytes_received: self.bytes_received,
             count: 1,
+            source: None,
+            recorded_at: None,
         }
     }
 }

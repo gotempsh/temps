@@ -257,6 +257,8 @@ pub(crate) fn record(sandbox: i32, host: &str, outcome: ConnectionOutcome) -> Co
         bytes_sent: 10,
         bytes_received: 20,
         count: 1,
+        source: None,
+        recorded_at: None,
     }
 }
 
@@ -460,10 +462,11 @@ async fn a_sandboxs_records_come_from_its_node_and_are_read_by_its_owner() {
             )]),
         )
         .await
-        .unwrap_err();
-    assert!(
-        matches!(foreign, EgressRecordingError::NotPlacedOnNode { node_id, .. } if node_id == f.worker_b),
-        "{foreign:?}"
+        .unwrap();
+    assert_eq!(
+        (foreign.stored, foreign.not_placed),
+        (0, 1),
+        "a node that does not host the sandbox stores nothing for it"
     );
 
     let outcome = wired

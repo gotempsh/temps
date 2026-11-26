@@ -48,7 +48,14 @@ pub(crate) struct CachedSnapshot {
     digest: String,
 }
 
-pub(crate) type SnapshotCache = std::sync::Mutex<std::collections::HashMap<i32, CachedSnapshot>>;
+pub(crate) type SnapshotCache = std::sync::Mutex<SnapshotEntries>;
+
+/// The cached snapshots, and when the stale ones were last evicted.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotEntries {
+    entries: std::collections::HashMap<i32, CachedSnapshot>,
+    swept: Option<Instant>,
+}
 
 #[derive(Debug, FromQueryResult)]
 struct ModeAndRevision {
@@ -109,7 +116,7 @@ impl NetworkPolicyService {
         let observed = self.observed_key(node_id);
         {
             let cache = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(hit) = cache.get(&node_id).filter(|c| {
+            if let Some(hit) = cache.entries.get(&node_id).filter(|c| {
                 c.revision == revision
                     && c.observed == observed
                     && c.built.elapsed() < SNAPSHOT_CACHE_MAX_AGE
@@ -120,7 +127,8 @@ impl NetworkPolicyService {
         let snapshot = Arc::new(self.node_snapshot(node_id).await?);
         let digest = snapshot_digest(&snapshot);
         let mut cache = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
-        cache.insert(
+        store(
+            &mut cache,
             node_id,
             CachedSnapshot {
                 revision,
@@ -150,6 +158,25 @@ impl NetworkPolicyService {
     }
 }
 
+/// Caches `entry` for `node_id`, evicting the entries too old to be reused
+/// at most once per [`SNAPSHOT_CACHE_MAX_AGE`]: a node that was removed, or
+/// stopped asking, holds no memory past twice that age, so the cache is
+/// bounded by the nodes that ask. Sweeping on every store would make a
+/// revision change, which every node rebuilds after, cost a scan per node.
+fn store(cache: &mut SnapshotEntries, node_id: i32, entry: CachedSnapshot) {
+    let now = Instant::now();
+    if cache
+        .swept
+        .is_none_or(|swept| now.duration_since(swept) >= SNAPSHOT_CACHE_MAX_AGE)
+    {
+        cache
+            .entries
+            .retain(|_, cached| now.duration_since(cached.built) < SNAPSHOT_CACHE_MAX_AGE);
+        cache.swept = Some(now);
+    }
+    cache.entries.insert(node_id, entry);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +185,56 @@ mod tests {
     use temps_test_utils::TestDatabase;
     use temps_workload::{WorkloadKind, WorkloadRef};
     use temps_workload_netpol::{IdentityMap, NodePolicy, NodePolicyReport, POLICY_PROTOCOL};
+
+    fn cached(built: Instant) -> CachedSnapshot {
+        CachedSnapshot {
+            revision: 1,
+            observed: 0,
+            built,
+            snapshot: Arc::new(PolicySnapshot::default()),
+            digest: "d".into(),
+        }
+    }
+
+    /// A node that stopped asking (removed, or gone) does not keep its
+    /// snapshot in memory past the age at which it would be rebuilt.
+    #[test]
+    fn storing_evicts_snapshots_too_old_to_be_reused() {
+        let mut cache = SnapshotEntries::default();
+        let Some(old) = Instant::now().checked_sub(SNAPSHOT_CACHE_MAX_AGE + Duration::from_secs(1))
+        else {
+            return;
+        };
+        cache.entries.insert(7, cached(old));
+        cache.entries.insert(8, cached(Instant::now()));
+        store(&mut cache, 9, cached(Instant::now()));
+        let mut held: Vec<i32> = cache.entries.keys().copied().collect();
+        held.sort();
+        assert_eq!(held, vec![8, 9]);
+    }
+
+    /// Eviction is a sweep at most once per cache age, not a scan on every
+    /// store: N nodes rebuilding after a revision change cost N inserts.
+    #[test]
+    fn stores_between_sweeps_do_not_scan_the_cache() {
+        let mut cache = SnapshotEntries::default();
+        store(&mut cache, 1, cached(Instant::now()));
+        let swept = cache.swept.expect("the first store sweeps");
+        let Some(old) = Instant::now().checked_sub(SNAPSHOT_CACHE_MAX_AGE + Duration::from_secs(1))
+        else {
+            return;
+        };
+        cache.entries.insert(7, cached(old));
+        store(&mut cache, 2, cached(Instant::now()));
+        assert_eq!(cache.swept, Some(swept), "no sweep before the age passes");
+        assert!(
+            cache.entries.contains_key(&7),
+            "evicted on the next sweep, not now"
+        );
+        cache.swept = Some(old);
+        store(&mut cache, 3, cached(Instant::now()));
+        assert!(!cache.entries.contains_key(&7));
+    }
 
     /// A service on its own connection, counting every statement it runs.
     async fn counted(db: &TestDatabase) -> (NetworkPolicyService, Arc<AtomicUsize>) {

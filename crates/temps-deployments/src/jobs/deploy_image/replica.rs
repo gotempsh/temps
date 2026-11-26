@@ -519,6 +519,25 @@ impl DeployImageJob {
                     )
                     .await;
             }
+            _ if self.config.workload_isolation != temps_workload::Isolation::Process => {
+                // The recorder knows a caller by its address on the
+                // deployment network, which only a container has: a replica
+                // in a microVM or in the node runtime would be sent to a
+                // proxy that refuses it, and lose its way out.
+                return self
+                    .log(
+                        context,
+                        format!(
+                            "Outbound connection recording is on for this environment, but \
+                             this replica runs with {} isolation, which does not record yet: \
+                             its connections are not recorded",
+                            temps_workload_plane::scheduler::isolation_name(
+                                self.config.workload_isolation
+                            )
+                        ),
+                    )
+                    .await;
+            }
             RecordedEgress::NotServing => {
                 return self
                     .log(
@@ -707,13 +726,15 @@ impl DeployImageJob {
         // A steered replica reaches the network through the recorder, which
         // knows a caller by its address. Docker assigned that address just
         // now, so the recorder is told at once instead of on its next pass:
-        // the application's first connection must already find it.
+        // the application's first connection must already find it. It
+        // rediscovers: recording may have been turned off since this
+        // replica was planned, and the replica still goes through it.
         if request
             .labels
             .contains_key(temps_workload_egress::steering::STEERED_LABEL)
         {
             if let Some(recorder) = &self.egress_recorder {
-                recorder.refresh().await;
+                recorder.rediscover().await;
             }
         }
 
@@ -1841,7 +1862,7 @@ mod tests {
         use temps_workload_egress::steering::STEERED_LABEL;
 
         let recorder = "172.18.0.1:13128".parse().unwrap();
-        let recorded = |recorded_egress, assignment: &NodeAssignment| {
+        let recorded_with = |recorded_egress, assignment: &NodeAssignment, isolation| {
             let assignment = assignment.clone();
             async move {
                 let deployer = Arc::new(ScriptedDeployer::default());
@@ -1854,6 +1875,7 @@ mod tests {
                     .environment_variables(variables.clone())
                     .remote_environment_variables(Some(variables))
                     .recorded_egress(recorded_egress)
+                    .workload_isolation(isolation)
                     .build(deployer.clone())
                     .unwrap();
                 let writer = Arc::new(RecordingLogWriter::default());
@@ -1871,6 +1893,13 @@ mod tests {
                 let lines = writer.lines.lock().unwrap().join("\n");
                 (request, lines)
             }
+        };
+        let recorded = |recorded_egress, assignment: &NodeAssignment| {
+            recorded_with(
+                recorded_egress,
+                assignment,
+                temps_workload::Isolation::Process,
+            )
         };
 
         let (request, lines) =
@@ -1914,6 +1943,24 @@ mod tests {
                 None => assert!(!lines.contains("recording"), "{lines}"),
             }
         }
+
+        // Only a container is known by its address: a microVM replica is
+        // left with its own way out, and the log says why.
+        let (request, lines) = recorded_with(
+            RecordedEgress::Proxy(recorder),
+            &NodeAssignment::Local,
+            temps_workload::Isolation::MicroVm,
+        )
+        .await;
+        assert!(
+            !request.environment_vars.contains_key("HTTPS_PROXY")
+                && !request.labels.contains_key(STEERED_LABEL),
+            "a microVM replica is not steered"
+        );
+        assert!(
+            lines.contains("isolation, which does not record yet"),
+            "{lines}"
+        );
     }
 
     // Create phase.

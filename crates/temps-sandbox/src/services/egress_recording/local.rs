@@ -109,6 +109,10 @@ pub struct SandboxTraffic {
     /// refresh until it works, so a failed replacement never leaves a
     /// sandbox without a way out for long.
     pending: std::sync::Mutex<HashSet<i32>>,
+    /// Set when the recorder started or stopped but the sandboxes to
+    /// re-point could not be read: every recorded sidecar is refreshed on
+    /// the next [`LocalTraffic::maintain`] until the read works.
+    resync: std::sync::atomic::AtomicBool,
 }
 
 impl SandboxTraffic {
@@ -122,6 +126,7 @@ impl SandboxTraffic {
             docker,
             sidecars,
             pending: std::sync::Mutex::new(HashSet::new()),
+            resync: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -201,18 +206,36 @@ impl SandboxTraffic {
     }
 
     /// The ids of this host's recorded sandboxes whose sidecar can be
-    /// replaced now.
-    async fn steerable_recorded(&self) -> Vec<i32> {
+    /// replaced now, or `None` when they could not be read: then a resync
+    /// is due, and retried on every [`LocalTraffic::maintain`].
+    async fn steerable_recorded(&self) -> Option<Vec<i32>> {
         match self.recorded_rows().await {
-            Ok(rows) => rows
-                .iter()
-                .filter(|row| steerable(row))
-                .map(|row| row.id)
-                .collect(),
+            Ok(rows) => Some(
+                rows.iter()
+                    .filter(|row| steerable(row))
+                    .map(|row| row.id)
+                    .collect(),
+            ),
             Err(error) => {
-                warn!(%error, "egress recording: could not read the recorded sandboxes");
-                Vec::new()
+                warn!(%error, "egress recording: could not read the recorded sandboxes; their egress proxies are refreshed once it can");
+                self.resync
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                None
             }
+        }
+    }
+
+    /// Refreshes every recorded sidecar, if a start or stop could not.
+    async fn retry_resync(&self) {
+        if !self
+            .resync
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        if let Some(ids) = self.steerable_recorded().await {
+            self.refresh_sidecars(ids, "the recorder started or stopped earlier")
+                .await;
         }
     }
 }
@@ -239,7 +262,12 @@ impl LocalTraffic for SandboxTraffic {
     /// Publishes the recorder's address and the recorded sandboxes for the
     /// sidecars, and returns each one's policy and the addresses of its
     /// sidecar. Reads only: replacing a sidecar is [`Self::maintain`]'s.
-    async fn refresh(&self, address: SocketAddr) -> Result<RecordedTraffic, String> {
+    /// Reads everything on every refresh, so `discover` changes nothing.
+    async fn refresh(
+        &self,
+        address: SocketAddr,
+        _discover: bool,
+    ) -> Result<RecordedTraffic, String> {
         let rows = self
             .recorded_rows()
             .await
@@ -276,6 +304,7 @@ impl LocalTraffic for SandboxTraffic {
     /// Retries the sidecars whose replacement failed, outside the refresh:
     /// replacing one may itself refresh the recorder.
     async fn maintain(&self) {
+        self.retry_resync().await;
         self.retry_pending().await;
     }
 
@@ -284,8 +313,9 @@ impl LocalTraffic for SandboxTraffic {
     /// it matters when recording was turned on while the recorder was down.
     /// Recreation happens only on drift, and a failure is retried.
     async fn started(&self, _address: SocketAddr) {
-        let ids = self.steerable_recorded().await;
-        self.refresh_sidecars(ids, "the recorder started").await;
+        if let Some(ids) = self.steerable_recorded().await {
+            self.refresh_sidecars(ids, "the recorder started").await;
+        }
     }
 
     /// The recorder does not serve sandboxes: running sidecars still hand
@@ -294,8 +324,9 @@ impl LocalTraffic for SandboxTraffic {
     /// request until it is back.
     async fn stopped(&self) {
         temps_sandbox_providers::docker::publish_egress_recording(None);
-        let ids = self.steerable_recorded().await;
-        self.refresh_sidecars(ids, "the recorder stopped").await;
+        if let Some(ids) = self.steerable_recorded().await {
+            self.refresh_sidecars(ids, "the recorder stopped").await;
+        }
     }
 }
 
@@ -381,6 +412,42 @@ mod tests {
         traffic.retry_pending().await;
         assert!(traffic.pending.lock().unwrap().is_empty());
         assert_eq!(sidecars.applied_to(), vec![ON_CONTROL_PLANE.1.to_string()]);
+    }
+
+    /// The recorder started while the recorded sandboxes could not be read:
+    /// their sidecars are re-pointed on a later maintenance pass, once the
+    /// read works, not left on the old hand-off until the next restart.
+    #[tokio::test]
+    async fn a_start_whose_read_failed_is_resynced_by_maintenance() {
+        let Some(f) = fixture().await else { return };
+        let conn = f.db.connection();
+        conn.execute_unprepared(&format!(
+            "UPDATE sandboxes SET egress_recording = true WHERE id = {}",
+            ON_CONTROL_PLANE.0
+        ))
+        .await
+        .unwrap();
+        let sidecars = FlakySidecars::failing(0);
+        let traffic = traffic(f.db.connection_arc(), sidecars.clone());
+
+        conn.execute_unprepared("ALTER TABLE sandboxes RENAME TO sandboxes_unreadable")
+            .await
+            .unwrap();
+        traffic.started("127.0.0.1:13128".parse().unwrap()).await;
+        traffic.maintain().await;
+        assert!(sidecars.applied_to().is_empty(), "nothing could be read");
+
+        conn.execute_unprepared("ALTER TABLE sandboxes_unreadable RENAME TO sandboxes")
+            .await
+            .unwrap();
+        traffic.maintain().await;
+        assert_eq!(sidecars.applied_to(), vec![ON_CONTROL_PLANE.1.to_string()]);
+        traffic.maintain().await;
+        assert_eq!(
+            sidecars.applied_to().len(),
+            1,
+            "resynced once, not on every pass"
+        );
     }
 
     /// A changed opt-in replaces the sidecar of a sandbox this host runs,

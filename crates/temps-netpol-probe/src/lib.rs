@@ -175,7 +175,10 @@ impl HttpRecordSink {
 
 #[async_trait::async_trait]
 impl EgressRecordSink for HttpRecordSink {
-    async fn deliver(&self, batch: EgressRecordBatch) -> Result<(), RecordSinkError> {
+    async fn deliver(
+        &self,
+        batch: EgressRecordBatch,
+    ) -> Result<temps_workload_netpol::Delivered, RecordSinkError> {
         let records = batch.records.len();
         let failed = |reason: String| RecordSinkError::Delivery {
             destination: format!("http://{}{}", self.authority, self.path),
@@ -186,7 +189,7 @@ impl EgressRecordSink for HttpRecordSink {
         match self.post(&body).await {
             Ok(status) if (200..300).contains(&status) => {
                 println!("records delivered {records}");
-                Ok(())
+                Ok(temps_workload_netpol::Delivered::default())
             }
             Ok(status) => Err(failed(format!("answered {status}"))),
             Err(reason) => Err(failed(reason)),
