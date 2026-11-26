@@ -36,7 +36,7 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `create` - Create a new sandbox
 - `list` (`ls`) - List your sandboxes
 - `nodes` - List nodes that can run sandboxes and control which ones take new sandboxes
-- `show` - Show details for a sandbox
+- `show` - Show a sandbox: status, image, node, expiry, preview access and outbound policy
 - `rm` (`stop`, `destroy`) - Remove a sandbox permanently (aliases: stop, destroy)
 - `pause` - Pause a running sandbox (non-destructive — resume later with `sandbox resume`)
 - `resume` - Resume a paused sandbox
@@ -44,8 +44,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `clone` - Clone a git repo or extract a tarball into a running sandbox
 - `shell` (`attach`) - Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave the program running; `exit` ends it. Reattach with the same --tab
 - `extend` - Extend a sandbox's idle timeout
-- `exec` - Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
-- `logs` - Stream logs from a detached job (SSE)
+- `exec` - Run a command inside a sandbox, print its output and exit with its exit code. Put `--` before the command: `exec ID -- ls -la`
+- `logs` - Print the output of a job started with `exec --detach`, following it until the job ends
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
 - `preview-access` - Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
@@ -218,7 +218,7 @@ Destroy every sandbox on a worker node, from all users, so the node can be remov
 
 ### `sandbox show`
 
-Show details for a sandbox
+Show a sandbox: status, image, node, expiry, preview access and outbound policy
 
 **Usage:** `sandbox show <id> [options]`
 
@@ -306,7 +306,7 @@ Extend a sandbox's idle timeout
 
 ### `sandbox exec`
 
-Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
+Run a command inside a sandbox, print its output and exit with its exit code. Put `--` before the command: `exec ID -- ls -la`
 
 **Usage:** `sandbox exec <id> [args...] [options]`
 
@@ -320,7 +320,7 @@ Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
 
 ### `sandbox logs`
 
-Stream logs from a detached job (SSE)
+Print the output of a job started with `exec --detach`, following it until the job ends
 
 **Usage:** `sandbox logs <id> <jobId>`
 

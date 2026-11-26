@@ -37,6 +37,7 @@ import {
 import { toast } from 'sonner'
 
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -290,6 +291,11 @@ export default function SandboxDetail() {
       query.state.data?.sandbox.status === 'starting' ? 2_000 : 10_000,
   })
   const sandbox = sandboxResp ? toSandboxView(sandboxResp.sandbox) : undefined
+  usePageSubject(
+    sandbox
+      ? { kind: 'sandbox', sandboxId: sandbox.id, name: sandbox.name }
+      : null
+  )
 
   // The create's steps, while it runs. A 404 with nothing read yet means this
   // server no longer tracks it (restarted, or finished long ago): the page

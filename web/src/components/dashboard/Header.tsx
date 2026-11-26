@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
+import { AgentHandoffButton } from '@/components/agent-handoff/AgentHandoffButton'
 import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
@@ -189,9 +190,11 @@ export function Header() {
             <React.Fragment key={action.id}>{action.element}</React.Fragment>
           ))}
           {/* One button stands here: the assistant. Everything else is in the
-              command palette (⌘K) or on its own page. The two after it show
-              themselves only while they have something to say: work running
-              or waiting for review, and a backup that is overdue or stalled. */}
+              command palette (⌘K) or on its own page. The others show
+              themselves only while they have something to say: a handoff on
+              pages that declared what they are showing, work running or
+              waiting for review, and a backup that is overdue or stalled. */}
+          <AgentHandoffButton />
           <AiAssistantButton />
           <OperationsTray />
           <BackupAlertsButton />

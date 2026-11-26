@@ -42,7 +42,7 @@ bunx @temps-sdk/cli@beta configure
 
 Use this index or search for a top-level command heading to load only the relevant group.
 
-- [`login`](#login) - Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.
+- [`login`](#login) - Authenticate with a Temps server. Opens the browser for interactive logins; use --no-wait then --resume when a person approves but the caller cannot keep a command open, and --api-key for headless / CI.
 - [`logout`](#logout) - Revoke the active context's API key on the server and forget it locally
 - [`whoami`](#whoami) - Display current authenticated user and active context
 - [`context`](#context) - Manage CLI contexts (one set of credentials per Temps server)
@@ -142,7 +142,7 @@ Use this index or search for a top-level command heading to load only the releva
 
 ## `login`
 
-Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.
+Authenticate with a Temps server. Opens the browser for interactive logins; use --no-wait then --resume when a person approves but the caller cannot keep a command open, and --api-key for headless / CI.
 
 **Usage:** `login [url] [options]`
 
@@ -152,6 +152,9 @@ Authenticate with a Temps server. Opens the browser for interactive logins; use 
 |------|-------------|---------|----------|
 | `-k, --api-key <key>` | Use a pre-minted API key (Settings → API Keys) instead of opening the browser. Required for headless / CI. | - | No |
 | `--context <name>` | Save the credentials under this context name (defaults to URL host) | - | No |
+| `--no-wait` | Print the browser approval link and exit instead of waiting for it. For agents and scripts whose shell returns output only when a command exits; finish with --resume. | - | No |
+| `--resume` | Finish a sign-in started with --no-wait: wait for the browser approval, then save the credentials. Exits with code 2 if it is not approved yet; run it again. | - | No |
+| `--wait-secs <seconds>` | With --resume: how long to wait for the approval before exiting with code 2 (default: 90) | - | No |
 | `--debug` | Print every request/response (URL, status, headers, raw body) to stderr. Also enabled via TEMPS_DEBUG=1. | - | No |
 | `--api-key-file <path>` | Read the API key from a file (- reads stdin) instead of --api-key | - | No |
 | `--api-key-stdin` | Read the API key from stdin instead of --api-key | - | No |
@@ -5672,6 +5675,7 @@ Inspect distributed traces and operation latency
 - `regressions` - List the operations that got slower or faster after a deployment
 - `breakdown` - Show where the time inside one operation goes: queries, downstream calls, its own code
 - `page` - Compare a page's web vitals with the backend requests that served it
+- `show` (`get`) - Show every span of one trace: timing, service, status, attributes and events
 
 ### `traces span-stats` (alias: `operations`, `ops`)
 
@@ -5755,6 +5759,21 @@ Compare a page's web vitals with the backend requests that served it
 | `--project-id <id>` | Project ID | - | No |
 | `--path <path>` | The page path, e.g. /checkout | - | No |
 | `--json` | Output in JSON format | - | No |
+
+### `traces show` (alias: `get`)
+
+Show every span of one trace: timing, service, status, attributes and events
+
+**Usage:** `traces show <trace-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project the trace belongs to | - | Yes |
+| `--start-time <iso>` | Look for the trace from this time (ISO 8601); pair with --end-time | - | No |
+| `--end-time <iso>` | Look for the trace up to this time (ISO 8601); pair with --start-time | - | No |
+| `--json` | Output the spans in JSON format | - | No |
 
 ## `facets`
 
@@ -10418,7 +10437,7 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `create` - Create a new sandbox
 - `list` (`ls`) - List your sandboxes
 - `nodes` - List nodes that can run sandboxes and control which ones take new sandboxes
-- `show` - Show details for a sandbox
+- `show` - Show a sandbox: status, image, node, expiry, preview access and outbound policy
 - `rm` (`stop`, `destroy`) - Remove a sandbox permanently (aliases: stop, destroy)
 - `pause` - Pause a running sandbox (non-destructive — resume later with `sandbox resume`)
 - `resume` - Resume a paused sandbox
@@ -10426,8 +10445,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `clone` - Clone a git repo or extract a tarball into a running sandbox
 - `shell` (`attach`) - Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave the program running; `exit` ends it. Reattach with the same --tab
 - `extend` - Extend a sandbox's idle timeout
-- `exec` - Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
-- `logs` - Stream logs from a detached job (SSE)
+- `exec` - Run a command inside a sandbox, print its output and exit with its exit code. Put `--` before the command: `exec ID -- ls -la`
+- `logs` - Print the output of a job started with `exec --detach`, following it until the job ends
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
 - `preview-access` - Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
@@ -10600,7 +10619,7 @@ Destroy every sandbox on a worker node, from all users, so the node can be remov
 
 ### `sandbox show`
 
-Show details for a sandbox
+Show a sandbox: status, image, node, expiry, preview access and outbound policy
 
 **Usage:** `sandbox show <id> [options]`
 
@@ -10688,7 +10707,7 @@ Extend a sandbox's idle timeout
 
 ### `sandbox exec`
 
-Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
+Run a command inside a sandbox, print its output and exit with its exit code. Put `--` before the command: `exec ID -- ls -la`
 
 **Usage:** `sandbox exec <id> [args...] [options]`
 
@@ -10702,7 +10721,7 @@ Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
 
 ### `sandbox logs`
 
-Stream logs from a detached job (SSE)
+Print the output of a job started with `exec --detach`, following it until the job ends
 
 **Usage:** `sandbox logs <id> <jobId>`
 

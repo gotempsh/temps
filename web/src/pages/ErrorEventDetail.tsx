@@ -21,6 +21,7 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import { extractSentryEvent, sentryExceptions } from '@/lib/sentry-utils'
@@ -68,6 +69,25 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   const primaryException = sentryEvent
     ? sentryExceptions(sentryEvent).slice(-1)[0]
     : undefined
+
+  // Declare what is on the page once, for "Hand off to agent" and the
+  // built-in assistant alike. The IDs come from the occurrence that loaded,
+  // not from the address: `parseInt` and `Number` read a link like `1e2`
+  // differently, and the handoff must name the record on screen.
+  usePageSubject(
+    event &&
+      Number.isSafeInteger(event.error_group_id) &&
+      event.error_group_id > 0 &&
+      Number.isSafeInteger(event.id) &&
+      event.id > 0
+      ? {
+          kind: 'error_group',
+          project: { id: project.id, slug: project.slug, name: project.name },
+          groupId: event.error_group_id,
+          eventId: event.id,
+        }
+      : null
+  )
 
   usePageTitle(
     sentryEvent

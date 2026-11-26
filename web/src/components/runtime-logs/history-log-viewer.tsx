@@ -45,6 +45,7 @@ import {
   useLogHistory,
 } from '@/hooks/useLogHistory'
 import { useQuery } from '@tanstack/react-query'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import AnsiToHtml from 'ansi-to-html'
 import { RuntimeLogRowLayout } from './runtime-log-row-layout'
@@ -643,6 +644,26 @@ export default function HistoryLogViewer({
     },
     !!project.id
   )
+
+  // What this search is showing, for the header's "Hand off to agent" and
+  // the built-in assistant: the same window and filters the query above
+  // sends, so the agent's command returns these lines and not a nearby list.
+  usePageSubject({
+    kind: 'runtime_logs',
+    mode: 'history',
+    project: { id: project.id, slug: project.slug, name: project.name },
+    startTime: start,
+    endTime: end,
+    environment: selectedEnv,
+    environmentName: environments?.find((e) => String(e.id) === selectedEnv)
+      ?.name,
+    service: selectedService,
+    containerId: selectedContainer,
+    nodeId: selectedNode,
+    deploymentId: selectedDeploy,
+    levels: selectedLevels.length > 0 ? selectedLevels : undefined,
+    text: !fulltextDisabled && debouncedText ? debouncedText : undefined,
+  })
 
   // Filter options come from `available_sources` — the FULL set of
   // containers/nodes/services for the scope (project + env + deployment + time),

@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { getProjectOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ingestSetupClient } from '@/components/project/setup/ingest-setup-cache.test-helpers'
+import { HAND_OFF_LABEL } from '@/lib/agent-handoff'
 import { ingestSetupFixture } from '@/lib/ingest-setup.fixture'
 import { QueryContent } from './GlobalPage'
 import { ObservabilitySetupGuide } from './ObservabilitySetupGuide'
@@ -61,7 +62,7 @@ describe('empty observability pages teach the setup', () => {
       // Without a service in scope, the guide asks for one.
       expect(html).toContain('Choose service')
       // The prompt needs a service's endpoints, so it waits for one.
-      expect(html).not.toContain('Copy AI prompt')
+      expect(html).not.toContain(HAND_OFF_LABEL)
     })
   }
 
@@ -103,7 +104,7 @@ describe('empty observability pages teach the setup', () => {
         <ObservabilitySetupGuide kind={kind} projectId={7} />,
         client
       )
-      expect(html).toContain('Copy AI prompt')
+      expect(html).toContain(HAND_OFF_LABEL)
       expect(html).not.toContain('disabled=""')
     }
   })

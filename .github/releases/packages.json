@@ -99,7 +99,8 @@
     ],
     "channel_pinned": [
       "skills/**/*.md",
-      "skills/**/*.json"
+      "skills/**/*.json",
+      "web/src/lib/ai-onboarding.ts"
     ],
     "versioning": "until-server-passes"
   }

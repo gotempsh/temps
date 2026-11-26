@@ -225,7 +225,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(catalog['cli'], {
             'kind': 'npm', 'path': 'apps/temps-cli', 'name': '@temps-sdk/cli',
             'stamped': ['skills/temps-cli/references/COMMANDS.md'],
-            'channel_pinned': ['skills/**/*.md', 'skills/**/*.json'],
+            'channel_pinned': ['skills/**/*.md', 'skills/**/*.json', 'web/src/lib/ai-onboarding.ts'],
             # 0.1.38 and 0.2.0-beta.1 shipped before SDKs followed the server version.
             'versioning': 'until-server-passes'})
         # Every other SDK releases at the server version.
@@ -236,6 +236,23 @@ class ReleaseTests(unittest.TestCase):
         # The generated command reference names the current CLI version, so `prepare` can move it.
         reference = (release.ROOT / 'skills/temps-cli/references/COMMANDS.md').read_text()
         self.assertIn(f"`@temps-sdk/cli@{package['version']}`", reference)
+
+    def test_the_console_names_an_installable_cli_and_follows_its_channel(self):
+        # A server release is public before its CLI is approved on npm, so the
+        # console names the channel's dist-tag, never an exact version, and
+        # `prepare` moves that tag when the CLI changes channel.
+        package = next(p for p in release.catalog_packages() if p['key'] == 'cli')
+        pin = 'web/src/lib/ai-onboarding.ts'
+        self.assertIn(pin, package['channel_pinned'])
+        self.assertNotIn(pin, package.get('stamped', []))
+        tag = sdk_prepare.DIST_TAGS[release.channel(package['version'], package['kind'])]
+        text = (release.ROOT / pin).read_text()
+        self.assertEqual(re.findall(r'@temps-sdk/cli@[0-9A-Za-z][0-9A-Za-z.+-]*', text), [f'@temps-sdk/cli@{tag}'])
+        edits = sdk_prepare.Edits(release.ROOT)
+        stable = '1.0.0' if tag == 'beta' else '9.0.0-beta.1'
+        moved = 'latest' if tag == 'beta' else 'beta'
+        sdk_prepare.set_channel_pins(edits, package, stable)
+        self.assertIn(f"const TEMPS_CLI_PACKAGE = '@temps-sdk/cli@{moved}'", edits.files[pin])
 
     def test_npm_archive_checks_manifest_dependencies_and_entrypoints(self):
         package = dict(self.catalog['cli'], key='cli', version='1.2.3')
