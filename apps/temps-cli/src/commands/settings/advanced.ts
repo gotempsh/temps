@@ -46,6 +46,7 @@ import {
   type JsonObject,
 } from '../../lib/json-edit.js'
 import { SENSITIVE_SETTINGS, SETTING_FIELDS } from './fields.js'
+import { SECTION_FIELDS } from './section-fields.gen.js'
 
 interface JsonOptions {
   json?: boolean
@@ -105,9 +106,17 @@ export function touchedSections(assignments: Assignment[], document: JsonObject 
  * document, so starting from the current one keeps every other setting.
  */
 export function mergeSettings(current: JsonObject, fromFile: JsonObject | undefined, assignments: Assignment[]): JsonObject {
+  if (fromFile) rejectUnknownSectionFields(fromFile)
   const base = fromFile ? deepMerge(current, fromFile) : current
   return assignments.reduce((document, a) => {
     const [section, ...rest] = a.path
+    // An unset (null) or absent section has no fields to check a name against: use the schema's.
+    if (section !== undefined && rest.length > 0 && !isJsonObject(document[section])) {
+      const known = sectionFields(section)
+      if (known && !known.includes(rest[0] as string)) {
+        throw new ValidationError(`Unknown field "${rest[0]}" in ${section}. Known fields: ${[...known].sort().join(', ')}`)
+      }
+    }
     // A known section the GET response leaves out is created, like an unset (null) one.
     const withSection =
       section !== undefined && rest.length > 0 && section in SETTING_FIELDS && !(section in document)
@@ -125,6 +134,21 @@ export function mergeSettings(current: JsonObject, fromFile: JsonObject | undefi
  */
 export const WRITE_ONLY_SETTINGS: Record<string, readonly string[]> = {
   geo: ['maxmind_license_key', 'clear_maxmind_license_key'],
+}
+
+/** The fields `section` accepts: its schema fields plus write-only ones, or `undefined` for a section with no field list. */
+export function sectionFields(section: string): readonly string[] | undefined {
+  const fields = SECTION_FIELDS[section]
+  return fields ? [...fields, ...(WRITE_ONLY_SETTINGS[section] ?? [])] : undefined
+}
+
+/** Refuse, in a settings file, a field the schema does not give a section. */
+export function rejectUnknownSectionFields(document: JsonObject): void {
+  for (const [section, value] of Object.entries(document)) {
+    const known = sectionFields(section)
+    if (!known || !isJsonObject(value)) continue
+    rejectUnknownFields(value, Object.fromEntries(known.map((field) => [field, ''])), `The settings file's ${section} section`)
+  }
 }
 
 /**

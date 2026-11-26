@@ -46,7 +46,8 @@ describe('settings apply helpers', () => {
   })
 
   test('a settings file merges into sections field by field; scalars, lists and null replace', () => {
-    expect(mergeSettings(current, { shield: { enabled: true } }, []).shield).toEqual({ enabled: true, mode: 'monitor' })
+    const withGeo = { ...current, geo: { refresh_interval_hours: 24, stale_lookup_days: 30 } }
+    expect(mergeSettings(withGeo, { geo: { refresh_interval_hours: 8 } }, []).geo).toEqual({ refresh_interval_hours: 8, stale_lookup_days: 30 })
     expect(deepMerge({ a: { b: 1, c: [1] }, d: 1 }, { a: { c: [2] }, d: null })).toEqual({ a: { b: 1, c: [2] }, d: null })
     expect(deepMerge({ a: { b: 1 } }, { a: 'flat' })).toEqual({ a: 'flat' })
   })
@@ -58,6 +59,35 @@ describe('settings apply helpers', () => {
       maxmind_license_key: 'secret',
     })
     expect(() => mergeSettings(withGeo, undefined, settingsAssignments(['geo.maxmind_licence_key=x'], undefined))).toThrow(/Unknown field/)
+  })
+
+  test('a field under an unset or absent section is checked against the schema', () => {
+    // self_update is null in `current`; geo is absent.
+    expect(() => mergeSettings(current, undefined, settingsAssignments(['self_update.enabld=true'], undefined))).toThrow(
+      /Unknown field "enabld" in self_update. Known fields: channel, enabled/,
+    )
+    expect(() => mergeSettings(current, undefined, settingsAssignments(['geo.refresh_hours=8'], undefined))).toThrow(
+      /Unknown field "refresh_hours" in geo/,
+    )
+    // The write-only key is accepted there too.
+    expect(mergeSettings(current, undefined, settingsAssignments(['geo.maxmind_license_key'], 'k')).geo).toEqual({ maxmind_license_key: 'k' })
+  })
+
+  test('a settings file is checked field by field, including a section it sets from null', () => {
+    expect(() => mergeSettings(current, { self_update: { enabld: true } }, [])).toThrow(
+      /The settings file's self_update section has unknown field\(s\) enabld/,
+    )
+    expect(mergeSettings(current, { self_update: { enabled: true } }, []).self_update).toEqual({ enabled: true })
+    // A section the file sets to null, then an assignment under it, still checks the name.
+    expect(() => mergeSettings(current, { shield: null }, settingsAssignments(['shield.mood=x'], undefined))).toThrow(
+      /Unknown field "mood" in shield/,
+    )
+  })
+
+  test('the committed section field list matches openapi.json', async () => {
+    const { renderSectionFields, settingsSectionFields, SPEC_FILE, OUTPUT_FILE } = await import('../../../scripts/generate-settings-fields.js')
+    const expected = renderSectionFields(settingsSectionFields(await Bun.file(SPEC_FILE).json()))
+    expect(await Bun.file(OUTPUT_FILE).text()).toBe(expected)
   })
 
   test('a known section the GET response leaves out is created from the assignment', () => {

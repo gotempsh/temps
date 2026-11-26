@@ -18,7 +18,7 @@
     "spec:update": "bun run scripts/update-openapi.ts",
     "spec:check": "bun run scripts/check-openapi.ts",
     "coverage:api": "bun run scripts/api-coverage.ts",
-    "generate:api": "bun openapi-ts && python3 ../../scripts/source_attribution.py annotate apps/temps-cli/src/api",
+    "generate:api": "bun openapi-ts && python3 ../../scripts/source_attribution.py annotate apps/temps-cli/src/api && bun run scripts/generate-settings-fields.ts",
     "generate:docs": "bun run scripts/generate-docs.ts",
     "generate:docs:mdx": "bun run scripts/generate-docs.ts --format mdx",
     "generate:docs:json": "bun run scripts/generate-docs.ts --format json",
