@@ -245,6 +245,10 @@ pub trait TeamService: Send + Sync {
 
     async fn list_members(&self, team_id: i32) -> Result<Vec<TeamMember>, TeamError>;
 
+    /// One membership of a team, shaped like an entry of
+    /// [`Self::list_members`].
+    async fn get_member(&self, team_id: i32, user_id: i32) -> Result<TeamMember, TeamError>;
+
     async fn remove_member(&self, team_id: i32, user_id: i32) -> Result<(), TeamError>;
 
     /// Changes the fixed role on an existing membership.
@@ -653,6 +657,22 @@ impl TeamService for DefaultTeamService {
                 }
             })
             .collect())
+    }
+
+    async fn get_member(&self, team_id: i32, user_id: i32) -> Result<TeamMember, TeamError> {
+        let member = team_members::Entity::find()
+            .filter(team_members::Column::TeamId.eq(team_id))
+            .filter(team_members::Column::UserId.eq(user_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(TeamError::MemberNotFound { team_id, user_id })?;
+        let user_map = self.fetch_users(&[member.user_id]).await?;
+        let user = user_map.get(&member.user_id);
+        Ok(TeamMember {
+            user_name: user.map(|u| u.name.clone()),
+            user_email: user.map(|u| u.email.clone()),
+            member,
+        })
     }
 
     async fn remove_member(&self, team_id: i32, user_id: i32) -> Result<(), TeamError> {
@@ -1246,6 +1266,26 @@ mod tests {
             .into_connection();
         let svc = DefaultTeamService::new(Arc::new(db));
         let err = svc.remove_member(1, 5).await.unwrap_err();
+        assert!(matches!(
+            err,
+            TeamError::MemberNotFound {
+                team_id: 1,
+                user_id: 5
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_member_returns_the_membership_or_a_not_found_naming_it() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![member_row(3, 1, TeamRole::Viewer)]])
+            .append_query_results(vec![Vec::<users::Model>::new()])
+            .append_query_results(vec![Vec::<team_members::Model>::new()])
+            .into_connection();
+        let svc = DefaultTeamService::new(Arc::new(db));
+        let found = svc.get_member(1, ACTOR).await.unwrap();
+        assert_eq!((found.member.team_id, found.member.user_id), (1, ACTOR));
+        let err = svc.get_member(1, 5).await.unwrap_err();
         assert!(matches!(
             err,
             TeamError::MemberNotFound {

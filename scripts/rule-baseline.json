@@ -53,7 +53,7 @@
       "functions_over_300_lines": 1
     },
     "temps-analytics-funnels": {
-      "handler_db_access": 2
+      "handler_db_access": 1
     },
     "temps-analytics-performance": {
       "anyhow_in_library": 1

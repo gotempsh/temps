@@ -231,6 +231,20 @@ impl NodeAlertRuleService {
     ///
     /// Renaming the metric onto one the node already has a rule for is refused
     /// with `AlreadyExists`, the same answer `create` gives.
+    /// One rule of a node, or [`NodeAlertRuleError::RuleNotFound`].
+    pub(crate) async fn get(
+        &self,
+        node_id: i32,
+        rule_id: i32,
+    ) -> Result<monitoring_alert_rules::Model, NodeAlertRuleError> {
+        monitoring_alert_rules::Entity::find_by_id(rule_id)
+            .filter(monitoring_alert_rules::Column::NodeId.eq(node_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| NodeAlertRuleError::Database { node_id, source })?
+            .ok_or(NodeAlertRuleError::RuleNotFound { node_id, rule_id })
+    }
+
     pub(crate) async fn update(
         &self,
         node_id: i32,
@@ -239,12 +253,7 @@ impl NodeAlertRuleService {
     ) -> Result<monitoring_alert_rules::Model, NodeAlertRuleError> {
         let db_err = |source| NodeAlertRuleError::Database { node_id, source };
 
-        let existing = monitoring_alert_rules::Entity::find_by_id(rule_id)
-            .filter(monitoring_alert_rules::Column::NodeId.eq(node_id))
-            .one(self.db.as_ref())
-            .await
-            .map_err(db_err)?
-            .ok_or(NodeAlertRuleError::RuleNotFound { node_id, rule_id })?;
+        let existing = self.get(node_id, rule_id).await?;
 
         if changes.is_empty() {
             return Ok(existing);

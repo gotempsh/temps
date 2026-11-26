@@ -27,7 +27,7 @@ pub struct CliLoginRequest {
 pub struct AuthTokenResponse {
     pub access_token: String,
     pub refresh_token: String,
-    pub expires_at: i64,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -77,21 +77,17 @@ pub struct RouteUser {
     pub mfa_enabled: bool,
     pub email_verified: bool,
     pub must_change_password: bool,
-    #[schema(format = "int64", example = "1683900000000")]
-    pub created_at: i64,
-    #[schema(format = "int64", example = "1683900000000")]
-    pub updated_at: i64,
-    pub deleted_at: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub deleted_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct RouteRole {
     pub id: i32,
     pub name: String,
-    #[schema(format = "int64", example = "1683900000000")]
-    pub created_at: i64,
-    #[schema(format = "int64", example = "1683900000000")]
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -264,9 +260,9 @@ impl From<temps_entities::users::Model> for RouteUser {
             mfa_enabled: db_user.mfa_enabled,
             email_verified: db_user.email_verified,
             must_change_password: db_user.must_change_password,
-            created_at: db_user.created_at.timestamp_millis(),
-            updated_at: db_user.updated_at.timestamp_millis(),
-            deleted_at: db_user.deleted_at.map(|d| d.timestamp_millis()),
+            created_at: db_user.created_at,
+            updated_at: db_user.updated_at,
+            deleted_at: db_user.deleted_at,
         }
     }
 }
@@ -276,8 +272,8 @@ impl From<temps_entities::roles::Model> for RouteRole {
         Self {
             id: db_role.id,
             name: db_role.name,
-            created_at: db_role.created_at.timestamp_millis(),
-            updated_at: db_role.updated_at.timestamp_millis(),
+            created_at: db_role.created_at,
+            updated_at: db_role.updated_at,
         }
     }
 }
@@ -293,9 +289,9 @@ impl From<crate::user_service::ServiceUser> for RouteUser {
             mfa_enabled: service_user.mfa_enabled,
             email_verified: service_user.email_verified,
             must_change_password: service_user.must_change_password,
-            created_at: service_user.created_at.timestamp_millis(),
-            updated_at: service_user.updated_at.timestamp_millis(),
-            deleted_at: service_user.deleted_at.map(|d| d.timestamp_millis()),
+            created_at: service_user.created_at,
+            updated_at: service_user.updated_at,
+            deleted_at: service_user.deleted_at,
         }
     }
 }
@@ -305,8 +301,8 @@ impl From<crate::user_service::ServiceRole> for RouteRole {
         Self {
             id: service_role.id,
             name: service_role.name,
-            created_at: service_role.created_at.timestamp_millis(),
-            updated_at: service_role.updated_at.timestamp_millis(),
+            created_at: service_role.created_at,
+            updated_at: service_role.updated_at,
         }
     }
 }

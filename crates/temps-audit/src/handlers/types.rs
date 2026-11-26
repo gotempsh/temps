@@ -25,9 +25,8 @@ pub struct AuditLogResponse {
     pub user: Option<AuditLogUserInfo>,
     /// IP address details
     pub ip_address: Option<AuditLogIpInfo>,
-    /// When the action occurred
-    #[schema(example = 11932193)]
-    pub audit_date: i64,
+    /// When the action occurred, ISO 8601 in UTC
+    pub audit_date: chrono::DateTime<chrono::Utc>,
     /// Additional context about the action
     pub data: Option<serde_json::Value>,
 }
@@ -116,7 +115,7 @@ impl From<AuditLogWithDetails> for AuditLogResponse {
                 latitude: ip.latitude,
                 longitude: ip.longitude,
             }),
-            audit_date: details.log.audit_date.timestamp_millis(),
+            audit_date: details.log.audit_date,
             data: serde_json::from_str(&details.log.data).ok(),
         }
     }

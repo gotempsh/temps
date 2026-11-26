@@ -15,6 +15,7 @@ Inspect distributed traces and operation latency
 - `regressions` - List the operations that got slower or faster after a deployment
 - `breakdown` - Show where the time inside one operation goes: queries, downstream calls, its own code
 - `page` - Compare a page's web vitals with the backend requests that served it
+- `show` (`get`) - Show every span of one trace: timing, service, status, attributes and events
 
 ### `traces span-stats` (alias: `operations`, `ops`)
 
@@ -98,3 +99,18 @@ Compare a page's web vitals with the backend requests that served it
 | `--project-id <id>` | Project ID | - | No |
 | `--path <path>` | The page path, e.g. /checkout | - | No |
 | `--json` | Output in JSON format | - | No |
+
+### `traces show` (alias: `get`)
+
+Show every span of one trace: timing, service, status, attributes and events
+
+**Usage:** `traces show <trace-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project the trace belongs to | - | Yes |
+| `--start-time <iso>` | Look for the trace from this time (ISO 8601); pair with --end-time | - | No |
+| `--end-time <iso>` | Look for the trace up to this time (ISO 8601); pair with --start-time | - | No |
+| `--json` | Output the spans in JSON format | - | No |

@@ -152,6 +152,15 @@ impl GroupEnvVarService {
             )))
     }
 
+    /// One variable of a group, or [`ProjectGroupError::EnvVarNotFound`].
+    pub async fn get(
+        &self,
+        group_id: i32,
+        var_id: i32,
+    ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
+        self.find(self.db.as_ref(), group_id, var_id).await
+    }
+
     fn encrypt(&self, group_id: i32, key: &str, value: &str) -> Result<String, ProjectGroupError> {
         self.encryption
             .encrypt_string(value)

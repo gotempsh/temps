@@ -34,7 +34,7 @@ function environment(
   overrides: Partial<EnvironmentResponse>
 ): EnvironmentResponse {
   return {
-    created_at: 0,
+    created_at: '1970-01-01T00:00:00Z',
     id: 1,
     is_preview: false,
     main_url: '',
@@ -46,7 +46,7 @@ function environment(
     sleeping: false,
     slug: 'production',
     subdomain: 'app-production',
-    updated_at: 0,
+    updated_at: '1970-01-01T00:00:00Z',
     current_deployment_id: 10,
     ...overrides,
   }
@@ -61,7 +61,7 @@ function deployment(
     id,
     status,
     environment_id: 1,
-    created_at: id * 1000,
+    created_at: new Date(id * 1000).toISOString(),
     is_current: false,
     project_id: 1,
     url: '',

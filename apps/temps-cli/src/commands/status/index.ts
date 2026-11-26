@@ -135,7 +135,7 @@ async function status(projectArg: string | undefined, options: StatusOptions): P
         keyValue('  Status', statusBadge(deployment.status))
         keyValue(
           '  Last Deploy',
-          `#${deployment.id} - ${deployment.commit_hash?.substring(0, 7) ?? '-'} - ${formatRelativeTime(new Date(deployment.created_at * 1000).toISOString())}`
+          `#${deployment.id} - ${deployment.commit_hash?.substring(0, 7) ?? '-'} - ${formatRelativeTime(deployment.created_at)}`
         )
       } else {
         keyValue('  Status', colors.muted('no deployments'))

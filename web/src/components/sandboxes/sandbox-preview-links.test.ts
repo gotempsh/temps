@@ -69,8 +69,7 @@ describe('previewLinkBlockedReason', () => {
 })
 
 describe('previewLinkExpiry', () => {
-  // 2026-01-01T12:30:00Z
-  const expiresAt = Date.UTC(2026, 0, 1, 12, 30) / 1000
+  const expiresAt = '2026-01-01T12:30:00Z'
 
   test('is an absolute wall-clock time that does not change as time passes', () => {
     const options = { locale: 'en-US', timeZone: 'UTC' }

@@ -25,8 +25,8 @@ function repositoryLabel(project: ProjectCollectionItem): string | null {
   return project.repoName ?? null
 }
 
-/** Native, permission-rehydrated project collection used by both semantic
- * artifacts and intercepted `get_projects` read-tool receipts. */
+/** Native, permission-rehydrated project collection: the projects a write the
+ * user approved has just created. */
 export function GeneratedProjectCollection({
   presentation,
   title = 'Projects',

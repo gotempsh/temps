@@ -269,9 +269,10 @@ the whole crate for regressions.
 
 ## Frontend (`web/`)
 
-The console's rules (design standard, React, state, UI, mobile, pagination, the
-generated SDK) are in [`web/AGENTS.md`](./web/AGENTS.md), which tools load when
-you work under `web/`. Read it before any frontend change.
+The console's rules (design standard, React, state, UI, button labels, mobile,
+pagination, the generated SDK) are in [`web/AGENTS.md`](./web/AGENTS.md),
+which tools load when you work under `web/`. Read it before any frontend
+change.
 
 ## OpenAPI clients
 

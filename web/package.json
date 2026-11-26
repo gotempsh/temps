@@ -37,6 +37,8 @@
   },
   "dependencies": {
     "@hookform/resolvers": "^7.0.7",
+    "@json-render/core": "0.23.2",
+    "@json-render/react": "0.23.2",
     "@monaco-editor/react": "^4.7.0",
     "@nivo/line": "^0.99.0",
     "@radix-ui/react-alert-dialog": "^1.2.1",

@@ -14,7 +14,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::{get, patch},
+    routing::get,
     Json, Router,
 };
 use serde::Deserialize;
@@ -154,12 +154,43 @@ pub async fn list_webhooks(
     ))
 }
 
+/// One webhook of a status page
+///
+/// The same shape as in the list, with the outcome of its last delivery.
+/// The signing secret is never returned again.
+#[utoipa::path(
+    get,
+    path = "/status-pages/{status_page_id}/webhooks/{webhook_id}",
+    operation_id = "get_status_page_webhook",
+    params(
+        ("status_page_id" = i32, Path, description = "Status page ID"),
+        ("webhook_id" = i32, Path, description = "Webhook ID"),
+    ),
+    responses(
+        (status = 200, description = "The webhook", body = StatusPageWebhookResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Status page or webhook not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "Status Page",
+    security(("bearer_auth" = []))
+)]
+pub async fn get_webhook(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<WebhookRoutesState>>,
+    Path((status_page_id, webhook_id)): Path<(i32, i32)>,
+) -> Result<Json<StatusPageWebhookResponse>, Problem> {
+    page_access_guard!(auth, state, StatusPageRead, status_page_id);
+    Ok(Json(state.webhooks.get(status_page_id, webhook_id).await?))
+}
+
 /// Register a webhook on a status page
 ///
 /// Each new public event of the page (an incident update or resolution, a
 /// scheduled maintenance window) is posted to the URL as JSON, signed in
 /// `X-Temps-Signature` with the secret returned here, once. The URL must be
-/// `https://` and resolve to a public address.
+/// `https://` and resolve to a public address. `enabled` defaults to `true`.
 #[utoipa::path(
     post,
     path = "/status-pages/{status_page_id}/webhooks",
@@ -306,14 +337,22 @@ pub fn create_webhook_router(state: Arc<WebhookRoutesState>) -> Router {
         )
         .route(
             "/status-pages/{status_page_id}/webhooks/{webhook_id}",
-            patch(update_webhook).delete(delete_webhook),
+            get(get_webhook)
+                .patch(update_webhook)
+                .delete(delete_webhook),
         )
         .with_state(state)
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_webhooks, create_webhook, update_webhook, delete_webhook),
+    paths(
+        list_webhooks,
+        get_webhook,
+        create_webhook,
+        update_webhook,
+        delete_webhook
+    ),
     components(schemas(
         StatusPageWebhookResponse,
         StatusPageWebhookListResponse,

@@ -7,6 +7,7 @@ import { ProjectResponse, FunnelResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { KbdBadge } from '@/components/ui/kbd-badge'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 
 import { Skeleton } from '@/components/ui/skeleton'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -15,14 +16,23 @@ import {
   deleteFunnelMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { formatDateForAPI } from '@/lib/date'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useQuery,
+  useMutation,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import { BarChart3, Plus } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
 import { useNavigate } from 'react-router'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
+import { usePageInRange } from '@/hooks/usePageInRange'
 import { FunnelCard } from './FunnelCard'
+import { forgetDeletedFunnel } from './funnel-cache'
+
+const FUNNELS_PER_PAGE = 20
 
 interface FunnelManagementProps {
   project: ProjectResponse
@@ -37,6 +47,7 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
   })
   const [deletingFunnel, setDeletingFunnel] =
     React.useState<FunnelResponse | null>(null)
+  const [page, setPage] = React.useState(1)
 
   const dateRangeQuery = React.useMemo(() => {
     if (!dateRange?.from || !dateRange?.to) return null
@@ -47,7 +58,8 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
   }, [dateRange])
 
   const {
-    data: funnels,
+    data: funnelPage,
+    isPlaceholderData,
     isLoading,
     error,
     refetch,
@@ -56,16 +68,31 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
       path: {
         project_id: project.id,
       },
+      query: { page, page_size: FUNNELS_PER_PAGE },
     }),
+    placeholderData: keepPreviousData,
   })
+  const funnels = funnelPage?.items
+  const totalPages = Math.max(
+    1,
+    Math.ceil((funnelPage?.total ?? 0) / FUNNELS_PER_PAGE)
+  )
+  // Deleting the last funnel of the last page leaves that page empty.
+  usePageInRange(
+    page,
+    funnelPage && !isPlaceholderData
+      ? { rows: funnelPage.items.length, totalPages }
+      : undefined,
+    setPage
+  )
 
   const deleteFunnel = useMutation({
     ...deleteFunnelMutation(),
     meta: {
       errorTitle: 'Failed to delete funnel',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
+    onSuccess: (_, { path }) => {
+      void forgetDeletedFunnel(queryClient, path.project_id, path.funnel_id)
     },
   })
 
@@ -190,6 +217,16 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
               }
             />
           ))}
+          {funnelPage && funnelPage.total > FUNNELS_PER_PAGE && (
+            <ResponsivePagination
+              page={page}
+              pageSize={FUNNELS_PER_PAGE}
+              total={funnelPage.total}
+              totalPages={totalPages}
+              onPageChange={setPage}
+              ariaLabel="Funnel list pagination"
+            />
+          )}
         </div>
       )}
 

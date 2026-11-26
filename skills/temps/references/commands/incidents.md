@@ -97,6 +97,8 @@ List status updates for an incident
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Incident ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `incidents bucketed`

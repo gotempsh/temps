@@ -12582,6 +12582,7 @@ dependencies = [
  "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "utoipa",
 ]
@@ -13776,6 +13777,7 @@ dependencies = [
  "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tower-http 0.7.1",
  "tracing",
  "url",
@@ -14865,6 +14867,7 @@ name = "temps-plugin-sdk"
 version = "0.1.0-beta.62"
 dependencies = [
  "axum",
+ "chrono",
  "clap",
  "futures",
  "hyper",
@@ -15817,11 +15820,13 @@ dependencies = [
  "moka",
  "sea-orm 1.1.20",
  "serde",
+ "serde_json",
  "temps-auth",
  "temps-core",
  "temps-entities",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "utoipa",
 ]

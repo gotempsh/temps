@@ -140,8 +140,8 @@ export function UsersManagement({
             roles: [
               {
                 id: Date.now(),
-                created_at: Date.now(),
-                updated_at: Date.now(),
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
                 name: variables.body.role_type,
               },
             ],

@@ -62,7 +62,7 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 url	= { workspace = true }
 octocrab = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true }

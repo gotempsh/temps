@@ -308,7 +308,8 @@ pub async fn lookup_shield_client(
 /// List bypass tokens for an environment
 ///
 /// The active tokens valid here: the environment's own and the project-wide
-/// ones. Secrets are never returned.
+/// ones. Secrets are never returned. Not paginated: bounded by design, a
+/// project holds at most 100 active tokens (minting more answers 409).
 #[utoipa::path(
     tag = "Shield",
     get,
@@ -318,7 +319,7 @@ pub async fn lookup_shield_client(
         ("environment_id" = i32, Path, description = "Environment ID")
     ),
     responses(
-        (status = 200, description = "Active bypass tokens", body = Vec<ShieldTokenResponse>),
+        (status = 200, description = "Every active bypass token valid here (at most 100, newest first)", body = Vec<ShieldTokenResponse>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Project or environment not found", body = ProblemDetails),
@@ -488,14 +489,15 @@ async fn audit_entry(
 /// List a project's Shield entries
 ///
 /// Address ranges and fingerprints this project allows, logs, challenges or
-/// blocks, whatever the lists say.
+/// blocks, whatever the lists say. Not paginated: bounded by design, a project
+/// holds at most 500 entries (creating more answers 409), all returned here.
 #[utoipa::path(
     tag = "Shield",
     get,
     path = "/projects/{project_id}/shield/entries",
     params(("project_id" = i32, Path, description = "Project ID")),
     responses(
-        (status = 200, description = "The project's entries, newest first", body = Vec<ShieldEntryResponse>),
+        (status = 200, description = "Every entry of the project (at most 500, newest first)", body = Vec<ShieldEntryResponse>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Project not found", body = ProblemDetails),
@@ -560,6 +562,39 @@ pub async fn create_project_shield_entry(
         .await?;
     audit_entry(&state, "SHIELD_ENTRY_CREATED", user_id, &metadata, &entry).await;
     Ok((StatusCode::CREATED, Json(entry)))
+}
+
+/// Get one of a project's Shield entries
+#[utoipa::path(
+    tag = "Shield",
+    get,
+    path = "/projects/{project_id}/shield/entries/{entry_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("entry_id" = i64, Path, description = "Entry ID")
+    ),
+    responses(
+        (status = 200, description = "The entry, as listed", body = ShieldEntryResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Entry not found in this project", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_project_shield_entry(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ShieldConsoleState>>,
+    Path((project_id, entry_id)): Path<(i32, i64)>,
+) -> Result<Json<ShieldEntryResponse>, Problem> {
+    project_permission_guard!(auth, ProjectsRead, project_id, state.project_access_checker);
+    project_scope_guard!(auth, project_id);
+    Ok(Json(
+        state
+            .service
+            .get_entry(EntryOwner::Project(project_id), entry_id)
+            .await?,
+    ))
 }
 
 /// Change a project's Shield entry
@@ -738,13 +773,15 @@ pub async fn update_shield_settings(
 
 /// List platform Shield entries
 ///
-/// Entries that apply to every project.
+/// Entries that apply to every project. Not paginated: bounded by design, the
+/// platform holds at most 500 entries (creating more answers 409), all
+/// returned here.
 #[utoipa::path(
     tag = "Shield",
     get,
     path = "/settings/shield/entries",
     responses(
-        (status = 200, description = "Platform entries, newest first", body = Vec<ShieldEntryResponse>),
+        (status = 200, description = "Every platform entry (at most 500, newest first)", body = Vec<ShieldEntryResponse>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
@@ -791,6 +828,35 @@ pub async fn create_platform_shield_entry(
         .await?;
     audit_entry(&state, "SHIELD_ENTRY_CREATED", user_id, &metadata, &entry).await;
     Ok((StatusCode::CREATED, Json(entry)))
+}
+
+/// Get one platform Shield entry
+#[utoipa::path(
+    tag = "Shield",
+    get,
+    path = "/settings/shield/entries/{entry_id}",
+    params(("entry_id" = i64, Path, description = "Entry ID")),
+    responses(
+        (status = 200, description = "The entry, as listed", body = ShieldEntryResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Entry not found", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_platform_shield_entry(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ShieldConsoleState>>,
+    Path(entry_id): Path<i64>,
+) -> Result<Json<ShieldEntryResponse>, Problem> {
+    permission_guard!(auth, SettingsRead);
+    Ok(Json(
+        state
+            .service
+            .get_entry(EntryOwner::Platform, entry_id)
+            .await?,
+    ))
 }
 
 /// Change a platform Shield entry
@@ -996,7 +1062,7 @@ async fn decide_proposal(
 }
 
 pub fn create_routes() -> axum::Router<Arc<ShieldConsoleState>> {
-    use axum::routing::{delete, get, post, put};
+    use axum::routing::{delete, get, post};
 
     const ENV: &str = "/projects/{project_id}/environments/{environment_id}/shield";
     axum::Router::new()
@@ -1017,7 +1083,9 @@ pub fn create_routes() -> axum::Router<Arc<ShieldConsoleState>> {
         )
         .route(
             "/projects/{project_id}/shield/entries/{entry_id}",
-            put(update_project_shield_entry).delete(delete_project_shield_entry),
+            get(get_project_shield_entry)
+                .put(update_project_shield_entry)
+                .delete(delete_project_shield_entry),
         )
         .route(
             "/settings/shield",
@@ -1029,7 +1097,9 @@ pub fn create_routes() -> axum::Router<Arc<ShieldConsoleState>> {
         )
         .route(
             "/settings/shield/entries/{entry_id}",
-            put(update_platform_shield_entry).delete(delete_platform_shield_entry),
+            get(get_platform_shield_entry)
+                .put(update_platform_shield_entry)
+                .delete(delete_platform_shield_entry),
         )
         .route("/settings/shield/proposals", get(list_shield_proposals))
         .route(
@@ -1055,12 +1125,14 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             create_shield_token,
             revoke_shield_token,
             list_project_shield_entries,
+            get_project_shield_entry,
             create_project_shield_entry,
             update_project_shield_entry,
             delete_project_shield_entry,
             get_shield_settings,
             update_shield_settings,
             list_platform_shield_entries,
+            get_platform_shield_entry,
             create_platform_shield_entry,
             update_platform_shield_entry,
             delete_platform_shield_entry,
@@ -1275,7 +1347,7 @@ mod tests {
     }
 
     const ENV: &str = "/projects/5/environments/9/shield";
-    const PROJECT_ROUTES: [(&str, &str); 10] = [
+    const PROJECT_ROUTES: [(&str, &str); 11] = [
         ("GET", "/projects/5/environments/9/shield/summary?window=7d"),
         ("GET", "/projects/5/environments/9/shield/events?limit=5"),
         (
@@ -1287,14 +1359,16 @@ mod tests {
         ("DELETE", "/projects/5/environments/9/shield/tokens/3"),
         ("GET", "/projects/5/shield/entries"),
         ("POST", "/projects/5/shield/entries"),
+        ("GET", "/projects/5/shield/entries/3"),
         ("PUT", "/projects/5/shield/entries/3"),
         ("DELETE", "/projects/5/shield/entries/3"),
     ];
-    const PLATFORM_ROUTES: [(&str, &str); 9] = [
+    const PLATFORM_ROUTES: [(&str, &str); 10] = [
         ("GET", "/settings/shield"),
         ("PUT", "/settings/shield"),
         ("GET", "/settings/shield/entries"),
         ("POST", "/settings/shield/entries"),
+        ("GET", "/settings/shield/entries/3"),
         ("PUT", "/settings/shield/entries/3"),
         ("DELETE", "/settings/shield/entries/3"),
         ("GET", "/settings/shield/proposals?status=pending"),
@@ -1407,6 +1481,67 @@ mod tests {
             .await;
             assert_problem(&outcome, StatusCode::FORBIDDEN, "Project Access Denied");
             assert!(audit.recorded().is_empty(), "{method} {uri}");
+        }
+    }
+
+    fn entry_row(
+        id: i64,
+        project_id: Option<i32>,
+    ) -> temps_entities::shield_operator_entries::Model {
+        temps_entities::shield_operator_entries::Model {
+            id,
+            scope: if project_id.is_some() {
+                "project"
+            } else {
+                "platform"
+            }
+            .to_string(),
+            project_id,
+            network: Some("203.0.113.0/24".to_string()),
+            ja4: None,
+            verdict: "block".to_string(),
+            note: Some("scanner".to_string()),
+            created_by: Some(1),
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    /// One entry reads back as the list shows it; an entry of another owner,
+    /// or one that does not exist, is a 404 naming the entry.
+    #[tokio::test]
+    async fn one_entry_reads_back_or_is_a_404_naming_it() {
+        for (uri, project_id) in [
+            ("/projects/5/shield/entries/3", Some(5)),
+            ("/settings/shield/entries/3", None),
+        ] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![entry_row(3, project_id)]])
+                    .append_query_results([
+                        Vec::<temps_entities::shield_operator_entries::Model>::new(),
+                    ])
+                    .into_connection(),
+            );
+            let admin = || Some(AuthContext::new_session(user(), Role::Admin));
+            let (status, _, body) = send(
+                app(db.clone(), admin(), None, Arc::default()),
+                request("GET", uri),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(body["id"], 3, "{uri}: {body}");
+            assert_eq!(body["verdict"], "block", "{uri}: {body}");
+
+            let outcome = send(app(db, admin(), None, Arc::default()), request("GET", uri)).await;
+            assert_problem(&outcome, StatusCode::NOT_FOUND, "Shield Entry Not Found");
+            assert!(
+                outcome.2["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains('3')),
+                "{uri}: {}",
+                outcome.2
+            );
         }
     }
 

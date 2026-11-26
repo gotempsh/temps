@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import { PassThrough } from 'node:stream'
 import { render } from 'ink'
-import { DeploymentWatcher } from './deployment-watcher.js'
+import { DeploymentWatcher, formatDuration } from './deployment-watcher.js'
 
 async function watch(response: () => Response, jobs = () => Response.json({ jobs: [] })) {
   const paths: string[] = []
@@ -90,4 +90,21 @@ describe('deployment watcher HTTP polling', () => {
       expect(attempts).toBe(2)
     })
   }
+})
+
+describe('formatDuration', () => {
+  test('reads the ISO 8601 timestamps the API sends', () => {
+    expect(formatDuration('2026-11-25T10:00:00Z', '2026-11-25T10:01:05.250Z')).toBe('1m 5s')
+    expect(formatDuration('2026-11-25T10:00:00Z', null, Date.parse('2026-11-25T10:00:42Z'))).toBe('42s')
+  })
+
+  test('still reads epoch seconds and milliseconds from older servers', () => {
+    expect(formatDuration(1_764_064_800, 1_764_064_865)).toBe('1m 5s')
+    expect(formatDuration(1_764_064_800_000, 1_764_064_830_000)).toBe('30s')
+  })
+
+  test('an unreadable timestamp gives no duration instead of NaN', () => {
+    expect(formatDuration('not a date', '2026-11-25T10:01:05Z')).toBe('')
+    expect(formatDuration('2026-11-25T10:00:00Z', 'soon')).toBe('')
+  })
 })

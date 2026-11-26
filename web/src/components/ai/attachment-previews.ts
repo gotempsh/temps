@@ -78,24 +78,7 @@ export function assistantImageError(
     : null
 }
 
-/** Helper line under the composer. Names what this model can be given. */
-export function attachHint(
-  isAssistantChat: boolean,
-  support: ImageSupport,
-  limits: AttachmentLimits
-): string {
-  const size = megabytes(limits.maxBytes)
-  if (!isAssistantChat) {
-    return `Attach, drop, or paste images and files · up to ${limits.maxFiles} files, ${size} each`
-  }
-  const what =
-    support === 'no'
-      ? 'PDFs and files (this model can\u2019t read images)'
-      : 'images, PDFs, and files'
-  return `Attach, drop, or paste ${what} · up to ${limits.maxFiles} files, ${size} each`
-}
-
-/** Tooltip for the attach button in an assistant chat. */
+/** Tooltip for the attach button in an assistant chat: what it takes, and the limits. */
 export function assistantAttachTitle(
   support: ImageSupport,
   limits: AttachmentLimits,

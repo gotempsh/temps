@@ -4,8 +4,8 @@
 import { test, expect, describe } from 'bun:test'
 import { buildCustomDomainUpdateBody, customDomainTimestamp } from './index.js'
 
-test('custom domain timestamps are interpreted as epoch milliseconds', () => {
-  expect(customDomainTimestamp(1_796_278_035_000).toISOString()).toBe('2026-12-03T06:07:15.000Z')
+test('custom domain timestamps are read as ISO 8601', () => {
+  expect(customDomainTimestamp('2026-12-03T06:07:15Z').toISOString()).toBe('2026-12-03T06:07:15.000Z')
 })
 
 describe('buildCustomDomainUpdateBody', () => {

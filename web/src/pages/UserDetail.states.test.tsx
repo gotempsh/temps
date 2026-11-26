@@ -68,8 +68,8 @@ test('successful list without the user shows user not found', () => {
         image: '',
         mfa_enabled: false,
         must_change_password: false,
-        created_at: Date.parse('2026-01-01T00:00:00Z'),
-        updated_at: Date.parse('2026-01-01T00:00:00Z'),
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
       },
       roles: [],
     },
@@ -141,7 +141,7 @@ function auditLogs(count: number, operationType: string, ageMs: number) {
   return Array.from({ length: count }, (_, id) => ({
     id,
     operation_type: operationType,
-    audit_date: Date.now() - ageMs,
+    audit_date: new Date(Date.now() - ageMs).toISOString(),
   }))
 }
 
@@ -159,8 +159,8 @@ function busyUserClient() {
         image: '',
         mfa_enabled: false,
         must_change_password: false,
-        created_at: Date.parse('2026-01-01T00:00:00Z'),
-        updated_at: Date.parse('2026-01-01T00:00:00Z'),
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
       },
       roles: [],
     },

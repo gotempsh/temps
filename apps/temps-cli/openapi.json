@@ -724,8 +724,8 @@
             ]
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "domain_id": {
             "format": "int32",
@@ -747,9 +747,9 @@
             ]
           },
           "expires_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -771,8 +771,8 @@
             "type": "string"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -4803,6 +4803,43 @@
         ],
         "type": "object"
       },
+      "AnalyticsIngestKeyList": {
+        "description": "One page of a project's analytics ingest keys, newest first.",
+        "properties": {
+          "items": {
+            "description": "The items on this page.",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsIngestKey"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "The page served, starting at 1.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "The page size served (at most 100).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Items across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "AnalyticsProjectOption": {
         "properties": {
           "project_id": {
@@ -6433,9 +6470,9 @@
       "ApplicationPreviewLinkResponse": {
         "properties": {
           "expires_at": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "description": "When the link stops working, ISO 8601 in UTC.",
+            "format": "date-time",
+            "type": "string"
           },
           "url": {
             "description": "A short-lived authenticated URL. Its fragment carries the grant and\nnever reaches the development server or referrer headers.",
@@ -7917,10 +7954,9 @@
         "description": "Response type for audit log entries",
         "properties": {
           "audit_date": {
-            "description": "When the action occurred",
-            "example": 11932193,
-            "format": "int64",
-            "type": "integer"
+            "description": "When the action occurred, ISO 8601 in UTC",
+            "format": "date-time",
+            "type": "string"
           },
           "data": {
             "description": "Additional context about the action"
@@ -8098,8 +8134,8 @@
             "type": "string"
           },
           "expires_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "refresh_token": {
             "type": "string"
@@ -9022,6 +9058,43 @@
         },
         "type": "object"
       },
+      "BackupList": {
+        "description": "One page of a schedule's backups, newest first.",
+        "properties": {
+          "items": {
+            "description": "The items on this page.",
+            "items": {
+              "$ref": "#/components/schemas/BackupResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "The page served, starting at 1.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "The page size served (at most 100).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Items across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "BackupResponse": {
         "description": "Response type for backup",
         "properties": {
@@ -9046,9 +9119,9 @@
             ]
           },
           "completed_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -9073,9 +9146,9 @@
             ]
           },
           "expires_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -9152,8 +9225,8 @@
             ]
           },
           "started_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "state": {
             "type": "string"
@@ -9188,8 +9261,8 @@
             "type": "string"
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "description": {
             "type": [
@@ -9209,9 +9282,9 @@
             "type": "boolean"
           },
           "last_run": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -9227,9 +9300,9 @@
             "type": "string"
           },
           "next_run": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -9256,8 +9329,8 @@
             "type": "boolean"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -10918,10 +10991,10 @@
         "description": "Current on-demand cert status for a single hostname (ADR-018 §5). Backs\n`GET /domains/by-host/{hostname}/cert-status`.",
         "properties": {
           "backoff_until": {
-            "description": "On-demand negative-cache deadline (epoch millis), when in backoff.",
-            "format": "int64",
+            "description": "On-demand negative-cache deadline (ISO 8601, UTC), when in backoff.",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -19325,22 +19398,6 @@
         ],
         "type": "object"
       },
-      "CreateFunnelResponse": {
-        "properties": {
-          "funnel_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "message": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "funnel_id",
-          "message"
-        ],
-        "type": "object"
-      },
       "CreateFunnelStep": {
         "properties": {
           "event_filter": {
@@ -21468,6 +21525,11 @@
       },
       "CreateStatusPageWebhookRequest": {
         "properties": {
+          "enabled": {
+            "default": true,
+            "description": "Whether events are posted to it (default `true`). A webhook created\nswitched off receives nothing until it is enabled.",
+            "type": "boolean"
+          },
           "url": {
             "description": "`https://` URL with a public address, at most 2048 characters.",
             "type": "string"
@@ -22725,8 +22787,8 @@
             ]
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "domain": {
             "type": "string"
@@ -22749,9 +22811,9 @@
             ]
           },
           "expiration_time": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -22760,9 +22822,9 @@
             "type": "integer"
           },
           "last_renewed": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -22800,8 +22862,8 @@
             ]
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -24438,8 +24500,8 @@
         "description": "A single captured container-log dump, including its full text content.",
         "properties": {
           "captured_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "container_name": {
             "type": "string"
@@ -24480,9 +24542,9 @@
         "description": "Metadata for one captured (historical) container-log dump. Listed on the\ndeployment detail page so a user can pick which past container's logs to read.",
         "properties": {
           "captured_at": {
-            "description": "Unix epoch milliseconds of when the logs were captured (just before\nteardown). Matches the timestamp convention used by `DeploymentResponse`.",
-            "format": "int64",
-            "type": "integer"
+            "description": "When the logs were captured (just before teardown), ISO 8601 in UTC.",
+            "format": "date-time",
+            "type": "string"
           },
           "container_id": {
             "type": "string"
@@ -24754,8 +24816,8 @@
       "DeploymentJobResponse": {
         "properties": {
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "dependencies": {},
           "deployment_id": {
@@ -24782,9 +24844,9 @@
             ]
           },
           "finished_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -24809,9 +24871,9 @@
           },
           "outputs": {},
           "started_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -24819,8 +24881,8 @@
             "type": "string"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -25233,9 +25295,9 @@
             ]
           },
           "commit_date": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -25252,8 +25314,8 @@
             ]
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "deployment_config": {
             "oneOf": [
@@ -25285,9 +25347,9 @@
             ]
           },
           "finished_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -25342,9 +25404,9 @@
             ]
           },
           "started_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -28930,8 +28992,8 @@
             ]
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "dns_challenge_token": {
             "type": [
@@ -28949,9 +29011,9 @@
             "type": "string"
           },
           "expiration_time": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -28986,17 +29048,17 @@
             ]
           },
           "last_renewed": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
           "on_demand_backoff_until": {
-            "description": "On-demand TLS negative-cache deadline (epoch millis), when this hostname's\non-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).\n`None` means no active backoff.",
-            "format": "int64",
+            "description": "On-demand TLS negative-cache deadline (ISO 8601, UTC), when this hostname's\non-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).\n`None` means no active backoff.",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -29004,8 +29066,8 @@
             "type": "string"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "verification_method": {
             "type": "string"
@@ -30225,7 +30287,7 @@
             ]
           },
           "reason_code": {
-            "description": "Why it cannot, when `recording` is false: one of\n`unsupported_platform`, `proxy_not_serving`, `node_not_reporting`,\n`agent_predates_recording`.",
+            "description": "Why it cannot, when `recording` is false: one of\n`unsupported_platform`, `proxy_not_serving`, `node_not_reporting`,\n`agent_predates_recording`, or `kind_not_served` when the node\nrecords but not this kind of workload.",
             "type": [
               "string",
               "null"
@@ -30291,7 +30353,7 @@
             ]
           },
           "reason_code": {
-            "description": "Why recording cannot work, when `configured` is false:\n`otel_unavailable`, or the `reason_code` of the node that cannot\nrecord.",
+            "description": "Why recording cannot work, when `configured` is false:\n`otel_unavailable`; `not_recordable` when nothing routes this\nworkload's traffic to a recorder (a backend or deployment kind it\nhas no route for); or the `reason_code` of the node that cannot\nrecord.",
             "type": [
               "string",
               "null"
@@ -31799,8 +31861,8 @@
       "EnvironmentDomainResponse": {
         "properties": {
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "domain": {
             "type": "string"
@@ -32093,8 +32155,8 @@
             ]
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "current_deployment_id": {
             "format": "int32",
@@ -32115,10 +32177,10 @@
             ]
           },
           "estimated_sleep_at": {
-            "description": "Estimated time (epoch millis) when the environment will go to sleep\nbased on last activity + idle timeout. NULL when sleeping or on-demand disabled.",
-            "format": "int64",
+            "description": "Estimated time (ISO 8601, UTC) when the environment will go to sleep\nbased on last activity + idle timeout. NULL when sleeping or on-demand disabled.",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -32138,10 +32200,10 @@
             "type": "boolean"
           },
           "last_activity_at": {
-            "description": "Last proxied request timestamp (epoch millis) for on-demand environments.\nNULL when on-demand is disabled or no traffic has been received yet.",
-            "format": "int64",
+            "description": "Last proxied request time (ISO 8601, UTC) for on-demand environments.\nNULL when on-demand is disabled or no traffic has been received yet.",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -32196,8 +32258,8 @@
             "type": "string"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -32271,8 +32333,8 @@
       "EnvironmentVariableResponse": {
         "properties": {
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "environments": {
             "items": {
@@ -32307,8 +32369,8 @@
             ]
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "value": {
             "description": "Plaintext for regular variables in create/update responses, or `\"***\"`\nin list responses. Always `None` for marked secrets. Only regular\nvariables can be read through the audited per-variable reveal endpoint.",
@@ -37069,8 +37131,45 @@
         ],
         "type": "object"
       },
+      "FunnelList": {
+        "description": "One page of a project's active funnels, newest first.",
+        "properties": {
+          "items": {
+            "description": "The items on this page.",
+            "items": {
+              "$ref": "#/components/schemas/FunnelResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "The page served, starting at 1.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "The page size served (at most 100).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Items across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "FunnelMessageResponse": {
-        "description": "Acknowledges a funnel update or delete.",
+        "description": "Acknowledges a funnel delete.",
         "properties": {
           "message": {
             "type": "string"
@@ -37121,8 +37220,10 @@
         "type": "object"
       },
       "FunnelResponse": {
+        "description": "A funnel and its steps.",
         "properties": {
           "created_at": {
+            "format": "date-time",
             "type": "string"
           },
           "description": {
@@ -37141,16 +37242,61 @@
           "name": {
             "type": "string"
           },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "steps": {
+            "description": "The steps a visitor goes through, in order.",
+            "items": {
+              "$ref": "#/components/schemas/FunnelStepResponse"
+            },
+            "type": "array"
+          },
           "updated_at": {
+            "format": "date-time",
             "type": "string"
           }
         },
         "required": [
           "id",
+          "project_id",
           "name",
           "is_active",
+          "steps",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "FunnelStepResponse": {
+        "description": "One step of a funnel, as it was written.",
+        "properties": {
+          "event_filter": {
+            "description": "The filters the step matches events with (empty: every event of\n`event_name`).",
+            "items": {
+              "$ref": "#/components/schemas/SmartFilter"
+            },
+            "type": "array"
+          },
+          "event_name": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "order": {
+            "description": "Position of the step in the funnel, starting at 1.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "order",
+          "event_name",
+          "event_filter"
         ],
         "type": "object"
       },
@@ -38605,6 +38751,24 @@
         "properties": {
           "environment_id": {
             "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page": {
+            "description": "Page number, starting at 1 (default 1).",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page_size": {
+            "description": "Items per page (default 20, max 100).",
+            "format": "int64",
+            "minimum": 0,
             "type": [
               "integer",
               "null"
@@ -43995,6 +44159,43 @@
           "started_at",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "IncidentUpdateList": {
+        "description": "One page of an incident's updates, newest first.",
+        "properties": {
+          "items": {
+            "description": "The items on this page.",
+            "items": {
+              "$ref": "#/components/schemas/IncidentUpdateResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "The page served, starting at 1.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "The page size served (at most 100).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Items across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
         ],
         "type": "object"
       },
@@ -54143,8 +54344,8 @@
         "properties": {
           "config": {},
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "enabled": {
             "type": "boolean"
@@ -54160,8 +54361,8 @@
             "type": "string"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -54178,8 +54379,8 @@
       "NotificationRoute": {
         "properties": {
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "enabled": {
             "type": "boolean"
@@ -54205,8 +54406,8 @@
             "type": "array"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -54711,6 +54912,43 @@
         ],
         "type": "object"
       },
+      "OidcProviderUserList": {
+        "description": "One page of the users who sign in through an OIDC provider, newest\nfirst.",
+        "properties": {
+          "items": {
+            "description": "The items on this page.",
+            "items": {
+              "$ref": "#/components/schemas/OidcProviderUserResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "The page served, starting at 1.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "The page size served (at most 100).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Items across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "OidcProviderUserResponse": {
         "description": "A user that has logged in via a given OIDC provider. Used by the\nadmin \"Users for provider\" panel — the `oidc_subject` is the\nIdP-side identifier we matched on, useful when diagnosing why a\nuser can or can't log in.",
         "properties": {
@@ -54842,9 +55080,9 @@
             ]
           },
           "created_at": {
-            "description": "When the attempt was recorded (epoch millis).",
-            "format": "int64",
-            "type": "integer"
+            "description": "When the attempt was recorded (ISO 8601, UTC).",
+            "format": "date-time",
+            "type": "string"
           },
           "duration_ms": {
             "description": "End-to-end issuance duration in milliseconds (0/None for skipped).",
@@ -54902,18 +55140,18 @@
             "description": "The audit record for the attempt this row represents (newest first in\nthe list)."
           },
           "backoff_until": {
-            "description": "On-demand negative-cache deadline (epoch millis), when in backoff.",
-            "format": "int64",
+            "description": "On-demand negative-cache deadline (ISO 8601, UTC), when in backoff.",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
           "expiration_time": {
-            "description": "Certificate expiration (epoch millis), when an active cert exists.",
-            "format": "int64",
+            "description": "Certificate expiration (ISO 8601, UTC), when an active cert exists.",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -60449,10 +60687,9 @@
       "PreviewShareLinkResponse": {
         "properties": {
           "expires_at": {
-            "description": "Unix seconds after which the link stops working.",
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
+            "description": "When the link stops working, ISO 8601 in UTC.",
+            "format": "date-time",
+            "type": "string"
           },
           "url": {
             "description": "The full link. Its fragment contains the grant and must be treated as a\ncredential; URL fragments are not sent to servers or in Referer headers.",
@@ -61827,8 +62064,8 @@
             "type": "boolean"
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "cross_project_trace_sharing": {
             "description": "ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed\nfrom cross-project discovery results. Default true (consistent with the\nOSS global-observability model where any OtelRead holder can query any\nproject's telemetry).",
@@ -61928,9 +62165,9 @@
             "type": "boolean"
           },
           "last_deployment": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -62055,8 +62292,8 @@
             ]
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "vulnerability_scanning_enabled": {
             "description": "Opt-in Trivy vulnerability scanning of this project's deployed Docker\nimages. Off by default — project owners explicitly enable it.",
@@ -62110,6 +62347,43 @@
         ],
         "type": "object"
       },
+      "ProjectSecretList": {
+        "description": "One page of a project's secrets (metadata only), newest first.",
+        "properties": {
+          "items": {
+            "description": "The items on this page.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectSecretResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "description": "The page served, starting at 1.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "The page size served (at most 100).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Items across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
       "ProjectSecretResponse": {
         "description": "Project secret metadata. There is deliberately no `value` field — secret\nplaintext is never returned after creation. Callers that need the value\nmust read it from the mounted file inside the container.",
         "properties": {
@@ -62121,8 +62395,8 @@
             "type": "array"
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "environments": {
             "items": {
@@ -62145,8 +62419,8 @@
             "type": "integer"
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -67268,9 +67542,9 @@
         "description": "One row of the standard (non-on-demand) renewal-attempt audit log, backing\nthe domain detail page's renewal timeline.",
         "properties": {
           "created_at": {
-            "description": "When the attempt was recorded (epoch millis).",
-            "format": "int64",
-            "type": "integer"
+            "description": "When the attempt was recorded (ISO 8601, UTC).",
+            "format": "date-time",
+            "type": "string"
           },
           "error": {
             "type": [
@@ -69400,9 +69674,8 @@
       "RouteRole": {
         "properties": {
           "created_at": {
-            "example": "1683900000000",
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "id": {
             "format": "int32",
@@ -69412,9 +69685,8 @@
             "type": "string"
           },
           "updated_at": {
-            "example": "1683900000000",
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           }
         },
         "required": [
@@ -69467,14 +69739,13 @@
       "RouteUser": {
         "properties": {
           "created_at": {
-            "example": "1683900000000",
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "deleted_at": {
-            "format": "int64",
+            "format": "date-time",
             "type": [
-              "integer",
+              "string",
               "null"
             ]
           },
@@ -69501,9 +69772,8 @@
             "type": "string"
           },
           "updated_at": {
-            "example": "1683900000000",
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "username": {
             "type": "string"
@@ -70802,8 +71072,8 @@
             "type": "string"
           },
           "created_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "effective_endpoint": {
             "description": "The endpoint every client (WAL-G, restore and worker jobs) receives,\nalways with an explicit scheme. `None` for AWS S3 itself.",
@@ -70856,8 +71126,8 @@
             "writeOnly": true
           },
           "updated_at": {
-            "format": "int64",
-            "type": "integer"
+            "format": "date-time",
+            "type": "string"
           },
           "worker_credentials": {
             "$ref": "#/components/schemas/WorkerCredentialsPolicy",
@@ -88314,17 +88584,24 @@
         "type": "object"
       },
       "UpdateMcpRequest": {
+        "description": "Partial update of an MCP server: omitted or `null` fields keep their\ncurrent value.",
         "properties": {
           "config": {
-            "type": "object"
+            "description": "Replacement server config. Omit or send `null` to keep the current\nconfig; masked (`***`) credential values keep the stored secret.",
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "description": {
+            "description": "New description. Omit or send `null` to keep the current description;\nan empty string clears it (stored and returned as `null`).",
             "type": [
               "string",
               "null"
             ]
           },
           "name": {
+            "description": "New display name. Omit or send `null` to keep the current name.",
             "type": [
               "string",
               "null"
@@ -89645,20 +89922,24 @@
         "type": "object"
       },
       "UpdateSkillRequest": {
+        "description": "Partial update of a skill: omitted or `null` fields keep their current value.",
         "properties": {
           "content": {
+            "description": "New SKILL.md content. Omit or send `null` to keep the current content.",
             "type": [
               "string",
               "null"
             ]
           },
           "description": {
+            "description": "New description. Omit or send `null` to keep the current description;\nan empty string clears it (stored and returned as `null`).",
             "type": [
               "string",
               "null"
             ]
           },
           "name": {
+            "description": "New display name. Omit or send `null` to keep the current name.",
             "type": [
               "string",
               "null"
@@ -98655,6 +98936,82 @@
           "Authentication"
         ]
       },
+      "get": {
+        "operationId": "get_oidc_provider",
+        "parameters": [
+          {
+            "description": "OIDC provider ID",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcProviderResponse"
+                }
+              }
+            },
+            "description": "The OIDC provider"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "OIDC provider not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One OIDC provider, as listed; the client secret is masked.",
+        "tags": [
+          "Authentication"
+        ]
+      },
       "patch": {
         "operationId": "update_oidc_provider",
         "parameters": [
@@ -98832,6 +99189,31 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -98839,14 +99221,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/OidcProviderUserResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/OidcProviderUserList"
                 }
               }
             },
-            "description": "Users authenticated via this OIDC provider"
+            "description": "One page of the users who sign in through this OIDC provider, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Provider not found"
@@ -101215,7 +101600,7 @@
     },
     "/ai/assistant/conversations": {
       "post": {
-        "description": "The assistant runs on the AI gateway (an OpenRouter key is enough), has no\nsandbox, and acts with the calling user's own permissions: every tool call\nis replayed through the real router with their auth, and every change is a\nproposal the user confirms in the UI. When no provider is configured this\nanswers `409` with `setup_path`, so the client can onboard instead of\nfailing.",
+        "description": "The assistant runs on the AI gateway (one provider key is enough), has no\nsandbox, and acts with the calling user's own permissions: every tool call\nis replayed through the real router with their auth, and every change is a\nproposal the user confirms in the UI. When no provider is configured this\nanswers `409` with `setup_path`, so the client can onboard instead of\nfailing.",
         "operationId": "create_assistant_conversation",
         "requestBody": {
           "content": {
@@ -115641,11 +116026,37 @@
         "operationId": "list_backups_for_schedule",
         "parameters": [
           {
+            "description": "Backup schedule ID",
             "in": "path",
             "name": "id",
             "required": true,
             "schema": {
               "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
               "type": "integer"
             }
           }
@@ -115655,14 +116066,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/BackupResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/BackupList"
                 }
               }
             },
-            "description": "List of backups for the schedule"
+            "description": "One page of the schedule's backups, newest first"
           },
           "401": {
             "content": {
@@ -127030,7 +127438,7 @@
                 }
               }
             },
-            "description": "Recent restore runs for the service"
+            "description": "The service's 50 most recent restore runs, newest first. Not paginated: bounded by design to recent history; older runs are not returned"
           },
           "401": {
             "content": {
@@ -129017,7 +129425,7 @@
                 }
               }
             },
-            "description": "Recent upgrades"
+            "description": "The service's 50 most recent upgrades, newest first. Not paginated: bounded by design to recent history; older upgrades are not returned"
           },
           "401": {
             "content": {
@@ -132769,6 +133177,31 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -132776,14 +133209,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/IncidentUpdateResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/IncidentUpdateList"
                 }
               }
             },
-            "description": "Successfully retrieved incident updates"
+            "description": "One page of the incident's updates, newest first"
           },
           "401": {
             "description": "Unauthorized"
@@ -141695,6 +142125,65 @@
           }
         ],
         "summary": "Delete a worker's resource alert.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "NodeMetricsGetAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Alert rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                }
+              }
+            },
+            "description": "The alert rule"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alert rule not found on this node"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One monitoring alert rule of a node, as listed.",
         "tags": [
           "Metrics"
         ],
@@ -150976,6 +151465,65 @@
         ],
         "x-maturity": "experimental"
       },
+      "get": {
+        "operationId": "get_group_env_var",
+        "parameters": [
+          {
+            "description": "Project group ID",
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Variable ID",
+            "in": "path",
+            "name": "var_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupEnvVarResponse"
+                }
+              }
+            },
+            "description": "The variable (value masked)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions on a member project"
+          },
+          "404": {
+            "description": "Project group or variable not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One variable every project in the group inherits, as listed: a plain\nvalue is masked and a secret's value is never returned.",
+        "tags": [
+          "Project Groups"
+        ],
+        "x-maturity": "experimental"
+      },
       "patch": {
         "operationId": "update_group_env_var",
         "parameters": [
@@ -151208,7 +151756,7 @@
             "description": "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"
           },
           "409": {
-            "description": "A route involving the project appeared, the project changed group, or a project joined the destination group, while the request was being authorized; retry"
+            "description": "A route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict"
           }
         },
         "security": [
@@ -157679,6 +158227,31 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -157686,14 +158259,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/AnalyticsIngestKey"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/AnalyticsIngestKeyList"
                 }
               }
             },
-            "description": "Ingest keys, active and revoked, newest first"
+            "description": "One page of ingest keys, active and revoked, newest first"
           },
           "401": {
             "description": "Unauthorized"
@@ -157779,6 +158349,65 @@
       }
     },
     "/projects/{project_id}/analytics/ingest-keys/{key_id}": {
+      "get": {
+        "description": "The same shape as in the list; `public_key` is not a secret and is\nreturned unmasked, see [`create_analytics_ingest_key`].",
+        "operationId": "get_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "The ingest key"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One of a project's analytics ingest keys, active or revoked.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      },
       "patch": {
         "description": "`allowed_origins` and `rate_limit_per_minute` are three-state: omit to leave\nunchanged, send `null` to clear, send a value to replace. Clearing\n`allowed_origins` allows any origin; clearing `rate_limit_per_minute`\nremoves the limit.",
         "operationId": "update_analytics_ingest_key",
@@ -167979,7 +168608,7 @@
         ]
       },
       "put": {
-        "description": "With recording on, containers of the environment's deployments are\nstarted with the per-node egress proxy as their HTTP(S) proxy, and\nevery connection they make through it produces one OpenTelemetry log\nrecord when it ends, allowed or refused: destination (`server.address`,\n`server.port`; method and path without the query for plain HTTP),\noutcome and refusal reason, bytes each way and duration. Never headers,\nbodies or query strings. Off by default.\n\nIt applies to containers started after it is turned on: redeploy the\nenvironment to start recording. Turning it off stops recording at once.\nOnly clients that honour the proxy variables are recorded, and only\npublic destinations go through the proxy: internal addresses and names\nstay direct. While it is on, the environment's outbound HTTP(S) depends\non the node's egress proxy being up. Turning it on fails with 422 when\nno node the environment runs on can record, naming the environment, the\nnode and what is missing.",
+        "description": "With recording on, containers of the environment's deployments are\nstarted with the per-node egress proxy as their HTTP(S) proxy, and\nevery connection they make through it produces one OpenTelemetry log\nrecord when it ends, allowed or refused: destination (`server.address`,\n`server.port`; method and path without the query for plain HTTP),\noutcome and refusal reason, bytes each way and duration. Never headers,\nbodies or query strings. Off by default.\n\nIt applies to containers started after it is turned on: redeploy the\nenvironment to start recording. Turning it off stops recording at once.\nOnly clients that honour the proxy variables are recorded, and only\npublic destinations go through the proxy: internal addresses and names\nstay direct. While it is on, the environment's outbound HTTP(S) depends\non the node's egress proxy being up. Turning it on fails with 422 when\nno node the environment runs on can record, naming the environment, the\nnode and what is missing, or when it is a Docker Compose environment,\nwhose containers are never sent through the proxy (`reason_code` is then\n`not_recordable`).",
         "operationId": "set_environment_egress_recording",
         "parameters": [
           {
@@ -168072,7 +168701,7 @@
                 }
               }
             },
-            "description": "Recording cannot work for this environment: no node it runs on can record"
+            "description": "Recording cannot work for this environment: no node it runs on can record, or it is a Compose environment"
           },
           "500": {
             "content": {
@@ -169756,7 +170385,7 @@
     },
     "/projects/{project_id}/environments/{environment_id}/shield/tokens": {
       "get": {
-        "description": "The active tokens valid here: the environment's own and the project-wide\nones. Secrets are never returned.",
+        "description": "The active tokens valid here: the environment's own and the project-wide\nones. Secrets are never returned. Not paginated: bounded by design, a\nproject holds at most 100 active tokens (minting more answers 409).",
         "operationId": "list_shield_tokens",
         "parameters": [
           {
@@ -169792,7 +170421,7 @@
                 }
               }
             },
-            "description": "Active bypass tokens"
+            "description": "Every active bypass token valid here (at most 100, newest first)"
           },
           "401": {
             "content": {
@@ -174135,7 +174764,7 @@
                 }
               }
             },
-            "description": "The project's inbound filters"
+            "description": "The project's inbound filters, oldest first. Not paginated: bounded by design to 50 rules per project"
           },
           "401": {
             "description": "Unauthorized"
@@ -174269,6 +174898,65 @@
           }
         ],
         "summary": "Delete an inbound filter. Matching events are stored again from the next\none.",
+        "tags": [
+          "error-tracking"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "operationId": "getErrorInboundFilter",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Inbound filter ID",
+            "in": "path",
+            "name": "filter_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InboundFilterResponse"
+                }
+              }
+            },
+            "description": "The filter, as listed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such filter in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one inbound filter and how many events it dropped.",
         "tags": [
           "error-tracking"
         ],
@@ -176875,6 +177563,31 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100).",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "maximum": 100,
+              "minimum": 1,
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -176882,17 +177595,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/FunnelResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/FunnelList"
                 }
               }
             },
-            "description": "Funnels retrieved successfully"
+            "description": "One page of funnels, newest first"
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
           },
           "500": {
             "description": "Internal server error"
@@ -176903,7 +177616,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "List all funnels for a project",
+        "summary": "List a project's active funnels, newest first, with their steps",
         "tags": [
           "Funnels"
         ],
@@ -176938,17 +177651,20 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CreateFunnelResponse"
+                  "$ref": "#/components/schemas/FunnelResponse"
                 }
               }
             },
-            "description": "Funnel created successfully"
+            "description": "Funnel created; the body is the funnel with its steps"
           },
           "400": {
             "description": "Bad request"
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
           },
           "500": {
             "description": "Internal server error"
@@ -177067,6 +177783,9 @@
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Funnel not found"
           },
@@ -177085,7 +177804,67 @@
         ],
         "x-maturity": "beta"
       },
+      "get": {
+        "operationId": "get_funnel",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Funnel ID",
+            "in": "path",
+            "name": "funnel_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunnelResponse"
+                }
+              }
+            },
+            "description": "The funnel with its steps"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No active funnel with this ID in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one funnel with its steps",
+        "tags": [
+          "Funnels"
+        ],
+        "x-maturity": "beta"
+      },
       "put": {
+        "description": "Replaces the funnel's name, description and steps.",
         "operationId": "update_funnel",
         "parameters": [
           {
@@ -177124,17 +177903,20 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/FunnelMessageResponse"
+                  "$ref": "#/components/schemas/FunnelResponse"
                 }
               }
             },
-            "description": "Funnel updated successfully"
+            "description": "Funnel updated; the body is the funnel with its steps"
           },
           "400": {
             "description": "Bad request"
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Funnel not found"
@@ -177976,6 +178758,63 @@
           },
           "409": {
             "description": "Check busy"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "HTTP Checks"
+        ]
+      },
+      "get": {
+        "operationId": "getHttpCheck",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Check ID",
+            "in": "path",
+            "name": "check_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpCheckView"
+                }
+              }
+            },
+            "description": "The check, as listed (credentials are never returned)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "No check with this ID in the project"
           },
           "500": {
             "description": "Internal error"
@@ -180943,7 +181782,7 @@
           "Agents"
         ]
       },
-      "put": {
+      "patch": {
         "operationId": "update_mcp",
         "parameters": [
           {
@@ -180984,13 +181823,20 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            }
+            },
+            "description": "Updated definition"
           },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "MCP server not found"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -180998,6 +181844,74 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Agents"
+        ]
+      },
+      "put": {
+        "deprecated": true,
+        "operationId": "update_mcp_put",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "MCP server slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMcpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpDefinitionResponse"
+                }
+              }
+            },
+            "description": "Updated definition"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "MCP server not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Deprecated alias of `PATCH /projects/{project_id}/mcp-servers/{slug}`: a partial update, where omitted\nor `null` fields keep their current value.",
         "tags": [
           "Agents"
         ]
@@ -183521,12 +184435,34 @@
             }
           },
           {
-            "description": "Optional environment filter",
+            "description": "Only secrets attached to this environment",
             "in": "query",
             "name": "environment_id",
             "required": false,
             "schema": {
               "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, starting at 1 (default 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Items per page (default 20, max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
               "type": "integer"
             }
           }
@@ -183536,14 +184472,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/ProjectSecretResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/ProjectSecretList"
                 }
               }
             },
-            "description": "List of secrets (metadata only, no values)"
+            "description": "One page of secrets (metadata only, no values), newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
           },
           "404": {
             "description": "Project not found"
@@ -183557,7 +184496,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "List project secrets (metadata only — values never returned).",
+        "summary": "List project secrets (metadata only — values never returned), newest first.",
         "tags": [
           "Secrets"
         ]
@@ -183660,6 +184599,64 @@
           }
         ],
         "summary": "Delete a project secret. Running containers keep their mounted secret files\nuntil they are redeployed.",
+        "tags": [
+          "Secrets"
+        ]
+      },
+      "get": {
+        "operationId": "getProjectSecret",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Secret ID",
+            "in": "path",
+            "name": "secret_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectSecretResponse"
+                }
+              }
+            },
+            "description": "The secret's metadata, without its value"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No secret with this ID in the project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one project secret (metadata only — the value is never returned).",
         "tags": [
           "Secrets"
         ]
@@ -184166,7 +185163,7 @@
     },
     "/projects/{project_id}/shield/entries": {
       "get": {
-        "description": "Address ranges and fingerprints this project allows, logs, challenges or\nblocks, whatever the lists say.",
+        "description": "Address ranges and fingerprints this project allows, logs, challenges or\nblocks, whatever the lists say. Not paginated: bounded by design, a project\nholds at most 500 entries (creating more answers 409), all returned here.",
         "operationId": "list_project_shield_entries",
         "parameters": [
           {
@@ -184192,7 +185189,7 @@
                 }
               }
             },
-            "description": "The project's entries, newest first"
+            "description": "Every entry of the project (at most 500, newest first)"
           },
           "401": {
             "content": {
@@ -184429,6 +185426,92 @@
           }
         ],
         "summary": "Remove a project's Shield entry",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "get": {
+        "operationId": "get_project_shield_entry",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entry ID",
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldEntryResponse"
+                }
+              }
+            },
+            "description": "The entry, as listed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Entry not found in this project"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one of a project's Shield entries",
         "tags": [
           "Shield"
         ]
@@ -184769,7 +185852,7 @@
           "Agents"
         ]
       },
-      "put": {
+      "patch": {
         "operationId": "update_skill",
         "parameters": [
           {
@@ -184810,13 +185893,20 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            }
+            },
+            "description": "Updated definition"
           },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Skill not found"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -184824,6 +185914,74 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Agents"
+        ]
+      },
+      "put": {
+        "deprecated": true,
+        "operationId": "update_skill_put",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Skill slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSkillRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillDefinitionResponse"
+                }
+              }
+            },
+            "description": "Updated definition"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Skill not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Deprecated alias of `PATCH /projects/{project_id}/skills/{slug}`: a partial update, where omitted\nor `null` fields keep their current value.",
         "tags": [
           "Agents"
         ]
@@ -192658,7 +193816,7 @@
           "Agents"
         ]
       },
-      "put": {
+      "patch": {
         "operationId": "update_global_mcp",
         "parameters": [
           {
@@ -192689,13 +193847,20 @@
                   "$ref": "#/components/schemas/McpDefinitionResponse"
                 }
               }
-            }
+            },
+            "description": "Updated definition"
           },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "MCP server not found"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -192703,6 +193868,64 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Agents"
+        ]
+      },
+      "put": {
+        "deprecated": true,
+        "operationId": "update_global_mcp_put",
+        "parameters": [
+          {
+            "description": "MCP server slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMcpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpDefinitionResponse"
+                }
+              }
+            },
+            "description": "Updated definition"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "MCP server not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Deprecated alias of `PATCH /settings/mcp-servers/{slug}`: a partial update, where omitted\nor `null` fields keep their current value.",
         "tags": [
           "Agents"
         ]
@@ -193189,7 +194412,7 @@
     },
     "/settings/shield/entries": {
       "get": {
-        "description": "Entries that apply to every project.",
+        "description": "Entries that apply to every project. Not paginated: bounded by design, the\nplatform holds at most 500 entries (creating more answers 409), all\nreturned here.",
         "operationId": "list_platform_shield_entries",
         "responses": {
           "200": {
@@ -193203,7 +194426,7 @@
                 }
               }
             },
-            "description": "Platform entries, newest first"
+            "description": "Every platform entry (at most 500, newest first)"
           },
           "401": {
             "content": {
@@ -193397,6 +194620,82 @@
           }
         ],
         "summary": "Remove a platform Shield entry",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "get": {
+        "operationId": "get_platform_shield_entry",
+        "parameters": [
+          {
+            "description": "Entry ID",
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldEntryResponse"
+                }
+              }
+            },
+            "description": "The entry, as listed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Entry not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one platform Shield entry",
         "tags": [
           "Shield"
         ]
@@ -193940,7 +195239,7 @@
           "Agents"
         ]
       },
-      "put": {
+      "patch": {
         "operationId": "update_global_skill",
         "parameters": [
           {
@@ -193971,13 +195270,20 @@
                   "$ref": "#/components/schemas/SkillDefinitionResponse"
                 }
               }
-            }
+            },
+            "description": "Updated definition"
           },
           "401": {
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Insufficient permissions"
+          },
           "404": {
             "description": "Skill not found"
+          },
+          "500": {
+            "description": "Internal server error"
           }
         },
         "security": [
@@ -193985,6 +195291,64 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Agents"
+        ]
+      },
+      "put": {
+        "deprecated": true,
+        "operationId": "update_global_skill_put",
+        "parameters": [
+          {
+            "description": "Skill slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSkillRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillDefinitionResponse"
+                }
+              }
+            },
+            "description": "Updated definition"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Skill not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Deprecated alias of `PATCH /settings/skills/{slug}`: a partial update, where omitted\nor `null` fields keep their current value.",
         "tags": [
           "Agents"
         ]
@@ -195991,7 +197355,7 @@
         "x-maturity": "beta"
       },
       "post": {
-        "description": "Each new public event of the page (an incident update or resolution, a\nscheduled maintenance window) is posted to the URL as JSON, signed in\n`X-Temps-Signature` with the secret returned here, once. The URL must be\n`https://` and resolve to a public address.",
+        "description": "Each new public event of the page (an incident update or resolution, a\nscheduled maintenance window) is posted to the URL as JSON, signed in\n`X-Temps-Signature` with the secret returned here, once. The URL must be\n`https://` and resolve to a public address. `enabled` defaults to `true`.",
         "operationId": "create_status_page_webhook",
         "parameters": [
           {
@@ -196106,6 +197470,66 @@
           }
         ],
         "summary": "Delete a webhook",
+        "tags": [
+          "Status Page"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "description": "The same shape as in the list, with the outcome of its last delivery.\nThe signing secret is never returned again.",
+        "operationId": "get_status_page_webhook",
+        "parameters": [
+          {
+            "description": "Status page ID",
+            "in": "path",
+            "name": "status_page_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Webhook ID",
+            "in": "path",
+            "name": "webhook_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusPageWebhookResponse"
+                }
+              }
+            },
+            "description": "The webhook"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Status page or webhook not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One webhook of a status page",
         "tags": [
           "Status Page"
         ],
@@ -197368,6 +198792,63 @@
         ],
         "x-maturity": "beta"
       },
+      "get": {
+        "operationId": "get_team_member",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeamMemberResponse"
+                }
+              }
+            },
+            "description": "The membership"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The user is not a member of the team"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One member of a team, as listed.",
+        "tags": [
+          "Teams"
+        ],
+        "x-maturity": "beta"
+      },
       "patch": {
         "operationId": "update_team_member_role",
         "parameters": [
@@ -198577,6 +200058,54 @@
           }
         ],
         "summary": "Delete a user",
+        "tags": [
+          "Users"
+        ]
+      },
+      "get": {
+        "operationId": "get_user",
+        "parameters": [
+          {
+            "description": "User ID",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteUserWithRoles"
+                }
+              }
+            },
+            "description": "The user and their roles"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "User not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One user with their roles, as listed (deleted users included, with\n`deleted_at` set).",
         "tags": [
           "Users"
         ]
@@ -200322,7 +201851,7 @@
         "x-maturity": "experimental"
       },
       "put": {
-        "description": "With recording on, every outbound connection the sandbox makes through\nthe per-node egress proxy produces one OpenTelemetry log record when it\nends, allowed or refused: destination\n(`server.address`, `server.port`; method and path without the query for\nplain HTTP), outcome and refusal reason, bytes each way and duration.\nNever headers, bodies or query strings. Off by default. A sandbox needs\nno project to record. Turning it on fails with 422 when its node cannot\nrecord, naming the sandbox, the node and what is missing.",
+        "description": "With recording on, every outbound connection the sandbox makes through\nthe per-node egress proxy produces one OpenTelemetry log record when it\nends, allowed or refused: destination\n(`server.address`, `server.port`; method and path without the query for\nplain HTTP), outcome and refusal reason, bytes each way and duration.\nNever headers, bodies or query strings. Off by default. A sandbox needs\nno project to record. Turning it on fails with 422 when its node cannot\nrecord, naming the sandbox, the node and what is missing, or when the\nsandbox runs on a backend the recorder cannot see (only Docker sandboxes\nrecord; `reason_code` is then `not_recordable`).",
         "operationId": "set_egress_recording",
         "parameters": [
           {
@@ -200404,7 +201933,7 @@
                 }
               }
             },
-            "description": "Recording cannot work for this sandbox: its node cannot record"
+            "description": "Recording cannot work for this sandbox: its node cannot record, or its backend has no route to the recorder"
           },
           "500": {
             "content": {

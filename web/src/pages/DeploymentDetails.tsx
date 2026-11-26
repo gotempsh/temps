@@ -73,7 +73,7 @@ import {
 import { historicalImageRuntime } from '@/lib/template-runtime-defaults'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import GithubIcon from '@/icons/Github'
-import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useScreenshotsEnabled } from '@/hooks/useScreenshotsEnabled'
@@ -137,8 +137,12 @@ function formatDurationMs(ms?: number | null): string | null {
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
 }
 
-function formatRange(startMs: number, endMs: number): string {
-  const totalSeconds = Math.max(0, Math.round((endMs - startMs) / 1000))
+/** The time between two ISO 8601 instants, as "Xm Ys". */
+function formatRange(start: string, end: string): string {
+  const totalSeconds = Math.max(
+    0,
+    Math.round((Date.parse(end) - Date.parse(start)) / 1000)
+  )
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}m ${seconds}s`
@@ -1391,28 +1395,36 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     ])
   }, [setBreadcrumbs, project.slug, deploymentId])
 
-  // Tell the assistant which deployment the user is looking at.
-  const assistantContext = deployment
-    ? [
-        'The user is viewing a deployment in the Temps console.',
-        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
-        `Deployment #${deployment.id} — status: ${deployment.status ?? 'unknown'}${deployment.environment ? `, environment: ${deployment.environment}` : ''}.`,
-        deployment.branch ? `Branch: ${deployment.branch}.` : '',
-        deployment.commit_hash
-          ? `Commit: ${deployment.commit_hash.slice(0, 8)}${deployment.commit_message ? ` — ${deployment.commit_message.split('\n')[0]}` : ''}.`
-          : '',
-        deployment.cancelled_reason
-          ? `Failure reason: ${deployment.cancelled_reason}.`
-          : '',
-        deployment.failure
-          ? `Classified as ${deployment.failure.code} in the ${deployment.failure.stage} stage. Suggested fix: ${deployment.failure.remediation}`
-          : '',
-        'Fetch details via the temps CLI: `deployments get_deployment`, `get_deployment_jobs`, `get_deployment_job_logs`.',
-      ]
-        .filter(Boolean)
-        .join('\n')
-    : null
-  useAssistantPageContext(assistantContext, `deployment #${deploymentId}`)
+  // Declare what is on the page once, for "Hand off to agent" and the
+  // built-in assistant alike. The details below go to the assistant only: the
+  // handoff prompt carries the reference, never the record.
+  usePageSubject(
+    deployment
+      ? {
+          kind: 'deployment',
+          project: { id: project.id, slug: project.slug, name: project.name },
+          deploymentId: deployment.id,
+        }
+      : null,
+    {
+      assistantDetails: deployment
+        ? [
+            `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
+            `Deployment #${deployment.id} — status: ${deployment.status ?? 'unknown'}${deployment.environment?.name ? `, environment: ${deployment.environment.name}` : ''}.`,
+            deployment.branch ? `Branch: ${deployment.branch}.` : '',
+            deployment.commit_hash
+              ? `Commit: ${deployment.commit_hash.slice(0, 8)}${deployment.commit_message ? ` — ${deployment.commit_message.split('\n')[0]}` : ''}.`
+              : '',
+            deployment.cancelled_reason
+              ? `Failure reason: ${deployment.cancelled_reason}.`
+              : '',
+            deployment.failure
+              ? `Classified as ${deployment.failure.code} in the ${deployment.failure.stage} stage. Suggested fix: ${deployment.failure.remediation}`
+              : '',
+          ]
+        : [],
+    }
+  )
 
   // Invalidate jobs query when deployment status changes to ensure fresh job data
   useEffect(() => {

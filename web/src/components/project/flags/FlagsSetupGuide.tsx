@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { HAND_OFF_LABEL } from '@/lib/agent-handoff'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
   Card,
@@ -115,7 +116,7 @@ TEMPS_API_TOKEN=dt_...`}
               value={aiPrompt(flagKey, envQuery)}
               className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
             >
-              Copy AI prompt
+              {HAND_OFF_LABEL}
             </CopyButton>
           </div>
         </CardHeader>

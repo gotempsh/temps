@@ -18,62 +18,35 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar'
 import {
-  Activity,
-  Rocket,
   ArrowLeft,
   BadgeCheck,
-  BarChart3,
   ChevronsUpDown,
   Check,
-  Boxes,
-  Gauge,
+  LayoutGrid,
   LogOut,
   Monitor,
   Moon,
   Search,
   Settings,
   Sun,
-  Sparkles,
-  X,
 } from 'lucide-react'
-import { toast } from 'sonner'
 
-import { adminGetNodeOptions } from '@/api/client/@tanstack/react-query.gen'
-import type { ProjectResponse } from '@/api/client/types.gen'
-import { resolveConsoleScope } from '@/lib/console-scope'
-import {
-  ProjectGroupScopeNav,
-  ProjectScopeHeader,
-  ServiceScopeNav,
-} from './ProjectScopeNav'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
-import {
-  projectNavGroupsFor,
-  projectRoot,
-  resolveProjectLocation,
-} from '@/lib/project-navigation'
-import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
-import {
-  nodeRouteOf,
-  nodeSections,
-  nodeSectionUrl,
-  resolveNodeSection,
-} from '@/lib/node-detail'
-import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { SIDEBAR_HELP_LINKS } from '@/lib/support'
 import {
+  SETTINGS_OVERVIEW_URL,
   isSettingsSidebarRoute,
-  primaryPlatformGroups,
-  type PlatformNavItem,
+  setupMenuEntry,
 } from './primary-navigation'
+import { AskEntry } from '@/components/navigation/AskEntry'
+import { EntityTree } from '@/components/navigation/EntityTree'
 import { cn } from '@/lib/utils'
-import { useQuery } from '@tanstack/react-query'
 import { type LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { Link, useLocation, useNavigate } from 'react-router'
+import { useEffect, useMemo, useState } from 'react'
+import { Link, useLocation } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
   DropdownMenu,
@@ -90,48 +63,10 @@ import {
 import { useTheme } from 'next-themes'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import {
-  mergeSettingsNavigationGroups,
-  settingsNavigationGroups,
+  resolveSettingsTab,
   type SettingsNavigationIcon,
 } from '@/components/settings/settings-navigation'
-
-// AI drill-down — swapped in for /ai-gateway and /chat, mirroring the
-// Settings sidebar swap so AI's pages read as one coherent area instead of a
-// scattered set of sidebar entries. The assistant itself is reached from the
-// header's AI button, so the area holds only the gateway's pages.
-const AI_MODE_PREFIXES = ['/ai-gateway', '/chat']
-const aiNavItems: PlatformNavItem[] = [
-  {
-    title: 'Providers',
-    url: '/ai-gateway',
-    icon: Sparkles,
-    featureKey: 'ai-gateway',
-  },
-  {
-    title: 'Usage',
-    url: '/ai-gateway/usage',
-    icon: BarChart3,
-    featureKey: 'ai-gateway',
-  },
-  {
-    title: 'Models',
-    url: '/ai-gateway/models',
-    icon: Boxes,
-    featureKey: 'ai-gateway',
-  },
-  {
-    title: 'Limits',
-    url: '/ai-gateway/limits',
-    icon: Gauge,
-    featureKey: 'ai-gateway',
-  },
-  {
-    title: 'Activity',
-    url: '/ai-gateway/activity',
-    icon: Activity,
-    featureKey: 'ai-gateway',
-  },
-]
+import { useSettingsGroups } from '@/components/settings/use-settings-groups'
 
 function NavPlugins({
   items,
@@ -257,39 +192,22 @@ export default function AppSidebar() {
     [platformNavEntries]
   )
 
-  // Route-driven sidebar swap.
-  //   /settings/*            → settings nav (back → default)
-  //   /p/:slug/*             → the project's own nav
-  //   /projects/:slug/*      → the service's project nav, with the service
-  //                            open inside it (a standalone service keeps
-  //                            its own menu)
-  //   /settings/nodes/:id/*  → node nav (back → the node list)
-  //   anything else          → default (server-wide) nav
-  // /projects (the list) and /projects/new keep the default nav.
-  // Worker Nodes keeps its historical /settings/nodes URL but is a main-nav
-  // page ("Applications"). Swapping to the settings sidebar there would
-  // hide the entry that is currently active and highlight nothing, so the
-  // route is explicitly excluded from the settings swap.
+  // One menu everywhere: the tree of what the user owns, which opens to the
+  // project, service, database, domain or server shown. Only Settings swaps
+  // it for its own list of pages (back → the tree).
   const settingsMode = isSettingsSidebarRoute(location.pathname)
-  const nodeRoute = nodeRouteOf(location.pathname)
-  const aiMode = AI_MODE_PREFIXES.some((p) => location.pathname.startsWith(p))
-  const scope = resolveConsoleScope(location.pathname)
 
-  // Override: user pressed Back from the settings or AI swap; show DefaultNav
+  // Override: user pressed Back from the settings swap; show DefaultNav
   // only for that exact navigation. Keyed on `location.key` rather than
-  // pathname — a Link back to the very same URL (e.g. clicking "AI" again
+  // pathname — a Link back to the very same URL (clicking "Settings" again
   // right after backing out of it) still produces a new history entry with
   // a new key, so the override correctly drops and the swap re-triggers.
-  // A project's sidebar has no such override: its way out is a real link to
-  // every project, so the URL and the sidebar always agree.
   const [forceDefaultKey, setForceDefaultKey] = useState<string | null>(null)
   const forceDefault = forceDefaultKey === location.key
 
   const compact = isMinimal && !isMobile
 
-  const showDefault =
-    (forceDefault && (settingsMode || aiMode)) ||
-    (!settingsMode && !aiMode && scope.kind === 'global' && !nodeRoute)
+  const showDefault = forceDefault || !settingsMode
 
   return (
     <Sidebar>
@@ -334,31 +252,12 @@ export default function AppSidebar() {
       </SidebarHeader>
       <SidebarContent>
         <NavCommandTrigger />
-        <GettingStartedNavItem />
+        <AskEntry />
         {showDefault ? (
           <DefaultNav pluginItems={pluginItems} />
-        ) : settingsMode ? (
+        ) : (
           <SettingsNav onBack={() => setForceDefaultKey(location.key)} />
-        ) : aiMode ? (
-          <AiNav onBack={() => setForceDefaultKey(location.key)} />
-        ) : scope.kind === 'project' ? (
-          <ProjectGroupScopeNav slug={scope.groupSlug} route={scope.route} />
-        ) : scope.kind === 'service' ? (
-          <ServiceScopeNav
-            slug={scope.serviceSlug}
-            route={scope.route}
-            standalone={(service, notice) => (
-              <ProjectNav
-                slug={scope.serviceSlug}
-                route={scope.route}
-                project={service}
-                notice={notice}
-              />
-            )}
-          />
-        ) : nodeRoute ? (
-          <NodeNav nodeId={nodeRoute.nodeId} segment={nodeRoute.segment} />
-        ) : null}
+        )}
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
@@ -397,7 +296,8 @@ function NavSection({
   items,
   siblingUrls,
 }: {
-  label: string
+  /** Absent for entries that stand above the groups. */
+  label?: string
   items: {
     id?: string
     title: string
@@ -405,6 +305,8 @@ function NavSection({
     icon: SettingsNavigationIcon
     activeWhen?: (pathname: string) => boolean
     featureKey?: string
+    /** A short count beside the title, such as steps done. */
+    detail?: string
   }[]
   // URLs of items in OTHER sections that share the sidebar. Used so a
   // parent-like url (e.g. `/settings`) doesn't light up when a more
@@ -439,9 +341,11 @@ function NavSection({
     <SidebarGroup
       className={compact ? '' : 'group-data-[collapsible=icon]:hidden'}
     >
-      <SidebarGroupLabel className={compact ? 'hidden' : ''}>
-        {label}
-      </SidebarGroupLabel>
+      {label && (
+        <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+          {label}
+        </SidebarGroupLabel>
+      )}
       <SidebarMenu>
         {items.map((item) => {
           const isActive =
@@ -459,6 +363,11 @@ function NavSection({
                 <Link to={item.url}>
                   <item.icon />
                   {!compact && <span>{item.title}</span>}
+                  {!compact && item.detail && (
+                    <span className="ml-auto text-xs tabular-nums text-muted-foreground">
+                      {item.detail}
+                    </span>
+                  )}
                   {!compact && (
                     <FeatureMaturityBadge
                       featureKey={item.featureKey}
@@ -471,91 +380,6 @@ function NavSection({
           )
         })}
       </SidebarMenu>
-    </SidebarGroup>
-  )
-}
-
-// Persistent link to platform setup progress, pinned just below the Find
-// (⌘K) box at the top of the sidebar content so it shows on every page
-// regardless of which nav mode (default/settings/project) is active. Styled
-// as a bordered callout card (not a plain nav row) with a mini progress bar
-// so it reads as a distinct "you have setup left" prompt. Full checklist
-// detail lives on its own /setup page. Renders nothing once dismissed or
-// fully complete (same visibility rule as the /setup page). Once a step is done
-// it can be dismissed; /setup stays reachable from the command palette.
-function GettingStartedNavItem() {
-  const { isMinimal, isMobile } = useSidebar()
-  const compact = isMinimal && !isMobile
-  const { completedCount, totalCount, visible, canDismiss, dismiss } =
-    useGettingStarted()
-
-  if (!visible) return null
-
-  const pct = Math.round((completedCount / totalCount) * 100)
-
-  if (compact) {
-    return (
-      <SidebarGroup className="pb-0">
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              asChild
-              tooltip={`Platform setup — ${completedCount}/${totalCount}`}
-              className="justify-center"
-            >
-              <Link
-                to="/setup"
-                aria-label={`Platform setup, ${completedCount} of ${totalCount} steps complete`}
-              >
-                <BadgeCheck />
-              </Link>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarGroup>
-    )
-  }
-
-  return (
-    <SidebarGroup className="relative pb-0">
-      <Link
-        to="/setup"
-        className={cn(
-          'group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70',
-          canDismiss && 'pr-9'
-        )}
-      >
-        <div className="flex items-center gap-2">
-          <BadgeCheck className="size-4 shrink-0 text-primary" />
-          <span className="flex-1 text-sm font-medium">Platform setup</span>
-          <span className="text-xs tabular-nums text-muted-foreground">
-            {completedCount}/{totalCount}
-          </span>
-        </div>
-        <div className="h-1 w-full overflow-hidden rounded-full bg-sidebar-border">
-          <div
-            className="h-full rounded-full bg-primary transition-all duration-500"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-      </Link>
-      {canDismiss && (
-        <button
-          type="button"
-          aria-label="Hide platform setup"
-          title="Hide platform setup"
-          className="absolute right-3.5 top-4 flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-          onClick={() => {
-            dismiss()
-            toast('Platform setup hidden', {
-              description:
-                'Open it again from ⌘K: search for "Finish setting up".',
-            })
-          }}
-        >
-          <X className="size-3.5" />
-        </button>
-      )}
     </SidebarGroup>
   )
 }
@@ -801,28 +625,12 @@ function ExtensionNav({ items }: { items?: ConsoleNavItem[] }) {
 function DefaultNav({ pluginItems }: NavProps) {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-
+  const location = useLocation()
   const { navItems: extraNavItems } = useConsoleExtensions()
-  const platformUrls = useMemo(
-    () =>
-      primaryPlatformGroups.flatMap((group) =>
-        group.items.map((item) => item.url)
-      ),
-    []
-  )
 
   return (
     <>
-      {primaryPlatformGroups.map((group) => (
-        <NavSection
-          key={group.label}
-          label={group.label}
-          items={group.items}
-          siblingUrls={platformUrls.filter(
-            (url) => !group.items.some((item) => item.url === url)
-          )}
-        />
-      ))}
+      <EntityTree />
       <NavPlugins items={pluginItems} />
       <ExtensionNav items={extraNavItems} />
       <SidebarGroup className="mt-auto">
@@ -831,9 +639,13 @@ function DefaultNav({ pluginItems }: NavProps) {
             <SidebarMenuButton
               asChild
               tooltip={compact ? 'Settings' : undefined}
-              className={compact ? 'justify-center' : 'justify-start'}
+              className={cn(
+                compact ? 'justify-center' : 'justify-start',
+                isSettingsSidebarRoute(location.pathname) &&
+                  'bg-sidebar-accent text-sidebar-accent-foreground'
+              )}
             >
-              <Link to="/settings">
+              <Link to={SETTINGS_OVERVIEW_URL}>
                 <Settings />
                 {!compact && <span>Settings</span>}
               </Link>
@@ -845,31 +657,48 @@ function DefaultNav({ pluginItems }: NavProps) {
   )
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Settings nav — replaces the whole sidebar when on /settings/*.
-// Back button returns to root.
-// ─────────────────────────────────────────────────────────────────────────────
+const SETTINGS_OVERVIEW_ITEM = {
+  title: 'Overview',
+  url: SETTINGS_OVERVIEW_URL,
+  icon: LayoutGrid,
+}
 
 function SettingsNav({ onBack }: { onBack: () => void }) {
-  // Extension-provided links (e.g. an identity-provider page from a
-  // console extension) join the built-in groups here, so instance
-  // configuration lands in Settings rather than the workspace nav.
-  const { settingsNavItems: extensionSettingsItems } = useConsoleExtensions()
-  const groups = useMemo(
-    () =>
-      mergeSettingsNavigationGroups(
-        settingsNavigationGroups,
-        extensionSettingsItems
-      ),
-    [extensionSettingsItems]
-  )
-  // Every url across every settings group. Each section gets the list
-  // minus its own items so active-state resolution sees the full tree
-  // (prevents `/settings` lighting up on `/settings/keys`).
-  const allSettingsUrls = groups.flatMap((g) => g.items.map((i) => i.url))
+  // The built-in groups, the links extensions add (an identity-provider
+  // page from a console extension), and the audit log only for the roles
+  // that can read it.
+  const groups = useSettingsGroups()
+  const { pathname } = useLocation()
+  // Every url across every settings group, tabs included. Each section gets
+  // the list minus its own items so active-state resolution sees the full
+  // tree (prevents `/settings` lighting up on `/settings/keys`).
+  const allSettingsUrls = [
+    SETTINGS_OVERVIEW_URL,
+    ...groups.flatMap((g) =>
+      g.items.flatMap((i) => [i.url, ...(i.tabs ?? []).map((t) => t.url)])
+    ),
+  ]
+  const tabbed = resolveSettingsTab(pathname, groups)?.item
+  // What is left to set up is listed here until it is done or dismissed.
+  const setup = setupMenuEntry(useGettingStarted())
   return (
     <>
       <SwapHeader title="Settings" onBack={onBack} backLabel="Back to menu" />
+      <NavSection
+        items={
+          setup
+            ? [
+                SETTINGS_OVERVIEW_ITEM,
+                {
+                  ...setup,
+                  icon: BadgeCheck,
+                  activeWhen: (path) => path === setup.url,
+                },
+              ]
+            : [SETTINGS_OVERVIEW_ITEM]
+        }
+        siblingUrls={allSettingsUrls}
+      />
       {groups.map((group) => {
         const ownUrls = new Set(group.items.map((i) => i.url))
         const siblings = allSettingsUrls.filter((u) => !ownUrls.has(u))
@@ -877,7 +706,15 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
           <NavSection
             key={group.label}
             label={group.label}
-            items={group.items}
+            // An entry with several pages is the one shown on any of them.
+            items={group.items.map((item) => {
+              const { ownsPath } = item
+              if (ownsPath)
+                return { ...item, activeWhen: () => ownsPath(pathname) }
+              return item.tabs
+                ? { ...item, activeWhen: () => item === tabbed }
+                : item
+            })}
             siblingUrls={siblings}
           />
         )
@@ -890,177 +727,6 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
 // AI nav — replaces the whole sidebar for the AI area (Providers, Usage,
 // Limits, Activity). Back button returns to root.
 // ─────────────────────────────────────────────────────────────────────────────
-
-function AiNav({ onBack }: { onBack: () => void }) {
-  return (
-    <>
-      <SwapHeader title="AI" onBack={onBack} backLabel="Back to menu" />
-      <NavSection label="AI" items={aiNavItems} />
-    </>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Project nav — replaces the whole sidebar when on /projects/:slug/*.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// A standalone service's menu: its pages grouped by job. Each section's own
-// pages are tabs on the page, so this stays one level deep. A
-// monitoring-only service gets the sections it has, plus a way to add
-// hosting. A service inside a project gets its project's sidebar instead
-// (`ServiceScopeNav`).
-function ProjectNav({
-  slug,
-  route,
-  project,
-  notice,
-}: {
-  slug: string
-  route: string
-  project: ProjectResponse | undefined
-  /** Shown under the header, such as a failed project lookup. */
-  notice?: ReactNode
-}) {
-  const location = useLocation()
-  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
-  const compact = isMinimal && !isMobile
-  const root = projectRoot(slug)
-  // "Add hosting" is a page of its own, not part of any section.
-  const onHosting = route === 'hosting' || route.startsWith('hosting/')
-  const active = onHosting ? null : resolveProjectLocation(route).section.id
-  // Until the project loads, show the full menu most projects have.
-  const groups = projectNavGroupsFor(project ?? {})
-  // Keep the environment chosen in the project bar when switching sections.
-  const env = new URLSearchParams(location.search).get(ENVIRONMENT_PARAM)
-  const query = env ? `?${ENVIRONMENT_PARAM}=${encodeURIComponent(env)}` : ''
-  return (
-    <>
-      <ProjectScopeHeader title={project?.name ?? 'Loading…'} />
-      {notice}
-      {groups.map((group, index) => (
-        <SidebarGroup
-          key={group.label ?? index}
-          className={index === 0 ? 'py-2' : 'py-0'}
-        >
-          {group.label && (
-            <SidebarGroupLabel className={compact ? 'hidden' : ''}>
-              {group.label}
-            </SidebarGroupLabel>
-          )}
-          <SidebarMenu aria-label={group.label ?? 'Project'}>
-            {group.sections.map((section) => {
-              const Icon = section.icon
-              const isActive = active === section.id
-              return (
-                <SidebarMenuItem key={section.id} data-tour={section.id}>
-                  <SidebarMenuButton
-                    asChild
-                    tooltip={compact ? section.title : undefined}
-                    className={cn(
-                      compact ? 'justify-center' : 'justify-start',
-                      isActive &&
-                        'bg-sidebar-accent text-sidebar-accent-foreground'
-                    )}
-                  >
-                    <Link
-                      to={`${root}/${section.tabs[0].url}${query}`}
-                      aria-current={isActive ? 'page' : undefined}
-                      onClick={() => isMobile && setOpenMobile(false)}
-                    >
-                      <Icon />
-                      {!compact && <span>{section.title}</span>}
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              )
-            })}
-          </SidebarMenu>
-        </SidebarGroup>
-      ))}
-      {project?.source_type === 'external' && (
-        <SidebarGroup className="py-0">
-          <SidebarMenu aria-label="Hosting">
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                asChild
-                tooltip={compact ? 'Add hosting' : undefined}
-                className={cn(
-                  compact ? 'justify-center' : 'justify-start',
-                  onHosting &&
-                    'bg-sidebar-accent text-sidebar-accent-foreground'
-                )}
-              >
-                <Link
-                  to={`${root}/hosting`}
-                  aria-current={onHosting ? 'page' : undefined}
-                  onClick={() => isMobile && setOpenMobile(false)}
-                >
-                  <Rocket />
-                  {!compact && <span>Add hosting</span>}
-                </Link>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
-        </SidebarGroup>
-      )}
-    </>
-  )
-}
-
-/**
- * A node's sections, like a project's. Back leads to the node list: unlike a
- * project, a node is reached from there, not from the main menu.
- */
-function NodeNav({
-  nodeId,
-  segment,
-}: {
-  nodeId: number
-  segment: string | undefined
-}) {
-  const { data: node } = useQuery(
-    adminGetNodeOptions({ path: { node_id: nodeId } })
-  )
-  const navigate = useNavigate()
-  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
-  const compact = isMinimal && !isMobile
-  const active = resolveNodeSection(segment, node?.role)
-  return (
-    <>
-      <SwapHeader
-        title={node?.name ?? 'Loading…'}
-        onBack={() => navigate(WORKER_NODES_URL)}
-        backLabel="Back to worker nodes"
-      />
-      <SidebarGroup className="py-2">
-        <SidebarMenu aria-label="Node navigation">
-          {nodeSections(node?.role).map((item) => (
-            <SidebarMenuItem key={item.section}>
-              <SidebarMenuButton
-                asChild
-                tooltip={compact ? item.title : undefined}
-                className={cn(
-                  compact ? 'justify-center' : 'justify-start',
-                  active === item.section &&
-                    'bg-sidebar-accent text-sidebar-accent-foreground'
-                )}
-              >
-                <Link
-                  to={nodeSectionUrl(nodeId, item.section)}
-                  aria-current={active === item.section ? 'page' : undefined}
-                  onClick={() => isMobile && setOpenMobile(false)}
-                >
-                  <item.icon />
-                  {!compact && <span>{item.title}</span>}
-                </Link>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          ))}
-        </SidebarMenu>
-      </SidebarGroup>
-    </>
-  )
-}
 
 // Shared back-arrow header used by Settings, Project, and drill-down
 // sub-views. `onBack` is a state callback — it never navigates.

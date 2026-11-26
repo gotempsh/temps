@@ -360,6 +360,7 @@ impl From<BackupCapabilityError> for Problem {
             S3ConnectionTestResponse,
             BackupScheduleResponse,
             BackupResponse,
+            BackupList,
             ExternalServiceSummary,
             ExternalServiceBackupCapabilityResponse,
             ExternalServiceBackupResponse,
@@ -830,8 +831,8 @@ pub struct S3SourceResponse {
     pub managed_by_cloud: bool,
     /// What a worker node receives from this source (ADR-102).
     pub worker_credentials: WorkerCredentialsPolicy,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Response body for an S3 connection test.
@@ -854,12 +855,12 @@ pub struct BackupScheduleResponse {
     #[schema(example = "0 0 3 * * *")]
     pub schedule_expression: String,
     pub enabled: bool,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub description: Option<String>,
     pub tags: Vec<String>,
-    pub next_run: Option<i64>,
-    pub last_run: Option<i64>,
+    pub next_run: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_run: Option<chrono::DateTime<chrono::Utc>>,
     /// Per-schedule wall-clock timeout override for backup jobs (seconds).
     /// `null` means the default of four hours (14400 seconds) is used.
     pub max_runtime_secs: Option<i64>,
@@ -914,8 +915,8 @@ pub struct BackupResponse {
     pub schedule_id: Option<i32>,
     pub backup_type: String,
     pub state: String,
-    pub started_at: i64,
-    pub completed_at: Option<i64>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Final size of the backup once completed. Null while running.
     pub size_bytes: Option<i64>,
     /// Best-effort partial size while a backup is still running, computed
@@ -930,7 +931,7 @@ pub struct BackupResponse {
     pub checksum: Option<String>,
     pub compression_type: String,
     pub created_by: i32,
-    pub expires_at: Option<i64>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub tags: Vec<String>,
     /// External service that owns this backup (Redis, Postgres, etc.).
     /// `null` for control-plane backups (the Temps server's own database).
@@ -951,6 +952,12 @@ pub struct BackupResponse {
     /// caller override → schedule override → engine default.
     pub max_runtime_secs: Option<i64>,
 }
+
+temps_core::paginated_response!(
+    /// One page of a schedule's backups, newest first.
+    BackupList,
+    BackupResponse
+);
 
 /// Response type for source backup index
 #[derive(Serialize, ToSchema)]
@@ -1049,8 +1056,8 @@ impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
             is_default: source.is_default,
             managed_by_cloud: source.managed_by_cloud,
             worker_credentials: WorkerCredentialsPolicy::from_column(&source.worker_credentials),
-            created_at: source.created_at.timestamp_millis(),
-            updated_at: source.updated_at.timestamp_millis(),
+            created_at: source.created_at,
+            updated_at: source.updated_at,
         }
     }
 }
@@ -1065,12 +1072,12 @@ impl From<temps_entities::backup_schedules::Model> for BackupScheduleResponse {
             s3_source_id: schedule.s3_source_id,
             schedule_expression: schedule.schedule_expression,
             enabled: schedule.enabled,
-            created_at: schedule.created_at.timestamp_millis(),
-            updated_at: schedule.updated_at.timestamp_millis(),
+            created_at: schedule.created_at,
+            updated_at: schedule.updated_at,
             description: schedule.description,
             tags: serde_json::from_str(&schedule.tags).unwrap_or_default(),
-            next_run: schedule.next_run.map(|dt| dt.timestamp_millis()),
-            last_run: schedule.last_run.map(|dt| dt.timestamp_millis()),
+            next_run: schedule.next_run,
+            last_run: schedule.last_run,
             max_runtime_secs: schedule.max_runtime_secs,
             target_all_services: schedule.target_all_services,
             include_control_plane: schedule.include_control_plane,
@@ -1097,8 +1104,8 @@ impl From<temps_entities::backups::Model> for BackupResponse {
             schedule_id: backup.schedule_id,
             backup_type: backup.backup_type,
             state: backup.state,
-            started_at: backup.started_at.timestamp_millis(),
-            completed_at: backup.finished_at.map(|dt| dt.timestamp_millis()),
+            started_at: backup.started_at,
+            completed_at: backup.finished_at,
             size_bytes: backup.size_bytes,
             live_size_bytes: None,
             file_count: backup.file_count,
@@ -1109,7 +1116,7 @@ impl From<temps_entities::backups::Model> for BackupResponse {
             checksum: backup.checksum,
             compression_type: backup.compression_type,
             created_by: backup.created_by,
-            expires_at: backup.expires_at.map(|dt| dt.timestamp_millis()),
+            expires_at: backup.expires_at,
             tags: serde_json::from_str(&backup.tags).unwrap_or_default(),
             // Populated by the handler when the linked external service is available.
             external_service: None,
@@ -2285,8 +2292,12 @@ async fn delete_backup_schedule(
     tag = "Backups",
     get,
     path = "/backups/schedules/{id}/backups",
+    params(
+        ("id" = i32, Path, description = "Backup schedule ID"),
+        temps_core::PageQuery
+    ),
     responses(
-        (status = 200, description = "List of backups for the schedule", body = Vec<BackupResponse>),
+        (status = 200, description = "One page of the schedule's backups, newest first", body = BackupList),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup schedule not found"),
@@ -2300,6 +2311,7 @@ async fn list_backups_for_schedule(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<BackupAppState>>,
     Path(id): Path<i32>,
+    axum::extract::Query(page): axum::extract::Query<temps_core::PageQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
     require_schedule_access(
@@ -2322,12 +2334,12 @@ async fn list_backups_for_schedule(
         "list historical backups for this schedule",
     )
     .await?;
-    let backups = app_state
+    let (backups, total) = app_state
         .backup_service
-        .list_backups_for_schedule(id)
+        .list_backups_for_schedule(id, page)
         .await?;
     let responses: Vec<BackupResponse> = backups.into_iter().map(Into::into).collect();
-    Ok(Json(responses))
+    Ok(Json(BackupList::new(responses, total, page)))
 }
 
 /// Query parameters for `GET /api/backups/schedules/{id}/runs`.

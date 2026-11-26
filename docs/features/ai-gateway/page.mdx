@@ -157,7 +157,7 @@ If two keys that reach different upstreams both serve the same model ID, the req
 
 ## Self-hosted Providers {{ anchor: true, id: 'self-hosted' }}
 
-Add a **Self-hosted (OpenAI-compatible)** provider to use a model server on your own network, such as MLX, vLLM, llama.cpp, LM Studio or Ollama's OpenAI API:
+Add an **OpenAI API** provider to use any server that speaks the OpenAI protocol, including a model server on your own network, such as MLX, vLLM, llama.cpp, LM Studio or Ollama's OpenAI API:
 
 1. Enter the server's base URL including `/v1`, for example `http://10.0.0.5:8000/v1`. The API key is optional, since many local servers run without authentication.
 2. Allow Temps to reach the address. Private and loopback addresses are blocked by default. Either an administrator enables **Trust this private address for this key only**, which lets this one key reach that exact IP address and port, or the address is added under **Settings → Security → Trusted private networks**, which every outbound feature honours. Trusting on the key requires the base URL to use an IP address, and cloud metadata and link-local addresses can never be trusted.

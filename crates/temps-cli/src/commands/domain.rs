@@ -8,7 +8,7 @@
 //! managing certificate orders, and importing custom certificates.
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use colored::Colorize;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -354,22 +354,22 @@ struct DomainResponse {
     id: i32,
     domain: String,
     status: String,
-    expiration_time: Option<i64>,
-    last_renewed: Option<i64>,
+    expiration_time: Option<DateTime<Utc>>,
+    last_renewed: Option<DateTime<Utc>>,
     dns_challenge_token: Option<String>,
     dns_challenge_value: Option<String>,
     last_error: Option<String>,
     last_error_type: Option<String>,
     is_wildcard: bool,
     verification_method: String,
-    created_at: i64,
-    updated_at: i64,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
     certificate: Option<String>,
     /// On-demand TLS negative-cache deadline (ADR-018). Present once the
     /// backend `DomainResponse` is extended in Layer 7; absent on older
     /// servers, so it is `serde(default)` for forward/backward compat.
     #[serde(default)]
-    on_demand_backoff_until: Option<i64>,
+    on_demand_backoff_until: Option<DateTime<Utc>>,
 }
 
 /// Latest on-demand TLS issuance attempt for a hostname (ADR-018 §5).
@@ -384,7 +384,7 @@ struct CertStatusResponse {
     /// `active`, `on_demand_failed`, ...). `None` when no domain row exists yet.
     status: Option<String>,
     /// Negative-cache deadline; set while in a failed backoff window.
-    backoff_until: Option<i64>,
+    backoff_until: Option<DateTime<Utc>>,
     /// The most recent attempt row, if any attempts have been recorded.
     last_attempt: Option<CertAttemptResponse>,
 }
@@ -402,7 +402,7 @@ struct CertAttemptResponse {
     error_chain: Option<String>,
     error_category: Option<String>,
     duration_ms: Option<i32>,
-    created_at: i64,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -454,9 +454,9 @@ struct AcmeOrderResponse {
     certificate_url: Option<String>,
     error: Option<String>,
     error_type: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-    expires_at: Option<i64>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
     challenge_validation: Option<ChallengeValidationStatus>,
 }
 
@@ -608,19 +608,18 @@ fn diagnostic_api_url(url: &str) -> String {
 }
 
 // ========================================
-// Helper: format millis timestamp
+// Helper: format API timestamps
 // ========================================
+//
+// The domains API sends every timestamp as an ISO 8601 string, which the
+// response types decode straight into `DateTime<Utc>`.
 
-fn format_millis_timestamp(millis: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(millis)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "N/A".to_string())
+fn format_timestamp(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
 }
 
-fn format_millis_date(millis: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(millis)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "N/A".to_string())
+fn format_date(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%d").to_string()
 }
 
 // ========================================
@@ -871,7 +870,7 @@ fn print_domain_details(domain: &DomainResponse) {
         println!(
             "  {} {}",
             "Expires:".bright_white(),
-            format_millis_timestamp(exp).bright_cyan()
+            format_timestamp(exp).bright_cyan()
         );
     }
 
@@ -994,7 +993,7 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
 
             let backoff = domain
                 .on_demand_backoff_until
-                .map(format_millis_timestamp)
+                .map(format_timestamp)
                 .unwrap_or_else(|| "-".to_string());
 
             println!(
@@ -1036,7 +1035,7 @@ async fn execute_list_api(cmd: ListDomainsApiCommand) -> anyhow::Result<()> {
 
         let expiration = domain
             .expiration_time
-            .map(format_millis_date)
+            .map(format_date)
             .unwrap_or_else(|| "N/A".to_string());
 
         println!(
@@ -1106,18 +1105,18 @@ async fn execute_show(cmd: ShowDomainCommand) -> anyhow::Result<()> {
     println!(
         "  {} {}",
         "Created:".bright_white(),
-        format_millis_timestamp(domain_resp.created_at).bright_cyan()
+        format_timestamp(domain_resp.created_at).bright_cyan()
     );
     println!(
         "  {} {}",
         "Updated:".bright_white(),
-        format_millis_timestamp(domain_resp.updated_at).bright_cyan()
+        format_timestamp(domain_resp.updated_at).bright_cyan()
     );
     if let Some(renewed) = domain_resp.last_renewed {
         println!(
             "  {} {}",
             "Last Renewed:".bright_white(),
-            format_millis_timestamp(renewed).bright_cyan()
+            format_timestamp(renewed).bright_cyan()
         );
     }
 
@@ -1330,7 +1329,7 @@ async fn execute_cert_status(cmd: CertStatusCommand) -> anyhow::Result<()> {
         println!(
             "  {} {}",
             "Backoff Until:".bright_white(),
-            format_millis_timestamp(backoff).bright_yellow()
+            format_timestamp(backoff).bright_yellow()
         );
     }
 
@@ -1349,7 +1348,7 @@ async fn execute_cert_status(cmd: CertStatusCommand) -> anyhow::Result<()> {
             println!(
                 "    {} {}",
                 "When:".bright_white(),
-                format_millis_timestamp(attempt.created_at).bright_cyan()
+                format_timestamp(attempt.created_at).bright_cyan()
             );
             println!(
                 "    {} {}",
@@ -1586,14 +1585,14 @@ async fn execute_order_show(cmd: OrderShowCommand) -> anyhow::Result<()> {
     println!(
         "  {} {}",
         "Created:".bright_white(),
-        format_millis_timestamp(order_resp.created_at).bright_cyan()
+        format_timestamp(order_resp.created_at).bright_cyan()
     );
 
     if let Some(expires) = order_resp.expires_at {
         println!(
             "  {} {}",
             "Expires:".bright_white(),
-            format_millis_timestamp(expires).bright_cyan()
+            format_timestamp(expires).bright_cyan()
         );
     }
 
@@ -1833,7 +1832,7 @@ async fn execute_order_list(cmd: OrderListCommand) -> anyhow::Result<()> {
             order.domain_id.to_string().bright_cyan(),
             status_colored,
             order.email,
-            format_millis_date(order.created_at)
+            format_date(order.created_at)
         );
     }
 
@@ -2286,19 +2285,48 @@ MIIBkTCB+wIJAKHBfpeg...
     }
 
     #[test]
-    fn test_format_millis_timestamp() {
-        let millis = 1700000000000_i64; // 2023-11-14
-        let formatted = format_millis_timestamp(millis);
-        assert!(formatted.contains("2023"));
-        assert!(formatted.contains("UTC"));
+    fn test_format_timestamp() {
+        let at: DateTime<Utc> = "2023-11-14T22:13:20.250Z".parse().unwrap();
+        assert_eq!(format_timestamp(at), "2023-11-14 22:13:20 UTC");
     }
 
     #[test]
-    fn test_format_millis_date() {
-        let millis = 1700000000000_i64;
-        let formatted = format_millis_date(millis);
-        assert!(formatted.contains("2023"));
-        assert!(!formatted.contains("UTC"));
+    fn test_format_date() {
+        let at: DateTime<Utc> = "2023-11-14T22:13:20Z".parse().unwrap();
+        assert_eq!(format_date(at), "2023-11-14");
+    }
+
+    /// The domains API sends ISO 8601 strings; the epoch-millis numbers older
+    /// builds of the CLI expected no longer decode, rather than turning into
+    /// a wrong date.
+    #[test]
+    fn domain_timestamps_decode_from_iso_8601() {
+        let domain = |created_at: &str| {
+            serde_json::from_str::<DomainResponse>(&format!(
+                r#"{{"id":1,"domain":"example.com","status":"active","expiration_time":null,
+                    "last_renewed":null,"dns_challenge_token":null,"dns_challenge_value":null,
+                    "last_error":null,"last_error_type":null,"is_wildcard":false,
+                    "verification_method":"http-01","created_at":{created_at},
+                    "updated_at":"2023-11-14T22:13:20Z","certificate":null}}"#
+            ))
+        };
+        let parsed = domain(r#""2023-11-14T22:13:20Z""#).expect("an ISO timestamp decodes");
+        assert_eq!(parsed.created_at.timestamp_millis(), 1_700_000_000_000);
+        assert!(domain("1700000000000").is_err());
+
+        let order: AcmeOrderResponse = serde_json::from_value(serde_json::json!({
+            "id": 2, "order_url": "https://acme.test/order/2", "domain_id": 1,
+            "email": "ops@example.com", "status": "pending", "identifiers": [],
+            "authorizations": null, "finalize_url": null, "certificate_url": null,
+            "error": null, "error_type": null,
+            "created_at": "2023-11-14T22:13:20Z", "updated_at": "2023-11-14T22:13:20Z",
+            "expires_at": "2023-11-21T22:13:20Z", "challenge_validation": null
+        }))
+        .expect("an ACME order with ISO timestamps decodes");
+        assert_eq!(
+            order.expires_at.map(format_date).as_deref(),
+            Some("2023-11-21")
+        );
     }
 
     #[test]
@@ -2375,7 +2403,7 @@ MIIBkTCB+wIJAKHBfpeg...
         let json = r#"{
             "hostname": "myapp.1.2.3.4.sslip.io",
             "status": "on_demand_failed",
-            "backoff_until": 1700000000000,
+            "backoff_until": "2023-11-14T22:13:20Z",
             "last_attempt": {
                 "id": 7,
                 "hostname": "myapp.1.2.3.4.sslip.io",
@@ -2387,7 +2415,7 @@ MIIBkTCB+wIJAKHBfpeg...
                 "error_chain": "rate limited\n  caused by: too many certificates",
                 "error_category": "rate_limited",
                 "duration_ms": 4200,
-                "created_at": 1700000000000
+                "created_at": "2023-11-14T22:13:20.500Z"
             }
         }"#;
         let parsed: CertStatusResponse = serde_json::from_str(json).unwrap();
@@ -2396,6 +2424,11 @@ MIIBkTCB+wIJAKHBfpeg...
         assert_eq!(attempt.error_category.as_deref(), Some("rate_limited"));
         assert_eq!(attempt.challenge_served, Some(true));
         assert_eq!(attempt.duration_ms, Some(4200));
+        assert_eq!(attempt.created_at.timestamp_millis(), 1_700_000_000_500);
+        assert_eq!(
+            parsed.backoff_until.map(format_timestamp).as_deref(),
+            Some("2023-11-14 22:13:20 UTC")
+        );
     }
 
     #[test]
@@ -2414,8 +2447,8 @@ MIIBkTCB+wIJAKHBfpeg...
             "last_error_type": null,
             "is_wildcard": false,
             "verification_method": "http-01",
-            "created_at": 1700000000000,
-            "updated_at": 1700000000000,
+            "created_at": "2023-11-14T22:13:20Z",
+            "updated_at": "2023-11-14T22:13:20Z",
             "certificate": null
         }"#;
         let parsed: DomainResponse = serde_json::from_str(json).unwrap();
@@ -2423,7 +2456,7 @@ MIIBkTCB+wIJAKHBfpeg...
     }
 
     #[tokio::test]
-    async fn domain_list_uses_api_prefix_and_decodes_millis_and_pem() {
+    async fn domain_list_uses_api_prefix_and_decodes_iso_timestamps_and_pem() {
         async fn domains(headers: HeaderMap) -> impl IntoResponse {
             if headers
                 .get(header::AUTHORIZATION)
@@ -2438,10 +2471,10 @@ MIIBkTCB+wIJAKHBfpeg...
                     "id": 7,
                     "domain": "example.com",
                     "status": "active",
-                    "expiration_time": 1796278035000_i64,
-                    "last_renewed": 1788505547092_i64,
-                    "created_at": 1788505084030_i64,
-                    "updated_at": 1788505547092_i64,
+                    "expiration_time": "2026-12-01T05:27:15Z",
+                    "last_renewed": "2026-09-02T23:05:47.092Z",
+                    "created_at": "2026-09-02T22:58:04.030Z",
+                    "updated_at": "2026-09-02T23:05:47.092Z",
                     "certificate": "-----BEGIN CERTIFICATE-----\nMIIB-test-chain\n-----END CERTIFICATE-----\n",
                     "is_wildcard": false,
                     "verification_method": "dns-01"
@@ -2490,9 +2523,9 @@ MIIBkTCB+wIJAKHBfpeg...
                 "id": 7,
                 "domain": hostname,
                 "status": "active",
-                "expiration_time": 1796278035000_i64,
-                "created_at": 1788505084030_i64,
-                "updated_at": 1788505547092_i64,
+                "expiration_time": "2026-12-01T05:27:15Z",
+                "created_at": "2026-09-02T22:58:04.030Z",
+                "updated_at": "2026-09-02T23:05:47.092Z",
                 "certificate": "-----BEGIN CERTIFICATE-----\nMIIB-test-chain\n-----END CERTIFICATE-----\n",
                 "is_wildcard": true,
                 "verification_method": "dns-01"

@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
+import {
+  getDeploymentContainerLogContentOptions,
+  listDeploymentContainerLogsOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -11,64 +14,10 @@ import { useQuery } from '@tanstack/react-query'
 import { Download, FileText, ScrollText } from 'lucide-react'
 import { useState } from 'react'
 
-// These types mirror the backend DeploymentContainerLog* response DTOs. Once
-// the OpenAPI SDK is regenerated (bun run openapi-ts) the generated
-// types/wrappers can replace these and the raw `client.get` calls below.
-interface DeploymentContainerLog {
-  id: number
-  deployment_id: number
-  container_id: string
-  container_name: string
-  service_name: string | null
-  node_id: number | null
-  size_bytes: number
-  truncated: boolean
-  captured_at: number
-}
-
-interface DeploymentContainerLogsListResponse {
-  logs: DeploymentContainerLog[]
-}
-
-interface DeploymentContainerLogContentResponse {
-  id: number
-  container_name: string
-  service_name: string | null
-  size_bytes: number
-  truncated: boolean
-  captured_at: number
-  content: string
-}
-
-const bearer = [{ scheme: 'bearer' as const, type: 'http' as const }]
-
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-}
-
-async function fetchCapturedLogs(
-  projectId: number,
-  deploymentId: number
-): Promise<DeploymentContainerLogsListResponse> {
-  const response = await client.get({
-    url: `/projects/${projectId}/deployments/${deploymentId}/container-logs`,
-    security: bearer,
-  })
-  return response.data as DeploymentContainerLogsListResponse
-}
-
-async function fetchCapturedLogContent(
-  projectId: number,
-  deploymentId: number,
-  logId: number
-): Promise<DeploymentContainerLogContentResponse> {
-  const response = await client.get({
-    url: `/projects/${projectId}/deployments/${deploymentId}/container-logs/${logId}`,
-    security: bearer,
-  })
-  return response.data as DeploymentContainerLogContentResponse
 }
 
 interface DeploymentContainerLogsProps {
@@ -92,20 +41,20 @@ export function DeploymentContainerLogs({
     isPending,
     isError,
   } = useQuery({
-    queryKey: ['deployment-container-logs', projectId, deploymentId],
-    queryFn: () => fetchCapturedLogs(projectId, deploymentId),
+    ...listDeploymentContainerLogsOptions({
+      path: { project_id: projectId, deployment_id: deploymentId },
+    }),
     enabled: projectId > 0 && deploymentId > 0,
   })
 
   const { data: content, isPending: isContentPending } = useQuery({
-    queryKey: [
-      'deployment-container-log-content',
-      projectId,
-      deploymentId,
-      selectedLogId,
-    ],
-    queryFn: () =>
-      fetchCapturedLogContent(projectId, deploymentId, selectedLogId as number),
+    ...getDeploymentContainerLogContentOptions({
+      path: {
+        project_id: projectId,
+        deployment_id: deploymentId,
+        log_id: selectedLogId ?? 0,
+      },
+    }),
     enabled: selectedLogId != null,
   })
 

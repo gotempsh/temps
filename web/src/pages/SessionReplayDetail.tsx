@@ -18,6 +18,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import {
   Button,
   Detail,
@@ -248,6 +249,22 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
     }),
     enabled: !!visitorId && !!sessionId,
   })
+  const visitor = Number(visitorId)
+  const session = Number(sessionId)
+  usePageSubject(
+    sessionData &&
+      Number.isSafeInteger(visitor) &&
+      visitor > 0 &&
+      Number.isSafeInteger(session) &&
+      session > 0
+      ? {
+          kind: 'session_replay',
+          project: { id: project.id, slug: project.slug, name: project.name },
+          visitorId: visitor,
+          sessionId: session,
+        }
+      : null
+  )
   const { data: eventsData } = useQuery({
     ...getSessionReplayEventsOptions({
       path: {
