@@ -94,6 +94,23 @@ export interface SessionReplaySubject {
   sessionId: number
 }
 
+export interface DeploymentSubject {
+  kind: 'deployment'
+  project: HandoffProject
+  deploymentId: number
+}
+
+/** One request the proxy served. */
+export interface ProxyLogSubject {
+  kind: 'proxy_log'
+  /** The request ID list links carry, or the numeric ID of an older link. */
+  logId: string
+  /** Set on a project's own request log page. */
+  project?: HandoffProject
+  /** The project the instance-wide page was opened with, when it has one. */
+  projectId?: number
+}
+
 export type HandoffSubject =
   | SandboxSubject
   | TraceSubject
@@ -101,6 +118,8 @@ export type HandoffSubject =
   | RuntimeLogsHistorySubject
   | RuntimeLogsLiveSubject
   | SessionReplaySubject
+  | DeploymentSubject
+  | ProxyLogSubject
 
 export type HandoffSubjectKind = HandoffSubject['kind']
 
@@ -158,6 +177,8 @@ export const MAX_LABEL_LENGTH = 60
 export const MAX_REQUEST_LENGTH = 500
 /** Lines the history view asks for per page. */
 export const RUNTIME_LOGS_PAGE_SIZE = 500
+/** Lines of each job's build log a deployment prompt asks for. */
+export const DEPLOYMENT_LOG_LINES = 1000
 /** The window the live view's "all containers" poll looks back over. */
 export const RUNTIME_LOGS_LIVE_WINDOW = '1h'
 
@@ -719,6 +740,86 @@ function planSessionReplay(subject: SessionReplaySubject): SubjectPlan {
   }
 }
 
+function planDeployment(subject: DeploymentSubject): SubjectPlan {
+  const project = carryProject(subject.project)
+  // These two commands take the project by slug, not by ID.
+  const slug = carryId(subject.project?.slug, 'project slug')
+  const deployment = carryNumber(subject.deploymentId, 'deployment ID')
+  return {
+    lookingAt: `deployment ${deployment.shown} in ${project.described}`,
+    read: [
+      cli(
+        [
+          'deployments',
+          'status',
+          '--project',
+          slug.arg,
+          '--deployment-id',
+          deployment.arg,
+          '--json',
+        ],
+        'The deployment: status, environment, branch, commit, timings, URL and, if it failed, the stage and the reason.'
+      ),
+      cli(
+        [
+          'deployments',
+          'logs',
+          '--project',
+          slug.arg,
+          '--deployment',
+          deployment.arg,
+          '--lines',
+          String(DEPLOYMENT_LOG_LINES),
+        ],
+        `The build log of each of its jobs, as plain text (this command has no --json): the last ${DEPLOYMENT_LOG_LINES} lines per job.`
+      ),
+    ],
+    notes: [
+      ...notesOf(slug, deployment),
+      "The page also lists logs captured from this deployment's earlier containers. The CLI has no command for those yet, so they are not included.",
+    ],
+    rules: [READ_ONLY_RULE],
+  }
+}
+
+function planProxyLog(subject: ProxyLogSubject): SubjectPlan {
+  const raw = asText(subject.logId)
+  // The console reads a purely numeric ID as a stored row and anything else
+  // as a request ID; the two are different commands.
+  const numeric = /^\d+$/.test(raw)
+  const log = numeric
+    ? carryNumber(Number(raw), 'proxy log ID')
+    : carryId(subject.logId, 'request ID')
+  const args: HandoffArg[] = numeric
+    ? ['proxy-logs', 'show', '--id', log.arg]
+    : ['proxy-logs', 'by-request', '--request-id', log.arg]
+  const notes = notesOf(log)
+  let where = ''
+  if (subject.project) {
+    const project = carryProject(subject.project)
+    args.push('--project-id', project.id.arg)
+    notes.push(...notesOf(project.id))
+    where = ` in ${project.described}`
+  } else if (subject.projectId != null) {
+    const projectId = carryNumber(subject.projectId, 'project ID')
+    args.push('--project-id', projectId.arg)
+    notes.push(...notesOf(projectId))
+    where = ` in project ${projectId.shown}`
+  }
+  args.push('--json')
+  return {
+    lookingAt: `${numeric ? 'proxy log' : 'request'} ${log.shown}${where}`,
+    read: [
+      cli(
+        args,
+        'The request as the proxy recorded it: method, host, path, status, timings, where it was routed, the client and the headers.'
+      ),
+    ],
+    notes,
+    rules: [READ_ONLY_RULE],
+  }
+}
+
 function planSubject(subject: HandoffSubject): SubjectPlan {
   switch (subject.kind) {
     case 'sandbox':
@@ -733,6 +834,10 @@ function planSubject(subject: HandoffSubject): SubjectPlan {
         : planRuntimeLogsLive(subject)
     case 'session_replay':
       return planSessionReplay(subject)
+    case 'deployment':
+      return planDeployment(subject)
+    case 'proxy_log':
+      return planProxyLog(subject)
   }
 }
 
@@ -855,6 +960,10 @@ export function subjectLabel(subject: HandoffSubject): string {
       return 'these logs'
     case 'session_replay':
       return 'this session replay'
+    case 'deployment':
+      return 'this deployment'
+    case 'proxy_log':
+      return 'this request'
   }
 }
 
@@ -869,6 +978,10 @@ const ASSISTANT_TOOL_HINT: Record<HandoffSubjectKind, string> = {
     'Search the same lines with the temps CLI: `logs search` with the same project, window and filters.',
   session_replay:
     'Read it with the temps CLI: `session-replay show <visitor-id> <session-id>`.',
+  deployment:
+    'Fetch details via the temps CLI: `deployments get_deployment`, `get_deployment_jobs`, `get_deployment_job_logs`.',
+  proxy_log:
+    'Read it with the temps CLI: `proxy-logs by-request --request-id <id>`, or `proxy-logs show --id <id>` for a numeric ID.',
 }
 
 /**
@@ -967,5 +1080,17 @@ export const HANDOFF_SUBJECT_EXAMPLES: Record<
       visitorId: 52,
       sessionId: 981,
     },
+  ],
+  deployment: [
+    { kind: 'deployment', project: EXAMPLE_PROJECT, deploymentId: 311 },
+  ],
+  proxy_log: [
+    {
+      kind: 'proxy_log',
+      logId: '7c1f0a52-3b8e-4d1a-9f60-2e5d8c4b7a13',
+      project: EXAMPLE_PROJECT,
+    },
+    { kind: 'proxy_log', logId: '88412', projectId: 4 },
+    { kind: 'proxy_log', logId: '88412' },
   ],
 }

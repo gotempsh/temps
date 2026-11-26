@@ -187,11 +187,19 @@ describe('the commands are the ones the prompt describes', () => {
       error_group: ['errors show', 'errors events', 'errors event'],
       runtime_logs: ['logs search', 'runtime-logs'],
       session_replay: ['session-replay show', 'session-replay events'],
+      deployment: ['deployments status', 'deployments logs'],
+      proxy_log: ['proxy-logs by-request', 'proxy-logs show'],
     })
   })
 
   test('asks for JSON wherever the prompt does not say the output is plain text', () => {
-    const textOnly = new Set(['sandbox fs read', 'sandbox exec', 'sandbox logs', 'runtime-logs'])
+    const textOnly = new Set([
+      'sandbox fs read',
+      'sandbox exec',
+      'sandbox logs',
+      'runtime-logs',
+      'deployments logs',
+    ])
     for (const [, subjects] of examples) {
       for (const command of subjects.flatMap((s) => resolved(s).slice(3))) {
         expect(command.flags.includes('--json'), command.path).toBe(!textOnly.has(command.path))

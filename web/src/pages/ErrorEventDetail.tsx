@@ -21,6 +21,7 @@ import {
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import { extractSentryEvent, sentryExceptions } from '@/lib/sentry-utils'
@@ -68,6 +69,25 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
   const primaryException = sentryEvent
     ? sentryExceptions(sentryEvent).slice(-1)[0]
     : undefined
+
+  // Declare what is on the page once, for "Hand off to agent" and the
+  // built-in assistant alike.
+  const groupId = Number(errorGroupId)
+  const occurrenceId = Number(eventId)
+  usePageSubject(
+    event &&
+      Number.isSafeInteger(groupId) &&
+      groupId > 0 &&
+      Number.isSafeInteger(occurrenceId) &&
+      occurrenceId > 0
+      ? {
+          kind: 'error_group',
+          project: { id: project.id, slug: project.slug, name: project.name },
+          groupId,
+          eventId: occurrenceId,
+        }
+      : null
+  )
 
   usePageTitle(
     sentryEvent

@@ -59,7 +59,8 @@ prompt is your responsibility.
 ## 3. Read
 
 - Run each read command once, as written. Prefer the `--json` form the prompt
-  gives; `runtime-logs` prints plain text and has no `--json`.
+  gives; `runtime-logs` and `deployments logs` print plain text and have no
+  `--json`.
 - A slot such as `<absolute-path>` or `<project-ID>` is something the console
   could not fill in. Ask the person; do not guess.
 - A `Note:` line says what the page shows that the command does not carry (a
@@ -83,7 +84,7 @@ Read only, unless the person asks for a change in so many words. A request to
 
 | Looking at | Expected | Needs an explicit request |
 |---|---|---|
-| A trace, an error, logs, a session replay | The read commands in the prompt | Anything else on the instance |
+| A trace, an error, logs, a session replay, a deployment, a proxied request | The read commands in the prompt | Anything else on the instance, including `deployments rollback`, `cancel`, `pause`, `resume` and `teardown` |
 | A sandbox | `sandbox show`, `sandbox exec`, `sandbox fs read`/`write`/`stat`/`mkdir`, `sandbox logs` inside that sandbox | `sandbox rm` (`stop`, `destroy`), `restart`, `pause`, `egress`, `preview-access`, `password`, and anything outside that sandbox |
 
 For a change the person did ask for, follow

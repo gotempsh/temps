@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, within } from '@testing-library/react'
+import { cleanup, render, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ContextType } from 'react'
 import { MemoryRouter, Route, Routes } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
+import {
+  createPageSubjectStore,
+  PageSubjectStoreContext,
+} from '@/components/agent-handoff/page-subject'
 import { AiAssistantContext } from '@/components/ai/AiAssistantContext-shared'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
@@ -17,8 +21,11 @@ import { ErrorGroupDetail } from './ErrorGroupDetail'
 installBrowserWindow()
 afterEach(cleanup)
 
+const assistantContexts: Array<{ value: string; label: string } | null> = []
 const assistant = {
-  setPageContext: () => {},
+  setPageContext: (context: { value: string; label: string } | null) => {
+    assistantContexts.push(context)
+  },
 } as unknown as ContextType<typeof AiAssistantContext>
 
 test('assigning and resolving an error sit together as one group of actions', async () => {
@@ -34,6 +41,7 @@ test('assigning and resolving an error sit together as one group of actions', as
         assigned_to: null,
       }),
   })
+  const subjects = createPageSubjectStore()
   const view = render(
     <QueryClientProvider
       client={
@@ -41,30 +49,36 @@ test('assigning and resolving an error sit together as one group of actions', as
       }
     >
       <MemoryRouter initialEntries={['/errors/204']}>
-        <AuthContext.Provider
-          value={
-            { user: { id: 1, role: 'user' } } as unknown as NonNullable<
-              ContextType<typeof AuthContext>
-            >
-          }
-        >
-          <AiAssistantContext.Provider value={assistant}>
-            <BreadcrumbProvider>
-              <Routes>
-                <Route
-                  path="/errors/:errorGroupId"
-                  element={
-                    <ErrorGroupDetail
-                      project={
-                        { id: 7, slug: 'example' } as unknown as ProjectResponse
-                      }
-                    />
-                  }
-                />
-              </Routes>
-            </BreadcrumbProvider>
-          </AiAssistantContext.Provider>
-        </AuthContext.Provider>
+        <PageSubjectStoreContext.Provider value={subjects}>
+          <AuthContext.Provider
+            value={
+              { user: { id: 1, role: 'user' } } as unknown as NonNullable<
+                ContextType<typeof AuthContext>
+              >
+            }
+          >
+            <AiAssistantContext.Provider value={assistant}>
+              <BreadcrumbProvider>
+                <Routes>
+                  <Route
+                    path="/errors/:errorGroupId"
+                    element={
+                      <ErrorGroupDetail
+                        project={
+                          {
+                            id: 7,
+                            slug: 'example',
+                            name: 'Example',
+                          } as unknown as ProjectResponse
+                        }
+                      />
+                    }
+                  />
+                </Routes>
+              </BreadcrumbProvider>
+            </AiAssistantContext.Provider>
+          </AuthContext.Provider>
+        </PageSubjectStoreContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -75,4 +89,19 @@ test('assigning and resolving an error sit together as one group of actions', as
   expect(actions.getByRole('button', { name: /Unassigned/ })).toBeTruthy()
   expect(actions.getByRole('button', { name: /Resolve/ })).toBeTruthy()
   expect(actions.getByRole('button', { name: /Ignore/ })).toBeTruthy()
+
+  // The page declares the group once, for the header's "Hand off to agent"
+  // and for the built-in assistant, from the same declaration.
+  await waitFor(() =>
+    expect(subjects.get()).toEqual({
+      kind: 'error_group',
+      project: { id: 7, slug: 'example', name: 'Example' },
+      groupId: 204,
+    })
+  )
+  const told = assistantContexts.filter(Boolean).pop()
+  expect(told?.label).toBe('this error')
+  expect(told?.value).toContain(
+    'The user is viewing error group 204 in project "Example" (ID 7) in the Temps console.'
+  )
 })
