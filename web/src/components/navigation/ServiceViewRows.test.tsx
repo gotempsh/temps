@@ -162,6 +162,16 @@ test('a service with custom domains has one Domains row, last, saying how many a
   ).toBe('/projects/synthetic-api/domains')
 })
 
+test('the Domains row keeps the environment chosen in the bar', async () => {
+  mockUse({ domains: [{ domain: 'shop.example.test', status: 'active' }] })
+  const { list } = renderRows('deployments?env=staging')
+  await waitFor(() =>
+    expect(
+      list.querySelector('a[data-view="domains"]')?.getAttribute('href')
+    ).toBe('/projects/synthetic-api/domains?env=staging')
+  )
+})
+
 test('the Domains row carries the mark on its page, not the Overview', async () => {
   mockUse({ domains: [{ domain: 'shop.example.test', status: 'active' }] })
   const { list } = renderRows('domains')

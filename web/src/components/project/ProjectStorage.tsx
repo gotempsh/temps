@@ -11,10 +11,10 @@ import {
   externalServiceMetricsGetRangeOptions,
   linkServiceToProjectMutation,
   listProjectServicesOptions,
-  listServicesOptions,
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { MetricSparkline } from '@/components/charts/metric-sparkline'
+import { useIsDesktop } from '@/components/hooks/use-mobile'
 import { CreateServiceButton } from '@/components/storage/CreateServiceButton'
 import { Input } from '@/components/ui/input'
 import {
@@ -35,6 +35,7 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
+import { serverDatabasesQuery } from '@/lib/server-databases'
 import { cn, formatBytes } from '@/lib/utils'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -63,25 +64,34 @@ import { formatCpuUsage } from '@/lib/cpu-format'
 import { serviceBackupsHref } from '@/lib/service-backup-setup'
 import { toast } from 'sonner'
 
-/**
- * Compact 1h sparkline + current value for one container resource metric of
- * a linked service. Renders nothing when the service has no metric history
- * (monitoring disabled, service stopped) so unmonitored rows stay clean.
- */
-export function ResourceSparkline({
-  serviceId,
-  metric,
-  historyMetric,
-  label,
-  format,
-}: {
+type ResourceSparklineProps = {
   serviceId: number
   metric: string
   /** Charted before `metric` has readings; see `withCpuHistory`. */
   historyMetric?: string
   label: string
   format: (value: number) => string
-}) {
+}
+
+/**
+ * Compact 1h sparkline + current value for one container resource metric of
+ * a linked service. Renders nothing when the service has no metric history
+ * (monitoring disabled, service stopped) so unmonitored rows stay clean.
+ * A narrow row has no room for it: below `lg` it is not mounted, so it
+ * polls nothing there.
+ */
+export function ResourceSparkline(props: ResourceSparklineProps) {
+  const wide = useIsDesktop()
+  return wide ? <ResourceSparklineChart {...props} /> : null
+}
+
+function ResourceSparklineChart({
+  serviceId,
+  metric,
+  historyMetric,
+  label,
+  format,
+}: ResourceSparklineProps) {
   const { data } = useQuery({
     ...externalServiceMetricsGetRangeOptions({
       path: { id: serviceId },
@@ -114,7 +124,7 @@ export function ResourceSparkline({
   const last = values[values.length - 1]
 
   return (
-    <div className="hidden w-24 shrink-0 flex-col items-stretch gap-0.5 lg:flex">
+    <div className="flex w-24 shrink-0 flex-col items-stretch gap-0.5">
       <MetricSparkline data={values} height={16} />
       <span className="text-right text-[10px] tabular-nums text-muted-foreground">
         {label} {format(last)}
@@ -390,7 +400,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     isError: servicesError,
   } = useQuery({
     // Asked for with the page: it decides whether linking is offered.
-    ...listServicesOptions(),
+    ...serverDatabasesQuery(),
     retry: false,
   })
 
@@ -575,7 +585,8 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     search
   )
   // Linking is offered only once a database can be linked: none on the
-  // server, or every one already linked, and the section is not shown.
+  // server, or every one of a type the service already uses, and the
+  // section is not shown.
   // One that could not be loaded is shown, so its retry is reachable.
   const linkableCount = linkableDatabases(
     services ?? [],
@@ -668,7 +679,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                   next deployment.
                 </p>
                 {/* A few are read at a glance; more are found by name. */}
-                {linkableCount > LINKABLE_ROWS && (
+                {(linkableCount > LINKABLE_ROWS || search !== '') && (
                   <Input
                     aria-label="Search existing databases"
                     placeholder="Search by name or database type…"

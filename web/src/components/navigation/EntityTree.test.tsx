@@ -11,6 +11,7 @@ import {
 } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
+import { collectRouteQueryFailures } from '@/lib/route-query-failures'
 import { SidebarProvider } from '@/components/ui/sidebar'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -80,12 +81,11 @@ const projects = {
 
 function renderAt(path: string, routes: Parameters<typeof mockApi>[0]) {
   const api = mockApi(routes)
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
   const view = render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <SidebarProvider>
           <EntityTree />
@@ -93,7 +93,7 @@ function renderAt(path: string, routes: Parameters<typeof mockApi>[0]) {
       </MemoryRouter>
     </QueryClientProvider>
   )
-  return { api, view }
+  return { api, view, client }
 }
 
 const hrefs = (root: HTMLElement) =>
@@ -346,6 +346,29 @@ describe('the Server row', () => {
     )
   })
 
+  test('counts every database, not the first page of them', async () => {
+    // A full first page of running databases, and a failed one after it.
+    const running = Array.from({ length: 100 }, (_, index) => ({
+      ...mainDb,
+      id: 100 + index,
+      name: `db-${index}`,
+    }))
+    const { view } = renderAt('/projects', {
+      ...projects,
+      'GET /external-services': (request: Request) =>
+        jsonResponse(
+          new URL(request.url).searchParams.get('page') === '2'
+            ? [{ ...cache, id: 500 }]
+            : running
+        ),
+      'GET /internal/nodes': () =>
+        jsonResponse({ nodes: [{ id: 1, name: 'a', status: 'active' }] }),
+    })
+    await waitFor(() =>
+      expect(serverRow(view).textContent).toBe('Server1 failed')
+    )
+  })
+
   test('says nothing when it cannot be asked', async () => {
     const { view } = renderAt('/projects', projects)
     await view.findByRole('link', { name: /web/ })
@@ -463,6 +486,75 @@ describe('Projects', () => {
       name: 'Create service',
     })
     expect(add.getAttribute('href')).toBe('/projects/new')
+  })
+
+  test('a service past the page of services read still lists its views', async () => {
+    // A large server: the service open is not in the page the tree reads.
+    const { view, api } = renderAt('/projects/late-service/deployments', {
+      ...projects,
+      'GET /projects': () =>
+        jsonResponse({
+          projects: [service(4, 'web'), service(5, 'api'), service(9, 'blog')],
+          total: 240,
+        }),
+      'GET /projects/by-slug/late-service': () =>
+        jsonResponse(service(300, 'late-service')),
+    })
+    const row = await view.findByRole('link', { name: /late-service/ })
+    expect(row.getAttribute('href')).toBe('/projects/late-service')
+    const views = await view.findByRole('list', {
+      name: 'late-service views',
+    })
+    expect(
+      within(views).getByRole('link', { name: 'Deployments' })
+    ).toBeTruthy()
+    expect(api.called('GET', '/projects/by-slug/late-service')).toBe(true)
+  })
+
+  test('a private worker failing its health checks is shown in trouble', async () => {
+    const { view } = renderAt('/projects', {
+      ...projects,
+      'GET /monitors-health/projects': () =>
+        jsonResponse({
+          projects: {
+            '9': {
+              project_id: 9,
+              status: 'no_address',
+              runtime_status: 'unhealthy',
+            },
+          },
+        }),
+    })
+    const blog = await view.findByRole('link', { name: /blog/ })
+    await waitFor(() => expect(blog.textContent).toContain('Unhealthy'))
+  })
+
+  test('a service the page lists is not asked for again', async () => {
+    const { view, api } = renderAt('/projects/blog/deployments', projects)
+    await view.findByRole('list', { name: 'blog views' })
+    expect(api.called('GET', '/projects/by-slug/blog')).toBe(false)
+  })
+
+  test("the tree's failed reads are its rows' to show, not the page's", async () => {
+    // A Reader is refused the nodes, and the projects list fails: each is
+    // the tree's to say, so the page's failure banner reports neither.
+    const { view, api, client } = renderAt('/projects', {
+      ...projects,
+      'GET /projects': () => jsonResponse({ title: 'Boom' }, 500),
+      'GET /internal/nodes': () => jsonResponse({ title: 'Forbidden' }, 403),
+    })
+    const list = await view.findByRole('list', { name: 'Projects' })
+    expect(await within(list).findByText('Could not be loaded')).toBeTruthy()
+    await waitFor(() => expect(api.called('GET', '/internal/nodes')).toBe(true))
+    await waitFor(() =>
+      expect(
+        client
+          .getQueryCache()
+          .getAll()
+          .filter((query) => query.state.status === 'error').length
+      ).toBeGreaterThanOrEqual(2)
+    )
+    expect(collectRouteQueryFailures(client)).toEqual([])
   })
 
   test('a list that could not be loaded says so and offers a retry', async () => {

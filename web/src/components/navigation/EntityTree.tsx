@@ -15,8 +15,8 @@ import { Link, useLocation } from 'react-router'
 import {
   adminListNodesOptions,
   getProjectsMonitorHealthOptions,
+  getProjectBySlugOptions,
   getProjectsOptions,
-  listServicesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { useProjectGroups } from '@/components/project-groups/useProjectGroups'
@@ -46,6 +46,7 @@ import {
   locateInTree,
   pickProjects,
   projectNodes,
+  withShownService,
   countedState,
   serverState,
   serviceState,
@@ -55,6 +56,8 @@ import {
   type TreeLocation,
   type TreeState,
 } from '@/lib/entity-tree'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
+import { serverDatabasesQuery } from '@/lib/server-databases'
 import { projectRoot } from '@/lib/project-navigation'
 import { SERVER_HOME, SERVER_PAGE } from '@/lib/server-navigation'
 import { groupHref } from '@/lib/terminology'
@@ -67,6 +70,15 @@ import { useTreeFold } from './use-tree-fold'
 
 const ACTIVE = 'bg-sidebar-accent text-sidebar-accent-foreground'
 const QUERY = { staleTime: 60_000, retry: false } as const
+/**
+ * The tree's own reads. Each failure is shown in its row (with a retry), and
+ * a role may be refused some (a Reader cannot list the nodes): none says
+ * anything about the page, so none raises the page's failure banner.
+ */
+const TREE_QUERY = {
+  ...QUERY,
+  meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+} as const
 /**
  * Projects listed on a large server; the Projects page, with search, has
  * the rest. Few enough that the tree never grows with the server.
@@ -291,11 +303,30 @@ export function EntityTree() {
   const groupList = useProjectGroups()
   const services = useQuery({
     ...getProjectsOptions({ query: { per_page: 100, page: 1 } }),
-    ...QUERY,
+    ...TREE_QUERY,
     enabled: projectsOpen,
   })
 
-  const nodes = projectNodes(groupList.groups, services.data?.projects ?? [])
+  const listed = projectNodes(groupList.groups, services.data?.projects ?? [])
+  // The service shown may be past the page read: it is read on its own (the
+  // request its page already made), so the tree still holds its views.
+  const shownUnlisted =
+    location.serviceSlug !== undefined &&
+    services.isSuccess &&
+    !listed.some((node) =>
+      node.kind === 'project'
+        ? node.services.some((s) => s.slug === location.serviceSlug)
+        : node.service.slug === location.serviceSlug
+    )
+  const shownService = useQuery({
+    ...getProjectBySlugOptions({ path: { slug: location.serviceSlug ?? '' } }),
+    ...QUERY,
+    enabled: projectsOpen && shownUnlisted,
+  })
+  const nodes = withShownService(
+    listed,
+    shownUnlisted ? shownService.data : undefined
+  )
   const current = nodes.find((node) => isCurrentNode(node, location))
   const recent = useRecentProjects(current?.key)
   const openAll = nodes.length < OPEN_ALL_BELOW
@@ -316,12 +347,14 @@ export function EntityTree() {
     ...getProjectsMonitorHealthOptions({
       query: { project_ids: healthIds.join(',') },
     }),
-    ...QUERY,
+    ...TREE_QUERY,
     refetchInterval: 60_000,
     enabled: projectsOpen && healthIds.length > 0,
   })
-  const stateOf = (service: ServiceNode) =>
-    serviceState(health.data?.projects[String(service.id)]?.status)
+  const stateOf = (service: ServiceNode) => {
+    const reported = health.data?.projects[String(service.id)]
+    return serviceState(reported?.status, reported?.runtime_status)
+  }
   const nodeState = (node: ProjectNode) =>
     node.kind === 'project'
       ? worstState(node.services.map(stateOf))
@@ -360,12 +393,12 @@ export function EntityTree() {
   // trouble shows without opening it.
   const serverNodes = useQuery({
     ...adminListNodesOptions(),
-    ...QUERY,
+    ...TREE_QUERY,
     enabled: !compact,
   })
   const serverDatabases = useQuery({
-    ...listServicesOptions(),
-    ...QUERY,
+    ...serverDatabasesQuery(),
+    ...TREE_QUERY,
     enabled: !compact,
   })
   const onServer =

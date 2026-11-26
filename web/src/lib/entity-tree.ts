@@ -84,11 +84,22 @@ const state = (tone: TreeState['tone'], label: string): TreeState => ({
 
 /**
  * A service's state from its uptime monitors. A service nothing checks has
- * none: the tree does not claim it is healthy.
+ * none: the tree does not claim it is healthy. One with no address to check
+ * (a private worker) is read from the health checks its worker reports.
  */
 export function serviceState(
-  status: string | undefined
+  status: string | undefined,
+  runtimeStatus?: string | null
 ): TreeState | undefined {
+  if (status === 'no_address')
+    switch (runtimeStatus) {
+      case 'healthy':
+        return state('ok', 'Healthy')
+      case 'unhealthy':
+        return state('bad', 'Unhealthy')
+      default:
+        return undefined
+    }
   switch (status) {
     case 'operational':
       return state('ok', 'Healthy')
@@ -261,6 +272,28 @@ export function projectNodes(
         key: `service:${service.id}`,
         service,
       })),
+  ]
+}
+
+/**
+ * `nodes` with the service shown among them. The tree reads one page of
+ * services, so on a large server the one open may be past it: it is added
+ * as a row of its own, so its views are still listed under it.
+ */
+export function withShownService(
+  nodes: readonly ProjectNode[],
+  shown: ServiceNode | undefined
+): ProjectNode[] {
+  if (!shown) return [...nodes]
+  const listed = nodes.some((node) =>
+    node.kind === 'project'
+      ? node.services.some((service) => service.id === shown.id)
+      : node.service.id === shown.id
+  )
+  if (listed) return [...nodes]
+  return [
+    ...nodes,
+    { kind: 'service', key: `service:${shown.id}`, service: shown },
   ]
 }
 

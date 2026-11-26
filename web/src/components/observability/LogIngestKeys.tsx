@@ -72,8 +72,14 @@ export function LogIngestKeys({
 }) {
   const [open, setOpen] = useState(false)
   // The keys' service is the page's until another is chosen here. Choosing
-  // here leaves the page's filter alone: adding a host is not a search.
+  // here leaves the page's filter alone: adding a host is not a search. The
+  // choice lasts one opening: opened again, perhaps after the page moved to
+  // another service, the dialog starts from the page's.
   const [choice, setChoice] = useState<number | 'choosing' | undefined>()
+  const openDialog = (next: boolean) => {
+    if (next) setChoice(undefined)
+    setOpen(next)
+  }
   const serviceId = choice === 'choosing' ? undefined : (choice ?? projectId)
   const services = useLogServices(open && serviceId === undefined)
   const service = useQuery({
@@ -87,14 +93,14 @@ export function LogIngestKeys({
         size="sm"
         variant="outline"
         className="h-9 gap-2"
-        onClick={() => setOpen(true)}
+        onClick={() => openDialog(true)}
       >
         <Plus className="size-4" />
         {/* The page's one action: named at every width, a bare plus says
             nothing. */}
         Add log source
       </Button>
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={openDialog}>
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Add a log source</DialogTitle>

@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, fireEvent, render, within } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
@@ -33,6 +39,14 @@ const services = [
   { id: 4, name: 'api', slug: 'api', source_type: 'git' },
   { id: 5, name: 'web', slug: 'web', source_type: 'git' },
 ]
+
+function providers(children: React.ReactNode, client: QueryClient) {
+  return (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>{children}</MemoryRouter>
+    </QueryClientProvider>
+  )
+}
 
 function mountDialog(projectId: number | undefined) {
   const api = mockApi({
@@ -102,4 +116,27 @@ test("with the page's service it names it, and another can be chosen", async () 
   expect(within(dialog).queryByRole('button', { name: 'Create key' })).toBe(
     null
   )
+})
+
+test("opened again after the page moves to another service, it starts from the page's", async () => {
+  const { view } = mountDialog(undefined)
+  fireEvent.click(view.getByRole('button', { name: 'Add log source' }))
+  let dialog = await view.findByRole('dialog')
+  const list = await within(dialog).findByRole('list', { name: 'Services' })
+  fireEvent.click(within(list).getByRole('button', { name: 'api' }))
+  expect(await within(dialog).findByText('api')).toBeTruthy()
+  fireEvent.keyDown(dialog, { key: 'Escape' })
+  await waitFor(() => expect(view.queryByRole('dialog')).toBeNull())
+
+  // The page is now filtered to web.
+  view.rerender(
+    providers(
+      <LogIngestKeys projectId={5} />,
+      new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    )
+  )
+  fireEvent.click(view.getByRole('button', { name: 'Add log source' }))
+  dialog = await view.findByRole('dialog')
+  expect(await within(dialog).findByText('web')).toBeTruthy()
+  expect(within(dialog).queryByText('api')).toBeNull()
 })

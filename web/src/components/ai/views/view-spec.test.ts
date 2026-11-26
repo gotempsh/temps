@@ -199,6 +199,34 @@ describe('parseViewSpec', () => {
     expect(view?.dropped).toBe(3)
   })
 
+  test('an element named after object machinery is dropped, and cannot hide a cycle', () => {
+    // Whole-object JSON keeps `__proto__` as an ordinary key.
+    const source = JSON.stringify({
+      root: 'top',
+      elements: {
+        top: { type: 'Stack', props: {}, children: ['__proto__', 'ok'] },
+        ok: { type: 'Status', props: { tone: 'idle', label: 'Stopped' } },
+      },
+    }).replace(
+      '"ok":',
+      '"__proto__":{"type":"Stack","props":{},"children":["__proto__"]},"ok":'
+    )
+    const view = parseViewSpec(source)
+    expect(view?.spec.elements.top.children).toEqual(['ok'])
+    expect(Object.getPrototypeOf(view?.spec.elements)).toBe(Object.prototype)
+    expect(view?.dropped).toBe(1)
+
+    for (const key of ['constructor', 'prototype']) {
+      const named = parseViewSpec(
+        lines(
+          add('/root', key),
+          el(key, 'Status', { tone: 'idle', label: 'x' })
+        )
+      )
+      expect(named).toBeNull()
+    }
+  })
+
   test('a view stops at its element limit', () => {
     const keys = Array.from(
       { length: VIEW_LIMITS.elements + 20 },

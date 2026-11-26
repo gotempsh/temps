@@ -79,9 +79,15 @@ test("a service's views are listed under it in the sidebar, and its page has one
   await expect(page).toHaveURL(/settings\/general$/)
 
   const views = page.getByRole('list', { name: `${name} views`, exact: true })
-  const listed = await views.locator('a[data-view]').allTextContents()
-  // In order, whatever else is listed between them.
-  expect(listed.filter((title) => ALWAYS.includes(title))).toEqual(ALWAYS)
+  // In order, whatever else is listed between them. Polled: the tree loads
+  // its services on its own, after the page has redirected.
+  await expect
+    .poll(async () =>
+      (await views.locator('a[data-view]').allTextContents()).filter((title) =>
+        ALWAYS.includes(title)
+      )
+    )
+    .toEqual(ALWAYS)
   await expect(
     views.getByRole('link', { name: 'Settings', exact: true })
   ).toHaveAttribute('aria-current', 'page')

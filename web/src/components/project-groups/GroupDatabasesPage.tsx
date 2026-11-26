@@ -27,7 +27,6 @@ import type {
 import {
   linkServiceToProjectMutation,
   listProjectServicesQueryKey,
-  listServicesOptions,
   unlinkServiceFromProjectMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -62,9 +61,11 @@ import {
   containerCpuChartMetric,
   containerCpuHistoryMetric,
 } from '@/lib/container-cpu'
+import { serverDatabasesQuery } from '@/lib/server-databases'
 import { formatCpuUsage } from '@/lib/cpu-format'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
 import { projectRoot } from '@/lib/project-navigation'
+import { appsThatCanLink, linkableDatabases } from '@/lib/database-links'
 import type { GroupDatabase, GroupMember } from '@/lib/group-scoped-lists'
 import { SERVER_WIDE_LISTS } from '@/lib/console-scope'
 import { serviceBackupsHref } from '@/lib/service-backup-setup'
@@ -107,7 +108,14 @@ export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
     change: ServiceLinkChange
   } | null>(null)
 
-  useKeyboardShortcut({ key: 'n', callback: () => setCreateOpen(true) })
+  // A database is created linked to a service: with none that can use
+  // one, nothing is offered to create.
+  useKeyboardShortcut({
+    key: 'n',
+    callback: () => {
+      if (target) setCreateOpen(true)
+    },
+  })
 
   // The redeploy prompt needs the app in full; read once a link changes.
   const fullApps = useQuery({
@@ -199,18 +207,20 @@ export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
       actions={
         <div className="flex flex-wrap items-center gap-2">
           <ServerWideButton list={SERVER_WIDE_LISTS.databases} />
-          <CreateServiceButton
-            projectId={target?.id ?? null}
-            label="Create database"
-            open={createOpen}
-            onOpenChange={setCreateOpen}
-          />
+          {target && (
+            <CreateServiceButton
+              projectId={target.id}
+              label="Create database"
+              open={createOpen}
+              onOpenChange={setCreateOpen}
+            />
+          )}
         </div>
       }
     />
   )
 
-  if (group.projects.length > 0 && apps.length === 0) {
+  if (!target) {
     return (
       <PageContainer innerClassName="space-y-6">
         {header}
@@ -220,7 +230,7 @@ export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
   }
 
   const targetPicker =
-    apps.length > 1 && target ? (
+    apps.length > 1 ? (
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-sm text-muted-foreground">Add databases to</span>
         <SegmentedControl
@@ -277,6 +287,7 @@ export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
                 key={database.id}
                 database={database}
                 apps={apps}
+                databases={databases}
                 busy={busy}
                 onLink={(app) =>
                   requestLink({ database: database.service, app })
@@ -292,27 +303,21 @@ export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
 
       {targetPicker}
 
-      {target && (
-        <LinkExistingDatabase
-          target={target}
-          linked={databases.filter((db) =>
-            db.usedBy.some((app) => app.id === target.id)
-          )}
-          busy={busy}
-          onLink={(database) => requestLink({ database, app: target })}
-        />
-      )}
+      <LinkExistingDatabase
+        target={target}
+        linked={databases.filter((db) =>
+          db.usedBy.some((app) => app.id === target.id)
+        )}
+        busy={busy}
+        onLink={(database) => requestLink({ database, app: target })}
+      />
 
       <DatabaseTypeCards
-        projectId={target?.id ?? null}
+        projectId={target.id}
         heading={
           databases.length ? 'Create a new database' : 'Create a database'
         }
-        description={
-          target
-            ? `Choose a database type to configure a new database linked to ${target.name}.`
-            : 'Choose a database type to configure a new database.'
-        }
+        description={`Choose a database type to configure a new database linked to ${target.name}.`}
       />
 
       <ConfirmDeleteDialog
@@ -390,6 +395,7 @@ function browseHref(database: GroupDatabase) {
 export function GroupDatabaseRow({
   database,
   apps,
+  databases,
   busy,
   onLink,
   onUnlink,
@@ -397,6 +403,8 @@ export function GroupDatabaseRow({
   database: GroupDatabase
   /** The project's apps that can use a database. */
   apps: readonly GroupMember[]
+  /** Every database those apps use, for the types each already has. */
+  databases: readonly GroupDatabase[]
   busy: boolean
   onLink: (app: GroupMember) => void
   onUnlink: (app: GroupMember) => void
@@ -408,9 +416,7 @@ export function GroupDatabaseRow({
     CONTAINER_CPU_METRIC,
     service.topology === 'cluster'
   )
-  const unlinkedApps = apps.filter(
-    (app) => !database.usedBy.some((used) => used.id === app.id)
-  )
+  const unlinkedApps = appsThatCanLink(database, apps, databases)
   const details = [service.service_type, service.version]
     .filter(Boolean)
     .join(' ')
@@ -609,23 +615,18 @@ function LinkExistingDatabase({
   onLink,
 }: {
   target: GroupMember
-  /** Databases `target` already uses, left out of the list. */
+  /** Databases `target` already uses: neither they nor their types are listed. */
   linked: readonly GroupDatabase[]
   busy: boolean
   onLink: (database: ExternalServiceInfo) => void
 }) {
   const [search, setSearch] = useState('')
   const all = useQuery({
-    ...listServicesOptions(),
+    ...serverDatabasesQuery(),
     retry: false,
   })
-  const term = search.trim().toLowerCase()
-  const linkable = (all.data ?? []).filter(
-    (database) => !linked.some((used) => used.id === database.id)
-  )
-  const matching = linkable.filter((database) =>
-    `${database.name} ${database.service_type}`.toLowerCase().includes(term)
-  )
+  const linkable = linkableDatabases(all.data ?? [], linked, '')
+  const matching = linkableDatabases(all.data ?? [], linked, search)
   const available = matching.slice(0, LINKABLE_ROWS)
   // Nothing to link, or not known yet: no section. One that could not be
   // loaded is shown, so its retry is reachable.
@@ -663,7 +664,7 @@ function LinkExistingDatabase({
             deployment.
           </p>
           {/* A few are read at a glance; more are found by name. */}
-          {linkable.length > LINKABLE_ROWS && (
+          {(linkable.length > LINKABLE_ROWS || search !== '') && (
             <Input
               aria-label="Search existing databases"
               placeholder="Search by name or database type…"

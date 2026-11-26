@@ -9,6 +9,7 @@ import {
   mergeGroupDatabases,
   type GroupDatabase,
 } from '@/lib/group-scoped-lists'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 
 /** The databases an open project's services use, in whichever state. */
 export interface ProjectDatabases {
@@ -40,6 +41,8 @@ export function useTreeDatabases(
       }),
       staleTime: 60_000,
       retry: false,
+      // Shown in the tree with a retry; not the page's failure.
+      meta: { routeFailure: ROUTE_FAILURE_IGNORE },
     })),
   })
   const byProject = new Map<string, ProjectDatabases>()

@@ -169,6 +169,9 @@ describe("a project's databases", () => {
 
   test('a server database asks which database to use before linking', async () => {
     const mock = renderPage(project(web, api), {
+      // web uses no Postgres yet, so one can be linked to it.
+      'GET /external-services/projects/11': () =>
+        jsonResponse([link(2, cache)]),
       'GET /external-services': () =>
         jsonResponse([orders, database(10, 'reports', 'postgres')]),
     })
@@ -201,7 +204,58 @@ describe("a project's databases", () => {
     expect(
       screen.getByText("None of this project's services can use a database")
     )
+    // A database is created linked to a service: with none, none is offered.
+    expect(screen.queryByRole('button', { name: /Create database/ })).toBeNull()
     expect(mock.calls).toHaveLength(0)
+    mock.restore()
+  })
+
+  test('a project with no service offers no database to create', () => {
+    const mock = renderPage(project())
+    expect(
+      screen.getByText("None of this project's services can use a database")
+    )
+    expect(screen.queryByRole('button', { name: /Create database/ })).toBeNull()
+    expect(screen.queryByText('Create a database')).toBeNull()
+    mock.restore()
+  })
+
+  test('a database of a type the service already uses is not offered to link', async () => {
+    // web uses a Postgres and a Redis: the server's other Redis is not
+    // offered, since the server refuses a second database of a type.
+    const mock = renderPage(project(web, api))
+    await screen.findByRole('button', { name: 'cache, used by web' })
+    await waitFor(() =>
+      expect(mock.called('GET', '/external-services')).toBe(true)
+    )
+    expect(screen.queryByText('Link an existing database')).toBeNull()
+    expect(screen.queryByText('sessions')).toBeNull()
+    mock.restore()
+  })
+
+  test("a database's menu offers it only to the apps using no database of its type", async () => {
+    const reports = database(10, 'reports', 'postgres')
+    const mock = renderPage(project(web, api), {
+      'GET /external-services/projects/11': () =>
+        jsonResponse([link(1, reports), link(2, cache)]),
+      'GET /external-services/projects/12': () =>
+        jsonResponse([link(3, orders)]),
+    })
+    await screen.findByRole('button', { name: 'orders-db, used by api' })
+    // web has its own Postgres: orders-db cannot be linked to it.
+    await openActions('orders-db')
+    expect(screen.queryByText('Link to')).toBeNull()
+    await act(async () => {
+      fireEvent.keyDown(document.activeElement ?? document.body, {
+        key: 'Escape',
+      })
+    })
+    // api has no Redis: cache can be.
+    await openActions('cache')
+    const linkGroup = screen.getByText('Link to').parentElement
+    if (!linkGroup) throw new Error('no Link to group')
+    expect(within(linkGroup).getAllByRole('menuitem')).toHaveLength(1)
+    expect(within(linkGroup).getByRole('menuitem', { name: 'api' }))
     mock.restore()
   })
 })

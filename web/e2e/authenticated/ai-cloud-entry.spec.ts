@@ -12,6 +12,15 @@ import { expect, expectAppMounted, test } from '../fixtures'
  * the gateway fields are overridden, keeping every other field the shape the
  * server actually sends.
  */
+const SETUP_PATH = '/ai-gateway'
+
+/**
+ * The top bar's Ask button. The bar is a plain `header` inside `main`, which
+ * has no banner role, so it is found as an element.
+ */
+const askButton = (page: Page) =>
+  page.locator('header').getByRole('button', { name: 'Ask', exact: true })
+
 const routeGatewayAvailability = async (
   page: Page,
   available: boolean,
@@ -26,7 +35,8 @@ const routeGatewayAvailability = async (
         ...status,
         gateway_available: available,
         reason: available ? null : reason,
-        setup_path: available ? null : '/ai-gateway?add=openrouter',
+        // The path the server sends: provider settings, no vendor chosen.
+        setup_path: available ? null : SETUP_PATH,
       },
     })
   })
@@ -44,10 +54,7 @@ test.describe('AI entry and onboarding', () => {
     await page.goto('/projects')
     await expectAppMounted(page)
 
-    const entry = page.getByRole('banner').getByRole('button', {
-      name: 'Ask',
-      exact: true,
-    })
+    const entry = askButton(page)
     await expect(entry).toBeVisible()
     await expect(entry).toHaveAttribute('aria-pressed', 'false')
 
@@ -59,8 +66,13 @@ test.describe('AI entry and onboarding', () => {
     await expect(page.getByText('No AI provider is configured.')).toBeVisible()
     await expect(page.getByLabel('OpenRouter API key')).toBeVisible()
 
-    await page.getByRole('link', { name: /Open AI provider settings/ }).click()
-    await expect(page).toHaveURL(/\/ai-gateway(?:[?#]|$)/)
+    const settings = page.getByRole('link', {
+      name: /Open AI provider settings/,
+    })
+    // Provider settings, with no vendor preselected.
+    await expect(settings).toHaveAttribute('href', SETUP_PATH)
+    await settings.click()
+    await expect(page).toHaveURL(/\/ai-gateway$/)
     await expect(
       page.getByRole('heading', { name: 'AI Gateway', exact: true })
     ).toBeVisible()
@@ -85,10 +97,7 @@ test.describe('AI entry and onboarding', () => {
     await page.goto('/projects')
     await expectAppMounted(page)
 
-    await page
-      .getByRole('banner')
-      .getByRole('button', { name: 'Ask', exact: true })
-      .click()
+    await askButton(page).click()
     await expect(page).toHaveURL(/\/chat(?:[?#]|$)/)
     await expect(
       page.getByRole('heading', { name: READY_HEADING })
@@ -114,9 +123,7 @@ test.describe('AI entry and onboarding', () => {
       page.getByRole('link', { name: /^Ask/ }).first()
     ).toHaveAttribute('aria-current', 'page')
 
-    const entry = page
-      .getByRole('banner')
-      .getByRole('button', { name: 'Ask', exact: true })
+    const entry = askButton(page)
     await expect(entry).toHaveAttribute('aria-pressed', 'true')
     // A direct visit has nowhere to go back to, so it lands on a real page.
     await entry.click()

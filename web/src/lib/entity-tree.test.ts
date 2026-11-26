@@ -14,6 +14,7 @@ import {
   serverState,
   serviceState,
   withRecent,
+  withShownService,
   worstState,
 } from './entity-tree'
 
@@ -85,6 +86,17 @@ describe('states', () => {
     })
     expect(serviceState('down')).toEqual({ tone: 'bad', label: 'Down' })
     expect(serviceState('not_deployed')?.tone).toBe('idle')
+  })
+
+  test('a service with no address is read from its worker health checks', () => {
+    expect(serviceState('no_address', 'unhealthy')).toEqual({
+      tone: 'bad',
+      label: 'Unhealthy',
+    })
+    expect(serviceState('no_address', 'healthy')?.tone).toBe('ok')
+    // Not observed: no claim either way.
+    expect(serviceState('no_address', 'unknown')).toBeUndefined()
+    expect(serviceState('no_address')).toBeUndefined()
   })
 
   test('databases, domains and servers each say theirs in words', () => {
@@ -308,4 +320,20 @@ describe('withRecent', () => {
     const many = Array.from({ length: 8 }, (_, index) => `p${index}`)
     expect(withRecent(many, 'new')).toEqual(['new', ...many.slice(0, 7)])
   })
+})
+
+test('the service shown is added to the tree when the page read leaves it out', () => {
+  const web = { id: 4, name: 'web', slug: 'web' }
+  const late = { id: 300, name: 'late', slug: 'late' }
+  const nodes = projectNodes(
+    [{ id: 3, name: 'Shop', slug: 'shop', projects: [web] }],
+    [web]
+  )
+  expect(withShownService(nodes, late).map((node) => node.key)).toEqual([
+    'project:3',
+    'service:300',
+  ])
+  // Already a row, in a project or on its own: nothing is added.
+  expect(withShownService(nodes, web)).toEqual(nodes)
+  expect(withShownService(nodes, undefined)).toEqual(nodes)
 })

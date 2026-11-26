@@ -122,6 +122,13 @@ function normalised(
   return value
 }
 
+/**
+ * Keys that name an object's own machinery rather than a property: as an
+ * element's key, `__proto__` would replace the prototype of the elements
+ * object instead of adding an element. A view never needs them.
+ */
+const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
 /** One element, kept only if it is a catalog component with valid props. */
 function element(value: unknown): UIElement | null {
   if (!isRecord(value) || typeof value.type !== 'string') return null
@@ -159,12 +166,16 @@ export function parseViewSpec(source: string): ParsedView | null {
   }
   const written = raw.elements
   const elements: Record<string, UIElement> = {}
+  // Every key claimed, kept apart from `elements` so that no key, however
+  // it is spelled, can hide from it.
+  const claimed = new Set<string>()
   let dropped = read.unreadable
 
   const keep = (key: string): boolean => {
     const parsed =
-      !has(elements, key) &&
-      Object.keys(elements).length < VIEW_LIMITS.elements &&
+      !RESERVED_KEYS.has(key) &&
+      !claimed.has(key) &&
+      claimed.size < VIEW_LIMITS.elements &&
       has(written, key)
         ? element(written[key])
         : null
@@ -175,8 +186,10 @@ export function parseViewSpec(source: string): ParsedView | null {
     const wanted = parsed.children ?? []
     // Claimed before its children are visited, so a child naming an
     // ancestor finds the key taken and is dropped.
-    elements[key] = { ...parsed, children: [] }
-    elements[key].children = wanted.filter(keep)
+    claimed.add(key)
+    const kept: UIElement = { ...parsed, children: [] }
+    elements[key] = kept
+    kept.children = wanted.filter(keep)
     return true
   }
 

@@ -937,6 +937,17 @@ export function ProjectDetail() {
                   path="activity"
                   element={<Observe project={project} />}
                 />
+                {/* The Activity page's former URL, kept for bookmarks. */}
+                <Route
+                  path="observe/*"
+                  element={
+                    <RenamedProjectRouteRedirect
+                      projectSlug={project.slug}
+                      from="observe"
+                      to="activity"
+                    />
+                  }
+                />
                 <Route
                   path="settings/*"
                   element={

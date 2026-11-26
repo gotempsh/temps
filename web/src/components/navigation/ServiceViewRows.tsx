@@ -4,7 +4,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Globe, Plus } from 'lucide-react'
 import { useEffect, useRef } from 'react'
-import { Link, useLocation } from 'react-router'
+import { Link, useLocation, useSearchParams } from 'react-router'
 import {
   getProjectBySlugOptions,
   listCustomDomainsForProjectOptions,
@@ -23,6 +23,7 @@ import {
   SidebarSeparator,
 } from '@/components/ui/sidebar'
 import { countedState, domainState } from '@/lib/entity-tree'
+import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
 import { projectRoot } from '@/lib/project-navigation'
 import { scrollElementIntoView } from '@/lib/scroll-to-element'
 import { cn } from '@/lib/utils'
@@ -63,6 +64,12 @@ export function ServiceViewRows({
   })
   const domainList = domains.data?.domains ?? []
   const domainsUrl = `${projectRoot(service.slug)}/domains`
+  // Like every view's link, it keeps the environment chosen in the bar.
+  const [searchParams] = useSearchParams()
+  const env = searchParams.get(ENVIRONMENT_PARAM)
+  const environmentQuery = env
+    ? `?${ENVIRONMENT_PARAM}=${encodeURIComponent(env)}`
+    : ''
   // With its own row, the Domains page is marked there, not on the
   // Overview that holds it as a tab.
   const onDomains = domainList.length > 0 && pathname === domainsUrl
@@ -129,7 +136,7 @@ export function ServiceViewRows({
         <SidebarMenuSubItem>
           <SidebarMenuSubButton asChild isActive={onDomains}>
             <Link
-              to={domainsUrl}
+              to={`${domainsUrl}${environmentQuery}`}
               data-view="domains"
               aria-current={onDomains ? 'page' : undefined}
               onClick={onNavigate}
