@@ -9,6 +9,7 @@ import {
   updatePlatformSettings as updateSettingsApi,
   type PlatformSettings,
 } from '@/api/platformSettings'
+import { problemDetail } from '@/lib/api-problem'
 import { shouldRetryQuery } from '@/lib/query-retry'
 import { isStaleRevision, STALE_REVISION_MESSAGE } from '@/lib/stale-revision'
 import { useIsInstanceAdmin } from './useIsInstanceAdmin'
@@ -69,7 +70,8 @@ export function useSettingsPage() {
 
 /**
  * Re-read the settings after a save was refused as stale, and hand the
- * stored document to `onLatestLoaded` (a form that keeps its unsaved edits
+ * stored document to `onLatestLoaded` (rejecting, without calling it, when
+ * the read fails) (a form that keeps its unsaved edits
  * across refetches adopts its revision, so saving again applies the edits
  * on top of the other save).
  */
@@ -77,10 +79,12 @@ export async function loadLatestSettings(
   queryClient: ReturnType<typeof useQueryClient>,
   onLatestLoaded?: (latest: PlatformSettings) => void
 ) {
-  await queryClient.refetchQueries({
-    queryKey: ['platform-settings'],
-    exact: true,
-  })
+  // A failed read rejects instead of leaving the old document in the cache
+  // to be adopted as if it were the latest.
+  await queryClient.refetchQueries(
+    { queryKey: ['platform-settings'], exact: true },
+    { throwOnError: true }
+  )
   const latest = queryClient.getQueryData<PlatformSettings>([
     'platform-settings',
   ])
@@ -101,6 +105,17 @@ export function useUpdateSettings(
   } = {}
 ) {
   const queryClient = useQueryClient()
+  const loadLatest = async () => {
+    try {
+      await loadLatestSettings(queryClient, options.onLatestLoaded)
+    } catch (error) {
+      // The form and the revision its edits are based on stay as they were.
+      toast.error('Could not load the latest settings', {
+        description: `${problemDetail(error, 'The server did not answer.')} Your unsaved changes are kept.`,
+        action: { label: 'Retry', onClick: () => void loadLatest() },
+      })
+    }
+  }
 
   return useMutation({
     // The revision the page was rendered from, not a fresh read: a save made
@@ -130,8 +145,7 @@ export function useUpdateSettings(
           description: STALE_REVISION_MESSAGE,
           action: {
             label: 'Load latest',
-            onClick: () =>
-              void loadLatestSettings(queryClient, options.onLatestLoaded),
+            onClick: () => void loadLatest(),
           },
         })
         return

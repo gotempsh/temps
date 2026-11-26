@@ -238,3 +238,72 @@ test('after a refused save, "Load latest" re-reads the settings in place and han
   expect(reloaded).toBe(false)
   window.location.reload = reload
 })
+
+test('a "Load latest" whose read fails keeps the form as it was and offers a retry', async () => {
+  let failReads = false
+  mockApi({
+    'GET /settings': () =>
+      failReads
+        ? jsonResponse({ detail: 'Settings are unavailable' }, 503)
+        : jsonResponse({ preview_domain: 'other.example.com', revision: 'r2' }),
+    'PUT /settings': () =>
+      jsonResponse(
+        {
+          title: 'Settings Changed Since They Were Read',
+          detail: 'Platform settings changed since it was read',
+          expected_revision: 'r1',
+          current_revision: 'r2',
+        },
+        409
+      ),
+  })
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  client.setQueryData(['platform-settings'], {
+    preview_domain: 'example.com',
+    revision: 'r1',
+  })
+  const loaded: string[] = []
+  const { result } = renderHook(
+    () => {
+      useQuery({
+        queryKey: ['platform-settings'],
+        queryFn: getPlatformSettings,
+        staleTime: Infinity,
+        retry: false,
+      })
+      return useUpdateSettings({
+        baseRevision: 'r1',
+        onLatestLoaded: (latest) => loaded.push(latest.revision ?? ''),
+      })
+    },
+    {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          {children}
+          <Toaster />
+        </QueryClientProvider>
+      ),
+    }
+  )
+  act(() => {
+    result.current.mutate({ preview_domain: 'mine.example.com' })
+  })
+  await waitFor(() => expect(result.current.isError).toBe(true))
+  failReads = true
+  await act(async () => {
+    fireEvent.click(await screen.findByRole('button', { name: 'Load latest' }))
+  })
+  expect(
+    await screen.findByText('Could not load the latest settings')
+  ).toBeTruthy()
+  // The cached document is not handed over as if it were the latest.
+  expect(loaded).toEqual([])
+
+  failReads = false
+  await act(async () => {
+    fireEvent.click(await screen.findByRole('button', { name: 'Retry' }))
+  })
+  await waitFor(() => expect(loaded).toEqual(['r2']))
+})

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 /**
  * The revision a settings form's values are based on, to send back as
@@ -19,8 +19,8 @@ export function useFormBaseRevision(
   revision: string | undefined
 ): { baseRevision: string | undefined; adopt: (revision?: string) => void } {
   const [frozen, setFrozen] = useState(revision)
-  useEffect(() => {
-    if (!dirty) setFrozen(revision)
-  }, [dirty, revision])
+  // Follow the read while clean, during render rather than in an effect, so
+  // an edit made right after a refetch is based on that refetch.
+  if (!dirty && frozen !== revision) setFrozen(revision)
   return { baseRevision: dirty ? frozen : revision, adopt: setFrozen }
 }
