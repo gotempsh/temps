@@ -169,16 +169,35 @@ fn a_route_the_platform_does_not_have_is_detected() {
 /// deploy, in a background task, as "Failed to deserialize platform response".
 #[test]
 fn every_projected_field_exists_on_the_schema_it_projects() {
-    use utoipa::openapi::{RefOr, Schema};
-
     let docs = merged_docs();
     let components = docs
         .components
         .as_ref()
         .expect("the merged document has no components section");
 
+    let problems = projection_problems(components, temps_plugin_sdk::api::DECLARED_PROJECTIONS);
+    assert!(
+        problems.is_empty(),
+        "temps-plugin-sdk projections no longer match the platform's schemas:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+/// A projection as `DECLARED_PROJECTIONS` lists it: the schema name and its
+/// `(field, required, rust type)` triples.
+type Projection<'a> = (&'a str, &'a [(&'a str, bool, &'a str)]);
+
+/// Everything wrong with `projections` against the platform's schemas: a
+/// field that is absent, required by the SDK but optional on the wire, or
+/// decoded into a Rust type its wire format cannot fill.
+fn projection_problems(
+    components: &utoipa::openapi::Components,
+    projections: &[Projection<'_>],
+) -> Vec<String> {
+    use utoipa::openapi::{RefOr, Schema};
+
     let mut problems = Vec::new();
-    for (schema_name, fields) in temps_plugin_sdk::api::DECLARED_PROJECTIONS {
+    for (schema_name, fields) in projections {
         let Some(RefOr::T(Schema::Object(object))) = components.schemas.get(*schema_name) else {
             problems.push(format!(
                 "{schema_name}: not an object schema in the platform's OpenAPI components"
@@ -186,13 +205,13 @@ fn every_projected_field_exists_on_the_schema_it_projects() {
             continue;
         };
 
-        for (field, required) in *fields {
-            if !object.properties.contains_key(*field) {
+        for (field, required, rust_type) in *fields {
+            let Some(property) = object.properties.get(*field) else {
                 problems.push(format!(
                     "{schema_name}.{field}: projected by the SDK but absent from the schema"
                 ));
                 continue;
-            }
+            };
             // A non-`Option` Rust field cannot decode a response that omits
             // the key, so "present but optional" is a decode failure waiting
             // for the one response that leaves it out.
@@ -202,14 +221,149 @@ fn every_projected_field_exists_on_the_schema_it_projects() {
                      not — make the SDK field `Option<..>` or mark it `required = false`"
                 ));
             }
+            if let Some(problem) = wire_type_problem(components, property, rust_type) {
+                problems.push(format!("{schema_name}.{field}: {problem}"));
+            }
         }
     }
+    problems
+}
 
-    assert!(
-        problems.is_empty(),
-        "temps-plugin-sdk projections no longer match the platform's schemas:\n  {}",
-        problems.join("\n  ")
+/// Why a field the SDK decodes into `rust_type` cannot take what the schema
+/// `property` says the platform sends, or `None` when it can. The ISO 8601
+/// timestamp migration is the case this exists for: a `created_at: i64`
+/// exists on the schema and is required, yet fails on every response.
+fn wire_type_problem(
+    components: &utoipa::openapi::Components,
+    property: &utoipa::openapi::RefOr<utoipa::openapi::Schema>,
+    rust_type: &str,
+) -> Option<String> {
+    let rust_type: String = rust_type.chars().filter(|c| !c.is_whitespace()).collect();
+    let inner = rust_type
+        .strip_prefix("Option<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(&rust_type);
+    let (want_type, want_format) = match inner {
+        "DateTime<Utc>" | "chrono::DateTime<chrono::Utc>" => ("string", Some("date-time")),
+        "String" => ("string", None),
+        "i32" | "i64" | "u32" | "u64" => ("integer", None),
+        "f32" | "f64" => ("number", None),
+        "bool" => ("boolean", None),
+        other => {
+            return Some(format!(
+                "the SDK decodes it as `{other}`, which this test has no wire mapping for; \
+                 add one to `wire_type_problem`"
+            ))
+        }
+    };
+
+    let mut types = BTreeSet::new();
+    let mut formats = BTreeSet::new();
+    let value = match serde_json::to_value(property) {
+        Ok(value) => value,
+        Err(error) => return Some(format!("its schema does not serialize to JSON: {error}")),
+    };
+    collect_wire_types(components, &value, 0, &mut types, &mut formats);
+
+    if !types.contains(want_type) {
+        return Some(format!(
+            "the SDK decodes it as `{rust_type}`, but the platform sends {types:?}"
+        ));
+    }
+    if let Some(format) = want_format {
+        if !formats.contains(format) {
+            return Some(format!(
+                "the SDK decodes it as `{rust_type}`, which needs a `{format}` string, but the \
+                 schema's formats are {formats:?}"
+            ));
+        }
+    }
+    None
+}
+
+/// Gathers the JSON types and formats a schema allows, through nullable
+/// type arrays, `oneOf`/`anyOf`/`allOf` and component `$ref`s.
+fn collect_wire_types(
+    components: &utoipa::openapi::Components,
+    schema: &serde_json::Value,
+    depth: usize,
+    types: &mut BTreeSet<String>,
+    formats: &mut BTreeSet<String>,
+) {
+    if depth > 8 {
+        return;
+    }
+    match schema.get("type") {
+        Some(serde_json::Value::String(t)) => {
+            types.insert(t.clone());
+        }
+        Some(serde_json::Value::Array(ts)) => {
+            types.extend(ts.iter().filter_map(|t| t.as_str()).map(str::to_string));
+        }
+        _ => {}
+    }
+    if let Some(format) = schema.get("format").and_then(|f| f.as_str()) {
+        formats.insert(format.to_string());
+    }
+    for key in ["oneOf", "anyOf", "allOf"] {
+        for variant in schema
+            .get(key)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            collect_wire_types(components, variant, depth + 1, types, formats);
+        }
+    }
+    if let Some(name) = schema
+        .get("$ref")
+        .and_then(|r| r.as_str())
+        .and_then(|r| r.strip_prefix("#/components/schemas/"))
+    {
+        // A target that cannot be read adds no types, so the field is
+        // reported as mismatched rather than passing unchecked.
+        if let Some(Ok(target)) = components.schemas.get(name).map(serde_json::to_value) {
+            collect_wire_types(components, &target, depth + 1, types, formats);
+        }
+    }
+}
+
+/// The wire-type check must catch the regression it was added for: decoding
+/// `ProjectResponse.created_at`, now an ISO 8601 string, into an `i64`.
+#[test]
+fn the_projection_check_rejects_a_timestamp_decoded_as_a_number() {
+    let docs = merged_docs();
+    let components = docs.components.as_ref().expect("no components section");
+
+    let wrong: &[Projection<'_>] = &[(
+        "ProjectResponse",
+        &[
+            ("created_at", true, "i64"),
+            ("last_deployment", false, "Option<i64>"),
+        ],
+    )];
+    let problems = projection_problems(components, wrong);
+    assert_eq!(
+        problems.len(),
+        2,
+        "expected both timestamps flagged: {problems:#?}"
     );
+    assert!(
+        problems[0].starts_with("ProjectResponse.created_at:"),
+        "{problems:#?}"
+    );
+
+    // ...and the right types pass, so the check is not vacuously strict.
+    let right: &[Projection<'_>] = &[(
+        "ProjectResponse",
+        &[
+            ("created_at", true, "DateTime<Utc>"),
+            ("last_deployment", false, "Option<DateTime<Utc>>"),
+            ("slug", true, "String"),
+            ("id", true, "i32"),
+        ],
+    )];
+    assert_eq!(projection_problems(components, right), Vec::<String>::new());
 }
 
 /// The projection check must have teeth: if schema lookup silently returned

@@ -538,13 +538,28 @@ mod integration_tests {
         assert_eq!(updated.status, "resolved");
         assert!(updated.resolved_at.is_some());
 
-        // Get incident updates
-        let updates = incident_service
-            .get_incident_updates(incident.id)
+        // Get incident updates: initial + status update, newest first, a
+        // page at a time.
+        let (updates, total) = incident_service
+            .get_incident_updates(incident.id, temps_core::PageQuery::default())
             .await
             .unwrap();
-
-        assert!(updates.len() >= 2); // Initial + status update
+        assert!(total >= 2);
+        assert_eq!(updates.len() as u64, total);
+        assert!(updates[0].message.contains("scaling up"), "newest first");
+        let (first_page, paged_total) = incident_service
+            .get_incident_updates(
+                incident.id,
+                temps_core::PageQuery {
+                    page: Some(1),
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(paged_total, total);
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].id, updates[0].id);
     }
 
     #[tokio::test]

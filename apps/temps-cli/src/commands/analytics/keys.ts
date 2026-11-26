@@ -4,6 +4,7 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { nextPageHint, pageQuery, type PageFlags } from '../../lib/page-options.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import {
   listAnalyticsIngestKeys,
@@ -33,7 +34,7 @@ import {
   keyValue,
 } from '../../ui/output.js'
 
-interface ListOptions {
+interface ListOptions extends PageFlags {
   project?: string
   json?: boolean
 }
@@ -102,6 +103,8 @@ export function registerAnalyticsKeysCommands(analytics: Command): void {
     .alias('ls')
     .description('List analytics ingest keys for a project')
     .option('-p, --project <project>', 'Project slug or ID')
+    .option('--page <n>', 'Page number (default: 1)')
+    .option('--page-size <n>', 'Items per page (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
     .action(listIngestKeysAction)
 
@@ -187,24 +190,28 @@ async function listIngestKeysAction(options: ListOptions): Promise<void> {
 
   const projectId = await resolveProjectId(options.project)
 
-  const keys = await withSpinner('Fetching analytics ingest keys...', async () => {
+  const query = pageQuery(options)
+  const result = await withSpinner('Fetching analytics ingest keys...', async () => {
     const { data, error } = await listAnalyticsIngestKeys({
       client,
       path: { project_id: projectId },
+      query,
     })
     if (error) {
       throw new Error(getErrorMessage(error))
     }
-    return data ?? []
+    if (!data) throw new Error(`Failed to list analytics ingest keys of project ${projectId}: empty response`)
+    return data
   })
 
   if (options.json) {
-    json(keys)
+    json(result)
     return
   }
 
+  const keys = result.items
   newline()
-  header(`${icons.key} Analytics ingest keys (${keys.length})`)
+  header(`${icons.key} Analytics ingest keys (${keys.length} of ${result.total})`)
 
   if (keys.length === 0) {
     info('No analytics ingest keys found for this project')
@@ -240,6 +247,8 @@ async function listIngestKeysAction(options: ListOptions): Promise<void> {
   ]
 
   printTable(keys, columns, { style: 'minimal' })
+  const more = nextPageHint(result)
+  if (more) info(more)
   newline()
 }
 

@@ -65,6 +65,8 @@ List secrets for a project (values are never returned)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Filter to one environment | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `projects secrets create` (alias: `add`)

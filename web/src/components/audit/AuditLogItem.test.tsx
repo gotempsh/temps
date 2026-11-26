@@ -10,7 +10,7 @@ test('autonomous plugin activity is attributed to its plugin, not system', () =>
       <tbody>
         <AuditLogItemRow
           id={1}
-          audit_date={0}
+          audit_date="1970-01-01T00:00:00Z"
           operation_type="EXTERNAL_PLUGIN_HOST_OPERATION_DENIED"
           data={{
             actor: { id: 'actor-id', kind: 'plugin', name: 'example-plugin' },
@@ -33,7 +33,7 @@ test('visitor enrichment by a deployment token is attributed to that token', () 
       <tbody>
         <AuditLogItemRow
           id={3}
-          audit_date={0}
+          audit_date="1970-01-01T00:00:00Z"
           operation_type="VISITOR_ENRICHED"
           data={{
             actor_kind: 'deployment_token',
@@ -61,7 +61,7 @@ test('a malformed enrichment payload still renders the generic row', () => {
       <tbody>
         <AuditLogItemRow
           id={4}
-          audit_date={0}
+          audit_date="1970-01-01T00:00:00Z"
           operation_type="VISITOR_ENRICHED"
           data={{ actor_kind: 12, custom_data_keys: 'nope' }}
         />
@@ -81,7 +81,7 @@ test.each([
       <tbody>
         <AuditLogItemRow
           id={2}
-          audit_date={0}
+          audit_date="1970-01-01T00:00:00Z"
           operation_type={`EXTERNAL_PLUGIN_HOST_OPERATION_${outcome}`}
           data={{
             actor: { id: 'actor-id', kind: 'plugin', name: 'example-plugin' },
@@ -100,7 +100,7 @@ test('a retired preview names its branch and why it closed', () => {
       <tbody>
         <AuditLogItemRow
           id={4}
-          audit_date={0}
+          audit_date="1970-01-01T00:00:00Z"
           operation_type="PREVIEW_ENVIRONMENT_RETIRED"
           data={{
             project_id: 3,

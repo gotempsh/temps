@@ -75,6 +75,16 @@ impl InboundFilterService {
             .collect()
     }
 
+    /// One rule of a project, with how many events it dropped.
+    pub async fn get(
+        &self,
+        project_id: i32,
+        filter_id: i32,
+    ) -> Result<InboundFilter, ErrorTrackingError> {
+        let row = self.find(project_id, filter_id).await?;
+        to_filter(row, &self.registry.pending_drops())
+    }
+
     pub async fn create(
         &self,
         project_id: i32,

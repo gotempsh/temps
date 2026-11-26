@@ -46,7 +46,17 @@ const secret = (body: Record<string, unknown> = {}) => ({
 const routes = {
   'GET /projects/by-slug/app': { id: 4, slug: 'app' },
   'POST /projects/4/secrets': (_url: URL, body: unknown) => secret(body as Record<string, unknown>),
-  'GET /projects/4/secrets': [secret({ compose_services: ['worker'] })],
+  // One page, as the list endpoint answers: the secret the tests update is
+  // on page 2, so a lookup by key has to read past the first page.
+  'GET /projects/4/secrets': (url: URL) =>
+    url.searchParams.get('page') === '2'
+      ? { items: [secret({ compose_services: ['worker'] })], total: 101, page: 2, page_size: 100 }
+      : {
+          items: Array.from({ length: 100 }, (_, i) => secret({ id: 100 + i, key: `OTHER_${i}` })),
+          total: 101,
+          page: 1,
+          page_size: 100,
+        },
   'PUT /projects/4/secrets/5': (_url: URL, body: unknown) => secret(body as Record<string, unknown>),
 }
 
@@ -136,6 +146,10 @@ describe('projects secrets update', () => {
     const run = await runWithApi(register, ['projects', 'secrets', 'update', '-p', 'app', '-k', 'CODEX_AUTH', '--include-in-preview'], routes)
     expect(run.error).toBeUndefined()
     expect(sentBody(run, 'PUT /projects/4/secrets/5')).toEqual({ compose_services: ['worker'], include_in_preview: true })
+    expect(run.requests.filter((r) => r.startsWith('GET /projects/4/secrets'))).toEqual([
+      'GET /projects/4/secrets?page=1&page_size=100',
+      'GET /projects/4/secrets?page=2&page_size=100',
+    ])
   })
 
   test('--value-stdin on a terminal fails before any request', async () => {

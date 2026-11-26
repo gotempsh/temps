@@ -137,8 +137,12 @@ function formatDurationMs(ms?: number | null): string | null {
   return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`
 }
 
-function formatRange(startMs: number, endMs: number): string {
-  const totalSeconds = Math.max(0, Math.round((endMs - startMs) / 1000))
+/** The time between two ISO 8601 instants, as "Xm Ys". */
+function formatRange(start: string, end: string): string {
+  const totalSeconds = Math.max(
+    0,
+    Math.round((Date.parse(end) - Date.parse(start)) / 1000)
+  )
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}m ${seconds}s`

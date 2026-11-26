@@ -331,6 +331,8 @@ List secrets for a project (values are never returned)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Filter to one environment | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `projects secrets create` (alias: `add`)
@@ -2017,6 +2019,8 @@ List backups for a schedule
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--schedule-id <id>` | Schedule ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `backups show`
@@ -8436,6 +8440,8 @@ List status updates for an incident
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Incident ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `incidents bucketed`
@@ -9517,6 +9523,8 @@ List analytics ingest keys for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `analytics keys create` (alias: `add`)
@@ -10011,7 +10019,7 @@ Manage analytics funnels for projects
 
 **Subcommands:**
 
-- `list` (`ls`) - List all funnels for a project
+- `list` (`ls`) - List the funnels of a project, newest first
 - `create` (`add`) - Create a new funnel for a project
 - `update` - Update a funnel
 - `remove` (`rm`) - Delete a funnel
@@ -10020,13 +10028,15 @@ Manage analytics funnels for projects
 
 ### `funnels list` (alias: `ls`)
 
-List all funnels for a project
+List the funnels of a project, newest first
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `funnels create` (alias: `add`)

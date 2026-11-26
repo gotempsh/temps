@@ -33,7 +33,8 @@ import {
 export interface AuditLogItemProps {
   id: number
   operation_type: string
-  audit_date: number
+  /** ISO 8601, UTC. */
+  audit_date: string
   user?: AuditLogUserInfo
   ip_address?: AuditLogIpInfo
   data?: Record<string, unknown>

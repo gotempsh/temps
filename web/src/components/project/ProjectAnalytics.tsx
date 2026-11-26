@@ -21,6 +21,11 @@ import {
   VisitorIdentityCard,
 } from '@/components/analytics/VisitorIdentityCard'
 import { IdentifyUsersCard } from '@/components/analytics/IdentifyUsersCard'
+import {
+  fetchAllIngestKeys,
+  INGEST_KEYS_PAGE_SIZE,
+  ingestKeyState,
+} from '@/components/project/ingest-keys'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -168,7 +173,10 @@ import {
 import { format } from 'date-fns'
 import { toast } from 'sonner'
 import { useUrlState } from '@temps-sdk/ds'
-import { setProjectHosting } from '@/api/client/sdk.gen'
+import {
+  listAnalyticsIngestKeys,
+  setProjectHosting,
+} from '@/api/client/sdk.gen'
 import { getErrorMessage } from '@/utils/errorHandling'
 import {
   dateFilterFromParams,
@@ -1767,14 +1775,28 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     path: { project_id: project.id },
   }).queryKey
 
+  // Every key, page by page: the list is newest first and keeps revoked
+  // keys, so the active one can sit behind a full page of newer revoked ones.
+  // The key extends `keysQueryKey`, so invalidating that refetches it.
   const {
-    data: keys,
+    data: allKeys,
     isLoading: isLoadingKeys,
     isError: isErrorKeys,
     refetch: refetchKeys,
   } = useQuery({
-    ...listAnalyticsIngestKeysOptions({ path: { project_id: project.id } }),
+    queryKey: [...keysQueryKey, 'all-pages'] as const,
+    queryFn: ({ signal }) =>
+      fetchAllIngestKeys(async (page) => {
+        const { data } = await listAnalyticsIngestKeys({
+          path: { project_id: project.id },
+          query: { page, page_size: INGEST_KEYS_PAGE_SIZE },
+          signal,
+          throwOnError: true,
+        })
+        return data
+      }),
   })
+  const olderKeys = allKeys?.unread ?? 0
 
   const invalidateKeys = () => {
     void queryClient.invalidateQueries({ queryKey: keysQueryKey })
@@ -1812,15 +1834,10 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     },
   })
 
-  const activeKeys = React.useMemo(
-    () => (keys ?? []).filter((k: AnalyticsIngestKey) => k.is_active),
-    [keys]
+  const { revokedKeys, primaryKey } = React.useMemo(
+    () => ingestKeyState(allKeys?.keys ?? []),
+    [allKeys]
   )
-  const revokedKeys = React.useMemo(
-    () => (keys ?? []).filter((k: AnalyticsIngestKey) => !k.is_active),
-    [keys]
-  )
-  const primaryKey = activeKeys[0]
   const keySnippetValue = primaryKey?.public_key ?? 'pa_YOUR_INGEST_KEY'
 
   return (
@@ -1986,6 +2003,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
           <summary className="cursor-pointer font-medium text-muted-foreground">
             {revokedKeys.length} revoked key
             {revokedKeys.length === 1 ? '' : 's'}
+            {olderKeys > 0 && ` (${olderKeys} older not shown)`}
           </summary>
           <div className="mt-3 space-y-2">
             {revokedKeys.map((k: AnalyticsIngestKey) => (

@@ -3366,11 +3366,7 @@ async fn list_on_demand_certs(
         .into_iter()
         .map(|row| {
             let (status, expiration_time, backoff_until) = match row.domain {
-                Some(d) => (
-                    Some(d.status),
-                    d.expiration_time.map(|dt| dt.timestamp_millis()),
-                    d.on_demand_backoff_until.map(|dt| dt.timestamp_millis()),
-                ),
+                Some(d) => (Some(d.status), d.expiration_time, d.on_demand_backoff_until),
                 None => (None, None, None),
             };
             OnDemandCertRow {
@@ -3445,10 +3441,7 @@ async fn get_on_demand_cert_status(
         })?;
 
     let (domain_status, backoff_until) = match status.domain {
-        Some(d) => (
-            Some(d.status),
-            d.on_demand_backoff_until.map(|dt| dt.timestamp_millis()),
-        ),
+        Some(d) => (Some(d.status), d.on_demand_backoff_until),
         None => (None, None),
     };
 
@@ -4022,19 +4015,25 @@ mod tests {
     }
 
     #[test]
-    fn acme_order_responses_use_epoch_milliseconds() {
+    fn acme_order_responses_use_iso_8601_timestamps() {
         let mut order = test_acme_order(None);
         order.expires_at = Some(order.created_at + chrono::Duration::hours(1));
-        let expected_created_at = order.created_at.timestamp_millis();
-        let expected_updated_at = order.updated_at.timestamp_millis();
-        let expected_expires_at = order.expires_at.map(|value| value.timestamp_millis());
+        let expected_created_at = order.created_at;
+        let expected_updated_at = order.updated_at;
+        let expected_expires_at = order.expires_at;
 
         let response = AcmeOrderResponse::from(order);
 
         assert_eq!(response.created_at, expected_created_at);
         assert_eq!(response.updated_at, expected_updated_at);
         assert_eq!(response.expires_at, expected_expires_at);
-        assert!(response.created_at > 1_000_000_000_000);
+        let json = serde_json::to_value(&response).expect("the response serializes");
+        assert!(
+            json["created_at"]
+                .as_str()
+                .is_some_and(|t| t.ends_with('Z')),
+            "timestamps are ISO 8601 in UTC: {json}"
+        );
     }
 
     #[tokio::test]

@@ -40,7 +40,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, patch, post},
+    routing::{get, post},
     Extension, Json, Router,
 };
 use temps_authz::{
@@ -62,6 +62,12 @@ use super::types::{
     AnalyticsIngestEndpoint, AnalyticsIngestKey, AnalyticsIngestKeyError,
     CreateAnalyticsIngestKeyRequest, UpdateAnalyticsIngestKeyRequest,
 };
+
+temps_core::paginated_response!(
+    /// One page of a project's analytics ingest keys, newest first.
+    AnalyticsIngestKeyList,
+    AnalyticsIngestKey
+);
 
 /// State for the ingest-key admin routes.
 ///
@@ -87,6 +93,7 @@ pub struct AnalyticsIngestKeysAppState {
     paths(
         create_analytics_ingest_key,
         list_analytics_ingest_keys,
+        get_analytics_ingest_key,
         get_analytics_ingest_key_endpoint,
         update_analytics_ingest_key,
         rotate_analytics_ingest_key,
@@ -95,6 +102,7 @@ pub struct AnalyticsIngestKeysAppState {
     components(schemas(
         AnalyticsIngestEndpoint,
         AnalyticsIngestKey,
+        AnalyticsIngestKeyList,
         CreateAnalyticsIngestKeyRequest,
         UpdateAnalyticsIngestKeyRequest,
     )),
@@ -116,7 +124,7 @@ pub fn configure_ingest_key_routes() -> Router<Arc<AnalyticsIngestKeysAppState>>
         )
         .route(
             "/projects/{project_id}/analytics/ingest-keys/{key_id}",
-            patch(update_analytics_ingest_key),
+            get(get_analytics_ingest_key).patch(update_analytics_ingest_key),
         )
         .route(
             "/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate",
@@ -291,10 +299,11 @@ async fn create_analytics_ingest_key(
     path = "/projects/{project_id}/analytics/ingest-keys",
     operation_id = "list_analytics_ingest_keys",
     params(
-        ("project_id" = i32, Path, description = "Project ID")
+        ("project_id" = i32, Path, description = "Project ID"),
+        temps_core::PageQuery
     ),
     responses(
-        (status = 200, description = "Ingest keys, active and revoked, newest first", body = Vec<AnalyticsIngestKey>),
+        (status = 200, description = "One page of ingest keys, active and revoked, newest first", body = AnalyticsIngestKeyList),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error")
@@ -305,6 +314,7 @@ async fn list_analytics_ingest_keys(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AnalyticsIngestKeysAppState>>,
     Path(project_id): Path<i32>,
+    axum::extract::Query(page): axum::extract::Query<temps_core::PageQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AnalyticsRead);
     // A project-bound deployment token has no legitimate reason to mint, list,
@@ -315,9 +325,50 @@ async fn list_analytics_ingest_keys(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    let keys = state.ingest_key_service.list(project_id).await?;
+    let (keys, total) = state.ingest_key_service.list(project_id, page).await?;
 
-    Ok((StatusCode::OK, Json(keys)))
+    Ok((
+        StatusCode::OK,
+        Json(AnalyticsIngestKeyList::new(keys, total, page)),
+    ))
+}
+
+/// One of a project's analytics ingest keys, active or revoked.
+///
+/// The same shape as in the list; `public_key` is not a secret and is
+/// returned unmasked, see [`create_analytics_ingest_key`].
+#[utoipa::path(
+    tag = "Analytics Ingest Keys",
+    get,
+    path = "/projects/{project_id}/analytics/ingest-keys/{key_id}",
+    operation_id = "get_analytics_ingest_key",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("key_id" = i32, Path, description = "Analytics ingest key ID")
+    ),
+    responses(
+        (status = 200, description = "The ingest key", body = AnalyticsIngestKey),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Ingest key not found in this project"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_analytics_ingest_key(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AnalyticsIngestKeysAppState>>,
+    Path((project_id, key_id)): Path<(i32, i32)>,
+) -> Result<Json<AnalyticsIngestKey>, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    // Like listing: a deployment token never reads ingest credentials.
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    Ok(Json(
+        state.ingest_key_service.get(project_id, key_id).await?,
+    ))
 }
 
 /// The public address an app Temps does not deploy should send analytics to.
@@ -703,7 +754,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to mint an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to mint an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -718,7 +769,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to update an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to update an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -732,7 +783,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to rotate an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to rotate an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -746,7 +797,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("an ApiReader must not be able to revoke an ingest key");
+        .unwrap_or_else(|| panic!("an ApiReader must not be able to revoke an ingest key"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -761,10 +812,11 @@ mod tests {
             user_auth(Role::MetricsIngest),
             State(empty_state()),
             Path(1),
+            axum::extract::Query(temps_core::PageQuery::default()),
         )
         .await
         .err()
-        .expect("a role without AnalyticsRead must not list ingest keys");
+        .unwrap_or_else(|| panic!("a role without AnalyticsRead must not list ingest keys"));
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -919,7 +971,9 @@ mod tests {
         let err = get_analytics_ingest_key_endpoint(user_auth(Role::User), State(state), Path(7))
             .await
             .err()
-            .expect("a failed settings read must not be reported as 'no external URL'");
+            .unwrap_or_else(|| {
+                panic!("a failed settings read must not be reported as 'no external URL'")
+            });
 
         assert_eq!(err.status_code, StatusCode::INTERNAL_SERVER_ERROR);
         let rendered = serde_json::to_string(&err.body).expect("problem body should serialize");
@@ -944,7 +998,9 @@ mod tests {
         )
         .await
         .err()
-        .expect("a role without AnalyticsRead must not read the ingest endpoint");
+        .unwrap_or_else(|| {
+            panic!("a role without AnalyticsRead must not read the ingest endpoint")
+        });
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
@@ -957,7 +1013,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not read the ingest endpoint");
+        .unwrap_or_else(|| panic!("a deployment token must not read the ingest endpoint"));
         assert_deployment_token_denied(err);
     }
 
@@ -983,7 +1039,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to mint an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to mint an ingest key"));
         assert_deployment_token_denied(err);
         assert!(
             audit.recorded().is_empty(),
@@ -993,11 +1049,15 @@ mod tests {
 
     #[tokio::test]
     async fn list_rejects_a_deployment_token() {
-        let err =
-            list_analytics_ingest_keys(deployment_token_auth(), State(empty_state()), Path(1))
-                .await
-                .err()
-                .expect("a deployment token must not be able to list ingest keys");
+        let err = list_analytics_ingest_keys(
+            deployment_token_auth(),
+            State(empty_state()),
+            Path(1),
+            axum::extract::Query(temps_core::PageQuery::default()),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a deployment token must not be able to list ingest keys"));
         assert_deployment_token_denied(err);
     }
 
@@ -1012,7 +1072,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to update an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to update an ingest key"));
         assert_deployment_token_denied(err);
     }
 
@@ -1026,7 +1086,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to rotate an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to rotate an ingest key"));
         assert_deployment_token_denied(err);
     }
 
@@ -1040,7 +1100,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a deployment token must not be able to revoke an ingest key");
+        .unwrap_or_else(|| panic!("a deployment token must not be able to revoke an ingest key"));
         assert_deployment_token_denied(err);
     }
 
@@ -1081,12 +1141,74 @@ mod tests {
         )
         .await
         .err()
-        .expect("a key from another project must not be updatable");
+        .unwrap_or_else(|| panic!("a key from another project must not be updatable"));
         assert_eq!(err.status_code, StatusCode::NOT_FOUND);
         assert!(
             audit.recorded().is_empty(),
             "a failed update must not emit an audit record"
         );
+    }
+
+    #[tokio::test]
+    async fn one_key_reads_back_unmasked_or_is_a_404_naming_it() {
+        let (state, audit) = state_with(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![key_model(10, 1, None)]])
+                .append_query_results([Vec::<analytics_ingest_keys::Model>::new()]),
+        );
+
+        let Json(key) =
+            get_analytics_ingest_key(user_auth(Role::User), State(state.clone()), Path((1, 10)))
+                .await
+                .expect("a user with AnalyticsRead reads one key");
+        assert_eq!((key.id, key.project_id), (10, 1));
+        assert!(key.public_key.starts_with("pa_") && !key.public_key.contains('*'));
+
+        let err = get_analytics_ingest_key(user_auth(Role::User), State(state), Path((42, 10)))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a key of another project is not found"));
+        assert_eq!(err.status_code, StatusCode::NOT_FOUND);
+        let detail = err
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        assert!(detail.contains("10") && detail.contains("42"), "{detail}");
+        assert!(audit.recorded().is_empty(), "reads are not audited");
+    }
+
+    #[tokio::test]
+    async fn reading_one_key_needs_a_token_analytics_read_and_no_deployment_token() {
+        use tower::ServiceExt;
+        let response = configure_ingest_key_routes()
+            .with_state(empty_state())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/projects/1/analytics/ingest-keys/10")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let err = get_analytics_ingest_key(
+            user_auth(Role::MetricsIngest),
+            State(empty_state()),
+            Path((1, 10)),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a role without AnalyticsRead"));
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+
+        let err =
+            get_analytics_ingest_key(deployment_token_auth(), State(empty_state()), Path((1, 10)))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("a deployment token"));
+        assert_deployment_token_denied(err);
     }
 
     #[tokio::test]
@@ -1104,7 +1226,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("a key from another project must not be revocable");
+        .unwrap_or_else(|| panic!("a key from another project must not be revocable"));
         assert_eq!(err.status_code, StatusCode::NOT_FOUND);
     }
 
@@ -1156,17 +1278,32 @@ mod tests {
 
         let (state, _audit) = state_with(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "num_items".to_string(),
+                    sea_orm::Value::BigInt(Some(42)),
+                )])]])
                 .append_query_results([vec![key_model(10, 1, None), revoked]]),
         );
 
-        let response = list_analytics_ingest_keys(user_auth(Role::Admin), State(state), Path(1))
-            .await
-            .expect("list should succeed")
-            .into_response();
+        let response = list_analytics_ingest_keys(
+            user_auth(Role::Admin),
+            State(state),
+            Path(1),
+            axum::extract::Query(temps_core::PageQuery {
+                page: Some(2),
+                page_size: Some(2),
+            }),
+        )
+        .await
+        .expect("list should succeed")
+        .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        let keys = body.as_array().expect("body should be an array");
+        assert_eq!(body["total"], 42);
+        assert_eq!(body["page"], 2);
+        assert_eq!(body["page_size"], 2);
+        let keys = body["items"].as_array().expect("items should be an array");
         assert_eq!(keys.len(), 2);
         for key in keys {
             let public_key = key["public_key"].as_str().expect("public_key");
@@ -1425,9 +1562,16 @@ mod tests {
             }
         }
 
-        assert_eq!(operation_ids.len(), 6, "expected six operations");
+        // list, read one, create, update, rotate, revoke, endpoint
+        assert_eq!(operation_ids.len(), 7, "expected seven operations");
+        assert!(
+            operation_ids
+                .iter()
+                .any(|id| id == "get_analytics_ingest_key"),
+            "reading one key back must be documented: {operation_ids:?}"
+        );
         let unique: std::collections::HashSet<_> = operation_ids.iter().collect();
-        assert_eq!(unique.len(), 6, "operationIds must be unique");
+        assert_eq!(unique.len(), 7, "operationIds must be unique");
     }
 
     /// The `public_key` field must never be described as a secret, and must

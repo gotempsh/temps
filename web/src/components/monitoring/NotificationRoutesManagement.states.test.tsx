@@ -44,8 +44,8 @@ const provider: NotificationProviderResponse = {
   provider_type: 'email',
   config: {},
   enabled: true,
-  created_at: 0,
-  updated_at: 0,
+  created_at: '1970-01-01T00:00:00Z',
+  updated_at: '1970-01-01T00:00:00Z',
 }
 
 function signedIn(role: string): UserResponse {

@@ -44,7 +44,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Megaphone, Pencil, Plus } from 'lucide-react'
@@ -522,11 +527,21 @@ function PostUpdateForm({ incident }: { incident: IncidentResponse }) {
   )
 }
 
+/** Updates shown per page under an incident, newest first. */
+const UPDATES_PER_PAGE = 20
+
 function IncidentRow({ incident }: { incident: IncidentResponse }) {
   const queryClient = useQueryClient()
-  const updates = useQuery(
-    getIncidentUpdatesOptions({ path: { incident_id: incident.id } })
-  )
+  const [updatesPage, setUpdatesPage] = useState(1)
+  const updates = useQuery({
+    ...getIncidentUpdatesOptions({
+      path: { incident_id: incident.id },
+      query: { page: updatesPage, page_size: UPDATES_PER_PAGE },
+    }),
+    placeholderData: keepPreviousData,
+  })
+  const updatesTotal = updates.data?.total ?? 0
+  const updatesPages = Math.max(1, Math.ceil(updatesTotal / UPDATES_PER_PAGE))
   const toggle = useMutation({
     ...setIncidentUpdateVisibilityMutation(),
     meta: { errorTitle: 'Failed to change update visibility' },
@@ -569,7 +584,7 @@ function IncidentRow({ incident }: { incident: IncidentResponse }) {
         <p className="text-sm text-destructive">Failed to load updates.</p>
       ) : (
         <ul className="space-y-2">
-          {(updates.data ?? []).map((update) => (
+          {(updates.data?.items ?? []).map((update) => (
             <li
               key={update.id}
               className="flex flex-col gap-2 border-l-2 pl-3 sm:flex-row sm:items-start sm:justify-between"
@@ -611,6 +626,16 @@ function IncidentRow({ incident }: { incident: IncidentResponse }) {
             </li>
           ))}
         </ul>
+      )}
+      {updatesTotal > UPDATES_PER_PAGE && (
+        <ResponsivePagination
+          page={updatesPage}
+          pageSize={UPDATES_PER_PAGE}
+          total={updatesTotal}
+          totalPages={updatesPages}
+          onPageChange={setUpdatesPage}
+          ariaLabel="Incident update pagination"
+        />
       )}
       <PostUpdateForm incident={incident} />
     </div>

@@ -59,7 +59,7 @@ interface StatusDisplay {
  * collapsed to their human-facing forms (pending / issuing / failed); `active`
  * is the healthy issued state. `null` means no domains row exists yet.
  */
-function statusDisplay(status: string | null): StatusDisplay {
+function statusDisplay(status: string | null | undefined): StatusDisplay {
   switch (status) {
     case 'active':
       return { label: 'active', variant: 'success' }
@@ -91,7 +91,7 @@ function outcomeDisplay(outcome: string): StatusDisplay {
   }
 }
 
-function boolLabel(value: boolean | null): string {
+function boolLabel(value: boolean | null | undefined): string {
   if (value === null) return '—'
   return value ? 'Yes' : 'No'
 }

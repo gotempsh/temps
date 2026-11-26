@@ -78,10 +78,11 @@ describe('changePercent', () => {
 describe('comparableDeployments', () => {
   test('keeps deployments that went live, newest first', () => {
     const list = comparableDeployments([
-      { id: 1, status: 'deployed', created_at: 1 },
-      { id: 2, status: 'failed', created_at: 3 },
-      { id: 3, status: 'completed', created_at: 2 },
-      { id: 4, status: 'pending', created_at: 4 },
+      { id: 1, status: 'deployed', created_at: '2026-11-20T10:00:01Z' },
+      { id: 2, status: 'failed', created_at: '2026-11-20T10:00:03Z' },
+      // Fractional seconds sort after the whole second as text, not in time.
+      { id: 3, status: 'completed', created_at: '2026-11-20T10:00:01.5Z' },
+      { id: 4, status: 'pending', created_at: '2026-11-20T10:00:04Z' },
     ])
     expect(list.map((d) => d.id)).toEqual([3, 1])
   })

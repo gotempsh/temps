@@ -61,9 +61,9 @@ export function isProvisionedStatus(status: string): boolean {
   return status === 'active' || status === 'provisioned'
 }
 
-/** Domain API timestamps are epoch milliseconds, matching JavaScript Date. */
-export function domainTimestamp(timestampMillis: number): Date {
-  return new Date(timestampMillis)
+/** Domain API timestamps are ISO 8601 strings in UTC. */
+export function domainTimestamp(timestamp: string): Date {
+  return new Date(timestamp)
 }
 
 interface AddOptions {
