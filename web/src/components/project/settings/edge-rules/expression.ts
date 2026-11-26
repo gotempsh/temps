@@ -320,6 +320,14 @@ function validateAction(action: RuleAction): string[] {
   }
 }
 
+/**
+ * Why a rule without conditions is refused (same text as the engine's
+ * `NO_CONDITIONS`). Such a rule matches every request, so one that enforces a
+ * block takes the whole project offline.
+ */
+export const NO_CONDITIONS =
+  'Add a condition. A rule without conditions would match every request; to apply it to every request on purpose, add the condition "path starts with /".'
+
 export function validateRule(draft: EdgeRuleDraft): RuleIssue[] {
   const issues: RuleIssue[] = []
   const name = draft.name.trim()
@@ -329,6 +337,9 @@ export function validateRule(draft: EdgeRuleDraft): RuleIssue[] {
       target: 'name',
       message: `Names are limited to ${LIMITS.nameLength} characters.`,
     })
+
+  if (draft.expression.children.length === 0)
+    issues.push({ target: draft.expression.id, message: NO_CONDITIONS })
 
   let conditions = 0
   walk(draft.expression, (node, depth) => {
@@ -365,11 +376,6 @@ export function ruleWarnings(draft: EdgeRuleDraft): string[] {
   const warnings: string[] = []
   const conditions = conditionsOf(draft.expression)
   const action = draft.action.type
-  if (conditions.length === 0) {
-    warnings.push(
-      'This rule has no conditions, so it matches every request to the project.'
-    )
-  }
   const spoofable = conditions.filter(
     (c) =>
       c.field === 'header' &&

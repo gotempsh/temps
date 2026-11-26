@@ -26,8 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use temps_edge_rules::describe::describe_rule;
 use temps_edge_rules::{
-    auto_name, limits, prepare_expression, validate_rule, Action, Decision, Group, Mode,
-    ParsedSample, PatternUsage, Program, RuleDefinition, RuleIssue, RuleOutcome, SampleRequest,
+    auto_name, limits, prepare_expression, validate_rule_with, Action, Decision, EmptyExpression,
+    Group, Mode, ParsedSample, PatternUsage, Program, RuleDefinition, RuleIssue, RuleOutcome,
+    SampleRequest,
 };
 use temps_entities::{environments, project_edge_rules, projects};
 use thiserror::Error;
@@ -49,13 +50,24 @@ pub enum EdgeRuleServiceError {
     RuleNotFound { project_id: i32, rule_id: i32 },
 
     #[error(
-        "Edge rule '{rule}' in project {project_id} is invalid: {}",
+        "Edge rule '{}' in project {project_id} is invalid: {}",
+        echoed_name(rule),
         summarize(issues)
     )]
     Invalid {
         project_id: i32,
         rule: String,
         issues: Vec<RuleIssue>,
+    },
+
+    #[error(
+        "Position {position} is outside the edge rules of project {project_id}: use 0 (first) \
+         to {max} (after the last rule), or leave position out to add the rule last"
+    )]
+    InvalidPosition {
+        project_id: i32,
+        position: i32,
+        max: i32,
     },
 
     #[error("Project {project_id} already has {max} edge rules, the maximum")]
@@ -91,6 +103,21 @@ pub enum EdgeRuleServiceError {
         #[source]
         source: sea_orm::DbErr,
     },
+}
+
+/// Longest part of a rule name an error repeats. A refused name can be as long
+/// as the request body, and the error must not echo all of it.
+const MAX_ECHOED_NAME_CHARS: usize = limits::NAME_LENGTH;
+
+/// `name` as an error repeats it: whole up to the name limit, otherwise cut
+/// there and followed by `…`.
+fn echoed_name(name: &str) -> String {
+    if name.chars().count() <= MAX_ECHOED_NAME_CHARS {
+        return name.to_string();
+    }
+    let mut shown: String = name.chars().take(MAX_ECHOED_NAME_CHARS).collect();
+    shown.push('…');
+    shown
 }
 
 fn summarize(issues: &[RuleIssue]) -> String {
@@ -175,7 +202,9 @@ pub struct CreateEdgeRuleRequest {
     pub environment_id: Option<i32>,
     pub expression: Group,
     pub action: Action,
-    /// Where to insert the rule (0 = first). Defaults to the end.
+    /// Where to insert the rule: 0 is first, and the number of rules the
+    /// project has is after the last one. Defaults to the end. A position
+    /// outside that range is refused.
     #[serde(default)]
     pub position: Option<i32>,
 }
@@ -442,13 +471,14 @@ impl EdgeRuleService {
         name: Option<&str>,
         mut expression: Group,
         action: Action,
+        empty: EmptyExpression,
     ) -> Result<Prepared, EdgeRuleServiceError> {
         prepare_expression(&mut expression);
         let name = match name.map(str::trim) {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => auto_name(&expression, &action),
         };
-        let issues = validate_rule(&name, &expression, &action);
+        let issues = validate_rule_with(&name, &expression, &action, empty);
         if !issues.is_empty() {
             return Err(EdgeRuleServiceError::Invalid {
                 project_id,
@@ -568,7 +598,13 @@ impl EdgeRuleService {
         expression: Group,
         action: Action,
     ) -> Result<(String, String), EdgeRuleServiceError> {
-        let prepared = Self::prepare(project_id, name, expression, action)?;
+        let prepared = Self::prepare(
+            project_id,
+            name,
+            expression,
+            action,
+            EmptyExpression::Refuse,
+        )?;
         let summary = describe_rule(&prepared.expression, &prepared.action);
         Ok((prepared.name, summary))
     }
@@ -616,6 +652,7 @@ impl EdgeRuleService {
             request.name.as_deref(),
             request.expression,
             request.action,
+            EmptyExpression::Refuse,
         )?;
         let txn = self.db.begin().await.map_err(db_error(project_id))?;
         self.ensure_project(&txn, project_id).await?;
@@ -642,7 +679,17 @@ impl EdgeRuleService {
         Self::check_pattern_budget(&txn, project_id, None, &prepared.name, &prepared.expression)
             .await?;
         let end = i32::try_from(count).unwrap_or(i32::MAX);
-        let position = request.position.map_or(end, |p| p.clamp(0, end));
+        let position = match request.position {
+            None => end,
+            Some(position) if (0..=end).contains(&position) => position,
+            Some(position) => {
+                return Err(EdgeRuleServiceError::InvalidPosition {
+                    project_id,
+                    position,
+                    max: end,
+                })
+            }
+        };
         if position < end {
             // Make room. The position constraint is deferred, so the
             // transient duplicates are fine until commit.
@@ -711,7 +758,16 @@ impl EdgeRuleService {
             .unwrap_or_else(|| before.expression.clone());
         let action = request.action.unwrap_or_else(|| before.action.clone());
         let name = request.name.as_deref().or(Some(before.name.as_str()));
-        let prepared = Self::prepare(project_id, name, expression, action)?;
+        let enabled = request.enabled.unwrap_or(current.enabled);
+        // A rule stored before empty expressions were refused can still be
+        // turned off or renamed while off; enabling it, or writing a new
+        // expression, needs a condition.
+        let empty = if expression_changed || enabled {
+            EmptyExpression::Refuse
+        } else {
+            EmptyExpression::Allow
+        };
+        let prepared = Self::prepare(project_id, name, expression, action, empty)?;
         if expression_changed {
             Self::check_pattern_budget(
                 &txn,
@@ -728,7 +784,7 @@ impl EdgeRuleService {
 
         let mut active: project_edge_rules::ActiveModel = current.clone().into();
         active.name = Set(prepared.name);
-        active.enabled = Set(request.enabled.unwrap_or(current.enabled));
+        active.enabled = Set(enabled);
         active.mode = Set(request.mode.unwrap_or(before.mode).as_str().to_string());
         active.environment_id = Set(environment_id);
         active.expression = Set(to_json(project_id, &prepared.expression)?);
@@ -884,6 +940,7 @@ impl EdgeRuleService {
                         input.name.as_deref(),
                         input.expression,
                         input.action,
+                        EmptyExpression::Refuse,
                     )?;
                     out.push(RuleDefinition {
                         id,
@@ -1084,7 +1141,13 @@ pub(crate) mod tests {
             "action": {"type": "block", "status": 200}
         }))
         .expect("parses");
-        match EdgeRuleService::prepare(7, None, request.expression, request.action) {
+        match EdgeRuleService::prepare(
+            7,
+            None,
+            request.expression,
+            request.action,
+            EmptyExpression::Refuse,
+        ) {
             Err(EdgeRuleServiceError::Invalid {
                 project_id: 7,
                 issues,
@@ -1101,8 +1164,14 @@ pub(crate) mod tests {
     #[test]
     fn an_empty_name_is_generated_from_the_rule() {
         let request = block_admin();
-        let prepared = EdgeRuleService::prepare(1, Some("  "), request.expression, request.action)
-            .unwrap_or_else(|e| panic!("valid rule: {e}"));
+        let prepared = EdgeRuleService::prepare(
+            1,
+            Some("  "),
+            request.expression,
+            request.action,
+            EmptyExpression::Refuse,
+        )
+        .unwrap_or_else(|e| panic!("valid rule: {e}"));
         assert_eq!(
             prepared.name,
             "Block when path starts with /admin (ignoring case)"
@@ -1395,6 +1464,302 @@ pub(crate) mod tests {
                 project_id: 999_999
             })
         ));
+    }
+
+    fn no_conditions(combinator: &str) -> serde_json::Value {
+        serde_json::json!({"combinator": combinator, "children": []})
+    }
+
+    fn is_no_conditions(error: &EdgeRuleServiceError) -> bool {
+        matches!(
+            error,
+            EdgeRuleServiceError::Invalid { issues, .. }
+                if issues.iter().any(|i| i.message == temps_edge_rules::NO_CONDITIONS)
+        )
+    }
+
+    #[tokio::test]
+    async fn rules_without_conditions_are_refused_on_every_write_path() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let service = EdgeRuleService::new(test_db.connection_arc());
+        let (project_id, _) = project(&test_db, "edge-no-conditions").await;
+
+        for combinator in ["all", "any", "none"] {
+            let request: CreateEdgeRuleRequest = serde_json::from_value(serde_json::json!({
+                "mode": "enforce",
+                "expression": no_conditions(combinator),
+                "action": {"type": "block", "status": 403}
+            }))
+            .expect("parses");
+            let error = service
+                .create(project_id, request, None)
+                .await
+                .expect_err("a rule without conditions must be refused");
+            assert!(is_no_conditions(&error), "{combinator}: {error}");
+            let problem = temps_core::problemdetails::Problem::from(error);
+            assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        }
+        let listed = service
+            .list(project_id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(listed.rules.is_empty(), "nothing is stored");
+
+        // Validation and the dry run refuse the same draft.
+        let expression: Group = serde_json::from_value(no_conditions("all")).expect("parses");
+        let error = service
+            .validate(project_id, None, expression.clone(), Action::Log)
+            .expect_err("validation refuses it");
+        assert!(is_no_conditions(&error), "{error}");
+        let error = service
+            .evaluate(
+                project_id,
+                EvaluateEdgeRulesRequest {
+                    request: sample("https://example.test/"),
+                    rules: Some(vec![EvaluateRuleInput {
+                        id: None,
+                        name: None,
+                        enabled: true,
+                        mode: Mode::Enforce,
+                        environment_id: None,
+                        expression: expression.clone(),
+                        action: Action::Log,
+                    }]),
+                },
+            )
+            .await
+            .expect_err("the dry run refuses it");
+        assert!(is_no_conditions(&error), "{error}");
+
+        // Emptying the expression of a saved rule is refused, enabled or not.
+        let saved = service
+            .create(project_id, block_admin(), None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        for enabled in [Some(true), Some(false)] {
+            let error = service
+                .update(
+                    project_id,
+                    saved.id,
+                    UpdateEdgeRuleRequest {
+                        enabled,
+                        expression: Some(expression.clone()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .expect_err("emptying the expression must be refused");
+            assert!(is_no_conditions(&error), "{error}");
+        }
+        let kept = service
+            .get(project_id, saved.id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(kept.expression, saved.expression);
+        assert_eq!(kept.revision, saved.revision);
+
+        // Matching every request on purpose is one explicit condition.
+        let every_request = rule_on("/", serde_json::json!({"type": "block", "status": 403}));
+        let created = service
+            .create(project_id, every_request, None)
+            .await
+            .unwrap_or_else(|e| panic!("an explicit condition is accepted: {e}"));
+        assert_eq!(created.summary, "Block with 403 when path starts with /");
+    }
+
+    #[tokio::test]
+    async fn a_stored_rule_without_conditions_can_still_be_turned_off() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let service = EdgeRuleService::new(test_db.connection_arc());
+        let (project_id, _) = project(&test_db, "edge-legacy-empty").await;
+        // A rule saved before such rules were refused.
+        let rows = test_db
+            .query_sql(&format!(
+                "INSERT INTO project_edge_rules (project_id, position, name, enabled, mode, \
+                 expression, action, revision, created_at, updated_at) VALUES ({project_id}, 0, \
+                 'Block every request', true, 'enforce', \
+                 '{{\"id\":\"root\",\"combinator\":\"all\",\"children\":[]}}'::jsonb, \
+                 '{{\"type\":\"block\",\"status\":403}}'::jsonb, 1, NOW(), NOW()) RETURNING id"
+            ))
+            .await
+            .expect("insert a stored rule");
+        let rule_id: i32 = rows
+            .first()
+            .expect("one row")
+            .try_get("", "id")
+            .expect("id");
+
+        // Renaming it while it stays enabled is refused...
+        let error = service
+            .update(
+                project_id,
+                rule_id,
+                UpdateEdgeRuleRequest {
+                    name: Some("Renamed".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("an enabled rule without conditions cannot be saved again");
+        assert!(is_no_conditions(&error), "{error}");
+
+        // ...turning it off is not, and a disabled one can be renamed.
+        let (_, off) = service
+            .update(
+                project_id,
+                rule_id,
+                UpdateEdgeRuleRequest {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("turning the rule off must work: {e}"));
+        assert!(!off.enabled);
+        let (_, renamed) = service
+            .update(
+                project_id,
+                rule_id,
+                UpdateEdgeRuleRequest {
+                    name: Some("Old catch-all".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("a disabled rule can be renamed: {e}"));
+        assert_eq!(renamed.name, "Old catch-all");
+        assert!(!renamed.enabled);
+
+        // Turning it back on needs a condition.
+        let error = service
+            .update(
+                project_id,
+                rule_id,
+                UpdateEdgeRuleRequest {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("re-enabling a rule without conditions must be refused");
+        assert!(is_no_conditions(&error), "{error}");
+        let stored = service
+            .get(project_id, rule_id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!stored.enabled);
+
+        service
+            .delete(project_id, rule_id, None)
+            .await
+            .unwrap_or_else(|e| panic!("it can be deleted: {e}"));
+    }
+
+    #[tokio::test]
+    async fn positions_outside_the_rules_are_refused() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let service = EdgeRuleService::new(test_db.connection_arc());
+        let (project_id, _) = project(&test_db, "edge-positions").await;
+        let first = service
+            .create(project_id, block_admin(), None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        for position in [-1, 2, i32::MIN, i32::MAX] {
+            let mut request = rule_on("/api", serde_json::json!({"type": "log"}));
+            request.position = Some(position);
+            let error = service
+                .create(project_id, request, None)
+                .await
+                .expect_err("a position outside the rules must be refused");
+            match &error {
+                EdgeRuleServiceError::InvalidPosition {
+                    project_id: p,
+                    position: got,
+                    max,
+                } => {
+                    assert_eq!((*p, *got, *max), (project_id, position, 1));
+                }
+                other => panic!("expected InvalidPosition, got {other}"),
+            }
+            let problem = temps_core::problemdetails::Problem::from(error);
+            assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+        }
+        let listed = service
+            .list(project_id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(listed.rules.len(), 1, "nothing is stored");
+
+        // The ends of the range are accepted, where they say.
+        let mut last = rule_on("/last", serde_json::json!({"type": "log"}));
+        last.position = Some(1);
+        let last = service
+            .create(project_id, last, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(last.position, 1);
+        let mut top = rule_on("/top", serde_json::json!({"type": "log"}));
+        top.position = Some(0);
+        let top = service
+            .create(project_id, top, None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(top.position, 0);
+        let order: Vec<i32> = service
+            .list(project_id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .rules
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(order, vec![top.id, first.id, last.id]);
+    }
+
+    #[test]
+    fn an_invalid_rule_error_does_not_echo_a_long_name() {
+        let request = block_admin();
+        let name = "n".repeat(200_000);
+        let error = EdgeRuleService::prepare(
+            1,
+            Some(&name),
+            request.expression,
+            request.action,
+            EmptyExpression::Refuse,
+        )
+        .err()
+        .expect("an over-long name is refused");
+        let message = error.to_string();
+        assert!(message.len() < 1_024, "{} bytes", message.len());
+        assert!(
+            message.contains("Names are limited to 80 characters."),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("'{}…'", "n".repeat(80))),
+            "{message}"
+        );
+        let problem = temps_core::problemdetails::Problem::from(error);
+        let body = serde_json::to_string(&problem.body).expect("serializes");
+        assert!(body.len() < 2_048, "{} bytes", body.len());
+    }
+
+    #[test]
+    fn a_short_rule_name_is_echoed_whole() {
+        assert_eq!(echoed_name("Block admin"), "Block admin");
+        assert_eq!(echoed_name(&"x".repeat(80)), "x".repeat(80));
     }
 
     #[tokio::test]

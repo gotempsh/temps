@@ -208,18 +208,19 @@ fn validate_condition(c: &Condition) -> Vec<String> {
     }
     if let Some(kind) = field.keyed {
         let key = c.key.as_deref().unwrap_or("").trim();
+        // The length comes first: the other messages repeat the name.
         if key.is_empty() {
             issues.push(format!("Enter the {} name.", kind.label()));
-        } else if kind == KeyKind::Header && !header_name_re().is_match(key) {
-            issues.push(format!("\"{key}\" is not a valid header name."));
-        } else if key.chars().any(char::is_whitespace) {
-            issues.push(format!("The {} name cannot contain spaces.", kind.label()));
         } else if key.len() > limits::VALUE_BYTES {
             issues.push(format!(
                 "The {} name is limited to {} bytes.",
                 kind.label(),
                 limits::VALUE_BYTES
             ));
+        } else if kind == KeyKind::Header && !header_name_re().is_match(key) {
+            issues.push(format!("\"{key}\" is not a valid header name."));
+        } else if key.chars().any(char::is_whitespace) {
+            issues.push(format!("The {} name cannot contain spaces.", kind.label()));
         }
     }
     if c.op.is_presence() {
@@ -333,7 +334,9 @@ fn validate_redirect(target: &str, status: u16) -> Vec<String> {
         return issues;
     }
     if target.len() > 2048 {
+        // The checks below repeat parts of the target.
         issues.push("The redirect target is limited to 2048 bytes.".into());
+        return issues;
     }
     if target.chars().any(|c| c.is_control()) {
         issues.push("The redirect target cannot contain control characters.".into());
@@ -401,8 +404,37 @@ pub fn validate_action(action: &Action) -> Vec<String> {
     }
 }
 
+/// Why a rule without conditions is refused. Such a rule matches every
+/// request, so one enforcing a block takes the whole project offline; a rule
+/// meant for every request says so with an explicit condition.
+pub const NO_CONDITIONS: &str = "Add a condition. A rule without conditions would match every \
+     request; to apply it to every request on purpose, add the condition \"path starts with /\".";
+
+/// Whether an expression without conditions is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyExpression {
+    /// Refused with [`NO_CONDITIONS`]. Every new or edited rule.
+    Refuse,
+    /// Accepted. Only for a stored rule whose expression is not being
+    /// changed and that is left disabled, so a rule saved before empty
+    /// expressions were refused can still be turned off or renamed.
+    Allow,
+}
+
 /// Validates a prepared rule. An empty list means the rule can be saved.
+/// A rule must have at least one condition ([`NO_CONDITIONS`]).
 pub fn validate_rule(name: &str, expression: &Group, action: &Action) -> Vec<RuleIssue> {
+    validate_rule_with(name, expression, action, EmptyExpression::Refuse)
+}
+
+/// [`validate_rule`] with an explicit policy for an expression without
+/// conditions.
+pub fn validate_rule_with(
+    name: &str,
+    expression: &Group,
+    action: &Action,
+    empty: EmptyExpression,
+) -> Vec<RuleIssue> {
     let mut issues = Vec::new();
     let name = name.trim();
     if name.is_empty() {
@@ -424,6 +456,9 @@ pub fn validate_rule(name: &str, expression: &Group, action: &Action) -> Vec<Rul
             ),
         ));
     } else {
+        if expression.children.is_empty() && empty == EmptyExpression::Refuse {
+            issues.push(issue(&expression.id, NO_CONDITIONS));
+        }
         walk_group(expression, 1, true, &mut issues);
     }
     for message in validate_action(action) {
@@ -548,6 +583,15 @@ mod tests {
         };
         prepare_expression(&mut g);
         g
+    }
+
+    /// A rule that matches every request through an explicit condition.
+    fn any_request() -> Group {
+        rule(vec![Expression::Condition(cond(
+            Field::Path,
+            Operator::StartsWith,
+            &["/"],
+        ))])
     }
 
     fn block() -> Action {
@@ -728,7 +772,7 @@ mod tests {
 
     #[test]
     fn name_is_required_and_bounded() {
-        let g = rule(vec![]);
+        let g = any_request();
         assert_eq!(messages(" ", &g, &block()), vec!["Give the rule a name."]);
         let long = "x".repeat(81);
         assert_eq!(
@@ -861,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_nested_groups_are_rejected_but_an_empty_root_is_not() {
+    fn empty_nested_groups_are_rejected() {
         let g = rule(vec![Expression::Group(Group {
             id: String::new(),
             combinator: Combinator::Any,
@@ -871,12 +915,85 @@ mod tests {
             messages("r", &g, &block()),
             vec!["Add a condition to this group or remove it."]
         );
-        assert!(messages("r", &rule(vec![]), &block()).is_empty());
+    }
+
+    #[test]
+    fn a_rule_without_conditions_is_refused_whatever_its_combinator() {
+        for combinator in [Combinator::All, Combinator::Any, Combinator::None] {
+            let mut g = Group {
+                id: String::new(),
+                combinator,
+                children: vec![],
+            };
+            prepare_expression(&mut g);
+            let issues = validate_rule("r", &g, &block());
+            assert_eq!(
+                issues,
+                vec![RuleIssue {
+                    target: g.id.clone(),
+                    message: NO_CONDITIONS.to_string(),
+                }],
+                "{combinator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_condition_on_every_path_is_accepted() {
+        let g = rule(vec![Expression::Condition(cond(
+            Field::Path,
+            Operator::StartsWith,
+            &["/"],
+        ))]);
+        assert!(messages("r", &g, &block()).is_empty());
+    }
+
+    #[test]
+    fn an_empty_expression_is_accepted_only_when_allowed() {
+        let g = rule(vec![]);
+        assert!(
+            validate_rule_with("r", &g, &block(), EmptyExpression::Allow).is_empty(),
+            "a stored rule left disabled may keep its empty expression"
+        );
+        // Everything else is still checked.
+        let bad = Action::Block {
+            status: 200,
+            body: String::new(),
+        };
+        assert_eq!(
+            validate_rule_with("r", &g, &bad, EmptyExpression::Allow).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_oversized_header_name_or_target_is_not_repeated() {
+        let huge = format!("{}!", "h".repeat(200_000));
+        let mut c = cond(Field::Header, Operator::Exists, &[]);
+        c.key = Some(huge.clone());
+        let g = rule(vec![Expression::Condition(c)]);
+        let issues = messages("r", &g, &block());
+        assert_eq!(issues, vec!["The header name is limited to 256 bytes."]);
+
+        let g = rule(vec![Expression::Condition(cond(
+            Field::Path,
+            Operator::StartsWith,
+            &["/"],
+        ))]);
+        let target = format!("/{}", "{x}".repeat(100_000));
+        let redirect = Action::Redirect {
+            target,
+            status: 302,
+        };
+        assert_eq!(
+            messages("r", &g, &redirect),
+            vec!["The redirect target is limited to 2048 bytes."]
+        );
     }
 
     #[test]
     fn block_status_and_body_are_bounded() {
-        let g = rule(vec![]);
+        let g = any_request();
         let bad = Action::Block {
             status: 500,
             body: "x".repeat(1025),
@@ -892,7 +1009,7 @@ mod tests {
 
     #[test]
     fn redirect_targets_cannot_become_open_redirects() {
-        let g = rule(vec![]);
+        let g = any_request();
         let check = |target: &str| {
             messages(
                 "r",

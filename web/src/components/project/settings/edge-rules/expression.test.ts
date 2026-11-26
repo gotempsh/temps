@@ -8,6 +8,7 @@ import {
   emptyDraft,
   newCondition,
   newGroup,
+  NO_CONDITIONS,
   removeNode,
   ruleWarnings,
   updateNode,
@@ -99,13 +100,30 @@ describe('validateRule', () => {
     ).toContain('Patterns may use at most 8 * wildcards.')
   })
 
-  test('rejects empty nested groups but allows an empty root', () => {
-    const draft = draftWith([])
-    expect(validateRule(draft)).toEqual([])
+  test('rejects a rule without conditions, whatever its combinator', () => {
+    for (const combinator of ['all', 'any', 'none'] as const) {
+      const draft = draftWith([])
+      draft.expression.combinator = combinator
+      expect(validateRule(draft)).toEqual([
+        { target: draft.expression.id, message: NO_CONDITIONS },
+      ])
+    }
+  })
+
+  test('accepts an explicit condition on every path', () => {
+    expect(
+      validateRule(
+        draftWith([{ field: 'path', op: 'starts_with', value: '/' }])
+      )
+    ).toEqual([])
+  })
+
+  test('rejects empty nested groups', () => {
+    const draft = draftWith([{ field: 'path', op: 'starts_with', value: '/' }])
     draft.expression.children.push(newGroup('any', []))
-    expect(messages(draft)).toContain(
-      'Add a condition to this group or remove it.'
-    )
+    expect(messages(draft)).toEqual([
+      'Add a condition to this group or remove it.',
+    ])
   })
 
   test('limits nesting depth to four levels', () => {
@@ -129,7 +147,13 @@ describe('validateRule', () => {
 
   describe('redirect targets cannot become open redirects', () => {
     const redirect = (target: string) =>
-      messages(draftWith([], { type: 'redirect', target, status: 302 }))
+      messages(
+        draftWith([{ field: 'path', op: 'starts_with', value: '/old' }], {
+          type: 'redirect',
+          target,
+          status: 302,
+        })
+      )
 
     test('accepts fixed-host URLs and paths with placeholders', () => {
       expect(redirect('https://docs.example.com{path}')).toEqual([])
@@ -172,8 +196,8 @@ describe('ruleWarnings', () => {
     expect(warnings.some((w) => w.includes('can be forged'))).toBe(true)
   })
 
-  test('warns that a rule without conditions matches everything', () => {
-    expect(ruleWarnings(draftWith([]))[0]).toContain('matches every request')
+  test('a rule without conditions is an error, not a warning', () => {
+    expect(ruleWarnings(draftWith([]))).toEqual([])
   })
 
   test('warns when an allow rule ignores path case', () => {
