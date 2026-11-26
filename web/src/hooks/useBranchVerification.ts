@@ -8,7 +8,7 @@ import {
 import type { BranchInfo } from '@/api/client/types.gen'
 import { httpStatusOf } from '@/lib/http-error-status'
 import { useQuery } from '@tanstack/react-query'
-import { useMemo } from 'react'
+import { useCallback, useMemo } from 'react'
 
 /**
  * What the server has said about one branch name that a branch listing did
@@ -35,6 +35,14 @@ export interface BranchVerification {
   status: BranchVerificationStatus
   /** The branch the lookup found, with the server's `is_default` and SHA. */
   branch?: BranchInfo
+  /**
+   * Ask the provider again. The exact lookup has its own query key, so
+   * refreshing the branch listing never refetches it: a "Refresh branches"
+   * control must call this too, or a branch past the listing cap keeps the
+   * head SHA (or the failure) from before the refresh. A no-op when nothing
+   * is being verified.
+   */
+  refresh: () => Promise<void>
 }
 
 export interface BranchVerificationInput {
@@ -101,17 +109,24 @@ export function useBranchVerification({
   const query = connectionId ? connectionQuery : publicQuery
   const asked = canAsk && (!!connectionId || !!publicProvider)
 
+  const { refetch } = query
+  const refresh = useCallback(async () => {
+    if (!asked) return
+    await refetch()
+  }, [asked, refetch])
+
   return useMemo<BranchVerification>(() => {
-    if (!asked) return { status: 'not-needed' }
-    if (query.data) return { status: 'found', branch: query.data }
+    if (!asked) return { status: 'not-needed', refresh }
+    if (query.data) return { status: 'found', branch: query.data, refresh }
     if (query.isError) {
       // Only the server saying "no such branch" settles the question. A 401,
       // 403, 429, 502 or network failure leaves it open, and claiming the
       // branch is missing on one of those is exactly the bug this guards.
       return {
         status: httpStatusOf(query.error) === 404 ? 'missing' : 'unverified',
+        refresh,
       }
     }
-    return { status: 'checking' }
-  }, [asked, query.data, query.error, query.isError])
+    return { status: 'checking', refresh }
+  }, [asked, query.data, query.error, query.isError, refresh])
 }

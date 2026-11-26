@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
@@ -26,12 +32,20 @@ const project = {
   main_branch: 'main',
 } as ProjectResponse
 
-/** Production deploys `main`, which is the branch under test. */
+/** Both environments deploy `main`, which is the branch under test. */
 const environments = [
   {
     id: 1,
     name: 'production',
     slug: 'production',
+    branch: 'main',
+    is_preview: false,
+    current_deployment_id: null,
+  },
+  {
+    id: 2,
+    name: 'staging',
+    slug: 'staging',
     branch: 'main',
     is_preview: false,
     current_deployment_id: null,
@@ -51,7 +65,7 @@ const branch = (name: string) => ({
  */
 function renderModal(options: {
   truncated: boolean
-  lookup: () => Response
+  lookup: (request: Request) => Response
   /** Omit to leave the lookup unmocked, i.e. still in flight / 404-by-default. */
   withLookup?: boolean
 }) {
@@ -164,4 +178,52 @@ test('nothing alarming is said while the lookup is still in flight', async () =>
   expect(view.queryByText(NOT_FOUND)).toBeNull()
   expect(view.queryByText(UNVERIFIED)).toBeNull()
   release?.()
+})
+
+test('typing a replacement for a confirmed-missing branch keeps the field mounted and focused', async () => {
+  const looked: string[] = []
+  const { view } = renderModal({
+    truncated: true,
+    lookup: (request) => {
+      looked.push(new URL(request.url).searchParams.get('name') ?? '')
+      return jsonResponse({ title: 'Branch Not Found' }, 404)
+    },
+  })
+
+  // Choosing an environment is what puts its branch in the field (production
+  // is preselected, so pick the other one to make a change).
+  const trigger = await waitFor(() => {
+    const element = view.baseElement.querySelector<HTMLElement>('#environment')
+    if (!element || element.hasAttribute('data-disabled')) {
+      throw new Error('environment picker not ready')
+    }
+    return element
+  })
+  fireEvent.pointerDown(trigger, {
+    button: 0,
+    ctrlKey: false,
+    pointerType: 'mouse',
+  })
+  fireEvent.click(await view.findByRole('option', { name: 'staging' }))
+
+  const input = await view.findByPlaceholderText('Enter branch name manually')
+  await waitFor(() => expect(view.getByText(NOT_FOUND)).toBeTruthy())
+  input.focus()
+  const lookupsBeforeTyping = looked.length
+
+  fireEvent.change(input, { target: { value: 'mai' } })
+  fireEvent.change(input, { target: { value: 'main-2' } })
+
+  // The new name is pending verification, yet the field the user is typing
+  // in is the same element, still focused, with no stale "not found".
+  expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
+  expect(document.activeElement).toBe(input)
+  expect(view.queryByText(NOT_FOUND)).toBeNull()
+
+  // Only the name the user settled on is looked up, once.
+  await act(() => new Promise((resolve) => setTimeout(resolve, 500)))
+  await waitFor(() => expect(view.getByText(NOT_FOUND)).toBeTruthy())
+  expect(looked.slice(lookupsBeforeTyping)).toEqual(['main-2'])
+  expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
+  expect(document.activeElement).toBe(input)
 })

@@ -57,6 +57,7 @@ import {
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
 import { useBranchVerification } from '@/hooks/useBranchVerification'
+import { useDebounce } from '@/hooks/useDebounce'
 import { parsePublicRepositoryUrl } from '@/lib/public-repository'
 import { gitProviderSetupPath, problemDetail } from '@/lib/api-problem'
 import {
@@ -266,6 +267,11 @@ export function RedeploymentModal({
   // listing holds a prefix of the repository's branches, so a name it lacks
   // may still exist and must never be reported as missing on its strength.
   const [branchListTruncated, setBranchListTruncated] = useState(false)
+  // Once the server has confirmed an environment's branch is gone, the field
+  // becomes free text and stays free text while the user types a replacement.
+  // Re-verifying each edit passes through "checking", and swapping the input
+  // back to the combobox then would pull focus away after one character.
+  const [manualBranchEntry, setManualBranchEntry] = useState(false)
   const [commitToCheck, setCommitToCheck] = useState('')
   const [tagToCheck, setTagToCheck] = useState('')
   // What the user typed over the default image for docker_image projects (e.g.
@@ -349,29 +355,54 @@ export function RedeploymentModal({
     !availableBranches.includes(effectiveBranch)
   )
   const publicRepository = parsePublicRepositoryUrl(projectDetails.git_url)
+  // A name being typed is looked up once the user pauses, not per keystroke:
+  // each lookup is a provider request, and every intermediate prefix would
+  // flash "not found".
+  const debouncedBranch = useDebounce(effectiveBranch, 350)
+  const verifiedName = manualBranchEntry ? debouncedBranch : effectiveBranch
+  const branchEditPending = verifiedName !== effectiveBranch
   const branchVerification = useBranchVerification({
     repoOwner: projectDetails.repo_owner || '',
     repoName: projectDetails.repo_name || '',
     connectionId: projectDetails.git_provider_connection_id || undefined,
     publicProvider: publicRepository?.provider ?? null,
     publicInstanceUrl: publicRepository?.instanceUrl,
-    branch: effectiveBranch,
+    branch: verifiedName,
     enabled: branchMissingFromList && deploymentType === 'branch',
   })
+  const branchChecking =
+    branchVerification.status === 'checking' ||
+    (branchEditPending && branchMissingFromList && deploymentType === 'branch')
   // The server answering 404 is one sound basis for saying the branch does
   // not exist; a listing the provider ran to the end is the other, since
   // nothing was left unread. While the lookup is in flight, say nothing.
   const branchNotFound =
-    branchVerification.status === 'missing' ||
-    (branchMissingFromList &&
-      !branchListTruncated &&
-      branchVerification.status !== 'found' &&
-      branchVerification.status !== 'checking')
+    !branchEditPending &&
+    (branchVerification.status === 'missing' ||
+      (branchMissingFromList &&
+        !branchListTruncated &&
+        branchVerification.status !== 'found' &&
+        branchVerification.status !== 'checking'))
   // Missing from a capped list and the lookup failed for a reason other than
   // 404 (rate limit, provider outage, a provider with no single-branch
   // endpoint): say the branch could not be verified, never that it is gone.
+  // The confirmed-missing answer is what switches the field to free text; the
+  // edits that follow keep it there (see `manualBranchEntry`).
+  const entersManualBranchEntry =
+    branchNotFound && deploymentType === 'branch' && !!selectedEnvironment
+  useEffect(() => {
+    if (entersManualBranchEntry) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setManualBranchEntry(true)
+    }
+  }, [entersManualBranchEntry])
+  const showsManualBranchInput =
+    deploymentType === 'branch' &&
+    !!selectedEnvironment &&
+    (manualBranchEntry || entersManualBranchEntry)
   const branchUnverified =
     !branchNotFound &&
+    !branchEditPending &&
     branchMissingFromList &&
     branchListTruncated &&
     branchVerification.status === 'unverified'
@@ -493,6 +524,7 @@ export function RedeploymentModal({
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setSelectedBranch('')
       setSelectedEnvironment(null)
+      setManualBranchEntry(false)
       setSelectedCommit(defaultCommit || '')
       setSelectedTag(defaultTag || '')
       setDeploymentType(defaultType || 'branch')
@@ -503,6 +535,7 @@ export function RedeploymentModal({
   const handleEnvironmentChange = (value: string) => {
     const environmentId = value ? parseInt(value) : null
     setSelectedEnvironment(environmentId)
+    setManualBranchEntry(false)
 
     if (!environmentId || !environmentsQuery.data || isImageDeploy) return
 
@@ -983,9 +1016,7 @@ export function RedeploymentModal({
                         combobox already offers the current branch plus a
                         "use this exact ref" row. Free text is only for a
                         branch the server has confirmed is gone. */}
-                    {deploymentType === 'branch' &&
-                    selectedEnvironment &&
-                    branchNotFound ? (
+                    {showsManualBranchInput ? (
                       <div className="space-y-2">
                         <Input
                           value={effectiveBranch}
@@ -1022,7 +1053,7 @@ export function RedeploymentModal({
                       />
                     )}
                     <div id="branch-lookup-status" aria-live="polite">
-                      {branchVerification.status === 'checking' && (
+                      {branchChecking && (
                         <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2.5 text-sm text-muted-foreground">
                           <Loader2 className="h-4 w-4 animate-spin" />
                           Checking “{effectiveBranch}” with the Git provider…

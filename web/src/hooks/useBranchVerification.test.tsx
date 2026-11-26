@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -18,9 +18,14 @@ afterEach(cleanup)
 function Probe(props: BranchVerificationInput) {
   const verification = useBranchVerification(props)
   return (
-    <span>
-      {verification.status}:{verification.branch?.commit_sha ?? 'none'}
-    </span>
+    <>
+      <span>
+        {verification.status}:{verification.branch?.commit_sha ?? 'none'}
+      </span>
+      <button type="button" onClick={() => void verification.refresh()}>
+        refresh
+      </button>
+    </>
   )
 }
 
@@ -108,4 +113,42 @@ test('a public repository is verified through the public endpoint', async () => 
   await waitFor(() =>
     expect(view.getByText(`found:${'b'.repeat(40)}`)).toBeTruthy()
   )
+})
+
+test('refresh asks the provider again, so a failed lookup can be retried', async () => {
+  let attempts = 0
+  const { view } = renderProbe({
+    'GET /repositories/temps/example/branch': () => {
+      attempts += 1
+      return attempts === 1
+        ? jsonResponse({ title: 'Rate limit exceeded' }, 429)
+        : jsonResponse({
+            name: 'main',
+            commit_sha: 'b'.repeat(40),
+            protected: false,
+            is_default: false,
+          })
+    },
+  })
+
+  await waitFor(() => expect(view.getByText('unverified:none')).toBeTruthy())
+  fireEvent.click(view.getByText('refresh'))
+  await waitFor(() =>
+    expect(view.getByText(`found:${'b'.repeat(40)}`)).toBeTruthy()
+  )
+  expect(attempts).toBe(2)
+})
+
+test('refresh spends no provider request when nothing is being verified', async () => {
+  const { api, view } = renderProbe(
+    {
+      'GET /repositories/temps/example/branch': () =>
+        jsonResponse({ title: 'Branch Not Found' }, 404),
+    },
+    { enabled: false }
+  )
+
+  fireEvent.click(view.getByText('refresh'))
+  await waitFor(() => expect(view.getByText('not-needed:none')).toBeTruthy())
+  expect(api.called('GET', '/repositories/temps/example/branch')).toBe(false)
 })

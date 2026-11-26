@@ -211,6 +211,11 @@ export function BranchSelector({
             }).queryKey,
           })
         }
+        // A selected branch past the listing cap is answered by the exact
+        // lookup, whose query key the listing refresh above never touches.
+        // Ask again too, or the dialog keeps the head SHA from before the
+        // push the user is refreshing for (or a failure it cannot retry).
+        await verification.refresh()
       })
     } catch (error) {
       toast.error(
