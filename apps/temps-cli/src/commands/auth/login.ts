@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { credentials, config } from '../../config/store.js'
-import { upsertContext, defaultContextName } from '../../config/contexts.js'
+import { upsertContext, defaultContextName, getContext } from '../../config/contexts.js'
 import { promptPassword } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { info, icons, colors, newline, box } from '../../ui/output.js'
@@ -118,6 +118,30 @@ function debugLog(message: string, payload?: unknown): void {
  * We read the raw body as text first, log it, and then re-parse as JSON so the
  * caller still gets a parsed object (or a typed error pointing at the raw body).
  */
+/**
+ * `work`, or a rejection with the signal's reason as soon as `signal` aborts,
+ * whichever comes first. Bounds a body read the same way `fetch` bounds the
+ * request, whatever the runtime does with the signal once headers arrived.
+ */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal | null | undefined): Promise<T> {
+  if (!signal) return work
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason)
+    signal.addEventListener('abort', onAbort, { once: true })
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err)
+      },
+    )
+  })
+}
+
 async function debugFetch(
   url: string,
   init: RequestInit,
@@ -129,15 +153,17 @@ async function debugFetch(
   }
   let res: Response
   try {
-    res = await fetch(url, init)
+    res = await untilAborted(fetch(url, init), init.signal)
   } catch (err) {
+    // The caller's deadline, not an unreachable server: let it say so.
+    if (init.signal?.aborted) throw err
     const reason = err instanceof Error ? err.message : String(err)
     if (debug) debugLog(`   fetch failed: ${reason}`)
     throw new AuthenticationError(
       `Unable to connect to ${url}: ${reason}. Is the server reachable from this machine?`,
     )
   }
-  const rawBody = await res.text()
+  const rawBody = await untilAborted(res.text(), init.signal)
   if (debug) {
     debugLog(`<- ${res.status} ${res.statusText} (${url})`)
     const headers: Record<string, string> = {}
@@ -333,6 +359,43 @@ async function requestDeviceSession(
   }
 }
 
+/** A URL in the form contexts store it, comparable however it was typed. */
+function comparableApiBase(url: string): string {
+  const base = serverBaseUrl(url)
+  try {
+    const parsed = new URL(base)
+    return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`
+  } catch {
+    return base
+  }
+}
+
+/**
+ * The split sign-in refuses to save under a context name that already
+ * belongs to another server. Two servers can map to one name
+ * (`temps.example.com` and `temps-example.com` are both `temps-example-com`
+ * in a console prompt), and replacing the person's context would point
+ * every later command that names it at the wrong server.
+ */
+export class ContextTakenError extends CliError {
+  constructor(context: string, existingUrl: string, requestedUrl: string) {
+    super(
+      `Context "${context}" already points to ${existingUrl}, not ${requestedUrl}. Nothing was changed. ` +
+        `Sign in under another name with --context <name>, or run \`temps context remove ${context}\` first if that context is no longer used.`,
+      'CONTEXT_TAKEN',
+      1,
+    )
+    this.name = 'ContextTakenError'
+  }
+}
+
+async function ensureContextIsFor(context: string, apiBaseUrl: string): Promise<void> {
+  const existing = await getContext(context)
+  if (existing && comparableApiBase(existing.url) !== comparableApiBase(apiBaseUrl)) {
+    throw new ContextTakenError(context, serverBaseUrl(existing.url), serverBaseUrl(apiBaseUrl))
+  }
+}
+
 /** Save the credentials an approved device session delivered. */
 async function persistDeviceLogin(
   success: ApprovedDevicePollResponse,
@@ -394,10 +457,15 @@ export async function startDeviceLogin(
   opts: { url?: string; context?: string; debug?: boolean } = {},
 ): Promise<void> {
   const debug = debugEnabled(opts)
+  const requestedBase = serverBaseUrl(opts.url ?? config.get('apiUrl'))
+  const contextName = opts.context ?? defaultContextName(requestedBase)
+  // Before the server mints anything: a sign-in that could only be saved by
+  // replacing another server's context is not started at all.
+  await ensureContextIsFor(contextName, requestedBase)
   const session = await requestDeviceSession({ url: opts.url, debug })
   const now = Date.now()
   const pending: PendingLogin = {
-    context: opts.context ?? defaultContextName(session.apiBaseUrl),
+    context: contextName,
     apiBaseUrl: session.apiBaseUrl,
     deviceCode: session.start.device_code,
     userCode: session.start.user_code,
@@ -457,9 +525,10 @@ export async function resumeDeviceLogin(
         `Start a new one with: ${restart}`,
     )
   }
+  await ensureContextIsFor(contextName, pending.apiBaseUrl)
   const now = Date.now()
   if (pendingLoginExpired(pending, now)) {
-    await clearPendingLogin(contextName)
+    await clearPendingLogin(contextName, pending.deviceCode)
     throw new AuthenticationError(
       `The sign-in started for context "${contextName}" expired before it was approved. Start a new one with: ${restart}`,
     )
@@ -481,13 +550,14 @@ export async function resumeDeviceLogin(
           timeoutError: boundedByWait
             ? () => new LoginStillPendingError(pending, waitSecs)
             : undefined,
-          poll: () =>
+          poll: (signal) =>
             debugFetch(
               pollUrl,
               {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ device_code: pending.deviceCode }),
+                signal,
               },
               debug,
             ),
@@ -495,16 +565,24 @@ export async function resumeDeviceLogin(
       { successText: 'Browser approval received' },
     )
   } catch (err) {
-    // Still pending is not a failure of the sign-in: keep it so the caller
-    // can run --resume again. Anything else (denied, expired, rejected by
-    // the server) means this device code is dead.
-    if (!(err instanceof LoginStillPendingError)) {
-      await clearPendingLogin(contextName)
+    // Denied, expired or rejected by the server: this device code is dead.
+    if (err instanceof DeviceLoginEndedError) {
+      await clearPendingLogin(contextName, pending.deviceCode)
+      throw err
     }
-    throw err
+    if (err instanceof LoginStillPendingError) throw err
+    // A dropped connection or a server error is not the end of the sign-in:
+    // the person's link still works, so keep it and say how to go on.
+    const reason = err instanceof Error ? err.message : String(err)
+    throw new AuthenticationError(
+      `${reason} The sign-in is still waiting: run the same command again to keep waiting for the same approval.`,
+    )
   }
 
-  await clearPendingLogin(contextName)
+  // Only this sign-in: a newer --no-wait may have replaced it meanwhile.
+  await clearPendingLogin(contextName, pending.deviceCode)
+  // Checked again: another sign-in may have taken the name while this waited.
+  await ensureContextIsFor(contextName, pending.apiBaseUrl)
   await persistDeviceLogin(success, contextName, pending.apiBaseUrl)
 }
 
@@ -559,13 +637,14 @@ export async function loginWithDevice(
         pollUrl,
         intervalSecs: start.interval ?? 2,
         expiresInSecs: start.expires_in ?? 900,
-        poll: () =>
+        poll: (signal) =>
           debugFetch(
             pollUrl,
             {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ device_code: start.device_code }),
+              signal,
             },
             debug,
           ),
@@ -615,8 +694,11 @@ export interface PollForDeviceApprovalOptions {
   intervalSecs: number
   /** Lifetime advertised by `/auth/cli/device/start`, in seconds. */
   expiresInSecs: number
-  /** Performs one poll request. */
-  poll: () => Promise<{ res: Response; rawBody: string; json: unknown }>
+  /**
+   * Performs one poll request. The signal aborts when the wait runs out, so
+   * a request or body read that stalls cannot hold the command past it.
+   */
+  poll: (signal: AbortSignal) => Promise<{ res: Response; rawBody: string; json: unknown }>
   /** Injectable for tests. */
   sleep?: (ms: number) => Promise<void>
   /** Injectable for tests. */
@@ -627,6 +709,23 @@ export interface PollForDeviceApprovalOptions {
    * out of it means "not approved yet", not "start again".
    */
   timeoutError?: () => Error
+}
+
+/**
+ * The device session is over and polling it again cannot succeed: the person
+ * denied it, it expired, or the server rejected the device code. Anything
+ * else (a dropped connection, a server error) may pass.
+ */
+export class DeviceLoginEndedError extends AuthenticationError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DeviceLoginEndedError'
+  }
+}
+
+/** 4xx other than "too many requests" and "request timeout": the request itself is refused. */
+function refusesDeviceCode(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429
 }
 
 /**
@@ -667,7 +766,21 @@ export async function pollForDeviceApproval(
     if (remainingMs <= 0) break
     // Never sleep past the session's lifetime.
     await sleepFn(Math.min(nextDelayMs, remainingMs))
-    const { res, rawBody, json } = await opts.poll()
+    const leftMs = deadline - now()
+    if (leftMs <= 0) break
+    // The deadline bounds the request too, not only the loop.
+    const abort = new AbortController()
+    const timer = setTimeout(() => abort.abort(new Error('poll deadline reached')), leftMs)
+    let reply: { res: Response; rawBody: string; json: unknown }
+    try {
+      reply = await opts.poll(abort.signal)
+    } catch (err) {
+      if (abort.signal.aborted) break
+      throw err
+    } finally {
+      clearTimeout(timer)
+    }
+    const { res, rawBody, json } = reply
 
     if (res.status === 429) {
       throttledLastPoll = true
@@ -680,7 +793,8 @@ export async function pollForDeviceApproval(
 
     if (!res.ok) {
       const problem = (json as { title?: string; detail?: string } | null) ?? null
-      throw new AuthenticationError(
+      const Failure = refusesDeviceCode(res.status) ? DeviceLoginEndedError : AuthenticationError
+      throw new Failure(
         problem?.detail ||
           problem?.title ||
           `Polling failed at ${opts.pollUrl} (status ${res.status}). ` +
@@ -703,9 +817,9 @@ export async function pollForDeviceApproval(
         nextDelayMs = intervalMs
         continue
       case 'access_denied':
-        throw new AuthenticationError('Authorization denied in the browser.')
+        throw new DeviceLoginEndedError('Authorization denied in the browser.')
       case 'expired_token':
-        throw new AuthenticationError(
+        throw new DeviceLoginEndedError(
           'Authorization code expired before approval. Run `temps login` again.',
         )
       case 'approved':

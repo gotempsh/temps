@@ -3,6 +3,7 @@
 
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
 import {
+  DeviceLoginEndedError,
   debugEnabled,
   serverBaseUrl,
   absoluteVerificationUri,
@@ -209,7 +210,37 @@ describe('pollForDeviceApproval', () => {
     expect(h.polls()).toBe(1)
   })
 
+  test('a server error is not the end of the sign-in; a refused request is', async () => {
+    const failed = await harness([{ status: 503, body: { detail: 'restarting' } }])
+      .run()
+      .catch((e: unknown) => e)
+    expect(failed).not.toBeInstanceOf(DeviceLoginEndedError)
+    const refused = await harness([{ status: 400, body: { detail: 'unknown device code' } }])
+      .run()
+      .catch((e: unknown) => e)
+    expect(refused).toBeInstanceOf(DeviceLoginEndedError)
+  })
+
+  test('the deadline also ends a poll request that never answers', async () => {
+    const started = Date.now()
+    const error = await pollForDeviceApproval({
+      pollUrl: 'https://temps.example/api/auth/cli/device/poll',
+      intervalSecs: 0,
+      expiresInSecs: 1,
+      timeoutError: () => new Error('still pending'),
+      poll: (signal) =>
+        new Promise((_, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        }),
+    }).catch((e: unknown) => e)
+    expect((error as Error).message).toBe('still pending')
+    expect(Date.now() - started).toBeLessThan(3_000)
+  })
+
   test('access_denied and expired_token are terminal', async () => {
+    await expect(harness([{ status: 200, body: { status: 'access_denied' } }]).run()).rejects.toBeInstanceOf(
+      DeviceLoginEndedError,
+    )
     await expect(harness([{ status: 200, body: { status: 'access_denied' } }]).run()).rejects.toThrow(
       /denied/,
     )

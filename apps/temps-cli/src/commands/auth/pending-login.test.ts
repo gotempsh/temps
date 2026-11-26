@@ -13,8 +13,11 @@ import {
   savePendingLogin,
   type PendingLogin,
 } from './pending-login.js'
+import { getContext, upsertContext } from '../../config/contexts.js'
 import {
+  ContextTakenError,
   DEFAULT_RESUME_WAIT_SECS,
+  DeviceLoginEndedError,
   LOGIN_STILL_PENDING_EXIT_CODE,
   LoginStillPendingError,
   formatPendingLoginInstructions,
@@ -86,6 +89,16 @@ describe('pending login store', () => {
 
     expect(await getPendingLogin('stale')).toBeNull()
     expect(await getPendingLogin('temps-example-com')).not.toBeNull()
+  })
+
+  test('clearing by device code leaves a newer sign-in for the same context alone', async () => {
+    // A --resume that finishes after a new --no-wait replaced its entry.
+    await savePendingLogin(pending({ deviceCode: 'device-code-newer' }), NOW)
+    await clearPendingLogin('temps-example-com', 'device-code-1')
+    expect((await getPendingLogin('temps-example-com'))?.deviceCode).toBe('device-code-newer')
+
+    await clearPendingLogin('temps-example-com', 'device-code-newer')
+    expect(await getPendingLogin('temps-example-com')).toBeNull()
   })
 
   test('clearing the last sign-in removes the file', async () => {
@@ -198,7 +211,7 @@ describe('pollForDeviceApproval with a bounded wait', () => {
 })
 
 /** A device-authorization server whose poll answer the test controls. */
-function fakeDeviceServer(pollStatus: () => string) {
+function fakeDeviceServer(pollStatus: () => string | Response) {
   const requests: string[] = []
   const server = Bun.serve({
     port: 0,
@@ -217,7 +230,8 @@ function fakeDeviceServer(pollStatus: () => string) {
         })
       }
       if (url.pathname === '/api/auth/cli/device/poll') {
-        return Response.json({ status: pollStatus() })
+        const answer = pollStatus()
+        return typeof answer === 'string' ? Response.json({ status: answer }) : answer
       }
       return new Response('not found', { status: 404 })
     },
@@ -319,5 +333,156 @@ describe('split browser sign-in against a device-authorization server', () => {
       resumeDeviceLogin({ url: 'https://temps.example.com', context: 'temps-example-com' }),
     ).rejects.toThrow(/expired before it was approved/)
     expect(await getPendingLogin('temps-example-com')).toBeNull()
+  })
+
+  test('--resume stops at its deadline even when the server never finishes answering', async () => {
+    // Headers arrive, the body never ends: only the deadline can end the wait.
+    const fake = fakeDeviceServer(
+      () => new Response(new ReadableStream({ start() {} }), { status: 200 }),
+    )
+    await savePendingLogin(
+      pending({
+        context: 'local',
+        apiBaseUrl: `${fake.origin}/api`,
+        intervalSecs: 1,
+        expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+      }),
+    )
+    const started = Date.now()
+    let error: unknown
+    try {
+      await resumeDeviceLogin({ url: fake.origin, context: 'local', waitSecs: 2 })
+    } catch (e) {
+      error = e
+    } finally {
+      await fake.server.stop(true)
+    }
+
+    expect(error).toBeInstanceOf(LoginStillPendingError)
+    expect(Date.now() - started).toBeLessThan(5_000)
+    expect(await getPendingLogin('local')).not.toBeNull()
+  })
+
+  test('--resume keeps the sign-in when the server fails, and says to run it again', async () => {
+    const fake = fakeDeviceServer(
+      () => Response.json({ title: 'Service Unavailable', detail: 'restarting' }, { status: 503 }),
+    )
+    await savePendingLogin(
+      pending({
+        context: 'local',
+        apiBaseUrl: `${fake.origin}/api`,
+        intervalSecs: 1,
+        expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+      }),
+    )
+    let error: unknown
+    try {
+      await resumeDeviceLogin({ url: fake.origin, context: 'local', waitSecs: 5 })
+    } catch (e) {
+      error = e
+    } finally {
+      await fake.server.stop(true)
+    }
+
+    expect((error as Error).message).toBe(
+      'restarting The sign-in is still waiting: run the same command again to keep waiting for the same approval.',
+    )
+    expect(await getPendingLogin('local')).not.toBeNull()
+  })
+
+  test('--resume forgets a device code the server refuses', async () => {
+    const fake = fakeDeviceServer(
+      () => Response.json({ title: 'Bad Request', detail: 'unknown device code' }, { status: 400 }),
+    )
+    await savePendingLogin(
+      pending({
+        context: 'local',
+        apiBaseUrl: `${fake.origin}/api`,
+        intervalSecs: 1,
+        expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+      }),
+    )
+    let error: unknown
+    try {
+      await resumeDeviceLogin({ url: fake.origin, context: 'local', waitSecs: 5 })
+    } catch (e) {
+      error = e
+    } finally {
+      await fake.server.stop(true)
+    }
+
+    expect(error).toBeInstanceOf(DeviceLoginEndedError)
+    expect(await getPendingLogin('local')).toBeNull()
+  })
+})
+
+describe('a context name that belongs to another server', () => {
+  const theirs = {
+    name: 'temps-example-com',
+    url: 'https://temps-example.com/api',
+    apiKey: 'tk_someone_elses',
+    email: 'person@example.com',
+  }
+
+  test('--no-wait refuses before asking the server for anything, and changes nothing', async () => {
+    await upsertContext(theirs)
+    const fake = fakeDeviceServer(() => 'authorization_pending')
+    let error: unknown
+    try {
+      await startDeviceLogin({ url: 'https://temps.example.com', context: 'temps-example-com' })
+    } catch (e) {
+      error = e
+    } finally {
+      await fake.server.stop(true)
+    }
+
+    expect(error).toBeInstanceOf(ContextTakenError)
+    expect((error as Error).message).toBe(
+      'Context "temps-example-com" already points to https://temps-example.com/api, not https://temps.example.com/api. Nothing was changed. ' +
+        'Sign in under another name with --context <name>, or run `temps context remove temps-example-com` first if that context is no longer used.',
+    )
+    expect(fake.requests).toEqual([])
+    expect(await getPendingLogin('temps-example-com')).toBeNull()
+    expect(await getContext('temps-example-com')).toMatchObject(theirs)
+  })
+
+  test('--resume refuses too, without polling, and keeps the started sign-in', async () => {
+    const fake = fakeDeviceServer(() => 'approved')
+    await savePendingLogin(
+      pending({
+        apiBaseUrl: `${fake.origin}/api`,
+        expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+      }),
+    )
+    await upsertContext(theirs)
+    let error: unknown
+    try {
+      await resumeDeviceLogin({ url: fake.origin, context: 'temps-example-com', waitSecs: 5 })
+    } catch (e) {
+      error = e
+    } finally {
+      await fake.server.stop(true)
+    }
+
+    expect(error).toBeInstanceOf(ContextTakenError)
+    expect(fake.requests).toEqual([])
+    expect(await getPendingLogin('temps-example-com')).not.toBeNull()
+    expect(await getContext('temps-example-com')).toMatchObject(theirs)
+  })
+
+  test('the same server written differently is not another server', async () => {
+    await upsertContext({ ...theirs, url: 'https://TEMPS.example.com/api/' })
+    const fake = fakeDeviceServer(() => 'authorization_pending')
+    const originalLog = console.log
+    console.log = () => {}
+    try {
+      await startDeviceLogin({ url: fake.origin, context: 'local' })
+      await upsertContext({ ...theirs, name: 'local', url: `${fake.origin}/` })
+      await startDeviceLogin({ url: `${fake.origin}/api`, context: 'local' })
+    } finally {
+      console.log = originalLog
+      await fake.server.stop(true)
+    }
+    expect((await getPendingLogin('local'))?.apiBaseUrl).toBe(`${fake.origin}/api`)
   })
 })

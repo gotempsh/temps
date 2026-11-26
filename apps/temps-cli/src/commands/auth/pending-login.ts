@@ -109,9 +109,17 @@ export async function getPendingLogin(context: string): Promise<PendingLogin | n
   return (await loadAll()).find((e) => e.context === context) ?? null
 }
 
-/** Forget the started sign-in for `context`. */
-export async function clearPendingLogin(context: string): Promise<void> {
+/**
+ * Forget the started sign-in for `context`. With `deviceCode`, only that
+ * sign-in: a `--resume` that finishes after a newer `--no-wait` replaced its
+ * entry must not delete the newer one, whose link the person may be about to
+ * approve. The match is made on the entries read here, in the same read and
+ * write.
+ */
+export async function clearPendingLogin(context: string, deviceCode?: string): Promise<void> {
   const all = await loadAll()
-  const rest = all.filter((e) => e.context !== context)
+  const rest = all.filter(
+    (e) => e.context !== context || (deviceCode !== undefined && e.deviceCode !== deviceCode),
+  )
   if (rest.length !== all.length) await saveAll(rest)
 }

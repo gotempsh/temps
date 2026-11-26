@@ -10,6 +10,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { isTTY } from '../../utils/tty.js'
+import { CliError } from '../../utils/errors.js'
 import {
   newline,
   header,
@@ -1923,8 +1924,10 @@ async function execAction(
   if (res.stdout) process.stdout.write(res.stdout)
   if (res.stderr) process.stderr.write(res.stderr)
 
+  // Set, not `process.exit()`: exiting at once can cut off output still being
+  // written to a pipe, which is exactly when the output matters.
   if (res.exit_code !== 0) {
-    process.exit(res.exit_code)
+    process.exitCode = res.exit_code
   }
 }
 
@@ -2006,6 +2009,15 @@ async function logsAction(id: string, jobId: string): Promise<void> {
   } finally {
     reader.releaseLock()
   }
+  // The server ends every stream with `done` once the job has exited, so a
+  // stream that closes without it was cut (a proxy timeout, a restart): the
+  // job may still be running and its output above may be incomplete.
+  throw new CliError(
+    `The log stream of job ${jobId} closed before the job ended, so the output above may be incomplete. ` +
+      `Run the same command again to keep following it; lines written while disconnected are not shown again.`,
+    'LOG_STREAM_INTERRUPTED',
+    1,
+  )
 }
 
 async function domainAction(id: string, options: { port: string }): Promise<void> {
