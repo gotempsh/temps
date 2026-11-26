@@ -1495,34 +1495,28 @@ impl NodeScheduler {
             pool
         };
 
+        let least_loaded = self.strategy == SchedulingStrategy::LeastLoaded
+            && pool.iter().any(|e| e.load_score.is_some());
+        // Replicas already on each pool node break ties between nodes of
+        // about the same load, so consecutive deployments spread instead of
+        // all landing on the node whose noise reads lowest.
+        let running = if least_loaded {
+            self.running_replicas(&pool).await
+        } else {
+            Vec::new()
+        };
         let assignments = if anti_affinity && pool.len() > 1 {
             // Anti-affinity: spread replicas across different nodes first,
             // then wrap around when we have more replicas than nodes.
-            match self.strategy {
-                SchedulingStrategy::RoundRobin => {
-                    schedule_anti_affinity_round_robin(&pool, replica_count)
-                }
-                SchedulingStrategy::LeastLoaded => {
-                    let has_capacity = pool.iter().any(|e| e.load_score.is_some());
-                    if has_capacity {
-                        schedule_anti_affinity_least_loaded(&pool, replica_count)
-                    } else {
-                        schedule_anti_affinity_round_robin(&pool, replica_count)
-                    }
-                }
+            if least_loaded {
+                schedule_anti_affinity_least_loaded(&pool, replica_count, &running)
+            } else {
+                schedule_anti_affinity_round_robin(&pool, replica_count)
             }
+        } else if least_loaded {
+            schedule_least_loaded(&pool, replica_count, &running)
         } else {
-            match self.strategy {
-                SchedulingStrategy::RoundRobin => self.schedule_round_robin(&pool, replica_count),
-                SchedulingStrategy::LeastLoaded => {
-                    let has_capacity = pool.iter().any(|e| e.load_score.is_some());
-                    if has_capacity {
-                        schedule_least_loaded(&pool, replica_count)
-                    } else {
-                        self.schedule_round_robin(&pool, replica_count)
-                    }
-                }
-            }
+            self.schedule_round_robin(&pool, replica_count)
         };
 
         let warnings = anti_affinity_warnings(anti_affinity, &assignments);
@@ -1541,6 +1535,25 @@ impl NodeScheduler {
     ) -> Result<NodeAssignment, NodeError> {
         let mut assignments = self.schedule_replicas(1, labels, None, false).await?;
         Ok(assignments.remove(0))
+    }
+
+    /// The replicas each pool entry already runs, in pool order. A failed
+    /// count degrades to load-only ranking (all zero) rather than failing
+    /// the placement.
+    async fn running_replicas(&self, pool: &[PoolEntry]) -> Vec<u32> {
+        match self.node_service.running_replica_counts().await {
+            Ok(counts) => pool
+                .iter()
+                .map(|entry| counts.get(&entry.node_id()).copied().unwrap_or(0))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Could not count the replicas running on each node; ranking by load only"
+                );
+                vec![0; pool.len()]
+            }
+        }
     }
 
     fn schedule_round_robin(&self, pool: &[PoolEntry], replica_count: u32) -> Vec<NodeAssignment> {
@@ -1685,6 +1698,30 @@ struct PoolEntry {
     load_score: Option<f64>,
 }
 
+impl PoolEntry {
+    /// The node id containers on this entry are stored with (the control
+    /// plane's are stored without one, counted as [`CONTROL_PLANE_NODE_ID`]).
+    fn node_id(&self) -> i32 {
+        match &self.assignment {
+            NodeAssignment::Local => CONTROL_PLANE_NODE_ID,
+            NodeAssignment::Remote { node_id, .. } => *node_id,
+        }
+    }
+}
+
+/// The load each pool entry ranks with (see
+/// [`temps_workload_plane::scheduler::ranking_loads`]): a worker that has
+/// not reported its capacity yet ranks with the least-loaded node, the
+/// control plane (which reports none) at the neutral 0.5.
+fn ranking_loads(pool: &[PoolEntry]) -> Vec<f64> {
+    temps_workload_plane::scheduler::ranking_loads(
+        &pool
+            .iter()
+            .map(|e| (e.load_score, matches!(e.assignment, NodeAssignment::Local)))
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Compute a load score from a node's capacity JSON.
 ///
 /// Returns a score between 0.0 (idle) and 1.0 (fully loaded).
@@ -1713,13 +1750,24 @@ fn compute_load_score(capacity: &serde_json::Value) -> Option<f64> {
 
 /// Assign replicas to the least-loaded nodes.
 ///
-/// For each replica, picks the node with the lowest effective load score.
-/// Nodes without capacity data get a neutral score of 0.5.
-/// After assigning a replica, the node's effective score is bumped by a
-/// small increment to spread replicas across nodes with similar load.
-fn schedule_least_loaded(pool: &[PoolEntry], replica_count: u32) -> Vec<NodeAssignment> {
+/// For each replica, picks the node with the lowest effective load score;
+/// nodes within [`temps_workload_plane::scheduler::LOAD_TIE_TOLERANCE`] of
+/// it count as tied, and the one running the fewest replicas (`running`,
+/// in pool order) wins. A worker without capacity data ranks with the
+/// least-loaded node, the control plane at a neutral 0.5. After assigning a
+/// replica, the node's effective score is bumped by a small increment and
+/// its replica count by one, to spread replicas across nodes with similar
+/// load.
+fn schedule_least_loaded(
+    pool: &[PoolEntry],
+    replica_count: u32,
+    running: &[u32],
+) -> Vec<NodeAssignment> {
     // Effective scores — mutated as we assign replicas
-    let mut scores: Vec<f64> = pool.iter().map(|e| e.load_score.unwrap_or(0.5)).collect();
+    let mut scores = ranking_loads(pool);
+    let mut running: Vec<u32> = (0..pool.len())
+        .map(|i| running.get(i).copied().unwrap_or(0))
+        .collect();
 
     // Bump per assignment: roughly "one replica's worth" of load spread
     // across the pool. This prevents piling all replicas on one low-load node.
@@ -1732,16 +1780,13 @@ fn schedule_least_loaded(pool: &[PoolEntry], replica_count: u32) -> Vec<NodeAssi
     let mut assignments = Vec::with_capacity(replica_count as usize);
 
     for _ in 0..replica_count {
-        // Find the index with the lowest score
-        let best_idx = scores
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let best_idx =
+            temps_workload_plane::scheduler::pick_least_loaded(&scores, &running, |_| true)
+                .unwrap_or(0);
 
         assignments.push(pool[best_idx].assignment.clone());
         scores[best_idx] += bump;
+        running[best_idx] += 1;
     }
 
     assignments
@@ -1768,8 +1813,12 @@ fn schedule_anti_affinity_round_robin(
 fn schedule_anti_affinity_least_loaded(
     pool: &[PoolEntry],
     replica_count: u32,
+    running: &[u32],
 ) -> Vec<NodeAssignment> {
-    let mut scores: Vec<f64> = pool.iter().map(|e| e.load_score.unwrap_or(0.5)).collect();
+    let mut scores = ranking_loads(pool);
+    let mut running: Vec<u32> = (0..pool.len())
+        .map(|i| running.get(i).copied().unwrap_or(0))
+        .collect();
 
     let mut assignments = Vec::with_capacity(replica_count as usize);
     let mut used_in_round: Vec<bool> = vec![false; pool.len()];
@@ -1783,17 +1832,15 @@ fn schedule_anti_affinity_least_loaded(
         }
 
         // Find the least-loaded node that hasn't been used in this round
-        let best_idx = scores
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !used_in_round[*i])
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let best_idx = temps_workload_plane::scheduler::pick_least_loaded(&scores, &running, |i| {
+            !used_in_round[i]
+        })
+        .unwrap_or(0);
 
         assignments.push(pool[best_idx].assignment.clone());
         used_in_round[best_idx] = true;
         used_count += 1;
+        running[best_idx] += 1;
 
         // Bump score for future rounds
         let bump = if pool.is_empty() {
@@ -3912,6 +3959,111 @@ mod tests {
     }
 
     // --- Least-loaded scheduling tests ---
+
+    /// An idle worker: a few percent of CPU and memory, `noise` apart.
+    fn idle_worker(id: i32, noise: f64) -> nodes::Model {
+        make_node_with_capacity(
+            id,
+            &format!("worker-{id}"),
+            serde_json::json!({
+                "cpu_percent": 2.0 + noise,
+                "memory_used_bytes": 100_000_000.0,
+                "memory_total_bytes": 4_000_000_000.0,
+            }),
+        )
+    }
+
+    /// A scheduler over `workers` (no control plane in the pool) whose
+    /// database reports `running` replicas per node id.
+    fn scheduler_with_running(workers: Vec<nodes::Model>, running: &[(i32, i64)]) -> NodeScheduler {
+        let rows: Vec<std::collections::BTreeMap<&str, sea_orm::Value>> = running
+            .iter()
+            .map(|(node_id, replicas)| {
+                std::collections::BTreeMap::from([
+                    ("node_id", sea_orm::Value::from(*node_id)),
+                    ("replicas", sea_orm::Value::from(*replicas)),
+                ])
+            })
+            .collect();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![workers])
+            .append_query_results(vec![rows])
+            .into_connection();
+        NodeScheduler::new(Arc::new(NodeService::new(Arc::new(db))))
+            .with_local_workloads_enabled(false)
+    }
+
+    /// Regression: six single-replica deployments, one after another, on
+    /// three idle workers piled up on whichever read least loaded (the app
+    /// just placed shows in no heartbeat yet). Each placement now sees the
+    /// replicas earlier ones left, so they spread 2/2/2.
+    #[tokio::test]
+    async fn consecutive_single_replica_deployments_spread_over_idle_workers() {
+        let mut running: std::collections::BTreeMap<i32, i64> =
+            [(1, 0), (2, 0), (3, 0)].into_iter().collect();
+        for _ in 0..6 {
+            let scheduler = scheduler_with_running(
+                vec![
+                    idle_worker(1, 1.0),
+                    idle_worker(2, 0.0),
+                    idle_worker(3, 3.0),
+                ],
+                &running.iter().map(|(id, n)| (*id, *n)).collect::<Vec<_>>(),
+            );
+            let placed = scheduler
+                .schedule_replicas(1, None, None, false)
+                .await
+                .unwrap();
+            let node = placed[0].node_id().expect("placed on a worker");
+            *running.get_mut(&node).unwrap() += 1;
+        }
+        assert_eq!(
+            running.values().copied().collect::<Vec<_>>(),
+            vec![2, 2, 2],
+            "{running:?}"
+        );
+    }
+
+    /// Regression: a worker that has just joined has sent no capacity report
+    /// yet; it scored a neutral 0.5 and lost every placement to idle
+    /// workers. It now ranks with the least-loaded worker, and runs nothing.
+    #[tokio::test]
+    async fn a_worker_without_a_capacity_report_yet_takes_new_replicas() {
+        let scheduler = scheduler_with_running(
+            vec![
+                idle_worker(1, 0.0),
+                idle_worker(2, 1.0),
+                make_node(3, "worker-3"),
+            ],
+            &[(1, 1), (2, 1)],
+        );
+        let placed = scheduler
+            .schedule_replicas(1, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(placed[0].node_id(), Some(3));
+    }
+
+    /// Replica counts only break ties: a clearly busier worker still loses
+    /// to an idle one that runs more replicas.
+    #[tokio::test]
+    async fn running_replicas_never_outweigh_a_real_load_difference() {
+        let busy = make_node_with_capacity(
+            1,
+            "worker-1",
+            serde_json::json!({
+                "cpu_percent": 60.0,
+                "memory_used_bytes": 2_000_000_000.0,
+                "memory_total_bytes": 4_000_000_000.0,
+            }),
+        );
+        let scheduler = scheduler_with_running(vec![busy, idle_worker(2, 0.0)], &[(2, 5)]);
+        let placed = scheduler
+            .schedule_replicas(1, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(placed[0].node_id(), Some(2));
+    }
 
     #[tokio::test]
     async fn test_least_loaded_prefers_idle_node() {

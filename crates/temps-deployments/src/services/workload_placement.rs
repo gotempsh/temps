@@ -2412,18 +2412,14 @@ mod tests {
                 Some(cfg(Some(vec![]), Some(serde_json::json!({})), true, 1)),
             ),
         ];
-        // Packing two replicas ranks the whole unpinned pool, and the
-        // per-replica bump is spread over the pool size. g-tight is in
+        // Packing two replicas ranks the whole unpinned pool. g-tight is in
         // NodeScheduler's pool (0.854 raw) but over 0.90 after its reserve,
-        // so the unified pool is one node smaller and the second replica's
-        // bump differs: b-worker twice versus b-worker then a-worker. The
-        // reserve is the only cause (the attribution re-runs without it).
-        for seed in set
-            .iter_mut()
-            .filter(|seed| seed.name == "unpinned-two-packed")
-        {
-            seed.expect = Some(ExpectedDifference::SystemReserved);
-        }
+        // so the unified pool is one node smaller and the per-replica bump
+        // differs. Both still agree, b-worker then a-worker: nodes of about
+        // the same load are ranked by the replicas they run, the one just
+        // placed included, so the second replica never packs onto b-worker
+        // beside an idle a-worker. (The reserve's own difference is shown by
+        // `pinned-tight-or-large`.)
         // Alone, g-tight is used by both: when every candidate is over the
         // threshold both schedulers fall back to the whole pool.
         set.push(env(

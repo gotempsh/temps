@@ -2300,6 +2300,38 @@ impl NodeService {
         Ok(nodes)
     }
 
+    /// How many deployment replicas each node runs (or is starting), keyed by
+    /// node id with the control plane as [`temps_core::CONTROL_PLANE_NODE_ID`]
+    /// (its containers have no node). The same containers the workload
+    /// plane counts as committed to a node: not deleted, and not exited,
+    /// stopped, failed or cancelled. One grouped query.
+    pub async fn running_replica_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<i32, u32>, NodeError> {
+        use sea_orm::FromQueryResult;
+
+        #[derive(FromQueryResult)]
+        struct NodeReplicas {
+            node_id: i32,
+            replicas: i64,
+        }
+
+        let rows = NodeReplicas::find_by_statement(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COALESCE(node_id, 0) AS node_id, COUNT(*) AS replicas \
+               FROM deployment_containers \
+              WHERE deleted_at IS NULL \
+                AND (status IS NULL OR status NOT IN ('exited', 'stopped', 'failed', 'cancelled')) \
+              GROUP BY 1",
+        ))
+        .all(self.db.as_ref())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.node_id, u32::try_from(row.replicas).unwrap_or(u32::MAX)))
+            .collect())
+    }
+
     /// Mark a node as offline.
     pub async fn mark_offline(&self, node_id: i32) -> Result<(), NodeError> {
         let node = nodes::Entity::find_by_id(node_id)
