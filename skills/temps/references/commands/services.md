@@ -70,6 +70,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`services get-runtime`](#services-get-runtime)
 - [`services get-stats`](#services-get-stats)
 - [`services get-tls`](#services-get-tls)
+- [`services restored-databases`](#services-restored-databases)
+- [`services set-link-database`](#services-set-link-database)
 - [`services update-tls`](#services-update-tls)
 - [`services get-managed-ca-certificate`](#services-get-managed-ca-certificate)
 - [`services test-wal-archive-target`](#services-test-wal-archive-target)
@@ -151,6 +153,8 @@ Manage external services (databases, caches, storage)
 - `get-runtime` - Inspect a service's container(s): status, restart count, OOM-killed flag, exit code, and the cgroup limits..
 - `get-stats` - Sample current CPU/memory usage from each of a service's containers
 - `get-tls` - Get service tls
+- `restored-databases` - What the latest PostgreSQL restore brought back: its databases and users, which linked project reads each, and linked databases the backup does not have
+- `set-link-database` - Change which database a linked project reads from this service, for example one a restore brought back. Its apps read it from their next deployment
 - `update-tls` - Update service tls
 - `get-managed-ca-certificate` - Get managed ca certificate
 - `test-wal-archive-target` - Test wal archive target
@@ -1162,6 +1166,35 @@ Get service tls
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services restored-databases`
+
+What the latest PostgreSQL restore brought back: its databases and users, which linked project reads each, and linked databases the backup does not have
+
+**Usage:** `services restored-databases <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services set-link-database`
+
+Change which database a linked project reads from this service, for example one a restore brought back. Its apps read it from their next deployment
+
+**Usage:** `services set-link-database <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--database-provisioning-mode <value>` | project_environment (one database per environment), project (one for the whole project) or custom (the name in --custom-database-name) (one of: project_environment, project, custom) [required] | - | No |
+| `--custom-database-name <value>` | The database every environment reads, in custom mode: lowercase letters, digits and _ | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `services update-tls`

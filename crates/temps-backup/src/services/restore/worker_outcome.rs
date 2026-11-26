@@ -928,6 +928,14 @@ impl super::super::restore_reconcile::WorkerRestoreResume for ManagerWorkerResto
             };
             match persist_terminal_state(db.as_ref(), run_id, &result, TERMINAL_WRITE_RETRY).await {
                 Ok(disposition) => {
+                    if result.is_ok() && disposition == TerminalDisposition::WorkerResult {
+                        super::restored_inventory::record_restored_inventory(
+                            db.as_ref(),
+                            mgr.as_ref(),
+                            run_id,
+                        )
+                        .await;
+                    }
                     // Resumed workers use the same persisted outcome for their log.
                     let _ = disposition.worker_outcome(run_id, result);
                 }
@@ -1363,6 +1371,7 @@ mod tests {
                     cancel_requested_at: Set(None),
                     cancel_requested_by: Set(None),
                     restored_login_encrypted: Set(None),
+                    restored_inventory: Set(None),
                 },
                 Some(self.backup_id),
                 self.service_id,
@@ -1728,6 +1737,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         }
     }
 
@@ -2119,6 +2129,7 @@ mod tests {
 
         let before_upgrade = temps_entities::restore_runs::Model {
             restored_login_encrypted: None,
+            restored_inventory: None,
             ..none_recorded.clone()
         };
         assert_eq!(
@@ -2132,6 +2143,7 @@ mod tests {
 
         let unreadable = temps_entities::restore_runs::Model {
             restored_login_encrypted: Some("not-a-sealed-value".to_string()),
+            restored_inventory: None,
             ..none_recorded
         };
         assert_eq!(

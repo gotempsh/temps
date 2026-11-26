@@ -333,6 +333,13 @@ pub(super) async fn run(
     // use, and which the target's stored config is patched to afterwards.
     let origin_credentials =
         capture_origin_credentials(db, enc, mgr, run_id, backup, target).await?;
+    let set_configured_login = restored_login_for(
+        &target.service_type,
+        &backup.s3_location,
+        backup_origin_service_id(db.as_ref(), backup).await,
+        target.id,
+        origin_credentials.is_some(),
+    ) == RestoredLogin::SetConfiguredPassword;
     let restored_login = origin_credentials.as_ref().map(|origin| {
         let mut login = serde_json::Map::new();
         origin.apply(&mut login);
@@ -412,6 +419,7 @@ pub(super) async fn run(
                 recovery_target.clone(),
                 target_user_data.clone(),
                 Some(super::worker_outcome::operation_id(run_id)),
+                set_configured_login,
             )
         },
         |wait| super::wait_for_node_slot(db.as_ref(), run_id, phase, wait),

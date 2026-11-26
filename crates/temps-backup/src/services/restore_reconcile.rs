@@ -397,6 +397,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         }
     }
 
