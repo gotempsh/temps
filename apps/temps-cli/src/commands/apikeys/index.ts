@@ -46,6 +46,37 @@ export function roleTypeForPermissions(roleType: string, permissions: string[] |
   return permissions && permissions.length > 0 ? 'custom' : roleType
 }
 
+export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string }
+
+/** The permissions named by `--permissions`: every entry non-blank. */
+export function parsePermissionsFlag(value: string): Parsed<string[]> {
+  const permissions = value.split(',').map(p => p.trim())
+  if (permissions.some(p => p === '')) {
+    return { ok: false, error: '--permissions has an empty entry; list permission names separated by commas' }
+  }
+  return { ok: true, value: permissions }
+}
+
+/**
+ * The permissions picked by number from `available` (1-based). Every entry
+ * must be one of the listed numbers: a key is never created from part of a
+ * selection, nor with the role's own permissions when the user asked to choose.
+ */
+export function parsePermissionSelection(input: string, available: string[]): Parsed<string[]> {
+  const entries = input.split(',').map(s => s.trim())
+  if (entries.every(e => e === '')) {
+    return { ok: false, error: 'No permissions selected; enter at least one number from the list' }
+  }
+  const invalid = entries.filter(e => !/^\d+$/.test(e) || Number(e) < 1 || Number(e) > available.length)
+  if (invalid.length > 0) {
+    return {
+      ok: false,
+      error: `Not on the list: ${invalid.map(e => `"${e}"`).join(', ')}; enter numbers from 1 to ${available.length}`,
+    }
+  }
+  return { ok: true, value: [...new Set(entries.map(e => available[Number(e) - 1]!))] }
+}
+
 export function groupPermissionsByCategory<T extends { category?: string | null }>(
   permissions: T[],
 ): Map<string, T[]> {
@@ -215,6 +246,17 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
   let expiresAt: string | null = null
   let selectedPermissions: string[] | null = null
 
+  // An explicit --permissions list is the key's permissions in either mode.
+  if (options.permissions !== undefined) {
+    const parsed = parsePermissionsFlag(options.permissions)
+    if (!parsed.ok) {
+      warning(parsed.error)
+      process.exitCode = 1
+      return
+    }
+    selectedPermissions = parsed.value
+  }
+
   // Check if automation mode (all required params provided)
   const isAutomation = options.yes && options.name && options.role
 
@@ -236,11 +278,6 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
         return
       }
       expiresAt = iso
-    }
-
-    // Handle permissions
-    if (options.permissions) {
-      selectedPermissions = options.permissions.split(',').map(p => p.trim())
     }
   } else {
     // Interactive mode
@@ -277,11 +314,13 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
       expiresAt = expiry.toISOString()
     }
 
-    // Get available permissions
-    const { data: permissionsData } = await getApiKeyPermissions({ client })
+    // Get available permissions, unless --permissions already named them.
+    const { data: permissionsData } = selectedPermissions
+      ? { data: undefined }
+      : await getApiKeyPermissions({ client })
     const permissionsList = permissionsData?.permissions ?? []
 
-    if (permissionsList.length > 0) {
+    if (!selectedPermissions && permissionsList.length > 0) {
       const useCustomPermissions = await promptConfirm({
         message: 'Customize permissions? (otherwise all permissions for role will be granted)',
         default: false,
@@ -297,12 +336,13 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
           default: '',
         })
 
-        if (permInput) {
-          const indices = permInput.split(',').map(s => parseInt(s.trim(), 10) - 1)
-          selectedPermissions = indices
-            .filter(i => i >= 0 && i < permissionsList.length)
-            .map(i => permissionsList[i]!.name)
+        const picked = parsePermissionSelection(permInput, permissionsList.map(p => p.name))
+        if (!picked.ok) {
+          warning(`${picked.error}. No API key was created.`)
+          process.exitCode = 1
+          return
         }
+        selectedPermissions = picked.value
       }
     }
   }

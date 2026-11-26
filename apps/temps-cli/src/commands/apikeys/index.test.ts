@@ -147,6 +147,18 @@ describe('apikeys create --yes', () => {
     expect(printed.join('\n')).toContain('Using the custom role')
   })
 
+  test('a --permissions list with an empty entry creates nothing', async () => {
+    const previous = process.exitCode
+    try {
+      await create('--name', 'ci', '--role', 'user', '--permissions', 'projects:read,,')
+      expect(bodies).toEqual([])
+      expect(process.exitCode).toBe(1)
+      expect(printed.join('\n')).toContain('--permissions has an empty entry')
+    } finally {
+      process.exitCode = previous
+    }
+  })
+
   test('a predefined role without --permissions is sent as chosen', async () => {
     await create('--name', 'ci', '--role', 'reader')
     expect(bodies).toHaveLength(1)
