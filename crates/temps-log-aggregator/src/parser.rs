@@ -308,11 +308,17 @@ pub fn mask_uri_passwords(line: &str) -> std::borrow::Cow<'_, str> {
                 }
             }
         }
-        // One byte back: an authority that ends at the slash of the next
-        // URI's `://` (`…@db,postgres://v:q@db2`) holds that separator's
-        // colon, and the next URI's `://` must still be found. The next
+        // An authority that ends at the slash of the next URI's `://`
+        // (`…@db,postgres://v:q@db2`) holds that separator's colon: resume
+        // on the colon so the next URI is still found. Only then, as any
+        // other byte before the end may be inside a multi-byte character
+        // (`https://例え`), where slicing the line would panic. The next
         // match still starts past this authority, so the scan moves on.
-        search = authority_end.saturating_sub(1).max(authority_start);
+        search = if authority_end > authority_start && bytes[authority_end - 1] == b':' {
+            authority_end - 1
+        } else {
+            authority_end
+        };
     }
     match out {
         Some(mut out) => {
@@ -975,6 +981,13 @@ mod tests {
             (
                 "file:///tmp/x then postgres://u:pw@db",
                 "file:///tmp/x then postgres://u:****@db",
+            ),
+            // A host that ends in a multi-byte character, at the end of the
+            // line or before a path.
+            ("connecting to https://例え.テスト", "connecting to https://例え.テスト"),
+            (
+                "https://u:pw@例え/x then postgres://v:pw2@db",
+                "https://u:****@例え/x then postgres://v:****@db",
             ),
         ];
         for (raw, wanted) in cases {
