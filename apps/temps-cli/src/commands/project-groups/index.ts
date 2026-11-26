@@ -12,7 +12,6 @@
 import type { Command } from 'commander'
 import {
   addProjectToGroup,
-  getInheritedEnvVars,
   clearGroupRepository,
   createGroupEnvVar,
   createGroupRoute,
@@ -20,14 +19,16 @@ import {
   deleteGroupEnvVar,
   deleteGroupRoute,
   deleteProjectGroup,
+  detectPublicPresets,
+  getGroupEnvVar,
   getGroupRepository,
+  getInheritedEnvVars,
   getProjectBySlug,
   getProjectGroup,
   getProjectGroupBySlug,
   getProjects,
   getRepositoryPresetLive,
   importProjectServices,
-  detectPublicPresets,
   listGroupEnvVars,
   listGroupRoutes,
   listProjectGroups,
@@ -35,8 +36,9 @@ import {
   setGroupRepository,
   setRepositoryInheritance,
   updateGroupEnvVar,
-  updateProjectGroup
+  updateProjectGroup,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type {
   ImportedApp,
   InheritedEnvVarResponse,
@@ -495,6 +497,12 @@ export function registerProjectGroupsCommands(program: Command): void {
   const vars = groups
     .command('vars')
     .description('Variables shared by every service in a project (group)')
+
+  endpoint(vars, getGroupEnvVar, {
+    name: 'get',
+    description: 'Show one shared variable (a secret value is never shown)',
+    path: { group_id: 'int', var_id: 'int' },
+  })
 
   vars
     .command('list <group>')

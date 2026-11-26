@@ -341,6 +341,7 @@ Http checks commands
 - `create` - Create http check
 - `get-capabilities` - Get http checks capabilities
 - `list-presets` - List http check presets
+- `get` - Show one http check
 - `delete` - Delete http check
 - `set-enabled` - Set http check enabled
 - `update` - Update http check
@@ -427,6 +428,19 @@ Get http checks capabilities
 #### `monitors http-checks list-presets`
 
 List http check presets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks get`
+
+Show one http check
+
+**Usage:** `monitors http-checks get <check-id> [options]`
 
 **Options:**
 

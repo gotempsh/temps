@@ -14,6 +14,8 @@ import {
   createShieldToken,
   deletePlatformShieldEntry,
   deleteProjectShieldEntry,
+  getPlatformShieldEntry,
+  getProjectShieldEntry,
   getShieldSettings,
   getShieldSummary,
   listPlatformShieldEntries,
@@ -107,6 +109,12 @@ export function registerShieldEndpoints(program: Command): void {
     },
   })
 
+  endpoint(group, getProjectShieldEntry, {
+    name: "get-entry",
+    description: "Show one of a project's Shield entries",
+    path: { project_id: 'project', entry_id: 'int' },
+  })
+
   endpoint(group, deleteProjectShieldEntry, {
     name: "delete-entry",
     description: "Remove a project's Shield entry",
@@ -153,6 +161,12 @@ export function registerShieldEndpoints(program: Command): void {
       note: 'string',
       verdict: { kind: 'string!', help: "The verdict an operator entry gives what it matches", values: ["allow","log","challenge","block"] },
     },
+  })
+
+  endpoint(group, getPlatformShieldEntry, {
+    name: "get-platform-entry",
+    description: "Show one platform-wide Shield entry",
+    path: { entry_id: 'int' },
   })
 
   endpoint(group, deletePlatformShieldEntry, {

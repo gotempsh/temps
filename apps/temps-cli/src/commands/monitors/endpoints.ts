@@ -16,6 +16,7 @@ import {
   detectSecretCredential,
   getBucketedStatus,
   getCronMonitor,
+  getHttpCheck,
   getHttpChecksCapabilities,
   getProjectsMonitorHealth,
   listCronMonitorRuns,
@@ -173,6 +174,12 @@ export function registerMonitorsEndpoints(program: Command): void {
     name: "http-checks list-presets",
     description: "List http check presets",
     path: { project_id: 'project' },
+  })
+
+  endpoint(group, getHttpCheck, {
+    name: "http-checks get",
+    description: "Show one http check",
+    path: { project_id: 'project', check_id: 'int' },
   })
 
   endpoint(group, deleteHttpCheck, {

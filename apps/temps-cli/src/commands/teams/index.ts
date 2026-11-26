@@ -8,6 +8,7 @@ import {
   deleteTeam,
   getProjects,
   getTeam,
+  getTeamMember,
   grantProjectAccess,
   listProjectAccess,
   listTeamMembers,
@@ -17,8 +18,9 @@ import {
   removeTeamMember,
   revokeProjectAccess,
   updateTeam,
-  updateTeamMemberRole
+  updateTeamMemberRole,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type {
   ProjectAccessResponse,
   TeamMemberResponse,
@@ -112,6 +114,12 @@ export function registerTeamsCommands(program: Command): void {
   const members = teams
     .command('members')
     .description('Manage team membership')
+
+  endpoint(members, getTeamMember, {
+    name: 'get',
+    description: "Show one member of a team",
+    path: { team_id: 'int', user_id: 'int' },
+  })
 
   members
     .command('list <team>')

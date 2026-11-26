@@ -12,8 +12,9 @@ import {
   createOidcRoleMapping,
   deleteOidcProvider,
   deleteOidcRoleMapping,
-  listOidcProviderUsers,
+  getOidcProvider,
   listOidcProviders,
+  listOidcProviderUsers,
   listOidcRoleMappings,
   testOidcProvider,
   updateOidcProvider,
@@ -45,6 +46,12 @@ export function registerSettingsEndpoints(program: Command): void {
       template: 'string',
       trust_idp_email: { kind: 'bool', help: "Defaults false" },
     },
+  })
+
+  endpoint(group, getOidcProvider, {
+    name: "oidc get-provider",
+    description: "Show one oidc provider",
+    path: { provider_id: 'int' },
   })
 
   endpoint(group, deleteOidcProvider, {
@@ -101,6 +108,7 @@ export function registerSettingsEndpoints(program: Command): void {
     name: "oidc list-provider-users",
     description: "List oidc provider users",
     path: { provider_id: 'int' },
+    query: { page: 'int', page_size: 'int' },
   })
 
   endpoint(group, deleteOidcRoleMapping, {

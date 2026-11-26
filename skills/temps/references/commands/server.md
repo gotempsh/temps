@@ -99,8 +99,21 @@ CPU, memory and disk alerts on a node
 
 **Subcommands:**
 
+- `get` - Show one of a node's resource alerts
 - `create` - Alert when a node metric crosses a threshold
 - `delete` (`rm`) - Delete a node's resource alert
+
+#### `server alert-rules get`
+
+Show one of a node's resource alerts
+
+**Usage:** `server alert-rules get <id> <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `server alert-rules create`
 

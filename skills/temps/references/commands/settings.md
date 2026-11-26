@@ -259,6 +259,7 @@ Oidc commands
 
 - `list-providers` - List oidc providers
 - `create-provider` - Create oidc provider
+- `get-provider` - Show one oidc provider
 - `delete-provider` - Delete oidc provider
 - `update-provider` - Update oidc provider
 - `list-role-mappings` - List oidc role mappings
@@ -303,6 +304,18 @@ Create oidc provider
 | `--no-trust-idp-email` | Set trust_idp_email to false | - | No |
 | `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
 | `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc get-provider`
+
+Show one oidc provider
+
+**Usage:** `settings oidc get-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 #### `settings oidc delete-provider`
@@ -399,6 +412,8 @@ List oidc provider users
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `settings oidc delete-role-mapping`

@@ -732,16 +732,17 @@ async function updateAction(
 
     if (isProject) {
       const pid = await resolveProjectId(options.project!)
-      // api-coverage: PUT /projects/{project_id}/skills/{slug}
+      // api-coverage: PATCH /projects/{project_id}/skills/{slug}
       url = '/projects/{project_id}/skills/{slug}'
       pathParams = { project_id: pid, slug }
     } else {
-      // api-coverage: PUT /settings/skills/{slug}
+      // api-coverage: PATCH /settings/skills/{slug}
       url = '/settings/skills/{slug}'
       pathParams = { slug }
     }
 
-    const { data, error } = await client.put({ url, path: pathParams, body })
+    // PATCH is the partial update; PUT is its deprecated alias.
+    const { data, error } = await client.patch({ url, path: pathParams, body })
     if (error) throw new Error(getErrorMessage(error))
     return data as SkillDefinition
   })

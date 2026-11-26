@@ -183,6 +183,15 @@
       "entries": [
         "PUT /projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id} body.protocol_version"
       ]
+    },
+    {
+      "reason": "Deprecated PUT aliases of the PATCH partial updates for skills and MCP servers (the spec marks them `deprecated`); `skills update` and `agents update-mcp`/`update-global-mcp` call the PATCH operations.",
+      "entries": [
+        "PUT /projects/{project_id}/mcp-servers/{slug}",
+        "PUT /projects/{project_id}/skills/{slug}",
+        "PUT /settings/mcp-servers/{slug}",
+        "PUT /settings/skills/{slug}"
+      ]
     }
   ]
 }

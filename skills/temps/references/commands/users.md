@@ -10,6 +10,7 @@ Manage platform users
 
 **Subcommands:**
 
+- `get` - Show one platform user
 - `list` (`ls`) - List all users
 - `create` (`add`) - Create a new user
 - `me` - Show current user info
@@ -24,6 +25,18 @@ Manage platform users
 - `verify-and-enable-mfa` - Verify and enable mfa
 - `change-password-self` - Change password self
 - `update` - Update user information (admin only)
+
+### `users get`
+
+Show one platform user
+
+**Usage:** `users get <user-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `users list` (alias: `ls`)
 

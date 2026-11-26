@@ -85,10 +85,23 @@ Manage team membership
 
 **Subcommands:**
 
+- `get` - Show one member of a team
 - `list` (`ls`) - List a team's members
 - `add` - Add a user to a team
 - `set-role` - Change a member's role in the team
 - `remove` (`rm`) - Remove a user from a team
+
+#### `teams members get`
+
+Show one member of a team
+
+**Usage:** `teams members get <team-id> <user-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `teams members list` (alias: `ls`)
 

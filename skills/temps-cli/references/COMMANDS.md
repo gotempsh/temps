@@ -343,10 +343,24 @@ Manage project secrets — mounted into the deployed container as files at /run/
 
 **Subcommands:**
 
+- `get` - Show one project secret's metadata (the value is never returned)
 - `list` (`ls`) - List secrets for a project (values are never returned)
 - `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
+
+#### `projects secrets get`
+
+Show one project secret's metadata (the value is never returned)
+
+**Usage:** `projects secrets get <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `projects secrets list` (alias: `ls`)
 
@@ -6455,6 +6469,7 @@ Oidc commands
 
 - `list-providers` - List oidc providers
 - `create-provider` - Create oidc provider
+- `get-provider` - Show one oidc provider
 - `delete-provider` - Delete oidc provider
 - `update-provider` - Update oidc provider
 - `list-role-mappings` - List oidc role mappings
@@ -6499,6 +6514,18 @@ Create oidc provider
 | `--no-trust-idp-email` | Set trust_idp_email to false | - | No |
 | `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
 | `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc get-provider`
+
+Show one oidc provider
+
+**Usage:** `settings oidc get-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 #### `settings oidc delete-provider`
@@ -6595,6 +6622,8 @@ List oidc provider users
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `settings oidc delete-role-mapping`
@@ -6616,6 +6645,7 @@ Manage platform users
 
 **Subcommands:**
 
+- `get` - Show one platform user
 - `list` (`ls`) - List all users
 - `create` (`add`) - Create a new user
 - `me` - Show current user info
@@ -6630,6 +6660,18 @@ Manage platform users
 - `verify-and-enable-mfa` - Verify and enable mfa
 - `change-password-self` - Change password self
 - `update` - Update user information (admin only)
+
+### `users get`
+
+Show one platform user
+
+**Usage:** `users get <user-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `users list` (alias: `ls`)
 
@@ -6899,10 +6941,23 @@ Manage team membership
 
 **Subcommands:**
 
+- `get` - Show one member of a team
 - `list` (`ls`) - List a team's members
 - `add` - Add a user to a team
 - `set-role` - Change a member's role in the team
 - `remove` (`rm`) - Remove a user from a team
+
+#### `teams members get`
+
+Show one member of a team
+
+**Usage:** `teams members get <team-id> <user-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `teams members list` (alias: `ls`)
 
@@ -7234,10 +7289,23 @@ Variables shared by every service in a project (group)
 
 **Subcommands:**
 
+- `get` - Show one shared variable (a secret value is never shown)
 - `list` (`ls`) - List shared variables (secret values are never shown)
 - `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 - `unset` - Remove a shared variable
+
+#### `project-groups vars get`
+
+Show one shared variable (a secret value is never shown)
+
+**Usage:** `project-groups vars get <group-id> <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `project-groups vars list` (alias: `ls`)
 
@@ -7806,6 +7874,7 @@ Http checks commands
 - `create` - Create http check
 - `get-capabilities` - Get http checks capabilities
 - `list-presets` - List http check presets
+- `get` - Show one http check
 - `delete` - Delete http check
 - `set-enabled` - Set http check enabled
 - `update` - Update http check
@@ -7892,6 +7961,19 @@ Get http checks capabilities
 #### `monitors http-checks list-presets`
 
 List http check presets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks get`
+
+Show one http check
+
+**Usage:** `monitors http-checks get <check-id> [options]`
 
 **Options:**
 
@@ -9460,10 +9542,24 @@ Drop noisy error events before they are stored (browser extensions, crawlers, lo
 
 **Subcommands:**
 
+- `get` - Show one of a project's inbound filters
 - `list` - List a project's inbound filters and how many events each dropped
 - `add` - Add an inbound filter
 - `update` - Change a filter's pattern, or switch it on or off
 - `remove` (`delete`) - Delete an inbound filter; matching events are stored again
+
+#### `errors filters get`
+
+Show one of a project's inbound filters
+
+**Usage:** `errors filters get <filter-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `errors filters list`
 
@@ -10700,8 +10796,21 @@ CPU, memory and disk alerts on a node
 
 **Subcommands:**
 
+- `get` - Show one of a node's resource alerts
 - `create` - Alert when a node metric crosses a threshold
 - `delete` (`rm`) - Delete a node's resource alert
+
+#### `server alert-rules get`
+
+Show one of a node's resource alerts
+
+**Usage:** `server alert-rules get <id> <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `server alert-rules create`
 
@@ -15589,10 +15698,23 @@ Post every public update of a status page to signed HTTPS webhooks
 
 **Subcommands:**
 
+- `get` - Show one webhook of a status page
 - `list` (`ls`) - List the webhooks of a status page and how deliveries are going
 - `add` - Add a webhook; its signing secret is printed once
 - `update` - Change the URL, or pause and resume deliveries
 - `remove` (`rm`) - Delete a webhook; events waiting for it are dropped
+
+#### `status-pages webhooks get`
+
+Show one webhook of a status page
+
+**Usage:** `status-pages webhooks get <status-page-id> <webhook-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `status-pages webhooks list` (alias: `ls`)
 
@@ -16690,12 +16812,26 @@ Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 
 **Subcommands:**
 
+- `get` - Show one analytics ingest key
 - `list` (`ls`) - List analytics ingest keys for a project
 - `create` (`add`) - Mint a new analytics ingest key
 - `update` - Update an ingest key's label, origin allowlist, or rate limit
 - `rotate` - Replace an ingest key value, keeping the same row and scope
 - `revoke` - Revoke (deactivate) an analytics ingest key
 - `get-ingest-endpoint` - The public address an app Temps does not deploy should send analytics to
+
+#### `analytics keys get`
+
+Show one analytics ingest key
+
+**Usage:** `analytics keys get <key-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `analytics keys list` (alias: `ls`)
 
@@ -25026,12 +25162,14 @@ Shield: bot and abuse protection rules, entries and proposals
 - `revoke-token` - Revoke a bypass token
 - `list-entries` - List a project's Shield entries
 - `create-entry` - Add a Shield entry to a project
+- `get-entry` - Show one of a project's Shield entries
 - `delete-entry` - Remove a project's Shield entry
 - `update-entry` - Change a project's Shield entry
 - `get-settings` - Get the platform Shield settings
 - `update-settings` - Change the platform Shield settings
 - `list-platform-entries` - List platform Shield entries
 - `create-platform-entry` - Add a platform Shield entry
+- `get-platform-entry` - Show one platform-wide Shield entry
 - `delete-platform-entry` - Remove a platform Shield entry
 - `update-platform-entry` - Change a platform Shield entry
 - `list-proposals` - List fleet learning's proposals
@@ -25159,6 +25297,19 @@ Add a Shield entry to a project
 | `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `shield get-entry`
+
+Show one of a project's Shield entries
+
+**Usage:** `shield get-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `shield delete-entry`
 
 Remove a project's Shield entry
@@ -25240,6 +25391,18 @@ Add a platform Shield entry
 | `--verdict <value>` | The verdict an operator entry gives what it matches (one of: allow, log, challenge, block) [required] | - | No |
 | `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
 | `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield get-platform-entry`
+
+Show one platform-wide Shield entry
+
+**Usage:** `shield get-platform-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 ### `shield delete-platform-entry`

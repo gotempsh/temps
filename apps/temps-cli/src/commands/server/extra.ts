@@ -11,11 +11,13 @@ import { client } from '../../lib/api-client.js'
 import {
   nodeMetricsCreateAlertRule,
   nodeMetricsDeleteAlertRule,
+  nodeMetricsGetAlertRule,
   nodeMetricsGetClusterLatest,
   nodeMetricsGetClusterRange,
   nodeMetricsGetDiskHealth,
   nodeMetricsGetReporting,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type { NodeCreateAlertRuleRequest } from '../../api/types.gen.js'
 import { call, confirmRisk, connect, output, parseIntegerFlag, type JsonOption } from '../../lib/command-kit.js'
 import { ValidationError } from '../../utils/errors.js'
@@ -137,6 +139,11 @@ export function registerServerExtraCommands(server: Command): void {
     })
 
   const alerts = server.command('alert-rules').description('CPU, memory and disk alerts on a node')
+  endpoint(alerts, nodeMetricsGetAlertRule, {
+    name: 'get',
+    description: "Show one of a node's resource alerts",
+    path: { id: 'int', rule_id: 'int' },
+  })
   alerts
     .command('create')
     .description('Alert when a node metric crosses a threshold')

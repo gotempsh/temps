@@ -92,10 +92,24 @@ Manage project secrets — mounted into the deployed container as files at /run/
 
 **Subcommands:**
 
+- `get` - Show one project secret's metadata (the value is never returned)
 - `list` (`ls`) - List secrets for a project (values are never returned)
 - `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
+
+#### `projects secrets get`
+
+Show one project secret's metadata (the value is never returned)
+
+**Usage:** `projects secrets get <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `projects secrets list` (alias: `ls`)
 

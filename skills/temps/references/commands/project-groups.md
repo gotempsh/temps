@@ -4,6 +4,22 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`project-groups list`](#project-groups-list-alias-ls)
+- [`project-groups show`](#project-groups-show-alias-get)
+- [`project-groups create`](#project-groups-create-alias-new)
+- [`project-groups update`](#project-groups-update-alias-edit)
+- [`project-groups delete`](#project-groups-delete-alias-rm)
+- [`project-groups add`](#project-groups-add)
+- [`project-groups remove`](#project-groups-remove)
+- [`project-groups repo`](#project-groups-repo)
+- [`project-groups import`](#project-groups-import)
+- [`project-groups follow`](#project-groups-follow)
+- [`project-groups unfollow`](#project-groups-unfollow)
+- [`project-groups routes`](#project-groups-routes)
+- [`project-groups vars`](#project-groups-vars)
+
 ## `project-groups` (alias: `pg`)
 
 Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
@@ -233,10 +249,23 @@ Variables shared by every service in a project (group)
 
 **Subcommands:**
 
+- `get` - Show one shared variable (a secret value is never shown)
 - `list` (`ls`) - List shared variables (secret values are never shown)
 - `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 - `unset` - Remove a shared variable
+
+#### `project-groups vars get`
+
+Show one shared variable (a secret value is never shown)
+
+**Usage:** `project-groups vars get <group-id> <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `project-groups vars list` (alias: `ls`)
 

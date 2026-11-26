@@ -5,16 +5,18 @@ import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
-  listUsers,
+  assignRole,
   createUser,
   deleteUser,
-  restoreUser,
-  resetUserPassword,
-  resetUserMfa,
-  assignRole,
-  removeRole,
   getCurrentUser,
+  getUser,
+  listUsers,
+  removeRole,
+  resetUserMfa,
+  resetUserPassword,
+  restoreUser,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type { RouteUserWithRoles } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
@@ -103,6 +105,12 @@ export function registerUsersCommands(program: Command): void {
   const users = program
     .command('users')
     .description('Manage platform users')
+
+  endpoint(users, getUser, {
+    name: 'get',
+    description: 'Show one platform user',
+    path: { user_id: 'int' },
+  })
 
   users
     .command('list')

@@ -14,12 +14,14 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`shield revoke-token`](#shield-revoke-token)
 - [`shield list-entries`](#shield-list-entries)
 - [`shield create-entry`](#shield-create-entry)
+- [`shield get-entry`](#shield-get-entry)
 - [`shield delete-entry`](#shield-delete-entry)
 - [`shield update-entry`](#shield-update-entry)
 - [`shield get-settings`](#shield-get-settings)
 - [`shield update-settings`](#shield-update-settings)
 - [`shield list-platform-entries`](#shield-list-platform-entries)
 - [`shield create-platform-entry`](#shield-create-platform-entry)
+- [`shield get-platform-entry`](#shield-get-platform-entry)
 - [`shield delete-platform-entry`](#shield-delete-platform-entry)
 - [`shield update-platform-entry`](#shield-update-platform-entry)
 - [`shield list-proposals`](#shield-list-proposals)
@@ -40,12 +42,14 @@ Shield: bot and abuse protection rules, entries and proposals
 - `revoke-token` - Revoke a bypass token
 - `list-entries` - List a project's Shield entries
 - `create-entry` - Add a Shield entry to a project
+- `get-entry` - Show one of a project's Shield entries
 - `delete-entry` - Remove a project's Shield entry
 - `update-entry` - Change a project's Shield entry
 - `get-settings` - Get the platform Shield settings
 - `update-settings` - Change the platform Shield settings
 - `list-platform-entries` - List platform Shield entries
 - `create-platform-entry` - Add a platform Shield entry
+- `get-platform-entry` - Show one platform-wide Shield entry
 - `delete-platform-entry` - Remove a platform Shield entry
 - `update-platform-entry` - Change a platform Shield entry
 - `list-proposals` - List fleet learning's proposals
@@ -173,6 +177,19 @@ Add a Shield entry to a project
 | `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `shield get-entry`
+
+Show one of a project's Shield entries
+
+**Usage:** `shield get-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `shield delete-entry`
 
 Remove a project's Shield entry
@@ -254,6 +271,18 @@ Add a platform Shield entry
 | `--verdict <value>` | The verdict an operator entry gives what it matches (one of: allow, log, challenge, block) [required] | - | No |
 | `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
 | `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield get-platform-entry`
+
+Show one platform-wide Shield entry
+
+**Usage:** `shield get-platform-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 ### `shield delete-platform-entry`

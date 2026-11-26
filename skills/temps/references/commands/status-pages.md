@@ -392,10 +392,23 @@ Post every public update of a status page to signed HTTPS webhooks
 
 **Subcommands:**
 
+- `get` - Show one webhook of a status page
 - `list` (`ls`) - List the webhooks of a status page and how deliveries are going
 - `add` - Add a webhook; its signing secret is printed once
 - `update` - Change the URL, or pause and resume deliveries
 - `remove` (`rm`) - Delete a webhook; events waiting for it are dropped
+
+#### `status-pages webhooks get`
+
+Show one webhook of a status page
+
+**Usage:** `status-pages webhooks get <status-page-id> <webhook-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `status-pages webhooks list` (alias: `ls`)
 

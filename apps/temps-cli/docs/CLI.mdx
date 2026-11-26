@@ -257,10 +257,22 @@ Manage project secrets — mounted into the deployed container as files at /run/
 
 **Subcommands:**
 
+- `get` - Show one project secret's metadata (the value is never returned)
 - `list` (`ls`) - List secrets for a project (values are never returned)
 - `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
+
+#### `projects secrets get <secret-id>`
+
+Show one project secret's metadata (the value is never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `projects secrets list` (alias: `ls`)
 
@@ -272,6 +284,8 @@ List secrets for a project (values are never returned)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <name>` | Filter to one environment | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `projects secrets create` (alias: `add`)
@@ -2016,6 +2030,8 @@ List backups for a schedule
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--schedule-id <id>` | Schedule ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `backups show`
@@ -3515,6 +3531,7 @@ Manage platform users
 
 **Subcommands:**
 
+- `get` - Show one platform user
 - `list` (`ls`) - List all users
 - `create` (`add`) - Create a new user
 - `me` - Show current user info
@@ -3523,6 +3540,16 @@ Manage platform users
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
 - `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 - `role` - Manage user roles
+
+### `users get <user-id>`
+
+Show one platform user
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `users list` (alias: `ls`)
 
@@ -4468,11 +4495,23 @@ Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 
 **Subcommands:**
 
+- `get` - Show one analytics ingest key
 - `list` (`ls`) - List analytics ingest keys for a project
 - `create` (`add`) - Mint a new analytics ingest key
 - `update` - Update an ingest key's label, origin allowlist, or rate limit
 - `rotate` - Replace an ingest key value, keeping the same row and scope
 - `revoke` - Revoke (deactivate) an analytics ingest key
+
+#### `analytics keys get <key-id>`
+
+Show one analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `analytics keys list` (alias: `ls`)
 
@@ -4483,6 +4522,8 @@ List analytics ingest keys for a project
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `analytics keys create` (alias: `add`)

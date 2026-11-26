@@ -132,12 +132,26 @@ Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 
 **Subcommands:**
 
+- `get` - Show one analytics ingest key
 - `list` (`ls`) - List analytics ingest keys for a project
 - `create` (`add`) - Mint a new analytics ingest key
 - `update` - Update an ingest key's label, origin allowlist, or rate limit
 - `rotate` - Replace an ingest key value, keeping the same row and scope
 - `revoke` - Revoke (deactivate) an analytics ingest key
 - `get-ingest-endpoint` - The public address an app Temps does not deploy should send analytics to
+
+#### `analytics keys get`
+
+Show one analytics ingest key
+
+**Usage:** `analytics keys get <key-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `analytics keys list` (alias: `ls`)
 

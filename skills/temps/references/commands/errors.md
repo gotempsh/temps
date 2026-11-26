@@ -237,10 +237,24 @@ Drop noisy error events before they are stored (browser extensions, crawlers, lo
 
 **Subcommands:**
 
+- `get` - Show one of a project's inbound filters
 - `list` - List a project's inbound filters and how many events each dropped
 - `add` - Add an inbound filter
 - `update` - Change a filter's pattern, or switch it on or off
 - `remove` (`delete`) - Delete an inbound filter; matching events are stored again
+
+#### `errors filters get`
+
+Show one of a project's inbound filters
+
+**Usage:** `errors filters get <filter-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `errors filters list`
 
