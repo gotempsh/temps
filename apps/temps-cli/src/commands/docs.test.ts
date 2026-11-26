@@ -35,8 +35,11 @@ describe('generateDocs', () => {
     expect(commands.some((command) => command.name === 'otel-forward')).toBe(true)
     expect(commands.some((command) => command.name === 'projects')).toBe(true)
     expect(commands.some((command) => command.name === 'cloud')).toBe(true)
+    // kv and blob are implemented now, so the docs list them.
+    expect(commands.some((command) => command.name === 'kv')).toBe(true)
+    expect(commands.some((command) => command.name === 'blob')).toBe(true)
     // Registered but not implemented: neither help nor docs advertise them.
-    for (const unavailable of ['kv', 'blob', 'exec', 'dev']) {
+    for (const unavailable of ['exec', 'dev']) {
       expect(commands.some((command) => command.name === unavailable)).toBe(false)
     }
   })
@@ -68,7 +71,10 @@ describe('generateDocs', () => {
     const { createProgram } = await import('../cli.js')
     const program = createProgram()
     const help = program.helpInformation()
-    for (const unavailable of ['kv', 'blob', 'exec', 'dev']) {
+    for (const available of ['kv', 'blob']) {
+      expect(help).toMatch(new RegExp(`^\\s+${available}\\b`, 'm'))
+    }
+    for (const unavailable of ['exec', 'dev']) {
       expect(help).not.toMatch(new RegExp(`^\\s+${unavailable}\\b`, 'm'))
       expect(program.commands.some((command) => command.name() === unavailable)).toBe(
         true,

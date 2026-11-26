@@ -23,7 +23,7 @@ export interface MockRun {
   stderr: string
   /** `METHOD /path?query` of every request, in order (without the `/api` prefix). */
   requests: string[]
-  /** JSON bodies sent, keyed like `requests`. */
+  /** Bodies sent, keyed like `requests`: parsed JSON, or the text of a non-JSON body. */
   bodies: Array<{ request: string; body: unknown }>
   error?: Error
 }
@@ -92,7 +92,13 @@ export async function runWithApi(
     const key = `${request.method} ${path}`
     requests.push(`${key}${url.search}`)
     const text = request.body ? await request.text() : ''
-    const body = text ? JSON.parse(text) : undefined
+    // A binary upload is recorded as its text; anything else as parsed JSON.
+    let body: unknown
+    try {
+      body = text ? JSON.parse(text) : undefined
+    } catch {
+      body = text
+    }
     if (body !== undefined) bodies.push({ request: key, body })
     const route = routes[key]
     if (route === undefined) {
