@@ -25,8 +25,8 @@ function telegramProvider(
     name,
     provider_type: 'telegram',
     enabled: true,
-    created_at: 0,
-    updated_at: 0,
+    created_at: '1970-01-01T00:00:00Z',
+    updated_at: '1970-01-01T00:00:00Z',
     config: { bot_token: '***', chat_id: chatId, message_thread_id: null },
   }
 }

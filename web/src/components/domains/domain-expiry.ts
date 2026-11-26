@@ -5,13 +5,13 @@ import { isServingCert } from '@/lib/domain-status'
 
 export function hasUrgentCertificate(
   status: string,
-  expiration: number | null | undefined,
+  expiration: string | null | undefined,
   now = Date.now()
 ): boolean {
+  const expiresAt = expiration == null ? NaN : Date.parse(expiration)
   return (
     isServingCert(status) &&
-    expiration != null &&
-    Number.isFinite(expiration) &&
-    expiration - now <= 15 * 24 * 60 * 60 * 1000
+    Number.isFinite(expiresAt) &&
+    expiresAt - now <= 15 * 24 * 60 * 60 * 1000
   )
 }

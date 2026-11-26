@@ -4,7 +4,14 @@
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
-import { QueryContent } from './GlobalPage'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { render as renderDom } from '@testing-library/react'
+import { ServiceScopeProvider } from '@/contexts/ServiceScopeContext'
+import type { GlobalView } from '@/hooks/useGlobalView'
+import { installBrowserWindow } from '@/test/dom'
+import { ProjectScope, QueryContent } from './GlobalPage'
+
+installBrowserWindow()
 
 function render(props: {
   loading?: boolean
@@ -54,4 +61,28 @@ test('data renders its children', () => {
   const html = render({})
   expect(html).toContain('row data')
   expect(html).not.toContain('No logs in this view')
+})
+
+test("inside a project the service picker shows the chosen service's icon", () => {
+  const scope = {
+    label: 'Shop',
+    href: '/p/shop',
+    services: [
+      { id: 11, name: 'web', slug: 'web', source_type: 'git' },
+      { id: 12, name: 'legacy', slug: 'legacy', source_type: 'external' },
+    ],
+    serverWide: { label: 'All logs', title: 'Every log', url: '/logs' },
+  }
+  const view = { projectId: 11, patch: () => {} } as unknown as GlobalView
+  const { getByRole, unmount } = renderDom(
+    <QueryClientProvider client={new QueryClient()}>
+      <ServiceScopeProvider value={scope}>
+        <ProjectScope view={view} />
+      </ServiceScopeProvider>
+    </QueryClientProvider>
+  )
+  const picker = getByRole('combobox', { name: 'Service in Shop' })
+  expect(picker.textContent).toContain('web')
+  expect(picker.querySelector('span[aria-hidden="true"]')).toBeTruthy()
+  unmount()
 })

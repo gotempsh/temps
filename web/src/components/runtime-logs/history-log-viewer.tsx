@@ -121,9 +121,10 @@ interface DeploymentLike {
   commit_hash?: string | null
   commit_message?: string | null
   tag?: string | null
-  created_at: number
-  started_at?: number | null
-  finished_at?: number | null
+  /** ISO 8601, UTC. */
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
 }
 
 // Compact one-line label for a deployment, e.g. "#171 · feat/ovh-version · a1b2c3d".
@@ -572,12 +573,10 @@ export default function HistoryLogViewer({
     if (selectedDeploy == null) return
     const d = deployments.find((x) => x.id === selectedDeploy)
     if (!d) return
-    // Deployment timestamps come from the API as epoch MILLISECONDS (e.g.
-    // created_at = 1777651454430), so they feed straight into new Date(ms) — do
-    // NOT multiply by 1000.
-    const startMs = d.started_at ?? d.created_at
-    if (!startMs) return
-    const from = new Date(startMs)
+    // Deployment timestamps come from the API as ISO 8601 strings.
+    const startedAt = d.started_at ?? d.created_at
+    if (!startedAt) return
+    const from = new Date(startedAt)
     const to = d.finished_at ? new Date(d.finished_at) : new Date()
     setCustomRange({ from, to })
     setTimeRange(CUSTOM_RANGE_VALUE)

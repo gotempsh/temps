@@ -2,78 +2,41 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Hand-written helpers for the on-demand TLS certificate endpoints (ADR-018 §5)
- * that are not yet reflected in the generated OpenAPI client.
- *
- * These reuse the generated `client` transport (baseUrl `/api`, bearer auth,
- * error parsing) rather than hand-rolling `fetch`, so behaviour matches the rest
- * of the SDK. Once `bun run openapi-ts` is re-run against a server that exposes
- * these endpoints, this file can be deleted and the generated SDK used directly.
- *
- * TODO(sdk-regen): replace with generated SDK helpers for
- *   - GET /domains/on-demand-certs
- *   - GET /domains/by-host/{hostname}/cert-status
- * once these endpoints are included in the OpenAPI spec / generated client.
+ * Helpers for the on-demand TLS certificate endpoints (ADR-018 §5):
+ * `GET /domains/on-demand-certs` and `GET /domains/by-host/{hostname}/cert-status`.
+ * The requests and response types are the generated SDK's; this module adds
+ * the query options the certificates page uses and the error labels.
  */
 
 import { queryOptions } from '@tanstack/react-query'
-import { client } from '@/api/client/client.gen'
+import {
+  getOnDemandCertStatus as sdkGetOnDemandCertStatus,
+  listOnDemandCerts as sdkListOnDemandCerts,
+} from '@/api/client/sdk.gen'
+import type {
+  CertStatusResponse,
+  ListOnDemandCertsResponse,
+  OnDemandCertAttemptResponse,
+  OnDemandCertRow,
+} from '@/api/client/types.gen'
 
-/** Mirror of the backend `OnDemandCertAttemptResponse` DTO. */
-export interface OnDemandCertAttempt {
-  id: number
-  hostname: string
-  trigger: string
-  challenge_served: boolean | null
-  acme_request_sent: boolean | null
-  acme_response_status: string | null
-  outcome: string
-  error_chain: string | null
-  error_category: string | null
-  duration_ms: number | null
-  created_at: number
-}
-
-/** Mirror of the backend `OnDemandCertRow` DTO. */
-export interface OnDemandCertRow {
-  hostname: string
-  status: string | null
-  expiration_time: number | null
-  backoff_until: number | null
-  attempt: OnDemandCertAttempt
-}
-
-/** Mirror of the backend `ListOnDemandCertsResponse` DTO. */
-export interface ListOnDemandCertsResponse {
-  certs: OnDemandCertRow[]
-  total: number
-  page: number
-  page_size: number
-}
-
-/** Mirror of the backend `CertStatusResponse` DTO. */
-export interface CertStatusResponse {
-  hostname: string
-  status: string | null
-  backoff_until: number | null
-  last_attempt: OnDemandCertAttempt | null
-}
+// The response shapes are the generated ones, so a server-side change (such
+// as the timestamps becoming ISO 8601 strings) reaches this module's callers
+// as a type error instead of a silent mismatch.
+export type OnDemandCertAttempt = OnDemandCertAttemptResponse
+export type { CertStatusResponse, ListOnDemandCertsResponse, OnDemandCertRow }
 
 export interface ListOnDemandCertsQuery {
   page?: number
   page_size?: number
 }
 
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
-
 export async function listOnDemandCerts(
   query: ListOnDemandCertsQuery,
   signal?: AbortSignal
 ): Promise<ListOnDemandCertsResponse> {
-  const { data } = await client.get<ListOnDemandCertsResponse, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/domains/on-demand-certs',
-    query: query as Record<string, unknown>,
+  const { data } = await sdkListOnDemandCerts({
+    query,
     signal,
     throwOnError: true,
   })
@@ -84,9 +47,7 @@ export async function getOnDemandCertStatus(
   hostname: string,
   signal?: AbortSignal
 ): Promise<CertStatusResponse> {
-  const { data } = await client.get<CertStatusResponse, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/domains/by-host/{hostname}/cert-status',
+  const { data } = await sdkGetOnDemandCertStatus({
     path: { hostname },
     signal,
     throwOnError: true,
@@ -117,13 +78,17 @@ export function getOnDemandCertStatusOptions(hostname: string | undefined) {
 export function errorCategoryLabel(
   category: string | null | undefined,
   acmeResponseStatus?: string | null,
-  backoffUntil?: number | null
+  backoffUntil?: string | number | null
 ): string | null {
   if (!category) return null
-  const retry =
-    typeof backoffUntil === 'number'
-      ? ` — retry after ${new Date(backoffUntil).toLocaleString()}`
-      : ''
+  // The API sends the deadline as ISO 8601; an unreadable one adds nothing.
+  const deadline =
+    typeof backoffUntil === 'string'
+      ? Date.parse(backoffUntil)
+      : (backoffUntil ?? Number.NaN)
+  const retry = Number.isFinite(deadline)
+    ? ` — retry after ${new Date(deadline).toLocaleString()}`
+    : ''
   switch (category) {
     case 'rate_limited':
       return `Rate limit from Let's Encrypt${retry}`

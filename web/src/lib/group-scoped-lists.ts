@@ -17,6 +17,7 @@
 import type {
   CustomDomainResponse,
   DeploymentResponse,
+  ExternalServiceInfo,
   ProjectServiceInfo,
   ServiceBackupEntryResponse,
   ServiceTypeRoute,
@@ -89,8 +90,12 @@ export interface GroupDatabase {
   name: string
   type: ServiceTypeRoute
   status: string
+  /** The database as the server reports it: version, topology, metrics. */
+  service: ExternalServiceInfo
   /** The project's services linked to it. */
   usedBy: GroupMember[]
+  /** How each of those services is linked (database per environment...). */
+  links: { member: GroupMember; link: ProjectServiceInfo }[]
 }
 
 /**
@@ -110,10 +115,14 @@ export function mergeGroupDatabases(
         name: link.service.name,
         type: link.service.service_type,
         status: link.service.status,
+        service: link.service,
         usedBy: [],
+        links: [],
       }
-      if (member && !entry.usedBy.some((m) => m.id === member.id))
+      if (member && !entry.usedBy.some((m) => m.id === member.id)) {
         entry.usedBy.push(member)
+        entry.links.push({ member, link })
+      }
       byId.set(link.service.id, entry)
     }
   })
@@ -155,7 +164,10 @@ export function mergeGroupDeployments(
         ? (deployments ?? []).map((deployment) => ({ ...deployment, service }))
         : []
     })
-    .sort((a, b) => b.created_at - a.created_at || b.id - a.id)
+    .sort(
+      (a, b) =>
+        Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id
+    )
 }
 
 export interface GroupBackup extends ServiceBackupEntryResponse {

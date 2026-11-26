@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { parseStepsJson } from './index.js'
+import { parseStepsJson, stepsToWrite } from './index.js'
 
 describe('parseStepsJson', () => {
   test('parses a valid array of steps', () => {
@@ -31,5 +31,23 @@ describe('parseStepsJson', () => {
 
   test('accepts an empty array', () => {
     expect(parseStepsJson('[]')).toEqual([])
+  })
+})
+
+describe('stepsToWrite', () => {
+  test('keeps the stored steps, in their order, when an update leaves them out', () => {
+    const steps = stepsToWrite([
+      { id: 12, order: 2, event_name: 'signup', event_filter: [] },
+      {
+        id: 11,
+        order: 1,
+        event_name: 'page_view',
+        event_filter: [{ type: 'page_path', value: '/pricing' }],
+      },
+    ])
+    expect(steps).toEqual([
+      { event_name: 'page_view', event_filter: [{ type: 'page_path', value: '/pricing' }] },
+      { event_name: 'signup', event_filter: [] },
+    ])
   })
 })

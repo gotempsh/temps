@@ -23,7 +23,7 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 sea-orm = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }

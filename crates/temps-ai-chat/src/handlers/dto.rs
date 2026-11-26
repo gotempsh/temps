@@ -303,7 +303,8 @@ pub struct ApplicationPreviewLinkResponse {
     /// A short-lived authenticated URL. Its fragment carries the grant and
     /// never reaches the development server or referrer headers.
     pub url: String,
-    pub expires_at: u64,
+    /// When the link stops working, ISO 8601 in UTC.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

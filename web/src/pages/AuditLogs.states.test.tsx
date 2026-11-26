@@ -69,7 +69,7 @@ function renderPage({
             {
               id: 1,
               operation_type: 'LOGIN_SUCCESS',
-              audit_date: Date.parse(from),
+              audit_date: new Date(Date.parse(from)).toISOString(),
               user: null,
               ip_address: null,
               data: {},
@@ -143,7 +143,7 @@ test('resource scope reaches every audit page and can be explicitly removed', as
         Array.from({ length: 20 }, (_, i) => ({
           id: i + 1,
           operation_type: 'UPDATE_ACCESS_VAULT',
-          audit_date: Date.parse(from),
+          audit_date: new Date(Date.parse(from)).toISOString(),
           data: { resource_id: 'vault_fixture' },
         }))
       )

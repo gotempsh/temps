@@ -54,7 +54,7 @@ chrono = { workspace = true }
 clickhouse = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 dashmap = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }

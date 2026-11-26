@@ -14,7 +14,8 @@ import {
 import type { StepConversionResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
-import { newline, json as jsonOut, colors, info, keyValue } from '../../ui/output.js'
+import { newline, json as jsonOut, colors, info, keyValue, warning } from '../../ui/output.js'
+import { MAX_PAGE_SIZE } from '../../lib/page-options.js'
 import { parsePeriod } from './period.js'
 
 interface FunnelsOptions {
@@ -70,14 +71,24 @@ export async function funnelsOverview(options: FunnelsOptions): Promise<void> {
   const projectId = projectData.id
 
   // Fetch funnels list
-  const funnelsData = await withSpinner('Fetching funnels...', async () => {
+  // The newest funnels, one page at the API's maximum size: each one costs
+  // a metrics request below.
+  const funnelPage = await withSpinner('Fetching funnels...', async () => {
     const { data, error } = await listFunnels({
       client,
       path: { project_id: projectId },
+      query: { page: 1, page_size: MAX_PAGE_SIZE },
     })
     if (error) throw new Error(getErrorMessage(error))
-    return data ?? []
+    if (!data) throw new Error(`Failed to list funnels of project ${projectId}: empty response`)
+    return data
   })
+  const funnelsData = funnelPage.items
+  if (funnelPage.total > funnelsData.length) {
+    warning(
+      `Showing the ${funnelsData.length} newest of ${funnelPage.total} funnels; see the rest with temps funnels list --project-id ${projectId} --page 2`,
+    )
+  }
 
   if (funnelsData.length === 0) {
     newline()

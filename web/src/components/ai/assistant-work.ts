@@ -57,26 +57,6 @@ export function groupAssistantParts(
 }
 
 /**
- * The result an answer stands on, if it has one. An answer that only looked
- * things up ("list my projects") ends on its result, so the last result with a
- * view of its own stays on screen as that view. Once the model does anything
- * else (reads a playbook, runs a command, writes a file) the lookups were steps
- * toward that work, so there is none: they fold with the rest of it.
- */
-export function standaloneResultId(
-  parts: readonly ChatPart[],
-  isLookup: (tool: ToolCall) => boolean,
-  hasOwnView: (tool: ToolCall) => boolean
-): string | null {
-  const tools = parts.flatMap((part) =>
-    part.type === 'tool' ? [part.tool] : []
-  )
-  if (!tools.every(isLookup)) return null
-  const viewable = tools.filter(hasOwnView)
-  return viewable.length > 0 ? viewable[viewable.length - 1].id : null
-}
-
-/**
  * The work group the turn is working on: the last segment, while the turn
  * runs. Once the model writes after it the group is done, and the activity
  * indicator follows the text instead.

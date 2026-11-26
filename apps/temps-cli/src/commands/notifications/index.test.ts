@@ -351,8 +351,8 @@ describe('invalid --topic-id', () => {
       name: 'alerts',
       provider_type: 'telegram',
       enabled: true,
-      created_at: 0,
-      updated_at: 0,
+      created_at: '1970-01-01T00:00:00Z',
+      updated_at: '1970-01-01T00:00:00Z',
       config: { bot_token: KEEP_STORED_SECRET, chat_id: '-1001', message_thread_id: null },
     }
     await expect(updateTelegramProviderAction(7, provider, { id: '7', topicId: '4.2' })).rejects.toThrow(

@@ -127,8 +127,8 @@ export async function show(options: ShowOptions): Promise<void> {
     'Preview Envs': project.enable_preview_environments ? 'Enabled' : 'Disabled',
     'Vulnerability Scanning': project.vulnerability_scanning_enabled ? 'Enabled' : 'Disabled',
     ...(dockerSocketAccess ? { 'Host Docker access': dockerSocketAccess } : {}),
-    Created: formatDate(new Date(project.created_at * 1000).toISOString()),
-    Updated: formatDate(new Date(project.updated_at * 1000).toISOString()),
+    Created: formatDate(project.created_at),
+    Updated: formatDate(project.updated_at),
   })
 
   newline()

@@ -18,8 +18,9 @@ describe('AiAssistantButton', () => {
       </AiAssistantProvider>
     )
 
-    expect(markup).toContain('title="AI assistant"')
-    expect(markup).toContain('AI assistant</span>')
+    // Named as the sidebar names it, with the same icon.
+    expect(markup).toContain('lucide-sparkles')
+    expect(markup).toContain('Ask</button>')
     expect(markup).toContain('aria-pressed="false"')
   })
 
@@ -33,5 +34,17 @@ describe('AiAssistantButton', () => {
     )
 
     expect(markup).toContain('aria-pressed="true"')
+  })
+
+  test('stands in the top bar at every width', () => {
+    const markup = renderToStaticMarkup(
+      <AiAssistantProvider>
+        <MemoryRouter>
+          <AiAssistantButton />
+        </MemoryRouter>
+      </AiAssistantProvider>
+    )
+
+    expect(markup).not.toMatch(/(^|[\s"])(max-)?(sm|md|lg):hidden/)
   })
 })

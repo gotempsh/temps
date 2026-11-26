@@ -570,11 +570,11 @@ pub(super) fn request_origin(metadata: &RequestMetadata) -> temps_core::ai_tool_
 }
 
 /// Console path where an operator adds the AI provider key the assistant needs.
-const ASSISTANT_SETUP_PATH: &str = "/ai-gateway?add=openrouter";
+const ASSISTANT_SETUP_PATH: &str = "/ai-gateway";
 
 /// Start a chat with the Temps assistant.
 ///
-/// The assistant runs on the AI gateway (an OpenRouter key is enough), has no
+/// The assistant runs on the AI gateway (one provider key is enough), has no
 /// sandbox, and acts with the calling user's own permissions: every tool call
 /// is replayed through the real router with their auth, and every change is a
 /// proposal the user confirms in the UI. When no provider is configured this
@@ -623,7 +623,7 @@ pub async fn create_assistant_conversation(
             ChatError::AiUnavailable => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("AI Not Configured")
                 .with_detail(
-                    "No AI provider is configured. Add an OpenRouter API key to start managing Temps by chat.",
+                    "No AI provider is configured. Add a provider key to start managing Temps by chat.",
                 )
                 .with_value("setup_path", ASSISTANT_SETUP_PATH),
             ChatError::Ai(message) => problemdetails::new(StatusCode::BAD_REQUEST)

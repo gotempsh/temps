@@ -77,6 +77,7 @@ pub fn router(state: Arc<TeamsAppState>) -> Router {
         teams::update_team,
         teams::delete_team,
         teams::list_team_members,
+        teams::get_team_member,
         teams::add_team_member,
         teams::update_team_member_role,
         teams::remove_team_member,

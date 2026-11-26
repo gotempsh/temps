@@ -24,6 +24,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
 import { FixErrorWithAgentButton } from '@/components/ai/FixErrorWithAgentButton'
@@ -120,7 +121,14 @@ export default function GlobalErrors() {
               {query.data?.data.map((issue) => (
                 <TableRow key={issue.id}>
                   <TableCell className="max-w-sm">
-                    <p className="text-xs text-muted-foreground md:hidden">
+                    <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground md:hidden">
+                      <ServiceIcon
+                        service={{
+                          id: issue.project_id,
+                          name: issue.project_name,
+                        }}
+                        size="xs"
+                      />
                       {issue.project_name}
                     </p>
                     <Link
@@ -138,7 +146,7 @@ export default function GlobalErrors() {
                     </p>
                   </TableCell>
                   <TableCell className="hidden md:table-cell">
-                    {issue.project_name}
+                    <IssueService issue={issue} />
                   </TableCell>
                   <TableCell>
                     <Badge
@@ -201,5 +209,25 @@ export default function GlobalErrors() {
         />
       </QueryContent>
     </GlobalPage>
+  )
+}
+
+/** The service an issue belongs to, with its icon, linking to it. */
+export function IssueService({
+  issue,
+}: {
+  issue: { project_id: number; project_name: string; project_slug: string }
+}) {
+  return (
+    <Link
+      to={`/projects/${encodeURIComponent(issue.project_slug)}`}
+      className="inline-flex max-w-56 items-center gap-2 hover:underline"
+    >
+      <ServiceIcon
+        service={{ id: issue.project_id, name: issue.project_name }}
+        size="sm"
+      />
+      <span className="truncate">{issue.project_name}</span>
+    </Link>
   )
 }

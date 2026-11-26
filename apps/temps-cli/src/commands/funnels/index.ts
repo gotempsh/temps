@@ -8,19 +8,21 @@ import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   listFunnels,
+  getFunnel,
   createFunnel,
   updateFunnel,
   deleteFunnel,
   getFunnelMetrics,
   previewFunnelMetrics,
 } from '../../api/sdk.gen.js'
-import type { FunnelResponse, StepConversionResponse, CreateFunnelStep } from '../../api/types.gen.js'
+import type { FunnelResponse, FunnelStepResponse, StepConversionResponse, CreateFunnelStep } from '../../api/types.gen.js'
+import { nextPageHint, pageQuery, type PageFlags } from '../../lib/page-options.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 
-interface ListOptions {
+interface ListOptions extends PageFlags {
   projectId: string
   json?: boolean
 }
@@ -67,8 +69,10 @@ export function registerFunnelsCommands(program: Command): void {
   funnels
     .command('list')
     .alias('ls')
-    .description('List all funnels for a project')
+    .description('List the funnels of a project, newest first')
     .requiredOption('--project-id <id>', 'Project ID')
+    .option('--page <n>', 'Page number (default: 1)')
+    .option('--page-size <n>', 'Items per page (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
     .action(listFunnelsAction)
 
@@ -119,6 +123,13 @@ export function registerFunnelsCommands(program: Command): void {
     .action(previewFunnelMetricsAction)
 }
 
+/** A funnel's stored steps in the shape a write takes, in their order. */
+export function stepsToWrite(steps: FunnelStepResponse[]): CreateFunnelStep[] {
+  return [...steps]
+    .sort((a, b) => a.order - b.order)
+    .map((step) => ({ event_name: step.event_name, event_filter: step.event_filter }))
+}
+
 export function parseStepsJson(stepsStr: string): CreateFunnelStep[] | null {
   try {
     const parsed = JSON.parse(stepsStr)
@@ -150,24 +161,28 @@ async function listFunnelsAction(options: ListOptions): Promise<void> {
     return
   }
 
-  const funnelsData = await withSpinner('Fetching funnels...', async () => {
+  const query = pageQuery(options)
+  const result = await withSpinner('Fetching funnels...', async () => {
     const { data, error } = await listFunnels({
       client,
       path: { project_id: projectId },
+      query,
     })
     if (error) {
       throw new Error(getErrorMessage(error))
     }
-    return data ?? []
+    if (!data) throw new Error(`Failed to list funnels of project ${projectId}: empty response`)
+    return data
   })
 
   if (options.json) {
-    json(funnelsData)
+    json(result)
     return
   }
 
+  const funnelsData = result.items
   newline()
-  header(`${icons.info} Funnels for Project ${projectId} (${funnelsData.length})`)
+  header(`${icons.info} Funnels for Project ${projectId} (${funnelsData.length} of ${result.total})`)
 
   if (funnelsData.length === 0) {
     info('No funnels configured')
@@ -179,12 +194,15 @@ async function listFunnelsAction(options: ListOptions): Promise<void> {
   const columns: TableColumn<FunnelResponse>[] = [
     { header: 'ID', key: 'id', width: 6 },
     { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
+    { header: 'Steps', accessor: (f) => String(f.steps.length) },
     { header: 'Active', accessor: (f) => f.is_active ? 'yes' : 'no', color: (v) => v === 'yes' ? colors.success(v) : colors.muted(v) },
     { header: 'Created', accessor: (f) => new Date(f.created_at).toLocaleString() },
     { header: 'Updated', accessor: (f) => new Date(f.updated_at).toLocaleString() },
   ]
 
   printTable(funnelsData, columns, { style: 'minimal' })
+  const more = nextPageHint(result)
+  if (more) info(more)
   newline()
 }
 
@@ -240,10 +258,10 @@ async function createFunnelAction(options: CreateOptions): Promise<void> {
   })
 
   success(`Funnel "${name}" created successfully`)
-  if (result?.funnel_id) {
-    info(`Funnel ID: ${result.funnel_id}`)
+  if (result) {
+    info(`Funnel ID: ${result.id}`)
+    info(`Steps: ${result.steps.length} step(s)`)
   }
-  info(`Steps: ${steps.length} step(s)`)
 }
 
 async function updateFunnelAction(options: UpdateOptions): Promise<void> {
@@ -262,20 +280,20 @@ async function updateFunnelAction(options: UpdateOptions): Promise<void> {
     return
   }
 
-  // Build the update body - the API requires the full CreateFunnelRequest shape
-  // First, fetch current funnel data to fill in missing fields
-  const currentFunnels = await withSpinner('Fetching current funnel...', async () => {
-    const { data, error } = await listFunnels({
+  // The update replaces the whole funnel, so a flag left out keeps what the
+  // funnel has now: read it, steps included.
+  const currentFunnel = await withSpinner('Fetching current funnel...', async () => {
+    const { data, error, response } = await getFunnel({
       client,
-      path: { project_id: projectId },
+      path: { project_id: projectId, funnel_id: funnelId },
     })
+    if (response?.status === 404) return undefined
     if (error) {
       throw new Error(getErrorMessage(error))
     }
-    return data ?? []
+    return data
   })
 
-  const currentFunnel = currentFunnels.find((f) => f.id === funnelId)
   if (!currentFunnel) {
     warning(`Funnel ${funnelId} not found in project ${projectId}`)
     return
@@ -290,7 +308,8 @@ async function updateFunnelAction(options: UpdateOptions): Promise<void> {
 
   const body = {
     name: options.name ?? currentFunnel.name,
-    steps: steps ?? ([] as CreateFunnelStep[]),
+    description: currentFunnel.description ?? undefined,
+    steps: steps ?? stepsToWrite(currentFunnel.steps),
   }
 
   await withSpinner('Updating funnel...', async () => {

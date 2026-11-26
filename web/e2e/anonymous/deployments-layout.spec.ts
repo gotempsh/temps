@@ -31,9 +31,10 @@ const deployments: DeploymentResponse[] = Array.from(
       'cancelled',
     ][index % 6],
     is_current: index === 0 || index === 6,
-    created_at: now - (index + 1) * 3600000,
-    started_at: now - 120000,
-    finished_at: index === 3 || index === 4 ? null : now - 103000,
+    created_at: new Date(now - (index + 1) * 3600000).toISOString(),
+    started_at: new Date(now - 120000).toISOString(),
+    finished_at:
+      index === 3 || index === 4 ? null : new Date(now - 103000).toISOString(),
     url: 'https://example.test',
     ...(index < 6
       ? {
@@ -93,8 +94,8 @@ for (const width of [1920, 1024, 768, 640, 390, 320]) {
           project_type: 'application',
           main_branch: 'main',
           directory: '.',
-          created_at: now,
-          updated_at: now,
+          created_at: new Date(now).toISOString(),
+          updated_at: new Date(now).toISOString(),
           deployment_config: {},
           preset: 'dockerfile',
         }
@@ -118,8 +119,8 @@ for (const width of [1920, 1024, 768, 640, 390, 320]) {
             slug: 'production',
             project_id: 2,
             main_url: 'https://example.test',
-            created_at: now,
-            updated_at: now,
+            created_at: new Date(now).toISOString(),
+            updated_at: new Date(now).toISOString(),
           },
         ]
       else if (path.endsWith('/active-visitors')) json = { count: 0 }

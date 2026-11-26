@@ -16,7 +16,7 @@ function deployment(
     environment_id: 1,
     is_current: true,
     status: 'completed',
-    created_at: Date.parse('2026-01-01T00:00:00Z'),
+    created_at: '2026-01-01T00:00:00Z',
     url: 'http://shop-production.localho.st:8080',
     commit_message: 'Ship it',
     environment: {

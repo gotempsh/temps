@@ -47,6 +47,7 @@
 //! conformance test is what makes that safe — it fails if a projected field
 //! stops existing in the spec.
 
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use temps_plugin_protocol::channel::{
@@ -182,12 +183,19 @@ pub struct DeployImage {
 pub trait ApiProjection {
     /// The OpenAPI component schema this projects.
     const SCHEMA: &'static str;
-    /// Fields read from that schema, and whether each must be present.
+    /// Fields read from that schema: the name, whether it must be present,
+    /// and the Rust type it decodes into (as written in the projection).
     ///
     /// A field marked required must be in the schema's `required` list — a
-    /// non-`Option` Rust field cannot decode a response that omits it.
-    const FIELDS: &'static [(&'static str, bool)];
+    /// non-`Option` Rust field cannot decode a response that omits it. The
+    /// type lets the conformance test check the wire format too: a timestamp
+    /// the platform sends as an ISO 8601 string cannot decode into an `i64`.
+    const FIELDS: &'static [ProjectedField];
 }
+
+/// One field a projection reads: `(name, required, rust type)`, the type as
+/// written in the projection (`Option<DateTime<Utc>>`).
+pub type ProjectedField = (&'static str, bool, &'static str);
 
 /// Define a projection and its conformance metadata from one field list, so
 /// the struct and the list it is checked against cannot drift.
@@ -212,8 +220,8 @@ macro_rules! projection {
 
         impl ApiProjection for $name {
             const SCHEMA: &'static str = $schema;
-            const FIELDS: &'static [(&'static str, bool)] =
-                &[$( (stringify!($field), $required), )*];
+            const FIELDS: &'static [ProjectedField] =
+                &[$( (stringify!($field), $required, stringify!($ty)), )*];
         }
     };
 }
@@ -230,8 +238,10 @@ projection! {
         repo_owner: Option<String>, required = false;
         git_url: Option<String>, required = false;
         main_branch: String, required = true;
-        last_deployment: Option<i64>, required = false;
-        created_at: i64, required = true;
+        /// When the project was last deployed (ISO 8601 on the wire).
+        last_deployment: Option<DateTime<Utc>>, required = false;
+        /// When the project was created (ISO 8601 on the wire).
+        created_at: DateTime<Utc>, required = true;
     }
 }
 
@@ -384,7 +394,7 @@ impl std::fmt::Debug for RuntimeCredentials {
 /// Every projection this SDK declares, as `(schema, fields)`.
 ///
 /// The conformance test walks this against the platform's OpenAPI components.
-pub const DECLARED_PROJECTIONS: &[(&str, &[(&str, bool)])] = &[
+pub const DECLARED_PROJECTIONS: &[(&str, &[ProjectedField])] = &[
     (ProjectRef::SCHEMA, ProjectRef::FIELDS),
     (EnvironmentRef::SCHEMA, EnvironmentRef::FIELDS),
     (StartedDeployment::SCHEMA, StartedDeployment::FIELDS),
@@ -796,13 +806,33 @@ mod tests {
         let full = r#"{
             "id": 7, "slug": "demo", "name": "Demo", "preset": "vite",
             "repo_name": null, "repo_owner": null, "directory": ".",
-            "main_branch": "main", "created_at": 0, "updated_at": 0,
+            "main_branch": "main", "created_at": "2026-11-25T11:39:26Z",
+            "updated_at": "2026-11-25T11:39:26Z",
+            "last_deployment": "2026-11-25T12:00:00.250Z",
             "attack_mode": false, "source_type": "static_files",
             "enable_preview_environments": false
         }"#;
         let project: ProjectRef = serde_json::from_str(full).unwrap();
         assert_eq!(project.id, 7);
         assert_eq!(project.preset.as_deref(), Some("vite"));
+        assert_eq!(project.created_at.to_rfc3339(), "2026-11-25T11:39:26+00:00");
+        assert_eq!(
+            project.last_deployment.map(|at| at.timestamp_millis()),
+            Some(1_795_608_000_250)
+        );
+    }
+
+    /// The platform sends timestamps as ISO 8601 strings; the epoch numbers
+    /// older servers sent are not accepted silently as something else.
+    #[test]
+    fn project_timestamps_decode_from_iso_8601_not_epoch_numbers() {
+        let at = |created_at: &str| {
+            serde_json::from_str::<ProjectRef>(&format!(
+                r#"{{"id":1,"name":"n","slug":"s","main_branch":"main","created_at":{created_at}}}"#
+            ))
+        };
+        assert!(at(r#""2026-11-25T11:39:26Z""#).is_ok());
+        assert!(at("1795665566").is_err());
     }
 
     /// A deployment that has not failed omits `cancelled_reason` entirely in

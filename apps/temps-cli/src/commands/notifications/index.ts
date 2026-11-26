@@ -1237,8 +1237,8 @@ async function showProvider(options: ShowOptions): Promise<void> {
   keyValue('ID', provider.id)
   keyValue('Type', provider.provider_type)
   keyValue('Status', provider.enabled ? colors.success('enabled') : colors.muted('disabled'))
-  keyValue('Created', new Date(provider.created_at * 1000).toLocaleString())
-  keyValue('Updated', new Date(provider.updated_at * 1000).toLocaleString())
+  keyValue('Created', new Date(provider.created_at).toLocaleString())
+  keyValue('Updated', new Date(provider.updated_at).toLocaleString())
   newline()
 }
 
@@ -1393,8 +1393,8 @@ async function showRoute(options: RouteShowOptions): Promise<void> {
   keyValue('Severity range', `${route.min_severity} → ${route.max_severity}`)
   keyValue('Providers', route.provider_ids.join(', ') || '(none)')
   keyValue('Status', route.enabled ? colors.success('enabled') : colors.muted('disabled'))
-  keyValue('Created', new Date(route.created_at * 1000).toLocaleString())
-  keyValue('Updated', new Date(route.updated_at * 1000).toLocaleString())
+  keyValue('Created', new Date(route.created_at).toLocaleString())
+  keyValue('Updated', new Date(route.updated_at).toLocaleString())
   newline()
 }
 

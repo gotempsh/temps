@@ -7,7 +7,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, patch},
+    routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -200,7 +200,9 @@ pub(crate) fn router() -> Router<Arc<TeamsAppState>> {
         )
         .route(
             "/teams/{team_id}/members/{user_id}",
-            patch(update_team_member_role).delete(remove_team_member),
+            get(get_team_member)
+                .patch(update_team_member_role)
+                .delete(remove_team_member),
         )
         .route("/teams/{team_id}/projects", get(list_team_projects))
 }
@@ -529,6 +531,34 @@ pub async fn add_team_member(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
+/// One member of a team, as listed.
+#[utoipa::path(
+    tag = "Teams",
+    get,
+    path = "/teams/{team_id}/members/{user_id}",
+    operation_id = "get_team_member",
+    params(("team_id" = i32, Path), ("user_id" = i32, Path)),
+    responses(
+        (status = 200, description = "The membership", body = TeamMemberResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "The user is not a member of the team"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_team_member(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<TeamsAppState>>,
+    Path((team_id, user_id)): Path<(i32, i32)>,
+) -> Result<Json<TeamMemberResponse>, Problem> {
+    permission_guard!(auth, UsersRead);
+    let member = state.team_service.get_member(team_id, user_id).await?;
+    Ok(Json(
+        TeamMemberResponse::from_team_member(member).map_err(Problem::from)?,
+    ))
+}
+
 #[utoipa::path(
     tag = "Teams",
     patch,
@@ -642,4 +672,147 @@ pub async fn list_team_projects(
         .map(ProjectAccessResponse::from_model)
         .collect();
     Ok(Json(responses.map_err(Problem::from)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checker::TeamProjectAccessChecker;
+    use crate::service::DefaultTeamService;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_entities::{team_members, users};
+    use tower::ServiceExt;
+
+    struct NoAudit;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Ok(())
+        }
+    }
+
+    struct AllowSensitive;
+
+    #[async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowSensitive {
+        async fn authorize(
+            &self,
+            _action: &SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
+    fn state(db: MockDatabase) -> Arc<TeamsAppState> {
+        let db = Arc::new(db.into_connection());
+        Arc::new(TeamsAppState::new(
+            Arc::new(DefaultTeamService::new(db.clone())),
+            Arc::new(NoAudit),
+            Arc::new(TeamProjectAccessChecker::new(db)),
+            Arc::new(AllowSensitive),
+        ))
+    }
+
+    fn user(id: i32) -> users::Model {
+        let now = chrono::Utc::now();
+        users::Model {
+            id,
+            name: "Member".to_string(),
+            email: format!("member{id}@example.test"),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn membership(team_id: i32, user_id: i32) -> team_members::Model {
+        let now = chrono::Utc::now();
+        team_members::Model {
+            id: 3,
+            team_id,
+            user_id,
+            role: "viewer".to_string(),
+            added_by: 1,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    async fn get(
+        state: Arc<TeamsAppState>,
+        auth: Option<temps_auth::AuthContext>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = axum::http::Request::builder()
+            .uri("/teams/1/members/5")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        if let Some(auth) = auth {
+            request.extensions_mut().insert(auth);
+        }
+        let response = router()
+            .with_state(state)
+            .oneshot(request)
+            .await
+            .expect("router answers");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn reading_one_member_needs_a_token_and_users_read() {
+        let empty = || state(MockDatabase::new(DatabaseBackend::Postgres));
+        assert_eq!(get(empty(), None).await.0, StatusCode::UNAUTHORIZED);
+        let no_users_read = temps_auth::AuthContext::new_session(user(1), Role::MetricsIngest);
+        assert_eq!(
+            get(empty(), Some(no_users_read)).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn one_member_reads_back_or_is_a_404_naming_it() {
+        let found = state(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![membership(1, 5)]])
+                .append_query_results([vec![user(5)]]),
+        );
+        let admin = || Some(temps_auth::AuthContext::new_session(user(1), Role::Admin));
+        let (status, body) = get(found, admin()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["user_id"], 5);
+        assert_eq!(body["team_id"], 1);
+        assert_eq!(body["user_email"], "member5@example.test");
+
+        let missing = state(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<team_members::Model>::new()]),
+        );
+        let (status, body) = get(missing, admin()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains('5') && detail.contains('1'), "{detail}");
+    }
 }

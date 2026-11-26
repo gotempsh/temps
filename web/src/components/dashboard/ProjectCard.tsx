@@ -14,11 +14,13 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
   AlertCircle,
+  ChevronRight,
   Container,
   FileUp,
   GitFork,
   Network,
   PackageOpen,
+  Radar,
   Users,
 } from 'lucide-react'
 import { Link } from 'react-router'
@@ -200,10 +202,13 @@ export function ProjectCard({
 }: ProjectCardProps) {
   const repository = projectRepository(project)
   const buildSource = projectBuildSource(project)
+  // A monitored service runs elsewhere: no build, preset or deployment. In
+  // the dense list it stays one row like its siblings, saying so.
+  const monitored =
+    project.source_type === 'external' || project.hosting === 'external'
   // Temps never deploys an app that runs elsewhere, so "Not deployed" would
   // read as something to fix.
-  const notDeployed =
-    project.hosting === 'external' ? 'Runs outside Temps' : 'Not deployed'
+  const notDeployed = monitored ? 'Runs outside Temps' : 'Not deployed'
   const totalVisitors = analytics?.unique_visitors ?? 0
   const apiRequests = health?.total_requests ?? 0
   const healthIndicator = projectHealthIndicator({
@@ -278,7 +283,7 @@ export function ProjectCard({
       </div>
     )
 
-  if (project.source_type === 'external') {
+  if (project.source_type === 'external' && layout !== 'dense') {
     return (
       <Link
         to={`/projects/${project.slug}/project`}
@@ -403,7 +408,7 @@ export function ProjectCard({
     return (
       <Link
         to={`/projects/${project.slug}`}
-        className="group grid gap-3 px-3 py-2.5 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring md:grid-cols-[minmax(12rem,1fr)_minmax(12rem,1fr)_minmax(13rem,1fr)_minmax(10rem,0.8fr)] md:items-center"
+        className="group grid gap-3 px-3 py-2.5 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring md:grid-cols-[minmax(12rem,1fr)_minmax(12rem,1fr)_minmax(13rem,1fr)_minmax(10rem,0.8fr)_auto] md:items-center"
       >
         <div className="flex min-w-0 items-center gap-2.5">
           <ProjectCardMedia
@@ -431,16 +436,23 @@ export function ProjectCard({
             )}
           </div>
         </div>
-        <div className="flex min-w-0 items-center gap-2 text-sm">
-          <BuildSourceIcon kind={buildSource.kind} />
-          <span className="truncate">
-            {repository?.label ?? buildSource.label}
-          </span>
-          <span className="text-muted-foreground">·</span>
-          <span className="truncate text-muted-foreground">
-            {projectPresetLabel(project.preset)}
-          </span>
-        </div>
+        {monitored ? (
+          <div className="flex min-w-0 items-center gap-2 text-sm">
+            <Radar className="size-4 shrink-0 text-muted-foreground" />
+            <span className="truncate">Monitored</span>
+          </div>
+        ) : (
+          <div className="flex min-w-0 items-center gap-2 text-sm">
+            <BuildSourceIcon kind={buildSource.kind} />
+            <span className="truncate">
+              {repository?.label ?? buildSource.label}
+            </span>
+            <span className="text-muted-foreground">·</span>
+            <span className="truncate text-muted-foreground">
+              {projectPresetLabel(project.preset)}
+            </span>
+          </div>
+        )}
         <div className="min-w-0">{activityContent}</div>
         <div className="min-w-0 text-sm">
           {project.last_deployment ? (
@@ -454,6 +466,10 @@ export function ProjectCard({
             <span className="text-muted-foreground">{notDeployed}</span>
           )}
         </div>
+        <ChevronRight
+          aria-hidden="true"
+          className="hidden size-4 text-muted-foreground/60 transition-transform group-hover:translate-x-0.5 group-hover:text-muted-foreground md:block"
+        />
       </Link>
     )
   }

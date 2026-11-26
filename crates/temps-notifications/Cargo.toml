@@ -25,7 +25,7 @@ async-trait = { workspace = true }
 lettre = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 uuid = { workspace = true }
 axum = { workspace = true }
 tracing = { workspace = true }

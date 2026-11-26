@@ -64,6 +64,16 @@ describe('serviceLinkRedeployMessage', () => {
     })
   })
 
+  test('names the app when a page covers several', () => {
+    const change = { serviceName: 'cache', appName: 'api' }
+    expect(
+      serviceLinkRedeployMessage({ ...change, kind: 'linked' }, []).title
+    ).toBe('cache was linked to api')
+    expect(
+      serviceLinkRedeployMessage({ ...change, kind: 'unlinked' }, []).title
+    ).toBe('cache was unlinked from api')
+  })
+
   test('explains that unlinking also needs a redeploy and names every environment', () => {
     const { title, description } = serviceLinkRedeployMessage(
       { kind: 'unlinked', serviceName: 'cache' },

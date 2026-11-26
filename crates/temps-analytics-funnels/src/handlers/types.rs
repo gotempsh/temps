@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::DateTime;
 use utoipa::ToSchema;
 
-use crate::services::{FunnelService, SmartFilter};
+use crate::services::{FunnelDefinition, FunnelService, SmartFilter};
 
 pub struct AppState {
     pub funnel_service: Arc<FunnelService>,
@@ -14,25 +15,65 @@ pub struct AppState {
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
+/// A funnel and its steps.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct FunnelResponse {
     pub id: i32,
+    pub project_id: i32,
     pub name: String,
     pub description: Option<String>,
     pub is_active: bool,
-    pub created_at: String,
-    pub updated_at: String,
+    /// The steps a visitor goes through, in order.
+    pub steps: Vec<FunnelStepResponse>,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
 }
 
-/// Acknowledges a funnel update or delete.
+/// One step of a funnel, as it was written.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FunnelStepResponse {
+    pub id: i32,
+    /// Position of the step in the funnel, starting at 1.
+    pub order: i32,
+    pub event_name: String,
+    /// The filters the step matches events with (empty: every event of
+    /// `event_name`).
+    pub event_filter: Vec<SmartFilter>,
+}
+
+impl From<FunnelDefinition> for FunnelResponse {
+    fn from(definition: FunnelDefinition) -> Self {
+        let FunnelDefinition { funnel, steps } = definition;
+        Self {
+            id: funnel.id,
+            project_id: funnel.project_id,
+            name: funnel.name,
+            description: funnel.description,
+            is_active: funnel.is_active,
+            steps: steps
+                .into_iter()
+                .map(|step| FunnelStepResponse {
+                    id: step.id,
+                    order: step.step_order,
+                    event_filter: SmartFilter::from_stored(step.id, step.event_filter.as_deref()),
+                    event_name: step.event_name,
+                })
+                .collect(),
+            created_at: funnel.created_at,
+            updated_at: funnel.updated_at,
+        }
+    }
+}
+
+temps_core::paginated_response!(
+    /// One page of a project's active funnels, newest first.
+    FunnelList,
+    FunnelResponse
+);
+
+/// Acknowledges a funnel delete.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct FunnelMessageResponse {
-    pub message: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateFunnelResponse {
-    pub funnel_id: i32,
     pub message: String,
 }
 

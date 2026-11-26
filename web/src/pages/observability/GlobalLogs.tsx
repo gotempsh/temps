@@ -85,6 +85,7 @@ export default function GlobalLogs() {
   // The saved search last opened, and the filters it holds that this page
   // has no control for. Cleared as soon as the filters change by hand.
   const [openedSearch, setOpenedSearch] = useState<{
+    id: number
     name: string
     notShown: string[]
     key: string
@@ -190,7 +191,10 @@ export default function GlobalLogs() {
     view.patch(patch)
   }
   const openSavedSearch = (
-    saved: Parameters<typeof viewFromSavedSearch>[0] & { name: string }
+    saved: Parameters<typeof viewFromSavedSearch>[0] & {
+      id: number
+      name: string
+    }
   ) => {
     setFollow(false)
     const opened = viewFromSavedSearch(saved)
@@ -214,6 +218,7 @@ export default function GlobalLogs() {
     // Every filter the key reads comes from the search itself, so the key
     // of the page it opens is known before the URL changes.
     setOpenedSearch({
+      id: saved.id,
       name: saved.name,
       notShown: opened.notShown,
       key: filterKey(apply(new URLSearchParams())),
@@ -324,16 +329,6 @@ export default function GlobalLogs() {
           <div className="flex items-center gap-2">
             {scope && <ServerWideLink scope={scope} />}
             <LogIngestKeys projectId={projectId} />
-            <SavedLogSearches
-              projectId={projectId}
-              currentQuery={savedQueryFromParams(view.params)}
-              currentRange={savedRangeFromWindow({
-                from: view.from,
-                to: view.to,
-                preset: view.range,
-              })}
-              onOpen={openSavedSearch}
-            />
           </div>
         }
       />
@@ -386,17 +381,42 @@ export default function GlobalLogs() {
           />
         }
         toolbar={
-          <div role="region" aria-label="Logs filters" className="space-y-2">
+          <div
+            role="region"
+            aria-label="Logs filters"
+            className="@container space-y-2"
+          >
             {/* One row: what to find, when, and whether to keep following.
-                The search takes the room; the rest keep their width. */}
+                The search takes the room; the rest keep their width. Saved
+                searches sit against the search they store. */}
             <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
-              <div className="min-w-0 flex-1">
-                <LogQueryInput
-                  params={view.params}
-                  text={view.search}
-                  environmentLabels={environmentLabels}
-                  filters={filters}
-                  onChange={filter}
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <div className="min-w-0 flex-1">
+                  <LogQueryInput
+                    params={view.params}
+                    text={view.search}
+                    environmentLabels={environmentLabels}
+                    filters={filters}
+                    onChange={filter}
+                  />
+                </div>
+                <SavedLogSearches
+                  projectId={projectId}
+                  currentQuery={savedQueryFromParams(view.params)}
+                  currentRange={savedRangeFromWindow({
+                    from: view.from,
+                    to: view.to,
+                    preset: view.range,
+                  })}
+                  onOpen={openSavedSearch}
+                  onPickService={(serviceId) =>
+                    filter({ project_id: String(serviceId) })
+                  }
+                  openedId={
+                    openedSearch?.key === filterKey(view.params)
+                      ? openedSearch.id
+                      : undefined
+                  }
                 />
               </div>
               <div className="flex flex-wrap items-center gap-2">

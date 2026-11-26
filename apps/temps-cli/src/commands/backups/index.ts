@@ -4,6 +4,7 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { nextPageHint, pageQuery, type PageFlags } from '../../lib/page-options.js'
 import {
   listBackupSchedules,
   createBackupSchedule,
@@ -57,7 +58,7 @@ interface DeleteScheduleOptions {
   yes?: boolean
 }
 
-interface ListBackupsOptions {
+interface ListBackupsOptions extends PageFlags {
   scheduleId: string
   json?: boolean
 }
@@ -309,6 +310,8 @@ export function registerBackupsCommands(program: Command): void {
     .alias('ls')
     .description('List backups for a schedule')
     .requiredOption('--schedule-id <id>', 'Schedule ID')
+    .option('--page <n>', 'Page number (default: 1)')
+    .option('--page-size <n>', 'Items per page (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
     .action(listBackups)
 
@@ -532,10 +535,10 @@ async function showSchedule(options: ShowScheduleOptions): Promise<void> {
   }
   console.log(`  ${colors.muted('S3 Source ID:')} ${schedule.s3_source_id}`)
   if (schedule.last_run) {
-    console.log(`  ${colors.muted('Last Run:')} ${formatRelativeTime(new Date(schedule.last_run * 1000).toISOString())}`)
+    console.log(`  ${colors.muted('Last Run:')} ${formatRelativeTime(schedule.last_run)}`)
   }
   if (schedule.next_run) {
-    console.log(`  ${colors.muted('Next Run:')} ${formatRelativeTime(new Date(schedule.next_run * 1000).toISOString())}`)
+    console.log(`  ${colors.muted('Next Run:')} ${formatRelativeTime(schedule.next_run)}`)
   }
   newline()
 }
@@ -801,8 +804,8 @@ async function showSource(options: ShowSourceOptions): Promise<void> {
   if (source.force_path_style !== null && source.force_path_style !== undefined) {
     console.log(`  ${colors.muted('Force Path Style:')} ${source.force_path_style}`)
   }
-  console.log(`  ${colors.muted('Created:')} ${formatRelativeTime(new Date(source.created_at * 1000).toISOString())}`)
-  console.log(`  ${colors.muted('Updated:')} ${formatRelativeTime(new Date(source.updated_at * 1000).toISOString())}`)
+  console.log(`  ${colors.muted('Created:')} ${formatRelativeTime(source.created_at)}`)
+  console.log(`  ${colors.muted('Updated:')} ${formatRelativeTime(source.updated_at)}`)
   newline()
 }
 
@@ -1047,24 +1050,28 @@ async function listBackups(options: ListBackupsOptions): Promise<void> {
     return
   }
 
-  const backups = await withSpinner('Fetching backups...', async () => {
+  const query = pageQuery(options)
+  const result = await withSpinner('Fetching backups...', async () => {
     const { data, error } = await listBackupsForSchedule({
       client,
       path: { id },
+      query,
     })
     if (error) {
       throw new Error(getErrorMessage(error))
     }
-    return data ?? []
+    if (!data) throw new Error(`Failed to list backups of schedule ${id}: empty response`)
+    return data
   })
 
   if (options.json) {
-    json(backups)
+    json(result)
     return
   }
 
+  const backups = result.items
   newline()
-  header(`${icons.package} Backups for Schedule #${options.scheduleId} (${backups.length})`)
+  header(`${icons.package} Backups for Schedule #${options.scheduleId} (${backups.length} of ${result.total})`)
 
   if (backups.length === 0) {
     info('No backups found for this schedule')
@@ -1077,10 +1084,12 @@ async function listBackups(options: ListBackupsOptions): Promise<void> {
     { header: 'Type', key: 'backup_type' },
     { header: 'State', key: 'state', color: (v) => statusBadge(v) },
     { header: 'Size', accessor: (b) => formatBytes(b.size_bytes) },
-    { header: 'Started', accessor: (b) => formatRelativeTime(new Date(b.started_at * 1000).toISOString()), color: (v) => colors.muted(v) },
+    { header: 'Started', accessor: (b) => formatRelativeTime(b.started_at), color: (v) => colors.muted(v) },
   ]
 
   printTable(backups, columns, { style: 'minimal' })
+  const more = nextPageHint(result)
+  if (more) info(more)
   newline()
 }
 
@@ -1114,9 +1123,9 @@ async function showBackup(options: ShowBackupOptions): Promise<void> {
   if (backup.checksum) {
     console.log(`  ${colors.muted('Checksum:')} ${backup.checksum}`)
   }
-  console.log(`  ${colors.muted('Started:')} ${formatRelativeTime(new Date(backup.started_at * 1000).toISOString())}`)
+  console.log(`  ${colors.muted('Started:')} ${formatRelativeTime(backup.started_at)}`)
   if (backup.completed_at) {
-    console.log(`  ${colors.muted('Completed:')} ${formatRelativeTime(new Date(backup.completed_at * 1000).toISOString())}`)
+    console.log(`  ${colors.muted('Completed:')} ${formatRelativeTime(backup.completed_at)}`)
   }
   if (backup.schedule_id) {
     console.log(`  ${colors.muted('Schedule ID:')} ${backup.schedule_id}`)

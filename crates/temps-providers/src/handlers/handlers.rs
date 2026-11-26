@@ -4013,6 +4013,7 @@ async fn update_service_log_ingestion(
         super::metrics_handlers::get_cluster_metrics_latest,
         super::metrics_handlers::get_node_metrics_reporting,
         super::metrics_handlers::list_node_alert_rules,
+        super::metrics_handlers::get_node_alert_rule,
         super::metrics_handlers::create_node_alert_rule,
         super::metrics_handlers::update_node_alert_rule,
         super::metrics_handlers::delete_node_alert_rule,

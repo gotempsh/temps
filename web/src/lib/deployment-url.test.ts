@@ -17,7 +17,7 @@ type DeploymentOverrides = Omit<Partial<DeploymentResponse>, 'environment'> & {
 function deployment(overrides: DeploymentOverrides = {}): DeploymentResponse {
   const { environment, ...rest } = overrides
   return {
-    created_at: 0,
+    created_at: '1970-01-01T00:00:00Z',
     environment_id: 2,
     id: 3,
     is_current: false,

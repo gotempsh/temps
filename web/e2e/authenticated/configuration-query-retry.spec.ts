@@ -116,8 +116,8 @@ test('Retry DNS providers restores the configured provider and clears the lookup
     status: 'pending',
     verification_method: 'dns-01',
     is_wildcard: false,
-    created_at: Date.parse(timestamp),
-    updated_at: Date.parse(timestamp),
+    created_at: timestamp,
+    updated_at: timestamp,
   }
   const order: AcmeOrderResponse = {
     id: 43,

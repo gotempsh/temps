@@ -125,6 +125,7 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             UpdateIncidentStatusRequest,
             UpdateIncidentRequest,
             IncidentUpdateResponse,
+            IncidentUpdateList,
             UpdateIncidentUpdateVisibilityRequest,
             IncidentBucketedResponse,
             ProjectMonitorHealth,
@@ -1034,9 +1035,10 @@ where
     path = "/incidents/{incident_id}/updates",
     params(
         ("incident_id" = i32, Path, description = "Incident ID"),
+        temps_core::PageQuery,
     ),
     responses(
-        (status = 200, description = "Successfully retrieved incident updates", body = Vec<IncidentUpdateResponse>),
+        (status = 200, description = "One page of the incident's updates, newest first", body = IncidentUpdateList),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Incident not found"),
@@ -1049,6 +1051,7 @@ pub async fn get_incident_updates<T>(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<T>>,
     Path(incident_id): Path<i32>,
+    Query(page): Query<temps_core::PageQuery>,
 ) -> Result<impl IntoResponse, Problem>
 where
     T: StatusPageAppState,
@@ -1064,11 +1067,17 @@ where
     app_state
         .status_page_service()
         .incident_service()
-        .get_incident_updates(incident_id)
+        .get_incident_updates(incident_id, page)
         .await
-        .map(Json)
+        .map(|(items, total)| Json(IncidentUpdateList::new(items, total, page)))
         .map_err(map_error)
 }
+
+temps_core::paginated_response!(
+    /// One page of an incident's updates, newest first.
+    IncidentUpdateList,
+    IncidentUpdateResponse
+);
 
 /// Show or hide an incident update on published status pages
 #[utoipa::path(
@@ -2688,6 +2697,7 @@ mod tests {
             RequireAuth(AuthContext::new_session(test_user(), Role::User)),
             State(fx.app_state.clone()),
             Path(fx.incident_id),
+            Query(temps_core::PageQuery::default()),
         )
         .await
         .err()

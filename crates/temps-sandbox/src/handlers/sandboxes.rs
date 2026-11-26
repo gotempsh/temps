@@ -3056,8 +3056,8 @@ pub struct PreviewShareLinkResponse {
     /// The full link. Its fragment contains the grant and must be treated as a
     /// credential; URL fragments are not sent to servers or in Referer headers.
     pub url: String,
-    /// Unix seconds after which the link stops working.
-    pub expires_at: u64,
+    /// When the link stops working, ISO 8601 in UTC.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Live project runtime variables issued to a sandbox. Values are deliberately
@@ -3183,7 +3183,25 @@ pub async fn create_preview_link(
         )
         .await?;
 
-    Ok(Json(PreviewShareLinkResponse { url, expires_at }))
+    Ok(Json(PreviewShareLinkResponse {
+        url,
+        expires_at: preview_link_expiry(expires_at)?,
+    }))
+}
+
+/// The expiry of a minted preview link, from the Unix seconds the sandbox
+/// service reports, as a timestamp.
+fn preview_link_expiry(unix_seconds: u64) -> Result<chrono::DateTime<chrono::Utc>, Problem> {
+    i64::try_from(unix_seconds)
+        .ok()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .ok_or_else(|| {
+            temps_core::problemdetails::new(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Invalid Preview Link Expiry")
+                .with_detail(format!(
+                    "The preview link expiry {unix_seconds} is not a representable time"
+                ))
+        })
 }
 
 pub fn routes() -> Router<Arc<SandboxAppState>> {

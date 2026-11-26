@@ -105,7 +105,7 @@ export function OnboardingChoices({
         downloads, DNS verification and app releases can add waiting time.
       </p>
       <div className="flex flex-wrap items-center gap-4 border-t pt-4 text-sm">
-        <Link to="/tools" className="underline underline-offset-4">
+        <Link to="/resources" className="underline underline-offset-4">
           Just exploring
         </Link>
         <Link

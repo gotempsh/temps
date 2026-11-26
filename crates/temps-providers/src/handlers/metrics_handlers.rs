@@ -2044,6 +2044,39 @@ async fn list_node_alert_rules(
     Ok((StatusCode::OK, Json(response)))
 }
 
+/// One monitoring alert rule of a node, as listed.
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}/metrics/alert-rules/{rule_id}",
+    operation_id = "NodeMetricsGetAlertRule",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+        ("rule_id" = i32, Path, description = "Alert rule ID"),
+    ),
+    responses(
+        (status = 200, description = "The alert rule", body = AlertRuleResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alert rule not found on this node"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_node_alert_rule(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((id, rule_id)): Path<(i32, i32)>,
+) -> Result<Json<AlertRuleResponse>, Problem> {
+    // The same guard as listing a node's rules.
+    permission_guard!(auth, SettingsRead);
+    let rule = NodeAlertRuleService::new(state.db.clone())
+        .get(id, rule_id)
+        .await
+        .map_err(|e| log_and_convert(id, e))?;
+    Ok(Json(AlertRuleResponse::from(rule)))
+}
+
 /// Update a node-scoped monitoring alert rule.
 ///
 /// Worker rules can be deleted. Control-plane defaults are update-only because
@@ -2799,7 +2832,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/nodes/{id}/metrics/alert-rules/{rule_id}",
-            patch(update_node_alert_rule).delete(delete_node_alert_rule),
+            get(get_node_alert_rule)
+                .patch(update_node_alert_rule)
+                .delete(delete_node_alert_rule),
         )
 }
 
@@ -2829,6 +2864,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         get_cluster_metrics_latest,
         get_node_metrics_reporting,
         list_node_alert_rules,
+        get_node_alert_rule,
         create_node_alert_rule,
         update_node_alert_rule,
         delete_node_alert_rule,
@@ -3708,5 +3744,136 @@ mod tests {
             deployment_visible_to_caller(42, None),
             "session users are not constrained by this fn — the checker is"
         );
+    }
+
+    mod node_alert_rule_reads {
+        use super::*;
+        use sea_orm::MockDatabase;
+        use tower::ServiceExt;
+
+        struct NoopAuditLogger;
+
+        #[async_trait::async_trait]
+        impl temps_core::AuditLogger for NoopAuditLogger {
+            async fn create_audit_log(
+                &self,
+                _operation: &dyn temps_core::AuditOperation,
+            ) -> temps_core::AuditResult<()> {
+                Ok(())
+            }
+        }
+
+        fn state(db: MockDatabase) -> Arc<AppState> {
+            let db = Arc::new(db.into_connection());
+            let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+                "node-alert-rule-read-test",
+            ));
+            let docker = Arc::new(
+                bollard::Docker::connect_with_local_defaults()
+                    .expect("Docker client configuration should be available"),
+            );
+            let manager = Arc::new(crate::services::ExternalServiceManager::new(
+                db.clone(),
+                encryption_service,
+                docker,
+                Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+            ));
+            Arc::new(AppState {
+                external_service_manager: manager.clone(),
+                data_import_service: crate::handlers::types::test_support::data_import_service(
+                    manager.clone(),
+                    db.clone(),
+                ),
+                sensitive_action_authorizer:
+                    crate::handlers::types::test_support::allow_sensitive_actions(),
+                audit_service: Arc::new(NoopAuditLogger),
+                query_service: Arc::new(crate::QueryService::new(manager)),
+                health_monitor: None,
+                metrics_store: None,
+                worker_metrics_status: None,
+                db: db.clone(),
+                api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+                config_service: None,
+                telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+                project_access_checker: None,
+                application_network_reconciler: None,
+                notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                    destinations: Some(0),
+                }),
+            })
+        }
+
+        fn rule(id: i32, node_id: i32) -> monitoring_alert_rules::Model {
+            monitoring_alert_rules::Model {
+                id,
+                service_id: None,
+                deployment_id: None,
+                node_id: Some(node_id),
+                name: "High disk".to_string(),
+                metric_name: "node.disk_percent".to_string(),
+                threshold: 90.0,
+                comparator: ">".to_string(),
+                severity: "critical".to_string(),
+                for_duration_secs: 300,
+                enabled: true,
+                silenced_until: None,
+                breach_started_at: None,
+            }
+        }
+
+        async fn get(
+            state: Arc<AppState>,
+            auth: Option<temps_auth::AuthContext>,
+        ) -> (StatusCode, serde_json::Value) {
+            let mut request = axum::http::Request::builder()
+                .uri("/nodes/7/metrics/alert-rules/5")
+                .body(axum::body::Body::empty())
+                .expect("request");
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            let response = configure_metrics_routes()
+                .with_state(state)
+                .oneshot(request)
+                .await
+                .expect("router answers");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        #[tokio::test]
+        async fn one_node_rule_needs_a_token_and_settings_read() {
+            let empty = || state(MockDatabase::new(sea_orm::DatabaseBackend::Postgres));
+            let (status, _) = get(empty(), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            // A plain user cannot read platform settings; nothing is queried.
+            let (status, _) = get(empty(), Some(test_session_auth(temps_auth::Role::User))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn one_node_rule_reads_back_or_is_a_404_naming_it() {
+            let found = state(
+                MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([vec![rule(5, 7)]]),
+            );
+            let (status, body) = get(found, Some(test_session_auth(temps_auth::Role::Admin))).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["id"], 5);
+            assert_eq!(body["metric_name"], "node.disk_percent");
+
+            let missing = state(
+                MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results([Vec::<monitoring_alert_rules::Model>::new()]),
+            );
+            let (status, body) =
+                get(missing, Some(test_session_auth(temps_auth::Role::Admin))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains('5') && detail.contains('7'), "{detail}");
+        }
     }
 }

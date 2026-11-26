@@ -26,7 +26,7 @@ function deployment(
       slug: 'production',
       domains: [],
     },
-    created_at: 1_788_000_000 + id,
+    created_at: new Date((1_788_000_000 + id) * 1000).toISOString(),
     status: 'pending',
     is_current: false,
     url: '',
