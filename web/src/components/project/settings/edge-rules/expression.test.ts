@@ -12,6 +12,7 @@ import {
   removeNode,
   ruleWarnings,
   updateNode,
+  updatePatch,
   validateRule,
   withAutoName,
 } from './expression'
@@ -108,6 +109,47 @@ describe('validateRule', () => {
         { target: draft.expression.id, message: NO_CONDITIONS },
       ])
     }
+  })
+
+  test('a disabled rule stored without conditions can keep them while renamed', () => {
+    const stored = draftWith([]).expression
+    const draft = draftWith([])
+    draft.expression = structuredClone(stored)
+    draft.enabled = false
+    draft.name = 'Old catch-all'
+    expect(validateRule(draft, stored)).toEqual([])
+
+    // Turning it on needs a condition...
+    expect(validateRule({ ...draft, enabled: true }, stored)).toEqual([
+      { target: stored.id, message: NO_CONDITIONS },
+    ])
+    // ...and so does a different expression, or a new rule.
+    const changed = structuredClone(stored)
+    changed.combinator = 'any'
+    expect(validateRule({ ...draft, expression: changed }, stored)).toEqual([
+      { target: stored.id, message: NO_CONDITIONS },
+    ])
+    expect(validateRule(draft)).toEqual([
+      { target: stored.id, message: NO_CONDITIONS },
+    ])
+  })
+
+  test('an update leaves out an unchanged expression and sends a changed one', () => {
+    const stored = draftWith([]).expression
+    const draft = { ...draftWith([]), expression: structuredClone(stored) }
+    const unchanged = updatePatch(draft, stored)
+    expect('expression' in unchanged).toBe(false)
+    expect(unchanged.name).toBe(draft.name)
+    expect(unchanged.action).toEqual(draft.action)
+
+    const edited = {
+      ...draft,
+      expression: draftWith([{ field: 'path', op: 'starts_with', value: '/' }])
+        .expression,
+    }
+    expect(updatePatch(edited, stored).expression).toEqual(edited.expression)
+    // Without a stored expression (a new rule) the whole draft is sent.
+    expect(updatePatch(draft, undefined)).toEqual(draft)
   })
 
   test('accepts an explicit condition on every path', () => {

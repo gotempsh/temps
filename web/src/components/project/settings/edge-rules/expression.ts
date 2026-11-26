@@ -328,7 +328,31 @@ function validateAction(action: RuleAction): string[] {
 export const NO_CONDITIONS =
   'Add a condition. A rule without conditions would match every request; to apply it to every request on purpose, add the condition "path starts with /".'
 
-export function validateRule(draft: EdgeRuleDraft): RuleIssue[] {
+/** Whether two expressions are the same conditions, ids included. */
+export function sameExpression(a: ConditionGroup, b: ConditionGroup): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** The draft to send for an existing rule, without an unchanged expression. */
+export function updatePatch(
+  draft: EdgeRuleDraft,
+  stored: ConditionGroup | undefined
+): Partial<EdgeRuleDraft> {
+  if (!stored || !sameExpression(draft.expression, stored)) return draft
+  const { expression: _unchanged, ...rest } = draft
+  return rest
+}
+
+/**
+ * `stored` is the expression the rule was loaded with, when editing one. As
+ * on the server, a rule saved before rules without conditions were refused
+ * may keep its empty expression while it stays disabled, so it can still be
+ * renamed; enabling it, or changing the expression, needs a condition.
+ */
+export function validateRule(
+  draft: EdgeRuleDraft,
+  stored?: ConditionGroup
+): RuleIssue[] {
   const issues: RuleIssue[] = []
   const name = draft.name.trim()
   if (!name) issues.push({ target: 'name', message: 'Give the rule a name.' })
@@ -338,7 +362,11 @@ export function validateRule(draft: EdgeRuleDraft): RuleIssue[] {
       message: `Names are limited to ${LIMITS.nameLength} characters.`,
     })
 
-  if (draft.expression.children.length === 0)
+  const keepsStoredEmpty =
+    !draft.enabled &&
+    stored !== undefined &&
+    sameExpression(draft.expression, stored)
+  if (draft.expression.children.length === 0 && !keepsStoredEmpty)
     issues.push({ target: draft.expression.id, message: NO_CONDITIONS })
 
   let conditions = 0

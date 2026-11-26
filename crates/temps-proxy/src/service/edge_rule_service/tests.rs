@@ -570,6 +570,45 @@ async fn a_stored_rule_without_conditions_can_still_be_turned_off() {
     assert_eq!(renamed.name, "Old catch-all");
     assert!(!renamed.enabled);
 
+    // An editor that saves the whole rule sends its stored expression back:
+    // that is not a new expression, so the disabled rule can still be renamed.
+    let (_, resent) = service
+        .update(
+            project_id,
+            rule_id,
+            UpdateEdgeRuleRequest {
+                name: Some("Old catch-all, kept".into()),
+                expression: Some(renamed.expression.clone()),
+                action: Some(renamed.action.clone()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("resending the stored expression is no change: {e}"));
+    assert_eq!(resent.name, "Old catch-all, kept");
+    assert_eq!(resent.expression, renamed.expression);
+
+    // A different expression without conditions is a new one, and refused.
+    let mut other = renamed.expression.clone();
+    other.combinator = match other.combinator {
+        temps_edge_rules::Combinator::All => temps_edge_rules::Combinator::Any,
+        _ => temps_edge_rules::Combinator::All,
+    };
+    let error = service
+        .update(
+            project_id,
+            rule_id,
+            UpdateEdgeRuleRequest {
+                expression: Some(other),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect_err("a new expression without conditions must be refused");
+    assert!(is_no_conditions(&error), "{error}");
+
     // Turning it back on needs a condition.
     let error = service
         .update(

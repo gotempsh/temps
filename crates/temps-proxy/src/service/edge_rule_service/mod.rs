@@ -752,7 +752,12 @@ impl EdgeRuleService {
         let stats = Self::stats(&txn, project_id).await?;
         let before = Self::to_response(&current, stats.get(&rule_id))?;
 
-        let expression_changed = request.expression.is_some();
+        // An editor that saves the whole rule resends its expression; one
+        // equal to the stored expression is not a change.
+        let expression_changed = request
+            .expression
+            .as_ref()
+            .is_some_and(|expression| expression != &before.expression);
         let expression = request
             .expression
             .unwrap_or_else(|| before.expression.clone());
