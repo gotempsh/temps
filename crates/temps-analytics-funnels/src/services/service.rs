@@ -403,9 +403,11 @@ impl FunnelService {
         let txn = self.db.begin().await?;
         let db = &txn;
 
-        // Find the funnel and verify it belongs to the project
+        // Find the funnel, live and in the project: a deleted (inactive)
+        // funnel is gone for every endpoint, so it is never written again.
         let funnel = funnels::Entity::find_by_id(funnel_id)
             .filter(funnels::Column::ProjectId.eq(project_id))
+            .filter(funnels::Column::IsActive.eq(true))
             .one(db)
             .await?
             .ok_or(FunnelError::NotFound {
@@ -450,9 +452,11 @@ impl FunnelService {
     pub async fn delete_funnel(&self, project_id: i32, funnel_id: i32) -> Result<(), FunnelError> {
         let db = self.db.as_ref();
 
-        // Find the funnel and verify it belongs to the project
+        // Find the funnel, live and in the project: a deleted (inactive)
+        // funnel is gone for every endpoint, so it is never written again.
         let funnel = funnels::Entity::find_by_id(funnel_id)
             .filter(funnels::Column::ProjectId.eq(project_id))
+            .filter(funnels::Column::IsActive.eq(true))
             .one(db)
             .await?
             .ok_or(FunnelError::NotFound {
@@ -1162,6 +1166,91 @@ mod tests {
         let deployment_id = deployment_result.last_insert_id;
 
         (project_id, environment_id, deployment_id)
+    }
+
+    /// A deleted funnel is soft-deleted (inactive). Updating or deleting it
+    /// again is a NotFound that writes nothing: an update used to rewrite
+    /// its name and steps and commit, and only the read after it said 404.
+    #[tokio::test]
+    async fn a_deleted_funnel_is_not_found_and_not_modified() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = test_db.db.clone();
+        let (project_id, _, _) = create_test_project(db.clone()).await;
+        let service = FunnelService::new(db.clone());
+        let funnel_id = service
+            .create_funnel(
+                project_id,
+                CreateFunnelRequest {
+                    name: "Signup".to_string(),
+                    description: None,
+                    steps: vec![CreateFunnelStep {
+                        event_name: "page_view".to_string(),
+                        event_filter: vec![],
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        service.delete_funnel(project_id, funnel_id).await.unwrap();
+        let deleted = funnels::Entity::find_by_id(funnel_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = service
+            .update_funnel(
+                project_id,
+                funnel_id,
+                CreateFunnelRequest {
+                    name: "Renamed".to_string(),
+                    description: Some("rewritten".to_string()),
+                    steps: vec![CreateFunnelStep {
+                        event_name: "checkout".to_string(),
+                        event_filter: vec![],
+                    }],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FunnelError::NotFound { project_id: p, funnel_id: f } if p == project_id && f == funnel_id),
+            "got {err:?}"
+        );
+        let again = service
+            .delete_funnel(project_id, funnel_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(again, FunnelError::NotFound { .. }),
+            "got {again:?}"
+        );
+
+        // Nothing about the deleted funnel changed.
+        let after = funnels::Entity::find_by_id(funnel_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, deleted);
+        let steps: Vec<String> = funnel_steps::Entity::find()
+            .filter(funnel_steps::Column::FunnelId.eq(funnel_id))
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|step| step.event_name)
+            .collect();
+        assert_eq!(steps, vec!["page_view".to_string()]);
     }
 
     #[tokio::test]
