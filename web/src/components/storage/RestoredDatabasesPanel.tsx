@@ -31,7 +31,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { problemDetail } from '@/lib/api-problem'
+import { serviceRestoreRunsQuery } from '@/pages/service-restore/restore-queries'
 import {
+  awaitingRestoredInventory,
   candidateDatabases,
   databaseRole,
   defaultChoice,
@@ -39,6 +41,7 @@ import {
   missingProjects,
   needsConfirmation,
   restoredSummary,
+  RESTORED_INVENTORY_POLL_MS,
   type MissingProject,
 } from '@/lib/restored-databases'
 import { cn } from '@/lib/utils'
@@ -237,9 +240,42 @@ export function RestoredDatabasesView({
   )
 }
 
+/** The report could not be read, and none was read before. */
+export function RestoredDatabasesError({
+  detail,
+  retrying,
+  onRetry,
+}: {
+  detail: string
+  retrying: boolean
+  onRetry: () => void
+}) {
+  return (
+    <Callout
+      tone="error"
+      title="Could not load what the last restore brought back"
+    >
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-sm [overflow-wrap:anywhere]">{detail}</p>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={retrying}
+          onClick={onRetry}
+        >
+          {retrying && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+          Retry
+        </Button>
+      </div>
+    </Callout>
+  )
+}
+
 /**
  * The service page's view of its latest PostgreSQL restore. Renders nothing
- * for other engines or when no restore recorded what it brought back.
+ * for other engines, while loading, or once the server says no restore
+ * recorded what it brought back. Key it by service, so a confirmation never
+ * outlives the service it was opened for.
  */
 export function RestoredDatabasesPanel({
   serviceId,
@@ -255,9 +291,20 @@ export function RestoredDatabasesPanel({
     database: string
   } | null>(null)
   const options = { path: { id: serviceId } }
-  const { data } = useQuery({
+  const isPostgres = serviceType === 'postgres'
+  // Shared with the restore banner, which follows a running restore.
+  const runs = useQuery({
+    ...serviceRestoreRunsQuery(serviceId),
+    enabled: isPostgres,
+  })
+  const reportQuery = useQuery({
     ...getRestoredDatabasesOptions(options),
-    enabled: serviceType === 'postgres',
+    enabled: isPostgres,
+    // A restore that just finished records its databases a moment later.
+    refetchInterval: (query) =>
+      awaitingRestoredInventory(runs.data, query.state.data?.report, Date.now())
+        ? RESTORED_INVENTORY_POLL_MS
+        : false,
   })
   const update = useMutation({
     ...updateLinkDatabaseMutation(),
@@ -285,8 +332,20 @@ export function RestoredDatabasesPanel({
     },
   })
 
-  const report = data?.report
-  if (!report) return null
+  const report = reportQuery.data?.report
+  if (!report) {
+    if (!isPostgres || !reportQuery.isError) return null
+    return (
+      <RestoredDatabasesError
+        detail={problemDetail(
+          reportQuery.error,
+          'The restored databases could not be listed'
+        )}
+        retrying={reportQuery.isFetching}
+        onRetry={() => void reportQuery.refetch()}
+      />
+    )
+  }
 
   const apply = (project: MissingProject, database: string) => {
     update.mutate({

@@ -5,6 +5,7 @@ import type {
   MissingLinkedDatabase,
   RestoredDatabase,
   RestoredDatabasesReport,
+  RestoreRunView,
 } from '@/api/client/types.gen'
 
 /** One linked project whose database the backup does not have. */
@@ -127,4 +128,37 @@ export function restoredSummary(report: RestoredDatabasesReport): string {
     'user',
     'users'
   )}${more}`
+}
+
+/** How long after a restore finishes the page waits for what it recorded. */
+export const RESTORED_INVENTORY_WAIT_MS = 2 * 60 * 1000
+
+/** How often the page asks for the report while it waits. */
+export const RESTORED_INVENTORY_POLL_MS = 3000
+
+/**
+ * The service's list of restore runs holds a run that restored into it in
+ * place and finished moments ago, while the report still describes an older
+ * restore (or none): the run is completed before Temps records what it
+ * brought back, so ask again until the report catches up or the wait ends.
+ */
+export function awaitingRestoredInventory(
+  runs: readonly RestoreRunView[] | undefined,
+  report: RestoredDatabasesReport | null | undefined,
+  now: number
+): boolean {
+  let latest: { id: number; finishedAt: number } | null = null
+  for (const run of runs ?? []) {
+    if (run.status !== 'completed' || !run.finished_at) continue
+    // A run into a new service restored somewhere else.
+    if (run.target_service_id != null || run.target_service_name) continue
+    const finishedAt = Date.parse(run.finished_at)
+    if (Number.isNaN(finishedAt)) continue
+    if (!latest || finishedAt > latest.finishedAt) {
+      latest = { id: run.id, finishedAt }
+    }
+  }
+  if (!latest) return false
+  if (report && report.restore_run_id >= latest.id) return false
+  return now - latest.finishedAt < RESTORED_INVENTORY_WAIT_MS
 }

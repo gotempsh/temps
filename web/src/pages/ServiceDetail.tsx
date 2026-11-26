@@ -10,6 +10,7 @@ import {
   deleteServiceMutation,
   getClusterHealthQueryKey,
   getProjectsOptions,
+  getRestoredDatabasesQueryKey,
   getServiceOptions,
   getServiceQueryKey,
   getServicePreviewEnvironmentVariablesMaskedOptions,
@@ -421,6 +422,11 @@ export function ServiceDetail() {
     onSuccess: (_data, variables) => {
       toast.success('Service linked successfully')
       refetchLinkedProjects()
+      void queryClient.invalidateQueries({
+        queryKey: getRestoredDatabasesQueryKey({
+          path: { id: variables.path.id },
+        }),
+      })
       setIsLinkPopoverOpen(false)
       const project = allProjectsData?.projects?.find(
         (candidate) => candidate.id === variables.body.project_id
@@ -1059,6 +1065,7 @@ export function ServiceDetail() {
 
             {/* What the last restore brought back, and links missing its data. */}
             <RestoredDatabasesPanel
+              key={service.service.id}
               serviceId={service.service.id}
               serviceType={service.service.service_type}
             />

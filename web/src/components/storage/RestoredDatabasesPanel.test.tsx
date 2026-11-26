@@ -5,7 +5,10 @@ import { describe, expect, it } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import { report } from '@/lib/restored-databases.fixture'
-import { RestoredDatabasesView } from './RestoredDatabasesPanel'
+import {
+  RestoredDatabasesError,
+  RestoredDatabasesView,
+} from './RestoredDatabasesPanel'
 
 const render = (props: Partial<Parameters<typeof RestoredDatabasesView>[0]>) =>
   renderToStaticMarkup(
@@ -48,5 +51,27 @@ describe('RestoredDatabasesView', () => {
     expect(html).toMatch(
       /<button[^>]*disabled[^>]*title="Point Shop at shop_prod"/
     )
+  })
+})
+
+describe('RestoredDatabasesError', () => {
+  it('says the report failed, with why and a Retry', () => {
+    const html = renderToStaticMarkup(
+      <RestoredDatabasesError
+        detail="Service 5 is unreachable"
+        retrying={false}
+        onRetry={() => {}}
+      />
+    )
+    expect(html).toContain('Could not load what the last restore brought back')
+    expect(html).toContain('Service 5 is unreachable')
+    expect(html).toMatch(/<button[^>]*>Retry<\/button>/)
+  })
+
+  it('locks Retry while the report is being read again', () => {
+    const html = renderToStaticMarkup(
+      <RestoredDatabasesError detail="down" retrying onRetry={() => {}} />
+    )
+    expect(html).toMatch(/<button[^>]*disabled[^>]*>.*Retry<\/button>/)
   })
 })
