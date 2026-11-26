@@ -12,6 +12,8 @@ use temps_core::UtcDateTime;
 use temps_entities::{funnel_steps, funnels};
 use tokio::sync::RwLock;
 
+use super::error::FunnelError;
+
 // ============================================================================
 // Caching Infrastructure
 // ============================================================================
@@ -396,7 +398,7 @@ impl FunnelService {
         project_id: i32,
         funnel_id: i32,
         request: CreateFunnelRequest,
-    ) -> Result<(), DbErr> {
+    ) -> Result<(), FunnelError> {
         // The funnel row and its steps change together or not at all.
         let txn = self.db.begin().await?;
         let db = &txn;
@@ -406,10 +408,9 @@ impl FunnelService {
             .filter(funnels::Column::ProjectId.eq(project_id))
             .one(db)
             .await?
-            .ok_or_else(|| {
-                DbErr::RecordNotFound(format!(
-                    "funnel {funnel_id} not found in project {project_id}"
-                ))
+            .ok_or(FunnelError::NotFound {
+                project_id,
+                funnel_id,
             })?;
 
         // Update funnel
@@ -446,7 +447,7 @@ impl FunnelService {
     }
 
     /// Delete a funnel (soft delete)
-    pub async fn delete_funnel(&self, project_id: i32, funnel_id: i32) -> Result<(), DbErr> {
+    pub async fn delete_funnel(&self, project_id: i32, funnel_id: i32) -> Result<(), FunnelError> {
         let db = self.db.as_ref();
 
         // Find the funnel and verify it belongs to the project
@@ -454,10 +455,9 @@ impl FunnelService {
             .filter(funnels::Column::ProjectId.eq(project_id))
             .one(db)
             .await?
-            .ok_or_else(|| {
-                DbErr::RecordNotFound(format!(
-                    "funnel {funnel_id} not found in project {project_id}"
-                ))
+            .ok_or(FunnelError::NotFound {
+                project_id,
+                funnel_id,
             })?;
 
         // Soft delete by setting is_active to false
@@ -477,7 +477,7 @@ impl FunnelService {
         &self,
         project_id: i32,
         request: CreateFunnelRequest,
-    ) -> Result<i32, DbErr> {
+    ) -> Result<i32, FunnelError> {
         // The funnel row and its steps are created together or not at all.
         let txn = self.db.begin().await?;
         let db = &txn;

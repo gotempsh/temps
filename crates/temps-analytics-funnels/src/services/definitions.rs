@@ -6,11 +6,12 @@
 
 use std::collections::HashMap;
 
-use sea_orm::{ColumnTrait, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 use serde_json::Value;
 use temps_core::PageQuery;
 use temps_entities::{funnel_steps, funnels};
 
+use super::error::FunnelError;
 use super::service::{FunnelService, SmartFilter};
 
 /// A funnel and its steps, in step order.
@@ -83,25 +84,22 @@ impl SmartFilter {
     }
 }
 
-fn funnel_not_found(project_id: i32, funnel_id: i32) -> DbErr {
-    DbErr::RecordNotFound(format!(
-        "funnel {funnel_id} not found in project {project_id}"
-    ))
-}
-
 impl FunnelService {
     /// One active funnel of `project_id`, with its steps.
     pub async fn get_funnel(
         &self,
         project_id: i32,
         funnel_id: i32,
-    ) -> Result<FunnelDefinition, DbErr> {
+    ) -> Result<FunnelDefinition, FunnelError> {
         let funnel = funnels::Entity::find_by_id(funnel_id)
             .filter(funnels::Column::ProjectId.eq(project_id))
             .filter(funnels::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| funnel_not_found(project_id, funnel_id))?;
+            .ok_or(FunnelError::NotFound {
+                project_id,
+                funnel_id,
+            })?;
         let steps = funnel_steps::Entity::find()
             .filter(funnel_steps::Column::FunnelId.eq(funnel_id))
             .order_by_asc(funnel_steps::Column::StepOrder)
@@ -116,7 +114,7 @@ impl FunnelService {
         &self,
         project_id: i32,
         page: PageQuery,
-    ) -> Result<(Vec<FunnelDefinition>, u64), DbErr> {
+    ) -> Result<(Vec<FunnelDefinition>, u64), FunnelError> {
         let (_, page_size) = page.normalize();
         let paginator = funnels::Entity::find()
             .filter(funnels::Column::ProjectId.eq(project_id))
@@ -230,10 +228,36 @@ mod tests {
         );
 
         let missing = service.get_funnel(1, 8).await.unwrap_err();
-        assert_eq!(
-            missing,
-            DbErr::RecordNotFound("funnel 8 not found in project 1".to_string())
+        assert!(
+            matches!(
+                missing,
+                FunnelError::NotFound {
+                    project_id: 1,
+                    funnel_id: 8
+                }
+            ),
+            "got {missing:?}"
         );
+        assert_eq!(missing.to_string(), "Funnel 8 not found in project 1");
+    }
+
+    /// A failing query is a database error, never reported as "not found".
+    #[tokio::test]
+    async fn a_failing_read_is_a_database_error() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())])
+            .append_query_errors([sea_orm::DbErr::Custom("connection lost".to_string())])
+            .into_connection();
+        let service = FunnelService::new(Arc::new(db));
+
+        let read = service.get_funnel(1, 7).await.unwrap_err();
+        assert!(matches!(read, FunnelError::Database(_)), "got {read:?}");
+        let list = service
+            .list_funnel_page(1, PageQuery::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(list, FunnelError::Database(_)), "got {list:?}");
+        assert!(list.to_string().contains("connection lost"), "{list}");
     }
 
     #[tokio::test]

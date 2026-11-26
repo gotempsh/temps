@@ -18,21 +18,26 @@ use super::types::{
 };
 use crate::services::{
     CreateFunnelRequest as ServiceCreateFunnelRequest, CreateFunnelStep as ServiceCreateFunnelStep,
-    FunnelFilter,
+    FunnelError, FunnelFilter,
 };
-use temps_core::problemdetails::Problem;
+use temps_core::problemdetails::{self, Problem};
 
-/// The Problem for a failed funnel operation: 404 when the funnel isn't there,
-/// so a client can tell "doesn't exist" from "Temps is broken".
-fn funnel_problem(error: sea_orm::DbErr, title: &str, detail: &str) -> Problem {
-    let (status, title) = match error {
-        sea_orm::DbErr::RecordNotFound(_) => (StatusCode::NOT_FOUND, "Funnel not found"),
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, title),
-    };
-    temps_core::error_builder::ErrorBuilder::new(status)
-        .title(title)
-        .detail(format!("{detail}: {error}"))
-        .build()
+/// 404 when the funnel isn't there, so a client can tell "doesn't exist"
+/// from "Temps is broken" (500).
+impl From<FunnelError> for Problem {
+    fn from(error: FunnelError) -> Self {
+        match error {
+            FunnelError::NotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Funnel Not Found")
+                .with_detail(error.to_string()),
+            FunnelError::Database(ref source) => {
+                tracing::error!(error = %source, "funnels: database failure");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Funnel Operation Failed")
+                    .with_detail(error.to_string())
+            }
+        }
+    }
 }
 
 /// Map an HTTP funnel definition to the service request.
@@ -85,18 +90,12 @@ pub async fn create_funnel(
         .funnel_service
         .create_funnel(project_id, service_request(request))
         .await
-        .map_err(|e| funnel_problem(e, "Failed to create funnel", "Error creating funnel"))?;
+        .map_err(Problem::from)?;
     let funnel = state
         .funnel_service
         .get_funnel(project_id, funnel_id)
         .await
-        .map_err(|e| {
-            funnel_problem(
-                e,
-                "Failed to read the created funnel",
-                "Error reading funnel",
-            )
-        })?;
+        .map_err(Problem::from)?;
     Ok((StatusCode::CREATED, Json(FunnelResponse::from(funnel))))
 }
 
@@ -132,7 +131,7 @@ pub async fn get_funnel(
         .funnel_service
         .get_funnel(project_id, funnel_id)
         .await
-        .map_err(|e| funnel_problem(e, "Failed to get funnel", "Error retrieving funnel"))?;
+        .map_err(Problem::from)?;
     Ok(Json(FunnelResponse::from(funnel)))
 }
 
@@ -207,11 +206,14 @@ pub async fn get_funnel_metrics(
             };
             Ok(Json(response))
         }
-        Err(e) => Err(funnel_problem(
-            e,
-            "Failed to get funnel metrics",
-            "Error retrieving funnel metrics",
-        )),
+        // The metrics query reports a funnel it cannot find as
+        // `RecordNotFound`; this handler knows which one it asked for.
+        Err(sea_orm::DbErr::RecordNotFound(_)) => Err(FunnelError::NotFound {
+            project_id,
+            funnel_id,
+        }
+        .into()),
+        Err(e) => Err(FunnelError::Database(e).into()),
     }
 }
 
@@ -247,7 +249,7 @@ pub async fn list_funnels(
         .funnel_service
         .list_funnel_page(project_id, page)
         .await
-        .map_err(|e| funnel_problem(e, "Failed to retrieve funnels", "Error retrieving funnels"))?;
+        .map_err(Problem::from)?;
     Ok(Json(FunnelList::new(
         funnels.into_iter().map(FunnelResponse::from).collect(),
         total,
@@ -292,18 +294,12 @@ pub async fn update_funnel(
         .funnel_service
         .update_funnel(project_id, funnel_id, service_request(request))
         .await
-        .map_err(|e| funnel_problem(e, "Failed to update funnel", "Error updating funnel"))?;
+        .map_err(Problem::from)?;
     let funnel = state
         .funnel_service
         .get_funnel(project_id, funnel_id)
         .await
-        .map_err(|e| {
-            funnel_problem(
-                e,
-                "Failed to read the updated funnel",
-                "Error reading funnel",
-            )
-        })?;
+        .map_err(Problem::from)?;
     Ok(Json(FunnelResponse::from(funnel)))
 }
 
@@ -343,11 +339,7 @@ pub async fn delete_funnel(
         Ok(_) => Ok(Json(FunnelMessageResponse {
             message: "Funnel deleted successfully".to_string(),
         })),
-        Err(e) => Err(funnel_problem(
-            e,
-            "Failed to delete funnel",
-            "Error deleting funnel",
-        )),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -677,20 +669,20 @@ mod funnel_handler_tests {
     }
 
     #[test]
-    fn a_missing_funnel_is_a_404_and_anything_else_a_500() {
-        let missing = funnel_problem(
-            sea_orm::DbErr::RecordNotFound("funnel 9 not found in project 1".to_string()),
-            "Failed to delete funnel",
-            "Error deleting funnel",
-        );
+    fn a_missing_funnel_is_a_404_naming_the_ids_and_a_database_failure_a_500() {
+        let missing = Problem::from(FunnelError::NotFound {
+            project_id: 1,
+            funnel_id: 9,
+        });
         assert_eq!(missing.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(missing.body["title"], "Funnel Not Found");
+        assert_eq!(missing.body["detail"], "Funnel 9 not found in project 1");
 
-        let broken = funnel_problem(
-            sea_orm::DbErr::Custom("connection lost".to_string()),
-            "Failed to delete funnel",
-            "Error deleting funnel",
-        );
+        let broken = Problem::from(FunnelError::Database(sea_orm::DbErr::Custom(
+            "connection lost".to_string(),
+        )));
         assert_eq!(broken.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(broken.body["title"], "Funnel Operation Failed");
     }
 
     #[tokio::test]
@@ -754,13 +746,8 @@ mod funnel_handler_tests {
             .expect("the router answers");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body = body_json(response).await;
-        assert_eq!(body["title"], "Funnel not found");
-        assert!(
-            body["detail"]
-                .as_str()
-                .is_some_and(|d| d.contains("funnel 99 not found in project 1")),
-            "{body}"
-        );
+        assert_eq!(body["title"], "Funnel Not Found");
+        assert_eq!(body["detail"], "Funnel 99 not found in project 1", "{body}");
     }
 
     #[tokio::test]
