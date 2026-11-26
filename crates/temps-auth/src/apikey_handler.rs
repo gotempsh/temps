@@ -283,7 +283,7 @@ pub async fn get_api_key(
     request_body = UpdateApiKeyRequest,
     responses(
         (status = 200, description = "API key updated successfully", body = ApiKeyResponse),
-        (status = 400, description = "Bad request: a blank name, an expiry in the past or removed, or permissions that differ from the key's (they cannot change after creation)"),
+        (status = 400, description = "Bad request: a blank name, a new expiry in the past (the key's current expiry may be sent back unchanged), a removed expiry, or permissions that differ from the key's (they cannot change after creation)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
@@ -321,6 +321,19 @@ pub async fn update_api_key(
         .await
         .map_err(|e| e.to_problem())?;
 
+    audit_api_key_update(&state, &auth, &metadata, &api_key, changed_fields).await;
+    Ok(Json(api_key))
+}
+
+/// Records a successful change to a key (never its secret). A failed audit
+/// write is logged and the change still succeeds.
+async fn audit_api_key_update(
+    state: &ApiKeyState,
+    auth: &temps_authz::AuthContext,
+    metadata: &RequestMetadata,
+    api_key: &crate::apikey_service::ApiKeyResponse,
+    changed_fields: Vec<&'static str>,
+) {
     let audit = ApiKeyUpdatedAudit {
         context: AuditContext {
             user_id: auth.user_id(),
@@ -339,8 +352,6 @@ pub async fn update_api_key(
             api_key.id, e
         );
     }
-
-    Ok(Json(api_key))
 }
 
 #[utoipa::path(
@@ -416,18 +427,18 @@ pub async fn delete_api_key(
 pub async fn deactivate_api_key(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<ApiKeyState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(api_key_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
 
-    match state
+    let api_key = state
         .api_key_service
         .deactivate_api_key(auth.user_id(), api_key_id)
         .await
-    {
-        Ok(api_key) => Ok(Json(api_key)),
-        Err(e) => Err(e.to_problem()),
-    }
+        .map_err(|e| e.to_problem())?;
+    audit_api_key_update(&state, &auth, &metadata, &api_key, vec!["is_active"]).await;
+    Ok(Json(api_key))
 }
 
 #[utoipa::path(
@@ -451,18 +462,18 @@ pub async fn deactivate_api_key(
 pub async fn activate_api_key(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<ApiKeyState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(api_key_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
 
-    match state
+    let api_key = state
         .api_key_service
         .activate_api_key(auth.user_id(), api_key_id)
         .await
-    {
-        Ok(api_key) => Ok(Json(api_key)),
-        Err(e) => Err(e.to_problem()),
-    }
+        .map_err(|e| e.to_problem())?;
+    audit_api_key_update(&state, &auth, &metadata, &api_key, vec!["is_active"]).await;
+    Ok(Json(api_key))
 }
 
 #[utoipa::path(
@@ -1149,6 +1160,42 @@ mod tests {
         assert_eq!(payload["changed_fields"], serde_json::json!(["is_active"]));
         assert_eq!(payload["is_active"], false);
         assert!(!entries[0].1.contains("stored-hash"));
+    }
+
+    #[tokio::test]
+    async fn activating_or_deactivating_a_key_is_audit_logged_without_its_secret() {
+        for active in [false, true] {
+            let stored = harness_key_model(false);
+            let mut updated = stored.clone();
+            updated.is_active = active;
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored]])
+                .append_query_results([vec![updated]])
+                .into_connection();
+            let (state, audit) = state_over(db);
+
+            let auth = RequireAuth(user_auth(Role::Admin));
+            let result = if active {
+                activate_api_key(auth, State(state), Extension(request_metadata()), Path(12))
+                    .await
+                    .map(IntoResponse::into_response)
+            } else {
+                deactivate_api_key(auth, State(state), Extension(request_metadata()), Path(12))
+                    .await
+                    .map(IntoResponse::into_response)
+            };
+            let response = result.unwrap_or_else(|_| panic!("the change succeeds"));
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let entries = audit.entries.lock().unwrap();
+            assert_eq!(entries.len(), 1, "{entries:?}");
+            assert_eq!(entries[0].0, "API_KEY_UPDATED");
+            let payload: serde_json::Value = serde_json::from_str(&entries[0].1).unwrap();
+            assert_eq!(payload["api_key_id"], 12);
+            assert_eq!(payload["changed_fields"], serde_json::json!(["is_active"]));
+            assert_eq!(payload["is_active"], active);
+            assert!(!entries[0].1.contains("stored-hash"));
+        }
     }
 
     #[tokio::test]

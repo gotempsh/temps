@@ -15,7 +15,7 @@ pub struct ApiKeyResponse {
     pub role_type: String,
     pub permissions: Option<Vec<String>>,
     pub is_active: bool,
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub last_used_at: Option<UtcDateTime>,
@@ -54,7 +54,7 @@ pub struct CreateApiKeyResponse {
     pub role_type: String,
     pub permissions: Option<Vec<String>>,
     pub api_key: String, // Only returned on creation
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub created_at: UtcDateTime,
@@ -79,14 +79,15 @@ pub struct CreateApiKeyRequest {
     /// `api_reader`) or `custom` for an explicit permission list.
     #[schema(example = "admin")]
     pub role_type: String,
-    /// The key's permissions, required with `role_type: custom` and refused
-    /// with any other role, which carries its own. Fixed once the key is
+    /// The key's permissions, required with `role_type: custom`. Any other
+    /// role carries its own: a non-empty list with it is refused, while an
+    /// empty list or none gives the role's permissions. Fixed once the key is
     /// created.
     #[schema(example = json!(["projects:read", "deployments:read"]))]
     pub permissions: Option<Vec<String>>,
     /// When the key stops working. Must be in the future. Defaults to one
     /// year after creation when left out: API keys always expire.
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     /// Immutable optional deployment resource scope.
     pub project_id: Option<i32>,
@@ -104,15 +105,17 @@ pub struct UpdateApiKeyRequest {
     /// To change them, create a new key and delete this one.
     #[schema(example = json!(["projects:read", "deployments:read"]))]
     pub permissions: Option<Vec<String>>,
-    /// A new expiry, which must be in the future. API keys always expire, so
-    /// `null` is refused for a key that has an expiry. Leave it out to keep
-    /// the current one.
+    /// A new expiry, which must be in the future. Leave it out, or send the
+    /// key's current expiry back unchanged (even one that has passed), to
+    /// keep it: an expired key can be renamed or deactivated without
+    /// extending it. API keys always expire, so `null` is refused for a key
+    /// that has an expiry.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "crate::apikey_service::explicit_null"
     )]
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<Option<UtcDateTime>>,
 }
 

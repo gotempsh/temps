@@ -33,7 +33,7 @@ pub struct ApiKeyResponse {
     pub role_type: String,
     pub permissions: Option<Vec<String>>,
     pub is_active: bool,
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub last_used_at: Option<UtcDateTime>,
@@ -72,7 +72,7 @@ pub struct CreateApiKeyResponse {
     pub role_type: String,
     pub permissions: Option<Vec<String>>,
     pub api_key: String, // Only returned on creation
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub created_at: UtcDateTime,
@@ -95,7 +95,7 @@ pub struct CreateApiKeyRequest {
     pub role_type: String,
     #[schema(example = json!(["projects:read", "deployments:read"]))]
     pub permissions: Option<Vec<String>>,
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     /// Immutable optional deployment resource scope.
     pub project_id: Option<i32>,
@@ -116,7 +116,7 @@ pub struct UpdateApiKeyRequest {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "explicit_null"
     )]
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<Option<UtcDateTime>>,
 }
 
@@ -604,6 +604,7 @@ impl ApiKeyService {
             }
         }
 
+        let stored_expiry = api_key.expires_at;
         let mut api_key_active: ApiKeyActiveModel = api_key.into();
 
         if let Some(name) = name {
@@ -612,8 +613,12 @@ impl ApiKeyService {
         if let Some(is_active) = request.is_active {
             api_key_active.is_active = Set(is_active);
         }
+        // Only a new expiry is written: resending the stored one must not
+        // overwrite an expiry another request changed in the meantime.
         if let Some(Some(expires_at)) = request.expires_at {
-            api_key_active.expires_at = Set(Some(expires_at));
+            if stored_expiry != Some(expires_at) {
+                api_key_active.expires_at = Set(Some(expires_at));
+            }
         }
         api_key_active.updated_at = Set(Utc::now());
 

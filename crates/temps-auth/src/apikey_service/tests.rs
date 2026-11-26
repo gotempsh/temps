@@ -112,7 +112,7 @@ async fn api_key_scope_validation_precedes_database_and_retains_database_errors(
 #[tokio::test]
 async fn scoped_api_key_lifecycle_preserves_scope_and_permissions() {
     let (db, service, user) = setup_test_env().await;
-    db.db.execute_unprepared("INSERT INTO projects(id,name,slug,repo_name,repo_owner,directory,main_branch,preset,created_at,updated_at) VALUES(7001,'scope-fixture','scope-fixture','app','example','.','main','static',now(),now()); INSERT INTO environments(id,name,slug,subdomain,host,project_id,created_at,updated_at,upstreams) VALUES(9001,'preview','preview','scope-preview','scope.example',7001,now(),now(),'[]')").await.unwrap();
+    db.db.execute_unprepared("INSERT INTO projects(id,name,slug,repo_name,repo_owner,directory,main_branch,preset,created_at,updated_at) VALUES(7001,'scope-fixture','scope-fixture','app','example','.','main','static',now(),now()),(7003,'other-fixture','other-fixture','app','example','.','main','static',now(),now()); INSERT INTO environments(id,name,slug,subdomain,host,project_id,created_at,updated_at,upstreams) VALUES(9001,'preview','preview','scope-preview','scope.example',7001,now(),now(),'[]')").await.unwrap();
     let make_request = |name: &str, project_id, environment_id| CreateApiKeyRequest {
         name: name.into(),
         role_type: "custom".into(),
@@ -198,7 +198,9 @@ async fn scoped_api_key_lifecycle_preserves_scope_and_permissions() {
     for (name, project, env) in [
         ("no-project", None, Some(9001)),
         ("missing", Some(7002), None),
-        ("wrong-project", Some(7001), Some(9002)),
+        ("missing-environment", Some(7001), Some(9002)),
+        // Environment 9001 exists, in project 7001, not 7003.
+        ("wrong-project", Some(7003), Some(9001)),
         ("invalid", Some(0), None),
     ] {
         assert!(
@@ -295,7 +297,11 @@ async fn test_create_api_key_custom_without_permissions_fails() {
     let result = api_key_service.create_api_key(user.id, request).await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::ValidationError(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::ValidationError(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -314,7 +320,11 @@ async fn test_create_api_key_with_invalid_role() {
     let result = api_key_service.create_api_key(user.id, request).await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::ValidationError(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::ValidationError(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -349,7 +359,11 @@ async fn test_create_api_key_duplicate_name_fails() {
     let result = api_key_service.create_api_key(user.id, request2).await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::Conflict(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::Conflict(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -368,7 +382,11 @@ async fn test_create_api_key_with_invalid_permission() {
     let result = api_key_service.create_api_key(user.id, request).await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::ValidationError(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::ValidationError(_)),
+        "{error:?}"
+    );
 }
 
 // API Key Listing Tests
@@ -452,7 +470,11 @@ async fn test_get_api_key_not_found() {
     let result = api_key_service.get_api_key(user.id, 999999).await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::NotFound(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::NotFound(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -465,7 +487,11 @@ async fn test_get_api_key_wrong_user() {
     let result = api_key_service.get_api_key(user.id + 1, api_key.id).await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::NotFound(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::NotFound(_)),
+        "{error:?}"
+    );
 }
 
 // API Key Update Tests
@@ -556,7 +582,11 @@ async fn test_update_api_key_duplicate_name_fails() {
         .await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::Conflict(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::Conflict(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -575,7 +605,11 @@ async fn test_update_api_key_not_found() {
         .await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::NotFound(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::NotFound(_)),
+        "{error:?}"
+    );
 }
 
 // API Key Deletion Tests
@@ -603,7 +637,11 @@ async fn test_delete_api_key_not_found() {
     let result = api_key_service.delete_api_key(user.id, 999999).await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::NotFound(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::NotFound(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -617,7 +655,11 @@ async fn test_delete_api_key_wrong_user() {
         .await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::NotFound(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::NotFound(_)),
+        "{error:?}"
+    );
 }
 
 // API Key Rotation Tests
@@ -785,7 +827,11 @@ async fn test_validate_api_key_invalid() {
         .await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::Unauthorized(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::Unauthorized(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -820,7 +866,11 @@ async fn test_validate_api_key_expired() {
         .await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::Unauthorized(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::Unauthorized(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -852,7 +902,11 @@ async fn test_validate_api_key_inactive() {
         .await;
 
     assert!(result.is_err());
-    matches!(result.unwrap_err(), ApiKeyServiceError::Unauthorized(_));
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, ApiKeyServiceError::Unauthorized(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -1991,4 +2045,64 @@ async fn update_trims_the_name_and_refuses_a_blank_one() {
         .await
         .unwrap();
     assert_eq!(renamed.name, "trimmed");
+}
+
+/// The UPDATE a resent, unchanged expiry produces: it must leave the column
+/// alone, so it cannot overwrite an expiry changed by a concurrent request.
+#[tokio::test]
+async fn resending_the_stored_expiry_does_not_write_it() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    let now = Utc::now();
+    let stored = api_keys::Model {
+        id: 7,
+        name: "lapsed".to_string(),
+        key_hash: "hash".to_string(),
+        key_prefix: "tk_lapse".to_string(),
+        user_id: 3,
+        role_type: "reader".to_string(),
+        permissions: None,
+        is_active: true,
+        expires_at: Some(now - Duration::days(3)),
+        last_used_at: None,
+        created_at: now,
+        updated_at: now,
+        service_id: None,
+        project_id: None,
+        environment_id: None,
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stored.clone()]])
+            .append_query_results([vec![api_keys::Model {
+                is_active: false,
+                ..stored.clone()
+            }]])
+            .into_connection(),
+    );
+    let service = ApiKeyService::new(db.clone());
+    service
+        .update_api_key(
+            3,
+            7,
+            UpdateApiKeyRequest {
+                is_active: Some(false),
+                expires_at: Some(stored.expires_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    drop(service);
+
+    let log = Arc::try_unwrap(db)
+        .unwrap_or_else(|_| panic!("the service was dropped"))
+        .into_transaction_log();
+    let update = log
+        .iter()
+        .map(|t| format!("{t:?}"))
+        .find(|t| t.contains("UPDATE"))
+        .expect("the key is updated");
+    let set = update.split(" WHERE ").next().unwrap_or_default();
+    assert!(set.contains("is_active"), "{update}");
+    assert!(!set.contains("expires_at"), "{update}");
 }
