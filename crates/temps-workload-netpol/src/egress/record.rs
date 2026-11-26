@@ -423,6 +423,9 @@ struct CollapseKey {
     port: Option<u16>,
     method: Option<String>,
     path: Option<String>,
+    /// A failed model relay and a failed MCP relay name no host, port or
+    /// path: only this tells them apart.
+    relay: Option<RelayKind>,
 }
 
 impl CollapseKey {
@@ -437,6 +440,7 @@ impl CollapseKey {
             port: record.port,
             method: record.method.clone(),
             path: record.path.clone(),
+            relay: record.relay,
         })
     }
 }
@@ -460,9 +464,13 @@ impl PendingBatch {
             if let Some(&index) = self.collapsed.get(&key) {
                 if let Some(first) = self.records.get_mut(index) {
                     first.count = first.count.saturating_add(record.count.max(1));
+                    // Connections end, and are pushed, in any order: the
+                    // first start and the last are kept whichever ends last.
                     first.last_started_at_ms = first
                         .last_started_at_ms
+                        .max(first.started_at_ms)
                         .max(record.last_started_at_ms.max(record.started_at_ms));
+                    first.started_at_ms = first.started_at_ms.min(record.started_at_ms);
                     first.duration_ms = first.duration_ms.max(record.duration_ms);
                     first.recorded_at = first.recorded_at.max(record.recorded_at);
                     return true;
@@ -798,6 +806,55 @@ mod tests {
             EgressReason::NoAllowRule,
             70
         )));
+    }
+
+    /// Repeats pushed in reverse start order (the earlier connection ended
+    /// last) still span the first start to the last.
+    #[test]
+    fn a_collapsed_refusal_keeps_its_first_start_whatever_ends_first() {
+        let mut batch = PendingBatch::default();
+        assert!(!batch.push(refused(
+            1,
+            "blocked.example.com",
+            EgressReason::NoAllowRule,
+            1100
+        )));
+        assert!(batch.push(refused(
+            1,
+            "blocked.example.com",
+            EgressReason::NoAllowRule,
+            1000
+        )));
+        let records = batch.take();
+        assert_eq!(records[0].count, 2);
+        assert_eq!(records[0].started_at_ms, 1000);
+        assert_eq!(records[0].last_started_at_ms, 1100);
+    }
+
+    /// A failed model relay and a failed MCP relay name no host or path;
+    /// they stay two records, each with its relay.
+    #[test]
+    fn failed_relays_of_different_kinds_never_collapse() {
+        let relay = |kind| ConnectionRecord {
+            kind: ConnectionKind::Relay,
+            outcome: ConnectionOutcome::Failed,
+            reason: Some(EgressReason::UpstreamUnreachable),
+            host: None,
+            port: None,
+            relay: Some(kind),
+            ..refused(1, "unused", EgressReason::UpstreamUnreachable, 5)
+        };
+        let mut batch = PendingBatch::default();
+        assert!(!batch.push(relay(RelayKind::Model)));
+        assert!(!batch.push(relay(RelayKind::Mcp)));
+        assert!(batch.push(relay(RelayKind::Mcp)));
+        let records = batch.take();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].relay, Some(RelayKind::Model));
+        assert_eq!(
+            (records[1].relay, records[1].count),
+            (Some(RelayKind::Mcp), 2)
+        );
     }
 
     #[test]

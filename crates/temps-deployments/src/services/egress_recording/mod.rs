@@ -36,11 +36,13 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter,
     QuerySelect, RelationTrait, Set,
 };
+use temps_entities::environment_workload_isolation::{self, EnvironmentWorkloadIsolation};
+use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_entities::preset::Preset;
 use temps_entities::{deployment_containers, deployments, environments, projects};
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::LocalEgressRecorder;
-use temps_workload_egress::steering::{proxy_variables, url_hosts, ProxyVariables};
+use temps_workload_egress::steering::{proxy_variables, url_hosts, InstallationId, ProxyVariables};
 use temps_workload_egress::{
     EgressActivityPage, EgressOutcomeFilter, EgressRecordingError, EgressRecordingService,
     EgressRecordingStatus, RecordedWorkload, WorkloadEgressAdapter, CONTROL_PLANE_NODE_ID,
@@ -82,8 +84,8 @@ pub enum RecordedEgress {
     /// deployments: the replicas start unrecorded, and the log says so.
     NotServing,
     /// Local replicas start with the recorder at this address as their
-    /// HTTP(S) proxy.
-    Proxy(SocketAddr),
+    /// HTTP(S) proxy, labelled as steered by this installation.
+    Proxy(SocketAddr, InstallationId),
 }
 
 impl RecordedEgress {
@@ -93,15 +95,19 @@ impl RecordedEgress {
         if !environment.egress_recording {
             return Self::Off;
         }
-        match recorder.and_then(|recorder| recorder.address(WorkloadKind::Deployment)) {
-            Some(address) => Self::Proxy(address),
+        match recorder.and_then(|recorder| {
+            recorder
+                .address(WorkloadKind::Deployment)
+                .map(|address| (address, recorder.installation()))
+        }) {
+            Some((address, installation)) => Self::Proxy(address, installation),
             None => Self::NotServing,
         }
     }
 
     /// The variables to add to a local replica's, when it is steered.
     pub fn variables(self, existing: &HashMap<String, String>) -> Option<ProxyVariables> {
-        let Self::Proxy(address) = self else {
+        let Self::Proxy(address, _) = self else {
             return None;
         };
         let platform = url_hosts(
@@ -155,6 +161,33 @@ async fn recorded(
         ))?
         .into_iter()
         .collect();
+    // Only `enforce` honours an environment's isolation, and a replica in a
+    // microVM is never a container on the deployment network: the recorder
+    // cannot tell its connections apart, so it is never steered and could
+    // never record.
+    let enforced: Vec<i32> = rows
+        .iter()
+        .filter(|row| row.workload_mode == EnvironmentWorkloadMode::Enforce)
+        .map(|row| row.id)
+        .collect();
+    let isolated: HashMap<i32, EnvironmentWorkloadIsolation> = if enforced.is_empty() {
+        HashMap::new()
+    } else {
+        environment_workload_isolation::Entity::find()
+            .filter(environment_workload_isolation::Column::Id.is_in(enforced))
+            .filter(
+                environment_workload_isolation::Column::WorkloadIsolation
+                    .ne(EnvironmentWorkloadIsolation::Process),
+            )
+            .all(db)
+            .await
+            .map_err(EgressRecordingError::db(
+                "reading which environments run outside containers",
+            ))?
+            .into_iter()
+            .map(|row| (row.id, row.workload_isolation))
+            .collect()
+    };
     let mut nodes: HashMap<i32, Vec<i32>> = HashMap::new();
     for (environment_id, node_id) in placements {
         let node_id = node_id.unwrap_or(CONTROL_PLANE_NODE_ID);
@@ -175,12 +208,23 @@ async fn recorded(
                 nodes: placed,
                 enabled: row.egress_recording,
                 live: row.deleted_at.is_none(),
-                unrecordable: compose.contains(&row.project_id).then(|| {
-                    "a Docker Compose environment's containers are started by Compose, \
-                     which does not send them through the egress proxy; only image \
-                     deployments record"
-                        .to_string()
-                }),
+                unrecordable: if compose.contains(&row.project_id) {
+                    Some(
+                        "a Docker Compose environment's containers are started by Compose, \
+                         which does not send them through the egress proxy; only image \
+                         deployments record"
+                            .to_string(),
+                    )
+                } else {
+                    isolated.get(&row.id).map(|isolation| {
+                        format!(
+                            "the environment's replicas run with {} isolation (workload mode \
+                             enforce), which the egress proxy cannot tell apart from the host; \
+                             only container replicas record",
+                            isolation.as_str()
+                        )
+                    })
+                },
             }
         })
         .collect())

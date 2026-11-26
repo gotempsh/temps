@@ -233,6 +233,8 @@ pub struct LocalEgressRecorder {
     reported: Mutex<Option<bool>>,
     /// When the finished refreshes started.
     refreshed: Mutex<Refreshed>,
+    /// This installation, named in what it steers here.
+    installation: crate::steering::InstallationId,
     wake: Notify,
 }
 
@@ -248,6 +250,7 @@ impl LocalEgressRecorder {
         service: Arc<EgressRecordingService>,
         capability: Arc<dyn LocalCapability>,
         serving: Arc<LocalServing>,
+        installation: crate::steering::InstallationId,
     ) -> Arc<Self> {
         Arc::new(Self {
             service,
@@ -261,6 +264,7 @@ impl LocalEgressRecorder {
             reported: Mutex::new(None),
             refreshed: Mutex::new(Refreshed::default()),
             wake: Notify::new(),
+            installation,
         })
     }
 
@@ -350,6 +354,12 @@ impl LocalEgressRecorder {
     /// Where `kind` is served now, if it is.
     pub fn address(&self, kind: WorkloadKind) -> Option<SocketAddr> {
         self.serving.address(kind)
+    }
+
+    /// The installation this recorder belongs to, named in the label of
+    /// what it steers ([`crate::steering::steered_label`]).
+    pub fn installation(&self) -> crate::steering::InstallationId {
+        self.installation
     }
 
     /// Asks for a refresh soon, without waiting for it.
@@ -714,6 +724,19 @@ impl Confirmation {
                         }
                 })
                 .collect();
+            // A record ingest would refuse is discarded here, by itself:
+            // ingest refuses a whole batch for one, and a batch carries
+            // other workloads' records.
+            let confirmed: Vec<ConnectionRecord> = confirmed
+                .into_iter()
+                .filter(|record| match crate::records::validate(record) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        warn!(workload = %record.workload, %reason, "egress recording: discarded a record ingest would refuse");
+                        false
+                    }
+                })
+                .collect();
             let unconfirmed = (before - confirmed.len()) as u64;
             if unconfirmed > 0 && refreshed {
                 warn!(
@@ -899,7 +922,12 @@ mod tests {
         let (service, _) = f.service();
         let capability = Arc::new(Capability::default());
         (
-            LocalEgressRecorder::new(service, capability.clone(), LocalServing::new()),
+            LocalEgressRecorder::new(
+                service,
+                capability.clone(),
+                LocalServing::new(),
+                crate::steering::InstallationId::from_bytes([7; 8]),
+            ),
             capability,
         )
     }
@@ -1384,6 +1412,32 @@ mod tests {
             .unwrap();
         assert_eq!(delivered.discarded, 3);
         assert_eq!(delivered.deferred, MAX_AWAITING_CONFIRMATION as u64);
+    }
+
+    /// A record ingest would refuse (an empty destination) is discarded by
+    /// itself; the valid records delivered with it are stored.
+    #[tokio::test]
+    async fn an_invalid_record_is_discarded_without_its_batch() {
+        let Some(f) = fixture().await else { return };
+        let (recorder, _) = moving_recorder(&f, 1);
+        recorder.refresh().await;
+        let collect = Arc::new(Collect::default());
+        let (stage, stats) = confirmation(&recorder, &collect);
+        let mut empty_host = record_of(1);
+        empty_host.host = Some(String::new());
+        stage
+            .deliver(EgressRecordBatch {
+                records: vec![empty_host, record_of(1)],
+                dropped: 0,
+            })
+            .await
+            .unwrap();
+        assert!(stage.confirm_awaiting().await);
+        let batches = collect.0.lock().unwrap();
+        assert_eq!(batches[0].records.len(), 1);
+        assert_eq!(batches[0].dropped, 1);
+        let stats = stats.snapshot();
+        assert_eq!((stats.records_delivered, stats.records_discarded), (1, 1));
     }
 
     /// What ingest takes but does not store (the workload stopped recording

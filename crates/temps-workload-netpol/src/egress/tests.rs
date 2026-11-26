@@ -308,6 +308,63 @@ fn a_query_on_a_host_only_url_is_never_part_of_the_host() {
     }
 }
 
+/// A name of dots alone names no host once its trailing dots go: it is
+/// malformed, never a record with an empty destination that ingest refuses
+/// with the rest of its batch.
+#[test]
+fn a_host_of_dots_alone_is_malformed() {
+    for head in [
+        "CONNECT .:443 HTTP/1.1\r\n\r\n",
+        "CONNECT ...:443 HTTP/1.1\r\n\r\n",
+        "GET http://./ HTTP/1.1\r\n\r\n",
+    ] {
+        assert!(parse_request(head.as_bytes()).is_none(), "{head:?}");
+    }
+    let dotted = parse_request(b"CONNECT example.com.:443 HTTP/1.1\r\n\r\n").unwrap();
+    assert_eq!(
+        dotted.kind,
+        RequestKind::Connect {
+            host: "example.com".into(),
+            port: 443
+        }
+    );
+}
+
+/// What a sidecar refused under its own policy reaches the recorder marked
+/// as such: refused and recorded with the sidecar's reason, never opened,
+/// and the marker is never passed on.
+#[tokio::test]
+async fn a_request_its_sender_refused_is_recorded_as_refused_and_never_opened() {
+    let echo = echo_server().await;
+    let (_proxy, addr, mut records) =
+        start_recording(vec![echo_rule(echo.port())], true, 16, |_| {}).await;
+    let status = exchange(
+        addr,
+        &format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nX-Temps-Egress-Refused: private_address\r\n\r\n",
+            echo.port()
+        ),
+        false,
+    )
+    .await;
+    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    let record = next_record(&mut records).await;
+    assert_eq!(record.outcome, ConnectionOutcome::Refused);
+    assert_eq!(record.reason, Some(EgressReason::PrivateAddress));
+    assert_eq!(record.host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(record.peer, None, "nothing was opened");
+
+    let forward = parse_request(
+        b"GET http://example.com/ HTTP/1.1\r\nX-Temps-Egress-Refused: policy\r\nAccept: */*\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(forward.refused_by_sender, Some(EgressReason::NoAllowRule));
+    assert_eq!(
+        forward.headers,
+        vec![("Accept".to_string(), b"*/*".to_vec())]
+    );
+}
+
 #[test]
 fn requests_parse_into_tunnels_forwards_and_relays() {
     let connect =

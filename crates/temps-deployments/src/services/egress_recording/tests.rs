@@ -46,10 +46,13 @@ pub(crate) struct Fixture {
 pub(crate) async fn fixture() -> Option<Fixture> {
     let db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error) => {
-            eprintln!("TimescaleDB unavailable, skipping environment egress test: {error}");
+        // Only a missing Docker skips: a migration or schema check that
+        // fails is a failure, never a test that passes without running.
+        Err(error) if !temps_test_utils::docker_available().await => {
+            eprintln!("Docker unavailable, skipping environment egress test: {error}");
             return None;
         }
+        Err(error) => panic!("the test database could not be prepared: {error}"),
     };
     let conn = db.connection();
     conn.execute_unprepared(&format!(
@@ -563,9 +566,12 @@ async fn a_deployment_goes_through_the_recorder_only_when_its_environment_record
     assert_eq!(RecordedEgress::Off.variables(&existing), None);
     assert_eq!(RecordedEgress::NotServing.variables(&existing), None);
 
-    let steering = RecordedEgress::Proxy("172.18.0.1:13128".parse().unwrap())
-        .variables(&existing)
-        .expect("steered");
+    let steering = RecordedEgress::Proxy(
+        "172.18.0.1:13128".parse().unwrap(),
+        temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
+    )
+    .variables(&existing)
+    .expect("steered");
     assert!(steering.steers());
     assert_eq!(steering.variables["HTTPS_PROXY"], "http://172.18.0.1:13128");
     let direct: Vec<&str> = steering.variables["NO_PROXY"].split(',').collect();
@@ -634,4 +640,60 @@ async fn a_compose_environment_cannot_record() {
             .as_deref(),
         Some("unsupported_platform")
     );
+}
+
+/// An environment whose replicas run in microVMs (workload mode enforce)
+/// is never steered to the recorder: it says so instead of being turned on
+/// and recording nothing. The same isolation outside enforce is ignored by
+/// the deploy path, so it does not stop recording there.
+#[tokio::test]
+async fn a_microvm_environment_says_it_cannot_record() {
+    let Some(f) = fixture().await else { return };
+    let wired = f.wired();
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE environments SET workload_isolation = 'micro_vm' WHERE id = {PRODUCTION}"
+        ))
+        .await
+        .unwrap();
+    let before = wired
+        .environments
+        .status(PROJECT, PRODUCTION)
+        .await
+        .unwrap();
+    assert_ne!(
+        before.reason_code.as_deref(),
+        Some("not_recordable"),
+        "isolation is ignored outside enforce: {before:?}"
+    );
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE environments SET workload_mode = 'enforce' WHERE id = {PRODUCTION}"
+        ))
+        .await
+        .unwrap();
+    let status = wired
+        .environments
+        .status(PROJECT, PRODUCTION)
+        .await
+        .unwrap();
+    assert!(!status.configured);
+    assert_eq!(status.reason_code.as_deref(), Some("not_recordable"));
+    assert!(
+        status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("micro_vm")),
+        "{status:?}"
+    );
+    let refused = wired
+        .environments
+        .set_enabled(PROJECT, PRODUCTION, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, EgressRecordingError::NotRecordable { .. }),
+        "{refused:?}"
+    );
+    assert!(!f.recording(PRODUCTION).await, "nothing was written");
 }

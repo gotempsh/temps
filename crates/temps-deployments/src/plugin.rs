@@ -1729,6 +1729,7 @@ async fn wire_egress_recording(context: &PluginContext) {
             db,
             docker,
             temps_core::NETWORK_NAME.to_string(),
+            recorder.installation(),
         )))
         .await;
 }

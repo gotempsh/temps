@@ -32,7 +32,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
+    QueryFilter, Statement,
+};
 use temps_entities::sandboxes;
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::{LocalTraffic, RecordedTraffic};
@@ -113,6 +116,16 @@ pub struct SandboxTraffic {
     /// re-point could not be read: every recorded sidecar is refreshed on
     /// the next [`LocalTraffic::maintain`] until the read works.
     resync: std::sync::atomic::AtomicBool,
+    /// Whether the recorded set the sidecars read was published from the
+    /// database as it is: false after a refresh could not read it. A
+    /// sidecar replaced meanwhile would get the old hand-off (or none) and
+    /// keep it, so replacements wait, pending, until a refresh publishes.
+    published: std::sync::atomic::AtomicBool,
+    /// The recorded rows, and the network policy revision they were read
+    /// at. Reused while the revision is unchanged: it moves whenever a
+    /// sandbox is created, removed, or changes status, opt-in, node or id.
+    /// A policy change does not move it, so it reloads by discovering.
+    rows: std::sync::Mutex<Option<(i64, Arc<Vec<sandboxes::Model>>)>>,
 }
 
 impl SandboxTraffic {
@@ -127,6 +140,8 @@ impl SandboxTraffic {
             sidecars,
             pending: std::sync::Mutex::new(HashSet::new()),
             resync: std::sync::atomic::AtomicBool::new(false),
+            published: std::sync::atomic::AtomicBool::new(false),
+            rows: std::sync::Mutex::new(None),
         }
     }
 
@@ -147,11 +162,51 @@ impl SandboxTraffic {
             .filter(sandboxes::Column::EgressRecording.eq(true))
             .filter(sandboxes::Column::NodeId.is_null())
             .filter(sandboxes::Column::Status.ne("destroyed"))
+            .filter(
+                Condition::any()
+                    .add(sandboxes::Column::Backend.is_null())
+                    .add(sandboxes::Column::Backend.eq("docker")),
+            )
             .all(self.db.as_ref())
             .await?
             .into_iter()
             .filter(|row| super::records_on_backend(row.backend.as_deref()))
             .collect())
+    }
+
+    /// The network policy revision: one row.
+    async fn revision(&self) -> Result<i64, sea_orm::DbErr> {
+        let row = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COALESCE((SELECT revision FROM network_policy_state WHERE id = 0), 0)::BIGINT \
+                 AS revision",
+            ))
+            .await?;
+        Ok(row
+            .map(|row| row.try_get::<i64>("", "revision"))
+            .transpose()?
+            .unwrap_or_default())
+    }
+
+    /// The recorded rows: read again on `discover` or when the revision
+    /// moved, otherwise the last read. O(changes): a refresh with nothing
+    /// changed costs one one-row query, not every opted-in row.
+    async fn current_rows(
+        &self,
+        discover: bool,
+    ) -> Result<Arc<Vec<sandboxes::Model>>, sea_orm::DbErr> {
+        let revision = self.revision().await?;
+        if !discover {
+            let cached = self.rows.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some((_, rows)) = cached.filter(|(at, _)| *at == revision) {
+                return Ok(rows);
+            }
+        }
+        let rows = Arc::new(self.recorded_rows().await?);
+        *self.rows.lock().unwrap_or_else(|e| e.into_inner()) = Some((revision, rows.clone()));
+        Ok(rows)
     }
 
     /// Replaces sandbox `id`'s sidecar so it matches the recorder's state,
@@ -175,6 +230,15 @@ impl SandboxTraffic {
         let Some(sidecars) = &self.sidecars else {
             return;
         };
+        if !self.published.load(std::sync::atomic::Ordering::Relaxed) {
+            // What a replacement would read is stale: wait for a refresh
+            // that publishes, then the retry replaces them.
+            for id in ids {
+                self.mark_pending(id, true);
+            }
+            warn!(why, "egress recording: the recorded sandboxes could not be published; their egress proxies are replaced once they are");
+            return;
+        }
         for id in ids {
             let result = self.refresh_sidecar(sidecars.as_ref(), id).await;
             if let Err(error) = &result {
@@ -262,18 +326,25 @@ impl LocalTraffic for SandboxTraffic {
     /// Publishes the recorder's address and the recorded sandboxes for the
     /// sidecars, and returns each one's policy and the addresses of its
     /// sidecar. Reads only: replacing a sidecar is [`Self::maintain`]'s.
-    /// Reads everything on every refresh, so `discover` changes nothing.
+    /// Rows are read again on `discover` (an opt-in or a policy changed) or
+    /// when the policy revision moved; otherwise the last read is reused.
     async fn refresh(
         &self,
         address: SocketAddr,
-        _discover: bool,
+        discover: bool,
     ) -> Result<RecordedTraffic, String> {
-        let rows = self
-            .recorded_rows()
-            .await
-            .map_err(|e| format!("could not read the recorded sandboxes: {e}"))?;
+        let rows = match self.current_rows(discover).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                self.published
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Err(format!("could not read the recorded sandboxes: {e}"));
+            }
+        };
         let names: HashSet<String> = rows.iter().map(|r| container_name(&r.public_id)).collect();
         temps_sandbox_providers::docker::publish_egress_recording(Some((address, names)));
+        self.published
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut traffic = RecordedTraffic::default();
         if rows.is_empty() {
             return Ok(traffic);
@@ -284,7 +355,7 @@ impl LocalTraffic for SandboxTraffic {
                 .map_err(|e| format!("could not list the sandbox egress proxies: {e}"))?,
         );
         let mut identities = IdentityMap::new();
-        for row in &rows {
+        for row in rows.iter() {
             let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(row.id));
             for address in endpoints
                 .get(&container_name(&row.public_id))
@@ -324,6 +395,9 @@ impl LocalTraffic for SandboxTraffic {
     /// request until it is back.
     async fn stopped(&self) {
         temps_sandbox_providers::docker::publish_egress_recording(None);
+        // No hand-off for anyone is exactly what the sidecars must read now.
+        self.published
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(ids) = self.steerable_recorded().await {
             self.refresh_sidecars(ids, "the recorder stopped").await;
         }
@@ -384,12 +458,131 @@ mod tests {
         }
     }
 
+    /// Traffic whose recorded set was published, as after the refresh the
+    /// recorder runs before anything is steered.
     fn traffic(db: Arc<DatabaseConnection>, sidecars: Arc<FlakySidecars>) -> SandboxTraffic {
-        SandboxTraffic::new(
+        let traffic = SandboxTraffic::new(
             db,
             bollard::Docker::connect_with_local_defaults().expect("docker client"),
             Some(sidecars),
+        );
+        traffic
+            .published
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        traffic
+    }
+
+    const RECORDER: &str = "127.0.0.1:13128";
+
+    /// A refresh, or `None` (said) when Docker cannot list the sidecars.
+    async fn refreshed(traffic: &SandboxTraffic, discover: bool) -> Option<RecordedTraffic> {
+        match traffic.refresh(RECORDER.parse().unwrap(), discover).await {
+            Ok(traffic) => Some(traffic),
+            Err(error) if error.contains("egress proxies") => {
+                eprintln!("Docker cannot list containers, skipping: {error}");
+                None
+            }
+            Err(error) => panic!("refresh failed: {error}"),
+        }
+    }
+
+    /// An opt-in whose refresh could not publish the recorded set does not
+    /// replace the sidecar with the stale hand-off (and clear the retry):
+    /// it waits, pending, and is replaced once a refresh publishes.
+    #[tokio::test]
+    async fn steering_waits_for_a_refresh_that_publishes() {
+        let Some(f) = fixture().await else { return };
+        let conn = f.db.connection();
+        conn.execute_unprepared(&format!(
+            "UPDATE sandboxes SET egress_recording = true WHERE id = {}",
+            ON_CONTROL_PLANE.0
+        ))
+        .await
+        .unwrap();
+        let sidecars = FlakySidecars::failing(0);
+        let traffic = traffic(f.db.connection_arc(), sidecars.clone());
+
+        conn.execute_unprepared("ALTER TABLE sandboxes RENAME TO sandboxes_unreadable")
+            .await
+            .unwrap();
+        assert!(traffic
+            .refresh(RECORDER.parse().unwrap(), true)
+            .await
+            .is_err());
+        conn.execute_unprepared("ALTER TABLE sandboxes_unreadable RENAME TO sandboxes")
+            .await
+            .unwrap();
+        traffic.steer(ON_CONTROL_PLANE.0).await;
+        assert!(
+            sidecars.applied_to().is_empty(),
+            "not with a stale hand-off"
+        );
+        assert_eq!(
+            *traffic.pending.lock().unwrap(),
+            HashSet::from([ON_CONTROL_PLANE.0])
+        );
+
+        if refreshed(&traffic, true).await.is_none() {
+            return;
+        }
+        traffic.maintain().await;
+        assert_eq!(sidecars.applied_to(), vec![ON_CONTROL_PLANE.1.to_string()]);
+        assert!(traffic.pending.lock().unwrap().is_empty());
+    }
+
+    /// With nothing changed a refresh reuses the rows it read; a moved
+    /// revision or a discovery (a policy or opt-in change) reads them again.
+    #[tokio::test]
+    async fn rows_are_read_again_only_when_something_changed() {
+        let Some(f) = fixture().await else { return };
+        let conn = f.db.connection();
+        conn.execute_unprepared(&format!(
+            "UPDATE sandboxes SET egress_recording = true WHERE id = {}",
+            ON_CONTROL_PLANE.0
+        ))
+        .await
+        .unwrap();
+        let traffic = traffic(f.db.connection_arc(), FlakySidecars::failing(0));
+        let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(ON_CONTROL_PLANE.0));
+        let policy_of = |mode| {
+            policy::proxy_policy(
+                subject,
+                &SandboxEgressPolicy {
+                    mode,
+                    rules: Vec::new(),
+                },
+            )
+        };
+        let set_mode = |mode: &'static str| {
+            format!(
+                "UPDATE sandboxes SET egress_policy = jsonb_set(egress_policy::jsonb, '{{mode}}', '\"{mode}\"') WHERE id = {}",
+                ON_CONTROL_PLANE.0
+            )
+        };
+        let Some(first) = refreshed(&traffic, false).await else {
+            return;
+        };
+        let before = first.policies[0].clone();
+        // A policy change moves no revision: the cached rows stay...
+        conn.execute_unprepared(&set_mode("restricted"))
+            .await
+            .unwrap();
+        let cached = refreshed(&traffic, false).await.unwrap();
+        assert_eq!(cached.policies[0], before, "reused, not read again");
+        // ...until it is discovered,
+        let discovered = refreshed(&traffic, true).await.unwrap();
+        assert_eq!(discovered.policies[0], policy_of(EgressMode::Restricted));
+        // or the revision moves.
+        conn.execute_unprepared(&set_mode("internet"))
+            .await
+            .unwrap();
+        conn.execute_unprepared(
+            "UPDATE network_policy_state SET revision = revision + 1 WHERE id = 0",
         )
+        .await
+        .unwrap();
+        let moved = refreshed(&traffic, false).await.unwrap();
+        assert_eq!(moved.policies[0], policy_of(EgressMode::Internet));
     }
 
     /// A sidecar whose refresh failed is refreshed again until it works,

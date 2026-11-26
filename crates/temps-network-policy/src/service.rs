@@ -908,7 +908,25 @@ impl NetworkPolicyService {
                 ..Default::default()
             }),
             NodeMode::Off => {
-                let (snapshot, digest) = self.cached_snapshot(node_id, revision).await?;
+                // The mode is known whatever happens to the snapshot: an
+                // agent leaving enforcement must hear `off` and remove its
+                // rules even when a row its snapshot reads cannot be read.
+                let (snapshot, digest) = match self.cached_snapshot(node_id, revision).await {
+                    Ok(built) => built,
+                    Err(error) => {
+                        tracing::warn!(
+                            node_id,
+                            %error,
+                            "network policy: could not build the snapshot of an off node; \
+                             answering its mode alone until it can be built"
+                        );
+                        return Ok(NodePolicy {
+                            mode,
+                            protocol,
+                            ..Default::default()
+                        });
+                    }
+                };
                 if report.held_snapshot.as_deref() == Some(digest.as_str()) {
                     return Ok(NodePolicy {
                         mode,
@@ -1284,19 +1302,30 @@ const OTHER_NODE_ADDRESSES_SQL: &str = "\
 /// Marks the egress policies of `recorded` workloads so the node's proxy
 /// records their connections, adding an empty policy for a recorded
 /// workload that has no proxy rules (so the flag reaches the node).
+///
+/// One pass over each list, indexed by subject: N recorded workloads cost
+/// O(N), not a scan of the list per workload.
 fn mark_recorded(
     mut egress: Vec<EgressPolicy>,
     recorded: impl IntoIterator<Item = WorkloadRef>,
 ) -> Vec<EgressPolicy> {
+    let mut index: HashMap<WorkloadRef, usize> = egress
+        .iter()
+        .enumerate()
+        .map(|(i, policy)| (policy.subject, i))
+        .collect();
     for subject in recorded {
-        match egress.iter_mut().find(|p| p.subject == subject) {
-            Some(policy) => policy.record = true,
-            None => egress.push(EgressPolicy {
-                subject,
-                rules: Vec::new(),
-                record: true,
-                public_only: false,
-            }),
+        match index.get(&subject) {
+            Some(&i) => egress[i].record = true,
+            None => {
+                index.insert(subject, egress.len());
+                egress.push(EgressPolicy {
+                    subject,
+                    rules: Vec::new(),
+                    record: true,
+                    public_only: false,
+                });
+            }
         }
     }
     egress

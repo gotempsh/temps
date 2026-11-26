@@ -93,7 +93,15 @@ impl TempsPlugin for WorkloadEgressPlugin {
             // reports node 0 able to record only those.
             let serving = LocalServing::new();
             service.set_local_serving(serving.clone());
-            context.register_service(LocalEgressRecorder::new(service, local, serving));
+            let installation = crate::steering::InstallationId::derive(
+                &context.require_service::<temps_core::EncryptionService>(),
+            );
+            context.register_service(LocalEgressRecorder::new(
+                service,
+                local,
+                serving,
+                installation,
+            ));
             Ok(())
         })
     }

@@ -81,7 +81,9 @@ impl crate::services::sandbox_service::EgressPolicyObserver for RecorderPolicyRe
     async fn policy_changed(&self, row: &sandboxes::Model) {
         // Only this host's recorder decides for this host's sandboxes.
         if row.node_id.is_none() {
-            self.recorder.refresh().await;
+            // A policy change does not move the revision the rows are
+            // cached at: read them again.
+            self.recorder.rediscover().await;
         }
     }
 }
@@ -176,7 +178,7 @@ impl WorkloadEgressAdapter for SandboxEgressAdapter {
         let Some(local) = self.local.get() else {
             return;
         };
-        local.recorder.refresh().await;
+        local.recorder.rediscover().await;
         let Ok(id) = i32::try_from(workload.workload.id) else {
             return;
         };

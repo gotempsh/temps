@@ -52,7 +52,7 @@ use sea_orm::{
 use temps_entities::{deployment_containers, deployments, environments};
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::{LocalTraffic, RecordedTraffic};
-use temps_workload_egress::steering::STEERED_LABEL;
+use temps_workload_egress::steering::{steered_by, InstallationId, STEERED_LABEL};
 use temps_workload_netpol::rule::{Action, PortRange};
 use temps_workload_netpol::{EgressPolicy, EgressRule, EgressTarget, HostPattern, IdentityMap};
 
@@ -92,17 +92,22 @@ pub struct SteeredContainer {
     pub address: IpAddr,
 }
 
-/// The steered containers among `containers`, by what only Docker records:
-/// the labels they were created with and their address on `network`.
+/// The containers among `containers` that `installation` steered, by what
+/// only Docker records: the labels they were created with and their address
+/// on `network`. A container another installation steered on a shared
+/// Docker daemon is never taken for this one's, whatever its environment id.
 pub fn steered_containers(
     containers: &[bollard::models::ContainerSummary],
     network: &str,
+    installation: InstallationId,
 ) -> Vec<SteeredContainer> {
     containers
         .iter()
         .filter_map(|container| {
             let labels = container.labels.as_ref()?;
-            labels.get(STEERED_LABEL)?;
+            if !steered_by(labels.get(STEERED_LABEL)?, installation) {
+                return None;
+            }
             let environment_id = labels.get(ENVIRONMENT_LABEL)?.parse().ok()?;
             let address = container
                 .network_settings
@@ -159,33 +164,42 @@ pub struct DeploymentTraffic {
     /// Whether the last container list found a steered container. Starts
     /// true: a restart does not know what is running.
     steered_seen: AtomicBool,
+    /// This installation: only the containers it steered are its own.
+    installation: InstallationId,
 }
 
 impl DeploymentTraffic {
-    pub fn new(db: Arc<DatabaseConnection>, docker: bollard::Docker, network: String) -> Self {
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        docker: bollard::Docker,
+        network: String,
+        installation: InstallationId,
+    ) -> Self {
         Self {
             db,
             docker,
             network,
             steered_seen: AtomicBool::new(true),
+            installation,
         }
     }
 
-    /// The environments that record now, whatever runs where. While any
+    /// Whether any environment records now, whatever runs where. While one
     /// does, the containers are listed on every refresh: a new replica is
     /// steered before the database knows where it runs, and must be in the
-    /// table from its first connection.
-    async fn recording(&self) -> Result<BTreeSet<i32>, String> {
+    /// table from its first connection. One row at most, whatever the
+    /// number of environments.
+    async fn any_recording(&self) -> Result<bool, String> {
         environments::Entity::find()
             .select_only()
             .column(environments::Column::Id)
             .filter(environments::Column::EgressRecording.eq(true))
             .filter(environments::Column::DeletedAt.is_null())
             .into_tuple::<i32>()
-            .all(self.db.as_ref())
+            .one(self.db.as_ref())
             .await
-            .map(|ids| ids.into_iter().collect())
-            .map_err(|e| format!("could not read the environments that record: {e}"))
+            .map(|id| id.is_some())
+            .map_err(|e| format!("could not read whether an environment records: {e}"))
     }
 
     /// The environments that record now and have a container on this host,
@@ -266,7 +280,7 @@ impl LocalTraffic for DeploymentTraffic {
     ) -> Result<RecordedTraffic, String> {
         if !discover
             && !needs_listing(
-                !self.recording().await?.is_empty(),
+                self.any_recording().await?,
                 self.steered_seen.load(Ordering::Relaxed),
             )
         {
@@ -288,7 +302,7 @@ impl LocalTraffic for DeploymentTraffic {
             }))
             .await
             .map_err(|e| format!("could not list the steered deployment containers: {e}"))?;
-        let steered = steered_containers(&containers, &self.network);
+        let steered = steered_containers(&containers, &self.network, self.installation);
         self.steered_seen
             .store(!steered.is_empty(), Ordering::Relaxed);
         Ok(traffic_of(&steered, &recording))
@@ -316,7 +330,12 @@ mod tests {
             bollard::API_DEFAULT_VERSION,
         )
         .expect("a client is built without connecting");
-        let traffic = DeploymentTraffic::new(f.db.connection_arc(), unreachable, NETWORK.into());
+        let traffic = DeploymentTraffic::new(
+            f.db.connection_arc(),
+            unreachable,
+            NETWORK.into(),
+            InstallationId::from_bytes([1; 8]),
+        );
         traffic.steered_seen.store(false, Ordering::Relaxed);
         let address: SocketAddr = "172.18.0.1:13128".parse().unwrap();
         assert!(traffic.refresh(address, true).await.is_err());
@@ -356,13 +375,25 @@ mod tests {
         }
     }
 
-    /// Only a container Docker says was steered, of an environment Docker
+    /// Only a container this installation steered, of an environment Docker
     /// names, speaks for that environment, from its address on the
-    /// deployment network and no other.
+    /// deployment network and no other. One another installation steered on
+    /// the same Docker daemon (same environment id, same network) is not
+    /// this one's.
     #[test]
     fn only_steered_containers_speak_for_their_environment() {
+        let ours = InstallationId::from_bytes([1; 8]);
+        let theirs = InstallationId::from_bytes([2; 8]);
+        let label = |installation| {
+            temps_workload_egress::steering::steered_label(
+                installation,
+                "172.18.0.1:13128".parse().unwrap(),
+            )
+        };
+        let our_label = label(ours);
+        let their_label = label(theirs);
         let steered = [
-            (STEERED_LABEL, "172.18.0.1:13128"),
+            (STEERED_LABEL, our_label.as_str()),
             (ENVIRONMENT_LABEL, "7"),
         ];
         let containers = [
@@ -373,16 +404,36 @@ mod tests {
             container(&steered, &[("other", "10.9.0.7")]),
             // Steered, but Docker names no environment.
             container(
-                &[(STEERED_LABEL, "172.18.0.1:13128")],
+                &[(STEERED_LABEL, our_label.as_str())],
                 &[(NETWORK, "172.18.0.8")],
             ),
             container(
-                &[(STEERED_LABEL, "x"), (ENVIRONMENT_LABEL, "production")],
+                &[
+                    (STEERED_LABEL, our_label.as_str()),
+                    (ENVIRONMENT_LABEL, "production"),
+                ],
                 &[(NETWORK, "172.18.0.9")],
+            ),
+            // Another installation's replica of an environment with the
+            // same id, on the same network.
+            container(
+                &[
+                    (STEERED_LABEL, their_label.as_str()),
+                    (ENVIRONMENT_LABEL, "7"),
+                ],
+                &[(NETWORK, "172.18.0.10")],
+            ),
+            // Steered before installations were named: nobody's.
+            container(
+                &[
+                    (STEERED_LABEL, "172.18.0.1:13128"),
+                    (ENVIRONMENT_LABEL, "7"),
+                ],
+                &[(NETWORK, "172.18.0.11")],
             ),
         ];
         assert_eq!(
-            steered_containers(&containers, NETWORK),
+            steered_containers(&containers, NETWORK, ours),
             vec![SteeredContainer {
                 environment_id: 7,
                 address: "172.18.0.5".parse().unwrap(),
@@ -432,8 +483,9 @@ mod tests {
             f.db.connection_arc(),
             bollard::Docker::connect_with_local_defaults().expect("docker client"),
             NETWORK.to_string(),
+            InstallationId::from_bytes([1; 8]),
         );
-        assert!(traffic.recording().await.unwrap().is_empty());
+        assert!(!traffic.any_recording().await.unwrap());
         assert!(traffic.recorded_here().await.unwrap().is_empty());
         f.db.connection()
             .execute_unprepared(&format!(
@@ -442,10 +494,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
-            traffic.recording().await.unwrap(),
-            BTreeSet::from([PRODUCTION, STAGING, ELSEWHERE]),
-            "every environment that records keeps the containers listed, placed or not"
+        assert!(
+            traffic.any_recording().await.unwrap(),
+            "any environment that records keeps the containers listed, placed or not"
         );
         assert_eq!(
             traffic.recorded_here().await.unwrap(),

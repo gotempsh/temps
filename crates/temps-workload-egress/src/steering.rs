@@ -29,10 +29,52 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 
 /// The label a container carries when it was started with the proxy
-/// variables: its value is the recorder address it was given. The recorder
-/// keeps every such container in its table, so turning recording off never
-/// cuts off a running container.
+/// variables: its value is [`steered_label`], the installation that steered
+/// it and the recorder address it was given. The recorder keeps every such
+/// container of its own installation in its table, so turning recording off
+/// never cuts off a running container.
 pub const STEERED_LABEL: &str = "sh.temps.egress-proxy";
+
+/// Which installation's recorder steered a container. Two installations can
+/// share a Docker daemon and its networks: a recorder that took the other's
+/// listener over must never take the other's containers for its own (their
+/// numeric environment ids can be the same). Derived from the installation's
+/// encryption key, so it is stable across restarts and differs between
+/// installations; it reveals nothing about the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InstallationId([u8; 8]);
+
+impl InstallationId {
+    pub fn derive(encryption: &temps_core::EncryptionService) -> Self {
+        let key = encryption.derive_subkey("temps.egress-recording.installation");
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&key[..8]);
+        Self(id)
+    }
+
+    pub fn from_bytes(id: [u8; 8]) -> Self {
+        Self(id)
+    }
+}
+
+impl std::fmt::Display for InstallationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+/// The [`STEERED_LABEL`] value of a container `installation` steered to its
+/// recorder at `address`.
+pub fn steered_label(installation: InstallationId, address: SocketAddr) -> String {
+    format!("{installation}@{address}")
+}
+
+/// Whether a [`STEERED_LABEL`] value says `installation` steered it.
+pub fn steered_by(label: &str, installation: InstallationId) -> bool {
+    label
+        .split_once('@')
+        .is_some_and(|(id, _)| id == installation.to_string())
+}
 
 /// The proxy variables, in both cases: tools disagree on which they read.
 pub const PROXY_VARIABLES: [(&str, &str); 2] =
@@ -158,10 +200,41 @@ pub fn is_internal(host: &str) -> bool {
 /// variable is a host (`REDIS_HOST=redis-cache`).
 fn hosts_in(name: &str, value: &str) -> Vec<String> {
     let hosts = url_hosts_in(value);
-    if !hosts.is_empty() || !name.to_ascii_uppercase().contains("HOST") {
+    if !hosts.is_empty() || !names_a_host(name) {
         return hosts;
     }
     host_of(value).into_iter().collect()
+}
+
+/// Words that make a variable a credential, whatever else its name says.
+const CREDENTIAL_WORDS: [&str; 10] = [
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASS",
+    "KEY",
+    "APIKEY",
+    "AUTH",
+    "CREDENTIAL",
+    "CREDENTIALS",
+];
+
+/// Whether a variable's value is a host by its name: its last word is
+/// `HOST` or `HOSTNAME` (`REDIS_HOST`, `DB_HOSTNAME`), or it ends in `HOST`
+/// (`PGHOST`), and no word of it says credential. `HOSTING_API_TOKEN` is
+/// not: its value would otherwise be copied verbatim into `NO_PROXY`,
+/// which diagnostics print.
+fn names_a_host(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let words: Vec<&str> = upper
+        .split(['_', '-', '.'])
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.iter().any(|word| CREDENTIAL_WORDS.contains(word)) {
+        return false;
+    }
+    matches!(words.last(), Some(&"HOST") | Some(&"HOSTNAME")) || upper.ends_with("HOST")
 }
 
 /// Every host after a `://` in `value`: `scheme://[user[:pass]@]host[:port]`,
@@ -220,6 +293,45 @@ mod tests {
 
     fn no_proxy(steering: &ProxyVariables) -> Vec<&str> {
         steering.variables["NO_PROXY"].split(',').collect()
+    }
+
+    /// A credential whose name mentions a host is never read as one: its
+    /// value would be copied verbatim into `NO_PROXY`, which diagnostics
+    /// print. Host variables still are.
+    #[test]
+    fn credentials_are_never_copied_into_no_proxy() {
+        let existing = variables(&[
+            ("HOSTING_API_TOKEN", "abcdef0123456789secret"),
+            ("REDIS_HOST_PASSWORD", "hunter2value"),
+            ("HOST_KEY", "keyvalue99"),
+            ("REDIS_HOST", "redis-cache"),
+            ("PGHOST", "postgres-main"),
+            ("DB_HOSTNAME", "db-primary"),
+        ]);
+        let steering = proxy_variables(proxy(), &existing, &[]);
+        let entries = no_proxy(&steering);
+        for secret in ["abcdef0123456789secret", "hunter2value", "keyvalue99"] {
+            assert!(!entries.contains(&secret), "{secret} leaked: {entries:?}");
+        }
+        for host in ["redis-cache", "postgres-main", "db-primary"] {
+            assert!(entries.contains(&host), "{host} missing: {entries:?}");
+        }
+    }
+
+    /// The label names the installation that steered a container, and only
+    /// that installation's recorder takes it for its own.
+    #[test]
+    fn a_steered_label_names_its_installation() {
+        let ours = InstallationId::from_bytes([1, 2, 3, 4, 5, 6, 7, 8]);
+        let theirs = InstallationId::from_bytes([9; 8]);
+        let label = steered_label(ours, proxy());
+        assert_eq!(label, "0102030405060708@172.18.0.1:13128");
+        assert!(steered_by(&label, ours));
+        assert!(!steered_by(&label, theirs));
+        assert!(
+            !steered_by("172.18.0.1:13128", ours),
+            "an unnamed steering is nobody's"
+        );
     }
 
     #[test]

@@ -967,12 +967,13 @@ function forwardInternal(request, response, target) {
   request.pipe(upstream);
 }
 
-// Hand a plain-http request to the egress recorder, as an absolute-form
-// proxy request: it decides, connects and records.
+// Hand a plain-http request this sandbox's policy admitted to the egress
+// recorder, as an absolute-form proxy request: it connects and records.
 function forwardRecorded(request, response, target) {
   const headers = { ...request.headers, host: target.host };
   delete headers["proxy-authorization"];
   delete headers["proxy-connection"];
+  delete headers["x-temps-egress-refused"];
   const upstream = http.request({
     host: recordingProxy.host,
     port: recordingProxy.port,
@@ -990,6 +991,34 @@ function forwardRecorded(request, response, target) {
   });
   request.on("error", () => upstream.destroy());
   request.pipe(upstream);
+}
+
+// The recorder's name for why this side refused: how it records it.
+function recordedReason(error) {
+  const reason = error instanceof Denied ? error.reason : "invalid";
+  if (reason === "private") return "private_address";
+  if (reason === "unresolvable" || reason === "lookup_timeout" || reason === "local_name") {
+    return "did_not_resolve";
+  }
+  return "no_allow_rule";
+}
+
+// Tell the recorder of a request this sandbox's policy refused, so it is
+// recorded like a refusal made there: the same request, marked refused,
+// which the recorder refuses and records without opening anything. The
+// client is answered here and never waits for it; a recorder that does
+// not answer costs one socket for at most five seconds.
+function noteRefusal(method, target, host, error) {
+  const socket = net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {
+    socket.end(
+      `${method} ${target} HTTP/1.1\r\nHost: ${host}\r\n` +
+      `X-Temps-Egress-Refused: ${recordedReason(error)}\r\nContent-Length: 0\r\n\r\n`
+    );
+  });
+  socket.setTimeout(5_000, () => socket.destroy());
+  socket.on("error", () => socket.destroy());
+  socket.on("data", () => {});
+  socket.on("end", () => socket.destroy());
 }
 
 async function handleRequest(request, response) {
@@ -1021,6 +1050,16 @@ async function handleRequest(request, response) {
       return;
     }
     if (recordingProxy) {
+      // This sandbox's own policy decides first, whatever the recorder
+      // holds: a recorder whose table has not followed a policy change, or
+      // that still names another sandbox's sidecar by this address, must
+      // never let more out than this policy does.
+      try {
+        await admit(target.hostname, Number(target.port) || 80);
+      } catch (error) {
+        noteRefusal(request.method, target.href, target.host, error);
+        throw error;
+      }
       forwardRecorded(request, response, target);
       return;
     }
@@ -1047,8 +1086,16 @@ server.on("connect", async (request, client, head) => {
     const { hostname, port } = parseAuthority(request.url, 443);
     destination = formatDestination(hostname, port);
     if (recordingProxy && !isInternalName(normalizeHost(hostname))) {
-      // The recorder answers the CONNECT itself (200 or 403) and carries
-      // the tunnel; this side only pipes bytes.
+      // This sandbox's own policy decides first (see handleRequest); then
+      // the recorder answers the CONNECT itself and carries the tunnel,
+      // and this side only pipes bytes.
+      try {
+        await admit(hostname, port);
+      } catch (error) {
+        noteRefusal("CONNECT", request.url, request.url, error);
+        throw error;
+      }
+      if (client.destroyed) return;
       let connected = false;
       upstream = net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {
         connected = true;
@@ -1510,6 +1557,65 @@ mod identity_tests {
     fn the_sidecar_script_hands_recorded_traffic_to_the_recorder() {
         assert!(SANDBOX_EGRESS_PROXY_SCRIPT.contains("TEMPS_EGRESS_RECORDING_PROXY_ADDRESS"));
         assert!(SANDBOX_EGRESS_PROXY_SCRIPT.contains("forwardRecorded(request, response, target)"));
+    }
+
+    /// With recording on, the sandbox's own policy still decides first:
+    /// both recorded paths admit before anything reaches the recorder, and
+    /// a refusal is sent to it marked as such (and never passed on with a
+    /// forwarded request). The recorder's table can lag a policy change or
+    /// still name another sandbox's sidecar by a reused address; neither
+    /// may widen what this sandbox can reach.
+    #[test]
+    fn the_sidecar_admits_under_its_own_policy_before_the_recorder() {
+        let script = SANDBOX_EGRESS_PROXY_SCRIPT;
+        let forward = script
+            .find("forwardRecorded(request, response, target);\n      return;")
+            .expect("the recorded forward");
+        let forward_admit = script[..forward]
+            .rfind("await admit(target.hostname")
+            .expect("a forward is admitted first");
+        assert!(
+            !script[forward_admit..forward].contains("forwardRecorded("),
+            "nothing is forwarded before the admission"
+        );
+        let tunnel = script
+            .find("net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {\n        connected = true;")
+            .expect("the recorded tunnel");
+        let tunnel_admit = script[..tunnel]
+            .rfind("await admit(hostname, port)")
+            .expect("a tunnel is admitted first");
+        assert!(
+            tunnel_admit > forward,
+            "the tunnel's own admission, not the forward's"
+        );
+        assert!(script.contains("noteRefusal(request.method, target.href, target.host, error)"));
+        assert!(script.contains("noteRefusal(\"CONNECT\", request.url, request.url, error)"));
+        assert!(script.contains("delete headers[\"x-temps-egress-refused\"]"));
+        assert_eq!(
+            temps_workload_netpol::egress::REFUSED_BY_SENDER,
+            "x-temps-egress-refused",
+            "the header the recorder reads"
+        );
+    }
+
+    /// The script parses, where Node is installed to check it.
+    #[test]
+    fn the_sidecar_script_is_valid_javascript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egress-proxy.js");
+        std::fs::write(&path, SANDBOX_EGRESS_PROXY_SCRIPT).expect("write the script");
+        match std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output()
+        {
+            Ok(output) => assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("node is not installed, skipping the syntax check: {error}"),
+        }
     }
 
     const SANDBOX: &str = "temps-sandbox-alpha";

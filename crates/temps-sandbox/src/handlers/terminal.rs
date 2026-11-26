@@ -368,7 +368,7 @@ fn wrap_shell(cmd: &str, environ: Option<&str>) -> String {
         Some(path) => format!(
             "if [ -r {path} ]; then temps_soh=$(printf '\\001'); \
              while IFS= read -r kv; do case \"${{kv%%=*}}\" in \
-             {KEEP_SHELL_VARS}|\"\"|*[!A-Za-z0-9_]*) continue ;; esac; \
+             {KEEP_SHELL_VARS}|\"\"|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; \
              case \"$kv\" in *\"$temps_soh\"*) kv=$(printf '%sx' \"$kv\" | tr '\\001' '\\n'); \
              kv=${{kv%x}} ;; esac; export \"$kv\" 2>/dev/null; \
              done <<TEMPS_ENVIRON\n$(tr '\\n\\000' '\\001\\n' < {path})\nTEMPS_ENVIRON\n\
@@ -1170,6 +1170,19 @@ mod tests {
                 "missing {expected} in:\n{env}"
             );
         }
+    }
+
+    /// A name a process environment can hold but a shell cannot export
+    /// (`2FA_ENABLED`, a leading digit) is skipped: exporting it would end
+    /// a POSIX shell before the terminal's command runs.
+    #[test]
+    fn a_name_the_shell_cannot_export_is_skipped() {
+        let out = shell_output_after_import(
+            &[("2FA_ENABLED", "true"), ("1HOST", "x"), ("KEPT", "yes")],
+            "echo \"ran:$KEPT\"",
+            &[],
+        );
+        assert_eq!(out, "ran:yes\n");
     }
 
     #[test]

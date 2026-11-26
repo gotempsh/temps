@@ -50,10 +50,13 @@ pub(crate) struct Fixture {
 pub(crate) async fn fixture() -> Option<Fixture> {
     let db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error) => {
-            eprintln!("TimescaleDB unavailable, skipping egress recording test: {error}");
+        // Only a missing Docker skips: a migration or schema check that
+        // fails is a failure, never a test that passes without running.
+        Err(error) if !temps_test_utils::docker_available().await => {
+            eprintln!("Docker unavailable, skipping egress recording test: {error}");
             return None;
         }
+        Err(error) => panic!("the test database could not be prepared: {error}"),
     };
     let conn = db.connection();
     conn.execute_unprepared(&format!(

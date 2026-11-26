@@ -506,7 +506,7 @@ impl DeployImageJob {
         use temps_workload_egress::steering::STEERED_LABEL;
 
         let recorded = self.config.recorded_egress;
-        let address = match recorded {
+        let (address, installation) = match recorded {
             RecordedEgress::Off => return Ok(()),
             _ if !assignment.is_local() => {
                 return self
@@ -549,7 +549,7 @@ impl DeployImageJob {
                     )
                     .await;
             }
-            RecordedEgress::Proxy(address) => address,
+            RecordedEgress::Proxy(address, installation) => (address, installation),
         };
         let Some(steering) = recorded.variables(environment_vars) else {
             return Ok(());
@@ -573,7 +573,10 @@ impl DeployImageJob {
             .await?;
         }
         environment_vars.extend(steering.variables);
-        labels.insert(STEERED_LABEL.to_string(), address.to_string());
+        labels.insert(
+            STEERED_LABEL.to_string(),
+            temps_workload_egress::steering::steered_label(installation, address),
+        );
         self.log(
             context,
             format!(
@@ -1862,6 +1865,7 @@ mod tests {
         use temps_workload_egress::steering::STEERED_LABEL;
 
         let recorder = "172.18.0.1:13128".parse().unwrap();
+        let installation = temps_workload_egress::steering::InstallationId::from_bytes([7; 8]);
         let recorded_with = |recorded_egress, assignment: &NodeAssignment, isolation| {
             let assignment = assignment.clone();
             async move {
@@ -1902,8 +1906,11 @@ mod tests {
             )
         };
 
-        let (request, lines) =
-            recorded(RecordedEgress::Proxy(recorder), &NodeAssignment::Local).await;
+        let (request, lines) = recorded(
+            RecordedEgress::Proxy(recorder, installation),
+            &NodeAssignment::Local,
+        )
+        .await;
         let env = &request.environment_vars;
         for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
             assert_eq!(env[name], "http://172.18.0.1:13128", "{name}");
@@ -1915,7 +1922,10 @@ mod tests {
             "its linked service stays direct: {}",
             env["NO_PROXY"]
         );
-        assert_eq!(request.labels[STEERED_LABEL], "172.18.0.1:13128");
+        assert_eq!(
+            request.labels[STEERED_LABEL], "0707070707070707@172.18.0.1:13128",
+            "the label names the installation that steered it"
+        );
         assert!(lines.contains("Recording outbound connections"), "{lines}");
 
         for (plan, assignment, said) in [
@@ -1926,7 +1936,7 @@ mod tests {
                 Some("egress recorder is not serving on this node"),
             ),
             (
-                RecordedEgress::Proxy(recorder),
+                RecordedEgress::Proxy(recorder, installation),
                 remote_on("127.0.0.1"),
                 Some("runs on a worker node, which does not record yet"),
             ),
@@ -1947,7 +1957,7 @@ mod tests {
         // Only a container is known by its address: a microVM replica is
         // left with its own way out, and the log says why.
         let (request, lines) = recorded_with(
-            RecordedEgress::Proxy(recorder),
+            RecordedEgress::Proxy(recorder, installation),
             &NodeAssignment::Local,
             temps_workload::Isolation::MicroVm,
         )

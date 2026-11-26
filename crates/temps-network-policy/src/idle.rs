@@ -456,6 +456,30 @@ mod tests {
             .any(|p| p.subject == WorkloadRef::new(WorkloadKind::Sandbox, 8101) && p.record));
     }
 
+    /// An `off` node whose snapshot cannot be built (a table it reads is
+    /// unreadable) still hears its mode: an agent turned off to recover
+    /// from a bad policy removes its rules instead of keeping them while
+    /// every poll fails.
+    #[tokio::test]
+    async fn an_off_node_hears_its_mode_when_its_snapshot_cannot_be_built() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        let (service, _) = counted(&db).await;
+        db.connection()
+            .execute_unprepared(
+                "ALTER TABLE network_policy_rules RENAME TO network_policy_rules_gone",
+            )
+            .await
+            .unwrap();
+        let answer = service
+            .node_policy(worker, new_agent(None))
+            .await
+            .expect("the mode, not an error");
+        assert_eq!(answer.mode, NodeMode::Off);
+        assert!(answer.snapshot.is_none() && !answer.unchanged);
+    }
+
     /// A node outside `off` gets exactly what it got before: a freshly
     /// built snapshot every pass, never `unchanged`, never a digest.
     #[tokio::test]

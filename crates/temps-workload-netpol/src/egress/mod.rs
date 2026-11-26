@@ -996,6 +996,13 @@ impl EgressProxy {
         };
         // Body bytes that arrived with the head, sent on before the splice.
         let early = filled.saturating_sub(head_len) as u64;
+        if let (Some(reason), RequestKind::Connect { .. } | RequestKind::Forward { .. }) =
+            (request.refused_by_sender, &request.kind)
+        {
+            self.stats.refused_policy.fetch_add(1, Ordering::Relaxed);
+            let _ = client.write_all(FORBIDDEN).await;
+            return Ended::refused(Some(request), reason);
+        }
         match request.kind {
             RequestKind::Connect { ref host, port } => {
                 let (mut upstream, peer) = match self.open(rules, source, host, port).await {
@@ -1405,6 +1412,27 @@ struct ParsedRequest {
     kind: RequestKind,
     /// Headers to pass on, without hop-by-hop and proxy headers.
     headers: Vec<(String, Vec<u8>)>,
+    /// Set when the sender already refused this request
+    /// ([`REFUSED_BY_SENDER`]): it is recorded as refused, for that reason,
+    /// and never opened.
+    refused_by_sender: Option<EgressReason>,
+}
+
+/// The header a workload's own egress proxy (a sandbox's sidecar) sends
+/// with a request it refused under its own policy, so the refusal is
+/// recorded like one made here: `no_allow_rule`, `private_address` or
+/// `did_not_resolve`. It can only ever refuse the sender's own request,
+/// so it needs no trust; it is never passed on.
+pub const REFUSED_BY_SENDER: &str = "x-temps-egress-refused";
+
+/// The reason a [`REFUSED_BY_SENDER`] header names; anything else is a
+/// refusal by the sender's policy.
+fn sender_refusal(value: &[u8]) -> EgressReason {
+    match value {
+        b"private_address" => EgressReason::PrivateAddress,
+        b"did_not_resolve" => EgressReason::DidNotResolve,
+        _ => EgressReason::NoAllowRule,
+    }
 }
 
 fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
@@ -1448,6 +1476,11 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
     } else {
         RequestKind::Refused(EgressReason::NotAProxyRequest)
     };
+    let refused_by_sender = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(REFUSED_BY_SENDER))
+        .map(|h| sender_refusal(h.value));
     let headers = request
         .headers
         .iter()
@@ -1456,7 +1489,7 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
             !matches!(
                 name.as_str(),
                 "proxy-authorization" | "proxy-connection" | "connection" | "keep-alive" | "host"
-            )
+            ) && name != REFUSED_BY_SENDER
         })
         .map(|h| (h.name.to_string(), h.value.to_vec()))
         .collect();
@@ -1464,6 +1497,7 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
         method,
         kind,
         headers,
+        refused_by_sender,
     })
 }
 
@@ -1493,7 +1527,12 @@ fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> 
     {
         return None;
     }
-    Some((host.trim_end_matches('.').to_ascii_lowercase(), port))
+    // A trailing dot names the same host; a name of dots alone names none.
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port))
 }
 
 fn is_token(segment: &str) -> bool {
