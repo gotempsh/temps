@@ -35,7 +35,9 @@ export function SecretPage({
       problemStatus(error) !== 404 && failureCount < 3,
   })
   const notFound = problemStatus(secretQuery.error) === 404
-  const secret = secretQuery.data
+  // A refetch that answers 404 keeps the last data in the cache; the secret
+  // is gone, so that data must not keep its controls on screen.
+  const secret = notFound ? undefined : secretQuery.data
   const listPath = settingsSectionHref(project.slug, 'variables', 'secrets')
   const detailPath = `/projects/${project.slug}/settings/secrets/${id}`
   const location = useLocation()

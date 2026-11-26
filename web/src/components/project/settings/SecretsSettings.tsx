@@ -6,6 +6,7 @@ import {
   createProjectSecretMutation,
   deleteProjectSecretMutation,
   getEnvironmentsOptions,
+  getProjectSecretQueryKey,
   listProjectSecretsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
@@ -190,6 +191,12 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               }
               onDeleted={() => {
                 refetchSecrets()
+                // Its detail page must not show it from the cache.
+                queryClient.removeQueries({
+                  queryKey: getProjectSecretQueryKey({
+                    path: { project_id: project.id, secret_id: s.id },
+                  }),
+                })
                 void notifyChange(
                   `Secret ${s.key} deleted`,
                   secretScope(s.environments)
