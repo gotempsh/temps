@@ -1528,6 +1528,19 @@ impl NodeScheduler {
         })
     }
 
+    /// Record that a deploy is starting replicas on these assignments, so
+    /// placements that follow count them before their containers are
+    /// registered. Only a caller that acts on the placement records it: a
+    /// shadow comparison, an explanation or a plan asks the same question
+    /// without placing anything.
+    pub fn record_placed(&self, assignments: &[NodeAssignment]) {
+        self.node_service.record_placements(
+            assignments
+                .iter()
+                .map(|assignment| assignment.node_id().unwrap_or(CONTROL_PLANE_NODE_ID)),
+        );
+    }
+
     /// Get the assignment for a single replica (convenience wrapper).
     pub async fn schedule_single(
         &self,
@@ -1537,11 +1550,11 @@ impl NodeScheduler {
         Ok(assignments.remove(0))
     }
 
-    /// The replicas each pool entry already runs, in pool order. A failed
-    /// count degrades to load-only ranking (all zero) rather than failing
-    /// the placement.
+    /// The replicas each pool entry already runs or was just given, in pool
+    /// order. A failed count degrades to load-only ranking (all zero) rather
+    /// than failing the placement.
     async fn running_replicas(&self, pool: &[PoolEntry]) -> Vec<u32> {
-        match self.node_service.running_replica_counts().await {
+        match self.node_service.committed_replica_counts().await {
             Ok(counts) => pool
                 .iter()
                 .map(|entry| counts.get(&entry.node_id()).copied().unwrap_or(0))
@@ -4022,6 +4035,51 @@ mod tests {
             vec![2, 2, 2],
             "{running:?}"
         );
+    }
+
+    /// Two deployments placed before either one's container is registered
+    /// read the same (zero) replica counts. The first placement must count
+    /// for the second, or both land on the worker that reads least loaded.
+    #[tokio::test]
+    async fn overlapping_placements_do_not_pick_the_same_worker() {
+        let workers = || vec![idle_worker(1, 1.0), idle_worker(2, 0.0)];
+        let none_registered: Vec<std::collections::BTreeMap<&str, sea_orm::Value>> = Vec::new();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![workers()])
+            .append_query_results(vec![none_registered.clone()])
+            .append_query_results(vec![workers()])
+            .append_query_results(vec![none_registered])
+            .into_connection();
+        // Placements share the process's node service, as every scheduler does.
+        let node_service = Arc::new(NodeService::new(Arc::new(db)));
+        let first = NodeScheduler::new(node_service.clone()).with_local_workloads_enabled(false);
+        let second = NodeScheduler::new(node_service).with_local_workloads_enabled(false);
+
+        let a = first.schedule_replicas(1, None, None, false).await.unwrap();
+        first.record_placed(&a);
+        let b = second
+            .schedule_replicas(1, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(a[0].node_id(), Some(2), "the first goes to the lowest load");
+        assert_eq!(
+            b[0].node_id(),
+            Some(1),
+            "the second sees the first placement although no container row exists yet"
+        );
+    }
+
+    #[test]
+    fn recent_placements_expire_and_stay_bounded() {
+        use crate::services::node_service::{RecentPlacements, PLACEMENT_RESERVATION_TTL};
+        let placements = RecentPlacements::default();
+        let start = std::time::Instant::now();
+        placements.record([1, 1, 2], start);
+        assert_eq!(placements.counts(start).get(&1), Some(&2));
+        assert_eq!(placements.counts(start).get(&2), Some(&1));
+        assert!(placements
+            .counts(start + PLACEMENT_RESERVATION_TTL)
+            .is_empty());
     }
 
     /// Regression: a worker that has just joined has sent no capacity report

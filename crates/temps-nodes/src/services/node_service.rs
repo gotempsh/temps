@@ -1243,11 +1243,101 @@ fn reserved_identity_claimed<'a>(
 
 pub struct NodeService {
     db: Arc<DatabaseConnection>,
+    /// Replicas placed in this process whose container rows may not exist
+    /// yet (see [`RecentPlacements`]).
+    recent_placements: RecentPlacements,
+}
+
+/// How long a placement counts as a replica on its node before its container
+/// row is expected to exist: a deploy writes the row once the container is
+/// created, after pulling the image. While both exist the replica counts
+/// twice, which only makes the next placement lean further away from it.
+pub const PLACEMENT_RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Placements kept at most; older ones are dropped first. A bound on memory
+/// for a burst of deployments, far above what two minutes of placements hold.
+const MAX_RECENT_PLACEMENTS: usize = 4096;
+
+/// The nodes replicas were placed on in the last [`PLACEMENT_RESERVATION_TTL`].
+///
+/// Replica counts are read from `deployment_containers`, and a placement's
+/// container row is written only once its container starts. Two placements
+/// that overlap would otherwise read the same counts and pick the same node;
+/// counting recent placements too spreads them.
+#[derive(Default)]
+pub(crate) struct RecentPlacements {
+    placed: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, i32)>>,
+}
+
+impl RecentPlacements {
+    pub(crate) fn record(&self, node_ids: impl IntoIterator<Item = i32>, now: std::time::Instant) {
+        let mut placed = self
+            .placed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::expire(&mut placed, now);
+        for node_id in node_ids {
+            if placed.len() == MAX_RECENT_PLACEMENTS {
+                placed.pop_front();
+            }
+            placed.push_back((now, node_id));
+        }
+    }
+
+    /// Placements per node that have not expired at `now`.
+    pub(crate) fn counts(&self, now: std::time::Instant) -> std::collections::HashMap<i32, u32> {
+        let mut placed = self
+            .placed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::expire(&mut placed, now);
+        let mut counts = std::collections::HashMap::new();
+        for (_, node_id) in placed.iter() {
+            *counts.entry(*node_id).or_insert(0u32) += 1;
+        }
+        counts
+    }
+
+    fn expire(
+        placed: &mut std::collections::VecDeque<(std::time::Instant, i32)>,
+        now: std::time::Instant,
+    ) {
+        while placed
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= PLACEMENT_RESERVATION_TTL)
+        {
+            placed.pop_front();
+        }
+    }
 }
 
 impl NodeService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            recent_placements: RecentPlacements::default(),
+        }
+    }
+
+    /// Record that replicas were just placed on these nodes (the control
+    /// plane as [`temps_core::CONTROL_PLANE_NODE_ID`]), so placements that
+    /// follow before their containers are registered count them.
+    pub fn record_placements(&self, node_ids: impl IntoIterator<Item = i32>) {
+        self.recent_placements
+            .record(node_ids, std::time::Instant::now());
+    }
+
+    /// [`Self::running_replica_counts`] plus the replicas placed in this
+    /// process in the last [`PLACEMENT_RESERVATION_TTL`].
+    pub async fn committed_replica_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<i32, u32>, NodeError> {
+        let mut counts = self.running_replica_counts().await?;
+        for (node_id, placed) in self.recent_placements.counts(std::time::Instant::now()) {
+            let count = counts.entry(node_id).or_insert(0);
+            *count = count.saturating_add(placed);
+        }
+        Ok(counts)
     }
 
     /// Reject a registration that claims an identity another node already
