@@ -3053,6 +3053,7 @@ mod tests {
             }),
             target_user_data: None,
             operation_id: Some("restore-run-5".to_string()),
+            set_configured_login: false,
         };
         let outcome = client(address)
             .postgres_walg_restore(&request)
@@ -3149,6 +3150,7 @@ mod tests {
                 recovery_target: None,
                 target_user_data: None,
                 operation_id: Some("restore-run-5".to_string()),
+                set_configured_login: false,
             })
             .await
             .expect_err("a dropped connection has no outcome");

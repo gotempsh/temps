@@ -4562,6 +4562,7 @@ mod tests {
             live_target_config: s3_config.clone(),
             pool: &mock_db,
             gate: &super::super::NoopRestoreGate,
+            restored_login: super::super::RestoredLogin::AsConfigured,
         };
 
         let restore_result = s3_service

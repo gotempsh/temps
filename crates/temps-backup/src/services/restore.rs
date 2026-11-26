@@ -18,7 +18,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use temps_providers::externalsvc::{RecoveryTarget, RestoreContext, ServiceType};
+use temps_providers::externalsvc::{RecoveryTarget, RestoreContext, RestoredLogin, ServiceType};
 use temps_providers::{ExternalServiceManager, S3Credentials};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -197,6 +197,11 @@ mod worker_mariadb;
 mod worker_mongodb;
 mod worker_outcome;
 pub use worker_outcome::ManagerWorkerRestoreResume;
+mod restored_inventory;
+pub use restored_inventory::{
+    MissingLinkedDatabase, RestoredDatabase, RestoredDatabaseKind, RestoredDatabaseUse,
+    RestoredDatabasesReport, RestoredDatabasesResponse, RestoredRole,
+};
 mod worker_redis;
 mod worker_walg;
 
@@ -945,6 +950,82 @@ impl RestoreService {
             "postgres" | "mongodb" | "mariadb"
         );
 
+        let is_cluster_in_place = target.topology == "cluster"
+            && target.service_type == "postgres"
+            && matches!(mode, RestoreRequestMode::InPlace);
+        // The same decision the restore makes: a physical PostgreSQL backup
+        // whose origin login is not held here gets the target's configured
+        // password set inside the restored data.
+        let sets_configured_login = !is_cluster_in_place && strategy == "walg_restore" && {
+            let origin_id = match &backup_row {
+                Some(backup) => backup_origin_service_id(self.db.as_ref(), backup).await,
+                None => None,
+            };
+            let origin_login_merged = match origin_id {
+                Some(id) if id != target.id => self
+                    .external_service_manager
+                    .get_service_config(id)
+                    .await
+                    .ok()
+                    .and_then(|origin| {
+                        RestoredServiceCredentials::from_origin(
+                            &target.service_type,
+                            &origin.parameters,
+                        )
+                    })
+                    .is_some(),
+                _ => false,
+            };
+            restored_login_for(
+                &target.service_type,
+                &resolved_location,
+                origin_id,
+                target.id,
+                origin_login_merged,
+            ) == RestoredLogin::SetConfiguredPassword
+        };
+        let configured_user = if sets_configured_login {
+            self.external_service_manager
+                .get_service_config(target.id)
+                .await
+                .ok()
+                .and_then(|config| {
+                    config
+                        .parameters
+                        .get("username")
+                        .and_then(|user| user.as_str())
+                        .map(str::to_string)
+                })
+        } else {
+            None
+        };
+        if sets_configured_login {
+            warnings.push(users_from_another_server_warning(
+                configured_user.as_deref(),
+                mode.is_destructive(),
+            ));
+        }
+        // Data from another service or server keeps its own database names,
+        // which need not be the ones this server's links read.
+        if engine_lower == "postgres" && (sets_configured_login || origin_binding.cross_service) {
+            let expected: Vec<String> = if matches!(mode, RestoreRequestMode::InPlace) {
+                match self
+                    .external_service_manager
+                    .linked_databases(target.id)
+                    .await
+                {
+                    Ok(linked) => linked.links.into_iter().map(|link| link.database).collect(),
+                    Err(error) => {
+                        warn!(service_id = target.id, %error, "Could not read the databases linked projects expect for the restore preview");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            warnings.push(database_names_warning(&expected));
+        }
+
         if mode.is_destructive()
             && engine_preserves_source_credentials
             && matches!(
@@ -982,12 +1063,12 @@ impl RestoreService {
                     }
                 }
             } else if strategy == "walg_restore" {
-                warnings.push(
-                    physical_postgres_login_warning(
-                        target.topology == "cluster" && target.service_type == "postgres",
-                    )
-                    .into(),
-                );
+                // A single server sets its own login inside the restored
+                // data (warned about above, for every mode); an in-place
+                // cluster restore does not.
+                if is_cluster_in_place {
+                    warnings.push(cluster_physical_restore_warning().into());
+                }
             } else {
                 warnings.push(
                     "Password change (origin unknown): after restore, the database will expect the password from the original backup's service, which this Temps no longer tracks. You may need to reset the password manually via `ALTER USER` after the restore completes."
@@ -1094,6 +1175,13 @@ impl RestoreService {
                     }
                 }
             }
+        }
+
+        if sets_configured_login {
+            insert_after_start_step(
+                &mut steps,
+                set_configured_login_step(configured_user.as_deref()),
+            );
         }
 
         // MinIO / RustFS reachability sanity check is done implicitly when
@@ -1479,6 +1567,7 @@ impl RestoreService {
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
             restored_login_encrypted: Set(None),
+            restored_inventory: Set(None),
         };
         let run = insert_restore_run(
             self.db.as_ref(),
@@ -1604,6 +1693,53 @@ impl RestoreService {
             .all(self.db.as_ref())
             .await?;
         views_with_source_backups(self.db.as_ref(), runs).await
+    }
+
+    /// What the latest completed restore into PostgreSQL service
+    /// `service_id` brought back, compared with the database each linked
+    /// project reads. `visible_projects` limits the projects the report
+    /// names (`None`: all of them). `None` when that restore recorded
+    /// nothing.
+    pub async fn restored_databases(
+        &self,
+        service_id: i32,
+        visible_projects: Option<&BTreeSet<i32>>,
+    ) -> Result<Option<RestoredDatabasesReport>, RestoreError> {
+        let service = self
+            .external_service_manager
+            .get_service(service_id)
+            .await
+            .map_err(|error| match error {
+                temps_providers::ExternalServiceError::ServiceNotFound { .. } => {
+                    RestoreError::ServiceNotFound { service_id }
+                }
+                other => RestoreError::ExternalService {
+                    reason: format!("loading service {service_id}: {other}"),
+                },
+            })?;
+        if service.service_type != "postgres" {
+            return Ok(None);
+        }
+        let Some((run, inventory)) =
+            restored_inventory::latest_restored_inventory(self.db.as_ref(), service_id).await?
+        else {
+            return Ok(None);
+        };
+        let linked = self
+            .external_service_manager
+            .linked_databases(service_id)
+            .await
+            .map_err(|error| RestoreError::ExternalService {
+                reason: format!(
+                    "reading the databases the projects linked to service {service_id} read: {error}"
+                ),
+            })?;
+        Ok(Some(restored_inventory::build_report(
+            &run,
+            inventory,
+            &linked,
+            visible_projects,
+        )))
     }
 
     /// Resolve every external service that produced a backup. An empty result
@@ -1894,19 +2030,90 @@ fn validate_pitr_recovery_target(
 /// fails. A single server keeps its original data until the restored one
 /// passes verification and puts it back otherwise; a cluster restore removes
 /// every member's data before seeding the primary, so nothing is put back.
-fn physical_postgres_login_warning(is_cluster: bool) -> &'static str {
-    if is_cluster {
-        "This physical PostgreSQL backup contains the original roles and passwords. \
-         Configure the destination service with the original database name, username and \
-         password before restoring. An in-place cluster restore removes every member's data \
-         before the backup is seeded and cannot put it back if a later step fails: take a \
-         fresh backup first, or restore into a new service."
+/// The restore preview's notice for a physical PostgreSQL backup from a
+/// server whose login this one does not hold: what comes back with the data,
+/// and the one password Temps changes so it can manage the restored database.
+fn users_from_another_server_warning(configured_user: Option<&str>, in_place: bool) -> String {
+    let user = configured_user.map_or_else(
+        || "this service's user".to_string(),
+        |user| format!("'{user}'"),
+    );
+    let rollback = if in_place {
+        " If Temps cannot sign in to the restored database afterwards, it puts the original \
+         data back."
     } else {
-        "This physical PostgreSQL backup contains the original roles and passwords. \
-         Configure the destination service with the original database name, username and \
-         password before restoring. Temps uses that login to verify recovery and puts the \
-         original data back if verification fails."
+        ""
+    };
+    format!(
+        "Users from another server: this backup carries the users and passwords of the \
+         server that made it. Temps keeps all of them, and sets the password of {user} to \
+         this service's password so Temps can manage the restored database. Every other \
+         user keeps its password from the source server, so rotate any you do not trust.{rollback}"
+    )
+}
+
+/// The preview note about database names after a restore from another
+/// service or server. `expected` are the databases the target's linked
+/// projects read.
+fn database_names_warning(expected: &[String]) -> String {
+    let mut names: Vec<&str> = expected.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names.dedup();
+    let linked = match names.as_slice() {
+        [] => "Linked apps read the database named for their project and environment on this \
+               server (such as 'shop_production')."
+            .to_string(),
+        names => format!(
+            "The projects linked to this service read {}.",
+            names
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    format!(
+        "Database names: the backup keeps the database names of the service that made it. \
+         {linked} A restored database with another name is kept, but no app reads it until \
+         you point the project's link at it. After the restore, the service page lists the \
+         restored databases and offers that change."
+    )
+}
+
+/// The restore step that sets the configured login, in the preview.
+fn set_configured_login_step(configured_user: Option<&str>) -> String {
+    let user = configured_user.map_or_else(
+        || "this service's user".to_string(),
+        |user| format!("'{user}'"),
+    );
+    format!(
+        "Before verifying, set the password of {user} inside the restored data to the one \
+         Temps stores for this service (creating the user if the backup has none), and \
+         create this service's database, empty, if the backup has none; every other user \
+         keeps its password from the backup"
+    )
+}
+
+/// Places `step` right after the step that starts PostgreSQL on the restored
+/// data, where the restore runs it; at the end when there is no such step.
+fn insert_after_start_step(steps: &mut Vec<String>, step: String) {
+    let start = steps.iter().rposition(|existing| {
+        existing.starts_with("Start ") || existing.starts_with("Run the WAL-G restore sequence")
+    });
+    match start {
+        Some(index) => steps.insert(index + 1, step),
+        None => steps.push(step),
     }
+}
+
+/// An in-place restore of a PostgreSQL cluster neither sets the configured
+/// login inside the restored data nor keeps the members' data to put back.
+fn cluster_physical_restore_warning() -> &'static str {
+    "This physical PostgreSQL backup contains the original roles and passwords. \
+     Configure the destination service with the original database name, username and \
+     password before restoring. An in-place cluster restore removes every member's data \
+     before the backup is seeded and cannot put it back if a later step fails: take a \
+     fresh backup first, or restore into a new service."
 }
 
 /// Check a point-in-time target for a PostgreSQL backup this server does not
@@ -2402,6 +2609,32 @@ fn credential_propagation_gates(target_service_type: &str, backup_location: &str
     }
 }
 
+/// Whether a restore sets the target's configured login inside the restored
+/// data ([`RestoredLogin::SetConfiguredPassword`]).
+///
+/// Only a physical PostgreSQL backup (WAL-G, an `s3://` location) carries its
+/// origin's roles and passwords into the restored data. When the origin's
+/// login was merged into the restore's config, or the backup is the target's
+/// own, the restored data already accepts the configured login. Otherwise the
+/// backup came from a server this one does not know (found in S3, or its
+/// service is gone) and its passwords are not held here: the restore sets the
+/// configured one. Every other engine keeps [`RestoredLogin::AsConfigured`].
+fn restored_login_for(
+    target_service_type: &str,
+    backup_location: &str,
+    origin_service_id: Option<i32>,
+    target_service_id: i32,
+    origin_login_merged: bool,
+) -> RestoredLogin {
+    let physical_postgres = target_service_type.eq_ignore_ascii_case("postgres")
+        && backup_location.starts_with("s3://");
+    if !physical_postgres || origin_login_merged || origin_service_id == Some(target_service_id) {
+        RestoredLogin::AsConfigured
+    } else {
+        RestoredLogin::SetConfiguredPassword
+    }
+}
+
 /// The origin's login an offline restore (PostgreSQL, a physical MariaDB
 /// base) runs with, merged over the target's configuration: the restored
 /// auth catalog (`pg_authid`, `mysql.user`) answers to it. `root_password`
@@ -2435,6 +2668,7 @@ async fn run_restore_worker(
     // here as a `JoinError` instead of unwinding past the terminal-state
     // write below and leaving the run `running` with no owner.
     let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
+    let mgr_for_inventory = mgr.clone();
     let inner = tokio::spawn(run_restore_inner(
         db.clone(),
         mgr,
@@ -2510,6 +2744,9 @@ async fn run_restore_worker(
     // The worker is done with its cancellation token.
     drop(registration);
     let persisted = persist_terminal_state(&db, run_id, &result, TERMINAL_WRITE_RETRY).await;
+    if result.is_ok() && matches!(persisted, Ok(TerminalDisposition::WorkerResult)) {
+        restored_inventory::record_restored_inventory(&db, &mgr_for_inventory, run_id).await;
+    }
     let outcome = match persisted {
         Ok(disposition) => disposition.worker_outcome(run_id, result),
         Err(error) => {
@@ -3074,6 +3311,25 @@ async fn run_restore_inner(
             .await?;
     }
 
+    // Chosen once the location is final: a backup recorded without one is
+    // backfilled from S3 above, and may only now name a WAL-G base backup.
+    let restored_login = restored_login_for(
+        &target_service.service_type,
+        &backup_model.s3_location,
+        origin_service_id,
+        target_service.id,
+        origin_credentials_for_post_restore_patch.is_some(),
+    );
+    if restored_login == RestoredLogin::SetConfiguredPassword {
+        info!(
+            run_id,
+            service_id = target_service.id,
+            backup_id = backup_model.id,
+            "The backup's origin login is not held here: the restore sets service {}'s configured password inside the restored data",
+            target_service.id
+        );
+    }
+
     let ctx = RestoreContext {
         s3_client: &s3_client,
         s3_credentials: &s3_credentials,
@@ -3085,6 +3341,7 @@ async fn run_restore_inner(
         live_target_config,
         pool: db.as_ref(),
         gate: &gate,
+        restored_login,
     };
 
     let new_service_parameters = match mode {
@@ -5564,12 +5821,105 @@ mod tests {
     }
 
     #[test]
+    fn the_database_names_note_names_what_linked_projects_read() {
+        let generic = database_names_warning(&[]);
+        assert!(
+            generic.contains("named for their project and environment"),
+            "{generic}"
+        );
+        assert!(generic.contains("service page"), "{generic}");
+
+        let named = database_names_warning(&[
+            "shop_staging".to_string(),
+            "shop_production".to_string(),
+            "shop_staging".to_string(),
+        ]);
+        assert!(
+            named.contains("read 'shop_production', 'shop_staging'."),
+            "{named}"
+        );
+    }
+
+    #[test]
     fn physical_restore_warning_promises_rollback_only_where_it_exists() {
-        let single = physical_postgres_login_warning(false);
-        assert!(single.contains("puts the original data back"));
-        let cluster = physical_postgres_login_warning(true);
+        let single = users_from_another_server_warning(Some("app"), true);
+        assert!(single.contains("puts the original data back"), "{single}");
+        let copy = users_from_another_server_warning(Some("app"), false);
+        assert!(!copy.contains("original data"), "{copy}");
+        let cluster = cluster_physical_restore_warning();
         assert!(cluster.contains("cannot put it back"), "{cluster}");
         assert!(!cluster.contains("puts the original data back"));
+    }
+
+    #[test]
+    fn users_from_another_server_notice_names_the_one_password_changed() {
+        let notice = users_from_another_server_warning(Some("app"), false);
+        assert!(notice.starts_with("Users from another server"), "{notice}");
+        assert!(notice.contains("Temps keeps all of them"), "{notice}");
+        assert!(notice.contains("sets the password of 'app'"), "{notice}");
+        assert!(notice.contains("rotate any you do not trust"), "{notice}");
+        let unnamed = users_from_another_server_warning(None, false);
+        assert!(unnamed.contains("this service's user"), "{unnamed}");
+    }
+
+    #[test]
+    fn only_a_physical_postgres_backup_from_an_unknown_login_sets_the_password() {
+        let s3 = "s3://bucket/walg/basebackups_005/base_000000010000000000000002";
+        // Another server's backup, or a deleted service's: origin login unknown.
+        assert_eq!(
+            restored_login_for("postgres", s3, None, 7, false),
+            RestoredLogin::SetConfiguredPassword
+        );
+        assert_eq!(
+            restored_login_for("Postgres", s3, Some(3), 7, false),
+            RestoredLogin::SetConfiguredPassword
+        );
+        // The origin login is merged into the target: it already answers.
+        assert_eq!(
+            restored_login_for("postgres", s3, Some(3), 7, true),
+            RestoredLogin::AsConfigured
+        );
+        // The target's own backup: its login is the restored one.
+        assert_eq!(
+            restored_login_for("postgres", s3, Some(7), 7, false),
+            RestoredLogin::AsConfigured
+        );
+        // A logical dump carries no roles; other engines are not affected.
+        assert_eq!(
+            restored_login_for("postgres", "backups/7/dump.sql.gz", None, 7, false),
+            RestoredLogin::AsConfigured
+        );
+        assert_eq!(
+            restored_login_for("mariadb", s3, None, 7, false),
+            RestoredLogin::AsConfigured
+        );
+    }
+
+    #[test]
+    fn the_login_step_follows_the_step_that_starts_postgres() {
+        let mut steps = vec![
+            "Stop pg".to_string(),
+            "Start pg. PostgreSQL enters recovery".to_string(),
+            "Wait for container to report healthy".to_string(),
+        ];
+        insert_after_start_step(&mut steps, set_configured_login_step(Some("app")));
+        assert!(steps[2].contains("set the password of 'app'"), "{steps:?}");
+        assert!(
+            steps[2].contains("create this service's database, empty, if the backup has none"),
+            "{steps:?}"
+        );
+        assert_eq!(steps[3], "Wait for container to report healthy");
+
+        let mut clone = vec![
+            "Run the WAL-G restore sequence against the new container".to_string(),
+            "Persist the new service in the database".to_string(),
+        ];
+        insert_after_start_step(&mut clone, set_configured_login_step(None));
+        assert!(clone[1].contains("this service's user"), "{clone:?}");
+
+        let mut other = vec!["Fetch".to_string()];
+        insert_after_start_step(&mut other, "login".to_string());
+        assert_eq!(other.last().map(String::as_str), Some("login"));
     }
 
     #[test]
@@ -6533,6 +6883,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         };
         let view: RestoreRunView = model.clone().into();
         assert!(view.cancellable);
@@ -6573,6 +6924,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         };
         let v: RestoreRunView = model.into();
         assert_eq!(v.id, 42);
@@ -6736,6 +7088,7 @@ mod tests {
             cancel_requested_at: Some(now),
             cancel_requested_by: Some(1),
             restored_login_encrypted: None,
+            restored_inventory: None,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_exec_results([sea_orm::MockExecResult {
@@ -7637,6 +7990,7 @@ mod tests {
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
             restored_login_encrypted: Set(None),
+            restored_inventory: Set(None),
         }
     }
 
@@ -8266,6 +8620,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         }
     }
 

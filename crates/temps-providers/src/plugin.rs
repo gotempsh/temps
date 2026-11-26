@@ -383,6 +383,8 @@ impl TempsPlugin for ProvidersPlugin {
             crate::handlers::server_tls_handlers::configure_routes().with_state(app_state.clone());
         let archive_target_routes = crate::handlers::archive_target_handlers::configure_routes()
             .with_state(app_state.clone());
+        let link_database_routes = crate::handlers::link_database_handlers::configure_routes()
+            .with_state(app_state.clone());
         let healthcheck_defaults =
             context.require_service::<crate::services::HealthcheckDefaultsService>();
         let healthcheck_routes = crate::handlers::healthcheck_handlers::configure_routes()
@@ -399,6 +401,7 @@ impl TempsPlugin for ProvidersPlugin {
             .merge(workload_routes)
             .merge(server_tls_routes)
             .merge(archive_target_routes)
+            .merge(link_database_routes)
             .merge(healthcheck_routes);
         Some(PluginRoutes::new(router))
     }
@@ -418,6 +421,8 @@ impl TempsPlugin for ProvidersPlugin {
         let archive_target = <ArchiveTargetApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::healthcheck_handlers::HealthcheckApiDoc;
         let healthcheck = <HealthcheckApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::link_database_handlers::LinkDatabaseApiDoc;
+        let link_database = <LinkDatabaseApiDoc as OpenApiTrait>::openapi();
         Some(merge_openapi_schemas(
             base,
             vec![
@@ -427,6 +432,7 @@ impl TempsPlugin for ProvidersPlugin {
                 server_tls,
                 archive_target,
                 healthcheck,
+                link_database,
             ],
         ))
     }

@@ -411,6 +411,7 @@ impl PostgresService {
         container_name: &str,
         recreate: &SwapRecreate,
         postgres_config: &PostgresConfig,
+        restored_login: crate::externalsvc::RestoredLogin,
     ) -> Result<()> {
         match recreate {
             SwapRecreate::Imported { restored, .. } => {
@@ -461,7 +462,21 @@ impl PostgresService {
         // Docker's running state alone is not SQL readiness for an imported
         // container without a healthcheck. Authenticate with the restored
         // login and wait for recovery before checking policy or reporting
-        // success.
+        // success. A backup from a server whose login Temps does not hold
+        // answers only to that server's passwords: set the configured one
+        // first, over the container's local socket.
+        if restored_login == crate::externalsvc::RestoredLogin::SetConfiguredPassword {
+            let roles = self
+                .set_configured_login(container_name, postgres_config)
+                .await?;
+            info!(
+                service = %self.name,
+                container = container_name,
+                username = %postgres_config.username,
+                restored_roles = %roles.join(", "),
+                "Restored data from another server: set the configured user's password; the other roles keep the passwords from the backup"
+            );
+        }
         self.wait_for_restored_database(postgres_config).await?;
         let (mode, _) = self
             .active_archive_settings(postgres_config, "/bin/true")
