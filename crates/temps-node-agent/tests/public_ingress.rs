@@ -1637,6 +1637,21 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
     .await
     .expect("start the private listener");
 
+    // A route's range is not enough: this worker's consent must admit the
+    // peer too (ADR-115 D8). Admitting nobody refuses even a peer inside
+    // the route's range.
+    let unadmitted = raw_request(private.http_address(), "inside.example.test").await;
+    assert!(unadmitted.starts_with("HTTP/1.1 403"), "{unadmitted}");
+    assert!(
+        unadmitted
+            .to_ascii_lowercase()
+            .contains("x-temps-private-ingress: outside-range"),
+        "{unadmitted}"
+    );
+    // What the ingress manager publishes from the consent before it binds
+    // the listener.
+    store.set_private_admit(vec!["127.0.0.0/8".parse().unwrap()]);
+
     let inside = raw_request(private.http_address(), "inside.example.test").await;
     assert!(inside.starts_with("HTTP/1.1 308"), "{inside}");
     assert!(
