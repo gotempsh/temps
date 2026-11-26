@@ -30,8 +30,8 @@ const ROUTE: RouteResponse = {
   port: 8080,
   enabled: true,
   route_type: 'http',
-  created_at: 0,
-  updated_at: 0,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
 }
 
 function renderRoutes(reloadRoutes: () => void) {

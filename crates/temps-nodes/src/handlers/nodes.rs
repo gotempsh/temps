@@ -808,11 +808,13 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::node_public_ingress::get_public_ingress_settings,
         crate::handlers::node_public_ingress::update_public_ingress_settings,
         crate::handlers::node_public_ingress::check_public_ingress,
+        admin_get_node_build_limits,
         admin_set_node_build_limits,
         cluster_dns_status,
         node_capability,
         crate::handlers::wireguard_mesh::wireguard_mesh_status,
         crate::handlers::wireguard_mesh::enable_wireguard_mesh,
+        crate::handlers::wireguard_mesh::disable_wireguard_mesh,
         crate::handlers::wireguard_mesh::set_wireguard_mesh_hub,
         crate::handlers::cluster_network::get_cluster_network,
         crate::handlers::cluster_network::update_cluster_network,
@@ -827,6 +829,7 @@ pub struct ClusterDnsStatusResponse {
     ),
     components(schemas(
         temps_deployer::build_protocol::BuildLimits,
+        NodeBuildLimitsResponse,
         RegisterNodeApiRequest,
         RegisterNodeResponse,
         MeshEnrollApiRequest,
@@ -947,7 +950,7 @@ pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
     Router::new()
         .route(
             "/internal/nodes/{node_id}/build-limits",
-            axum::routing::put(admin_set_node_build_limits),
+            get(admin_get_node_build_limits).put(admin_set_node_build_limits),
         )
         .route("/internal/nodes", get(admin_list_nodes))
         .route(
@@ -1021,7 +1024,8 @@ pub fn configure_admin_routes() -> Router<Arc<NodeAdminState>> {
         .route(
             "/nodes/wireguard",
             get(crate::handlers::wireguard_mesh::wireguard_mesh_status)
-                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh),
+                .post(crate::handlers::wireguard_mesh::enable_wireguard_mesh)
+                .delete(crate::handlers::wireguard_mesh::disable_wireguard_mesh),
         )
         .route(
             "/nodes/wireguard/hub",
@@ -3154,13 +3158,60 @@ async fn admin_set_node_public_ingress(
     }))
 }
 
+/// A worker's effective build limits.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NodeBuildLimitsResponse {
+    pub node_id: i32,
+    /// Builds the node runs at once.
+    pub concurrency: u16,
+    /// How long a build may wait for a free slot, in seconds.
+    pub queue_wait_seconds: u32,
+    /// How long a build may run, in seconds.
+    pub build_timeout_seconds: u32,
+    /// True when no limits were saved for the node, so these are the
+    /// defaults (and follow a future change of them).
+    pub is_default: bool,
+}
+
+/// Read a worker node's effective build limits, and whether they are the
+/// defaults. The control plane (node 0) has no per-node build limits and is
+/// answered with a 400 that says so.
+#[utoipa::path(
+    tag = "Nodes", get, path = "/internal/nodes/{node_id}/build-limits",
+    operation_id = "admin_get_node_build_limits",
+    params(("node_id" = i32, Path, description = "Worker node ID")),
+    responses((status = 200, description = "The worker's effective build limits, and whether they are the defaults", body = NodeBuildLimitsResponse),
+        (status = 400, description = "The node is the control plane or not a worker"),
+        (status = 401, description = "Unauthorized"), (status = 403, description = "Forbidden"),
+        (status = 404, description = "Node not found"),
+        (status = 500, description = "Stored limits are invalid or storage failed")),
+    security(("bearer_auth" = []))
+)]
+async fn admin_get_node_build_limits(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<NodeAdminState>>,
+    Path(node_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    // The same permission as the write: the limits are part of the node's
+    // settings, read back to confirm a change.
+    permission_guard!(auth, SettingsWrite);
+    let current = app_state.node_service.get_build_limits(node_id).await?;
+    Ok(Json(NodeBuildLimitsResponse {
+        node_id,
+        concurrency: current.limits.concurrency,
+        queue_wait_seconds: current.limits.queue_wait_seconds,
+        build_timeout_seconds: current.limits.build_timeout_seconds,
+        is_default: current.is_default,
+    }))
+}
+
 #[utoipa::path(
     tag = "Nodes", put, path = "/internal/nodes/{node_id}/build-limits",
     operation_id = "admin_set_node_build_limits",
     request_body = temps_deployer::build_protocol::BuildLimits,
     params(("node_id" = i32, Path, description = "Worker node ID")),
     responses((status = 200, body = temps_deployer::build_protocol::BuildLimits),
-        (status = 400, description = "Invalid limits or node role"),
+        (status = 400, description = "Invalid limits, node role, or the control plane (node 0)"),
         (status = 401, description = "Unauthorized"), (status = 403, description = "Forbidden"),
         (status = 404, description = "Node not found"), (status = 500, description = "Storage failed")),
     security(("bearer_auth" = []))
@@ -4431,6 +4482,18 @@ impl From<NodeError> for Problem {
             NodeError::NotFoundById { node_id } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Node Not Found")
                 .with_detail(format!("Node with id {} not found", node_id)),
+            NodeError::ControlPlaneHasNoBuildLimits { node_id } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Control Plane Has No Build Limits")
+                    .with_detail(error.to_string())
+                    .with_value("node_id", node_id)
+            }
+            NodeError::InvalidStoredBuildLimits { node_id, .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Stored Build Limits Invalid")
+                    .with_detail(error.to_string())
+                    .with_value("node_id", node_id)
+            }
             NodeError::AlreadyExists { ref name } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Node Already Exists")
                 .with_detail(format!("Node '{}' already exists", name)),
@@ -4919,6 +4982,99 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["total"], 0, "{body}");
+    }
+
+    /// `GET /internal/nodes/{id}/build-limits` (#2049): the PUT's
+    /// permission, the effective limits with whether they are defaults, and
+    /// an explicit 400 for the control plane instead of "not found".
+    #[tokio::test]
+    async fn build_limits_read_needs_settings_write() {
+        use crate::handlers::wireguard_mesh::admin_test_support::{mock_db, send, settings_reader};
+        let uri = "/internal/nodes/1/build-limits";
+        let (status, _, _) = send(admin_router(mock_db()), "GET", uri, None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, body) = send(
+            admin_router(mock_db()),
+            "GET",
+            uri,
+            None,
+            Some(settings_reader()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+
+    #[tokio::test]
+    async fn build_limits_read_reports_defaults_and_saved_values() {
+        use crate::handlers::wireguard_mesh::admin_test_support::{admin, mock_db, send};
+        let uri = "/internal/nodes/1/build-limits";
+
+        let db = mock_db().append_query_results(vec![vec![sample_node()]]);
+        let (status, _, body) = send(admin_router(db), "GET", uri, None, Some(admin())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["node_id"], 1);
+        assert_eq!(body["concurrency"], 1);
+        assert_eq!(body["queue_wait_seconds"], 300);
+        assert_eq!(body["build_timeout_seconds"], 1800);
+        assert_eq!(body["is_default"], true, "{body}");
+
+        let mut saved = sample_node();
+        saved.build_limits = Some(serde_json::json!({
+            "concurrency": 4,
+            "queue_wait_seconds": 60,
+            "build_timeout_seconds": 900,
+            "_version": 3,
+        }));
+        let db = mock_db().append_query_results(vec![vec![saved]]);
+        let (status, _, body) = send(admin_router(db), "GET", uri, None, Some(admin())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["concurrency"], 4);
+        assert_eq!(body["queue_wait_seconds"], 60);
+        assert_eq!(body["build_timeout_seconds"], 900);
+        assert_eq!(body["is_default"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_has_no_build_limits_rather_than_being_missing() {
+        use crate::handlers::wireguard_mesh::admin_test_support::{admin, mock_db, send};
+        for method in ["GET", "PUT"] {
+            let body = (method == "PUT").then(|| {
+                serde_json::json!({
+                    "concurrency": 2,
+                    "queue_wait_seconds": 60,
+                    "build_timeout_seconds": 900
+                })
+            });
+            let (status, _, problem) = send(
+                admin_router(mock_db()),
+                method,
+                "/internal/nodes/0/build-limits",
+                body,
+                Some(admin()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {problem}");
+            let detail = problem["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("control plane"), "{method}: {detail}");
+            assert!(!detail.contains("not found"), "{method}: {detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_worker_node_has_no_build_limits() {
+        use crate::handlers::wireguard_mesh::admin_test_support::{admin, mock_db, send};
+        let mut edge = sample_node();
+        edge.role = "edge".to_string();
+        let db = mock_db().append_query_results(vec![vec![edge]]);
+        let (status, _, body) = send(
+            admin_router(db),
+            "GET",
+            "/internal/nodes/1/build-limits",
+            None,
+            Some(admin()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 
     #[tokio::test]
@@ -7546,6 +7702,10 @@ mod tests {
             db.as_ref(),
             "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=",
             Some("198.51.100.1:51820".parse().unwrap()),
+            &temps_network::mesh::load_settings(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -7730,6 +7890,10 @@ mod tests {
             db.as_ref(),
             "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=",
             Some("198.51.100.1:51820".parse().unwrap()),
+            &temps_network::mesh::load_settings(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap(),
         )
         .await
         .unwrap();

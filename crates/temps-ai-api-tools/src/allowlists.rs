@@ -945,6 +945,8 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "admin_get_environment_workload_isolation",
     "admin_get_environment_workload_mode",
     "admin_get_node_resources",
+    // A worker's build concurrency, queue wait and timeout: numbers only.
+    "admin_get_node_build_limits",
     "admin_list_environment_volumes",
     "get_effective_policy",
     // Which projects may call a project's internal addresses (ADR 101):

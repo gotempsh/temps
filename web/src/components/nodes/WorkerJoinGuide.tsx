@@ -1098,8 +1098,8 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           Docker app whose VM holds the node&apos;s end of the mesh.
         </li>
         <li>
-          Workers already on your private network keep using it. Once on, the
-          mesh stays on.
+          Workers already on your private network keep using it. The mesh can be
+          turned off again only while no node is on it.
         </li>
       </ul>
 
@@ -1141,7 +1141,8 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
             <AlertDialogDescription>
               Every node must accept UDP {mesh.listen_port} from the others.
               Cross-node traffic pauses for up to a minute while nodes switch
-              over, and the mesh cannot be turned off again.
+              over. The mesh can be turned off again only while no node is on
+              it.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

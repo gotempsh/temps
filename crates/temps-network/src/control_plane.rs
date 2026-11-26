@@ -419,7 +419,7 @@ pub async fn setup_mesh_only(
         mesh_key_dir,
     )
     .await?;
-    crate::mesh::publish_control_plane(db, end.key.public_key(), end.endpoint).await?;
+    publish_end(db, &end).await?;
     Ok(Some(ControlPlaneMesh { end }))
 }
 
@@ -534,6 +534,25 @@ async fn reconcile_mesh_peers(db: &DatabaseConnection) -> Result<(), ControlPlan
 /// is reused. With no endpoint at all the control plane is still on the mesh:
 /// it dials every node that publishes one. See
 /// [`crate::mesh::resolve_control_plane_endpoint`].
+/// Publish the control plane's end for workers. When the mesh settings
+/// changed while it was being set up (turned off, or on again with another
+/// pool or port), nothing is published: the reconciler notices the change
+/// and sets the end up again for the new settings.
+async fn publish_end(db: &DatabaseConnection, end: &MeshEnd) -> Result<(), ControlPlaneSetupError> {
+    let published =
+        crate::mesh::publish_control_plane(db, end.key.public_key(), end.endpoint, &end.settings)
+            .await?;
+    if !published {
+        warn!(
+            mesh = %end.settings.cidr,
+            listen_port = end.settings.port,
+            "the WireGuard mesh settings changed while the control plane set its end up; \
+             not publishing it, the end is set up again for the current settings"
+        );
+    }
+    Ok(())
+}
+
 async fn setup_mesh(
     db: &DatabaseConnection,
     settings: &crate::mesh::MeshSettings,
@@ -791,8 +810,7 @@ pub async fn setup(
             // Only now tell workers the mesh has a hub: a setup that failed
             // above must never move them onto it.
             if let Some(end) = &mesh_end {
-                crate::mesh::publish_control_plane(db.as_ref(), end.key.public_key(), end.endpoint)
-                    .await?;
+                publish_end(db.as_ref(), end).await?;
             }
             Ok(overlay)
         }

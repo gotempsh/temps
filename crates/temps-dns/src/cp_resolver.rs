@@ -76,6 +76,38 @@ impl ControlPlaneResolver {
     }
 }
 
+/// Why the control plane cannot serve cluster DNS on `gateway`, the app
+/// network's gateway its containers query, or `None` when it can try.
+///
+/// The resolver must listen on that address, so it has to be one of this
+/// machine's own. It is not when Docker runs in a VM (as it does on a Mac)
+/// or on another host: the bridge, and its gateway,
+/// live there. Binding fails the same way on every attempt, so this is told
+/// apart from an outage up front. Only "address not available" counts; any
+/// other error is left to the resolver start, which reports it.
+pub fn control_plane_resolver_unsupported(gateway: IpAddr) -> Option<String> {
+    let probe = std::net::UdpSocket::bind(SocketAddr::new(gateway, 0)).map(drop);
+    unsupported_reason(gateway, &probe, cfg!(target_os = "macos"))
+}
+
+fn unsupported_reason(gateway: IpAddr, probe: &std::io::Result<()>, macos: bool) -> Option<String> {
+    let error = probe.as_ref().err()?;
+    if error.kind() != std::io::ErrorKind::AddrNotAvailable {
+        return None;
+    }
+    let where_docker_runs = if macos {
+        "Docker runs in a Linux VM on this Mac"
+    } else {
+        "Docker runs in a VM or on another host"
+    };
+    Some(format!(
+        "{where_docker_runs}, so the app network's gateway {gateway} is not an address of \
+         this machine and the control plane cannot answer DNS there. Apps on the control \
+         plane use Docker's own DNS and cannot reach other services by their *.temps.local \
+         names; apps on workers are not affected"
+    ))
+}
+
 /// Whether a resolver answers its readiness marker at `address`. See
 /// [`temps_node_dns::probe::probe_resolver`].
 pub async fn probe_control_plane_resolver(address: SocketAddr) -> bool {
@@ -199,6 +231,45 @@ async fn start_resolver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gateway_that_is_not_on_this_machine_is_unsupported() {
+        // TEST-NET-1 (RFC 5737) is never assigned to a local interface.
+        let elsewhere: IpAddr = "192.0.2.1".parse().unwrap();
+        let reason = control_plane_resolver_unsupported(elsewhere).expect("unsupported");
+        assert!(reason.contains("192.0.2.1"), "{reason}");
+        assert!(
+            reason.contains("not an address of this machine"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("apps on workers are not affected"),
+            "{reason}"
+        );
+
+        let here: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(control_plane_resolver_unsupported(here), None);
+    }
+
+    #[test]
+    fn only_an_unavailable_address_counts_and_a_mac_is_named() {
+        let gateway: IpAddr = "172.20.0.1".parse().unwrap();
+        let unavailable = Err(std::io::Error::from(std::io::ErrorKind::AddrNotAvailable));
+        let mac = unsupported_reason(gateway, &unavailable, true).expect("unsupported");
+        assert!(
+            mac.starts_with("Docker runs in a Linux VM on this Mac"),
+            "{mac}"
+        );
+        let other = unsupported_reason(gateway, &unavailable, false).expect("unsupported");
+        assert!(
+            other.starts_with("Docker runs in a VM or on another host"),
+            "{other}"
+        );
+
+        let denied = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(unsupported_reason(gateway, &denied, true), None);
+        assert_eq!(unsupported_reason(gateway, &Ok(()), true), None);
+    }
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::service_endpoints;
 

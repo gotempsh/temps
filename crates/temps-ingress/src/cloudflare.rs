@@ -38,6 +38,12 @@ const CLOUDFLARED_AMD64_SHA256: &str =
     "3bfc539f45d2620c71debb7a86be0efa737ed5ccbad9eb85c787116900e5c586";
 const CLOUDFLARED_ARM64_SHA256: &str =
     "2c65dfabf616c40efc7545d107d7a57ad5e21377e2964b7e88af19a238074a46";
+/// macOS builds ship only as `.tgz` archives holding the `cloudflared` binary;
+/// these pin the archives.
+const CLOUDFLARED_DARWIN_AMD64_SHA256: &str =
+    "3b0dbaf378337e9d7fb6cd235a76d1d6a7dee434c2d8edf9281164fb6a3837ab";
+const CLOUDFLARED_DARWIN_ARM64_SHA256: &str =
+    "647615df99d49cd179ea5e13ef760b9bbfb33630f6ae62f87e33dfadda60adcc";
 const CLOUDFLARED_IMAGE: &str = "cloudflare/cloudflared:2026.10.1@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5";
 
 pub struct CloudflareTunnelProvider {
@@ -422,12 +428,28 @@ impl TunnelProvider for CloudflareTunnelProvider {
                         arch: "x86_64".into(),
                         url: format!("{release}/cloudflared-linux-amd64"),
                         sha256: CLOUDFLARED_AMD64_SHA256.into(),
+                        archive_entry: None,
                     },
                     Artifact {
                         os: "linux".into(),
                         arch: "aarch64".into(),
                         url: format!("{release}/cloudflared-linux-arm64"),
                         sha256: CLOUDFLARED_ARM64_SHA256.into(),
+                        archive_entry: None,
+                    },
+                    Artifact {
+                        os: "macos".into(),
+                        arch: "x86_64".into(),
+                        url: format!("{release}/cloudflared-darwin-amd64.tgz"),
+                        sha256: CLOUDFLARED_DARWIN_AMD64_SHA256.into(),
+                        archive_entry: Some("cloudflared".into()),
+                    },
+                    Artifact {
+                        os: "macos".into(),
+                        arch: "aarch64".into(),
+                        url: format!("{release}/cloudflared-darwin-arm64.tgz"),
+                        sha256: CLOUDFLARED_DARWIN_ARM64_SHA256.into(),
+                        archive_entry: Some("cloudflared".into()),
                     },
                 ],
                 args: args.clone(),

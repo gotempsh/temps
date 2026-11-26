@@ -143,8 +143,8 @@ test('cached routes stay visible when a refresh fails', () => {
       port: 8080,
       enabled: true,
       route_type: 'http',
-      created_at: Date.parse('2026-01-01T00:00:00Z'),
-      updated_at: Date.parse('2026-01-01T00:00:00Z'),
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
     },
   ]
   client.setQueryData(listKey, cached)

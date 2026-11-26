@@ -77,7 +77,8 @@ export function UserEditDialog({
       path: {
         user_id: user.id,
       },
-      body: data,
+      // The API names the field `username`, as on create.
+      body: { email: data.email, username: data.name },
     })
   }
 

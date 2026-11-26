@@ -630,23 +630,18 @@ impl GitProviderManager {
         }
     }
 
-    /// Partial credential update for an existing provider. Each `Option::Some`
+    /// Partial credential update for an existing provider. Each `Some`
     /// replaces the corresponding field; `None` keeps the stored value.
     /// Variant-matching is enforced against the provider's existing auth_method:
     /// you can't turn a PAT provider into a GitHub App here — delete and recreate.
-    #[allow(clippy::too_many_arguments)]
+    /// Basic-auth (username, password) and SSH-key (private and public key)
+    /// credentials are validated before they are stored; fields of another
+    /// auth method are refused for them.
     pub async fn update_provider_credentials(
         &self,
         provider_id: i32,
-        client_id: Option<String>,
-        client_secret: Option<String>,
-        app_id: Option<String>,
-        app_secret: Option<String>,
-        private_key: Option<String>,
-        webhook_secret: Option<String>,
-        redirect_uri: Option<String>,
-        token: Option<String>,
-    ) -> Result<git_providers::Model, GitProviderManagerError> {
+        update: super::ProviderCredentialsUpdate,
+    ) -> Result<super::CredentialsUpdated, GitProviderManagerError> {
         // The merge below reads the stored credentials and writes them back
         // with the supplied fields replaced. Read them under a row lock in the
         // transaction that writes, so two concurrent updates serialize: an
@@ -664,67 +659,22 @@ impl GitProviderManager {
         let current_json = self.decrypt_sensitive_data(&provider.auth_config).await?;
         let current_method: AuthMethod = serde_json::from_value(current_json)?;
 
-        let updated_method = match current_method {
-            AuthMethod::GitHubApp {
-                app_id: existing_app_id,
-                client_id: existing_client_id,
-                client_secret: existing_client_secret,
-                private_key: existing_private_key,
-                webhook_secret: existing_webhook_secret,
-            } => {
-                let new_app_id = match app_id {
-                    Some(v) => v.parse::<i32>().map_err(|_| {
-                        GitProviderManagerError::InvalidConfiguration(
-                            "app_id must be a valid integer for GitHub App".to_string(),
-                        )
-                    })?,
-                    None => existing_app_id,
-                };
-                AuthMethod::GitHubApp {
-                    app_id: new_app_id,
-                    client_id: client_id.unwrap_or(existing_client_id),
-                    client_secret: client_secret.unwrap_or(existing_client_secret),
-                    private_key: private_key.unwrap_or(existing_private_key),
-                    webhook_secret: webhook_secret.unwrap_or(existing_webhook_secret),
-                }
-            }
-            AuthMethod::GitLabApp {
-                app_id: existing_app_id,
-                app_secret: existing_app_secret,
-                redirect_uri: existing_redirect_uri,
-            } => AuthMethod::GitLabApp {
-                app_id: app_id.unwrap_or(existing_app_id),
-                app_secret: app_secret.unwrap_or(existing_app_secret),
-                redirect_uri: redirect_uri.unwrap_or(existing_redirect_uri),
-            },
-            AuthMethod::OAuth {
-                client_id: existing_client_id,
-                client_secret: existing_client_secret,
-                redirect_uri: existing_redirect_uri,
-            } => AuthMethod::OAuth {
-                client_id: client_id.unwrap_or(existing_client_id),
-                client_secret: client_secret.unwrap_or(existing_client_secret),
-                redirect_uri: redirect_uri.unwrap_or(existing_redirect_uri),
-            },
-            AuthMethod::PersonalAccessToken {
-                token: existing_token,
-            } => AuthMethod::PersonalAccessToken {
-                token: token.clone().unwrap_or(existing_token),
-            },
-            AuthMethod::BasicAuth { .. } | AuthMethod::SSHKey { .. } => {
-                return Err(GitProviderManagerError::InvalidConfiguration(
-                    "Credential editing is not supported for this auth method".to_string(),
-                ));
-            }
-        };
+        let new_token = update.token.clone();
+        let new_password = update.password.clone();
+        let (updated_method, updated_fields) =
+            super::credentials::merge_credentials(provider_id, current_method, update)?;
 
         // A PAT provider's connections each hold their own encrypted copy of
         // the token, and that copy is what repository sync and clones use
         // (`get_connection_token`). Rotating only the provider's config left
         // every connection on the old token, which fails as soon as the user
         // revokes it, so the new token is written to both, atomically.
-        let rotated_connection_token = match (&updated_method, token) {
-            (AuthMethod::PersonalAccessToken { .. }, Some(new_token)) => {
+        // A basic-auth provider's connections hold the password the same way
+        // (it is the token the provider was created with), so a new password
+        // is written to them too.
+        let rotated_connection_token = match (&updated_method, new_token, new_password) {
+            (AuthMethod::PersonalAccessToken { .. }, Some(new_token), _)
+            | (AuthMethod::BasicAuth { .. }, _, Some(new_token)) => {
                 Some(self.encrypt_string(&new_token).await?)
             }
             _ => None,
@@ -761,7 +711,8 @@ impl GitProviderManager {
             info!(
                 provider_id,
                 connections = rotated.rows_affected,
-                "Rotated the personal access token on the provider and its connections"
+                auth_method = %updated.auth_method,
+                "Rotated the provider credential on the provider and its connections"
             );
         }
         txn.commit().await?;
@@ -769,7 +720,10 @@ impl GitProviderManager {
         // Clear cache so new credentials take effect on next provider_service request.
         self.providers_cache.write().await.clear();
 
-        Ok(updated)
+        Ok(super::CredentialsUpdated {
+            provider: updated,
+            updated_fields,
+        })
     }
 
     async fn unset_default_providers(&self) -> Result<(), GitProviderManagerError> {
@@ -1074,6 +1028,148 @@ mod tests {
         );
     }
 
+    /// A basic-auth provider's password rotates in place (#2048): the
+    /// provider keeps its id and connections, stores the new password
+    /// encrypted, and its connections get the new password too.
+    #[tokio::test]
+    async fn rotating_a_basic_auth_password_updates_the_provider_and_its_connections() {
+        use chrono::Utc;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Docker not available, skipping basic-auth rotation test");
+                return;
+            }
+            Err(error) => panic!("test database: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let manager = GitProviderManager::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db.clone()),
+            Arc::new(temps_core::NoopAuditLogger),
+        );
+        let basic = serde_json::to_value(AuthMethod::BasicAuth {
+            username: "deploy".to_string(),
+            password: "old-app-password".to_string(),
+        })
+        .unwrap();
+        let provider = git_providers::ActiveModel {
+            name: Set("generic".to_string()),
+            provider_type: Set("generic".to_string()),
+            base_url: Set(None),
+            api_url: Set(None),
+            auth_method: Set("basic".to_string()),
+            auth_config: Set(manager.encrypt_sensitive_data(&basic).await.unwrap()),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let connection = git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            user_id: Set(None),
+            account_name: Set("git.example.com".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(Some(
+                manager.encrypt_string("old-app-password").await.unwrap(),
+            )),
+            refresh_token: Set(None),
+            token_expires_at: Set(None),
+            refresh_token_expires_at: Set(None),
+            installation_id: Set(None),
+            metadata: Set(None),
+            is_active: Set(true),
+            is_expired: Set(true),
+            syncing: Set(false),
+            last_synced_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let refused = manager
+            .update_provider_credentials(
+                provider.id,
+                crate::services::git_provider_manager::ProviderCredentialsUpdate {
+                    password: Some("bad\npassword".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(GitProviderManagerError::InvalidCredentials { provider_id, .. })
+                    if provider_id == provider.id
+            ),
+            "an invalid password is refused before anything is stored"
+        );
+
+        let updated = manager
+            .update_provider_credentials(
+                provider.id,
+                crate::services::git_provider_manager::ProviderCredentialsUpdate {
+                    password: Some("new-app-password".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a basic-auth password rotates in place");
+        assert_eq!(updated.provider.id, provider.id);
+        assert_eq!(updated.updated_fields, vec!["password"]);
+
+        let stored = git_providers::Entity::find_by_id(provider.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        let method: AuthMethod = serde_json::from_value(
+            manager
+                .decrypt_sensitive_data(&stored.auth_config)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            method,
+            AuthMethod::BasicAuth { username, password }
+                if username == "deploy" && password == "new-app-password"
+        ));
+
+        let after = git_provider_connections::Entity::find_by_id(connection.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("the connection survives the rotation");
+        let stored_token = after.access_token.as_deref().unwrap();
+        assert_ne!(
+            stored_token, "new-app-password",
+            "the connection's copy is encrypted"
+        );
+        assert_eq!(
+            manager.decrypt_string(stored_token).await.unwrap(),
+            "new-app-password"
+        );
+        assert!(!after.is_expired, "a new password clears the expired flag");
+    }
+
     /// Rotating a PAT provider's token must reach its connections: their own
     /// encrypted copy is what sync and clones use, so updating only the
     /// provider left every connection on the revoked token.
@@ -1153,14 +1249,10 @@ mod tests {
         manager
             .update_provider_credentials(
                 rotated.id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("new-token".to_string()),
+                crate::services::git_provider_manager::ProviderCredentialsUpdate {
+                    token: Some("new-token".to_string()),
+                    ..Default::default()
+                },
             )
             .await
             .expect("a PAT provider's token rotates");
@@ -1299,14 +1391,7 @@ mod tests {
                 manager
                     .update_provider_credentials(
                         provider_id,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
+                        crate::services::git_provider_manager::ProviderCredentialsUpdate::default(),
                     )
                     .await
             })

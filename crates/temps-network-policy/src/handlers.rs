@@ -111,6 +111,11 @@ impl From<NetworkPolicyError> for Problem {
                     .with_title("Network Policy Not Available On Worker Nodes")
                     .with_detail(error.to_string())
             }
+            NetworkPolicyError::WorkloadKindUnavailable { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Workload Kind Not Available")
+                    .with_detail(error.to_string())
+            }
             NetworkPolicyError::InvalidStoredRule { .. }
             | NetworkPolicyError::InvalidStoredProfile { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -849,6 +854,14 @@ mod tests {
                     mode: "enforce".into(),
                 },
                 StatusCode::CONFLICT,
+            ),
+            (
+                NetworkPolicyError::WorkloadKindUnavailable {
+                    kind: "function",
+                    id: 1,
+                    table: "functions",
+                },
+                StatusCode::BAD_REQUEST,
             ),
         ];
         for (error, status) in cases {

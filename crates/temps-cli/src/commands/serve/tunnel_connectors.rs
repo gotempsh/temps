@@ -156,12 +156,23 @@ mod tests {
                 source: "cloudflare".into(),
             }),
             drivers: vec![DriverChoice::Process(ProcessSpec {
-                artifacts: vec![Artifact {
-                    os: "linux".into(),
-                    arch: "x86_64".into(),
-                    url: "https://example.com/cloudflared".into(),
-                    sha256: "0".repeat(64),
-                }],
+                artifacts: vec![
+                    Artifact {
+                        os: "linux".into(),
+                        arch: "x86_64".into(),
+                        url: "https://example.com/cloudflared".into(),
+                        sha256: "0".repeat(64),
+                        archive_entry: None,
+                    },
+                    // The archive entry must cross into the agent's types.
+                    Artifact {
+                        os: "macos".into(),
+                        arch: "aarch64".into(),
+                        url: "https://example.com/cloudflared.tgz".into(),
+                        sha256: "1".repeat(64),
+                        archive_entry: Some("cloudflared".into()),
+                    },
+                ],
                 args: vec!["tunnel".into(), "run".into()],
                 env: BTreeMap::new(),
                 readiness: Readiness::HttpReady {

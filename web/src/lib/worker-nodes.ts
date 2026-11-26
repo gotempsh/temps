@@ -22,6 +22,7 @@ export const WORKER_NODES_URL = '/settings/nodes'
  */
 export const NODES_ADVANCED_SECTIONS = [
   'mesh-hub',
+  'mesh-turn-off',
   'cluster-network',
   'cluster-dns',
   'cluster-trust',

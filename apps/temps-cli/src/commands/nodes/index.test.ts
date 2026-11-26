@@ -120,6 +120,8 @@ function makeMesh(overrides: Partial<WireguardMeshStatusResponse> = {}): Wiregua
     reason: null,
     cidr: null,
     ca_rotation_required: false,
+    can_disable: false,
+    disable_blocker: null,
     pool_cidr: '10.201.0.0/24',
     listen_port: 51820,
     control_plane: null,
@@ -352,5 +354,19 @@ describe('mesh links', () => {
       []
     )
     expect(findings.find((finding) => finding.label === 'Hub')?.status).toBe('info')
+  })
+})
+
+describe('nodes mesh disable', () => {
+  test('is registered with a confirmation bypass and JSON output', async () => {
+    const { createProgram } = await import('../../cli.js')
+    const program = await createProgram()
+    const mesh = program.commands
+      .find((command) => command.name() === 'nodes')
+      ?.commands.find((command) => command.name() === 'mesh')
+    const disable = mesh?.commands.find((command) => command.name() === 'disable')
+    expect(disable).toBeDefined()
+    expect(disable?.options.map((option) => option.long).sort()).toEqual(['--json', '--yes'])
+    expect(disable?.description()).toContain('Refused, with the reason')
   })
 })
