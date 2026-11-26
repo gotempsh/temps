@@ -1035,21 +1035,14 @@ impl ProjectService {
                         .collect::<BTreeMap<_, _>>()
                 })
                 .unwrap_or_default();
-            // Aliases are stored with the links, in the transaction that
-            // consumes the creator claims (an invalid alias consumes none),
-            // and before the first deployment is queued, so it already sees
-            // DATABASE_URL for POSTGRES_URL.
-            let aliases = storage_service_env_aliases
-                .iter()
-                .filter(|(_, aliases)| !aliases.is_empty())
-                .map(|(service_id, aliases)| (*service_id, aliases.clone()))
-                .collect::<BTreeMap<_, _>>();
+            // Aliases are stored with the links, before the first deployment
+            // is queued, so it already sees DATABASE_URL for POSTGRES_URL.
             self.external_service_manager
                 .link_services_to_project_with_claims(
                     &storage_service_ids,
                     project.id,
                     &claims,
-                    &aliases,
+                    &storage_service_env_aliases,
                 )
                 .await
                 .map_err(|e| ProjectError::StorageLinksFailed {

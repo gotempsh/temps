@@ -850,6 +850,15 @@ pub fn private_listener_of(
     Some(ip)
 }
 
+/// The range a private route is sent with, or `None` to hold it back. It may
+/// be a list (`100.64.0.0/10,fd7a:115c:a1e0::/48`, what a Tailscale listener
+/// admits by default), which the worker matches range by range. A list
+/// with any entry that does not parse, or that reaches past a private block,
+/// admits nobody rather than everybody.
+fn servable_private_range(range: Option<String>) -> Option<String> {
+    range.filter(|range| temps_core::ways_in::range_list_is_private(range))
+}
+
 /// The ranges a worker's private listener admits, as it reported them
 /// (ADR-115 D8): `10.8.0.0/24,fd00:1::/64`. `None` when it reports none
 /// (an agent that predates it) or any it reports is not a private range,
@@ -952,15 +961,7 @@ pub fn worker_private_routes(
         } else {
             None
         };
-        let range = private
-            .address
-            .range
-            .clone()
-            // A range that does not parse, or reaches past one private
-            // block, admits nobody rather than everybody. A worker on
-            // Tailscale admits two (`100.64.0.0/10,fd7a:115c:a1e0::/48`):
-            // each must be private.
-            .filter(|range| temps_core::ways_in::ranges_are_private(range) == Some(true));
+        let range = servable_private_range(private.address.range.clone());
         let listener = private.address.listener.clone();
         let entry = entry_from_route(host.clone(), &private.route).filter(|entry| {
             entry.backends.iter().all(|backend| {
@@ -1761,6 +1762,32 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(private_admit_of(Some(&row(serde_json::json!([])))), None);
+    }
+
+    #[test]
+    fn what_a_tailscale_listener_admits_by_default_is_sent_to_the_worker() {
+        // An agent started with `--listen tailscale` and no `--admit`
+        // reports both Tailscale ranges; the run stores them as the
+        // address's range, and route sync must send that address.
+        let reported = private_admit_of(Some(&ingress_row(Some(serde_json::json!({
+            "https": "100.64.0.3:443",
+            "admit": ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+        })))));
+        assert_eq!(
+            reported.as_deref(),
+            Some("100.64.0.0/10,fd7a:115c:a1e0::/48")
+        );
+        assert_eq!(servable_private_range(reported.clone()), reported);
+        assert_eq!(
+            servable_private_range(Some("100.64.0.0/10".to_string())).as_deref(),
+            Some("100.64.0.0/10")
+        );
+        // Anything public or unreadable in the list holds the route back.
+        assert_eq!(
+            servable_private_range(Some("100.64.0.0/10,0.0.0.0/0".to_string())),
+            None
+        );
+        assert_eq!(servable_private_range(None), None);
     }
 
     fn held_route(host: &str) -> RouteEntryDto {

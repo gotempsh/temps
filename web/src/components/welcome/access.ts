@@ -387,6 +387,15 @@ export function domainProblem(
         'That is not a domain name. Use lowercase letters, numbers, dashes and dots, like apps.example.com.',
     }
   }
+  // The server's limits (`domain_problem`): refused there, the provider
+  // and consent written before it would be left behind.
+  if (domain.length > 253)
+    return { reason: 'A domain name is at most 253 characters.' }
+  const long = domain.split('.').find((label) => label.length > 63)
+  if (long)
+    return {
+      reason: `'${long.slice(0, 20)}…' is longer than 63 characters, the most one part of a domain name can be.`,
+    }
   return null
 }
 

@@ -77,7 +77,8 @@ pub struct ControlPlanePrivateIngress {
     /// Every address the proxy's HTTP and HTTPS listeners bound, set once
     /// at startup.
     proxy_listeners: OnceLock<Vec<SocketAddr>>,
-    /// Woken when the consent changes, so the loop applies it at once.
+    /// Woken when the consent changes, so the loop applies it at once, and
+    /// when the proxy records its listeners.
     changed: Notify,
 }
 
@@ -87,9 +88,12 @@ impl ControlPlanePrivateIngress {
     }
 
     /// Record what the proxy's listeners bound. Only the first call counts:
-    /// Pingora binds listeners once, at startup.
+    /// Pingora binds listeners once, at startup. It wakes the loop, which
+    /// waits for this before its first pass.
     pub fn set_proxy_listeners(&self, listeners: Vec<SocketAddr>) {
-        let _ = self.proxy_listeners.set(listeners);
+        if self.proxy_listeners.set(listeners).is_ok() {
+            self.changed.notify_one();
+        }
     }
 
     /// What the proxy's listeners bound, `None` when no proxy runs in this
@@ -333,5 +337,25 @@ mod tests {
             .contains("No proxy runs"));
         ingress.set_proxy_listeners(listeners(&["0.0.0.0:443"]));
         assert_eq!(ingress.not_covered(tailscale), None);
+    }
+
+    #[tokio::test]
+    async fn recording_the_proxy_listeners_wakes_the_loop_once() {
+        let ingress = ControlPlanePrivateIngress::new();
+        ingress.set_proxy_listeners(vec!["0.0.0.0:443".parse().unwrap()]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), ingress.changed())
+            .await
+            .expect("the first record wakes the loop");
+        // Pingora binds once; a later call changes nothing and wakes nobody.
+        ingress.set_proxy_listeners(vec!["0.0.0.0:8443".parse().unwrap()]);
+        assert_eq!(
+            ingress.proxy_listeners(),
+            Some(&["0.0.0.0:443".parse().unwrap()][..])
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), ingress.changed())
+                .await
+                .is_err()
+        );
     }
 }

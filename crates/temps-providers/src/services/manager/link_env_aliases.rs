@@ -8,9 +8,7 @@
 //! name onto the injected one, and the runtime variables then carry both.
 
 use crate::services::*;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::collections::{BTreeMap, HashMap};
-use temps_entities::project_services;
 use tracing::warn;
 
 /// Most aliases one link may carry.
@@ -100,38 +98,6 @@ pub fn apply_env_aliases(
                 "Skipping a variable alias: the service does not inject the variable it points at"
             ),
         }
-    }
-}
-
-impl ExternalServiceManager {
-    /// Replace the variable aliases on the link between `service_id` and
-    /// `project_id`.
-    pub async fn set_link_env_aliases(
-        &self,
-        service_id: i32,
-        project_id: i32,
-        aliases: &BTreeMap<String, String>,
-    ) -> Result<(), ExternalServiceError> {
-        validate_env_aliases(service_id, project_id, aliases)?;
-        let link = project_services::Entity::find()
-            .filter(project_services::Column::ServiceId.eq(service_id))
-            .filter(project_services::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(ExternalServiceError::ServiceNotLinkedToProject {
-                service_id,
-                project_id,
-            })?;
-        let mut active: project_services::ActiveModel = link.into();
-        active.env_aliases = Set(serde_json::to_value(aliases).map_err(|e| {
-            ExternalServiceError::InternalError {
-                reason: format!(
-                    "serializing variable aliases for service {service_id} in project {project_id}: {e}"
-                ),
-            }
-        })?);
-        active.update(self.db.as_ref()).await?;
-        Ok(())
     }
 }
 

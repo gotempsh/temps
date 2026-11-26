@@ -119,21 +119,6 @@ pub fn cidr_is_private(cidr: &str) -> Option<bool> {
     })
 }
 
-/// [`cidr_is_private`] for a comma-separated list of ranges, the form a
-/// private address stores (`100.64.0.0/10,fd7a:115c:a1e0::/48`): `Some(true)`
-/// only when every range in it is private. `None` when the list is empty or
-/// any part does not parse.
-pub fn ranges_are_private(ranges: &str) -> Option<bool> {
-    let mut any = false;
-    for part in ranges.split(',') {
-        any = true;
-        if !cidr_is_private(part)? {
-            return Some(false);
-        }
-    }
-    any.then_some(true)
-}
-
 /// An IP access allow list that admits only private ranges, and whose it
 /// is, for messages that name the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +128,16 @@ pub struct PrivateAllowList {
     pub rule: String,
     /// Its first range, for the message.
     pub cidr: String,
+}
+
+/// Whether a stored range list (`100.64.0.0/10,fd7a:115c:a1e0::/48`, the
+/// form a private address's `private_range` takes when its listener admits
+/// several ranges) admits only private ranges: every comma-separated entry
+/// parses and is private. An empty list is not.
+pub fn range_list_is_private(ranges: &str) -> bool {
+    let mut parts = ranges.split(',').map(str::trim).peekable();
+    parts.peek().is_some_and(|first| !first.is_empty())
+        && parts.all(|part| cidr_is_private(part) == Some(true))
 }
 
 /// Whether an allow list of `cidrs` admits only private ranges: every entry
@@ -183,20 +178,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_list_of_ranges_is_private_only_when_every_range_is() {
-        assert_eq!(
-            ranges_are_private("100.64.0.0/10,fd7a:115c:a1e0::/48"),
-            Some(true)
-        );
-        assert_eq!(ranges_are_private("10.8.0.0/24"), Some(true));
-        assert_eq!(ranges_are_private("10.8.0.0/24, 8.8.8.0/24"), Some(false));
-        assert_eq!(ranges_are_private("10.8.0.0/24,not-a-range"), None);
-        assert_eq!(ranges_are_private(""), None);
-        // One CIDR's parser is not fooled by the list either.
-        assert_eq!(cidr_is_private("100.64.0.0/10,fd7a:115c:a1e0::/48"), None);
-    }
-
-    #[test]
     fn private_ranges_are_told_from_public_ones() {
         assert_eq!(cidr_is_private("100.64.0.0/10"), Some(true));
         assert_eq!(cidr_is_private("10.0.0.0/8"), Some(true));
@@ -216,6 +197,20 @@ mod tests {
             "93.184.215.0/24".into()
         ]));
         assert!(!only_private(&[]));
+    }
+
+    #[test]
+    fn a_range_list_is_private_only_when_every_range_is() {
+        assert!(range_list_is_private("100.64.0.0/10"));
+        assert!(range_list_is_private("100.64.0.0/10,fd7a:115c:a1e0::/48"));
+        assert!(range_list_is_private("10.8.0.0/24, fd00:1::/64"));
+        // One public range, an unparsable one or an empty entry admits nobody.
+        assert!(!range_list_is_private("100.64.0.0/10,0.0.0.0/0"));
+        assert!(!range_list_is_private("100.64.0.0/10,not-a-range"));
+        assert!(!range_list_is_private("100.64.0.0/10,"));
+        assert!(!range_list_is_private(""));
+        // The single-range check this replaces cannot read a list.
+        assert_eq!(cidr_is_private("100.64.0.0/10,fd7a:115c:a1e0::/48"), None);
     }
 
     #[test]

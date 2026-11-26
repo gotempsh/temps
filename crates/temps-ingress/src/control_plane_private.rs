@@ -39,6 +39,36 @@ use tracing::{debug, info, warn};
 /// nothing wakes the loop: the agent's interval.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+/// How long the first pass waits for the proxy in this process to record
+/// its listeners. Until then the loop cannot tell whether they cover the
+/// private address, and a pass would report that no proxy runs. Past it, the
+/// pass runs anyway and reports what it finds.
+pub const PROXY_START_WAIT: Duration = Duration::from_secs(120);
+
+/// Wait until the proxy has recorded its listeners, `deadline` passes or
+/// `shutdown` is signalled. `false` only on shutdown.
+async fn wait_for_proxy_listeners(
+    runtime: &ControlPlanePrivateIngress,
+    shutdown: &Notify,
+    deadline: Duration,
+) -> bool {
+    let until = tokio::time::Instant::now() + deadline;
+    while runtime.proxy_listeners().is_none() {
+        tokio::select! {
+            _ = shutdown.notified() => return false,
+            _ = runtime.changed() => {}
+            _ = tokio::time::sleep_until(until) => {
+                warn!(
+                    waited_secs = deadline.as_secs(),
+                    "the proxy has not recorded its listeners; checking private ingress without them"
+                );
+                return true;
+            }
+        }
+    }
+    true
+}
+
 /// How often the inside checks run when the private addresses do not
 /// change (ADR 064 D7).
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(300);
@@ -251,11 +281,15 @@ impl ControlPlanePrivateIngressLoop {
         })
     }
 
-    /// Sync now, every [`POLL_INTERVAL`] and whenever the consent changes,
-    /// until `shutdown`.
+    /// Sync once the proxy has recorded its listeners, then every
+    /// [`POLL_INTERVAL`] and whenever the consent changes, until `shutdown`.
     pub fn start(self: &Arc<Self>, shutdown: Arc<Notify>) -> tokio::task::JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            if !wait_for_proxy_listeners(&this.runtime, &shutdown, PROXY_START_WAIT).await {
+                debug!("control-plane private ingress stopped before the proxy started");
+                return;
+            }
             let mut state = LoopState::default();
             loop {
                 // A consent change during the inside checks ends the pass
@@ -440,6 +474,40 @@ mod tests {
 
     fn wildcard() -> Arc<ControlPlanePrivateIngress> {
         runtime(&["0.0.0.0:80", "0.0.0.0:443"])
+    }
+
+    #[tokio::test]
+    async fn the_first_pass_waits_for_the_proxy_to_record_its_listeners() {
+        let runtime = ControlPlanePrivateIngress::new();
+        let shutdown = Notify::new();
+        let later = Arc::clone(&runtime);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            later.set_proxy_listeners(vec!["0.0.0.0:443".parse().unwrap()]);
+        });
+        let started = tokio::time::Instant::now();
+        assert!(wait_for_proxy_listeners(&runtime, &shutdown, Duration::from_secs(30)).await);
+        assert!(runtime.proxy_listeners().is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "woken, not timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_pass_runs_anyway_when_no_proxy_records_listeners() {
+        let runtime = ControlPlanePrivateIngress::new();
+        let shutdown = Notify::new();
+        assert!(wait_for_proxy_listeners(&runtime, &shutdown, Duration::from_millis(20)).await);
+        assert!(runtime.proxy_listeners().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_the_wait_for_the_proxy() {
+        let runtime = ControlPlanePrivateIngress::new();
+        let shutdown = Notify::new();
+        shutdown.notify_one();
+        assert!(!wait_for_proxy_listeners(&runtime, &shutdown, Duration::from_secs(30)).await);
     }
 
     #[test]

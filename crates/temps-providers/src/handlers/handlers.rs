@@ -2861,8 +2861,7 @@ async fn link_service_to_project(
 
     match app_state
         .external_service_manager
-        // The aliases are stored with the link, in one transaction.
-        .link_service_to_project_with_aliases(
+        .link_service_to_project_with_provisioning(
             id,
             request.project_id,
             claim_user_id,
@@ -2870,7 +2869,7 @@ async fn link_service_to_project(
                 mode: request.database_provisioning_mode,
                 custom_database_name: request.custom_database_name,
             },
-            &request.env_aliases,
+            request.env_aliases.clone(),
         )
         .await
     {
