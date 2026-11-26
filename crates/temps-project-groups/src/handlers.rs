@@ -521,6 +521,9 @@ enum MemberPermission {
 /// [`LateMemberAuthorizer`] for a placement: a project that joined the
 /// destination after the caller was authorized needs what every other member
 /// needed (visible to the caller, and `EnvironmentsWrite` on it).
+///
+/// The service asks it with no transaction open, so the access checker's
+/// queries take a pooled connection without holding the group lock.
 pub(crate) struct EnvWriteOnLateMembers<'a> {
     pub(crate) project_access_checker: &'a Option<Arc<dyn ProjectAccessChecker>>,
     pub(crate) auth: &'a temps_authz::context::AuthContext,
@@ -528,34 +531,43 @@ pub(crate) struct EnvWriteOnLateMembers<'a> {
 
 #[async_trait::async_trait]
 impl LateMemberAuthorizer for EnvWriteOnLateMembers<'_> {
-    async fn unauthorized(&self, group_id: i32, project_ids: &[i32]) -> Vec<i32> {
-        let hidden = match hidden_projects_for(self.project_access_checker, self.auth).await {
-            Ok(hidden) => hidden,
-            Err(_) => {
-                tracing::warn!(
-                    group_id,
-                    ?project_ids,
-                    "project groups: could not re-check access to late group members; refusing"
-                );
-                return project_ids.to_vec();
-            }
+    async fn unauthorized(
+        &self,
+        group_id: i32,
+        project_ids: &[i32],
+    ) -> Result<Vec<i32>, ProjectGroupError> {
+        let check_failed = |problem: Problem| ProjectGroupError::LateMemberCheckFailed {
+            group_id,
+            project_ids: project_ids.to_vec(),
+            reason: format!("the project access lookup answered {}", problem.status_code),
         };
+        let hidden = hidden_projects_for(self.project_access_checker, self.auth)
+            .await
+            .map_err(check_failed)?;
         let mut denied = Vec::new();
         for &project_id in project_ids {
-            let allowed = !hidden.contains(&project_id)
-                && require_on_projects(
-                    self.auth,
-                    self.project_access_checker,
-                    &[project_id],
-                    MemberPermission::EnvironmentsWrite,
-                )
-                .await
-                .is_ok();
-            if !allowed {
+            if hidden.contains(&project_id) {
                 denied.push(project_id);
+                continue;
+            }
+            match require_on_projects(
+                self.auth,
+                self.project_access_checker,
+                &[project_id],
+                MemberPermission::EnvironmentsWrite,
+            )
+            .await
+            {
+                Ok(()) => {}
+                // The guards answer a lack of access with 403; anything else
+                // is the check itself failing.
+                Err(problem) if problem.status_code == StatusCode::FORBIDDEN => {
+                    denied.push(project_id);
+                }
+                Err(problem) => return Err(check_failed(problem)),
             }
         }
-        denied
+        Ok(denied)
     }
 }
 
@@ -2126,7 +2138,7 @@ mod tests {
             project_access_checker: &checker(&[]),
             auth: &admin,
         };
-        assert!(late.unauthorized(1, &[4, 5]).await.is_empty());
+        assert!(late.unauthorized(1, &[4, 5]).await.unwrap().is_empty());
 
         let user = user_auth(Role::User);
         let team = checker(&[4]);
@@ -2134,14 +2146,49 @@ mod tests {
             project_access_checker: &team,
             auth: &user,
         };
-        assert_eq!(late.unauthorized(1, &[4, 5]).await, vec![5]);
+        assert_eq!(late.unauthorized(1, &[4, 5]).await.unwrap(), vec![5]);
 
         let reader = user_auth(Role::Reader);
         let late = EnvWriteOnLateMembers {
             project_access_checker: &team,
             auth: &reader,
         };
-        assert_eq!(late.unauthorized(1, &[4]).await, vec![4]);
+        assert_eq!(late.unauthorized(1, &[4]).await.unwrap(), vec![4]);
+    }
+
+    /// Answers every access question with an infrastructure error.
+    struct Broken;
+
+    #[async_trait::async_trait]
+    impl ProjectAccessChecker for Broken {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Err("access store unavailable".into())
+        }
+    }
+
+    /// A lookup that fails is an error the placement reports as such, not a
+    /// denial that would surface as "members changed, retry" (409).
+    #[tokio::test]
+    async fn a_failing_access_lookup_on_late_members_is_an_error_not_a_denial() {
+        let user = user_auth(Role::User);
+        let broken: Option<Arc<dyn ProjectAccessChecker>> = Some(Arc::new(Broken));
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &broken,
+            auth: &user,
+        };
+        let err = late.unauthorized(7, &[4, 5]).await.unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::LateMemberCheckFailed { group_id: 7, ref project_ids, .. } if *project_ids == vec![4, 5]),
+            "got {err:?}"
+        );
+        assert_eq!(
+            Problem::from(err).status_code,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]

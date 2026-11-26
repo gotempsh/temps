@@ -218,14 +218,8 @@ impl GroupEnvVarService {
             .map_err(ProjectGroupError::db(format!(
                 "starting transaction to change the variables of project group {group_id}"
             )))?;
-        match ProjectGroupService::lock_group_members(
-            &txn,
-            group_id,
-            authorized_member_ids,
-            None,
-            None,
-        )
-        .await
+        match ProjectGroupService::lock_group_members(&txn, group_id, authorized_member_ids, None)
+            .await
         {
             Ok(_) => Ok(txn),
             Err(error) => {

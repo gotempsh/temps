@@ -151,6 +151,22 @@ pub enum ProjectGroupError {
         project_ids: Vec<i32>,
     },
 
+    /// Projects joined the group while a placement was being authorized, and
+    /// checking the caller's access to them failed (the access lookup itself
+    /// errored, it did not deny). Nothing was changed. Like
+    /// [`Self::MembersChanged`], the message counts the projects without
+    /// naming them.
+    #[error(
+        "Could not check access to {} project(s) that joined project group {group_id} while \
+         this request was being authorized ({reason}); retry the request",
+        .project_ids.len()
+    )]
+    LateMemberCheckFailed {
+        group_id: i32,
+        project_ids: Vec<i32>,
+        reason: String,
+    },
+
     /// The group's repository was changed while a project was being pointed
     /// at the one it had when the request started, so the project would have
     /// been left following a repository the group no longer has.
@@ -272,6 +288,22 @@ impl From<ProjectGroupError> for Problem {
                 .with_title("Group Members Changed")
                 .with_detail(error.to_string()),
 
+            ProjectGroupError::LateMemberCheckFailed {
+                group_id,
+                ref project_ids,
+                ref reason,
+            } => {
+                tracing::error!(
+                    group_id,
+                    ?project_ids,
+                    reason = %reason,
+                    "project groups: re-checking access to late group members failed"
+                );
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Access Check Failed")
+                    .with_detail(error.to_string())
+            }
+
             ProjectGroupError::RepositoryFollowersChanged { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Repository Followers Changed")
@@ -351,6 +383,25 @@ mod tests {
         assert!(message.contains("project group 7"), "got {message}");
         assert!(!message.contains("41") && !message.contains("42"));
         assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
+    }
+
+    /// A lookup that failed is not a denial: it is a 500 the caller can
+    /// retry, never the 409 a real lack of access to a late member gives.
+    #[test]
+    fn a_failed_late_member_check_is_a_server_error_that_counts_but_does_not_name_them() {
+        let error = ProjectGroupError::LateMemberCheckFailed {
+            group_id: 7,
+            project_ids: vec![41, 42],
+            reason: "the access lookup returned 500".to_string(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("2 project(s)"), "got {message}");
+        assert!(message.contains("project group 7"), "got {message}");
+        assert!(!message.contains("41") && !message.contains("42"));
+        assert_eq!(
+            Problem::from(error).status_code,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
