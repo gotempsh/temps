@@ -1651,21 +1651,31 @@ impl ExternalServiceManager {
 
         let (exit_code, stdout, stderr) = if let Some(node_id) = member.node_id {
             let client = self.get_remote_client(node_id).await?;
-            let result = client
-                .exec_in_service(crate::remote_service_client::RemoteExecParams {
-                    container_name: member.container_name.clone(),
-                    command: cmd,
-                    environment: HashMap::new(),
-                    user: Some("postgres".to_string()),
-                    detach: false,
-                })
-                .await
-                .map_err(|e| ExternalServiceError::InternalError {
+            let params = crate::remote_service_client::RemoteExecParams {
+                container_name: member.container_name.clone(),
+                command: cmd,
+                environment: HashMap::new(),
+                user: Some("postgres".to_string()),
+                detach: false,
+            };
+            // Another operation (a background reconcile, a backup step) can
+            // own the member's container for a moment; the agent then turns
+            // the exec away before running anything. Wait briefly for it.
+            let result = retry_node_busy(&MEMBER_EXEC_BUSY_BACKOFF, || {
+                client.exec_in_service(params.clone())
+            })
+            .await
+            .map_err(|e| match e {
+                // Nothing ran: kept typed, so the API answers 409 Node Busy
+                // and the caller knows a retry is safe.
+                busy @ ExternalServiceError::NodeBusy { .. } => busy,
+                other => ExternalServiceError::InternalError {
                     reason: format!(
                         "Failed to promote member '{}' on node {}: {}",
-                        member.container_name, node_id, e
+                        member.container_name, node_id, other
                     ),
-                })?;
+                },
+            })?;
             (result.exit_code, result.stdout, result.stderr)
         } else {
             self.exec_in_local_container(&member.container_name, &cmd, Some("postgres"))
@@ -1808,6 +1818,57 @@ impl temps_metrics::ClusterPrimaryConnector for ExternalServiceManager {
                 engine: "postgres".to_string(),
                 reason: e.to_string(),
             })
+    }
+}
+
+/// Waits between tries of a short, operator-triggered exec in a member
+/// whose node answered [`ExternalServiceError::NodeBusy`]: 7.5 s in all.
+const MEMBER_EXEC_BUSY_BACKOFF: [std::time::Duration; 4] = [
+    std::time::Duration::from_millis(500),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+];
+
+/// Run `attempt`, and again after each wait of `backoff` while it answers
+/// [`ExternalServiceError::NodeBusy`] (the node ran nothing). Any other
+/// outcome is returned at once; `NodeBusy` once the waits are used up.
+async fn retry_node_busy<T, F, Fut>(
+    backoff: &[std::time::Duration],
+    mut attempt: F,
+) -> Result<T, ExternalServiceError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ExternalServiceError>>,
+{
+    let mut waits = backoff.iter();
+    loop {
+        match attempt().await {
+            Err(ExternalServiceError::NodeBusy {
+                node,
+                route,
+                detail,
+            }) => match waits.next() {
+                Some(wait) => {
+                    warn!(
+                        node = %node,
+                        route = %route,
+                        detail = %detail,
+                        retry_in_ms = wait.as_millis() as u64,
+                        "Node is busy and ran nothing; retrying"
+                    );
+                    tokio::time::sleep(*wait).await;
+                }
+                None => {
+                    return Err(ExternalServiceError::NodeBusy {
+                        node,
+                        route,
+                        detail,
+                    })
+                }
+            },
+            other => return other,
+        }
     }
 }
 

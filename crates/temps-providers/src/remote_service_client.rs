@@ -105,7 +105,7 @@ pub struct RemoteServiceStatus {
 
 /// Request body for `exec_in_service`. Mirrors `temps_node_agent::ServiceExecRequest`
 /// but kept local to avoid a cross-crate dep.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RemoteExecParams {
     pub container_name: String,
     pub command: Vec<String>,
@@ -982,12 +982,7 @@ impl RemoteServiceClient {
         if !body.success {
             let mut error = body.error.unwrap_or_default();
             truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
-            return Err(ExternalServiceError::InternalError {
-                reason: format!(
-                    "Agent on node {} returned error ({}): {}",
-                    self.node_name, status, error
-                ),
-            });
+            return Err(self.agent_refusal(status, path, error));
         }
         body.data
             .map(AgentSupport::Supported)
@@ -1121,12 +1116,7 @@ impl RemoteServiceClient {
                 "Agent on node {} returned error ({}) at {}: {}",
                 self.node_name, status, url, err_msg
             );
-            return Err(ExternalServiceError::InternalError {
-                reason: format!(
-                    "Agent on node {} returned error ({}): {}",
-                    self.node_name, status, err_msg
-                ),
-            });
+            return Err(self.agent_refusal(status, path, err_msg));
         }
 
         body.data
@@ -1136,6 +1126,34 @@ impl RemoteServiceClient {
                     self.node_name, url
                 ),
             })
+    }
+
+    /// The error for an agent answer with `success: false` on `path`.
+    ///
+    /// A 429 is an admission refusal: the node is at its limit of backups
+    /// and restores or of concurrent exec and output-capture slots, or
+    /// another operation owns the container. Nothing ran, so it is the typed
+    /// [`ExternalServiceError::NodeBusy`] (a 409 "Node Busy" at the API) for
+    /// the caller to retry, never an internal error.
+    fn agent_refusal(
+        &self,
+        status: reqwest::StatusCode,
+        path: &str,
+        error: String,
+    ) -> ExternalServiceError {
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return ExternalServiceError::NodeBusy {
+                node: self.node_name.clone(),
+                route: path.to_string(),
+                detail: error,
+            };
+        }
+        ExternalServiceError::InternalError {
+            reason: format!(
+                "Agent on node {} returned error ({}): {}",
+                self.node_name, status, error
+            ),
+        }
     }
 
     /// POST `body` encrypted to the node. Every route this client calls with a
@@ -1174,12 +1192,7 @@ impl RemoteServiceClient {
                 "Agent on node {} returned error ({}) at {}: {}",
                 self.node_name, status, url, err_msg
             );
-            return Err(ExternalServiceError::InternalError {
-                reason: format!(
-                    "Agent on node {} returned error ({}): {}",
-                    self.node_name, status, err_msg
-                ),
-            });
+            return Err(self.agent_refusal(status, path, err_msg));
         }
 
         body.data
@@ -1251,21 +1264,7 @@ impl RemoteServiceClient {
         if !body.success {
             let mut error = body.error.unwrap_or_default();
             truncate_utf8(&mut error, MAX_HEALTH_ERROR_BYTES);
-            // The node runs its maximum of backups and restores: nothing ran,
-            // and the caller decides whether to wait for a slot.
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(ExternalServiceError::NodeBusy {
-                    node: self.node_name.clone(),
-                    route: path.to_string(),
-                    detail: error,
-                });
-            }
-            return Err(ExternalServiceError::InternalError {
-                reason: format!(
-                    "Agent on node {} returned error ({}): {}",
-                    self.node_name, status, error
-                ),
-            });
+            return Err(self.agent_refusal(status, path, error));
         }
         body.data
             .ok_or_else(|| ExternalServiceError::InternalError {
@@ -1298,12 +1297,7 @@ impl RemoteServiceClient {
 
         if !body.success {
             let err_msg = body.error.unwrap_or_default();
-            return Err(ExternalServiceError::InternalError {
-                reason: format!(
-                    "Agent on node {} returned error ({}): {}",
-                    self.node_name, status, err_msg
-                ),
-            });
+            return Err(self.agent_refusal(status, path, err_msg));
         }
 
         body.data
@@ -2981,6 +2975,83 @@ mod tests {
                 assert!(detail.contains("already runs 2"), "{detail}");
             }
             other => panic!("expected NodeBusy, got {other:?}"),
+        }
+    }
+
+    /// Regression: the sealed exec turned a 429 into an internal error, so a
+    /// switchover whose member container was owned by another operation
+    /// failed with a 500 although nothing ran. Every agent admission refusal
+    /// is the typed `NodeBusy`.
+    #[tokio::test]
+    async fn a_sealed_exec_the_agent_turns_away_is_node_busy() {
+        async fn owned() -> (reqwest::StatusCode, Json<serde_json::Value>) {
+            (
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "success": false,
+                    "data": null,
+                    "error": "Cannot execute command in 'postgres-orders-1': another operation already owns that container"
+                })),
+            )
+        }
+        async fn failed() -> (reqwest::StatusCode, Json<serde_json::Value>) {
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "data": null,
+                    "error": "exec create failed"
+                })),
+            )
+        }
+        let exec = |container: &str| RemoteExecParams {
+            container_name: container.to_string(),
+            command: vec!["pg_autoctl".to_string(), "perform".to_string()],
+            environment: HashMap::new(),
+            user: Some("postgres".to_string()),
+            detach: false,
+        };
+        for (handler, busy) in [(post(owned), true), (post(failed), false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new().route("/agent/services/exec", handler),
+                )
+                .await
+                .unwrap();
+            });
+            let client = RemoteServiceClient::new(
+                format!("http://{address}"),
+                "node-token".to_string(),
+                "worker-1".to_string(),
+            )
+            .unwrap()
+            .with_sealing(test_sealing());
+            let error = client
+                .exec_in_service(exec("postgres-orders-1"))
+                .await
+                .expect_err("the agent refused the exec");
+            server.abort();
+            match (busy, error) {
+                (
+                    true,
+                    ExternalServiceError::NodeBusy {
+                        node,
+                        route,
+                        detail,
+                    },
+                ) => {
+                    assert_eq!(node, "worker-1");
+                    assert_eq!(route, "/agent/services/exec");
+                    assert!(detail.contains("already owns that container"), "{detail}");
+                }
+                (false, ExternalServiceError::InternalError { reason }) => {
+                    assert!(reason.contains("exec create failed"), "{reason}")
+                }
+                (busy, other) => panic!("busy={busy}: unexpected {other:?}"),
+            }
         }
     }
 
