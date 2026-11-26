@@ -4,6 +4,23 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`monitors list`](#monitors-list)
+- [`monitors create`](#monitors-create)
+- [`monitors add-target`](#monitors-add-target)
+- [`monitors update-target`](#monitors-update-target)
+- [`monitors locations`](#monitors-locations)
+- [`monitors show`](#monitors-show)
+- [`monitors remove`](#monitors-remove)
+- [`monitors status`](#monitors-status)
+- [`monitors history`](#monitors-history)
+- [`monitors get-health`](#monitors-get-health)
+- [`monitors update`](#monitors-update)
+- [`monitors get-bucketed-status`](#monitors-get-bucketed-status)
+- [`monitors crons`](#monitors-crons)
+- [`monitors http-checks`](#monitors-http-checks)
+
 ## `monitors` (alias: `monitoring`)
 
 Manage uptime monitors for status pages
@@ -19,6 +36,11 @@ Manage uptime monitors for status pages
 - `remove` (`rm`) - Delete a monitor
 - `status` - Get current status — all monitors for a project, or a single monitor by ID
 - `history` - Get monitor uptime history
+- `get-health` - Get monitor-based health summaries for multiple projects in a single query
+- `update` - Update a monitor's name, check interval or check path
+- `get-bucketed-status` - Get bucketed status data for a monitor using TimescaleDB
+- `crons` - Crons commands
+- `http-checks` - Http checks commands
 
 ### `monitors list` (alias: `ls`)
 
@@ -160,3 +182,353 @@ Get monitor uptime history
 | `--id <id>` | Monitor ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 | `--days <days>` | Number of days to show | `7` | No |
+
+### `monitors get-health`
+
+Get monitor-based health summaries for multiple projects in a single query
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-ids <value>` | Comma-separated list of project IDs [required] | - | No |
+| `--environment-id <n>` | Select one environment within the authorized projects; defaults to production | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors update`
+
+Update a monitor's name, check interval or check path
+
+**Usage:** `monitors update <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--check-interval-seconds <n>` | How often to probe, in seconds. **Clamped, not rejected**, exactly like on create: values below 30 are... | - | No |
+| `--check-path <value>` | Path probed on the monitored environment; must start with '/' | - | No |
+| `--name <value>` | Display name; 1 to 255 characters after trimming | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors get-bucketed-status`
+
+Get bucketed status data for a monitor using TimescaleDB
+
+**Usage:** `monitors get-bucketed-status <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--interval <value>` | Bucket interval: '5min', 'hourly', or 'daily' (default: hourly) | - | No |
+| `--start-time <value>` | Start time (ISO 8601) (default: 24 hours ago) | - | No |
+| `--end-time <value>` | End time (ISO 8601) (default: now) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors crons`
+
+Crons commands
+
+**Subcommands:**
+
+- `list` - List cron monitors
+- `create` - Create cron monitor
+- `delete` - Delete cron monitor
+- `get` - Get cron monitor
+- `update` - Update cron monitor
+- `list-runs` - List cron monitor runs
+
+#### `monitors crons list`
+
+List cron monitors
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons create`
+
+Create cron monitor
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--config <json>` | Body field config (JSON) [required] | - | No |
+| `--environment-id <n>` | Body field environment_id | - | No |
+| `--slug <value>` | Body field slug [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons delete`
+
+Delete cron monitor
+
+**Usage:** `monitors crons delete <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons get`
+
+Get cron monitor
+
+**Usage:** `monitors crons get <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons update`
+
+Update cron monitor
+
+**Usage:** `monitors crons update <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--config <json>` | Body field config (JSON) | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons list-runs`
+
+List cron monitor runs
+
+**Usage:** `monitors crons list-runs <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors http-checks`
+
+Http checks commands
+
+**Subcommands:**
+
+- `detect-env-credential` - Detect env credential
+- `list-variable-history` - List variable history
+- `list` - List http checks
+- `create` - Create http check
+- `get-capabilities` - Get http checks capabilities
+- `list-presets` - List http check presets
+- `delete` - Delete http check
+- `set-enabled` - Set http check enabled
+- `update` - Update http check
+- `run` - Run http check
+- `detect-secret-credential` - Detect secret credential
+- `list-secret-history` - List secret history
+
+#### `monitors http-checks detect-env-credential`
+
+Detect env credential
+
+**Usage:** `monitors http-checks detect-env-credential <env-var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list-variable-history`
+
+List variable history
+
+**Usage:** `monitors http-checks list-variable-history <env-var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list`
+
+List http checks
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks create`
+
+Create http check
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--credential-stdin` | Body field credential (read from stdin) | - | No |
+| `--credential-file <path>` | Body field credential (read from a file) | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--env-var-id <n>` | Body field env_var_id | - | No |
+| `--interval-seconds <n>` | Body field interval_seconds | - | No |
+| `--kind <value>` | 'http' (default) calls an endpoint; 'local' reads expiring items (certificates, SSH certificates, OpenPGP... (one of: http, local) | - | No |
+| `--local <json>` | Body field local (JSON) | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--secret-id <n>` | Project secret to check | - | No |
+| `--spec <json>` | This is a declarative HTTP recipe, never executable code (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks get-capabilities`
+
+Get http checks capabilities
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list-presets`
+
+List http check presets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks delete`
+
+Delete http check
+
+**Usage:** `monitors http-checks delete <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks set-enabled`
+
+Set http check enabled
+
+**Usage:** `monitors http-checks set-enabled <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks update`
+
+Update http check
+
+**Usage:** `monitors http-checks update <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--credential-stdin` | Body field credential (read from stdin) | - | No |
+| `--credential-file <path>` | Body field credential (read from a file) | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--env-var-id <n>` | Body field env_var_id | - | No |
+| `--interval-seconds <n>` | Body field interval_seconds | - | No |
+| `--kind <value>` | 'http' (default) calls an endpoint; 'local' reads expiring items (certificates, SSH certificates, OpenPGP... (one of: http, local) | - | No |
+| `--local <json>` | Body field local (JSON) | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--secret-id <n>` | Project secret to check | - | No |
+| `--spec <json>` | This is a declarative HTTP recipe, never executable code (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks run`
+
+Run http check
+
+**Usage:** `monitors http-checks run <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks detect-secret-credential`
+
+Detect secret credential
+
+**Usage:** `monitors http-checks detect-secret-credential <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list-secret-history`
+
+List secret history
+
+**Usage:** `monitors http-checks list-secret-history <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |

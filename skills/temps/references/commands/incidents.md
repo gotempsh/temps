@@ -17,6 +17,7 @@ Manage incidents for status pages and monitoring
 - `set-visibility` - Show or hide an incident update on published status pages
 - `updates` - List status updates for an incident
 - `bucketed` - Get bucketed incident data for a project
+- `update` - Set or clear the heading an incident shows on published status pages
 
 ### `incidents list` (alias: `ls`)
 
@@ -112,4 +113,19 @@ Get bucketed incident data for a project
 | `--start-time <time>` | Start time (ISO 8601) | - | No |
 | `--end-time <time>` | End time (ISO 8601) | - | No |
 | `--environment-id <id>` | Filter by environment ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `incidents update`
+
+Set or clear the heading an incident shows on published status pages
+
+**Usage:** `incidents update <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--public-title <value>` | New public heading [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |

@@ -164,6 +164,8 @@ Scan the project's repository and add its apps as services that follow it
 | `-p, --path <dir...>` | Only these app directories (default: every app without a service) | - | No |
 | `--dry-run` | List what would be created without creating anything | - | No |
 | `--timeout <minutes>` | Stop waiting after this long (default 30); the import keeps running on the server | - | No |
+| `--fresh` | Scan a public repository again instead of using the cached scan | - | No |
+| `--base-url <url>` | HTTPS origin of the self-hosted GitLab a public repository lives on | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups follow`

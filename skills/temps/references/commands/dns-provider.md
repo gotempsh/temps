@@ -19,6 +19,9 @@ Manage DNS providers and managed domains
 - `zones` - List DNS zones for a provider
 - `domains` - Manage domains associated with a DNS provider
 - `lookup` - Lookup DNS A records for a domain
+- `update-managed-domain` - Update a managed domain's settings (hostname mode, sync opt-in, auto-manage)
+- `apply-hostname-mode` - Apply a hostname mode to a managed domain (persist + optional DNS sync + route reload)
+- `preview-hostname-mode` - Preview the impact of switching a managed domain's hostname mode
 
 ### `dns-provider list` (alias: `ls`)
 
@@ -159,6 +162,11 @@ Add a managed domain to a provider
 | `--id <id>` | Provider ID | - | Yes |
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `--auto-manage` | Enable auto-management for DNS records | - | No |
+| `--generated-hostname-mode <value>` | Layout of generated hostnames (one of: standard, flat) | - | No |
+| `--proxied-by-default` | Create records proxied through the provider (Cloudflare) by default | - | No |
+| `--no-proxied-by-default` | Set proxied_by_default to false | - | No |
+| `--sync-generated-records` | Keep generated hostnames' DNS records in this zone in sync | - | No |
+| `--no-sync-generated-records` | Set sync_generated_records to false | - | No |
 
 #### `dns-provider domains remove` (alias: `rm`)
 
@@ -193,4 +201,59 @@ Lookup DNS A records for a domain
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name to lookup | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `dns-provider update-managed-domain`
+
+Update a managed domain's settings (hostname mode, sync opt-in, auto-manage)
+
+**Usage:** `dns-provider update-managed-domain <provider-id> <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--auto-manage` | Toggle automatic DNS management for this domain | - | No |
+| `--no-auto-manage` | Set auto_manage to false | - | No |
+| `--generated-hostname-mode <value>` | '"standard"' or '"flat"' | - | No |
+| `--proxied-by-default` | Default proxy mode for newly managed records; 'false' is an explicit override | - | No |
+| `--no-proxied-by-default` | Set proxied_by_default to false | - | No |
+| `--sync-generated-records` | Toggle DNS record sync for this domain | - | No |
+| `--no-sync-generated-records` | Set sync_generated_records to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `dns-provider apply-hostname-mode`
+
+Apply a hostname mode to a managed domain (persist + optional DNS sync + route reload)
+
+**Usage:** `dns-provider apply-hostname-mode <provider-id> <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--adopt-records <json>` | Conflicting records, from the preview's 'conflicts', that the user confirmed the sync may adopt — one... (JSON) | - | No |
+| `--mode <value>` | Target mode to apply: '"standard"' or '"flat"' [required] | - | No |
+| `--skip-records <json>` | Conflicting hostnames, from the preview's 'conflicts', that the user chose to leave untouched: the sync... (JSON) | - | No |
+| `--sync-dns` | Also reconcile the provider's DNS zone for the affected hostnames | - | No |
+| `--no-sync-dns` | Set sync_dns to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `dns-provider preview-hostname-mode`
+
+Preview the impact of switching a managed domain's hostname mode
+
+**Usage:** `dns-provider preview-hostname-mode <provider-id> <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | Target mode: standard\|flat [required] | - | No |
+| `--sync` | Include DNS record changes | - | No |
+| `--no-sync` | Set sync to false | - | No |
 | `--json` | Output in JSON format | - | No |

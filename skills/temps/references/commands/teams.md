@@ -25,6 +25,7 @@ List all teams
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Page of 100 teams (default: 1) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `teams create` (alias: `add`)

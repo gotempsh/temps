@@ -26,6 +26,29 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`sandbox fs`](#sandbox-fs)
 - [`sandbox snapshots`](#sandbox-snapshots)
 - [`sandbox snapshot`](#sandbox-snapshot)
+- [`sandbox service-access`](#sandbox-service-access)
+- [`sandbox internal-access`](#sandbox-internal-access)
+- [`sandbox services`](#sandbox-services)
+- [`sandbox get-creation`](#sandbox-get-creation)
+- [`sandbox get-image-preparation`](#sandbox-get-image-preparation)
+- [`sandbox prepare-images`](#sandbox-prepare-images)
+- [`sandbox update-host-image-preparation`](#sandbox-update-host-image-preparation)
+- [`sandbox get-resource-defaults`](#sandbox-get-resource-defaults)
+- [`sandbox rootfs-report`](#sandbox-rootfs-report)
+- [`sandbox rootfs-gc`](#sandbox-rootfs-gc)
+- [`sandbox get-cmd`](#sandbox-get-cmd)
+- [`sandbox cmd-logs`](#sandbox-cmd-logs)
+- [`sandbox cmd`](#sandbox-cmd)
+- [`sandbox get-creation-by`](#sandbox-get-creation-by)
+- [`sandbox list-dir`](#sandbox-list-dir)
+- [`sandbox write-files`](#sandbox-write-files)
+- [`sandbox list-jobs`](#sandbox-list-jobs)
+- [`sandbox job-status`](#sandbox-job-status)
+- [`sandbox kill-job`](#sandbox-kill-job)
+- [`sandbox create-preview-link`](#sandbox-create-preview-link)
+- [`sandbox resize`](#sandbox-resize)
+- [`sandbox issue-runtime-environment`](#sandbox-issue-runtime-environment)
+- [`sandbox cmd-kill`](#sandbox-cmd-kill)
 
 ## `sandbox`
 
@@ -53,6 +76,29 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `fs` - Filesystem operations inside a sandbox
 - `snapshots` - Manage sandbox snapshots (ADR-037)
 - `snapshot` - Take a snapshot of a sandbox
+- `service-access` - Service access commands
+- `internal-access` - Internal access commands
+- `services` - Services commands
+- `get-creation` - Read a create's steps by the 'creation_id' its 'POST /v1/sandboxes' sent
+- `get-image-preparation` - Every host that can run sandboxes, with whether its default sandbox image is pulled (with download..
+- `prepare-images` - Pull the default sandbox image on every eligible host (or one), so the first sandbox there starts without..
+- `update-host-image-preparation` - Turn keeping one host's sandbox image prepared on or off
+- `get-resource-defaults` - Effective resource defaults and input ceilings for the requested placement
+- `rootfs-report` - Inspect rootfs storage: the Firecracker digest-keyed cache (with which sandboxes reference each entry) and..
+- `rootfs-gc` - Reclaim rootfs cache entries not backing any live sandbox
+- `get-cmd` - Get cmd
+- `cmd-logs` - Stream a command's stdout/stderr as 'application/x-ndjson' ('@vercel/sandbox'-compatible)
+- `cmd` - Run a command the '@vercel/sandbox' way: without --wait it returns the started command's id at once (read its output with cmd-logs); with --wait it prints the running and finished envelopes as JSON lines. For an interactive run use `temps sandbox exec`
+- `get-creation-by` - Read the steps of the create that made a sandbox, while this server still tracks it (it is running, or..
+- `list-dir` - List dir
+- `write-files` - Batch-write multiple files in a single request
+- `list-jobs` - List jobs
+- `job-status` - Job status
+- `kill-job` - Terminate a detached job
+- `create-preview-link` - Mint a shareable link to a sandbox preview
+- `resize` - Grow a Firecracker sandbox's root disk
+- `issue-runtime-environment` - Issue the same scoped service variables used by a deployment runtime for the project attached to this sandbox
+- `cmd-kill` - Kill a running command ('@vercel/sandbox'-compatible)
 
 ### `sandbox create`
 
@@ -68,6 +114,8 @@ Create a new sandbox
 | `-e, --env <KEY=VAL>` | Env var baked into the container (repeatable) | - | No |
 | `--cpu-limit <cpu>` | CPU limit (e.g., 0.5 for half a core) | - | No |
 | `--memory-mb <mb>` | Memory limit in megabytes | - | No |
+| `--pids-limit <n>` | Maximum number of processes (default 512) | - | No |
+| `--creation-id <id>` | Your own id for this create (8-64 letters, digits, - or _), to follow its steps with `sandbox get-creation` | - | No |
 | `--git-url <url>` | Git repo URL to clone into the work dir | - | No |
 | `--git-rev <revision>` | Git revision to check out (requires --git-url) | - | No |
 | `--git-depth <n>` | Shallow clone depth (requires --git-url) | - | No |
@@ -275,6 +323,7 @@ Clone a git repo or extract a tarball into a running sandbox
 | `--git-username <user>` | HTTP Basic username (pairs with --git-password) | - | No |
 | `--git-password <token>` | HTTP Basic password/token (injected via GIT_ASKPASS) | - | No |
 | `--tarball-url <url>` | Tarball URL to download and extract | - | No |
+| `--strip-git-metadata` | Remove the .git directory after cloning | - | No |
 | `--git-password-file <path>` | Read the Git HTTP password or token from a file (- reads stdin) instead of --git-password | - | No |
 | `--git-password-stdin` | Read the Git HTTP password or token from stdin instead of --git-password | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -516,3 +565,644 @@ Take a snapshot of a sandbox
 | `--label <label>` | Human-readable label for the snapshot | - | No |
 | `--wait` | Wait until the snapshot reaches ready or failed status | - | No |
 | `--json` | Output as JSON | - | No |
+
+### `sandbox service-access`
+
+Service access commands
+
+**Subcommands:**
+
+- `list` - List access services
+- `create` - Create access service
+- `get` - Get access service
+- `update` - Update access service
+- `list-grants` - List service grants
+- `request-grant` - Request service grant
+- `approve-grant` - Approve service grant
+- `revoke-grant` - Revoke service grant
+- `capability` - Access capability
+
+#### `sandbox service-access list`
+
+List access services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access create`
+
+Create access service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--clear-credential` | Body field clear_credential | - | No |
+| `--no-clear-credential` | Set clear_credential to false | - | No |
+| `--credential-stdin` | A credential (read from stdin) | - | No |
+| `--credential-file <path>` | A credential (read from a file) | - | No |
+| `--enabled` | Allows requests to be saved; does not enable a network connection [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--expected-version <n>` | Required for updates; omit for creation | - | No |
+| `--max-ttl-seconds <n>` | Maximum lifetime of a request, between 60 and 86400 seconds [required] | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--policy <json>` | Exact destination and request scope (JSON) [required] | - | No |
+| `--vault-id <value>` | Add a newly created service to this vault in the same transaction | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access get`
+
+Get access service
+
+**Usage:** `sandbox service-access get <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access update`
+
+Update access service
+
+**Usage:** `sandbox service-access update <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--clear-credential` | Body field clear_credential | - | No |
+| `--no-clear-credential` | Set clear_credential to false | - | No |
+| `--credential-stdin` | A credential (read from stdin) | - | No |
+| `--credential-file <path>` | A credential (read from a file) | - | No |
+| `--enabled` | Allows requests to be saved; does not enable a network connection [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--expected-version <n>` | Required for updates; omit for creation | - | No |
+| `--max-ttl-seconds <n>` | Maximum lifetime of a request, between 60 and 86400 seconds [required] | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--policy <json>` | Exact destination and request scope (JSON) [required] | - | No |
+| `--vault-id <value>` | Add a newly created service to this vault in the same transaction | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access list-grants`
+
+List service grants
+
+**Usage:** `sandbox service-access list-grants <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access request-grant`
+
+Request service grant
+
+**Usage:** `sandbox service-access request-grant <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--service-id <value>` | Body field service_id [required] | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--ttl-seconds <n>` | Absolute expiry is calculated at creation, even if the broker is unavailable [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access approve-grant`
+
+Approve service grant
+
+**Usage:** `sandbox service-access approve-grant <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--request-id <value>` | Body field request_id [required] | - | No |
+| `--service-id <value>` | Body field service_id [required] | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access revoke-grant`
+
+Revoke service grant
+
+**Usage:** `sandbox service-access revoke-grant <sandbox-id> <grant-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access capability`
+
+Access capability
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox internal-access`
+
+Internal access commands
+
+**Subcommands:**
+
+- `list-grants` - List the projects allowed to call this project's internal addresses
+- `create-grant` - Allow another project to call this project's internal addresses
+- `list-internal-access-sandbox-grants` - List the sandboxes allowed to call this project's internal addresses
+- `create-internal-access-sandbox-grant` - Allow one of your sandboxes to call this project's internal addresses
+- `delete-grant` - Stop a sandbox from calling this project's internal addresses
+- `delete-internal-access-grant` - Stop another project from calling this project's internal addresses
+- `list-addresses` - List the internal addresses one of your sandboxes may call
+
+#### `sandbox internal-access list-grants`
+
+List the projects allowed to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Only grants that cover this environment of the project: its own and the project-wide ones | - | No |
+| `--page <n>` | 1-based page, default 1 | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access create-grant`
+
+Allow another project to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--caller-environment-id <n>` | Only this environment of the calling project; omit for every environment, present and future | - | No |
+| `--caller-project-id <n>` | The project whose workloads may call [required] | - | No |
+| `--description <value>` | Why the grant exists, up to 200 characters | - | No |
+| `--target-environment-id <n>` | The environment of this project that may be called; omit for every environment, present and future | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access list-internal-access-sandbox-grants`
+
+List the sandboxes allowed to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Only grants that cover this environment of the project: its own and the project-wide ones | - | No |
+| `--page <n>` | 1-based page, default 1 | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access create-internal-access-sandbox-grant`
+
+Allow one of your sandboxes to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--description <value>` | Why the grant exists, up to 200 characters | - | No |
+| `--sandbox-id <value>` | Public id of one of your sandboxes [required] | - | No |
+| `--target-environment-id <n>` | The environment of this project that may be called; omit for every environment, present and future | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access delete-grant`
+
+Stop a sandbox from calling this project's internal addresses
+
+**Usage:** `sandbox internal-access delete-grant <grant-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access delete-internal-access-grant`
+
+Stop another project from calling this project's internal addresses
+
+**Usage:** `sandbox internal-access delete-internal-access-grant <grant-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access list-addresses`
+
+List the internal addresses one of your sandboxes may call
+
+**Usage:** `sandbox internal-access list-addresses <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | 1-based page, default 1 | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox services`
+
+Services commands
+
+**Subcommands:**
+
+- `list` - List sandbox services
+- `request` - Request sandbox service
+- `approve` - Approve sandbox service
+- `revoke` - Revoke sandbox service
+
+#### `sandbox services list`
+
+List sandbox services
+
+**Usage:** `sandbox services list <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox services request`
+
+Request sandbox service
+
+**Usage:** `sandbox services request <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--service-id <value>` | Body field service_id [required] | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox services approve`
+
+Approve sandbox service
+
+**Usage:** `sandbox services approve <sandbox-id> <access-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version [required] | - | No |
+| `--expires-at <value>` | Omit for the sandbox lifetime | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox services revoke`
+
+Revoke sandbox service
+
+**Usage:** `sandbox services revoke <sandbox-id> <access-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-creation`
+
+Read a create's steps by the 'creation_id' its 'POST /v1/sandboxes' sent
+
+**Usage:** `sandbox get-creation <creation-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-image-preparation`
+
+Every host that can run sandboxes, with whether its default sandbox image is pulled (with download..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox prepare-images`
+
+Pull the default sandbox image on every eligible host (or one), so the first sandbox there starts without..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node-id <n>` | The host to prepare: a node id, or '0' for the control plane | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox update-host-image-preparation`
+
+Turn keeping one host's sandbox image prepared on or off
+
+**Usage:** `sandbox update-host-image-preparation <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--keep-prepared` | Keep this host's default sandbox image pulled, re-pulling it when an upgrade changes the default. 'false'... [required] | - | No |
+| `--no-keep-prepared` | Set keep_prepared to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-resource-defaults`
+
+Effective resource defaults and input ceilings for the requested placement
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <value>` | Query parameter node | - | No |
+| `--backend <value>` | Which isolation backend a sandbox runs on (ADR-029, ADR-050) (one of: docker, firecracker, microsandbox, local) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox rootfs-report`
+
+Inspect rootfs storage: the Firecracker digest-keyed cache (with which sandboxes reference each entry) and..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox rootfs-gc`
+
+Reclaim rootfs cache entries not backing any live sandbox
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-cmd`
+
+Get cmd
+
+**Usage:** `sandbox get-cmd <id> <cmd-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox cmd-logs`
+
+Stream a command's stdout/stderr as 'application/x-ndjson' ('@vercel/sandbox'-compatible)
+
+**Usage:** `sandbox cmd-logs <id> <cmd-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox cmd`
+
+Run a command the '@vercel/sandbox' way: without --wait it returns the started command's id at once (read its output with cmd-logs); with --wait it prints the running and finished envelopes as JSON lines. For an interactive run use `temps sandbox exec`
+
+**Usage:** `sandbox cmd <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--command <value>` | Program to run [required] | - | No |
+| `--args <value>` | Argument (repeatable, in order) (repeatable) | - | No |
+| `--cwd <value>` | Working directory inside the sandbox | - | No |
+| `--env <json>` | Environment variables as a JSON object, e.g. {"NODE_ENV":"test"} (JSON) | - | No |
+| `--sudo` | Run the command privileged | - | No |
+| `--no-sudo` | Set sudo to false | - | No |
+| `--wait` | Wait for the command to finish | - | No |
+| `--no-wait` | Set wait to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-creation-by`
+
+Read the steps of the create that made a sandbox, while this server still tracks it (it is running, or..
+
+**Usage:** `sandbox get-creation-by <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox list-dir`
+
+List dir
+
+**Usage:** `sandbox list-dir <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Absolute path of a directory inside the sandbox [required] | - | No |
+| `--page <n>` | 1-based page (default 1) | - | No |
+| `--page-size <n>` | Entries per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox write-files`
+
+Batch-write multiple files in a single request
+
+**Usage:** `sandbox write-files <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--files <json>` | List of files to write (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox list-jobs`
+
+List jobs
+
+**Usage:** `sandbox list-jobs <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox job-status`
+
+Job status
+
+**Usage:** `sandbox job-status <id> <job-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox kill-job`
+
+Terminate a detached job
+
+**Usage:** `sandbox kill-job <id> <job-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--force` | When true, sends SIGKILL immediately | - | No |
+| `--no-force` | Set force to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox create-preview-link`
+
+Mint a shareable link to a sandbox preview
+
+**Usage:** `sandbox create-preview-link <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Path the recipient lands on | - | No |
+| `--port <n>` | Port inside the sandbox the preview serves on [required] | - | No |
+| `--ttl-seconds <n>` | How long the link stays usable, in seconds | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox resize`
+
+Grow a Firecracker sandbox's root disk
+
+**Usage:** `sandbox resize <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--disk-size-mb <n>` | New root disk size in MB [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox issue-runtime-environment`
+
+Issue the same scoped service variables used by a deployment runtime for the project attached to this sandbox
+
+**Usage:** `sandbox issue-runtime-environment <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox cmd-kill`
+
+Kill a running command ('@vercel/sandbox'-compatible)
+
+**Usage:** `sandbox cmd-kill <id> <cmd-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--force` | Optional: when true, SIGKILL instead of SIGTERM | - | No |
+| `--no-force` | Set force to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |

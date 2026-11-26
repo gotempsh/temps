@@ -103,3 +103,6 @@ syntax may have changed.
 - [`setup`](setup.md)
 - [`start`](start.md)
 - [`stop`](stop.md)
+- [`agents`](agents.md)
+- [`shield`](shield.md)
+- [`vault`](vault.md)

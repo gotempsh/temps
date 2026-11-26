@@ -20,6 +20,11 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`status-pages maintenance`](#status-pages-maintenance)
 - [`status-pages webhooks`](#status-pages-webhooks)
 - [`status-pages password`](#status-pages-password)
+- [`status-pages get-overview`](#status-pages-get-overview)
+- [`status-pages get-maintenance`](#status-pages-get-maintenance)
+- [`status-pages preview`](#status-pages-preview)
+- [`status-pages get-public-feed`](#status-pages-get-public-feed)
+- [`status-pages get-public-json`](#status-pages-get-public-json)
 
 ## `status-pages` (alias: `status-page`)
 
@@ -41,6 +46,11 @@ Publish public status pages showing monitors from any of your projects
 - `maintenance` - Schedule maintenance windows: shown on the page, no outage alerts, no downtime counted
 - `webhooks` - Post every public update of a status page to signed HTTPS webhooks
 - `password` - Protect a status page with a password
+- `get-overview` - Get status page overview
+- `get-maintenance` - A maintenance window
+- `preview` - Preview what a status page shows visitors, published or not
+- `get-public-feed` - Public status page (Atom feed)
+- `get-public-json` - Public status page (JSON)
 
 ### `status-pages list` (alias: `ls`)
 
@@ -66,6 +76,14 @@ Create a draft status page; monitors may come from any project
 | `-g, --group <name=ids>` | Show monitors together under a group, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `-d, --description <text>` | Public description | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--theme <value>` | Color scheme of the public page (one of: auto, light, dark) | - | No |
+| `--accent-color <value>` | Accent color, e.g. #2563eb | - | No |
+| `--logo-url <value>` | HTTPS URL of the logo shown in the header | - | No |
+| `--website-url <value>` | Where the logo links to | - | No |
+| `--show-response-times` | Show monitor response times | - | No |
+| `--no-show-response-times` | Set show_response_times to false | - | No |
+| `--show-uptime-percentage` | Show uptime percentages | - | No |
+| `--no-show-uptime-percentage` | Set show_uptime_percentage to false | - | No |
 
 ### `status-pages show`
 
@@ -92,6 +110,14 @@ Change the title, description or monitor selection
 | `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
 | `-g, --group <name=ids>` | With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--theme <value>` | Color scheme of the public page (one of: auto, light, dark) | - | No |
+| `--accent-color <value>` | Accent color, e.g. #2563eb | - | No |
+| `--logo-url <value>` | HTTPS URL of the logo shown in the header | - | No |
+| `--website-url <value>` | Where the logo links to | - | No |
+| `--show-response-times` | Show monitor response times | - | No |
+| `--no-show-response-times` | Set show_response_times to false | - | No |
+| `--show-uptime-percentage` | Show uptime percentages | - | No |
+| `--no-show-uptime-percentage` | Set show_uptime_percentage to false | - | No |
 
 ### `status-pages publish`
 
@@ -452,4 +478,65 @@ Set or change the password (prompted, or read from stdin); signs every visitor o
 | `--id <id>` | Status page ID | - | Yes |
 | `--password-stdin` | Read the password from the first line of stdin | - | No |
 | `--remove` | Remove the password and open the page again | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages get-overview`
+
+Get status page overview
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages get-maintenance`
+
+A maintenance window
+
+**Usage:** `status-pages get-maintenance <status-page-id> <maintenance-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages preview`
+
+Preview what a status page shows visitors, published or not
+
+**Usage:** `status-pages preview <status-page-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages get-public-feed`
+
+Public status page (Atom feed)
+
+**Usage:** `status-pages get-public-feed <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages get-public-json`
+
+Public status page (JSON)
+
+**Usage:** `status-pages get-public-json <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |

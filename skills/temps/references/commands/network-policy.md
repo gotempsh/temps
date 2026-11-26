@@ -13,6 +13,8 @@ Manage network policy for workloads: rules, egress/ingress profiles and the effe
 - `rules` - Manage network policy rules
 - `effective` - Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
 - `profile` - Manage a workload's egress and ingress profile
+- `list-node-modes` - List node modes
+- `set-node-mode` - Set node mode
 
 ### `network-policy rules`
 
@@ -117,4 +119,29 @@ Set a workload's profile. Each direction is open, restricted, none; a direction 
 |------|-------------|---------|----------|
 | `--egress <profile>` | Outbound profile (open, restricted, none). Omit for the kind's default | - | No |
 | `--ingress <profile>` | Inbound profile (open, restricted, none). Omit for the kind's default | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `network-policy list-node-modes`
+
+List node modes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `network-policy set-node-mode`
+
+Set node mode
+
+**Usage:** `network-policy set-node-mode <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | Body field mode [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |

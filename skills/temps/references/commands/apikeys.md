@@ -17,6 +17,9 @@ Manage API keys for programmatic access
 - `activate` - Activate a deactivated API key
 - `deactivate` - Deactivate an API key
 - `permissions` - List available API key permissions
+- `get-ai-harness-status` - Whether the caller's external AI harness has connected
+- `update-api-key` - Update api key
+- `rotate-api-key` - Rotate api key
 
 ### `apikeys list` (alias: `ls`)
 
@@ -27,6 +30,8 @@ List all API keys
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Keys per page (max 100) | - | No |
 
 ### `apikeys create` (alias: `add`)
 
@@ -95,4 +100,46 @@ List available API key permissions
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `apikeys get-ai-harness-status`
+
+Whether the caller's external AI harness has connected
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `apikeys update-api-key`
+
+Update api key
+
+**Usage:** `apikeys update-api-key <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expires-at <value>` | Body field expires_at | - | No |
+| `--is-active` | Body field is_active | - | No |
+| `--no-is-active` | Set is_active to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--permissions <value>` | Body field permissions (repeatable) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `apikeys rotate-api-key`
+
+Rotate api key
+
+**Usage:** `apikeys rotate-api-key <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
 | `--json` | Output in JSON format | - | No |

@@ -30,6 +30,10 @@ List all webhooks for a project
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Webhooks per page (max 100) | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `webhooks create` (alias: `add`)
 

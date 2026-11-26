@@ -26,6 +26,7 @@ List audit logs
 | `--offset <n>` | Number of logs to skip | - | No |
 | `--operation-type <type>` | Filter by operation type | - | No |
 | `--user-id <id>` | Filter by user ID | - | No |
+| `--resource-id <id>` | Filter by the ID of the resource acted on | - | No |
 | `--from <timestamp>` | Start timestamp (ISO 8601 or epoch ms) | - | No |
 | `--to <timestamp>` | End timestamp (ISO 8601 or epoch ms) | - | No |
 

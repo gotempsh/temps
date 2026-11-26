@@ -4,6 +4,24 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`settings show`](#settings-show)
+- [`settings update`](#settings-update)
+- [`settings geo-status`](#settings-geo-status)
+- [`settings set-external-url`](#settings-set-external-url)
+- [`settings set-preview-domain`](#settings-set-preview-domain)
+- [`settings fields`](#settings-fields)
+- [`settings apply`](#settings-apply)
+- [`settings admin-gate`](#settings-admin-gate)
+- [`settings telemetry`](#settings-telemetry)
+- [`settings ci-builder`](#settings-ci-builder)
+- [`settings disk-status`](#settings-disk-status)
+- [`settings public-ingress`](#settings-public-ingress)
+- [`settings refresh-routes`](#settings-refresh-routes)
+- [`settings weekly-digest`](#settings-weekly-digest)
+- [`settings oidc`](#settings-oidc)
+
 ## `settings`
 
 Manage platform settings
@@ -24,6 +42,7 @@ Manage platform settings
 - `public-ingress` - Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
 - `refresh-routes` - Rebuild the proxy route table now instead of waiting for the next change
 - `weekly-digest` - Generate and send the weekly digest now
+- `oidc` - Oidc commands
 
 ### `settings show` (alias: `get`)
 
@@ -230,4 +249,167 @@ Generate and send the weekly digest now
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings oidc`
+
+Oidc commands
+
+**Subcommands:**
+
+- `list-providers` - List oidc providers
+- `create-provider` - Create oidc provider
+- `delete-provider` - Delete oidc provider
+- `update-provider` - Update oidc provider
+- `list-role-mappings` - List oidc role mappings
+- `create-role-mapping` - Create oidc role mapping
+- `test-provider` - Test oidc provider
+- `list-provider-users` - List oidc provider users
+- `delete-role-mapping` - Delete oidc role mapping
+
+#### `settings oidc list-providers`
+
+List oidc providers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc create-provider`
+
+Create oidc provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--client-id <value>` | Body field client_id [required] | - | No |
+| `--client-secret-stdin` | A credential [required] (read from stdin) | - | No |
+| `--client-secret-file <path>` | A credential [required] (read from a file) | - | No |
+| `--default-role <value>` | Body field default_role | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--group-claim <value>` | Body field group_claim | - | No |
+| `--issuer-url <value>` | Body field issuer_url [required] | - | No |
+| `--jit-provisioning` | Body field jit_provisioning | - | No |
+| `--no-jit-provisioning` | Set jit_provisioning to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--role-claim <value>` | Body field role_claim | - | No |
+| `--scopes <value>` | Body field scopes | - | No |
+| `--template <value>` | Body field template | - | No |
+| `--trust-idp-email` | Defaults false | - | No |
+| `--no-trust-idp-email` | Set trust_idp_email to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc delete-provider`
+
+Delete oidc provider
+
+**Usage:** `settings oidc delete-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc update-provider`
+
+Update oidc provider
+
+**Usage:** `settings oidc update-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--client-id <value>` | Body field client_id | - | No |
+| `--client-secret-stdin` | A credential (read from stdin) | - | No |
+| `--client-secret-file <path>` | A credential (read from a file) | - | No |
+| `--default-role <value>` | Body field default_role | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--group-claim <value>` | Body field group_claim | - | No |
+| `--issuer-url <value>` | Body field issuer_url | - | No |
+| `--jit-provisioning` | Body field jit_provisioning | - | No |
+| `--no-jit-provisioning` | Set jit_provisioning to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--role-claim <value>` | Body field role_claim | - | No |
+| `--scopes <value>` | Body field scopes | - | No |
+| `--template <value>` | Body field template | - | No |
+| `--trust-idp-email` | Body field trust_idp_email | - | No |
+| `--no-trust-idp-email` | Set trust_idp_email to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc list-role-mappings`
+
+List oidc role mappings
+
+**Usage:** `settings oidc list-role-mappings <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc create-role-mapping`
+
+Create oidc role mapping
+
+**Usage:** `settings oidc create-role-mapping <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--idp-group <value>` | Body field idp_group [required] | - | No |
+| `--priority <n>` | Body field priority [required] | - | No |
+| `--role <value>` | Body field role [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc test-provider`
+
+Test oidc provider
+
+**Usage:** `settings oidc test-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc list-provider-users`
+
+List oidc provider users
+
+**Usage:** `settings oidc list-provider-users <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc delete-role-mapping`
+
+Delete oidc role mapping
+
+**Usage:** `settings oidc delete-role-mapping <mapping-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
 | `--json` | Output in JSON format | - | No |

@@ -4,6 +4,24 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`notifications list`](#notifications-list)
+- [`notifications add`](#notifications-add)
+- [`notifications update`](#notifications-update)
+- [`notifications enable`](#notifications-enable)
+- [`notifications disable`](#notifications-disable)
+- [`notifications show`](#notifications-show)
+- [`notifications remove`](#notifications-remove)
+- [`notifications test`](#notifications-test)
+- [`notifications routes`](#notifications-routes)
+- [`notifications create-cloudflare-provider`](#notifications-create-cloudflare-provider)
+- [`notifications update-cloudflare-provider`](#notifications-update-cloudflare-provider)
+- [`notifications create-email-provider`](#notifications-create-email-provider)
+- [`notifications create-webhook-provider`](#notifications-create-webhook-provider)
+- [`notifications update-webhook-provider`](#notifications-update-webhook-provider)
+- [`notifications reveal-provider-config`](#notifications-reveal-provider-config)
+
 ## `notifications` (alias: `notify`)
 
 Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
@@ -19,6 +37,12 @@ Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 - `remove` (`rm`) - Remove a notification provider
 - `test` - Send a test notification
 - `routes` - Manage severity-based notification routes (which providers receive which severities)
+- `create-cloudflare-provider` - Create a new Cloudflare Email Sending notification provider
+- `update-cloudflare-provider` - Update a Cloudflare Email Sending notification provider
+- `create-email-provider` - Create a new Email notification provider
+- `create-webhook-provider` - Create a new Webhook notification provider
+- `update-webhook-provider` - Update a Webhook notification provider
+- `reveal-provider-config` - Reveal notification provider config
 
 ### `notifications list` (alias: `ls`)
 
@@ -29,6 +53,8 @@ List configured notification providers
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `notifications add`
 
@@ -166,6 +192,8 @@ Manage severity-based notification routes (which providers receive which severit
 - `create` - Create a notification route
 - `update` - Update a notification route
 - `remove` (`rm`) - Remove a notification route
+- `get-delivery-coverage` - Check whether a notification of the given severity would be delivered
+- `test` - Send a test notification through a route to each of its providers
 
 #### `notifications routes list` (alias: `ls`)
 
@@ -176,6 +204,8 @@ List notification routes
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 #### `notifications routes show`
 
@@ -231,3 +261,122 @@ Remove a notification route
 | `--id <id>` | Route ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+#### `notifications routes get-delivery-coverage`
+
+Check whether a notification of the given severity would be delivered
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--severity <value>` | Severity of the notification to check: debug, info, warning, error, critical or emergency [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes test`
+
+Send a test notification through a route to each of its providers
+
+**Usage:** `notifications routes test <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `notifications create-cloudflare-provider`
+
+Create a new Cloudflare Email Sending notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a Cloudflare Email Sending notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications update-cloudflare-provider`
+
+Update a Cloudflare Email Sending notification provider
+
+**Usage:** `notifications update-cloudflare-provider <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a Cloudflare Email Sending notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications create-email-provider`
+
+Create a new Email notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Request-side SMTP config (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications create-webhook-provider`
+
+Create a new Webhook notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a generic webhook notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications update-webhook-provider`
+
+Update a Webhook notification provider
+
+**Usage:** `notifications update-webhook-provider <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a generic webhook notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications reveal-provider-config`
+
+Reveal notification provider config
+
+**Usage:** `notifications reveal-provider-config <id> <field> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
