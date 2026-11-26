@@ -39,16 +39,28 @@ export function refreshSavedFunnel(
  * Brings the cached funnel queries up to date after funnel `funnelId` was
  * deleted: every page of the project's funnel list is refetched, and the
  * funnel's own read and metrics are dropped so nothing shows it again.
+ *
+ * The deleted funnel's card stays mounted, observing its metrics, until the
+ * list refetch drops it. Removing a query that still has an observer makes
+ * that observer fetch it again on its next render, so the funnel's queries
+ * are removed only once the list refetch has settled.
  */
-export function forgetDeletedFunnel(
+export async function forgetDeletedFunnel(
   queryClient: QueryClient,
   projectId: number,
   funnelId: number
 ) {
   const path = { project_id: projectId, funnel_id: funnelId }
-  void queryClient.invalidateQueries({
-    queryKey: listFunnelsQueryKey({ path: { project_id: projectId } }),
-  })
-  queryClient.removeQueries({ queryKey: getFunnelQueryKey({ path }) })
-  queryClient.removeQueries({ queryKey: getFunnelMetricsQueryKey({ path }) })
+  const funnelKey = getFunnelQueryKey({ path })
+  const metricsKey = getFunnelMetricsQueryKey({ path })
+  // A metrics read already in flight for the deleted funnel is not needed.
+  await queryClient.cancelQueries({ queryKey: metricsKey })
+  try {
+    await queryClient.invalidateQueries({
+      queryKey: listFunnelsQueryKey({ path: { project_id: projectId } }),
+    })
+  } finally {
+    queryClient.removeQueries({ queryKey: funnelKey })
+    queryClient.removeQueries({ queryKey: metricsKey })
+  }
 }

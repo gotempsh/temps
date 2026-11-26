@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { expect, test } from 'bun:test'
-import { QueryClient } from '@tanstack/react-query'
+import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import type { FunnelResponse } from '@/api/client/types.gen'
 import {
   getFunnelMetricsQueryKey,
@@ -77,10 +77,10 @@ test('a saved funnel replaces its cached read and refreshes its lists and metric
   expect(invalidated(client, keys.otherProjectList)).toBe(false)
 })
 
-test('a deleted funnel is dropped from the cache and its project lists refetch', () => {
+test('a deleted funnel is dropped from the cache and its project lists refetch', async () => {
   const { client, keys } = seeded()
 
-  forgetDeletedFunnel(client, 3, 7)
+  await forgetDeletedFunnel(client, 3, 7)
 
   expect(client.getQueryState(keys.funnel)).toBeUndefined()
   expect(client.getQueryState(keys.metrics)).toBeUndefined()
@@ -91,4 +91,42 @@ test('a deleted funnel is dropped from the cache and its project lists refetch',
     'Untouched'
   )
   expect(invalidated(client, keys.otherProjectList)).toBe(false)
+})
+
+test("a deleted funnel's metrics stay cached until its list refetch settles", async () => {
+  const { client, keys } = seeded()
+  // The list is on screen, so invalidating it refetches it; that refetch is
+  // held until the test lets it finish.
+  let finishList: () => void = () => {}
+  let listRefetchStarted: () => void = () => {}
+  const refetching = new Promise<void>((resolve) => {
+    listRefetchStarted = resolve
+  })
+  const listObserver = new QueryObserver(client, {
+    queryKey: keys.firstPage,
+    queryFn: () =>
+      new Promise((resolve) => {
+        finishList = () =>
+          resolve({ items: [], total: 0, page: 1, page_size: 20 })
+        listRefetchStarted()
+      }),
+    staleTime: Infinity,
+  })
+  const unsubscribe = listObserver.subscribe(() => {})
+
+  const forgetting = forgetDeletedFunnel(client, 3, 7)
+  await refetching
+
+  // While the list still shows the funnel, its card keeps its metrics and
+  // its read: removing them now would make the card fetch them again.
+  expect(client.getQueryData(keys.metrics)).toEqual({ funnel_id: 7 })
+  expect(client.getQueryState(keys.funnel)).toBeDefined()
+  expect(client.getQueryState(keys.firstPage)?.fetchStatus).toBe('fetching')
+
+  finishList()
+  await forgetting
+
+  expect(client.getQueryState(keys.metrics)).toBeUndefined()
+  expect(client.getQueryState(keys.funnel)).toBeUndefined()
+  unsubscribe()
 })

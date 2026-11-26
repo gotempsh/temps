@@ -36,9 +36,17 @@ const FUNNEL: FunnelResponse = {
 test('deleting a funnel refetches the list and forgets the funnel', async () => {
   let deleted = false
   let listReads = 0
+  let metricsReads = 0
+  // The list read after the delete is held until the test lets it answer, as
+  // a slow network would: until then the deleted funnel's card is on screen.
+  let answerList: () => void = () => {}
+  const listAnswered = new Promise<void>((resolve) => {
+    answerList = resolve
+  })
   const api = mockApi({
-    'GET /projects/3/funnels': () => {
+    'GET /projects/3/funnels': async () => {
       listReads += 1
+      if (deleted) await listAnswered
       return jsonResponse({
         items: deleted ? [] : [FUNNEL],
         total: deleted ? 0 : 1,
@@ -46,15 +54,17 @@ test('deleting a funnel refetches the list and forgets the funnel', async () => 
         page_size: 12,
       })
     },
-    'GET /projects/3/funnels/7/metrics': () =>
-      jsonResponse({
+    'GET /projects/3/funnels/7/metrics': () => {
+      metricsReads += 1
+      return jsonResponse({
         funnel_id: 7,
         funnel_name: 'Checkout',
         total_entries: 0,
         step_conversions: [],
         overall_conversion_rate: 0,
         average_completion_time_seconds: 0,
-      }),
+      })
+    },
     'DELETE /projects/3/funnels/7': () => {
       deleted = true
       return jsonResponse({ message: 'Funnel deleted successfully' })
@@ -77,6 +87,7 @@ test('deleting a funnel refetches the list and forgets the funnel', async () => 
     fireEvent.click(await view.findByLabelText('Delete funnel'))
   })
   const readsBeforeDelete = listReads
+  await waitFor(() => expect(metricsReads).toBe(1))
   await act(async () => {
     fireEvent.click(view.getByRole('button', { name: 'Delete' }))
   })
@@ -84,6 +95,20 @@ test('deleting a funnel refetches the list and forgets the funnel', async () => 
   await waitFor(() => expect(deleted).toBe(true))
   // The list was asked again (a bare ['listFunnels'] key never matched it).
   await waitFor(() => expect(listReads).toBeGreaterThan(readsBeforeDelete))
-  expect(client.getQueryState(funnelKey)).toBeUndefined()
+  // While the list is being reread, the deleted funnel's card keeps its
+  // metrics instead of asking for them again.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  })
+  expect(view.queryByText('Checkout')).not.toBeNull()
+  expect(metricsReads).toBe(1)
+  await act(async () => {
+    answerList()
+  })
+  await waitFor(() => expect(client.getQueryState(funnelKey)).toBeUndefined())
+  await waitFor(() => expect(view.queryByText('Checkout')).toBeNull())
+  // The deleted funnel's card was gone before its metrics were dropped, so
+  // they were never asked for again.
+  expect(metricsReads).toBe(1)
   api.restore()
 })

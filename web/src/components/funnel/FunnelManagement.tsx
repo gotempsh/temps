@@ -92,7 +92,7 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
       errorTitle: 'Failed to delete funnel',
     },
     onSuccess: (_, { path }) => {
-      forgetDeletedFunnel(queryClient, path.project_id, path.funnel_id)
+      void forgetDeletedFunnel(queryClient, path.project_id, path.funnel_id)
     },
   })
 
