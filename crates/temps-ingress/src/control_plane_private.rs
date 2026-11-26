@@ -248,12 +248,85 @@ enum Pass {
     Interrupted,
 }
 
+/// Most hostnames one pass checks, as the agent's `private_check::check_all`
+/// checks at most.
+const CHECKS_PER_PASS: usize = 64;
+
+/// Inside-check results by hostname and when each was last checked. A pass
+/// checks the hostnames checked longest ago, never-checked ones first, so
+/// every one gets its turn however many there are.
+#[derive(Default)]
+struct CheckRotation {
+    results: std::collections::BTreeMap<String, PrivateCheck>,
+    checked_at: std::collections::BTreeMap<String, Instant>,
+}
+
+impl CheckRotation {
+    /// Forget hostnames no longer served here.
+    fn retain(&mut self, hosts: &[(String, PrivateAddress)]) {
+        let live: std::collections::BTreeSet<&str> =
+            hosts.iter().map(|(h, _)| h.as_str()).collect();
+        self.results.retain(|host, _| live.contains(host.as_str()));
+        self.checked_at
+            .retain(|host, _| live.contains(host.as_str()));
+    }
+
+    /// Whether a hostname has never been checked.
+    fn has_unchecked(&self, hosts: &[(String, PrivateAddress)]) -> bool {
+        hosts
+            .iter()
+            .any(|(host, _)| !self.checked_at.contains_key(host))
+    }
+
+    /// The next `limit` hostnames to check: never checked first, then the
+    /// ones checked longest ago.
+    fn next(
+        &self,
+        hosts: &[(String, PrivateAddress)],
+        limit: usize,
+    ) -> Vec<(String, PrivateAddress)> {
+        let mut order: Vec<&(String, PrivateAddress)> = hosts.iter().collect();
+        order.sort_by(|a, b| {
+            self.checked_at
+                .get(&a.0)
+                .cmp(&self.checked_at.get(&b.0))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        order.into_iter().take(limit).cloned().collect()
+    }
+
+    fn record(
+        &mut self,
+        checked: &[(String, PrivateAddress)],
+        results: Vec<PrivateCheck>,
+        at: Instant,
+    ) {
+        for (host, _) in checked {
+            self.checked_at.insert(host.clone(), at);
+            self.results.remove(host);
+        }
+        for result in results {
+            self.results.insert(result.hostname.clone(), result);
+        }
+    }
+
+    /// Every hostname's latest result, in hostname order.
+    fn report(&self) -> Vec<PrivateCheck> {
+        self.results.values().cloned().collect()
+    }
+
+    fn clear(&mut self) {
+        self.results.clear();
+        self.checked_at.clear();
+    }
+}
+
 /// What the loop keeps between passes.
 #[derive(Default)]
 struct LoopState {
     last_report: Option<ListenerReport>,
     last_hosts: Vec<(String, PrivateAddress)>,
-    last_checks: Vec<PrivateCheck>,
+    checks: CheckRotation,
     checked_at: Option<Instant>,
     /// When the consent last written about was given: a new consent is
     /// always answered with a fresh report, even an identical one, since
@@ -357,7 +430,7 @@ impl ControlPlanePrivateIngressLoop {
         let Some(mut report) = decision.report else {
             state.last_report = None;
             state.reported_consent_at = None;
-            state.last_checks.clear();
+            state.checks.clear();
             state.last_hosts.clear();
             if self.runtime.consent_generation() != generation {
                 return Pass::Interrupted;
@@ -372,33 +445,39 @@ impl ControlPlanePrivateIngressLoop {
         // every CHECK_INTERVAL, and only while something is served.
         let mut hosts = self.route_table.control_plane_private_hosts();
         hosts.sort_by(|a, b| a.0.cmp(&b.0));
+        state.checks.retain(&hosts);
+        // More hostnames than one pass checks: the rest are checked on the
+        // next passes, not after CHECK_INTERVAL.
         let due = state
             .checked_at
             .is_none_or(|at| at.elapsed() >= CHECK_INTERVAL)
-            || hosts != state.last_hosts;
+            || hosts != state.last_hosts
+            || state.checks.has_unchecked(&hosts);
         let mut ran_checks = false;
         if decision.serving.is_some() && due {
             ran_checks = true;
-            state.last_checks = if hosts.is_empty() {
+            let batch = state.checks.next(&hosts, CHECKS_PER_PASS);
+            let results = if batch.is_empty() {
                 Vec::new()
             } else {
                 // Up to one DNS timeout per host: a withdrawn or narrowed
                 // consent must not wait for all of them. The checks are of
                 // a decision that no longer holds, so they are dropped.
                 tokio::select! {
-                    checks = self.checker.check(hosts.clone()) => checks,
+                    checks = self.checker.check(batch.clone()) => checks,
                     _ = self.runtime.changed() => {
                         debug!("the private ingress consent changed during the inside checks; syncing again");
                         return Pass::Interrupted;
                     }
                 }
             };
+            state.checks.record(&batch, results, Instant::now());
             state.last_hosts = hosts;
             state.checked_at = Some(Instant::now());
         } else if decision.serving.is_none() {
-            state.last_checks.clear();
+            state.checks.clear();
         }
-        report.private_checks = state.last_checks.clone();
+        report.private_checks = state.checks.report();
 
         // Written when it changes, with every fresh check, and once for
         // every new consent.
@@ -795,6 +874,58 @@ mod tests {
         let changed = first + chrono::Duration::seconds(1);
         assert!(must_write(&state, &report, false, Some(changed)));
         assert!(must_write(&state, &report, true, Some(first)));
+    }
+
+    fn address(n: usize) -> (String, PrivateAddress) {
+        (
+            format!("app{n:03}.internal.example.test"),
+            PrivateAddress {
+                address_id: format!("environment:{n}"),
+                range: Some("100.64.0.0/10".into()),
+                node_id: Some(CONTROL_PLANE_NODE_ID),
+                listener: Some("100.101.102.103".into()),
+                via: Some("listener".into()),
+                principals: None,
+            },
+        )
+    }
+
+    fn passed(host: &str) -> PrivateCheck {
+        PrivateCheck {
+            address_id: String::new(),
+            hostname: host.to_string(),
+            listener: "100.101.102.103".into(),
+            outcome: temps_core::worker_ingress::PrivateCheckOutcome::Reachable,
+            message: "answered".into(),
+            status: Some(200),
+        }
+    }
+
+    /// The checker checks at most 64 hostnames a call; the 65th and later
+    /// ones get their turn on the following passes instead of never.
+    #[test]
+    fn every_hostname_gets_its_turn_past_one_batch() {
+        let hosts: Vec<_> = (0..65).map(address).collect();
+        let mut rotation = CheckRotation::default();
+        let start = Instant::now();
+
+        let first = rotation.next(&hosts, CHECKS_PER_PASS);
+        assert_eq!(first.len(), CHECKS_PER_PASS);
+        let results = first.iter().map(|(h, _)| passed(h)).collect();
+        rotation.record(&first, results, start);
+        assert!(rotation.has_unchecked(&hosts), "the 65th is still waiting");
+
+        // The next pass starts with the one never checked, then the oldest.
+        let second = rotation.next(&hosts, CHECKS_PER_PASS);
+        assert_eq!(second[0].0, "app064.internal.example.test");
+        let results = second.iter().map(|(h, _)| passed(h)).collect();
+        rotation.record(&second, results, start + Duration::from_secs(1));
+        assert!(!rotation.has_unchecked(&hosts));
+        assert_eq!(rotation.report().len(), 65);
+
+        // A hostname no longer served drops out of the report.
+        rotation.retain(&hosts[..10]);
+        assert_eq!(rotation.report().len(), 10);
     }
 
     #[test]
