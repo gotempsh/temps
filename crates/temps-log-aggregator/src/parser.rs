@@ -308,7 +308,11 @@ pub fn mask_uri_passwords(line: &str) -> std::borrow::Cow<'_, str> {
                 }
             }
         }
-        search = authority_end;
+        // One byte back: an authority that ends at the slash of the next
+        // URI's `://` (`…@db,postgres://v:q@db2`) holds that separator's
+        // colon, and the next URI's `://` must still be found. The next
+        // match still starts past this authority, so the scan moves on.
+        search = authority_end.saturating_sub(1).max(authority_start);
     }
     match out {
         Some(mut out) => {
@@ -957,6 +961,20 @@ mod tests {
             (
                 r#"{"msg":"postgres:\/\/u:secret@db\/app"}"#,
                 r#"{"msg":"postgres:\/\/u:****@db\/app"}"#,
+            ),
+            // URIs one after another, with nothing that ends the first one
+            // before the next one's `://`.
+            (
+                "postgres://u:pw@db,postgres://v:pw2@db2",
+                "postgres://u:****@db,postgres://v:****@db2",
+            ),
+            (
+                r#"{"dsns":"postgres:\/\/u:pw@db,postgres:\/\/v:pw2@db2"}"#,
+                r#"{"dsns":"postgres:\/\/u:****@db,postgres:\/\/v:****@db2"}"#,
+            ),
+            (
+                "file:///tmp/x then postgres://u:pw@db",
+                "file:///tmp/x then postgres://u:****@db",
             ),
         ];
         for (raw, wanted) in cases {
