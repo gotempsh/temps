@@ -7,8 +7,8 @@ the page and no credential. Your job is to connect, check you are on the right
 instance, read that record, and answer what they asked.
 
 Run the commands the prompt gives exactly as written, including its package
-version. The examples below use `@beta` and placeholder names; the prompt's
-own values win.
+tag. The examples below use `@beta` and placeholder names; the prompt's own
+values win.
 
 ## 1. Connect
 
@@ -45,9 +45,10 @@ bunx @temps-sdk/cli@beta login https://temps.example.com --context temps-example
   contexts to make room.
 - Never ask for a password or an API key, never open or approve the link
   yourself, and never print the saved key.
-- If `--no-wait` is rejected as an unknown option, the package is older than
-  the console. Stop and say so; do not fall back to a plain `login`, which
-  blocks until approved and hides the link from the person.
+- If `--no-wait` is rejected as an unknown option, the CLI is older than the
+  console (a new CLI release can wait for approval on npm after the console
+  ships). Stop and say so; do not fall back to a plain `login`, which blocks
+  until approved and hides the link from the person.
 
 ## 2. Verify
 

@@ -145,7 +145,7 @@ export interface HandoffCommand {
 export interface AgentHandoffInput {
   /** Address of this instance as the agent's machine reaches it. */
   origin: string
-  /** Version of `@temps-sdk/cli` the commands are pinned to. */
+  /** Version or npm dist-tag of `@temps-sdk/cli` the commands run. */
   cliVersion: string
   subject: HandoffSubject
   /** What the person wants the agent to do; becomes the last line. */

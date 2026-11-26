@@ -98,10 +98,11 @@ describe('AI harness onboarding commands', () => {
     ).toBe('bunx skills add gotempsh/temps --skill temps')
   })
 
-  test('pins a bare CLI version, read from the package spec the release rewrites', () => {
-    // The release moves `@temps-sdk/cli@<version>` in ai-onboarding.ts; the
-    // commands must get the version alone, never the package name with it.
-    expect(TEMPS_CLI_VERSION).toMatch(/^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/)
+  test('runs the CLI by the dist-tag of its channel, never an unpublished version', () => {
+    // A server release is public before its CLI is approved on npm, so an
+    // exact version could name a package npm does not serve yet. The tag
+    // alone, never the package name with it.
+    expect(['beta', 'latest']).toContain(TEMPS_CLI_VERSION)
   })
 
   test('connects the pinned CLI without putting the API key in command text', () => {
