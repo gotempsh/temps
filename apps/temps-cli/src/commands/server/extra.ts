@@ -22,30 +22,23 @@ import type { NodeCreateAlertRuleRequest } from '../../api/types.gen.js'
 import { call, confirmRisk, connect, output, parseIntegerFlag, type JsonOption } from '../../lib/command-kit.js'
 import { ValidationError } from '../../utils/errors.js'
 
-/** `--start`/`--end`/`--percentile` as metric query fields. */
-export function metricWindowQuery(flags: { start?: string; end?: string; percentile?: string }): {
+/**
+ * `--start`/`--end` as metric query fields. There is no `--percentile`: the
+ * server collects no histogram buckets for these metrics and refuses the
+ * parameter (a recorded percentile is a metric of its own, e.g. `*_p95_ms`).
+ */
+export function metricWindowQuery(flags: { start?: string; end?: string }): {
   start_time?: string
   end_time?: string
-  percentile?: number
 } {
   for (const [flag, value] of [['--start', flags.start], ['--end', flags.end]] as const) {
     if (value !== undefined && Number.isNaN(Date.parse(value))) {
       throw new ValidationError(`${flag} must be an ISO 8601 time, e.g. 2026-01-01T00:00:00Z, got "${value}"`)
     }
   }
-  let percentile: number | undefined
-  if (flags.percentile !== undefined) {
-    percentile = Number(flags.percentile)
-    if (!Number.isFinite(percentile) || percentile <= 0 || percentile > 1) {
-      throw new ValidationError(`--percentile must be a fraction in (0, 1], e.g. 0.95, got "${flags.percentile}"`)
-    }
-    // The API takes the percentile in 0-100 units; round away float noise (0.29 * 100 = 28.999...).
-    percentile = Number((percentile * 100).toFixed(6))
-  }
   return {
     ...(flags.start !== undefined && { start_time: flags.start }),
     ...(flags.end !== undefined && { end_time: flags.end }),
-    ...(percentile !== undefined && { percentile }),
   }
 }
 
@@ -101,7 +94,7 @@ export function registerServerExtraCommands(server: Command): void {
     .option('--end <time>', 'End of an explicit window (ISO 8601)')
     .option('--json', 'Output in JSON format')
     .action(async (options: JsonOption & { metric: string; nodes: string; range?: string; start?: string; end?: string }) => {
-      const { percentile: _unused, ...window } = metricWindowQuery(options)
+      const window = metricWindowQuery(options)
       const query = { metric: options.metric, node_ids: nodeIdList(options.nodes), ...(options.range !== undefined && { range: options.range }), ...window }
       await connect()
       output(await call(`Could not read ${options.metric} across nodes`, () => nodeMetricsGetClusterRange({ client, query })), options, options.metric)
