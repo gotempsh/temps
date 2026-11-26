@@ -35,6 +35,8 @@ import { registerReleaseHealthCommands } from './release-health.js'
 import { registerAttachmentCommands } from './attachments.js'
 import { registerSourceControlCommands } from './source-control.js'
 import { applySavedSearch, loadSavedSearch, registerSavedSearchCommands } from './saved-searches.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { ListErrorEventsData } from '../../api/types.gen.js'
 
 interface ListOptions {
   projectId: string
@@ -546,15 +548,16 @@ export function registerErrorsCommands(program: Command): void {
   registerAttachmentCommands(errors)
   registerSourceControlCommands(errors)
 
-  errors
-    .command('events')
-    .description('List events in an error group')
-    .requiredOption('--project-id <id>', 'Project ID')
-    .requiredOption('--group-id <id>', 'Error group ID')
-    .option('--page <page>', 'Page number')
-    .option('--page-size <size>', 'Page size')
-    .option('--json', 'Output in JSON format')
-    .action(listErrorEventsAction)
+  EVENTS_TAG_FILTER.addTo(
+    errors
+      .command('events')
+      .description('List events in an error group')
+      .requiredOption('--project-id <id>', 'Project ID')
+      .requiredOption('--group-id <id>', 'Error group ID')
+      .option('--page <page>', 'Page number')
+      .option('--page-size <size>', 'Page size')
+      .option('--json', 'Output in JSON format'),
+  ).action(listErrorEventsAction)
 
   errors
     .command('event')
@@ -1195,7 +1198,16 @@ async function listErrorGroupFingerprintsAction(options: FingerprintsOptions): P
   }
 }
 
+const EVENTS_TAG_FILTER = fieldFlags<NonNullable<ListErrorEventsData['query']>>(
+  {
+    tag_key: { kind: 'string', help: 'Only events with this tag (with --tag-value)' },
+    tag_value: { kind: 'string', help: 'The value --tag-key must have' },
+  },
+  'query',
+)
+
 async function listErrorEventsAction(options: EventsListOptions): Promise<void> {
+  const tags = await EVENTS_TAG_FILTER.read(options)
   await requireAuth()
   await setupClient()
 
@@ -1213,6 +1225,7 @@ async function listErrorEventsAction(options: EventsListOptions): Promise<void> 
       query: {
         page: options.page ? parseInt(options.page, 10) : undefined,
         page_size: options.pageSize ? parseInt(options.pageSize, 10) : undefined,
+        ...tags,
       },
     })
     if (error) {
@@ -1471,6 +1484,7 @@ async function postSourceFile(
 ): Promise<
   { ok: true; result: SourceFileResponse } | { ok: false; status: number; text: string }
 > {
+  // api-coverage: POST /projects/{project_id}/releases/{release}/source-files
   const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(release)}/source-files`
   const formData = new FormData()
   // Copy into a fresh ArrayBuffer-backed view so it satisfies BlobPart.
@@ -1618,6 +1632,7 @@ async function listSourceFilesAction(options: SourceFileListOptions): Promise<vo
 
   const apiUrl = normalizeApiUrl(config.get('apiUrl'))
   const apiKey = await credentials.getApiKey()
+  // api-coverage: GET /projects/{project_id}/releases/{release}/source-files
   const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-files`
 
   const result = await withSpinner('Fetching source files...', async () => {
@@ -1667,6 +1682,7 @@ async function deleteSourceFilesAction(options: SourceFileDeleteOptions): Promis
 
   const apiUrl = normalizeApiUrl(config.get('apiUrl'))
   const apiKey = await credentials.getApiKey()
+  // api-coverage: DELETE /projects/{project_id}/releases/{release}/source-files
   const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-files`
 
   const result = await withSpinner('Deleting source files...', async () => {
@@ -1748,6 +1764,7 @@ async function listSourceMapReleases(options: SourceMapReleasesOptions): Promise
 
   const apiUrl = normalizeApiUrl(config.get('apiUrl'))
   const apiKey = await credentials.getApiKey()
+  // api-coverage: GET /projects/{project_id}/source-map-releases
   const url = `${apiUrl}/projects/${projectId}/source-map-releases`
 
   const result = await withSpinner('Fetching releases...', async () => {

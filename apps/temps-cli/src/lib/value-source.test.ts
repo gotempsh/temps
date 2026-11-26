@@ -522,6 +522,7 @@ describe('every credential flag in the CLI', () => {
     'temps settings update --value', // platform settings: URLs, booleans, numbers
     'temps kv set --value', // application data in the KV store
     'temps notification-preferences update --value', // a preference flag
+    'temps analytics settings create-traffic-filter --value', // a referrer, IP range, ASN or country to filter
   ])
 
   test('has a file or stdin alternative', async () => {

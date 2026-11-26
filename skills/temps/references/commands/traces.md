@@ -16,6 +16,12 @@ Inspect distributed traces and operation latency
 - `breakdown` - Show where the time inside one operation goes: queries, downstream calls, its own code
 - `page` - Compare a page's web vitals with the backend requests that served it
 - `show` (`get`) - Show every span of one trace: timing, service, status, attributes and events
+- `query-global` - Query global traces
+- `query-global-summaries` - Query global trace summaries
+- `get-unified` - Assemble a unified cross-project span waterfall (Phase 2)
+- `query-summaries` - Query trace summaries — one row per trace with span count, error count, root span info, and proper..
+- `query` - Query trace spans with optional filters
+- `get-cross-siblings` - Discover sibling projects that share the same 'trace_id' (Phase 1 banner)
 
 ### `traces span-stats` (alias: `operations`, `ops`)
 
@@ -114,3 +120,130 @@ Show every span of one trace: timing, service, status, attributes and events
 | `--start-time <iso>` | Look for the trace from this time (ISO 8601); pair with --end-time | - | No |
 | `--end-time <iso>` | Look for the trace up to this time (ISO 8601); pair with --start-time | - | No |
 | `--json` | Output the spans in JSON format | - | No |
+
+### `traces query-global`
+
+Query global traces
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Query parameter project_id | - | No |
+| `--trace-id <value>` | Query parameter trace_id | - | No |
+| `--service-name <value>` | Query parameter service_name | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--min-duration-ms <number>` | Query parameter min_duration_ms | - | No |
+| `--start-time <value>` | Query parameter start_time | - | No |
+| `--end-time <value>` | Query parameter end_time | - | No |
+| `--environment-id <n>` | Query parameter environment_id | - | No |
+| `--deployment-id <n>` | Query parameter deployment_id | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs. e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--sort-by <value>` | Sort field for the trace-summaries list: "start_time" (default) or "duration" | - | No |
+| `--sort-order <value>` | Sort direction: "asc" or "desc" (default) | - | No |
+| `--limit <n>` | Query parameter limit | - | No |
+| `--offset <n>` | Query parameter offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces query-global-summaries`
+
+Query global trace summaries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Query parameter project_id | - | No |
+| `--trace-id <value>` | Query parameter trace_id | - | No |
+| `--service-name <value>` | Query parameter service_name | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--min-duration-ms <number>` | Query parameter min_duration_ms | - | No |
+| `--start-time <value>` | Query parameter start_time | - | No |
+| `--end-time <value>` | Query parameter end_time | - | No |
+| `--environment-id <n>` | Query parameter environment_id | - | No |
+| `--deployment-id <n>` | Query parameter deployment_id | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs. e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--sort-by <value>` | Sort field for the trace-summaries list: "start_time" (default) or "duration" | - | No |
+| `--sort-order <value>` | Sort direction: "asc" or "desc" (default) | - | No |
+| `--limit <n>` | Query parameter limit | - | No |
+| `--offset <n>` | Query parameter offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces get-unified`
+
+Assemble a unified cross-project span waterfall (Phase 2)
+
+**Usage:** `traces get-unified <trace-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339); pair with end_time, max 31 days | - | No |
+| `--end-time <value>` | Window end (RFC 3339); pair with start_time, max 31 days | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces query-summaries`
+
+Query trace summaries — one row per trace with span count, error count, root span info, and proper..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--trace-id <value>` | Filter by trace ID | - | No |
+| `--service-name <value>` | Filter by service name | - | No |
+| `--status <value>` | Filter by status (OK, ERROR) | - | No |
+| `--min-duration-ms <number>` | Minimum trace duration in ms | - | No |
+| `--start-time <value>` | Start time (RFC 3339) | - | No |
+| `--end-time <value>` | End time (RFC 3339) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--deployment-id <n>` | Filter by deployment ID | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs, e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--sort-by <value>` | Sort field: 'start_time' (default) or 'duration' | - | No |
+| `--sort-order <value>` | Sort direction: 'asc' or 'desc' (default) | - | No |
+| `--include-total` | Compute the 'total' count (default: true) | - | No |
+| `--no-include-total` | Set include_total to false | - | No |
+| `--limit <n>` | Max traces to return (default: 50, max: 100) | - | No |
+| `--offset <n>` | Offset for pagination | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces query`
+
+Query trace spans with optional filters
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--trace-id <value>` | Filter by trace ID | - | No |
+| `--service-name <value>` | Filter by service name | - | No |
+| `--status <value>` | Filter by status (OK, ERROR, UNSET) | - | No |
+| `--min-duration-ms <number>` | Minimum span duration in ms | - | No |
+| `--start-time <value>` | Start time (RFC 3339) | - | No |
+| `--end-time <value>` | End time (RFC 3339) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--deployment-id <n>` | Filter by deployment ID | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs, e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--limit <n>` | Max spans to return (default: 100, max: 1000) | - | No |
+| `--offset <n>` | Offset for pagination | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces get-cross-siblings`
+
+Discover sibling projects that share the same 'trace_id' (Phase 1 banner)
+
+**Usage:** `traces get-cross-siblings <trace-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--exclude-project-id <n>` | Project ID to exclude (the caller's own project) so the UI does not render a self-link | - | No |
+| `--json` | Output in JSON format | - | No |

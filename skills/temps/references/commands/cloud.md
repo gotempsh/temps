@@ -17,6 +17,10 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`cloud billing`](#cloud-billing)
 - [`cloud console-access`](#cloud-console-access)
 - [`cloud telemetry`](#cloud-telemetry)
+- [`cloud get-ai-capability`](#cloud-get-ai-capability)
+- [`cloud reconcile-backup-source`](#cloud-reconcile-backup-source)
+- [`cloud features`](#cloud-features)
+- [`cloud get-capability`](#cloud-get-capability)
 
 ## `cloud`
 
@@ -35,6 +39,10 @@ Temps Cloud
 - `billing` - Manage Temps Cloud billing and subscription
 - `console-access` - Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
 - `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
+- `get-ai-capability` - Get cloud ai capability
+- `reconcile-backup-source` - Reconcile cloud backup source
+- `features` - Turn the Temps Cloud features this instance uses on or off; omitted ones keep their setting
+- `get-capability` - Get cloud capability
 
 ### `cloud login`
 
@@ -328,6 +336,7 @@ Set the write mode to "local" (stored on this instance) or "cloud" (written to T
 |------|-------------|---------|----------|
 | `-p, --project <slug>` | Project slug | - | No |
 | `--fidelity <tier>` | Also set Cloud telemetry fidelity: metered or queryable. "cloud" requires "queryable". | - | No |
+| `--analytics <mode>` | Also set where analytics and metrics are written: local or cloud | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -382,4 +391,54 @@ Stop a Temps Cloud activation at its next chunk boundary
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cloud get-ai-capability`
+
+Get cloud ai capability
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `cloud reconcile-backup-source`
+
+Reconcile cloud backup source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `cloud features`
+
+Turn the Temps Cloud features this instance uses on or off; omitted ones keep their setting
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--backups-enabled` | Off-site backups through Temps Cloud | - | No |
+| `--no-backups-enabled` | Set backups_enabled to false | - | No |
+| `--console-access-enabled` | Let Temps Cloud open this console (see `temps cloud console-access`) | - | No |
+| `--no-console-access-enabled` | Set console_access_enabled to false | - | No |
+| `--notifications-enabled` | Notifications delivered through Temps Cloud | - | No |
+| `--no-notifications-enabled` | Set notifications_enabled to false | - | No |
+| `--telemetry-enabled` | Cloud telemetry for spans, analytics and metrics | - | No |
+| `--no-telemetry-enabled` | Set telemetry_enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cloud get-capability`
+
+Get cloud capability
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |

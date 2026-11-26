@@ -17,6 +17,7 @@ import { registerContextCommands } from './commands/context/index.js'
 import { registerConfigureCommand } from './commands/configure.js'
 import { registerSetupCommand } from './commands/setup/index.js'
 import { registerStartCommands } from './commands/start/index.js'
+import { registerEndpointCommands } from './commands/endpoints.js'
 import { registerProjectsCommands } from './commands/projects/index.js'
 import { registerDeployCommands } from './commands/deploy/index.js'
 import { registerDomainsCommands } from './commands/domains/index.js'
@@ -61,6 +62,7 @@ import { registerDnsProvidersCommands } from './commands/dns-providers/index.js'
 import { registerDeliveryProfilesCommands } from './commands/delivery-profiles/index.js'
 import { registerDeliveryCommands } from './commands/delivery/index.js'
 import { registerIpAccessCommands } from './commands/ip-access/index.js'
+import { registerPreviewGatewayCommands } from './commands/preview-gateway/index.js'
 import { registerEdgeRulesCommands } from './commands/edge-rules/index.js'
 import { registerNetworkPolicyCommands } from './commands/network-policy/index.js'
 import { registerAuditCommands } from './commands/audit/index.js'
@@ -229,6 +231,7 @@ export function createProgram(): Command {
   registerDeliveryProfilesCommands(program)
   registerDeliveryCommands(program)
   registerIpAccessCommands(program)
+  registerPreviewGatewayCommands(program)
   registerEdgeRulesCommands(program)
   registerNetworkPolicyCommands(program)
   registerAuditCommands(program)
@@ -277,6 +280,9 @@ export function createProgram(): Command {
   registerDocsCommand(program)
   registerSetupCommand(program)
   registerStartCommands(program)
+
+  // Last: these add commands to the groups registered above.
+  registerEndpointCommands(program)
 
   // Custom help
   program.addHelpText('beforeAll', LOGO)

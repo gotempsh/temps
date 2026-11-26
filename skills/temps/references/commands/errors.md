@@ -6,7 +6,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`errors list`](#errors-list)
+- [`errors list`](#errors-list-alias-ls)
 - [`errors assign`](#errors-assign)
 - [`errors show`](#errors-show)
 - [`errors update`](#errors-update)
@@ -31,8 +31,17 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`errors stats`](#errors-stats)
 - [`errors timeline`](#errors-timeline)
 - [`errors dashboard`](#errors-dashboard)
-- [`errors sourcemaps`](#errors-sourcemaps)
-- [`errors source-files`](#errors-source-files)
+- [`errors sourcemaps`](#errors-sourcemaps-alias-sm)
+- [`errors source-files`](#errors-source-files-alias-sf)
+- [`errors list-global-groups`](#errors-list-global-groups)
+- [`errors autofix`](#errors-autofix)
+- [`errors autofixer`](#errors-autofixer)
+- [`errors ingestion`](#errors-ingestion)
+- [`errors alert-rules`](#errors-alert-rules)
+- [`errors search-group-assignees`](#errors-search-group-assignees)
+- [`errors update-saved-search`](#errors-update-saved-search)
+- [`errors feedback`](#errors-feedback)
+- [`errors has-groups`](#errors-has-groups)
 
 ## `errors` (alias: `error`)
 
@@ -67,6 +76,15 @@ Manage error tracking and error groups
 - `dashboard` - Get error dashboard statistics
 - `sourcemaps` (`sm`) - Manage source maps for error symbolication
 - `source-files` (`sf`) - Manage raw source files for native (Go/Rust/…) symbolication
+- `list-global-groups` - List issues across every project visible to the caller
+- `autofix` - Autofix commands
+- `autofixer` - Autofixer commands
+- `ingestion` - Ingestion commands
+- `alert-rules` - Alert rules commands
+- `search-group-assignees` - Search users and teams to assign an error group to
+- `update-saved-search` - Rename, share or change the filters of your saved search
+- `feedback` - Feedback commands
+- `has-groups` - Check if project has any error groups
 
 ### `errors list` (alias: `ls`)
 
@@ -219,10 +237,24 @@ Drop noisy error events before they are stored (browser extensions, crawlers, lo
 
 **Subcommands:**
 
+- `get` - Show one of a project's inbound filters
 - `list` - List a project's inbound filters and how many events each dropped
 - `add` - Add an inbound filter
 - `update` - Change a filter's pattern, or switch it on or off
 - `remove` (`delete`) - Delete an inbound filter; matching events are stored again
+
+#### `errors filters get`
+
+Show one of a project's inbound filters
+
+**Usage:** `errors filters get <filter-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `errors filters list`
 
@@ -378,6 +410,25 @@ Show the health of each release: crash-free sessions and users, adoption and dep
 | `--environment <name>` | SDK environment (as the SDK sends it) | - | No |
 | `--days <n>` | Window in days, 1 to 14 | `7` | No |
 | `--page <n>` | Page | `1` | No |
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `list-telemetry` - List telemetry releases
+
+#### `errors releases list-telemetry`
+
+List telemetry releases
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--release <value>` | Exact SDK release identity; absent lists observed releases | - | No |
+| `--days <n>` | Retained observation window, 1–31 days; default 7 | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors release`
@@ -591,6 +642,8 @@ List events in an error group
 | `--page <page>` | Page number | - | No |
 | `--page-size <size>` | Page size | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--tag-key <value>` | Only events with this tag (with --tag-value) | - | No |
+| `--tag-value <value>` | The value --tag-key must have | - | No |
 
 ### `errors event`
 
@@ -761,3 +814,510 @@ Delete all source files for a release
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--release <version>` | Release version | - | Yes |
+
+### `errors list-global-groups`
+
+List issues across every project visible to the caller
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--project-id <n>` | Query parameter project_id | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--search <value>` | Query parameter search | - | No |
+| `--start-date <value>` | Query parameter start_date | - | No |
+| `--end-date <value>` | Query parameter end_date | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors autofix`
+
+Autofix commands
+
+**Subcommands:**
+
+- `get-capability` - Whether autofix can run for the project, what a fix would become, and the project's autofix policy
+- `list-incidents` - The project's autofix incidents, newest first
+- `open-incident` - Ask autofix to reproduce and fix an error group
+- `get-incident` - One autofix incident
+- `close-incident` - Record the decision on a fix waiting for review
+- `list-incident-events` - The incident's timeline: every action the server, the agent and people took, oldest first
+- `download-patch` - The fix as a unified diff, for 'git apply'
+- `stop-incident` - Stop an incident: cancels the agent's turn, deletes the sandbox and keeps the transcript and timeline
+- `set-paused` - Pause or resume autofix for the project
+- `update-settings` - Change the project's autofix policy
+
+#### `errors autofix get-capability`
+
+Whether autofix can run for the project, what a fix would become, and the project's autofix policy
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix list-incidents`
+
+The project's autofix incidents, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number, from 1 | - | No |
+| `--page-size <n>` | Items per page | - | No |
+| `--status <value>` | 'open', 'closed', or one exact status | - | No |
+| `--error-group-id <n>` | Only incidents of this error group | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix open-incident`
+
+Ask autofix to reproduce and fix an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--error-group-id <n>` | The error group to fix [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix get-incident`
+
+One autofix incident
+
+**Usage:** `errors autofix get-incident <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix close-incident`
+
+Record the decision on a fix waiting for review
+
+**Usage:** `errors autofix close-incident <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--decision <value>` | 'merged' (you merged the pull request), 'applied' (you applied the patch) or 'rejected' [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix list-incident-events`
+
+The incident's timeline: every action the server, the agent and people took, oldest first
+
+**Usage:** `errors autofix list-incident-events <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--after-id <n>` | Only events after this id; pass the last id seen to poll | - | No |
+| `--limit <n>` | Default 100, max 500 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix download-patch`
+
+The fix as a unified diff, for 'git apply'
+
+**Usage:** `errors autofix download-patch <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix stop-incident`
+
+Stop an incident: cancels the agent's turn, deletes the sandbox and keeps the transcript and timeline
+
+**Usage:** `errors autofix stop-incident <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix set-paused`
+
+Pause or resume autofix for the project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--paused` | Body field paused [required] | - | No |
+| `--no-paused` | Set paused to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix update-settings`
+
+Change the project's autofix policy
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ai-model <value>` | Empty string clears it | - | No |
+| `--ai-provider <value>` | Empty string clears it (back to the assistant's default) | - | No |
+| `--min-confidence <n>` | Confidence level, 0-5, an 'auto_merge' fix must reach | - | No |
+| `--mode <value>` | 'off', 'propose' or 'auto_merge' | - | No |
+| `--protected-paths <value>` | Body field protected_paths (repeatable) | - | No |
+| `--test-command <value>` | Empty string clears it | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors autofixer`
+
+Autofixer commands
+
+**Subcommands:**
+
+- `start-analysis` - Start an autofixer analysis run for the given error group
+- `get-run` - Get a single autofixer run with its logs
+- `add-context` - Append a user message to the run's context field
+- `create-pr` - Push the fix branch and create a pull request
+- `start-fix` - Transition from analysis to fix phase
+- `re-analyze` - Continue the conversation with user feedback
+
+#### `errors autofixer start-analysis`
+
+Start an autofixer analysis run for the given error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--branch <value>` | Branch to clone instead of the project's main branch | - | No |
+| `--error-group-id <n>` | Body field error_group_id [required] | - | No |
+| `--max-turns <n>` | Per-run turn cap applied to every phase (1–200) | - | No |
+| `--model <value>` | Model id for the chosen provider. 'None' uses the provider's saved default model | - | No |
+| `--provider <value>` | AI provider id ("claude_cli", "codex_cli", "opencode"). 'None' uses the platform default provider | - | No |
+| `--user-context <value>` | Free-text notes for the model (extra context about the error, retry guidance, constraints) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer get-run`
+
+Get a single autofixer run with its logs
+
+**Usage:** `errors autofixer get-run <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer add-context`
+
+Append a user message to the run's context field
+
+**Usage:** `errors autofixer add-context <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--message <value>` | Body field message [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer create-pr`
+
+Push the fix branch and create a pull request
+
+**Usage:** `errors autofixer create-pr <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer start-fix`
+
+Transition from analysis to fix phase
+
+**Usage:** `errors autofixer start-fix <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer re-analyze`
+
+Continue the conversation with user feedback
+
+**Usage:** `errors autofixer re-analyze <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors ingestion`
+
+Ingestion commands
+
+**Subcommands:**
+
+- `list-client-outcomes` - List client outcomes
+
+#### `errors ingestion list-client-outcomes`
+
+List client outcomes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--days <n>` | Retained observation window, 1–31 days; default 7 | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors alert-rules`
+
+Alert rules commands
+
+**Subcommands:**
+
+- `list` - List all alert rules for a project
+- `create` - Create a new alert rule
+- `delete` - Delete an alert rule
+- `get` - Get a specific alert rule
+- `update` - Update an existing alert rule
+
+#### `errors alert-rules list`
+
+List all alert rules for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules create`
+
+Create a new alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--cooldown-minutes <n>` | Minimum minutes between notifications for same rule+group | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--environment-filter <n>` | Optional environment ID to filter alerts | - | No |
+| `--error-level-filter <value>` | Optional error type/level filter | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--notification-priority <value>` | Notification priority: Low, Normal, High, Critical | - | No |
+| `--trigger-config <json>` | Trigger-specific configuration (e.g., {"count": 100, "window_minutes": 60} for frequency) (JSON) | - | No |
+| `--trigger-type <value>` | Trigger type: new_issue, regression, frequency, new_user, user_count, status_change [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules delete`
+
+Delete an alert rule
+
+**Usage:** `errors alert-rules delete <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules get`
+
+Get a specific alert rule
+
+**Usage:** `errors alert-rules get <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules update`
+
+Update an existing alert rule
+
+**Usage:** `errors alert-rules update <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--cooldown-minutes <n>` | Body field cooldown_minutes | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--environment-filter <n>` | Body field environment_filter | - | No |
+| `--error-level-filter <value>` | Body field error_level_filter | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--notification-priority <value>` | Body field notification_priority | - | No |
+| `--trigger-config <json>` | Body field trigger_config (JSON) | - | No |
+| `--trigger-type <value>` | Body field trigger_type | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors search-group-assignees`
+
+Search users and teams to assign an error group to
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--q <value>` | Text in the user's name or email, or the team's name | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors update-saved-search`
+
+Rename, share or change the filters of your saved search
+
+**Usage:** `errors update-saved-search <saved-search-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--filters <json>` | The list filters a saved search applies (JSON) | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--shared` | Body field shared | - | No |
+| `--no-shared` | Set shared to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors feedback`
+
+Feedback commands
+
+**Subcommands:**
+
+- `list` - List project feedback
+- `delete` - Delete project feedback
+- `get` - Get project feedback
+- `update` - Update project feedback
+
+#### `errors feedback list`
+
+List project feedback
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors feedback delete`
+
+Delete project feedback
+
+**Usage:** `errors feedback delete <feedback-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors feedback get`
+
+Get project feedback
+
+**Usage:** `errors feedback get <feedback-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors feedback update`
+
+Update project feedback
+
+**Usage:** `errors feedback update <feedback-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--status <value>` | Body field status [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors has-groups`
+
+Check if project has any error groups
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |

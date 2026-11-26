@@ -8,6 +8,7 @@ import {
   deleteTeam,
   getProjects,
   getTeam,
+  getTeamMember,
   grantProjectAccess,
   listProjectAccess,
   listTeamMembers,
@@ -17,8 +18,9 @@ import {
   removeTeamMember,
   revokeProjectAccess,
   updateTeam,
-  updateTeamMemberRole
+  updateTeamMemberRole,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type {
   ProjectAccessResponse,
   TeamMemberResponse,
@@ -32,6 +34,7 @@ import { colors, header, icons, info, json, keyValue, newline, success, warning 
 import { promptConfirm, promptSelect, promptText } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
+import { parseIntegerFlag } from '../../lib/project-id.js'
 
 const TEAM_ROLES: TeamRole[] = ['owner', 'admin', 'deployer', 'viewer']
 
@@ -71,6 +74,7 @@ export function registerTeamsCommands(program: Command): void {
     .command('list')
     .alias('ls')
     .description('List all teams')
+    .option('--page <n>', 'Page of 100 teams (default: 1)')
     .option('--json', 'Output in JSON format')
     .action(listTeamsAction)
 
@@ -110,6 +114,12 @@ export function registerTeamsCommands(program: Command): void {
   const members = teams
     .command('members')
     .description('Manage team membership')
+
+  endpoint(members, getTeamMember, {
+    name: 'get',
+    description: "Show one member of a team",
+    path: { team_id: 'int', user_id: 'int' },
+  })
 
   members
     .command('list <team>')
@@ -180,8 +190,8 @@ export function registerTeamsCommands(program: Command): void {
 // project slug) so nobody has to look up a numeric id first.
 // ---------------------------------------------------------------------------
 
-async function fetchTeams(): Promise<TeamResponse[]> {
-  const { data, error } = await listTeams({ client, query: { page_size: 100 } })
+async function fetchTeams(page?: number): Promise<TeamResponse[]> {
+  const { data, error } = await listTeams({ client, query: { page_size: 100, ...(page !== undefined && { page }) } })
   if (error) {
     throw new Error(getErrorMessage(error))
   }
@@ -267,11 +277,12 @@ export function slugify(name: string): string {
 // Teams
 // ---------------------------------------------------------------------------
 
-async function listTeamsAction(options: JsonOption): Promise<void> {
+async function listTeamsAction(options: JsonOption & { page?: string }): Promise<void> {
+  const page = options.page === undefined ? undefined : parseIntegerFlag(options.page, '--page', 1)
   await requireAuth()
   await setupClient()
 
-  const teams = await withSpinner('Fetching teams...', fetchTeams)
+  const teams = await withSpinner('Fetching teams...', () => fetchTeams(page))
 
   if (options.json) {
     json(teams)

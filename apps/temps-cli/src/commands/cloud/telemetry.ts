@@ -142,6 +142,7 @@ export interface UpdateProjectCloudTelemetryBody {
   fidelity?: CloudTelemetryFidelity
   attribute_allowlist?: string[]
   write_mode?: CloudTelemetryWriteMode
+  analytics_write_mode?: CloudTelemetryWriteMode
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -393,11 +394,15 @@ async function writeModeSet(
   options: {
     project?: string
     fidelity?: string
+    analytics?: string
     force?: boolean
     yes?: boolean
     json?: boolean
   },
 ): Promise<void> {
+  if (options.analytics !== undefined && options.analytics !== 'local' && options.analytics !== 'cloud') {
+    throw new Error(`Unknown analytics write mode "${options.analytics}". Use "local" or "cloud".`)
+  }
   if (mode !== 'local' && mode !== 'cloud') {
     throw new Error(
       `Unknown write mode "${mode}". Use "local" (spans stored on this instance) ` +
@@ -421,12 +426,13 @@ async function writeModeSet(
   // Switching to Cloud-primary stops this project's spans being stored on this
   // machine. That is not a setting to change by accident from a script, so it
   // confirms unless explicitly forced.
-  if (mode === 'cloud' && !options.force && !options.yes) {
+  if ((mode === 'cloud' || options.analytics === 'cloud') && !options.force && !options.yes) {
+    const what = [mode === 'cloud' && 'spans', options.analytics === 'cloud' && 'analytics and metrics'].filter(Boolean).join(' and ')
     const confirmed = await promptConfirm({
       message:
-        `Write ${project.slug}’s spans to Temps Cloud instead of storing them here? ` +
-        'New spans will not be stored on this instance at all. Spans already stored ' +
-        'here stay readable until they age out of retention.',
+        `Write ${project.slug}’s ${what} to Temps Cloud instead of storing them here? ` +
+        'New data will not be stored on this instance at all. Data already stored ' +
+        'here stays readable until it ages out of retention.',
       default: false,
     })
     if (!confirmed) {
@@ -436,6 +442,7 @@ async function writeModeSet(
   }
 
   const body: UpdateProjectCloudTelemetryBody = { write_mode: mode }
+  if (options.analytics) body.analytics_write_mode = options.analytics as CloudTelemetryWriteMode
   if (options.fidelity) {
     body.fidelity = options.fidelity as CloudTelemetryFidelity
   }
@@ -603,6 +610,10 @@ export function registerCloudTelemetryCommands(cloud: Command): void {
       '--fidelity <tier>',
       'Also set Cloud telemetry fidelity: metered or queryable. ' +
         '"cloud" requires "queryable".',
+    )
+    .option(
+      '--analytics <mode>',
+      'Also set where analytics and metrics are written: local or cloud',
     )
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')

@@ -43,6 +43,7 @@ export interface CreateTemplateOptions {
   wait?: boolean
   idempotencyKey?: string
   timeout?: string
+  runtimeOverrides?: string
   json?: boolean
 }
 
@@ -176,6 +177,34 @@ export function parseServiceNames(values: string[], template: Pick<TemplateRespo
   return names
 }
 
+/**
+ * `--runtime-overrides`: a JSON object of image-service overrides by the
+ * template's service name, e.g. `{"api":{"image":"ghcr.io/acme/api:2","exposed_port":8080}}`.
+ */
+export function parseRuntimeOverrides(
+  value: string,
+  serviceNames: Set<string>,
+): NonNullable<InstantiateTemplateRequest['runtime_overrides']> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch (err) {
+    throw new Error(`--runtime-overrides is not valid JSON: ${(err as Error).message}`)
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('--runtime-overrides takes a JSON object keyed by service name')
+  }
+  for (const [service, overrides] of Object.entries(parsed)) {
+    if (!serviceNames.has(service)) {
+      throw new Error(`--runtime-overrides: the template has no service "${service}" (it has ${[...serviceNames].join(', ')})`)
+    }
+    if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+      throw new Error(`--runtime-overrides: the overrides for "${service}" must be a JSON object`)
+    }
+  }
+  return parsed as NonNullable<InstantiateTemplateRequest['runtime_overrides']>
+}
+
 /** Build the request; every database the template needs defaults to a new one. */
 export function buildInstantiateRequest(
   template: Pick<TemplateResponse, 'name' | 'kind' | 'databases' | 'service_definitions'>,
@@ -215,6 +244,9 @@ export function buildInstantiateRequest(
     databases,
     fork,
     idempotency_key: idempotencyKey,
+    ...(options.runtimeOverrides !== undefined && {
+      runtime_overrides: parseRuntimeOverrides(options.runtimeOverrides, serviceNames),
+    }),
   }
 }
 

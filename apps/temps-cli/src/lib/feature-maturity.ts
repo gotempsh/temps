@@ -26,6 +26,7 @@ const COMMAND_FEATURE_KEYS: Readonly<Record<string, string>> = {
   'ip-access': 'ip-access-geo',
   incidents: 'status-pages',
   sandbox: 'sandboxes-preview-environments',
+  'preview-gateway': 'sandboxes-preview-environments',
   workflow: 'ai-agents-workflows',
   revenue: 'revenue-tracking',
   'session-replay': 'session-replay',

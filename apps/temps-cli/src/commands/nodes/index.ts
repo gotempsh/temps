@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
+import { registerNodesAdminCommands } from './admin.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -430,6 +431,7 @@ export function registerNodesCommands(program: Command): void {
 
   registerNodesSshCommands(nodes)
   registerNodesResourcesCommands(nodes)
+  registerNodesAdminCommands(nodes)
 }
 
 // ============================================================================

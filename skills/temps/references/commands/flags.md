@@ -4,6 +4,26 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`flags list`](#flags-list-alias-ls)
+- [`flags get`](#flags-get)
+- [`flags create`](#flags-create)
+- [`flags update`](#flags-update)
+- [`flags rules`](#flags-rules)
+- [`flags evaluate`](#flags-evaluate-alias-eval)
+- [`flags reshuffle`](#flags-reshuffle)
+- [`flags set`](#flags-set)
+- [`flags clear`](#flags-clear)
+- [`flags disable`](#flags-disable)
+- [`flags enable`](#flags-enable)
+- [`flags restore`](#flags-restore)
+- [`flags archive`](#flags-archive)
+- [`flags record-exposure`](#flags-record-exposure)
+- [`flags get-snapshot`](#flags-get-snapshot)
+- [`flags ofrep-server-bulk`](#flags-ofrep-server-bulk)
+- [`flags ofrep-server-single`](#flags-ofrep-server-single)
+
 ## `flags` (alias: `flag`)
 
 Manage feature flags (runtime config that changes without a redeploy)
@@ -23,6 +43,10 @@ Manage feature flags (runtime config that changes without a redeploy)
 - `enable` - Re-enable a flag in this environment after a kill switch
 - `restore` - Restore an archived flag
 - `archive` - Archive a flag (callers fall back to their own default)
+- `record-exposure` - Record which flags a running app actually evaluated
+- `get-snapshot` - Every flag for the caller's environment, collapsed to what the evaluator needs
+- `ofrep-server-bulk` - OFREP bulk evaluation for server-side OpenFeature SDKs
+- `ofrep-server-single` - OFREP single-flag evaluation for server-side OpenFeature SDKs
 
 ### `flags list` (alias: `ls`)
 
@@ -244,3 +268,55 @@ Archive a flag (callers fall back to their own default)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+
+### `flags record-exposure`
+
+Record which flags a running app actually evaluated
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--keys <value>` | Flag keys evaluated since the last report (repeatable) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags get-snapshot`
+
+Every flag for the caller's environment, collapsed to what the evaluator needs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--environment-id <n>` | Required only when the calling token is project-wide rather than scoped to a single environment | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags ofrep-server-bulk`
+
+OFREP bulk evaluation for server-side OpenFeature SDKs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--context <json>` | Body field context (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags ofrep-server-single`
+
+OFREP single-flag evaluation for server-side OpenFeature SDKs
+
+**Usage:** `flags ofrep-server-single <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--context <json>` | Body field context (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |

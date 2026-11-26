@@ -49,6 +49,7 @@ interface RemoveOptions {
   id: string
   force?: boolean
   yes?: boolean
+  deleteFromProvider?: boolean
 }
 
 interface ByNameOptions {
@@ -126,6 +127,7 @@ export function registerEmailDomainsCommands(program: Command): void {
     .alias('rm')
     .description('Remove an email domain')
     .requiredOption('--id <id>', 'Email domain ID')
+    .option('--delete-from-provider', 'Also delete the domain at the email provider (SES, etc.)')
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(removeDomainAction)
@@ -551,6 +553,7 @@ async function removeDomainAction(options: RemoveOptions): Promise<void> {
     const { error } = await deleteEmailDomain({
       client,
       path: { id },
+      query: options.deleteFromProvider ? { delete_from_provider: true } : undefined,
     })
     if (error) {
       throw new Error(getErrorMessage(error))

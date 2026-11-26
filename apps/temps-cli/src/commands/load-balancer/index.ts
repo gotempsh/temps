@@ -15,6 +15,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, keyValue } from '../../ui/output.js'
+import { ValidationError } from '../../utils/errors.js'
 
 interface ListOptions {
   json?: boolean
@@ -23,6 +24,7 @@ interface ListOptions {
 interface CreateOptions {
   domain?: string
   target?: string
+  type?: string
   yes?: boolean
 }
 
@@ -34,6 +36,7 @@ interface ShowOptions {
 interface UpdateOptions {
   domain: string
   target?: string
+  type?: string
 }
 
 interface RemoveOptions {
@@ -69,6 +72,7 @@ export function registerLoadBalancerCommands(program: Command): void {
     .description('Create a load balancer route')
     .option('-d, --domain <domain>', 'Domain for the route')
     .option('-t, --target <target>', 'Target upstream URL')
+    .option('--type <type>', 'http (default: match the Host header) or tls (match the SNI name, pass TCP through)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createRouteAction)
 
@@ -84,6 +88,7 @@ export function registerLoadBalancerCommands(program: Command): void {
     .description('Update a load balancer route')
     .requiredOption('-d, --domain <domain>', 'Domain of the route')
     .option('-t, --target <target>', 'New target upstream URL')
+    .option('--type <type>', 'http (match the Host header) or tls (match the SNI name, pass TCP through)')
     .action(updateRouteAction)
 
   lb
@@ -135,7 +140,16 @@ async function listRoutesAction(options: ListOptions): Promise<void> {
   newline()
 }
 
+const ROUTE_TYPES = ['http', 'tls']
+
+export function parseRouteType(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  if (!ROUTE_TYPES.includes(value)) throw new ValidationError(`--type must be one of ${ROUTE_TYPES.join(', ')}, got "${value}"`)
+  return value
+}
+
 async function createRouteAction(options: CreateOptions): Promise<void> {
+  const routeType = parseRouteType(options.type)
   await requireAuth()
   await setupClient()
 
@@ -184,6 +198,7 @@ async function createRouteAction(options: CreateOptions): Promise<void> {
         domain,
         host,
         port,
+        ...(routeType && { route_type: routeType }),
       },
     })
     if (error) {
@@ -248,6 +263,7 @@ async function showRoute(options: ShowOptions): Promise<void> {
 }
 
 async function updateRouteAction(options: UpdateOptions): Promise<void> {
+  const routeType = parseRouteType(options.type)
   await requireAuth()
   await setupClient()
 
@@ -274,6 +290,7 @@ async function updateRouteAction(options: UpdateOptions): Promise<void> {
         enabled: true,
         host,
         port,
+        ...(routeType && { route_type: routeType }),
       },
     })
     if (error) {

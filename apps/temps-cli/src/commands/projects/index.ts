@@ -14,6 +14,7 @@ import { projectIdenticalBuildsAction } from './identical-builds.js'
 import { projectGroupAction } from './group.js'
 import { registerProjectSecretsCommands } from './secrets.js'
 import { cloudflareCapabilityAction } from './cloudflare-capability.js'
+import { CREATE_PROJECT_EXTRA, DEPLOYMENT_CONFIG_EXTRA, GIT_EXTRA, SETTINGS_EXTRA, UPDATE_PROJECT_EXTRA } from './field-flags.js'
 
 export function registerProjectsCommands(program: Command): void {
   const projects = program
@@ -34,33 +35,36 @@ export function registerProjectsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .option('--page <n>', 'Page number')
     .option('--per-page <n>', 'Items per page')
+    .option('--group <id>', 'Only services in this project group (its numeric ID)')
+    .option('--ungrouped', 'Only services in no project group')
     .action(list)
 
-  projects
-    .command('create')
-    .alias('new')
-    .description('Create a new service (git-based or manual deployment); add it to a project with `project-groups add`')
-    .option('-n, --name <name>', 'Service name')
-    .option('-d, --description <description>', 'Service description')
-    .option('--repo <repository>', 'Repository in owner/name format (nested groups supported: group/subgroup/name)')
-    .option('--branch <branch>', 'Git branch')
-    .option('--directory <directory>', 'Root directory (relative to repo)')
-    .option('--preset <preset>', 'Build preset (e.g., nextjs, nodejs, static, docker)')
-    .option('--connection <id>', 'Git connection ID')
-    .option('--manual', 'Create a manual (non-git) service - deploy via Docker image or static files')
-    .option(
-      '--source-type <type>',
-      'Manual deployment method: manual (flexible), docker_image, or static_files'
-    )
-    .option('--image <image>', 'Docker image for the first deployment (manual mode)')
-    .option('--port <port>', 'Application/container port (manual mode, default: 3000)')
-    .option('--external', 'The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes)')
-    .option(
-      '--delivery-provider <provider>',
-      'Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`)'
-    )
-    .option('-y, --yes', 'Skip optional prompts (services, env vars, set-default)')
-    .action(create)
+  CREATE_PROJECT_EXTRA.addTo(
+    projects
+      .command('create')
+      .alias('new')
+      .description('Create a new service (git-based or manual deployment); add it to a project with `project-groups add`')
+      .option('-n, --name <name>', 'Service name')
+      .option('-d, --description <description>', 'Service description')
+      .option('--repo <repository>', 'Repository in owner/name format (nested groups supported: group/subgroup/name)')
+      .option('--branch <branch>', 'Git branch')
+      .option('--directory <directory>', 'Root directory (relative to repo)')
+      .option('--preset <preset>', 'Build preset (e.g., nextjs, nodejs, static, docker)')
+      .option('--connection <id>', 'Git connection ID')
+      .option('--manual', 'Create a manual (non-git) service - deploy via Docker image or static files')
+      .option(
+        '--source-type <type>',
+        'Manual deployment method: manual (flexible), docker_image, or static_files'
+      )
+      .option('--image <image>', 'Docker image for the first deployment (manual mode)')
+      .option('--port <port>', 'Application/container port (manual mode, default: 3000)')
+      .option('--external', 'The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes)')
+      .option(
+        '--delivery-provider <provider>',
+        'Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`)'
+      )
+      .option('-y, --yes', 'Skip optional prompts (services, env vars, set-default)'),
+  ).action(create)
 
   projects
     .command('cloudflare-capability')
@@ -84,61 +88,64 @@ export function registerProjectsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(projectGroupAction)
 
-  projects
-    .command('update')
-    .alias('edit')
-    .description('Update service name and description')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option('-n, --name <name>', 'New project name')
-    .option('-d, --description <description>', 'New project description')
-    .option('--json', 'Output in JSON format')
-    .option('-y, --yes', 'Skip prompts, use provided values (for automation)')
-    .action(updateProjectAction)
+  UPDATE_PROJECT_EXTRA.addTo(
+    projects
+      .command('update')
+      .alias('edit')
+      .description('Update service name and description')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option('-n, --name <name>', 'New project name')
+      .option('-d, --description <description>', 'New project description')
+      .option('--json', 'Output in JSON format')
+      .option('-y, --yes', 'Skip prompts, use provided values (for automation)'),
+  ).action(updateProjectAction)
 
-  projects
-    .command('settings')
-    .description('Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option('--name <name>', 'Project display name (does not change the URL)')
-    .option('--slug <slug>', 'Project URL slug')
-    .option('--attack-mode', 'Enable attack mode (CAPTCHA protection)')
-    .option('--no-attack-mode', 'Disable attack mode')
-    .option('--preview-envs', 'Enable preview environments')
-    .option('--no-preview-envs', 'Disable preview environments')
-    .option(
-      '--vulnerability-scanning',
-      'Enable Trivy vulnerability scanning of deployed Docker images (post-deploy + daily)'
-    )
-    .option(
-      '--no-vulnerability-scanning',
-      'Disable vulnerability scanning'
-    )
-    .option(
-      '--image-retention-hours <hours>',
-      'Hours to keep built images before nightly cleanup removes them (1-8760). ' +
-        'Images are needed to roll back, so this is the project rollback window'
-    )
-    .option(
-      '--reset-image-retention',
-      'Clear the per-project image retention override and use the system default'
-    )
-    .option('--json', 'Output in JSON format')
-    .option('-y, --yes', 'Skip prompts (for automation)')
-    .action(updateSettingsAction)
+  SETTINGS_EXTRA.addTo(
+    projects
+      .command('settings')
+      .description('Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option('--name <name>', 'Project display name (does not change the URL)')
+      .option('--slug <slug>', 'Project URL slug')
+      .option('--attack-mode', 'Enable attack mode (CAPTCHA protection)')
+      .option('--no-attack-mode', 'Disable attack mode')
+      .option('--preview-envs', 'Enable preview environments')
+      .option('--no-preview-envs', 'Disable preview environments')
+      .option(
+        '--vulnerability-scanning',
+        'Enable Trivy vulnerability scanning of deployed Docker images (post-deploy + daily)'
+      )
+      .option(
+        '--no-vulnerability-scanning',
+        'Disable vulnerability scanning'
+      )
+      .option(
+        '--image-retention-hours <hours>',
+        'Hours to keep built images before nightly cleanup removes them (1-8760). ' +
+          'Images are needed to roll back, so this is the project rollback window'
+      )
+      .option(
+        '--reset-image-retention',
+        'Clear the per-project image retention override and use the system default'
+      )
+      .option('--json', 'Output in JSON format')
+      .option('-y, --yes', 'Skip prompts (for automation)'),
+  ).action(updateSettingsAction)
 
-  projects
-    .command('git')
-    .description('Update git repository settings')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option('--owner <owner>', 'Repository owner')
-    .option('--repo <repo>', 'Repository name')
-    .option('--branch <branch>', 'Main branch')
-    .option('--directory <directory>', 'App directory path')
-    .option('--preset <preset>', 'Build preset (auto, nextjs, nodejs, static, docker, rust, go, python)')
-    .option('--connection <id>', 'Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged)')
-    .option('--json', 'Output in JSON format')
-    .option('-y, --yes', 'Skip prompts, use provided/existing values (for automation)')
-    .action(updateGitAction)
+  GIT_EXTRA.addTo(
+    projects
+      .command('git')
+      .description('Update git repository settings')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option('--owner <owner>', 'Repository owner')
+      .option('--repo <repo>', 'Repository name')
+      .option('--branch <branch>', 'Main branch')
+      .option('--directory <directory>', 'App directory path')
+      .option('--preset <preset>', 'Build preset (auto, nextjs, nodejs, static, docker, rust, go, python)')
+      .option('--connection <id>', 'Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged)')
+      .option('--json', 'Output in JSON format')
+      .option('-y, --yes', 'Skip prompts, use provided/existing values (for automation)'),
+  ).action(updateGitAction)
 
   projects
     .command('source')
@@ -178,21 +185,22 @@ export function registerProjectsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(projectIdenticalBuildsAction)
 
-  projects
-    .command('config')
-    .description('Update deployment configuration (resources, replicas)')
-    .option('-p, --project <project>', 'Project slug or ID')
-    .option('--replicas <n>', 'Number of container replicas')
-    .option('--cpu-limit <limit>', 'CPU limit in cores (e.g., 0.5, 1, 2)')
-    .option('--memory-limit <limit>', 'Memory limit in MB')
-    .option('--auto-deploy', 'Enable automatic deployments')
-    .option('--no-auto-deploy', 'Disable automatic deployments')
-    .option('--request-timeout <seconds>', 'Default timeout for regular HTTP requests, in seconds')
-    .option('--sse-idle-timeout <seconds>', 'Default idle timeout for SSE streams, in seconds')
-    .option('--websocket-idle-timeout <seconds>', 'Default idle timeout for WebSocket connections, in seconds')
-    .option('--json', 'Output in JSON format')
-    .option('-y, --yes', 'Skip prompts (for automation)')
-    .action(updateConfigAction)
+  DEPLOYMENT_CONFIG_EXTRA.addTo(
+    projects
+      .command('config')
+      .description('Update deployment configuration (resources, replicas)')
+      .option('-p, --project <project>', 'Project slug or ID')
+      .option('--replicas <n>', 'Number of container replicas')
+      .option('--cpu-limit <limit>', 'CPU limit in cores (e.g., 0.5, 1, 2)')
+      .option('--memory-limit <limit>', 'Memory limit in MB')
+      .option('--auto-deploy', 'Enable automatic deployments')
+      .option('--no-auto-deploy', 'Disable automatic deployments')
+      .option('--request-timeout <seconds>', 'Default timeout for regular HTTP requests, in seconds')
+      .option('--sse-idle-timeout <seconds>', 'Default idle timeout for SSE streams, in seconds')
+      .option('--websocket-idle-timeout <seconds>', 'Default idle timeout for WebSocket connections, in seconds')
+      .option('--json', 'Output in JSON format')
+      .option('-y, --yes', 'Skip prompts (for automation)'),
+  ).action(updateConfigAction)
 
   projects
     .command('delete')
