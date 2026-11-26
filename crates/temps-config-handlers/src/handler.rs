@@ -461,18 +461,35 @@ const REVISION_EXCLUDED_GEO_KEYS: [&str; 5] = [
     "last_error",
 ];
 
+/// Settings a `PUT /settings` writes that the masked view leaves out. None
+/// is a credential, so they are added to the revision as stored.
+const REVISION_WRITABLE_OUTSIDE_THE_VIEW: [&str; 3] = [
+    "environment_hostname_template",
+    "production_hostname_template",
+    "control_plane_resources",
+];
+
 /// Revision of the platform settings (#2081), over the masked view a reader
 /// sees, never the stored secrets: a hash of a stored credential would let
-/// anyone who can read the settings guess it offline.
+/// anyone who can read the settings guess it offline. Every other setting a
+/// save writes is covered too ([`REVISION_WRITABLE_OUTSIDE_THE_VIEW`]); a
+/// change to a credential alone does not change it, which the service's merge
+/// base check covers instead.
 pub(crate) fn settings_revision(settings: &AppSettings) -> String {
     let mut view = serde_json::to_value(AppSettingsResponse::from(settings.clone()))
         // Serializing a plain struct does not fail; if it ever did, every
         // revision would be the same and saves would be unconditional, as
         // they were before revisions existed.
         .unwrap_or_default();
+    let stored = serde_json::to_value(settings).unwrap_or_default();
     if let Some(view) = view.as_object_mut() {
         for key in REVISION_EXCLUDED_KEYS {
             view.remove(key);
+        }
+        for key in REVISION_WRITABLE_OUTSIDE_THE_VIEW {
+            if let Some(value) = stored.get(key) {
+                view.insert(key.to_string(), value.clone());
+            }
         }
         if let Some(geo) = view.get_mut("geo").and_then(|geo| geo.as_object_mut()) {
             for key in REVISION_EXCLUDED_GEO_KEYS {
@@ -3753,7 +3770,11 @@ async fn update_settings(
     // possibly-widened spend ceiling with neither the check nor the record that
     // are supposed to accompany it.
     validate_bulk_activation_guards(&settings.cloud)?;
-    let stored_settings = match app_state.config_service.get_settings().await {
+    // The document omitted fields and masked secrets are filled from: read
+    // now, not from the cache, which may be seconds old or predate another
+    // process's save; the service refuses a revision-checked save whose base
+    // the locked row has moved past.
+    let stored_settings = match app_state.config_service.get_settings_uncached().await {
         Ok(current) => current,
         Err(e) => {
             error!(
@@ -4048,6 +4069,7 @@ async fn update_settings(
             Some(temps_config::SettingsRevisionCheck {
                 expected: expected_revision,
                 revision_of: settings_revision,
+                merge_base: Some(stored_settings.clone()),
             }),
         )
         .await
@@ -7691,6 +7713,78 @@ mod tests {
     /// #2081: admin A reads the settings, admin B saves a change, then A
     /// saves what it read with another field changed. A's save is refused
     /// with a 409 naming both revisions instead of reverting B's change.
+    #[test]
+    fn the_settings_revision_follows_every_setting_a_save_writes_but_no_credential() {
+        let base = AppSettings::default();
+        let revision = settings_revision(&base);
+        let mut templated = base.clone();
+        templated.environment_hostname_template = Some("{env}-{project}".to_string());
+        assert_ne!(settings_revision(&templated), revision);
+        let mut production = base.clone();
+        production.production_hostname_template = Some("{project}".to_string());
+        assert_ne!(settings_revision(&production), revision);
+        let mut reserved = base.clone();
+        reserved.control_plane_resources.enforce_reservations =
+            !reserved.control_plane_resources.enforce_reservations;
+        assert_ne!(settings_revision(&reserved), revision);
+
+        // A stored credential never reaches the revision (it is masked).
+        let mut with_password = base.clone();
+        with_password.docker_registry.password = Some("first".to_string());
+        let mut rotated = base.clone();
+        rotated.docker_registry.password = Some("second".to_string());
+        assert_eq!(
+            settings_revision(&with_password),
+            settings_revision(&rotated)
+        );
+    }
+
+    /// Every top-level setting is either in the revision or one a
+    /// `PUT /settings` never writes, so a new setting cannot be left out of
+    /// it unnoticed (and a save of it reverted without a conflict).
+    #[test]
+    fn every_setting_is_in_the_revision_or_kept_from_the_stored_row() {
+        // Written by their own endpoints or by the system; the generic save
+        // keeps the stored values (`update_settings_checked`,
+        // `preserve_self_recorded_fields`).
+        const NOT_WRITTEN_BY_A_SETTINGS_SAVE: [&str; 6] = [
+            "anonymous_telemetry_enabled",
+            "blob",
+            "console_version",
+            "kv",
+            "managed_service_healthchecks",
+            "shield",
+        ];
+        let schema = <AppSettings as utoipa::PartialSchema>::schema();
+        let response = <AppSettingsResponse as utoipa::PartialSchema>::schema();
+        let properties = |schema: utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>| {
+            match serde_json::to_value(schema).unwrap_or_default()["properties"].as_object() {
+                Some(properties) => properties.keys().cloned().collect::<Vec<_>>(),
+                None => Vec::new(),
+            }
+        };
+        let in_view = properties(response);
+        let settings = properties(schema);
+        assert!(
+            in_view.len() > 10 && settings.len() > 10,
+            "the schemas list their properties"
+        );
+        let missing: Vec<String> = settings
+            .into_iter()
+            .filter(|key| {
+                !in_view.contains(key)
+                    && !REVISION_WRITABLE_OUTSIDE_THE_VIEW.contains(&key.as_str())
+                    && !NOT_WRITTEN_BY_A_SETTINGS_SAVE.contains(&key.as_str())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "settings outside the revision: {missing:?}; add each to \
+             REVISION_WRITABLE_OUTSIDE_THE_VIEW, or, if a settings save keeps its stored \
+             value, to NOT_WRITTEN_BY_A_SETTINGS_SAVE"
+        );
+    }
+
     #[tokio::test]
     async fn a_settings_save_from_a_stale_read_is_refused() {
         use tower::ServiceExt;

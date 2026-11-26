@@ -90,6 +90,57 @@ pub struct SettingsRevisionCheck {
     /// saved revision is still returned.
     pub expected: Option<String>,
     pub revision_of: fn(&AppSettings) -> String,
+    /// The stored document the caller merged the request onto (omitted
+    /// fields, masked secrets). With an `expected` revision, the write is
+    /// refused when the locked row no longer matches it: the revision covers
+    /// only what a reader sees, so a rotated credential or a field outside
+    /// the view could otherwise change underneath a matching revision and be
+    /// reverted from this older base. Sections the write keeps from the
+    /// locked row anyway are not compared.
+    pub merge_base: Option<AppSettings>,
+}
+
+/// Sections a generic settings write takes from the locked row whatever the
+/// caller sent (their dedicated writers own them), so a change to them since
+/// the caller's merge base cannot be reverted and does not make it stale.
+const KEPT_FROM_LOCKED_ROW: [&str; 9] = [
+    "plugin_installation_reporting_enabled",
+    "anonymous_telemetry_enabled",
+    "preview_gateway",
+    "kv",
+    "blob",
+    "managed_service_healthchecks",
+    "shield",
+    "trusted_private_networks",
+    "trusted_proxy_cidrs",
+];
+
+/// Whether a write merged onto `base` would revert something stored in
+/// `locked` since: they differ outside [`KEPT_FROM_LOCKED_ROW`]. Compared in
+/// memory only, credentials included; nothing of it is returned.
+fn merge_base_is_stale(base: &AppSettings, locked: &AppSettings) -> bool {
+    let comparable = |settings: &AppSettings| {
+        let mut value = serde_json::to_value(settings).unwrap_or_default();
+        if let Some(map) = value.as_object_mut() {
+            for key in KEPT_FROM_LOCKED_ROW {
+                map.remove(key);
+            }
+            if let Some(multi_node) = map.get_mut("multi_node").and_then(|v| v.as_object_mut()) {
+                for key in [
+                    "cluster_ca_cert_pem",
+                    "cluster_ca_key_encrypted",
+                    "join_token_hash",
+                ] {
+                    multi_node.remove(key);
+                }
+            }
+            if let Some(sandbox) = map.get_mut("agent_sandbox").and_then(|v| v.as_object_mut()) {
+                sandbox.remove("allowed_node_ids");
+            }
+        }
+        value
+    };
+    comparable(base) != comparable(locked)
 }
 
 /// Rebase credential-owned fields onto the row locked by the settings writer.
@@ -1570,6 +1621,14 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The application settings read from the database now, bypassing (and
+    /// refreshing) the cache: for a writer that merges a request onto the
+    /// stored document, which a cached snapshot up to
+    /// [`SETTINGS_CACHE_TTL`] old would revert.
+    pub async fn get_settings_uncached(&self) -> Result<AppSettings, ConfigServiceError> {
+        self.load_settings().await
+    }
+
     /// Get the application settings.
     pub async fn get_settings(&self) -> Result<AppSettings, ConfigServiceError> {
         // Serve from the in-memory cache while it is fresh — this is what keeps
@@ -1582,7 +1641,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
                 }
             }
         }
+        self.load_settings().await
+    }
 
+    /// Load the settings row and cache it.
+    async fn load_settings(&self) -> Result<AppSettings, ConfigServiceError> {
         let generation = self.settings_cache.read().await.generation;
 
         // Cache miss or stale: load from the DB and repopulate.
@@ -1903,11 +1966,27 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             None => AppSettings::default(),
         };
         if let Some(check) = &revision_check {
-            if let Err(stale) = temps_core::revision::check_expected_revision(
+            let current = (check.revision_of)(&locked_settings);
+            let stale = temps_core::revision::check_expected_revision(
                 || "Platform settings".to_string(),
                 check.expected.as_deref(),
-                &(check.revision_of)(&locked_settings),
-            ) {
+                &current,
+            )
+            .err()
+            .or_else(|| {
+                let expected = check.expected.as_ref()?;
+                let base = check.merge_base.as_ref()?;
+                merge_base_is_stale(base, &locked_settings).then(|| {
+                    temps_core::revision::StaleRevision {
+                        resource: "Platform settings (saved again while this save was being \
+                                   prepared)"
+                            .to_string(),
+                        expected: expected.clone(),
+                        current: current.clone(),
+                    }
+                })
+            });
+            if let Some(stale) = stale {
                 if let Err(rollback) = txn.rollback().await {
                     warn!(%rollback, "Failed to roll back a refused stale settings update");
                 }
@@ -4923,6 +5002,93 @@ mod tests {
             .await
             .handled
             .is_empty());
+    }
+
+    /// A revision covers what a reader sees, so a rotated credential leaves it
+    /// unchanged. A save merged onto a document read before the rotation
+    /// (masked secrets restored from it) must not write the old credential
+    /// back because the client's revision still matches (#2081).
+    #[tokio::test]
+    async fn a_save_merged_onto_a_document_older_than_the_row_is_refused() {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping stale merge base test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("stale merge base test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        // Like the handler's: what a reader sees, here without the password.
+        fn visible(settings: &AppSettings) -> String {
+            temps_core::revision::document_revision(&serde_json::json!({
+                "preview_domain": settings.preview_domain,
+                "registry": settings.docker_registry.registry_url,
+            }))
+        }
+        let mut initial = service.get_settings_uncached().await.expect("read");
+        initial.docker_registry.password = Some("before-rotation".to_string());
+        service
+            .update_settings(initial)
+            .await
+            .expect("store a password");
+        let base = service.get_settings_uncached().await.expect("merge base");
+
+        let mut rotated = base.clone();
+        rotated.docker_registry.password = Some("after-rotation".to_string());
+        service.update_settings(rotated).await.expect("rotate");
+        let revision = visible(&service.get_settings_uncached().await.expect("read"));
+        assert_eq!(
+            revision,
+            visible(&base),
+            "a rotation leaves the revision as it was"
+        );
+
+        let mut stale = base.clone();
+        stale.preview_domain = "mine.example.test".to_string();
+        let check = |merge_base: AppSettings| SettingsRevisionCheck {
+            expected: Some(revision.clone()),
+            revision_of: visible,
+            merge_base: Some(merge_base),
+        };
+        match service
+            .update_settings_checked(
+                stale,
+                GeoLicenseKeyIntent::Unchanged,
+                TrustedPrivateNetworksIntent::Unchanged,
+                TrustedProxyRangesIntent::Unchanged,
+                Some(check(base)),
+            )
+            .await
+        {
+            Err(ConfigServiceError::StaleRevision(stale)) => {
+                assert!(stale.resource.contains("saved again"), "{stale}")
+            }
+            Err(other) => panic!("expected a stale merge base to be refused, got {other}"),
+            Ok(_) => panic!("a save merged onto a stale document was written"),
+        }
+        let stored = service.get_settings_uncached().await.expect("read");
+        assert_eq!(
+            stored.docker_registry.password.as_deref(),
+            Some("after-rotation"),
+            "the rotation is kept"
+        );
+
+        // Merged onto the current row, the same change is saved.
+        let mut fresh = stored.clone();
+        fresh.preview_domain = "mine.example.test".to_string();
+        service
+            .update_settings_checked(
+                fresh,
+                GeoLicenseKeyIntent::Unchanged,
+                TrustedPrivateNetworksIntent::Unchanged,
+                TrustedProxyRangesIntent::Unchanged,
+                Some(check(stored)),
+            )
+            .await
+            .expect("a save on the current row");
     }
 
     #[tokio::test]
