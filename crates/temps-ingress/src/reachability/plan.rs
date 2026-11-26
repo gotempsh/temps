@@ -288,6 +288,9 @@ pub struct PlanFacts {
     pub workers_refusing: Vec<String>,
     /// Whether workers serve the environment, so a tunnel can carry it.
     pub served_by_workers: bool,
+    /// Every container of the current deployment runs on a worker, whether
+    /// or not any of its hostnames is public there.
+    pub on_workers: bool,
     /// Which tunnel would publish each hostname asked about (ADR 058 D9).
     pub intents: HashMap<String, PublicationIntent>,
     /// An IP allow list of only private ranges governing the environment,
@@ -597,6 +600,14 @@ pub struct TunnelRoute<'a> {
     pub route: bool,
     /// Set with `route`: what the choice changes, for the user to confirm.
     pub confirmation: Option<String>,
+}
+
+/// Whether the environment's current deployment runs on the control plane,
+/// so only node 0 can serve it privately (ADR-115 D6). Where it runs, not
+/// which of its hostnames workers publish: a worker deployment whose last
+/// public hostname went private still runs on its worker.
+pub fn runs_on_control_plane(facts: &PlanFacts) -> bool {
+    facts.deployed && !facts.on_workers && !facts.served_by_workers
 }
 
 /// Whether `tunnel` can carry this environment: ready, running somewhere,
@@ -2575,7 +2586,7 @@ pub(crate) fn plan_listener(
 
     // ADR-115 D6: what the control plane runs, this machine serves, once
     // the operator lets it.
-    let on_control_plane = facts.deployed && !facts.served_by_workers;
+    let on_control_plane = runs_on_control_plane(facts);
     if on_control_plane && facts.private_workers.is_empty() {
         return blocked_plan(
             address,
@@ -4555,6 +4566,38 @@ mod tests {
         }
     }
 
+    /// ADR-115 D6: an environment placed on workers that none serves yet is
+    /// still a worker's to serve, never this machine's.
+    #[test]
+    fn a_worker_placed_environment_is_never_planned_on_this_machine() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            on_workers: true,
+            ..private_facts()
+        };
+        assert!(!runs_on_control_plane(&facts));
+        let plan = plan_of(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert_eq!(plan.options[0].way_in, "private:homelab");
+
+        // Without a private worker the plan asks for one, not for this
+        // machine to serve privately.
+        let none = plan_of(&PlanFacts {
+            private_workers: Vec::new(),
+            ..facts
+        });
+        let blocked = none.blocked.expect("blocked");
+        assert!(
+            !blocked.reason.contains("runs on this machine"),
+            "{}",
+            blocked.reason
+        );
+        assert!(blocked
+            .action
+            .as_ref()
+            .is_none_or(|a| a.kind != ActionKind::ServePrivately));
+    }
+
     /// ADR-115 D6: an environment on the control plane is served privately
     /// by this machine, through the same DNS-01 plan as a worker's.
     #[test]
@@ -4981,6 +5024,35 @@ mod tests {
             ..serve_facts()
         });
         assert_eq!(kinds(&asked), vec![PlanOptionKind::TailscaleServe]);
+    }
+
+    /// ADR-115 D6: what runs on the control plane is never suggested an
+    /// idle worker's tailnet name, which that worker cannot serve; this
+    /// machine's own private listener is planned instead.
+    #[test]
+    fn a_control_plane_app_is_not_offered_an_idle_workers_machine_name() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            zones: vec![zone("example.com", "cloudflare")],
+            private_workers: vec![control_plane_fact(None)],
+            ..serve_facts()
+        };
+        assert_eq!(
+            address_for_audience(&facts),
+            Ok(Some("myapp.example.com".into()))
+        );
+        let plan = plan_of(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert_eq!(plan.options[0].kind, PlanOptionKind::PrivateWorker);
+        assert_eq!(plan.options[0].way_in, "private:this machine");
+
+        // With no zone to put a listener's record in, nothing a worker
+        // would serve is suggested either.
+        let no_zone = PlanFacts {
+            zones: Vec::new(),
+            ..facts
+        };
+        assert_eq!(address_for_audience(&no_zone), Ok(None));
     }
 
     /// ADR 065 D1/D5: a name under the tailnet that is no machine's needs

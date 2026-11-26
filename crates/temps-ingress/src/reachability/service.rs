@@ -1439,7 +1439,8 @@ impl ReachabilityService {
         // ADR-115 D6: what the control plane runs, node 0 serves privately,
         // once the operator allowed it; no worker can.
         let mut private_workers = private_workers;
-        if audience.is_private() && gathered.deployed && !served_by_workers {
+        if audience.is_private() && gathered.deployed && !gathered.on_workers && !served_by_workers
+        {
             private_workers = self
                 .control_plane_private_fact()
                 .await?
@@ -1487,6 +1488,7 @@ impl ReachabilityService {
             deployed: gathered.deployed,
             requested,
             served_by_workers,
+            on_workers: gathered.on_workers,
             attached_here,
             taken_elsewhere,
             platform_hosts: {

@@ -234,13 +234,19 @@ pub fn planned_private_address(facts: &PlanFacts) -> Result<Option<String>, Stri
         return planned_address(facts);
     }
     let free = |c: &String| !facts.taken_elsewhere.contains(c);
-    if usable_credential(facts).is_some() {
+    // A Service or a machine name is a worker's to serve, and a worker
+    // carries only what workers serve: for what runs on the control plane,
+    // suggesting one would hide this machine's own private listener behind
+    // a plan that is then refused.
+    let workers_serve_it = !facts.deployed || facts.served_by_workers;
+    if workers_serve_it && usable_credential(facts).is_some() {
         if let Some(address) = suggested_service_address(facts) {
             return Ok(Some(address));
         }
     }
     if let Some(name) = serve_candidates(facts)
         .into_iter()
+        .filter(|_| workers_serve_it)
         .filter(|w| machine_name_problem(facts, w).is_none())
         .filter_map(|w| w.report.dns_name.clone())
         .find(free)
@@ -257,7 +263,7 @@ pub fn planned_private_address(facts: &PlanFacts) -> Result<Option<String>, Stri
     {
         return Ok(Some(address));
     }
-    Ok(suggested_service_address(facts))
+    Ok(suggested_service_address(facts).filter(|_| workers_serve_it))
 }
 
 /// The plan for a private address: a worker's own tailnet name through
