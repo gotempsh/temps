@@ -190169,7 +190169,7 @@
     },
     "/repositories/{owner}/{repo}/branch": {
       "get": {
-        "description": "Answers with one provider request, so it is exact for repositories with\nmore branches than `GET repositories/{owner}/{repo}/branches` returns.\nA 404 here is the only sound basis for telling a user a branch does not\nexist.",
+        "description": "Reads the branch by name, so it is exact for repositories with more\nbranches than `GET repositories/{owner}/{repo}/branches` returns. A 404\nis only returned once the repository itself has been read through the\nsame connection: a provider answers 404 for every branch of a private\nrepository the credential can no longer see, and that is reported as a\nfailed lookup, not a missing branch. A 404 here is the only sound basis\nfor telling a user a branch does not exist.",
         "operationId": "get_repository_branch",
         "parameters": [
           {
@@ -190233,6 +190233,9 @@
           "404": {
             "description": "Repository or branch not found"
           },
+          "409": {
+            "description": "The connection must be reauthorized"
+          },
           "429": {
             "description": "Branch lookup rate limit exceeded"
           },
@@ -190240,7 +190243,7 @@
             "description": "Internal server error"
           },
           "502": {
-            "description": "Git provider request failed"
+            "description": "Git provider request failed, or the repository could not be read to confirm a missing branch"
           }
         },
         "security": [

@@ -101735,6 +101735,10 @@ export type GetRepositoryBranchErrors = {
      */
     404: unknown;
     /**
+     * The connection must be reauthorized
+     */
+    409: unknown;
+    /**
      * Branch lookup rate limit exceeded
      */
     429: unknown;
@@ -101743,7 +101747,7 @@ export type GetRepositoryBranchErrors = {
      */
     500: unknown;
     /**
-     * Git provider request failed
+     * Git provider request failed, or the repository could not be read to confirm a missing branch
      */
     502: unknown;
 };

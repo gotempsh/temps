@@ -282,10 +282,13 @@ pub struct BranchLookupQueryParams {
 
 /// Look up one branch of a repository by exact name
 ///
-/// Answers with one provider request, so it is exact for repositories with
-/// more branches than `GET repositories/{owner}/{repo}/branches` returns.
-/// A 404 here is the only sound basis for telling a user a branch does not
-/// exist.
+/// Reads the branch by name, so it is exact for repositories with more
+/// branches than `GET repositories/{owner}/{repo}/branches` returns. A 404
+/// is only returned once the repository itself has been read through the
+/// same connection: a provider answers 404 for every branch of a private
+/// repository the credential can no longer see, and that is reported as a
+/// failed lookup, not a missing branch. A 404 here is the only sound basis
+/// for telling a user a branch does not exist.
 #[utoipa::path(
     get,
     path = "repositories/{owner}/{repo}/branch",
@@ -300,9 +303,10 @@ pub struct BranchLookupQueryParams {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository or branch not found"),
+        (status = 409, description = "The connection must be reauthorized"),
         (status = 429, description = "Branch lookup rate limit exceeded"),
         (status = 500, description = "Internal server error"),
-        (status = 502, description = "Git provider request failed")
+        (status = 502, description = "Git provider request failed, or the repository could not be read to confirm a missing branch")
     ),
     tag = "Repositories",
     security(
@@ -397,17 +401,45 @@ pub async fn get_repository_branch(
                 protected: branch.protected,
             }))
         }
-        Ok(None) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-            .title("Branch Not Found")
-            .detail(format!(
-                "Repository {}/{} has no branch named '{}'.",
-                owner, repo, branch_name
-            ))
-            .value("branch", branch_name)
-            .build()),
-        Err(error @ GitProviderError::RateLimitExceeded)
-        | Err(error @ GitProviderError::PermissionDenied { .. })
-        | Err(error @ GitProviderError::AuthenticationFailed(_)) => Err(error.into()),
+        Ok(None) => {
+            // A 404 for the branch is only proof of absence if the connection
+            // can still read the repository: GitHub, GitLab, Gitea and
+            // Bitbucket all answer 404 for a private repository the
+            // credential cannot see (a fine-grained token whose repository
+            // selection no longer includes it, a revoked membership), and the
+            // token check passes regardless.
+            match provider_service
+                .get_repository(&access_token, &owner, &repo)
+                .await
+            {
+                Ok(_) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .title("Branch Not Found")
+                    .detail(format!(
+                        "Repository {}/{} has no branch named '{}'.",
+                        owner, repo, branch_name
+                    ))
+                    .value("branch", branch_name)
+                    .build()),
+                Err(error) => {
+                    warn!(
+                        repository_id = repository.id,
+                        connection_id,
+                        owner = %owner,
+                        repository = %repo,
+                        branch = %branch_name,
+                        error = %error,
+                        "Branch not found, and the repository could not be read to confirm it"
+                    );
+                    Err(branch_lookup_problem(
+                        error,
+                        BranchLookupStep::ConfirmRepository,
+                        &owner,
+                        &repo,
+                        &branch_name,
+                    ))
+                }
+            }
+        }
         Err(error) => {
             warn!(
                 repository_id = repository.id,
@@ -418,11 +450,78 @@ pub async fn get_repository_branch(
                 error = %error,
                 "Git provider branch lookup failed"
             );
-            Err(ErrorBuilder::new(StatusCode::BAD_GATEWAY)
-                .title("Failed to look up branch")
-                .detail("The git provider could not complete the branch lookup.")
-                .build())
+            Err(branch_lookup_problem(
+                error,
+                BranchLookupStep::ReadBranch,
+                &owner,
+                &repo,
+                &branch_name,
+            ))
         }
+    }
+}
+
+/// Which provider request of a branch lookup failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchLookupStep {
+    /// Reading the branch itself.
+    ReadBranch,
+    /// Reading the repository after the branch came back 404, to tell a
+    /// missing branch from a repository the connection cannot see.
+    ConfirmRepository,
+}
+
+/// The response for a branch lookup the provider did not answer.
+///
+/// Never a 404, whatever the variant: a client reads 404 from this endpoint
+/// as "the branch does not exist", and a failed lookup says nothing about
+/// that. Every variant is listed so that a new one forces a decision here.
+fn branch_lookup_problem(
+    error: GitProviderError,
+    step: BranchLookupStep,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Problem {
+    match &error {
+        // Already a status and detail the caller can act on, and none of
+        // them is a 404.
+        GitProviderError::RateLimitExceeded
+        | GitProviderError::PermissionDenied { .. }
+        | GitProviderError::AuthenticationFailed(_)
+        | GitProviderError::RefreshTokenRejected { .. }
+        | GitProviderError::BranchLookupUnavailable { .. }
+        | GitProviderError::DatabaseError(_)
+        | GitProviderError::HttpClientBuild { .. } => error.into(),
+        // The provider failed or answered unexpectedly. The not-found
+        // variants among these map to 404 elsewhere, which here would claim
+        // the branch is missing.
+        GitProviderError::ApiError(_)
+        | GitProviderError::NotImplemented
+        | GitProviderError::InvalidConfiguration(_)
+        | GitProviderError::Other(_)
+        | GitProviderError::ProviderNotFound(_)
+        | GitProviderError::ConnectionNotFound(_)
+        | GitProviderError::CommitNotFound { .. }
+        | GitProviderError::FileNotFound { .. }
+        | GitProviderError::RepositoryAlreadyExists { .. } => match step {
+            BranchLookupStep::ReadBranch => ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Failed to look up branch")
+                .detail(format!(
+                    "The git provider could not complete the lookup of branch '{}' in {}/{}.",
+                    branch, owner, repo
+                ))
+                .value("branch", branch.to_string())
+                .build(),
+            BranchLookupStep::ConfirmRepository => ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Branch Could Not Be Verified")
+                .detail(format!(
+                    "The git provider returned no branch '{}' for {}/{}, but the repository itself could not be read through this connection, so the branch may still exist. Check that the connection's credential still has access to {}/{}.",
+                    branch, owner, repo, owner, repo
+                ))
+                .value("branch", branch.to_string())
+                .build(),
+        },
     }
 }
 

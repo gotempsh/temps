@@ -295,6 +295,44 @@ mod branch_lookup_handler_tests {
             .await
     }
 
+    /// `GET /repos/temps/example` as GitHub answers it, with every field the
+    /// provider parses, so the handler gets a repository and not a parse error.
+    fn github_repository_body() -> String {
+        serde_json::json!({
+            "id": 1,
+            "name": "example",
+            "full_name": "temps/example",
+            "owner": { "login": "temps", "id": 1 },
+            "description": null,
+            "private": true,
+            "default_branch": "main",
+            "clone_url": "https://github.com/temps/example.git",
+            "ssh_url": "git@github.com:temps/example.git",
+            "html_url": "https://github.com/temps/example",
+            "language": null,
+            "size": 1,
+            "stargazers_count": 0,
+            "forks_count": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "pushed_at": null
+        })
+        .to_string()
+    }
+
+    /// The repository, readable through the connection: what turns a branch
+    /// 404 into proof that the branch is missing.
+    async fn mock_readable_repository(server: &mut mockito::ServerGuard) -> mockito::Mock {
+        server
+            .mock("GET", "/repos/temps/example")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(github_repository_body())
+            .expect(1)
+            .create_async()
+            .await
+    }
+
     #[tokio::test]
     async fn an_unauthenticated_request_is_turned_away_before_any_database_work() {
         let response = router()
@@ -367,19 +405,7 @@ mod branch_lookup_handler_tests {
             .mock("GET", "/repos/temps/example")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::json!({
-                    "id": 1,
-                    "name": "example",
-                    "full_name": "temps/example",
-                    "private": false,
-                    "default_branch": "main",
-                    "clone_url": "https://github.com/temps/example.git",
-                    "html_url": "https://github.com/temps/example",
-                    "owner": { "login": "temps", "id": 1 }
-                })
-                .to_string(),
-            )
+            .with_body(github_repository_body())
             .expect_at_least(1)
             .create_async()
             .await;
@@ -420,6 +446,7 @@ mod branch_lookup_handler_tests {
             .expect(1)
             .create_async()
             .await;
+        let repository = mock_readable_repository(&mut server).await;
 
         let response = router()
             .with_state(state_over(database(&server.url())))
@@ -433,6 +460,117 @@ mod branch_lookup_handler_tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         token.assert_async().await;
         branch.assert_async().await;
+        repository.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_branch_404_from_a_repository_the_connection_cannot_read_is_not_a_missing_branch() {
+        // A fine-grained token that lost this private repository still
+        // validates, and GitHub hides the repository by answering 404 for
+        // the branch and for the repository alike.
+        let mut server = mockito::Server::new_async().await;
+        let token = mock_valid_token(&mut server).await;
+        let branch = server
+            .mock("GET", "/repos/temps/example/branches/main")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Not Found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let repository = server
+            .mock("GET", "/repos/temps/example")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Not Found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let response = router()
+            .with_state(state_over(database(&server.url())))
+            .oneshot(request(Some(AuthContext::new_session(
+                test_user(),
+                Role::Admin,
+            ))))
+            .await
+            .expect("router responds");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read the response body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("a problem body");
+        assert_eq!(problem["title"], "Branch Could Not Be Verified");
+        assert_eq!(problem["branch"], "main");
+        token.assert_async().await;
+        branch.assert_async().await;
+        repository.assert_async().await;
+    }
+
+    #[test]
+    fn no_failed_lookup_is_ever_reported_as_a_missing_branch() {
+        // Every variant, at both steps: a 404 from this endpoint means "no
+        // such branch", so a lookup that failed must never produce one.
+        let variants = || {
+            vec![
+                GitProviderError::DatabaseError(sea_orm::DbErr::Custom("down".into())),
+                GitProviderError::ProviderNotFound("3".into()),
+                GitProviderError::ConnectionNotFound("7".into()),
+                GitProviderError::AuthenticationFailed("expired".into()),
+                GitProviderError::RefreshTokenRejected {
+                    provider: "GitHub".into(),
+                },
+                GitProviderError::PermissionDenied {
+                    operation: "read repository temps/example".into(),
+                    required_permission: "Contents: read".into(),
+                    provider_message: "Resource not accessible".into(),
+                },
+                GitProviderError::ApiError("HTTP 404".into()),
+                GitProviderError::CommitNotFound {
+                    repository: "temps/example".into(),
+                    commit_sha: "a".repeat(40),
+                },
+                GitProviderError::RepositoryAlreadyExists {
+                    name: "example".into(),
+                },
+                GitProviderError::BranchLookupUnavailable {
+                    provider: "Bitbucket".into(),
+                    repository: "temps/example".into(),
+                    branch: "main".into(),
+                    listed: 1000,
+                },
+                GitProviderError::FileNotFound {
+                    repository: "temps/example".into(),
+                    path: "README.md".into(),
+                    git_ref: "main".into(),
+                },
+                GitProviderError::NotImplemented,
+                GitProviderError::InvalidConfiguration("no api url".into()),
+                GitProviderError::RateLimitExceeded,
+                GitProviderError::HttpClientBuild {
+                    provider: "GitHub".into(),
+                    purpose: "API".into(),
+                    reason: "tls".into(),
+                },
+                GitProviderError::Other("unexpected".into()),
+            ]
+        };
+        for step in [
+            super::super::BranchLookupStep::ReadBranch,
+            super::super::BranchLookupStep::ConfirmRepository,
+        ] {
+            for error in variants() {
+                let label = format!("{error:?}");
+                let problem =
+                    super::super::branch_lookup_problem(error, step, "temps", "example", "main");
+                assert_ne!(
+                    problem.status_code,
+                    StatusCode::NOT_FOUND,
+                    "{label} at {step:?} must not read as a missing branch"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -498,6 +636,8 @@ mod branch_lookup_handler_tests {
             .create_async()
             .await;
 
+        let repository = mock_readable_repository(&mut server).await;
+
         let response = router()
             .with_state(state_over(database(&server.url())))
             .oneshot(
@@ -513,6 +653,7 @@ mod branch_lookup_handler_tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         token.assert_async().await;
         exact.assert_async().await;
+        repository.assert_async().await;
         trimmed.assert_async().await;
     }
 
@@ -530,6 +671,8 @@ mod branch_lookup_handler_tests {
             .create_async()
             .await;
 
+        let repository = mock_readable_repository(&mut server).await;
+
         let response = router()
             .with_state(state_over(database(&server.url())))
             .oneshot(
@@ -545,5 +688,6 @@ mod branch_lookup_handler_tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         token.assert_async().await;
         exact.assert_async().await;
+        repository.assert_async().await;
     }
 }

@@ -14201,10 +14201,13 @@ export const getRepositoryPresetByName = <ThrowOnError extends boolean = false>(
 /**
  * Look up one branch of a repository by exact name
  *
- * Answers with one provider request, so it is exact for repositories with
- * more branches than `GET repositories/{owner}/{repo}/branches` returns.
- * A 404 here is the only sound basis for telling a user a branch does not
- * exist.
+ * Reads the branch by name, so it is exact for repositories with more
+ * branches than `GET repositories/{owner}/{repo}/branches` returns. A 404
+ * is only returned once the repository itself has been read through the
+ * same connection: a provider answers 404 for every branch of a private
+ * repository the credential can no longer see, and that is reported as a
+ * failed lookup, not a missing branch. A 404 here is the only sound basis
+ * for telling a user a branch does not exist.
  */
 export const getRepositoryBranch = <ThrowOnError extends boolean = false>(options: Options<GetRepositoryBranchData, ThrowOnError>): RequestResult<GetRepositoryBranchResponses, GetRepositoryBranchErrors, ThrowOnError> => (options.client ?? client).get<GetRepositoryBranchResponses, GetRepositoryBranchErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
