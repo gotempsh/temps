@@ -701,26 +701,34 @@ pub struct CreateProjectSecretRequest {
     pub compose_services: Vec<String>,
 }
 
-/// Request to update a project secret. The `value` field is optional — omit it
-/// to rotate only the environment scoping / preview flag without touching the
-/// ciphertext.
+/// Request to update a project secret. Every field is optional, and a field
+/// that is left out (or `null`) keeps its stored value: rotating only the
+/// `value` keeps the secret's environments, preview flag and compose services
+/// exactly as they are.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct UpdateProjectSecretRequest {
     /// New plaintext value, <= 1 MiB. Omit to keep the existing value.
     #[serde(default)]
     pub value: Option<String>,
+    /// Replaces the environments the secret applies to. Omit to keep the
+    /// current environments. Bindings to deleted environments are always
+    /// kept, so an empty list applies the secret to every environment of the
+    /// project only when it has none; a secret still bound to a deleted
+    /// environment stays limited to it.
     #[serde(default)]
-    pub environment_ids: Vec<i32>,
-    #[serde(default = "default_include_in_preview")]
-    pub include_in_preview: bool,
-    /// Docker Compose services allowed to read this secret, by compose
-    /// service name. Empty (the default) delivers it to every service in the
-    /// stack, which is how secrets behaved before scoping existed.
+    pub environment_ids: Option<Vec<i32>>,
+    /// Whether preview environments receive the secret. Omit to keep the
+    /// current setting.
+    #[serde(default)]
+    pub include_in_preview: Option<bool>,
+    /// Replaces the Docker Compose services allowed to read this secret, by
+    /// compose service name. An empty list delivers it to every service in
+    /// the stack. Omit to keep the current services.
     ///
     /// Ignored by non-Compose presets: those deploy a single container, which
     /// always receives every secret in scope for its environment.
     #[serde(default)]
-    pub compose_services: Vec<String>,
+    pub compose_services: Option<Vec<String>>,
 }
 
 /// Project secret metadata. There is deliberately no `value` field — secret
@@ -837,6 +845,25 @@ mod tests {
 
         assert!(!omitted.include_in_preview);
         assert!(enabled.include_in_preview);
+    }
+
+    #[test]
+    fn project_secret_update_leaves_omitted_scope_fields_unset() {
+        let value_only: UpdateProjectSecretRequest =
+            serde_json::from_str(r#"{"value":"rotated"}"#).unwrap();
+        assert_eq!(value_only.value.as_deref(), Some("rotated"));
+        assert_eq!(value_only.environment_ids, None);
+        assert_eq!(value_only.include_in_preview, None);
+        assert_eq!(value_only.compose_services, None);
+
+        let explicit: UpdateProjectSecretRequest = serde_json::from_str(
+            r#"{"environment_ids":[],"include_in_preview":false,"compose_services":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(explicit.value, None);
+        assert_eq!(explicit.environment_ids, Some(vec![]));
+        assert_eq!(explicit.include_in_preview, Some(false));
+        assert_eq!(explicit.compose_services, Some(vec![]));
     }
 
     /// The four resource fields must distinguish three JSON states so the UI's

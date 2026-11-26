@@ -108,3 +108,54 @@ test('saving sends the revision the form was loaded from, not a refetched one', 
   expect(patches[0].revision).toBe(1)
   expect(screen.getByRole('button', { name: 'Save rule' })).toBeTruthy()
 })
+
+test('a disabled rule stored without conditions can be renamed', async () => {
+  const patches: Array<Record<string, unknown>> = []
+  // A rule saved before rules without conditions were refused, since turned
+  // off.
+  const stored: ApiRule = {
+    ...apiRule(3, 'Old catch-all'),
+    enabled: false,
+    expression: { combinator: 'all', children: [] },
+  }
+  mockApi({
+    'GET /projects/1/edge-rules': () => jsonResponse({ rules: [stored] }),
+    'GET /projects/1/environments': () => jsonResponse([]),
+    'PATCH /projects/1/edge-rules/5': async (request) => {
+      const body = (await request.json()) as Record<string, unknown>
+      patches.push(body)
+      return jsonResponse({ ...stored, name: body.name, revision: 4 })
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={['/projects/web/settings/edge-rules/5']}>
+        <BreadcrumbProvider>
+          <Routes>
+            <Route
+              path="/projects/web/settings/edge-rules/:ruleId"
+              element={<EdgeRuleEditor project={project} />}
+            />
+          </Routes>
+        </BreadcrumbProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const save = await screen.findByRole('button', { name: 'Save rule' })
+  fireEvent.change(document.getElementById('rule-name') as HTMLInputElement, {
+    target: { value: 'Old catch-all, kept' },
+  })
+
+  await act(async () => {
+    fireEvent.click(save)
+  })
+  await waitFor(() => expect(patches).toHaveLength(1))
+  // Only what changed is sent: the unchanged, empty expression stays out, so
+  // the server keeps it without asking for a condition.
+  expect(patches[0].name).toBe('Old catch-all, kept')
+  expect(patches[0].enabled).toBe(false)
+  expect('expression' in patches[0]).toBe(false)
+})
