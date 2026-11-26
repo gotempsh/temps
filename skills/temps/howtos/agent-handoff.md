@@ -36,6 +36,11 @@ bunx @temps-sdk/cli@beta login https://temps.example.com --context temps-example
   start a new sign-in, which replaces the one the person's link belongs to.
 - A denied or expired sign-in ends it. Tell the person and start again only if
   they want to.
+- A network or server error during `--resume` keeps the sign-in waiting. Run
+  the same command again; the person's link still belongs to it.
+- If `--no-wait` or `--resume` says the context already points to another
+  instance, stop and tell the person. Never remove, rename or switch their
+  contexts to make room.
 - Never ask for a password or an API key, never open or approve the link
   yourself, and never print the saved key.
 - If `--no-wait` is rejected as an unknown option, the package is older than
