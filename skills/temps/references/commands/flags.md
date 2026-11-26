@@ -6,12 +6,12 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`flags list`](#flags-list)
+- [`flags list`](#flags-list-alias-ls)
 - [`flags get`](#flags-get)
 - [`flags create`](#flags-create)
 - [`flags update`](#flags-update)
 - [`flags rules`](#flags-rules)
-- [`flags evaluate`](#flags-evaluate)
+- [`flags evaluate`](#flags-evaluate-alias-eval)
 - [`flags reshuffle`](#flags-reshuffle)
 - [`flags set`](#flags-set)
 - [`flags clear`](#flags-clear)

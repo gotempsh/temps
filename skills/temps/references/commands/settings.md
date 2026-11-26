@@ -6,8 +6,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`settings show`](#settings-show)
-- [`settings update`](#settings-update)
+- [`settings show`](#settings-show-alias-get)
+- [`settings update`](#settings-update-alias-set)
 - [`settings geo-status`](#settings-geo-status)
 - [`settings set-external-url`](#settings-set-external-url)
 - [`settings set-preview-domain`](#settings-set-preview-domain)

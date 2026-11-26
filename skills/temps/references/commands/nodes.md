@@ -16,7 +16,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`nodes containers`](#nodes-containers)
 - [`nodes drain`](#nodes-drain)
 - [`nodes undrain`](#nodes-undrain)
-- [`nodes remove`](#nodes-remove)
+- [`nodes remove`](#nodes-remove-alias-rm)
 - [`nodes build-limits`](#nodes-build-limits)
 - [`nodes public-ingress`](#nodes-public-ingress)
 - [`nodes workload-mode`](#nodes-workload-mode)

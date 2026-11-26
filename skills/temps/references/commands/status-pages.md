@@ -6,15 +6,15 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`status-pages list`](#status-pages-list)
+- [`status-pages list`](#status-pages-list-alias-ls)
 - [`status-pages create`](#status-pages-create)
 - [`status-pages show`](#status-pages-show)
 - [`status-pages update`](#status-pages-update)
 - [`status-pages publish`](#status-pages-publish)
 - [`status-pages unpublish`](#status-pages-unpublish)
 - [`status-pages rotate-url`](#status-pages-rotate-url)
-- [`status-pages delete`](#status-pages-delete)
-- [`status-pages domains`](#status-pages-domains)
+- [`status-pages delete`](#status-pages-delete-alias-rm)
+- [`status-pages domains`](#status-pages-domains-alias-domain)
 - [`status-pages subscriptions`](#status-pages-subscriptions)
 - [`status-pages subscribers`](#status-pages-subscribers)
 - [`status-pages maintenance`](#status-pages-maintenance)

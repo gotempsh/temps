@@ -170,11 +170,12 @@
       ]
     },
     {
-      "reason": "`@vercel/sandbox` compatibility fields of sandbox create: the server accepts `_runtime` and `networkPolicy` so that SDK's requests do not fail, and ignores them; `resources` is the SDK's spelling of `cpu_limit`/`memory_limit_mb`, which `temps sandbox create` sets with --cpu-limit and --memory-mb.",
+      "reason": "`@vercel/sandbox` compatibility fields: on sandbox create the server accepts `_runtime` and `networkPolicy` so that SDK's requests do not fail, and ignores them; `resources` is the SDK's spelling of `cpu_limit`/`memory_limit_mb`, which `temps sandbox create` sets with --cpu-limit and --memory-mb; on extend-timeout, `duration` is the SDK's milliseconds spelling of `extra_secs`, which `temps sandbox extend --secs` sets.",
       "entries": [
         "POST /v1/sandboxes body._runtime",
         "POST /v1/sandboxes body.networkPolicy",
-        "POST /v1/sandboxes body.resources"
+        "POST /v1/sandboxes body.resources",
+        "POST /v1/sandboxes/{id}/extend-timeout body.duration"
       ]
     },
     {
@@ -183,6 +184,5 @@
         "PUT /projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id} body.protocol_version"
       ]
     }
-  ],
-  "pending": []
+  ]
 }

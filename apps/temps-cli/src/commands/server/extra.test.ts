@@ -11,8 +11,11 @@ describe('server metric helpers', () => {
     expect(metricWindowQuery({ start: '2026-01-01T00:00:00Z', end: '2026-01-02T00:00:00Z', percentile: '0.95' })).toEqual({
       start_time: '2026-01-01T00:00:00Z',
       end_time: '2026-01-02T00:00:00Z',
-      percentile: 0.95,
+      percentile: 95,
     })
+    // The API takes 0-100: the fraction is scaled, without float noise.
+    expect(metricWindowQuery({ percentile: '1' })).toEqual({ percentile: 100 })
+    expect(metricWindowQuery({ percentile: '0.29' })).toEqual({ percentile: 29 })
     expect(() => metricWindowQuery({ start: 'yesterday' })).toThrow(/--start/)
     expect(() => metricWindowQuery({ percentile: '95' })).toThrow(/--percentile/)
   })
@@ -45,7 +48,7 @@ describe('temps server (extras)', () => {
   }
 
   test.each([
-    [['metrics', '--metric', 'node.cpu_percent', '--node', '1', '--percentile', '0.9', '--start', '2026-01-01T00:00:00Z'], 'GET /nodes/1/metrics?metric=node.cpu_percent&range=1h&start_time=2026-01-01T00%3A00%3A00Z&percentile=0.9'],
+    [['metrics', '--metric', 'node.cpu_percent', '--node', '1', '--percentile', '0.9', '--start', '2026-01-01T00:00:00Z'], 'GET /nodes/1/metrics?metric=node.cpu_percent&range=1h&start_time=2026-01-01T00%3A00%3A00Z&percentile=90'],
     [['cluster-metrics', '--metric', 'node.cpu_percent', '--nodes', '0,1', '--range', '24h'], 'GET /nodes/metrics/cluster?metric=node.cpu_percent&node_ids=0%2C1&range=24h'],
     [['cluster-latest', '--nodes', '0,1'], 'GET /nodes/metrics/cluster/latest?node_ids=0%2C1'],
     [['reporting'], 'GET /nodes/metrics/reporting'],

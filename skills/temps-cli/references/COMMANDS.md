@@ -47,90 +47,90 @@ Use this index or search for a top-level command heading to load only the releva
 - [`whoami`](#whoami) - Display current authenticated user and active context
 - [`context`](#context) - Manage CLI contexts (one set of credentials per Temps server)
 - [`configure`](#configure) - Configure CLI settings (AWS-style wizard)
-- [`projects`](#projects) - Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
+- [`projects`](#projects-alias-project-p) - Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 - [`drop`](#drop) - Detect and deploy a local source directory or ZIP without Git
 - [`deploy`](#deploy) - Deploy a project from git
-- [`deploy:static`](#deploystatic) - Deploy static files (tar.gz, zip, or directory)
-- [`deploy:image`](#deployimage) - Deploy a pre-built Docker image
-- [`deploy:local-image`](#deploylocal-image) - Build and deploy a local Docker image (or deploy existing image with --image)
-- [`deployments`](#deployments) - Manage deployments
-- [`domains`](#domains) - Manage custom domains
-- [`environments`](#environments) - Manage environments and environment variables
-- [`providers`](#providers) - Manage Git providers
-- [`backups`](#backups) - Manage backup schedules and backups
-- [`runtime-logs`](#runtime-logs) - View runtime container logs (use -f to follow in real-time)
-- [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
+- [`deploy:static`](#deploystatic-alias-deploy-static) - Deploy static files (tar.gz, zip, or directory)
+- [`deploy:image`](#deployimage-alias-deploy-image) - Deploy a pre-built Docker image
+- [`deploy:local-image`](#deploylocal-image-alias-deploy-local-image) - Build and deploy a local Docker image (or deploy existing image with --image)
+- [`deployments`](#deployments-alias-deploys) - Manage deployments
+- [`domains`](#domains-alias-domain) - Manage custom domains
+- [`environments`](#environments-alias-envs-env) - Manage environments and environment variables
+- [`providers`](#providers-alias-provider) - Manage Git providers
+- [`backups`](#backups-alias-backup) - Manage backup schedules and backups
+- [`runtime-logs`](#runtime-logs-alias-rlogs) - View runtime container logs (use -f to follow in real-time)
+- [`notifications`](#notifications-alias-notify) - Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 - [`dns`](#dns) - Manage DNS providers and Temps-managed DNS records
-- [`services`](#services) - Manage external services (databases, caches, storage)
+- [`services`](#services-alias-svc) - Manage external services (databases, caches, storage)
 - [`settings`](#settings) - Manage platform settings
 - [`users`](#users) - Manage platform users
 - [`teams`](#teams) - Manage teams and project access
 - [`access`](#access) - Manage which teams can reach a project
-- [`project-groups`](#project-groups) - Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
-- [`instantiations`](#instantiations) - Follow and retry template creations and imports
-- [`apikeys`](#apikeys) - Manage API keys for programmatic access
-- [`monitors`](#monitors) - Manage uptime monitors for status pages
-- [`webhooks`](#webhooks) - Manage webhooks for project events
-- [`containers`](#containers) - Manage project containers in environments
+- [`project-groups`](#project-groups-alias-pg) - Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
+- [`instantiations`](#instantiations-alias-inst) - Follow and retry template creations and imports
+- [`apikeys`](#apikeys-alias-keys) - Manage API keys for programmatic access
+- [`monitors`](#monitors-alias-monitoring) - Manage uptime monitors for status pages
+- [`webhooks`](#webhooks-alias-hooks) - Manage webhooks for project events
+- [`containers`](#containers-alias-cts) - Manage project containers in environments
 - [`cluster`](#cluster) - Cluster-wide multi-node operations
 - [`nodes`](#nodes) - Worker nodes and workload placement
 - [`tunnels`](#tunnels) - Ingress tunnels: publish apps on workers with no open ports or certificates. Apps under a tunnel's domain go live by adding the hostname to an environment
-- [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
-- [`errors`](#errors) - Manage error tracking and error groups
-- [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
+- [`tokens`](#tokens-alias-token) - Manage deployment tokens for project API access (KV, Blob, etc.)
+- [`errors`](#errors-alias-error) - Manage error tracking and error groups
+- [`metrics`](#metrics-alias-metric) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
 - [`server`](#server) - Resource usage of the machine running the Temps control plane (what /monitoring/server shows)
-- [`traces`](#traces) - Inspect distributed traces and operation latency
+- [`traces`](#traces-alias-trace) - Inspect distributed traces and operation latency
 - [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
 - [`kv`](#kv) - Read and write a project's keys in the KV store, and manage the KV service
-- [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
-- [`surveys`](#surveys) - Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
+- [`flags`](#flags-alias-flag) - Manage feature flags (runtime config that changes without a redeploy)
+- [`surveys`](#surveys-alias-survey) - Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
 - [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
 - [`blob`](#blob) - Upload, download and list a project's files in Blob storage, and manage the Blob service
 - [`dsn`](#dsn) - Manage Data Source Names (DSNs) for error tracking and analytics
-- [`scans`](#scans) - Manage vulnerability scans
-- [`custom-domains`](#custom-domains) - Manage project custom domains
-- [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
-- [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
+- [`scans`](#scans-alias-scan) - Manage vulnerability scans
+- [`custom-domains`](#custom-domains-alias-cdom) - Manage project custom domains
+- [`dns-provider`](#dns-provider-alias-dnsp) - Manage DNS providers and managed domains
+- [`delivery-profiles`](#delivery-profiles-alias-delivery-profile) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
 - [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
-- [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
-- [`preview-gateway`](#preview-gateway) - Manage the preview gateway that serves workspace preview URLs (status, settings, logs, restart, upgrade)
-- [`edge-rules`](#edge-rules) - Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
-- [`network-policy`](#network-policy) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
+- [`ip-access`](#ip-access-alias-ipa) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
+- [`preview-gateway`](#preview-gateway-alias-pgw) - Manage the preview gateway that serves workspace preview URLs (status, settings, logs, restart, upgrade)
+- [`edge-rules`](#edge-rules-alias-edge-rule) - Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
+- [`network-policy`](#network-policy-alias-netpol) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
 - [`audit`](#audit) - View audit logs
-- [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
-- [`logs`](#logs) - Search collected logs across every project and database you can access
-- [`email-domains`](#email-domains) - Manage email domains for transactional email
-- [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
-- [`incidents`](#incidents) - Manage incidents for status pages and monitoring
-- [`status-pages`](#status-pages) - Publish public status pages showing monitors from any of your projects
-- [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
-- [`emails`](#emails) - Manage and send emails
-- [`load-balancer`](#load-balancer) - Manage load balancer routes
-- [`migrate`](#migrate) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
-- [`templates`](#templates) - Browse templates and create them
-- [`platform`](#platform) - View platform and server information
-- [`presets`](#presets) - Browse available build presets
-- [`analytics`](#analytics) - View project analytics
-- [`funnels`](#funnels) - Manage analytics funnels for projects
-- [`notification-preferences`](#notification-preferences) - Manage notification preferences
-- [`skills`](#skills) - Manage AI skill definitions (global or project-scoped)
+- [`proxy-logs`](#proxy-logs-alias-plogs) - View proxy request logs and statistics
+- [`logs`](#logs-alias-glogs) - Search collected logs across every project and database you can access
+- [`email-domains`](#email-domains-alias-edom) - Manage email domains for transactional email
+- [`email-providers`](#email-providers-alias-eprov) - Manage email providers (SES, Scaleway) for transactional email
+- [`incidents`](#incidents-alias-incident) - Manage incidents for status pages and monitoring
+- [`status-pages`](#status-pages-alias-status-page) - Publish public status pages showing monitors from any of your projects
+- [`alarms`](#alarms-alias-alarm) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
+- [`emails`](#emails-alias-email) - Manage and send emails
+- [`load-balancer`](#load-balancer-alias-lb) - Manage load balancer routes
+- [`migrate`](#migrate-alias-imports-import) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
+- [`templates`](#templates-alias-tpl) - Browse templates and create them
+- [`platform`](#platform-alias-plat) - View platform and server information
+- [`presets`](#presets-alias-preset) - Browse available build presets
+- [`analytics`](#analytics-alias-stats) - View project analytics
+- [`funnels`](#funnels-alias-funnel) - Manage analytics funnels for projects
+- [`notification-preferences`](#notification-preferences-alias-notif-prefs) - Manage notification preferences
+- [`skills`](#skills-alias-skill) - Manage AI skill definitions (global or project-scoped)
 - [`mcp-servers`](#mcp-servers) - Manage MCP server definitions (global or project-scoped)
 - [`mcp`](#mcp) - Configure this Temps instance as an MCP server for AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed)
-- [`secrets`](#secrets) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
+- [`secrets`](#secrets-alias-secret) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
 - [`sandbox`](#sandbox) - Manage standalone sandboxes (/v1/sandbox API)
-- [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
+- [`workflow`](#workflow-alias-wf) - Trigger and inspect agent/workflow runs
 - [`workflows`](#workflows) - Durable application workflows
 - [`revenue`](#revenue) - Manage revenue integrations and import historical data
-- [`session-replay`](#session-replay) - Manage session replay recordings
+- [`session-replay`](#session-replay-alias-sessions-replay) - Manage session replay recordings
 - [`traefik-discovery`](#traefik-discovery) - Route containers Temps did not deploy by reading their Traefik labels (an existing docker-compose / Coolify / Dokploy stack)
 - [`init`](#init) - Initialize a Temps project in the current directory
 - [`link`](#link) - Link current directory to a Temps project
 - [`up`](#up) - Deploy the current project (runs setup wizard if not linked)
 - [`status`](#status) - Show project deployment status
 - [`ai`](#ai) - AI assistant status for a project
-- [`instances`](#instances) - Manage Temps server instances
+- [`instances`](#instances-alias-instance) - Manage Temps server instances
 - [`env:pull`](#envpull) - Pull environment variables to a .env file
 - [`env:push`](#envpush) - Push environment variables from a .env file
 - [`rollback`](#rollback) - Rollback to a previous deployment

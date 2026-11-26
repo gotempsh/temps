@@ -6,7 +6,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`deployments list`](#deployments-list)
+- [`deployments list`](#deployments-list-alias-ls)
 - [`deployments status`](#deployments-status)
 - [`deployments rollback`](#deployments-rollback)
 - [`deployments cancel`](#deployments-cancel)

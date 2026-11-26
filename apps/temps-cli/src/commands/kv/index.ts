@@ -221,13 +221,15 @@ async function getAction(key: string, options: ProjectOptions): Promise<void> {
     if (error || !data) fail(`Could not read key "${key}"`, error)
     return data
   })
-  const missing = result.value === null || result.value === undefined
-  if (missing) process.exitCode = 1
+  // `exists` tells a stored JSON null from a missing key; a server that
+  // predates it only has the value, where both read as null.
+  const exists = typeof result.exists === 'boolean' ? result.exists : result.value !== null && result.value !== undefined
+  if (!exists) process.exitCode = 1
   if (options.json) {
-    json({ key, value: result.value ?? null })
+    json({ key, value: result.value ?? null, exists })
     return
   }
-  if (missing) {
+  if (!exists) {
     info(`Key "${key}" does not exist`)
     return
   }

@@ -78,8 +78,10 @@ function fail(what: string, error: unknown): never {
 
 /** A stored pathname: relative to the project, without a leading slash. */
 export function normalizePathname(raw: string): string {
-  const pathname = raw.trim().replace(/^\/+/, '')
-  if (!pathname) throw new ValidationError('A blob pathname cannot be empty')
+  // Whitespace is kept: "a.txt " and "a.txt" are different blobs, and
+  // trimming one would read, overwrite or delete the other.
+  const pathname = raw.replace(/^\/+/, '')
+  if (!pathname.trim()) throw new ValidationError('A blob pathname cannot be empty')
   // URLs collapse `.` and `..` segments, so such an object could never be read back.
   if (pathname.split('/').some((segment) => segment === '..' || segment === '.')) {
     throw new ValidationError(`A blob pathname cannot contain "." or ".." segments: "${raw}"`)
@@ -266,8 +268,23 @@ async function listAction(prefix: string | undefined, options: ListOptions): Pro
     ]
     printTable(result.blobs, columns, { style: 'minimal' })
   }
-  if (result.hasMore && result.cursor) info(`More blobs: temps blob list --cursor ${result.cursor}`)
+  if (result.hasMore && result.cursor) info(`More blobs: ${continuationCommand(projectId, prefix, limit, result.cursor)}`)
   newline()
+}
+
+/** Quotes a value for a POSIX shell when it holds anything beyond safe characters. */
+export function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_\-./:=@%+,]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`
+}
+
+/** The `blob list` command that fetches the next page with the same project, prefix and page size. */
+export function continuationCommand(projectId: number, prefix: string | undefined, limit: number | undefined, cursor: string): string {
+  const parts = ['temps blob list']
+  if (prefix !== undefined) parts.push(shellQuote(prefix))
+  parts.push('-p', String(projectId))
+  if (limit !== undefined) parts.push('--limit', String(limit))
+  parts.push('--cursor', shellQuote(cursor))
+  return parts.join(' ')
 }
 
 async function putAction(file: string, options: PutOptions): Promise<void> {

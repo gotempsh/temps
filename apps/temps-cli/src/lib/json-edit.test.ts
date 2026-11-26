@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import {
   applyAssignments,
   getAtPath,
+  MAX_JSON_INPUT_BYTES,
   parseAssignment,
   parseCliValue,
   parsePath,
@@ -83,6 +84,13 @@ describe('readJsonObject and rejectUnknownFields', () => {
     await expect(readJsonObject(join(dir, 'none.json'), 'The file')).rejects.toThrow(/Could not read The file/)
     await expect(readJsonObject('-', 'The file', chunks('{oops'))).rejects.toThrow(/not JSON/)
     await expect(readJsonObject('-', 'The file', chunks('[1]'))).rejects.toThrow(/must be a JSON object/)
+  })
+
+  test('refuses a file or stdin over the size limit', async () => {
+    const big = join(dir, 'big.json')
+    writeFileSync(big, `{"a":"${'x'.repeat(MAX_JSON_INPUT_BYTES)}"}`)
+    await expect(readJsonObject(big, 'The file')).rejects.toThrow(/larger than 1048576 bytes/)
+    await expect(readJsonObject('-', 'The file', chunks('x'.repeat(MAX_JSON_INPUT_BYTES + 1)))).rejects.toThrow(/on stdin is larger/)
   })
 
   test('rejectUnknownFields lists the unknown and the known fields', () => {

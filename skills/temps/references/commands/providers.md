@@ -6,16 +6,16 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`providers list`](#providers-list)
+- [`providers list`](#providers-list-alias-ls)
 - [`providers add`](#providers-add)
-- [`providers remove`](#providers-remove)
+- [`providers remove`](#providers-remove-alias-rm)
 - [`providers show`](#providers-show)
 - [`providers activate`](#providers-activate)
 - [`providers deactivate`](#providers-deactivate)
 - [`providers safe-delete`](#providers-safe-delete)
 - [`providers deletion-check`](#providers-deletion-check)
 - [`providers git`](#providers-git)
-- [`providers connections`](#providers-connections)
+- [`providers connections`](#providers-connections-alias-conn)
 - [`providers public-repos`](#providers-public-repos)
 - [`providers repos`](#providers-repos)
 

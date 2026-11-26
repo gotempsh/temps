@@ -25,18 +25,18 @@
  *
  * - `excluded`: gaps intentionally left out of the CLI, grouped by a reviewed
  *   reason (browser-only flows, SDK ingest endpoints, callbacks).
- * - `pending`: gaps that existed when the check was added. It may only
- *   shrink: an entry that is now covered, or whose operation is gone, fails
- *   the check, so implementing a command removes its entries.
  *
- * Any gap in neither list fails: a new route ships with its command, or with
- * an `excluded` entry and the reason it has none.
+ * Any other gap fails: a new route ships with its command, or with an
+ * `excluded` entry and the reason it has none. There is no backlog list:
+ * the `pending` list that held the gaps found when the check was added is
+ * empty and closed, and an entry in it fails the check.
  */
 
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-export const CLI_ROOT = new URL('..', import.meta.url).pathname
+export const CLI_ROOT = fileURLToPath(new URL('..', import.meta.url))
 export const ALLOWLIST_PATH = join(CLI_ROOT, 'cli-api-coverage.json')
 export const SPEC_FILE = join(CLI_ROOT, 'openapi.json')
 export const SDK_FILE = join(CLI_ROOT, 'src/api/sdk.gen.ts')
@@ -62,7 +62,8 @@ export interface ExclusionGroup {
 
 export interface Allowlist {
   excluded: ExclusionGroup[]
-  pending: string[]
+  /** The closed backlog: must stay empty; an entry here fails the check. */
+  pending?: string[]
 }
 
 /** Source text of each command area, keyed by its path relative to `src/commands`. */
@@ -162,7 +163,7 @@ export function sdkFunctionsByOperation(sdkSource: string): Map<string, string[]
 /** `METHOD /normalized-path` of every direct `client.<method>({ url })` call in a source. */
 export function directClientCalls(source: string): Set<string> {
   const calls = new Set<string>()
-  const pattern = /client\.(get|put|post|delete|patch|head)\s*(?:<[^(]*>)?\(\s*\{[\s\S]{0,400}?url:\s*(['`])(.*?)\2/g
+  const pattern = /client\.(get|put|post|delete|patch|head)\s*(?:<[^(]*>)?\(\s*\{[\s\S]{0,400}?url:\s*(['"`])(.*?)\2/g
   for (const match of source.matchAll(pattern)) {
     calls.add(`${(match[1] as string).toUpperCase()} ${normalizePath(match[3] as string)}`)
   }
@@ -188,10 +189,12 @@ export function rawFetchCalls(source: string, specPaths: ReadonlySet<string>): S
     calls.add(`${match[1]} ${normalizePath(match[2] as string)}`)
   }
   if (!/\bfetch\(/.test(source)) return calls
-  for (const match of source.matchAll(/(['`])((?:\$\{[^}]*\})?\/[^'`\s]*)\1/g)) {
+  for (const match of source.matchAll(/(['"`])((?:\$\{[^}]*\})?\/[^'"`\s]*)\1/g)) {
     const literal = (match[2] as string).replace(/^\$\{[^}]*\}/, '').split('?')[0] as string
-    const path = normalizePath(literal.replace(/\$\{[^}]*\}$/, ''))
-    if (!specPaths.has(path)) continue
+    // A trailing `${...}` is a path parameter (`/widgets/${id}`) or a query
+    // string appended to the path (`/widgets${qs}`): try both readings.
+    const path = [normalizePath(literal), normalizePath(literal.replace(/\$\{[^}]*\}$/, ''))].find((p) => specPaths.has(p))
+    if (!path) continue
     const start = match.index ?? 0
     // The rest of this call: up to the end of the statement or the next request.
     const after = source.slice(start + match[0].length, start + match[0].length + 300).split(/;|\bfetch\(|\n\s*\n/)[0] ?? ''
@@ -224,8 +227,30 @@ export function readCommandAreas(dir: string = COMMANDS_DIR): CommandAreas {
 
 const ENDPOINT_IMPORT = /from '(?:\.\.\/)+lib\/endpoint\.js'/
 
-function mentions(source: string, identifier: string): boolean {
-  return new RegExp(`(?<![\\w$])${identifier.replace(/[$]/g, '\\$')}(?![\\w$])`).test(source)
+/** Whether `identifier` appears as a whole word; every regex character in it is literal. */
+export function mentions(source: string, identifier: string): boolean {
+  return new RegExp(`(?<![\\w$])${identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w$])`).test(source)
+}
+
+/**
+ * The code of an area without its import declarations and comment lines, so
+ * an SDK function that is imported or named in a comment but never used does
+ * not count as called. Imports of the generated SDK under another name
+ * (`listWidgets as fetchWidgets`) are returned so the local name counts.
+ */
+export function codeOf(source: string): { code: string; aliases: Map<string, string[]> } {
+  const aliases = new Map<string, string[]>()
+  const code = source
+    .replace(/^\s*import\s[\s\S]*?\sfrom\s+['"]([^'"]+)['"];?[ \t]*$/gm, (statement, from: string) => {
+      if (/api\/sdk\.gen(\.js)?$/.test(from)) {
+        for (const m of statement.matchAll(/(\w+)\s+as\s+(\w+)/g)) {
+          aliases.set(m[1] as string, [...(aliases.get(m[1] as string) ?? []), m[2] as string])
+        }
+      }
+      return ''
+    })
+    .replace(/^\s*(?:\/\/|\/\*|\*).*$/gm, '')
+  return { code, aliases }
 }
 
 export interface CoverageReport {
@@ -246,6 +271,7 @@ export function computeCoverage(spec: unknown, sdkSource: string, areas: Command
   const operations = listOperations(spec)
   const sdk = sdkFunctionsByOperation(sdkSource)
   const specPaths = new Set(operations.map((op) => normalizePath(op.path)))
+  const code = new Map([...areas].map(([area, source]) => [area, codeOf(source)]))
   const direct = new Map(
     [...areas].map(([area, source]) => [
       area,
@@ -259,15 +285,19 @@ export function computeCoverage(spec: unknown, sdkSource: string, areas: Command
   for (const op of operations) {
     const normalized = `${op.method.toUpperCase()} ${normalizePath(op.path)}`
     const names = sdk.get(normalized) ?? []
-    const callers = [...areas].filter(
-      ([area, source]) => direct.get(area)?.has(normalized) || names.some((name) => mentions(source, name)),
-    )
+    const callers = [...areas].filter(([area]) => {
+      const { code: text, aliases } = code.get(area) as { code: string; aliases: Map<string, string[]> }
+      return (
+        direct.get(area)?.has(normalized) ||
+        names.some((name) => [name, ...(aliases.get(name) ?? [])].some((local) => mentions(text, local)))
+      )
+    })
     if (!callers.length) {
       gaps.push(op.key)
       continue
     }
     covered.push(op.key)
-    const text = callers.map(([, source]) => source).join('\n')
+    const text = callers.map(([area]) => code.get(area)?.code ?? '').join('\n')
     for (const field of op.fields) {
       fieldsTotal++
       const name = field.slice(field.indexOf('.') + 1)
@@ -275,7 +305,8 @@ export function computeCoverage(spec: unknown, sdkSource: string, areas: Command
       else gaps.push(`${op.key} ${field}`)
     }
     // `endpoint()` (src/lib/endpoint.ts) gives every command it registers `--json`.
-    if (op.method === 'get' && !text.includes('--json') && !ENDPOINT_IMPORT.test(text)) gaps.push(`${op.key} --json`)
+    const raw = callers.map(([, source]) => source).join('\n')
+    if (op.method === 'get' && !text.includes('--json') && !ENDPOINT_IMPORT.test(raw)) gaps.push(`${op.key} --json`)
   }
   const known = new Set(operations.map((op) => `${op.method.toUpperCase()} ${normalizePath(op.path)}`))
   const unknownMarkers = new Set<string>()
@@ -295,10 +326,10 @@ export function operationOf(entry: string): string {
 }
 
 export interface CoverageDrift {
-  /** Gaps in neither `excluded` nor `pending`. */
+  /** Gaps that are not excluded. */
   uncovered: string[]
-  /** `pending` entries that are covered now or whose operation is gone. */
-  stalePending: string[]
+  /** Entries in the closed `pending` list. */
+  pending: string[]
   /** `excluded` entries that are covered now or whose operation is gone. */
   staleExcluded: string[]
   /** Exclusion groups without a reason. */
@@ -312,7 +343,7 @@ export interface CoverageDrift {
 export function coverageDrift(report: CoverageReport, allowlist: Allowlist): CoverageDrift {
   const gaps = new Set(report.gaps)
   const excluded = allowlist.excluded.flatMap((group) => group.entries)
-  const listed = [...excluded, ...allowlist.pending]
+  const listed = excluded
   const seen = new Set<string>()
   const duplicates = new Set<string>()
   for (const entry of listed) {
@@ -323,7 +354,7 @@ export function coverageDrift(report: CoverageReport, allowlist: Allowlist): Cov
   const excludedOps = new Set(excluded.filter((entry) => entry === operationOf(entry)))
   return {
     uncovered: report.gaps.filter((gap) => !seen.has(gap) && !excludedOps.has(operationOf(gap))),
-    stalePending: allowlist.pending.filter((entry) => !gaps.has(entry)).sort(),
+    pending: [...(allowlist.pending ?? [])].sort(),
     staleExcluded: excluded.filter((entry) => !gaps.has(entry)).sort(),
     unexplained: allowlist.excluded.filter((group) => !group.reason.trim()).length,
     duplicates: [...duplicates].sort(),
@@ -345,9 +376,9 @@ export function describeCoverageDrift(drift: CoverageDrift): string | null {
       'apps/temps-cli/cli-api-coverage.json with the reason.',
   )
   section(
-    'These `pending` entries in apps/temps-cli/cli-api-coverage.json are covered now or no longer exist; remove them:',
-    drift.stalePending,
-    'Run `bun run coverage:api --update-pending` to rewrite the list.',
+    'apps/temps-cli/cli-api-coverage.json lists gaps in `pending`, a closed list:',
+    drift.pending,
+    'Add the command or flag, or move the entry to an `excluded` group with the reason; then remove `pending`.',
   )
   section(
     'These `excluded` entries in apps/temps-cli/cli-api-coverage.json are covered now or no longer exist; remove them:',
@@ -378,14 +409,14 @@ export function readAllowlist(path: string = ALLOWLIST_PATH): Allowlist {
         entries: Array.isArray(g['entries']) ? g['entries'].map(String) : [],
       }
     }),
-    pending: Array.isArray(raw['pending']) ? raw['pending'].map(String) : [],
+    ...(Array.isArray(raw['pending']) && raw['pending'].length > 0 && { pending: raw['pending'].map(String) }),
   }
 }
 
 export function formatAllowlist(allowlist: Allowlist): string {
   const sorted: Allowlist = {
     excluded: allowlist.excluded.map((group) => ({ reason: group.reason, entries: [...group.entries].sort() })),
-    pending: [...allowlist.pending].sort(),
+    ...(allowlist.pending?.length && { pending: [...allowlist.pending].sort() }),
   }
   return JSON.stringify(sorted, null, 2) + '\n'
 }
@@ -401,14 +432,13 @@ export function summarize(report: CoverageReport, allowlist: Allowlist): string 
     allowlist.excluded.flatMap((group) => group.entries).filter((entry) => entry === operationOf(entry)),
   )
   const total = report.operations.length
-  const pendingOps = allowlist.pending.filter((entry) => entry === operationOf(entry)).length
-  const pendingInputs = allowlist.pending.length - pendingOps
+  const excludedInputs = allowlist.excluded.flatMap((group) => group.entries).filter((entry) => entry !== operationOf(entry))
   const percent = (n: number, d: number) => (d ? ((100 * n) / d).toFixed(1) : '100.0')
   return [
     `Operations: ${report.covered.length}/${total} called by a command (${percent(report.covered.length, total)}%), ` +
-      `${excludedOps.size} excluded, ${pendingOps} pending`,
+      `${excludedOps.size} excluded`,
     `Inputs of called operations: ${report.fieldsCovered}/${report.fieldsTotal} settable ` +
-      `(${percent(report.fieldsCovered, report.fieldsTotal)}%), ${pendingInputs} pending input or --json gaps`,
+      `(${percent(report.fieldsCovered, report.fieldsTotal)}%), ${excludedInputs.length} excluded`,
   ].join('\n')
 }
 
@@ -416,17 +446,6 @@ if (import.meta.main) {
   const args = process.argv.slice(2)
   const report = repositoryCoverage()
   const allowlist = readAllowlist()
-  if (args.includes('--update-pending')) {
-    // Only removes entries: a new gap is fixed or excluded with a reason, never queued here.
-    const gaps = new Set(report.gaps)
-    const next = {
-      excluded: allowlist.excluded,
-      pending: allowlist.pending.filter((entry) => gaps.has(entry)),
-    }
-    await Bun.write(ALLOWLIST_PATH, formatAllowlist(next))
-    console.log(summarize(report, next))
-    process.exit(0)
-  }
   if (args.includes('--list')) {
     for (const gap of report.gaps) console.log(gap)
     process.exit(0)

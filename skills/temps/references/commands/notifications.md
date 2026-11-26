@@ -6,13 +6,13 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`notifications list`](#notifications-list)
+- [`notifications list`](#notifications-list-alias-ls)
 - [`notifications add`](#notifications-add)
 - [`notifications update`](#notifications-update)
 - [`notifications enable`](#notifications-enable)
 - [`notifications disable`](#notifications-disable)
 - [`notifications show`](#notifications-show)
-- [`notifications remove`](#notifications-remove)
+- [`notifications remove`](#notifications-remove-alias-rm)
 - [`notifications test`](#notifications-test)
 - [`notifications routes`](#notifications-routes)
 - [`notifications create-cloudflare-provider`](#notifications-create-cloudflare-provider)

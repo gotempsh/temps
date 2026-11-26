@@ -7,15 +7,15 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 ## Contents
 
 - [`analytics keys`](#analytics-keys)
-- [`analytics conversions`](#analytics-conversions)
+- [`analytics conversions`](#analytics-conversions-alias-goals)
 - [`analytics identity`](#analytics-identity)
-- [`analytics overview`](#analytics-overview)
+- [`analytics overview`](#analytics-overview-alias-o)
 - [`analytics top`](#analytics-top)
 - [`analytics outbound`](#analytics-outbound)
 - [`analytics downloads`](#analytics-downloads)
 - [`analytics not-found`](#analytics-not-found)
 - [`analytics funnels`](#analytics-funnels)
-- [`analytics performance`](#analytics-performance)
+- [`analytics performance`](#analytics-performance-alias-speed)
 - [`analytics ai-agents`](#analytics-ai-agents)
 - [`analytics ai-pages`](#analytics-ai-pages)
 - [`analytics ai-page`](#analytics-ai-page)

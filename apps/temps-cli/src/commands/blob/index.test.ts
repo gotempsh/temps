@@ -5,7 +5,7 @@ import { afterAll, describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { blobMetadata, blobObjectUrl, buildEnableRequest, normalizePathname, registerBlobCommands } from './index.js'
+import { blobMetadata, blobObjectUrl, buildEnableRequest, continuationCommand, normalizePathname, registerBlobCommands, shellQuote } from './index.js'
 import { runWithApi } from '../../lib/mock-api.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'temps-blob-test-'))
@@ -29,6 +29,18 @@ describe('blob helpers', () => {
   test('normalizePathname refuses "." segments, which a URL would collapse', () => {
     for (const bad of ['docs/./x', './x', 'docs/.']) expect(() => normalizePathname(bad)).toThrow(/"\." or "\.\." segments/)
     expect(normalizePathname('docs/.hidden')).toBe('docs/.hidden')
+  })
+
+  test('normalizePathname keeps whitespace, which is part of the name', () => {
+    expect(normalizePathname(' a.txt ')).toBe(' a.txt ')
+    expect(normalizePathname('/docs/a b.txt\t')).toBe('docs/a b.txt\t')
+  })
+
+  test('continuationCommand repeats the project, prefix and page size, shell-quoted', () => {
+    expect(shellQuote('abc-1_2/x.y')).toBe('abc-1_2/x.y')
+    expect(shellQuote("it's here")).toBe(`'it'\\''s here'`)
+    expect(continuationCommand(7, 'my docs/', 50, 'c1')).toBe("temps blob list 'my docs/' -p 7 --limit 50 --cursor c1")
+    expect(continuationCommand(7, undefined, undefined, 'a b')).toBe("temps blob list -p 7 --cursor 'a b'")
   })
 
   test('buildEnableRequest needs the root user and password together', () => {
@@ -77,6 +89,14 @@ describe('temps blob', () => {
       'GET /blob?project_id=7&prefix=docs%2F&limit=1&cursor=next',
     ])
     expect(JSON.parse(run.stdout).blobs).toHaveLength(2)
+  })
+
+  test('list prints a next-page command with the same project, prefix and limit', async () => {
+    const run = await runWithApi(registerBlobCommands, ['blob', 'list', 'my docs/', '-p', '7', '--limit', '1'], {
+      'GET /blob': { blobs: [stored], hasMore: true, cursor: 'next' },
+    })
+    expect(run.error).toBeUndefined()
+    expect(run.stdout).toContain("temps blob list 'my docs/' -p 7 --limit 1 --cursor next")
   })
 
   test('put uploads the file to its pathname', async () => {

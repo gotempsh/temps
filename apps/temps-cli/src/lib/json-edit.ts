@@ -12,7 +12,6 @@
  * `path:=value` forces a string (`version:=1.10` keeps the text).
  */
 
-import { readFile } from 'node:fs/promises'
 import { ValidationError } from '../utils/errors.js'
 
 /** Largest JSON document read from a file or stdin. Request bodies are capped well below this. */
@@ -106,33 +105,46 @@ export function applyAssignments(document: JsonObject, assignments: Assignment[]
   return assignments.reduce((current, a) => setAtPath(current, a.path, a.value, options), document)
 }
 
+/** Text from `chunks`, refusing (with `tooLarge()`) once it passes MAX_JSON_INPUT_BYTES, before buffering the rest. */
+async function readBounded(chunks: AsyncIterable<Uint8Array | string>, tooLarge: () => string): Promise<string> {
+  const buffers: Buffer[] = []
+  let size = 0
+  for await (const chunk of chunks) {
+    const buffer = Buffer.from(chunk)
+    size += buffer.length
+    if (size > MAX_JSON_INPUT_BYTES) throw new ValidationError(tooLarge())
+    buffers.push(buffer)
+  }
+  return Buffer.concat(buffers).toString('utf8')
+}
+
+/**
+ * A file's text, refusing one over MAX_JSON_INPUT_BYTES without reading it:
+ * a regular file by its size, a pipe or device (no size) by streaming.
+ */
+async function readFileBounded(source: string, what: string): Promise<string> {
+  const tooLarge = () => `${what} in ${source} is larger than ${MAX_JSON_INPUT_BYTES} bytes`
+  const file = Bun.file(source)
+  try {
+    if (file.size > MAX_JSON_INPUT_BYTES) throw new ValidationError(tooLarge())
+    // Bun's ReadableStream is async-iterable at runtime; the DOM typings omit it.
+    return await readBounded(file.stream() as unknown as AsyncIterable<Uint8Array>, tooLarge)
+  } catch (err) {
+    if (err instanceof ValidationError) throw err
+    throw new ValidationError(`Could not read ${what} from ${source}: ${(err as Error).message}`)
+  }
+}
+
 /** Read a JSON object from a file path, or stdin for `-`. */
 export async function readJsonObject(
   source: string,
   what: string,
   stdin: AsyncIterable<Uint8Array | string> = process.stdin,
 ): Promise<JsonObject> {
-  let text: string
-  if (source === '-') {
-    const chunks: Buffer[] = []
-    let size = 0
-    for await (const chunk of stdin) {
-      const buffer = typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk)
-      size += buffer.length
-      if (size > MAX_JSON_INPUT_BYTES) throw new ValidationError(`${what} on stdin is larger than ${MAX_JSON_INPUT_BYTES} bytes`)
-      chunks.push(buffer)
-    }
-    text = Buffer.concat(chunks).toString('utf8')
-  } else {
-    try {
-      text = await readFile(source, 'utf8')
-    } catch (err) {
-      throw new ValidationError(`Could not read ${what} from ${source}: ${(err as Error).message}`)
-    }
-    if (Buffer.byteLength(text) > MAX_JSON_INPUT_BYTES) {
-      throw new ValidationError(`${what} in ${source} is larger than ${MAX_JSON_INPUT_BYTES} bytes`)
-    }
-  }
+  const text =
+    source === '-'
+      ? await readBounded(stdin, () => `${what} on stdin is larger than ${MAX_JSON_INPUT_BYTES} bytes`)
+      : await readFileBounded(source, what)
   let parsed: unknown
   try {
     parsed = JSON.parse(text)

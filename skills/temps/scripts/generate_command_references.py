@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 HEADING = re.compile(r"^## `([^`]+)`(?:.*)$", re.MULTILINE)
-SUBHEADING = re.compile(r"^### `([^`]+)`(?:.*)$", re.MULTILINE)
+SUBHEADING = re.compile(r"^### (`([^`]+)`.*)$", re.MULTILINE)
 FOOTER = re.compile(r"^---\n\n## Examples\n", re.MULTILINE)
 GENERATED_MARKER = (
     "<!-- Generated from skills/temps-cli/references/COMMANDS.md. "
@@ -78,11 +78,13 @@ def split_catalog(
             "Apply [the CLI runtime and safety contract](../cli-runtime.md) "
             "before executing a command. Runtime `--help` is authoritative.\n\n"
         )
-        subcommands = [item.group(1) for item in SUBHEADING.finditer(body)]
+        # (command, full heading text): the fragment comes from the whole heading,
+        # aliases included, as GitHub derives it.
+        subcommands = [(item.group(2), item.group(1)) for item in SUBHEADING.finditer(body)]
         if (header + body).count("\n") + 1 > 300 and subcommands:
             header += "## Contents\n\n"
             header += "\n".join(
-                f"- [`{subcommand}`](#{anchor(subcommand)})" for subcommand in subcommands
+                f"- [`{subcommand}`](#{anchor(title)})" for subcommand, title in subcommands
             )
             header += "\n\n"
         output.write_text(header + body, encoding="utf-8")

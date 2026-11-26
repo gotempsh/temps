@@ -6,7 +6,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`errors list`](#errors-list)
+- [`errors list`](#errors-list-alias-ls)
 - [`errors assign`](#errors-assign)
 - [`errors show`](#errors-show)
 - [`errors update`](#errors-update)
@@ -31,8 +31,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`errors stats`](#errors-stats)
 - [`errors timeline`](#errors-timeline)
 - [`errors dashboard`](#errors-dashboard)
-- [`errors sourcemaps`](#errors-sourcemaps)
-- [`errors source-files`](#errors-source-files)
+- [`errors sourcemaps`](#errors-sourcemaps-alias-sm)
+- [`errors source-files`](#errors-source-files-alias-sf)
 - [`errors list-global-groups`](#errors-list-global-groups)
 - [`errors autofix`](#errors-autofix)
 - [`errors autofixer`](#errors-autofixer)

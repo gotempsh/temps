@@ -56,7 +56,7 @@ describe('parseTail and parseHostPort', () => {
 
 describe('buildPreviewGatewayPatch', () => {
   test('sends only the flags given', () => {
-    expect(buildPreviewGatewayPatch({ hostPort: '9090' })).toEqual({ body: { host_port: 9090 }, disruptions: [] })
+    expect(buildPreviewGatewayPatch({ hostPort: '9090' }, { enabled: false, host_port: 8080 })).toEqual({ body: { host_port: 9090 }, disruptions: [] })
     expect(buildPreviewGatewayPatch({ autoUpgrade: false })).toEqual({ body: { auto_upgrade: false }, disruptions: [] })
     expect(buildPreviewGatewayPatch({ enable: true, image: ' img@sha256:b ' })).toEqual({
       body: { enabled: true, image: 'img@sha256:b' },
@@ -71,6 +71,11 @@ describe('buildPreviewGatewayPatch', () => {
 
   test('flags disabling and renaming as interrupting previews', () => {
     expect(buildPreviewGatewayPatch({ disable: true }).disruptions).toHaveLength(1)
+    // A port change on a running gateway recreates it; the same port, or a stopped gateway, does not.
+    expect(buildPreviewGatewayPatch({ hostPort: '9090' }, { enabled: true, host_port: 8080 }).disruptions[0]).toMatch(/host port/)
+    expect(buildPreviewGatewayPatch({ hostPort: '8080' }, { enabled: true, host_port: 8080 }).disruptions).toEqual([])
+    expect(buildPreviewGatewayPatch({ hostPort: '9090' }).disruptions).toHaveLength(1)
+    expect(buildPreviewGatewayPatch({ hostPort: '9090', disable: true }, { enabled: true, host_port: 8080 }).disruptions).toHaveLength(1)
     expect(buildPreviewGatewayPatch({ containerName: 'temps-b-gateway' }).disruptions[0]).toMatch(/Renaming/)
     expect(buildPreviewGatewayPatch({ disable: true, containerName: 'x' }).disruptions).toHaveLength(2)
   })
@@ -133,14 +138,28 @@ describe('temps preview-gateway', () => {
   test('configure sends a partial PATCH and prints the saved settings', async () => {
     const run = await runWithApi(
       registerPreviewGatewayCommands,
-      ['preview-gateway', 'configure', '--host-port', '9090', '--no-auto-upgrade', '--json'],
-      { 'PATCH /preview-gateway/settings': { ...settings, host_port: 9090, auto_upgrade: false } },
+      ['preview-gateway', 'configure', '--host-port', '9090', '--no-auto-upgrade', '--yes', '--json'],
+      {
+        'GET /preview-gateway/settings': settings,
+        'PATCH /preview-gateway/settings': { ...settings, host_port: 9090, auto_upgrade: false },
+      },
     )
     expect(run.error).toBeUndefined()
     expect(run.bodies).toEqual([
       { request: 'PATCH /preview-gateway/settings', body: { host_port: 9090, auto_upgrade: false } },
     ])
     expect(JSON.parse(run.stdout).host_port).toBe(9090)
+  })
+
+  test('configure --host-port on a running gateway asks first, and refuses without a terminal', async () => {
+    const run = await runWithApi(
+      registerPreviewGatewayCommands,
+      ['preview-gateway', 'configure', '--host-port', '9090'],
+      { 'GET /preview-gateway/settings': { ...settings, enabled: true, host_port: 8080 }, 'PATCH /preview-gateway/settings': settings },
+      { stdin: '' },
+    )
+    expect(run.error?.message).toMatch(/not an interactive terminal/)
+    expect(run.requests).toEqual(['GET /preview-gateway/settings'])
   })
 
   test('configure --disable without a terminal refuses instead of changing anything', async () => {

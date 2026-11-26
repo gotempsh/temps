@@ -6,10 +6,10 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`services list`](#services-list)
-- [`services create`](#services-create)
+- [`services list`](#services-list-alias-ls)
+- [`services create`](#services-create-alias-add)
 - [`services show`](#services-show)
-- [`services remove`](#services-remove)
+- [`services remove`](#services-remove-alias-rm)
 - [`services start`](#services-start)
 - [`services stop`](#services-stop)
 - [`services types`](#services-types)

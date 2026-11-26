@@ -142,7 +142,7 @@ pub async fn kv_get(
 
     let value = state.kv_service.get(project_id, &request.key).await?;
 
-    Ok(Json(GetResponse { value }))
+    Ok(Json(GetResponse::from(value)))
 }
 
 /// Set a value with optional expiration
@@ -152,7 +152,7 @@ pub async fn kv_get(
     path = "/kv/set",
     request_body = SetRequest,
     responses(
-        (status = 200, description = "Value set", body = SetResponse),
+        (status = 200, description = "Value set, or `result: null` when an NX/XX condition did not hold", body = SetResponse),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
     ),
@@ -186,11 +186,18 @@ pub async fn kv_set(
         .set(project_id, &request.key, request.value, options)
         .await
     {
-        Ok(_) => {
-            info!("KV SET success: key={}", request.key);
-            Ok(Json(SetResponse {
-                result: "OK".to_string(),
-            }))
+        Ok(written) => {
+            info!(
+                "KV SET {}: key={}, project_id={}",
+                if written {
+                    "success"
+                } else {
+                    "condition not met"
+                },
+                request.key,
+                project_id
+            );
+            Ok(Json(SetResponse::from_written(written)))
         }
         Err(e) => {
             error!("KV SET failed: key={}, error={}", request.key, e);

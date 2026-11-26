@@ -6,13 +6,13 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`monitors list`](#monitors-list)
-- [`monitors create`](#monitors-create)
+- [`monitors list`](#monitors-list-alias-ls)
+- [`monitors create`](#monitors-create-alias-add)
 - [`monitors add-target`](#monitors-add-target)
 - [`monitors update-target`](#monitors-update-target)
 - [`monitors locations`](#monitors-locations)
 - [`monitors show`](#monitors-show)
-- [`monitors remove`](#monitors-remove)
+- [`monitors remove`](#monitors-remove-alias-rm)
 - [`monitors status`](#monitors-status)
 - [`monitors history`](#monitors-history)
 - [`monitors get-health`](#monitors-get-health)

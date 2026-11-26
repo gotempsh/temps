@@ -41,6 +41,7 @@ import {
   parsePath,
   readJsonObject,
   rejectUnknownFields,
+  setAtPath,
   type Assignment,
   type JsonObject,
 } from '../../lib/json-edit.js'
@@ -104,9 +105,40 @@ export function touchedSections(assignments: Assignment[], document: JsonObject 
  * document, so starting from the current one keeps every other setting.
  */
 export function mergeSettings(current: JsonObject, fromFile: JsonObject | undefined, assignments: Assignment[]): JsonObject {
-  const base = fromFile ? { ...current, ...fromFile } : current
-  // Fields absent from the GET response (an unset optional section) may be set.
-  return applyAssignments(base, assignments, { allowNew: false })
+  const base = fromFile ? deepMerge(current, fromFile) : current
+  return assignments.reduce((document, a) => {
+    const [section, ...rest] = a.path
+    // A known section the GET response leaves out is created, like an unset (null) one.
+    const withSection =
+      section !== undefined && rest.length > 0 && section in SETTING_FIELDS && !(section in document)
+        ? { ...document, [section]: null }
+        : document
+    // A write-only field never appears in the GET response, so it may be added to its section.
+    const writeOnly = rest.length === 1 && WRITE_ONLY_SETTINGS[section as string]?.includes(rest[0] as string)
+    return setAtPath(withSection, a.path, a.value, { allowNew: Boolean(writeOnly) })
+  }, base)
+}
+
+/**
+ * Fields a settings write accepts but no response returns (the server skips
+ * them when serializing), so the current document cannot show them.
+ */
+export const WRITE_ONLY_SETTINGS: Record<string, readonly string[]> = {
+  geo: ['maxmind_license_key', 'clear_maxmind_license_key'],
+}
+
+/**
+ * `patch` merged into `base`: sections that are objects on both sides merge
+ * field by field, so `{"shield":{"enabled":true}}` keeps the other shield
+ * fields; anything else (a scalar, a list, null) replaces the value.
+ */
+export function deepMerge(base: JsonObject, patch: JsonObject): JsonObject {
+  const merged: JsonObject = { ...base }
+  for (const [key, value] of Object.entries(patch)) {
+    const existing = merged[key]
+    merged[key] = isJsonObject(existing) && isJsonObject(value) ? deepMerge(existing, value) : value
+  }
+  return merged
 }
 
 export function registerAdvancedSettingsCommands(settings: Command): void {
@@ -278,7 +310,7 @@ async function applyAction(raw: string[] | undefined, options: ApplyOptions): Pr
   await requireAuth()
   await setupClient()
   const current = await withSpinner('Fetching settings...', readCurrentSettings)
-  const body = mergeSettings(current, fromFile, assignments)
+  let body = mergeSettings(current, fromFile, assignments)
   const risky = sections.filter((section) => SENSITIVE_SETTINGS.has(section))
   const confirmed = await confirmRisk(
     risky.map((section) => `${section}: ${SETTING_FIELDS[section as keyof typeof SETTING_FIELDS]}. A wrong value can lock you out of the console.`),
@@ -286,6 +318,12 @@ async function applyAction(raw: string[] | undefined, options: ApplyOptions): Pr
     options.yes,
   )
   if (!confirmed) return
+  // PUT replaces the whole document. A sensitive save may have waited on the
+  // prompt, so rebuild the body on a fresh read: a change another admin saved
+  // meanwhile is kept instead of being reverted to the first read.
+  if (risky.length > 0) {
+    body = mergeSettings(await withSpinner('Fetching settings...', readCurrentSettings), fromFile, assignments)
+  }
   const result = await withSpinner('Saving settings...', async () => {
     const { data, error } = await updateSettings({ client, body: body as unknown as AppSettings })
     if (error) fail(`Could not save ${sections.join(', ')}`, error)

@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { fileURLToPath } from 'node:url'
 import {
+  CLI_ROOT,
+  codeOf,
   computeCoverage,
   coverageDrift,
   describeCoverageDrift,
   directClientCalls,
   formatAllowlist,
   listOperations,
+  mentions,
   normalizePath,
   rawFetchCalls,
   readAllowlist,
@@ -117,6 +121,17 @@ describe('call detection', () => {
     expect([...rawFetchCalls(source, paths)].sort()).toEqual(['DELETE /widgets/{}', 'GET /widgets', 'POST /gadgets/{}/run'])
   })
 
+  test('double-quoted URLs count like single-quoted ones', () => {
+    expect([...directClientCalls('client.get({ url: "/widgets" })')]).toEqual(['GET /widgets'])
+    expect([...rawFetchCalls('await fetch("/widgets")', new Set(['/widgets']))]).toEqual(['GET /widgets'])
+  })
+
+  test('a trailing interpolation is a path parameter, or a query string when the path is shorter', () => {
+    const paths = new Set(['/widgets', '/widgets/{}'])
+    expect([...rawFetchCalls("await fetch(`${base}/widgets/${id}`, { method: 'DELETE' })", paths)]).toEqual(['DELETE /widgets/{}'])
+    expect([...rawFetchCalls('await fetch(`${base}/widgets${qs}`)', paths)]).toEqual(['GET /widgets'])
+  })
+
   test('without a fetch call, only markers count', () => {
     expect([...rawFetchCalls("const url = `${base}/widgets`", new Set(['/widgets']))]).toEqual([])
   })
@@ -158,10 +173,34 @@ describe('computeCoverage', () => {
     expect(report.covered).toEqual([])
   })
 
+  test('an SDK function that is only imported or named in a comment is not called', () => {
+    const source = "import { listWidgets } from '../../api/sdk.gen.js'\n// listWidgets is used elsewhere\n'--json'"
+    expect(computeCoverage(spec, sdk, areas({ widgets: source })).covered).toEqual([])
+  })
+
+  test('an SDK function imported under another name counts where the local name is called', () => {
+    const source = "import {\n  listWidgets as fetchWidgets,\n} from '../../api/sdk.gen.js'\nfetchWidgets({ query: { page } })\n'--json'"
+    const report = computeCoverage(spec, sdk, areas({ widgets: source }))
+    expect(report.covered).toEqual(['GET /widgets'])
+    expect(codeOf(source).aliases.get('listWidgets')).toEqual(['fetchWidgets'])
+  })
+
+  test('an input name is matched literally', () => {
+    expect(mentions('send({ "filter[name]": v })', 'filter[name]')).toBe(true)
+    expect(mentions('send({ filtern: v })', 'filter[name]')).toBe(false)
+    expect(mentions('a.bXc', 'a.b')).toBe(false)
+    expect(mentions('page_size', 'page')).toBe(false)
+  })
+
+  test('the CLI root is a filesystem path, not a URL path', () => {
+    expect(CLI_ROOT).not.toContain('%')
+    expect(CLI_ROOT.endsWith('/temps-cli/') || CLI_ROOT.endsWith('/temps-cli')).toBe(true)
+  })
+
   test('a marker naming no operation is reported', () => {
     const report = computeCoverage(spec, sdk, areas({ widgets: '// api-coverage: GET /nothing/here' }))
     expect(report.unknownMarkers).toEqual(['widgets: GET /nothing/here'])
-    expect(describeCoverageDrift(coverageDrift(report, { excluded: [], pending: report.gaps }))).toContain(
+    expect(describeCoverageDrift(coverageDrift(report, { excluded: [] }))).toContain(
       'GET /nothing/here',
     )
   })
@@ -171,41 +210,46 @@ describe('coverageDrift', () => {
   const report = computeCoverage(spec, sdk, areas({ widgets: "createWidget({ body: { name } })\n'--json'" }))
   // gaps: DELETE /widgets/{id}, GET /widgets, POST /gadgets/{gadget_id}/run, POST /widgets body.color
 
-  test('a gap in neither list fails, naming the allowlist', () => {
-    const drift = coverageDrift(report, { excluded: [], pending: ['GET /widgets'] })
+  const others = ['DELETE /widgets/{id}', 'GET /widgets', 'POST /widgets body.color']
+
+  test('a gap that is not excluded fails, naming the allowlist', () => {
+    const drift = coverageDrift(report, { excluded: [{ reason: 'Not for people', entries: ['GET /widgets'] }] })
     expect(drift.uncovered).toEqual(['DELETE /widgets/{id}', 'POST /gadgets/{gadget_id}/run', 'POST /widgets body.color'])
     expect(describeCoverageDrift(drift)).toContain('cli-api-coverage.json')
   })
 
-  test('nothing drifts when every gap is listed', () => {
+  test('nothing drifts when every gap is excluded with a reason', () => {
     const allowlist: Allowlist = {
-      excluded: [{ reason: 'Called by gadgets, not people', entries: ['POST /gadgets/{gadget_id}/run'] }],
-      pending: ['DELETE /widgets/{id}', 'GET /widgets', 'POST /widgets body.color'],
+      excluded: [
+        { reason: 'Called by gadgets, not people', entries: ['POST /gadgets/{gadget_id}/run'] },
+        { reason: 'Not for the CLI', entries: others },
+      ],
     }
     expect(describeCoverageDrift(coverageDrift(report, allowlist))).toBeNull()
   })
 
-  test('pending may only shrink: a covered or removed entry is stale', () => {
+  test('the pending list is closed: any entry in it fails, even a real gap', () => {
     const drift = coverageDrift(report, {
-      excluded: [],
-      pending: [...report.gaps, 'POST /widgets body.name', 'GET /removed'],
+      excluded: [{ reason: 'Not for the CLI', entries: ['POST /gadgets/{gadget_id}/run', ...others.slice(1)] }],
+      pending: ['DELETE /widgets/{id}'],
     })
-    expect(drift.stalePending).toEqual(['GET /removed', 'POST /widgets body.name'])
-    expect(describeCoverageDrift(drift)).toContain('remove them')
+    expect(drift.pending).toEqual(['DELETE /widgets/{id}'])
+    expect(describeCoverageDrift(drift)).toContain('a closed list')
   })
 
   test('an excluded operation also covers its own field gaps', () => {
     const drift = coverageDrift(report, {
-      excluded: [{ reason: 'Not for the CLI', entries: ['POST /widgets body.color'] }],
-      pending: ['DELETE /widgets/{id}', 'GET /widgets', 'POST /gadgets/{gadget_id}/run'],
+      excluded: [{ reason: 'Not for the CLI', entries: ['POST /widgets body.color', 'DELETE /widgets/{id}', 'GET /widgets', 'POST /gadgets/{gadget_id}/run'] }],
     })
     expect(drift.uncovered).toEqual([])
   })
 
   test('every exclusion group needs a reason, and an entry is listed once', () => {
     const drift = coverageDrift(report, {
-      excluded: [{ reason: ' ', entries: ['GET /widgets'] }],
-      pending: ['GET /widgets', 'DELETE /widgets/{id}', 'POST /gadgets/{gadget_id}/run', 'POST /widgets body.color'],
+      excluded: [
+        { reason: ' ', entries: ['GET /widgets'] },
+        { reason: 'Not for the CLI', entries: ['GET /widgets', 'DELETE /widgets/{id}', 'POST /gadgets/{gadget_id}/run', 'POST /widgets body.color'] },
+      ],
     })
     expect(drift.unexplained).toBe(1)
     expect(drift.duplicates).toEqual(['GET /widgets'])
@@ -214,13 +258,14 @@ describe('coverageDrift', () => {
 })
 
 describe('repository', () => {
-  test('every API operation and input is covered by a command, excluded with a reason, or pending', () => {
+  test('every API operation and input is covered by a command or excluded with a reason', () => {
     const failure = describeCoverageDrift(coverageDrift(repositoryCoverage(), readAllowlist()))
     expect(failure).toBeNull()
-  })
+    // Scans every command source against the whole spec: seconds under a loaded full run.
+  }, 30_000)
 
   test('cli-api-coverage.json is in canonical form', async () => {
-    const path = new URL('../cli-api-coverage.json', import.meta.url).pathname
+    const path = fileURLToPath(new URL('../cli-api-coverage.json', import.meta.url))
     const text = await Bun.file(path).text()
     expect(text).toBe(formatAllowlist(readAllowlist(path)))
   })

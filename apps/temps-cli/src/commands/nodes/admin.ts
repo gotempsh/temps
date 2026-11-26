@@ -193,6 +193,8 @@ export function registerNodesAdminCommands(nodes: Command): void {
     .option('--json', 'Output in JSON format')
     .action(async (id: string, options: JsonOption & IngressFlags & { check?: boolean; toggleOnly?: boolean; yes?: boolean }) => {
       const node = nodeId(id)
+      // Before any branch: --toggle-only and --check must not pick one of two contradictory switches.
+      if (options.enable && options.disable) throw new ValidationError('Pass --enable or --disable, not both')
       await connect()
       if (options.check) {
         output(await call(`Could not check the public ingress of node ${node}`, () => adminCheckNodePublicIngress({ client, path: { node_id: node } })), options, `Public ingress check of node ${node}`)

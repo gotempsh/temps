@@ -78,14 +78,17 @@ impl KvService {
         }
     }
 
-    /// Set a value with optional expiration
+    /// Set a value with optional expiration.
+    ///
+    /// Returns `true` when the value was written and `false` when an NX/XX
+    /// condition did not hold (Redis answers `nil`, and nothing changes).
     pub async fn set(
         &self,
         project_id: i32,
         key: &str,
         value: Value,
         options: SetOptions,
-    ) -> Result<(), KvError> {
+    ) -> Result<bool, KvError> {
         debug!("KvService::set - getting connection...");
         let mut conn = self.get_connection().await?;
         debug!("KvService::set - got connection");
@@ -118,12 +121,13 @@ impl KvService {
 
         let result: Option<String> = cmd.query_async(&mut conn).await?;
 
-        // If NX/XX was used and condition not met, result is None
-        if (options.nx || options.xx) && result.is_none() {
+        // Redis answers nil, not an error, when NX/XX does not hold.
+        let written = result.is_some();
+        if !written {
             debug!("KV SET condition not met for {}", namespaced);
         }
 
-        Ok(())
+        Ok(written)
     }
 
     /// Delete one or more keys

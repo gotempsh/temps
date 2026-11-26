@@ -6,11 +6,11 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`backups schedules`](#backups-schedules)
-- [`backups sources`](#backups-sources)
-- [`backups list`](#backups-list)
+- [`backups schedules`](#backups-schedules-alias-schedule)
+- [`backups sources`](#backups-sources-alias-source)
+- [`backups list`](#backups-list-alias-ls)
 - [`backups show`](#backups-show)
-- [`backups delete`](#backups-delete)
+- [`backups delete`](#backups-delete-alias-rm)
 - [`backups cleanup`](#backups-cleanup)
 - [`backups run-service`](#backups-run-service)
 - [`backups list-alerts`](#backups-list-alerts)

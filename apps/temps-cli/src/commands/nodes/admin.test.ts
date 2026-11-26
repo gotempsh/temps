@@ -85,6 +85,14 @@ describe('temps nodes (admin)', () => {
     expect([...mode.requests, ...node.requests]).toEqual([])
   })
 
+  test('public-ingress refuses --enable with --disable on every branch, before calling the API', async () => {
+    for (const extra of [[], ['--toggle-only'], ['--check']]) {
+      const run = await runWithApi(registerNodesCommands, ['nodes', 'public-ingress', '3', '--enable', '--disable', ...extra, '--yes'], routes)
+      expect(run.error?.message).toMatch(/not both/)
+      expect(run.requests).toEqual([])
+    }
+  })
+
   test('ssh list passes paging', async () => {
     const run = await runWithApi(registerNodesCommands, ['nodes', 'ssh', '--page', '2', '--per-page', '50', '--json'], {
       'GET /nodes/ssh/enrollments': { enrollments: [] },

@@ -37,6 +37,8 @@ export function metricWindowQuery(flags: { start?: string; end?: string; percent
     if (!Number.isFinite(percentile) || percentile <= 0 || percentile > 1) {
       throw new ValidationError(`--percentile must be a fraction in (0, 1], e.g. 0.95, got "${flags.percentile}"`)
     }
+    // The API takes the percentile in 0-100 units; round away float noise (0.29 * 100 = 28.999...).
+    percentile = Number((percentile * 100).toFixed(6))
   }
   return {
     ...(flags.start !== undefined && { start_time: flags.start }),

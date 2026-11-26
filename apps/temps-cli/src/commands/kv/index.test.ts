@@ -63,6 +63,20 @@ describe('temps kv', () => {
     expect(run.requests).toEqual(['POST /kv/get'])
   })
 
+  test('get of a stored JSON null succeeds; a missing key with exists:false fails', async () => {
+    const stored = await runWithApi(registerKvCommands, ['kv', 'get', 'nullable', '-p', '7', '--json'], {
+      'POST /kv/get': { value: null, exists: true },
+    })
+    expect(stored.error).toBeUndefined()
+    expect(stored.exitCode).not.toBe(1)
+    expect(JSON.parse(stored.stdout)).toEqual({ key: 'nullable', value: null, exists: true })
+    const missing = await runWithApi(registerKvCommands, ['kv', 'get', 'gone', '-p', '7'], {
+      'POST /kv/get': { value: null, exists: false },
+    })
+    expect(missing.exitCode).toBe(1)
+    expect(missing.stdout).toContain('does not exist')
+  })
+
   test('a failure exits non-zero with --json too: missing key, unmet set condition, expire of a missing key', async () => {
     const routes = { 'POST /kv/get': { value: null }, 'POST /kv/set': { result: null }, 'POST /kv/expire': { success: false } }
     for (const argv of [

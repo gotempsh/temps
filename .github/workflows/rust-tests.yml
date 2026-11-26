@@ -918,9 +918,9 @@ jobs:
         run: bun apps/temps-cli/scripts/check-openapi.ts
 
       # Every operation and input in the committed spec has a CLI command or
-      # flag, or is listed in apps/temps-cli/cli-api-coverage.json: excluded
-      # with a reason, or pending (a list that may only shrink). Reads only
-      # committed files, like the step above, so it needs no install.
+      # flag, or is excluded with a reason in apps/temps-cli/cli-api-coverage.json
+      # (there is no backlog list). Reads only committed files, like the step
+      # above, so it needs no install.
       - name: Check the CLI covers the API
         run: bun test apps/temps-cli/scripts/api-coverage.test.ts
 

@@ -6,9 +6,9 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`environments list`](#environments-list)
+- [`environments list`](#environments-list-alias-ls)
 - [`environments create`](#environments-create)
-- [`environments delete`](#environments-delete)
+- [`environments delete`](#environments-delete-alias-rm)
 - [`environments vars`](#environments-vars)
 - [`environments resources`](#environments-resources)
 - [`environments timeouts`](#environments-timeouts)

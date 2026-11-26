@@ -7,15 +7,15 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 ## Contents
 
 - [`sandbox create`](#sandbox-create)
-- [`sandbox list`](#sandbox-list)
+- [`sandbox list`](#sandbox-list-alias-ls)
 - [`sandbox nodes`](#sandbox-nodes)
 - [`sandbox show`](#sandbox-show)
-- [`sandbox rm`](#sandbox-rm)
+- [`sandbox rm`](#sandbox-rm-alias-stop-destroy)
 - [`sandbox pause`](#sandbox-pause)
 - [`sandbox resume`](#sandbox-resume)
 - [`sandbox restart`](#sandbox-restart)
 - [`sandbox clone`](#sandbox-clone)
-- [`sandbox shell`](#sandbox-shell)
+- [`sandbox shell`](#sandbox-shell-alias-attach)
 - [`sandbox extend`](#sandbox-extend)
 - [`sandbox exec`](#sandbox-exec)
 - [`sandbox logs`](#sandbox-logs)

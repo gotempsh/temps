@@ -155,16 +155,39 @@ pub struct KeysRequest {
 /// Response for get operation
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GetResponse {
-    /// The value, or null if not found
+    /// The value, or null if not found. A stored JSON `null` is also null
+    /// here; `exists` tells the two apart.
     pub value: Option<Value>,
+    /// Whether the key exists, so a stored JSON `null` is not mistaken for a
+    /// missing key
+    pub exists: bool,
+}
+
+impl From<Option<Value>> for GetResponse {
+    fn from(value: Option<Value>) -> Self {
+        Self {
+            exists: value.is_some(),
+            value,
+        }
+    }
 }
 
 /// Response for set operation
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SetResponse {
-    /// Always "OK" on success
+    /// "OK" when the value was written; null when an NX/XX condition did not
+    /// hold and the key was left unchanged (the Redis reply)
     #[schema(example = "OK")]
-    pub result: String,
+    pub result: Option<String>,
+}
+
+impl SetResponse {
+    /// The response for a SET that `written` (false: NX/XX did not hold).
+    pub fn from_written(written: bool) -> Self {
+        Self {
+            result: written.then(|| "OK".to_string()),
+        }
+    }
 }
 
 /// Response for delete operation
@@ -293,4 +316,33 @@ pub struct UpdateKvResponse {
 
     /// Current service status
     pub status: KvStatusResponse,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_response_tells_a_stored_null_from_a_missing_key() {
+        let stored_null = serde_json::to_value(GetResponse::from(Some(Value::Null))).unwrap();
+        assert_eq!(
+            stored_null,
+            serde_json::json!({ "value": null, "exists": true })
+        );
+        let missing = serde_json::to_value(GetResponse::from(None)).unwrap();
+        assert_eq!(
+            missing,
+            serde_json::json!({ "value": null, "exists": false })
+        );
+        let present = serde_json::to_value(GetResponse::from(Some(serde_json::json!(3)))).unwrap();
+        assert_eq!(present, serde_json::json!({ "value": 3, "exists": true }));
+    }
+
+    #[test]
+    fn set_response_is_null_when_the_condition_did_not_hold() {
+        let written = serde_json::to_value(SetResponse::from_written(true)).unwrap();
+        assert_eq!(written, serde_json::json!({ "result": "OK" }));
+        let skipped = serde_json::to_value(SetResponse::from_written(false)).unwrap();
+        assert_eq!(skipped, serde_json::json!({ "result": null }));
+    }
 }

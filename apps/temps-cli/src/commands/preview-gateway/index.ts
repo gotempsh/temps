@@ -93,7 +93,10 @@ export interface PreviewGatewayPatch {
  * sent: every field of the request is optional and an absent one is left as
  * it is.
  */
-export function buildPreviewGatewayPatch(options: ConfigureOptions): PreviewGatewayPatch {
+export function buildPreviewGatewayPatch(
+  options: ConfigureOptions,
+  current?: Pick<PreviewGatewaySettingsResponse, 'enabled' | 'host_port'>,
+): PreviewGatewayPatch {
   if (options.enable && options.disable) {
     throw new ValidationError('Pass --enable or --disable, not both')
   }
@@ -117,7 +120,17 @@ export function buildPreviewGatewayPatch(options: ConfigureOptions): PreviewGate
   }
   // An empty image resets the gateway to the image pinned in this Temps build.
   if (options.resetImage) body.image = ''
-  if (options.hostPort !== undefined) body.host_port = parseHostPort(options.hostPort)
+  if (options.hostPort !== undefined) {
+    body.host_port = parseHostPort(options.hostPort)
+    // A running gateway is removed and recreated, with its ingress, on the new port.
+    // Without the current settings, assume it may be running.
+    if (body.enabled !== false && (current === undefined || (current.enabled && current.host_port !== body.host_port))) {
+      disruptions.push(
+        'Changing the host port removes and recreates the ingress and gateway containers: ' +
+          'preview URLs on the old port stop being served until they are back.',
+      )
+    }
+  }
   if (options.autoUpgrade !== undefined) body.auto_upgrade = options.autoUpgrade
   if (options.containerName !== undefined) {
     const name = options.containerName.trim()
@@ -301,9 +314,13 @@ async function settingsAction(options: JsonOptions): Promise<void> {
 }
 
 async function configureAction(options: ConfigureOptions): Promise<void> {
-  const { body, disruptions } = buildPreviewGatewayPatch(options)
+  // Validate the flags before any request.
+  buildPreviewGatewayPatch(options)
   await requireAuth()
   await setupClient()
+  // Whether a port change interrupts previews depends on the gateway running now.
+  const current = options.hostPort !== undefined ? await readSettings() : undefined
+  const { body, disruptions } = buildPreviewGatewayPatch(options, current)
   if (!(await confirmDisruption(disruptions, 'Apply this change to the preview gateway?', options))) return
   const settings = await withSpinner('Saving preview gateway settings...', async () => {
     const { data, error } = await patchPreviewGatewaySettings({ client, body })

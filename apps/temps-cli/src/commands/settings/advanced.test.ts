@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { buildAdminGate, mergeSettings, settingsAssignments, touchedSections } from './advanced.js'
+import { buildAdminGate, deepMerge, mergeSettings, settingsAssignments, touchedSections } from './advanced.js'
 import { registerSettingsCommands } from './index.js'
 import { runWithApi } from '../../lib/mock-api.js'
 
@@ -43,6 +43,27 @@ describe('settings apply helpers', () => {
       enabled: true,
     })
     expect(mergeSettings(current, { external_url: 'https://y.example' }, []).external_url).toBe('https://y.example')
+  })
+
+  test('a settings file merges into sections field by field; scalars, lists and null replace', () => {
+    expect(mergeSettings(current, { shield: { enabled: true } }, []).shield).toEqual({ enabled: true, mode: 'monitor' })
+    expect(deepMerge({ a: { b: 1, c: [1] }, d: 1 }, { a: { c: [2] }, d: null })).toEqual({ a: { b: 1, c: [2] }, d: null })
+    expect(deepMerge({ a: { b: 1 } }, { a: 'flat' })).toEqual({ a: 'flat' })
+  })
+
+  test('the write-only MaxMind key can be set in an existing geo section; other unknown fields still fail', () => {
+    const withGeo = { ...current, geo: { refresh_interval_hours: 24 } }
+    expect(mergeSettings(withGeo, undefined, settingsAssignments(['geo.maxmind_license_key'], 'secret')).geo).toEqual({
+      refresh_interval_hours: 24,
+      maxmind_license_key: 'secret',
+    })
+    expect(() => mergeSettings(withGeo, undefined, settingsAssignments(['geo.maxmind_licence_key=x'], undefined))).toThrow(/Unknown field/)
+  })
+
+  test('a known section the GET response leaves out is created from the assignment', () => {
+    expect(mergeSettings(current, undefined, settingsAssignments(['geo.refresh_interval_hours=8'], undefined)).geo).toEqual({
+      refresh_interval_hours: 8,
+    })
   })
 })
 
@@ -90,6 +111,17 @@ describe('temps settings (advanced)', () => {
     )
     expect(run.error?.message).toMatch(/not an interactive terminal/)
     expect(run.requests).toEqual(['GET /settings'])
+  })
+
+  test('a sensitive apply rebuilds the body on a fresh read, keeping a change saved meanwhile', async () => {
+    let reads = 0
+    const run = await runWithApi(registerSettingsCommands, ['settings', 'apply', 'external_url=https://other.example', '--yes'], {
+      'GET /settings': () => (++reads === 1 ? current : { ...current, trusted_proxy_cidrs: ['10.0.0.0/8'] }),
+      'PUT /settings': { success: true, message: 'ok' },
+    })
+    expect(run.error).toBeUndefined()
+    expect(run.requests).toEqual(['GET /settings', 'GET /settings', 'PUT /settings'])
+    expect(run.bodies[0]?.body).toEqual({ ...current, external_url: 'https://other.example', trusted_proxy_cidrs: ['10.0.0.0/8'] })
   })
 
   test('apply reads a secret value from stdin', async () => {

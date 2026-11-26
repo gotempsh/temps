@@ -120,8 +120,17 @@ describe('generateDocs', () => {
     expect(skill).not.toContain('npm install --global')
     expect(commandReference).toContain('## Command index')
     expect(commandReference).toContain(`bunx @temps-sdk/cli@${channel} [command]`)
-    expect(commandReference).toContain('[`backups`](#backups)')
-    expect(commandReference).toContain('[`otel-forward`](#otel-forward)')
+    expect(commandReference).toMatch(/\[`backups`\]\(#backups(-alias-[a-z0-9-]+)?\)/)
+    expect(commandReference).toMatch(/\[`otel-forward`\]\(#otel-forward(-alias-[a-z0-9-]+)?\)/)
+    // Every index link opens its heading, whose fragment includes the aliases.
+    expect(commandReference).toContain('[`preview-gateway`](#preview-gateway-alias-pgw)')
+    const fragments = new Set(
+      [...commandReference.matchAll(/^#{2,6} (.+)$/gm)].map((m) =>
+        (m[1] as string).toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-'),
+      ),
+    )
+    const broken = [...commandReference.matchAll(/\]\(#([^)]+)\)/g)].map((m) => m[1]).filter((f) => !fragments.has(f as string))
+    expect(broken).toEqual([])
     expect(commandReference).toContain(
       `bunx @temps-sdk/cli@${channel} --target-context production projects create --name my-app`,
     )
