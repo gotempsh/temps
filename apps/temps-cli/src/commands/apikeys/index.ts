@@ -37,6 +37,15 @@ export function computeExpiryIso(daysInput: string, from: Date = new Date()): st
   return expiry.toISOString()
 }
 
+/**
+ * The role type to send for a key with `permissions`. An explicit permission
+ * list makes a custom key: a predefined role carries its own permissions, and
+ * the server refuses a list sent with one instead of dropping it.
+ */
+export function roleTypeForPermissions(roleType: string, permissions: string[] | null): string {
+  return permissions && permissions.length > 0 ? 'custom' : roleType
+}
+
 export function groupPermissionsByCategory<T extends { category?: string | null }>(
   permissions: T[],
 ): Map<string, T[]> {
@@ -293,6 +302,7 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
           selectedPermissions = indices
             .filter(i => i >= 0 && i < permissionsList.length)
             .map(i => permissionsList[i]!.name)
+          roleType = roleTypeForPermissions(roleType, selectedPermissions)
         }
       }
     }

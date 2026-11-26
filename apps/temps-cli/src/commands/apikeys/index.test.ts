@@ -3,7 +3,13 @@
 
 import { Command } from 'commander'
 import { test, expect, describe } from 'bun:test'
-import { registerApiKeysCommands, computeExpiryIso, groupPermissionsByCategory, parseApiKeyScope } from './index.js'
+import {
+  registerApiKeysCommands,
+  computeExpiryIso,
+  groupPermissionsByCategory,
+  parseApiKeyScope,
+  roleTypeForPermissions,
+} from './index.js'
 
 describe('computeExpiryIso', () => {
   test('advances by the given number of days from the reference date', () => {
@@ -18,6 +24,17 @@ describe('computeExpiryIso', () => {
   test('rejects zero and negative day counts', () => {
     expect(computeExpiryIso('0')).toBeNull()
     expect(computeExpiryIso('-5')).toBeNull()
+  })
+})
+
+describe('roleTypeForPermissions', () => {
+  test('a chosen permission list makes the key custom', () => {
+    expect(roleTypeForPermissions('user', ['projects:read'])).toBe('custom')
+  })
+
+  test('no chosen permissions keep the picked role', () => {
+    expect(roleTypeForPermissions('user', null)).toBe('user')
+    expect(roleTypeForPermissions('reader', [])).toBe('reader')
   })
 })
 
