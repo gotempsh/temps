@@ -4,10 +4,35 @@
 //! Runtime state is shared by every hostname for a replica and retained on reload.
 use crate::BackendEntry;
 use std::sync::{
-    atomic::{AtomicU8, AtomicUsize, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    Arc, OnceLock,
 };
+use std::time::{Duration, Instant};
 use temps_entities::deployment_config::LoadBalancingConfig;
+
+/// Consecutive failed connects (refused, timed out, no route) after which a
+/// replica is taken out of rotation (passive outlier detection).
+pub const OUTLIER_CONSECUTIVE_CONNECT_FAILURES: u32 = 3;
+/// How long a replica is first taken out of rotation; each ejection that
+/// follows a failed probe doubles it, up to [`OUTLIER_MAX_EJECTION`].
+pub const OUTLIER_BASE_EJECTION: Duration = Duration::from_secs(5);
+pub const OUTLIER_MAX_EJECTION: Duration = Duration::from_secs(60);
+
+/// Milliseconds on a monotonic clock, never 0 (0 means "in rotation").
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    u64::try_from(elapsed).unwrap_or(u64::MAX).saturating_add(1)
+}
+
+/// What a recorded connect failure did to the replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectFailureOutcome {
+    /// Still in rotation (below the threshold), or already out of it.
+    Counted,
+    /// Taken out of rotation for this long.
+    Ejected(Duration),
+}
 
 #[derive(Debug, Default)]
 pub struct ReplicaState {
@@ -16,9 +41,104 @@ pub struct ReplicaState {
     pub health: AtomicU8,
     successes: AtomicUsize,
     failures: AtomicUsize,
+    /// Consecutive failed connects seen on the request path.
+    connect_failures: AtomicU32,
+    /// Ejections since the replica last accepted a connection.
+    ejections: AtomicU32,
+    /// [`now_ms`] until which the replica is out of rotation; 0 when it is
+    /// in rotation.
+    ejected_until_ms: AtomicU64,
+    /// A request was sent as the probe of an ejection that ran out; its
+    /// failed connect re-ejects the replica without waiting for the threshold.
+    probing: AtomicBool,
 }
 
 impl ReplicaState {
+    /// Whether the replica is out of rotation. One atomic load while it is
+    /// in rotation; the clock is read only while it is not.
+    pub fn out_of_rotation(&self) -> bool {
+        self.out_of_rotation_at(now_ms)
+    }
+
+    fn out_of_rotation_at(&self, now: impl FnOnce() -> u64) -> bool {
+        let until = self.ejected_until_ms.load(Ordering::Relaxed);
+        until != 0 && until > now()
+    }
+
+    /// Called for the replica a request was given: when its ejection has
+    /// run out, exactly one request becomes its probe (half-open). The
+    /// ejection is extended by [`OUTLIER_BASE_EJECTION`] while the probe is
+    /// out, so other requests keep avoiding the replica, and a probe whose
+    /// outcome is never recorded (the request was cancelled) cannot keep it
+    /// out of rotation for longer than that.
+    fn claim_probe_if_due(&self, now: impl FnOnce() -> u64) {
+        let until = self.ejected_until_ms.load(Ordering::Relaxed);
+        if until == 0 {
+            return;
+        }
+        let now = now();
+        if until > now {
+            return;
+        }
+        let grace = u64::try_from(OUTLIER_BASE_EJECTION.as_millis()).unwrap_or(u64::MAX);
+        if self
+            .ejected_until_ms
+            .compare_exchange(
+                until,
+                now.saturating_add(grace),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            self.probing.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A new connection to the replica could not be made (refused, timed
+    /// out or no route). After [`OUTLIER_CONSECUTIVE_CONNECT_FAILURES`] in a
+    /// row, or when the probe after an ejection fails, the replica leaves
+    /// rotation for a backoff that doubles each time.
+    pub fn record_connect_failure(&self) -> ConnectFailureOutcome {
+        self.record_connect_failure_at(now_ms())
+    }
+
+    fn record_connect_failure_at(&self, now: u64) -> ConnectFailureOutcome {
+        let failures = self
+            .connect_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let was_probe = self.probing.swap(false, Ordering::Relaxed);
+        let until = self.ejected_until_ms.load(Ordering::Relaxed);
+        let ejected_now = until != 0 && until > now;
+        if !was_probe && (failures < OUTLIER_CONSECUTIVE_CONNECT_FAILURES || ejected_now) {
+            return ConnectFailureOutcome::Counted;
+        }
+        let previous = self.ejections.fetch_add(1, Ordering::Relaxed);
+        let backoff = OUTLIER_BASE_EJECTION
+            .saturating_mul(1u32 << previous.min(16))
+            .min(OUTLIER_MAX_EJECTION);
+        let millis = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+        self.ejected_until_ms
+            .store(now.saturating_add(millis), Ordering::Relaxed);
+        ConnectFailureOutcome::Ejected(backoff)
+    }
+
+    /// A new connection to the replica was made: it is back in rotation and
+    /// its failures are forgotten. Loads only, while nothing is recorded.
+    pub fn record_connect_success(&self) {
+        if self.connect_failures.load(Ordering::Relaxed) != 0 {
+            self.connect_failures.store(0, Ordering::Relaxed);
+        }
+        if self.ejected_until_ms.load(Ordering::Relaxed) != 0
+            || self.ejections.load(Ordering::Relaxed) != 0
+        {
+            self.ejected_until_ms.store(0, Ordering::Relaxed);
+            self.ejections.store(0, Ordering::Relaxed);
+            self.probing.store(false, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_probe(&self, passed: bool, config: &LoadBalancingConfig) {
         if passed {
             self.failures.store(0, Ordering::Relaxed);
@@ -47,6 +167,11 @@ impl InFlightGuard {
         state.in_flight.fetch_add(1, Ordering::Relaxed);
         Self(state)
     }
+
+    /// The state of the replica this request was given.
+    pub fn state(&self) -> &ReplicaState {
+        &self.0
+    }
 }
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
@@ -69,10 +194,12 @@ pub fn reserve_avoiding(
     for _ in 0..3 {
         let (index, had_capacity) = select_candidate(backends, cursor, avoid)?;
         if let Some(guard) = reserve_candidate(&backends[index], had_capacity) {
+            backends[index].state.claim_probe_if_due(now_ms);
             return Some((index, guard));
         }
     }
     let (index, _) = select_candidate(backends, cursor, avoid)?;
+    backends[index].state.claim_probe_if_due(now_ms);
     Some((index, InFlightGuard::acquire(backends[index].state.clone())))
 }
 
@@ -121,7 +248,14 @@ fn select_candidate_after_snapshot(
         return None;
     }
     let has_untried = backends.iter().any(|b| !avoid.contains(&b.address));
-    let untried = |b: &BackendEntry| !has_untried || !avoid.contains(&b.address);
+    let tried_or_untried = |b: &BackendEntry| !has_untried || !avoid.contains(&b.address);
+    // Replicas the request path took out of rotation are skipped while any
+    // other candidate is in it; a route whose every replica is out still
+    // tries them, so ejection can never make it unreachable on its own.
+    let now = std::cell::OnceCell::new();
+    let out = |b: &BackendEntry| b.state.out_of_rotation_at(|| *now.get_or_init(now_ms));
+    let has_in_rotation = backends.iter().any(|b| tried_or_untried(b) && !out(b));
+    let untried = |b: &BackendEntry| tried_or_untried(b) && (!has_in_rotation || !out(b));
     let has_healthy = backends
         .iter()
         .any(|b| untried(b) && b.state.health.load(Ordering::Relaxed) == 1);
@@ -440,6 +574,106 @@ mod tests {
         backends[1].state.health.store(2, Ordering::Relaxed);
         assert_eq!(select(&backends, 1), Some(0));
     }
+    fn eject(state: &ReplicaState, now: u64) -> ConnectFailureOutcome {
+        let mut outcome = ConnectFailureOutcome::Counted;
+        for _ in 0..OUTLIER_CONSECUTIVE_CONNECT_FAILURES {
+            outcome = state.record_connect_failure_at(now);
+        }
+        outcome
+    }
+
+    #[test]
+    fn a_replica_refusing_connections_leaves_rotation_after_consecutive_failures() {
+        let backends = vec![entry(0), entry(0)];
+        let now = now_ms();
+        for _ in 1..OUTLIER_CONSECUTIVE_CONNECT_FAILURES {
+            assert_eq!(
+                backends[0].state.record_connect_failure_at(now),
+                ConnectFailureOutcome::Counted
+            );
+        }
+        assert!(!backends[0].state.out_of_rotation());
+        assert_eq!(
+            backends[0].state.record_connect_failure_at(now),
+            ConnectFailureOutcome::Ejected(OUTLIER_BASE_EJECTION)
+        );
+        assert!(backends[0].state.out_of_rotation());
+        // Rotation would pick replica 0 on even cursors; while it is out,
+        // every request goes to the replica that still accepts connections.
+        for cursor in 0..6 {
+            let (index, _guard) = reserve(&backends, cursor).unwrap();
+            assert_eq!(index, 1, "cursor {cursor} chose the ejected replica");
+        }
+    }
+
+    #[test]
+    fn a_success_between_failures_keeps_the_replica_in_rotation() {
+        let state = ReplicaState::default();
+        let now = now_ms();
+        for _ in 0..OUTLIER_CONSECUTIVE_CONNECT_FAILURES * 3 {
+            state.record_connect_failure_at(now);
+            state.record_connect_success();
+        }
+        assert!(!state.out_of_rotation());
+    }
+
+    #[test]
+    fn a_route_whose_every_replica_is_ejected_still_routes() {
+        let backends = vec![entry(0), entry(1)];
+        let now = now_ms();
+        eject(&backends[0].state, now);
+        eject(&backends[1].state, now);
+        assert_eq!(select(&backends, 0), Some(0));
+        // A failure seen while failing open does not extend the ejection.
+        assert_eq!(
+            backends[0].state.record_connect_failure_at(now),
+            ConnectFailureOutcome::Counted
+        );
+    }
+
+    #[test]
+    fn an_expired_ejection_sends_one_probe_and_a_failed_probe_doubles_the_backoff() {
+        let backends = vec![entry(0), entry(0)];
+        let state = &backends[0].state;
+        eject(state, now_ms());
+        assert!(state.out_of_rotation());
+        // Let the ejection run out (the earliest instant on the clock).
+        state.ejected_until_ms.store(1, Ordering::Relaxed);
+        assert!(!state.out_of_rotation());
+
+        let (first, _probe) = reserve(&backends, 0).unwrap();
+        assert_eq!(first, 0, "the expired replica is probed");
+        assert!(state.out_of_rotation(), "only one probe is in flight");
+        let (second, _other) = reserve(&backends, 0).unwrap();
+        assert_eq!(second, 1);
+
+        assert_eq!(
+            state.record_connect_failure_at(now_ms()),
+            ConnectFailureOutcome::Ejected(OUTLIER_BASE_EJECTION * 2)
+        );
+        assert!(state.out_of_rotation());
+    }
+
+    #[test]
+    fn the_ejection_backoff_is_capped_and_reset_by_a_successful_connect() {
+        let state = ReplicaState::default();
+        let now = now_ms();
+        let mut last = Duration::ZERO;
+        for _ in 0..10 {
+            state.probing.store(true, Ordering::Relaxed);
+            if let ConnectFailureOutcome::Ejected(backoff) = state.record_connect_failure_at(now) {
+                last = backoff;
+            }
+        }
+        assert_eq!(last, OUTLIER_MAX_EJECTION);
+        state.record_connect_success();
+        assert!(!state.out_of_rotation());
+        assert_eq!(
+            eject(&state, now),
+            ConnectFailureOutcome::Ejected(OUTLIER_BASE_EJECTION)
+        );
+    }
+
     #[test]
     fn thresholds_and_guard_release() {
         let s = Arc::new(ReplicaState::default());
