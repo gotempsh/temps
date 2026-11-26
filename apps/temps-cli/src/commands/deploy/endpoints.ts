@@ -80,7 +80,6 @@ export function registerDeployEndpoints(program: Command): void {
     query: {
       metric: { kind: 'string!', help: "Metric name, e.g. '\"pg.connections_active\"'" },
       range: { kind: 'string', help: "Time window: '\"1h\"' | '\"6h\"' | '\"24h\"' | '\"7d\"'" },
-      percentile: { kind: 'number', help: "Optional histogram percentile (0–100)" },
       start_time: { kind: 'string', help: "Explicit window start (ISO 8601)" },
       end_time: { kind: 'string', help: "Explicit window end (ISO 8601)" },
     },
