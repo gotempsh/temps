@@ -95,6 +95,7 @@ pub mod prelude {
 
     // Re-export common dependencies for convenience
     pub use axum;
+    pub use chrono;
 
     /// The path plugins have always named the protocol types by. The SDK no
     /// longer depends on `temps-core`, so this is the only part of it left.
