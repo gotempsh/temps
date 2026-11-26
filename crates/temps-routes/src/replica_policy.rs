@@ -71,17 +71,22 @@ impl ReplicaState {
     /// out, so other requests keep avoiding the replica, and a probe whose
     /// outcome is never recorded (the request was cancelled) cannot keep it
     /// out of rotation for longer than that.
-    fn claim_probe_if_due(&self, now: impl FnOnce() -> u64) {
+    ///
+    /// Returns whether the request may use the replica as a replica in
+    /// rotation: it was never ejected, or this request became its probe.
+    /// `false` means it is still ejected (another request claimed the probe
+    /// first, or it was chosen only because every replica is ejected).
+    fn claim_probe_if_due(&self, now: impl FnOnce() -> u64) -> bool {
         let until = self.ejected_until_ms.load(Ordering::Relaxed);
         if until == 0 {
-            return;
+            return true;
         }
         let now = now();
         if until > now {
-            return;
+            return false;
         }
         let grace = u64::try_from(OUTLIER_BASE_EJECTION.as_millis()).unwrap_or(u64::MAX);
-        if self
+        let claimed = self
             .ejected_until_ms
             .compare_exchange(
                 until,
@@ -89,10 +94,11 @@ impl ReplicaState {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )
-            .is_ok()
-        {
+            .is_ok();
+        if claimed {
             self.probing.store(true, Ordering::Relaxed);
         }
+        claimed
     }
 
     /// A new connection to the replica could not be made (refused, timed
@@ -194,13 +200,30 @@ pub fn reserve_avoiding(
     for _ in 0..3 {
         let (index, had_capacity) = select_candidate(backends, cursor, avoid)?;
         if let Some(guard) = reserve_candidate(&backends[index], had_capacity) {
-            backends[index].state.claim_probe_if_due(now_ms);
+            // Two requests can select a replica whose ejection just ran out;
+            // only one becomes its probe. The other gives the reservation back
+            // and selects again while another replica is in rotation.
+            if !backends[index].state.claim_probe_if_due(now_ms)
+                && another_in_rotation(backends, index, avoid)
+            {
+                drop(guard);
+                continue;
+            }
             return Some((index, guard));
         }
     }
     let (index, _) = select_candidate(backends, cursor, avoid)?;
     backends[index].state.claim_probe_if_due(now_ms);
     Some((index, InFlightGuard::acquire(backends[index].state.clone())))
+}
+
+/// Whether a replica other than `index` that this request has not tried is
+/// in rotation. Only reached when a probe claim is lost, so off the common path.
+fn another_in_rotation(backends: &[BackendEntry], index: usize, avoid: &[String]) -> bool {
+    backends
+        .iter()
+        .enumerate()
+        .any(|(i, b)| i != index && !avoid.contains(&b.address) && !b.state.out_of_rotation())
 }
 
 fn reserve_candidate(backend: &BackendEntry, had_capacity: bool) -> Option<InFlightGuard> {
@@ -262,6 +285,9 @@ fn select_candidate_after_snapshot(
     after_snapshot();
     select_with_health(backends, cursor, &untried, has_healthy)
         .or_else(|| select_with_health(backends, cursor, &untried, false))
+        // Every replica seen in rotation was ejected after the snapshot: the
+        // route is all-ejected now, and still answers.
+        .or_else(|| select_with_health(backends, cursor, &tried_or_untried, false))
 }
 
 fn select_with_health(
@@ -628,6 +654,45 @@ mod tests {
         assert_eq!(
             backends[0].state.record_connect_failure_at(now),
             ConnectFailureOutcome::Counted
+        );
+    }
+
+    #[test]
+    fn a_replica_ejected_after_the_snapshot_leaves_an_all_ejected_route_that_still_routes() {
+        let backends = vec![entry(0), entry(1)];
+        let now = now_ms();
+        eject(&backends[1].state, now);
+        // The snapshot sees replica 0 in rotation; another request ejects it
+        // before this one picks.
+        let selected = select_candidate_after_snapshot(&backends, 0, &[], || {
+            eject(&backends[0].state, now);
+        });
+        assert!(selected.is_some(), "an all-ejected route must still answer");
+    }
+
+    #[test]
+    fn only_the_request_that_wins_the_probe_is_admitted_to_an_expired_replica() {
+        let backends = vec![entry(0), entry(0)];
+        let state = &backends[0].state;
+        assert!(state.claim_probe_if_due(now_ms), "never ejected");
+        eject(state, now_ms());
+        assert!(!state.claim_probe_if_due(now_ms), "still ejected");
+        state.ejected_until_ms.store(1, Ordering::Relaxed);
+        // Two requests chose replica 0 from the same snapshot.
+        assert!(
+            state.claim_probe_if_due(now_ms),
+            "the first becomes the probe"
+        );
+        assert!(
+            !state.claim_probe_if_due(now_ms),
+            "the second is not admitted"
+        );
+        // ... and selects again, because replica 1 is in rotation.
+        assert!(another_in_rotation(&backends, 0, &[]));
+        eject(&backends[1].state, now_ms());
+        assert!(
+            !another_in_rotation(&backends, 0, &[]),
+            "with every replica ejected the request keeps the one it got"
         );
     }
 
