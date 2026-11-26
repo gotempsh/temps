@@ -435,6 +435,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_repository_preset_by_name",
     "get_repository_by_name",
     "get_public_branches",
+    // One branch of a public repository by exact name; same public
+    // provider read as `get_public_branches`.
+    "get_public_branch",
     "get_public_repository",
     // ── Agents / skills / MCP / sandbox — config + run status ──
     "list_agents",
