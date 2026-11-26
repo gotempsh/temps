@@ -68,11 +68,14 @@ pub(super) fn start_node_control(
             service_context.get_service::<temps_deployments::DeploymentService>();
         let health_alarm_service = service_context.get_service::<AlarmService>();
         let health_config_service = service_context.get_service::<temps_config::ConfigService>();
+        let health_workflow_service =
+            service_context.get_service::<temps_deployments::WorkflowExecutionService>();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             // Node silence only counts from when this process started watching
             // heartbeats: while it was down it recorded none.
             let mut heartbeat_watch = HeartbeatWatch::start(chrono::Utc::now());
+            let mut superseded_cleanup_cursor = 0;
             loop {
                 interval.tick().await;
                 let watching_since = heartbeat_watch.tick(chrono::Utc::now());
@@ -148,6 +151,23 @@ pub(super) fn start_node_control(
                         tracing::info!(
                             "Node health check: queued {} recovery redeploy(s) for recovered node(s)",
                             restored
+                        );
+                    }
+                }
+
+                // Remove containers of superseded deployments that their
+                // deploy could not remove because the node was down, now that
+                // it is back: Docker's restart policy starts them again, and
+                // nothing else would remove them before the next deploy.
+                if let Some(ref workflow_service) = health_workflow_service {
+                    let pass = workflow_service
+                        .remove_superseded_containers(superseded_cleanup_cursor)
+                        .await;
+                    superseded_cleanup_cursor = pass.next_cursor;
+                    if pass.environments > 0 {
+                        tracing::info!(
+                            environments = pass.environments,
+                            "Node health check: removed containers of superseded deployments                              left on nodes that are back"
                         );
                     }
                 }

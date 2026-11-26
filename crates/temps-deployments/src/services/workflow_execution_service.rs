@@ -39,6 +39,10 @@ use crate::services::failure_classifier::{
 };
 
 mod job_registry;
+mod superseded_cleanup;
+pub use superseded_cleanup::{
+    SupersededCleanupPass, MAX_ENVIRONMENTS_PER_PASS, SUPERSEDED_CLEANUP_SETTLE_SECS,
+};
 
 /// A lexically-last retained status used after a cleanup attempt fails.
 ///
@@ -5360,6 +5364,155 @@ mod tests {
         > {
             unimplemented!("not exercised by this test")
         }
+    }
+
+    /// #2077: a superseded deployment's container that its deploy could not
+    /// remove (its worker was down, the reason the environment failed over)
+    /// is removed once its node is reachable again, without waiting for the
+    /// environment's next deploy. Containers on a node that is still offline,
+    /// the serving deployment's own, and environments whose serving
+    /// deployment only just settled are left alone.
+    #[tokio::test]
+    async fn test_superseded_containers_are_removed_once_their_node_is_back(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel};
+        use temps_entities::{deployment_containers, nodes};
+
+        if !temps_test_utils::docker_available().await {
+            eprintln!("Skipping superseded container cleanup test: Docker unavailable");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+        let settled = Utc::now() - chrono::Duration::hours(1);
+        // `before_save` stamps `updated_at` on every model update, so the
+        // settle time is written with `update_many`.
+        let stamp = |updated_at: chrono::DateTime<Utc>| {
+            let db = db.clone();
+            let id = current_deployment.id;
+            async move {
+                deployments::Entity::update_many()
+                    .col_expr(deployments::Column::State, Expr::value("completed"))
+                    .col_expr(deployments::Column::UpdatedAt, Expr::value(updated_at))
+                    .filter(deployments::Column::Id.eq(id))
+                    .exec(db.as_ref())
+                    .await
+            }
+        };
+        stamp(settled).await?;
+        let mut serving = environment.clone().into_active_model();
+        serving.current_deployment_id = Set(Some(current_deployment.id));
+        serving.update(db.as_ref()).await?;
+
+        let superseded = |slug: &str, minutes: i64| deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(slug.to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(minutes)),
+            updated_at: Set(settled),
+            ..Default::default()
+        };
+        let failed_over = superseded("failed-over", 30).insert(db.as_ref()).await?;
+
+        let offline = nodes::ActiveModel {
+            name: Set("still-offline-worker".to_string()),
+            token_hash: Set("unused".to_string()),
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:39999".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("offline".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let live = |deployment_id: i32, container_id: &str, node_id: Option<i32>| {
+            deployment_containers::ActiveModel {
+                deployment_id: Set(deployment_id),
+                container_id: Set(container_id.to_string()),
+                container_name: Set(container_id.to_string()),
+                container_port: Set(Some(3000)),
+                status: Set(Some("running".to_string())),
+                node_id: Set(node_id),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            }
+        };
+        // Back on a reachable host, and recorded as running.
+        let returned = live(failed_over.id, "returned-old", None)
+            .insert(db.as_ref())
+            .await?;
+        // Its node is still down: nothing can remove it yet.
+        let unreachable = live(failed_over.id, "still-offline-old", Some(offline.id))
+            .insert(db.as_ref())
+            .await?;
+        let serving_container = live(current_deployment.id, "serving", None)
+            .insert(db.as_ref())
+            .await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service.clone(),
+            Arc::new(ScreenshotService::new(config_service).await?),
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
+        );
+
+        let reread = |id: i32| {
+            let db = db.clone();
+            async move {
+                deployment_containers::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .map(|row| row.expect("row exists"))
+            }
+        };
+
+        // The serving deployment only just settled: its own deploy may
+        // still be tearing the old one down, so the pass waits.
+        stamp(Utc::now()).await?;
+        let pass = service.remove_superseded_containers(0).await;
+        assert_eq!(pass.environments, 0, "{pass:?}");
+        assert!(reread(returned.id).await?.deleted_at.is_none());
+
+        stamp(settled).await?;
+        let pass = service.remove_superseded_containers(0).await;
+        assert_eq!(pass.environments, 1, "{pass:?}");
+        assert_eq!(pass.next_cursor, 0, "fewer than a full page: start over");
+
+        assert!(
+            reread(returned.id).await?.deleted_at.is_some(),
+            "the superseded container on a reachable host is removed"
+        );
+        assert!(
+            reread(unreachable.id).await?.deleted_at.is_none(),
+            "a container on a node that is still offline stays for a later pass"
+        );
+        assert!(reread(serving_container.id).await?.deleted_at.is_none());
+        Ok(())
     }
 
     /// Greptile on #1395: cleanup of retired worker containers must not be
