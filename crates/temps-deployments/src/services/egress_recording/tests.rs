@@ -577,3 +577,58 @@ async fn a_deployment_goes_through_the_recorder_only_when_its_environment_record
         "a public API the application calls is what gets recorded"
     );
 }
+
+/// A Compose environment's containers are started by Compose, which nothing
+/// steers to the recorder: it says so and cannot turn recording on.
+#[tokio::test]
+async fn a_compose_environment_cannot_record() {
+    let Some(f) = fixture().await else { return };
+    let wired = f.wired();
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE projects SET preset = 'docker-compose' WHERE id = {PROJECT}"
+        ))
+        .await
+        .unwrap();
+    let status = wired
+        .environments
+        .status(PROJECT, PRODUCTION)
+        .await
+        .unwrap();
+    assert!(!status.configured);
+    assert_eq!(status.reason_code.as_deref(), Some("not_recordable"));
+    assert!(
+        status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("Compose")),
+        "{status:?}"
+    );
+    let refused = wired
+        .environments
+        .set_enabled(PROJECT, PRODUCTION, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            EgressRecordingError::NotRecordable {
+                noun: "environment",
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(!f.recording(PRODUCTION).await, "nothing was written");
+    // Another project's image deployment is unaffected.
+    assert_eq!(
+        wired
+            .environments
+            .status(OTHER_PROJECT, ELSEWHERE)
+            .await
+            .unwrap()
+            .reason_code
+            .as_deref(),
+        Some("unsupported_platform")
+    );
+}

@@ -24,6 +24,13 @@ pub enum EgressRecordingError {
         reason: String,
     },
 
+    #[error("Recording outbound connections is unavailable for {noun} {id}: {reason}")]
+    NotRecordable {
+        noun: &'static str,
+        id: String,
+        reason: String,
+    },
+
     #[error(
         "Recording outbound connections is unavailable for {noun} {id}: OpenTelemetry storage \
          is not enabled on this control plane"

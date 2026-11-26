@@ -534,3 +534,56 @@ async fn the_node_snapshot_tells_the_proxy_which_sandboxes_record() {
         "every opted-in sandbox, with or without a project"
     );
 }
+
+/// Only a Docker sandbox has the sidecar that hands its connections to the
+/// recorder: one on another backend says so and cannot turn recording on,
+/// wherever it runs.
+#[tokio::test]
+async fn a_sandbox_on_another_backend_cannot_record() {
+    let Some(f) = fixture().await else { return };
+    let (wired, _) = f.collecting();
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE sandboxes SET backend = 'firecracker' WHERE id = {}",
+            ON_CONTROL_PLANE.0
+        ))
+        .await
+        .unwrap();
+    let status = wired
+        .sandboxes
+        .status(ON_CONTROL_PLANE.1, OWNER)
+        .await
+        .unwrap();
+    assert!(!status.configured);
+    assert_eq!(status.reason_code.as_deref(), Some("not_recordable"));
+    assert!(
+        status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("firecracker") && r.contains("only Docker sandboxes")),
+        "{status:?}"
+    );
+    let refused = wired
+        .sandboxes
+        .set_enabled(ON_CONTROL_PLANE.1, OWNER, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            EgressRecordingError::NotRecordable {
+                noun: "sandbox",
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !f.recording(ON_CONTROL_PLANE.0).await,
+        "nothing was written"
+    );
+    assert!(
+        records_on_backend(None) && records_on_backend(Some("docker")),
+        "a row from before the column is a Docker sandbox"
+    );
+}

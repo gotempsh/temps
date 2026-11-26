@@ -360,10 +360,19 @@ const KEEP_SHELL_VARS: &str = "TERM|PATH|HOME|PWD|OLDPWD|SHLVL|_";
 fn wrap_shell(cmd: &str, environ: Option<&str>) -> String {
     let quoted = cmd.replace('\'', r"'\''");
     let import = match environ {
+        // Entries in `environ` end with NUL and a value may hold newlines
+        // (a PEM certificate). Newlines become \001 and NULs newlines, so
+        // each line is one whole entry; \001 is turned back into newlines
+        // in the few values that had any. The trailing `x` keeps a value's
+        // own trailing newline through the command substitution.
         Some(path) => format!(
-            "if [ -r {path} ]; then while IFS= read -r kv; do case \"${{kv%%=*}}\" in \
-             {KEEP_SHELL_VARS}|\"\"|*[!A-Za-z0-9_]*) ;; *) export \"$kv\" 2>/dev/null ;; esac; \
-             done <<TEMPS_ENVIRON\n$(tr '\\000' '\\n' < {path})\nTEMPS_ENVIRON\nfi; "
+            "if [ -r {path} ]; then temps_soh=$(printf '\\001'); \
+             while IFS= read -r kv; do case \"${{kv%%=*}}\" in \
+             {KEEP_SHELL_VARS}|\"\"|*[!A-Za-z0-9_]*) continue ;; esac; \
+             case \"$kv\" in *\"$temps_soh\"*) kv=$(printf '%sx' \"$kv\" | tr '\\001' '\\n'); \
+             kv=${{kv%x}} ;; esac; export \"$kv\" 2>/dev/null; \
+             done <<TEMPS_ENVIRON\n$(tr '\\n\\000' '\\001\\n' < {path})\nTEMPS_ENVIRON\n\
+             unset kv temps_soh; fi; "
         ),
         None => String::new(),
     };
@@ -1079,6 +1088,16 @@ mod tests {
     /// What the shell sees: `script` from [`wrap_shell`] importing `environ`,
     /// run as an old agent runs it (only TERM, PATH, HOME set).
     fn shell_env_after_import(environ: &[(&str, &str)]) -> String {
+        shell_output_after_import(environ, "env", &[])
+    }
+
+    /// What `cmd` prints in that shell, started with `inherited` on top of
+    /// TERM, PATH and HOME (a newer agent passes the environment on).
+    fn shell_output_after_import(
+        environ: &[(&str, &str)],
+        cmd: &str,
+        inherited: &[(&str, &str)],
+    ) -> String {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("environ");
         let mut bytes = Vec::new();
@@ -1087,7 +1106,7 @@ mod tests {
             bytes.push(0);
         }
         std::fs::write(&path, bytes).expect("write environ");
-        let script = wrap_shell("env", Some(path.to_str().expect("utf-8 path")));
+        let script = wrap_shell(cmd, Some(path.to_str().expect("utf-8 path")));
         let output = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(&script)
@@ -1095,10 +1114,30 @@ mod tests {
             .env("TERM", "xterm-256color")
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/home/temps")
+            .envs(inherited.iter().copied())
             .output()
             .expect("run the wrapped shell");
         assert!(output.status.success(), "{script}: {output:?}");
         String::from_utf8(output.stdout).expect("utf-8")
+    }
+
+    /// A value with newlines (a PEM certificate) arrives whole, whether the
+    /// shell had nothing or already had the right value from a newer agent,
+    /// and its neighbours are untouched. A line inside it that looks like an
+    /// assignment is not mistaken for one.
+    #[test]
+    fn multi_line_values_are_imported_whole() {
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nNOT_A_VAR=inside\n-----END CERTIFICATE-----\n";
+        let environ = [("BEFORE", "one"), ("CERT", cert), ("AFTER", "two")];
+        let cmd =
+            "printf '[%s][%s][%s][%s]' \"$BEFORE\" \"$CERT\" \"$AFTER\" \"${NOT_A_VAR-unset}\"";
+        let expected = format!("[one][{cert}][two][unset]");
+        assert_eq!(shell_output_after_import(&environ, cmd, &[]), expected);
+        assert_eq!(
+            shell_output_after_import(&environ, cmd, &[("CERT", cert)]),
+            expected,
+            "an inherited value is not cut to its first line"
+        );
     }
 
     /// A shell from an old terminal agent gets the container's proxy and

@@ -20,7 +20,7 @@ use temps_network_policy::NodeRecordingStatus;
 use temps_workload_netpol::EgressRecordingCapability;
 use tracing::warn;
 
-use crate::local::{LocalCapability, LocalEgressRecorder};
+use crate::local::{LocalCapability, LocalEgressRecorder, LocalServing};
 use crate::service::{EgressLogStore, EgressRecordingService, NodeRecordingCapabilities};
 
 /// Capabilities when no network-policy service runs: nobody has reported.
@@ -89,7 +89,11 @@ impl TempsPlugin for WorkloadEgressPlugin {
             };
             let service = Arc::new(EgressRecordingService::new(db, capabilities, store));
             context.register_service(service.clone());
-            context.register_service(LocalEgressRecorder::new(service, local));
+            // The recorder says which kinds it serves here; the service
+            // reports node 0 able to record only those.
+            let serving = LocalServing::new();
+            service.set_local_serving(serving.clone());
+            context.register_service(LocalEgressRecorder::new(service, local, serving));
             Ok(())
         })
     }

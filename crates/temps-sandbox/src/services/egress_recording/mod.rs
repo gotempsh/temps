@@ -44,6 +44,13 @@ pub const SANDBOX_ID_ATTRIBUTE: &str = "temps.sandbox.id";
 /// What users call one, in messages.
 const NOUN: &str = "sandbox";
 
+/// Whether a sandbox on `backend` can be recorded: only a Docker sandbox
+/// has the egress sidecar that hands its connections to the recorder. A
+/// row from before the column was set is a Docker sandbox.
+pub fn records_on_backend(backend: Option<&str>) -> bool {
+    matches!(backend, None | Some("docker"))
+}
+
 /// A sandbox row as the recording service sees a workload.
 pub fn recorded(row: &sandboxes::Model) -> RecordedWorkload {
     RecordedWorkload {
@@ -53,6 +60,29 @@ pub fn recorded(row: &sandboxes::Model) -> RecordedWorkload {
         nodes: vec![row.node_id.unwrap_or(CONTROL_PLANE_NODE_ID)],
         enabled: row.egress_recording,
         live: row.status != "destroyed",
+        unrecordable: (!records_on_backend(row.backend.as_deref())).then(|| {
+            format!(
+                "a sandbox on the {} backend has no egress sidecar, so nothing hands its \
+                 connections to the egress proxy; only Docker sandboxes record",
+                row.backend.as_deref().unwrap_or_default()
+            )
+        }),
+    }
+}
+
+/// Refreshes the egress recorder when a recorded sandbox's policy changed,
+/// so the recorder holds the new policy before the change is reported done.
+pub struct RecorderPolicyRefresh {
+    pub recorder: Arc<LocalEgressRecorder>,
+}
+
+#[async_trait]
+impl crate::services::sandbox_service::EgressPolicyObserver for RecorderPolicyRefresh {
+    async fn policy_changed(&self, row: &sandboxes::Model) {
+        // Only this host's recorder decides for this host's sandboxes.
+        if row.node_id.is_none() {
+            self.recorder.refresh().await;
+        }
     }
 }
 

@@ -30,9 +30,15 @@
 //! as soon as it has created a steered container, so the application's
 //! first connection already finds its address in the table.
 //!
-//! **Cost.** Each refresh is one query for the environments that record on
-//! this host and, while any does or any steered container was last seen,
-//! one local container list filtered to the label.
+//! **A first deployment is not locked out.** While any environment records,
+//! every refresh lists the steered containers, so a replica is in the table
+//! from its first connection, before its deployment is marked complete. It
+//! is recorded once the database places it on this host; until then it is
+//! let through unrecorded.
+//!
+//! **Cost.** Each refresh is one query for the environments that record
+//! and, while any does or any steered container was last seen, one local
+//! container list filtered to the label and one query for where they run.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
@@ -135,6 +141,15 @@ pub fn traffic_of(containers: &[SteeredContainer], recording: &BTreeSet<i32>) ->
     }
 }
 
+/// Whether a refresh must list this host's containers: while an environment
+/// records (a replica of it may have just been steered, before anything
+/// says where it runs) or a steered container was last seen (it keeps its
+/// way out after recording is turned off). Otherwise nothing can be in the
+/// table and the list is skipped.
+fn needs_listing(any_recording: bool, steered_seen: bool) -> bool {
+    any_recording || steered_seen
+}
+
 /// The steered deployment containers of this host.
 pub struct DeploymentTraffic {
     db: Arc<DatabaseConnection>,
@@ -156,13 +171,31 @@ impl DeploymentTraffic {
         }
     }
 
+    /// The environments that record now, whatever runs where. While any
+    /// does, the containers are listed on every refresh: a new replica is
+    /// steered before the database knows where it runs, and must be in the
+    /// table from its first connection.
+    async fn recording(&self) -> Result<BTreeSet<i32>, String> {
+        environments::Entity::find()
+            .select_only()
+            .column(environments::Column::Id)
+            .filter(environments::Column::EgressRecording.eq(true))
+            .filter(environments::Column::DeletedAt.is_null())
+            .into_tuple::<i32>()
+            .all(self.db.as_ref())
+            .await
+            .map(|ids| ids.into_iter().collect())
+            .map_err(|e| format!("could not read the environments that record: {e}"))
+    }
+
     /// The environments that record now and have a container on this host,
     /// as the database has them. Only these are recorded: the control plane
     /// accepts a node's records only for workloads it placed there, so a
-    /// container the database no longer knows (one being torn down) keeps
+    /// container the database does not place here yet (a first deployment's
+    /// replica before it is ready) or any more (one being torn down) keeps
     /// its way out and is not recorded, instead of having this host's whole
     /// batch refused.
-    async fn recording(&self) -> Result<BTreeSet<i32>, String> {
+    async fn recorded_here(&self) -> Result<BTreeSet<i32>, String> {
         deployment_containers::Entity::find()
             .select_only()
             .column(deployments::Column::EnvironmentId)
@@ -183,7 +216,7 @@ impl DeploymentTraffic {
             .all(self.db.as_ref())
             .await
             .map(|ids| ids.into_iter().collect())
-            .map_err(|e| format!("could not read the environments that record: {e}"))
+            .map_err(|e| format!("could not read the environments recorded on this host: {e}"))
     }
 }
 
@@ -224,10 +257,13 @@ impl LocalTraffic for DeploymentTraffic {
     }
 
     async fn refresh(&self, _address: SocketAddr) -> Result<RecordedTraffic, String> {
-        let recording = self.recording().await?;
-        if recording.is_empty() && !self.steered_seen.load(Ordering::Relaxed) {
+        if !needs_listing(
+            !self.recording().await?.is_empty(),
+            self.steered_seen.load(Ordering::Relaxed),
+        ) {
             return Ok(RecordedTraffic::default());
         }
+        let recording = self.recorded_here().await?;
         let containers = self
             .docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
@@ -359,6 +395,7 @@ mod tests {
             NETWORK.to_string(),
         );
         assert!(traffic.recording().await.unwrap().is_empty());
+        assert!(traffic.recorded_here().await.unwrap().is_empty());
         f.db.connection()
             .execute_unprepared(&format!(
                 "UPDATE environments SET egress_recording = true \
@@ -368,9 +405,44 @@ mod tests {
             .unwrap();
         assert_eq!(
             traffic.recording().await.unwrap(),
+            BTreeSet::from([PRODUCTION, STAGING, ELSEWHERE]),
+            "every environment that records keeps the containers listed, placed or not"
+        );
+        assert_eq!(
+            traffic.recorded_here().await.unwrap(),
             BTreeSet::from([PRODUCTION]),
             "staging's container is gone and the other project's is on a worker"
         );
+    }
+
+    /// The first replica of an environment that records is steered before
+    /// the database says where it runs. It must be in the table from its
+    /// first connection, or a start-up that needs the internet is refused
+    /// and never becomes ready: while anything records, the containers are
+    /// listed, and a replica not placed here yet is let through unrecorded.
+    #[test]
+    fn a_first_replica_is_let_through_before_it_is_placed() {
+        assert!(
+            needs_listing(true, false),
+            "an idle host lists as soon as an environment records"
+        );
+        assert!(
+            needs_listing(false, true),
+            "a steered container keeps its way out"
+        );
+        assert!(!needs_listing(false, false));
+
+        let first = SteeredContainer {
+            environment_id: 7,
+            address: "172.18.0.5".parse().unwrap(),
+        };
+        let traffic = traffic_of(&[first], &BTreeSet::new());
+        let table =
+            temps_workload_netpol::EgressTable::build(&traffic.policies, &traffic.identities);
+        let rules = table
+            .lookup(first.address)
+            .expect("the new replica is in the table");
+        assert!(!rules.record, "recorded once it is placed here");
     }
 
     /// Recording observes: any public destination on any port goes through,

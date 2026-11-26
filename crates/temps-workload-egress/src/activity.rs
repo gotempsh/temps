@@ -155,6 +155,12 @@ impl EgressRecordingService {
                 id: workload.public_id.clone(),
             });
         };
+        // A page past what any store can address (the offset is a signed
+        // 64-bit integer in SQL) holds nothing: it is answered as empty,
+        // with the real total, rather than sent as a negative offset.
+        let offset = (page - 1)
+            .checked_mul(per_page)
+            .filter(|offset| i64::try_from(*offset).is_ok());
         let query = LogQuery {
             // Read by the workload alone; the project is not applied.
             project_id: workload.project_id.unwrap_or_default(),
@@ -167,7 +173,7 @@ impl EgressRecordingService {
             }),
             // One more than the page, to know whether another follows.
             limit: Some(per_page + 1),
-            offset: Some((page - 1).saturating_mul(per_page)),
+            offset: Some(offset.unwrap_or(0)),
             ..Default::default()
         };
         let unreadable = |source| EgressRecordingError::Query {
@@ -176,6 +182,17 @@ impl EgressRecordingService {
             source,
         };
         let total = store.count(query.clone()).await.map_err(unreadable)?;
+        if offset.is_none() {
+            return Ok(EgressActivityPage {
+                workload_kind: workload.workload.kind.as_str().to_string(),
+                workload_id: workload.public_id.clone(),
+                records: Vec::new(),
+                page,
+                per_page,
+                total,
+                has_more: false,
+            });
+        }
         let mut logs = store.query(query).await.map_err(unreadable)?;
         let has_more = logs.len() as u64 > per_page;
         logs.truncate(per_page as usize);

@@ -27,7 +27,7 @@ pub mod traffic;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -36,7 +36,8 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter,
     QuerySelect, RelationTrait, Set,
 };
-use temps_entities::{deployment_containers, deployments, environments};
+use temps_entities::preset::Preset;
+use temps_entities::{deployment_containers, deployments, environments, projects};
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::LocalEgressRecorder;
 use temps_workload_egress::steering::{proxy_variables, url_hosts, ProxyVariables};
@@ -138,6 +139,22 @@ async fn recorded(
         .map_err(EgressRecordingError::db(
             "reading where an environment's containers run",
         ))?;
+    // A Compose stack's containers are started by Compose, not by the
+    // deploy path that steers replicas to the recorder: nothing would ever
+    // reach it, so such an environment cannot record at all.
+    let compose: HashSet<i32> = projects::Entity::find()
+        .select_only()
+        .column(projects::Column::Id)
+        .filter(projects::Column::Id.is_in(rows.iter().map(|row| row.project_id)))
+        .filter(projects::Column::Preset.eq(Preset::DockerCompose))
+        .into_tuple::<i32>()
+        .all(db)
+        .await
+        .map_err(EgressRecordingError::db(
+            "reading how an environment is deployed",
+        ))?
+        .into_iter()
+        .collect();
     let mut nodes: HashMap<i32, Vec<i32>> = HashMap::new();
     for (environment_id, node_id) in placements {
         let node_id = node_id.unwrap_or(CONTROL_PLANE_NODE_ID);
@@ -158,6 +175,12 @@ async fn recorded(
                 nodes: placed,
                 enabled: row.egress_recording,
                 live: row.deleted_at.is_none(),
+                unrecordable: compose.contains(&row.project_id).then(|| {
+                    "a Docker Compose environment's containers are started by Compose, \
+                     which does not send them through the egress proxy; only image \
+                     deployments record"
+                        .to_string()
+                }),
             }
         })
         .collect())

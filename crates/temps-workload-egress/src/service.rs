@@ -5,7 +5,7 @@
 //! whether it can, and turning it on or off.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -19,6 +19,7 @@ use utoipa::ToSchema;
 
 use crate::adapter::{RecordedWorkload, WorkloadEgressAdapter};
 use crate::error::EgressRecordingError;
+use crate::local::LocalServing;
 
 /// The node id the control plane uses for itself.
 pub const CONTROL_PLANE_NODE_ID: i32 = 0;
@@ -71,7 +72,8 @@ pub struct EgressRecordingNode {
     pub recording: bool,
     /// Why it cannot, when `recording` is false: one of
     /// `unsupported_platform`, `proxy_not_serving`, `node_not_reporting`,
-    /// `agent_predates_recording`.
+    /// `agent_predates_recording`, or `kind_not_served` when the node
+    /// records but not this kind of workload.
     pub reason_code: Option<String>,
     /// The same, in a sentence that names what is missing.
     pub reason: Option<String>,
@@ -94,7 +96,9 @@ pub struct EgressRecordingStatus {
     /// true and this is false, nothing is being recorded.
     pub configured: bool,
     /// Why recording cannot work, when `configured` is false:
-    /// `otel_unavailable`, or the `reason_code` of the node that cannot
+    /// `otel_unavailable`; `not_recordable` when nothing routes this
+    /// workload's traffic to a recorder (a backend or deployment kind it
+    /// has no route for); or the `reason_code` of the node that cannot
     /// record.
     pub reason_code: Option<String>,
     /// The same, in a sentence that names what is missing.
@@ -112,13 +116,36 @@ pub struct EgressRecordingStatus {
     pub logs_path: Option<String>,
 }
 
+/// `reason_code` of a node that records, but not this workload kind on
+/// this host.
+pub const KIND_NOT_SERVED: &str = "kind_not_served";
+
+/// `reason_code` of a workload whose traffic the recorder has no way to see.
+pub const NOT_RECORDABLE: &str = "not_recordable";
+
+/// What one node answered for one workload, with its stable code.
+struct NodeAnswer {
+    node: EgressRecordingNode,
+    /// `None` when the node records this workload.
+    code: Option<&'static str>,
+}
+
+/// What stops recording.
+enum BlockedOn {
+    /// No OpenTelemetry storage on this control plane.
+    Storage,
+    /// The workload itself: nothing routes its traffic to a recorder.
+    Workload,
+    /// The node (id and name) the workload runs on.
+    Node(i32, String),
+}
+
 /// Why recording cannot work for a workload.
 struct Blocker {
     code: &'static str,
     reason: String,
     setup_path: Option<String>,
-    /// The node that cannot record, when a node is what is missing.
-    node: Option<(i32, String)>,
+    on: BlockedOn,
 }
 
 pub struct EgressRecordingService {
@@ -129,6 +156,8 @@ pub struct EgressRecordingService {
     pub(crate) store: Option<Arc<dyn EgressLogStore>>,
     /// One adapter per workload kind that records, registered at startup.
     adapters: RwLock<HashMap<WorkloadKind, Arc<dyn WorkloadEgressAdapter>>>,
+    /// Which kinds this host's recorder serves, once one runs here.
+    local: OnceLock<Arc<LocalServing>>,
 }
 
 impl EgressRecordingService {
@@ -142,7 +171,14 @@ impl EgressRecordingService {
             capabilities,
             store,
             adapters: RwLock::new(HashMap::new()),
+            local: OnceLock::new(),
         }
+    }
+
+    /// Tells the service which kinds this host's recorder serves, so node 0
+    /// is reported able to record only those. Set once.
+    pub fn set_local_serving(&self, serving: Arc<LocalServing>) {
+        let _ = self.local.set(serving);
     }
 
     /// Makes a workload kind recordable. Called once per kind at startup;
@@ -203,40 +239,83 @@ impl EgressRecordingService {
         Ok(names)
     }
 
-    /// Each node the workload runs on, and whether it can record.
+    /// What `node_id` says about recording `kind`. Node 0 is this host: it
+    /// can record only the kinds its recorder actually serves, which a
+    /// node-wide capability does not say (one kind's listener may be up
+    /// while another's could not start).
+    fn node_answer(
+        &self,
+        kind: WorkloadKind,
+        noun: &str,
+        node_id: i32,
+        node_name: String,
+    ) -> NodeAnswer {
+        let status = self.capabilities.status(node_id);
+        // The node's page fixes only an agent that is not reporting or is
+        // too old; nothing in the console fixes a platform, a proxy that is
+        // not serving or a kind this host does not serve, so those get no
+        // link.
+        let fixable_on_the_node = matches!(
+            status,
+            NodeRecordingStatus::NotReporting { .. } | NodeRecordingStatus::AgentPredatesRecording
+        );
+        let setup_path = || {
+            if node_id == CONTROL_PLANE_NODE_ID {
+                NODES_SETUP_PATH.to_string()
+            } else {
+                format!("{NODES_SETUP_PATH}/{node_id}")
+            }
+        };
+        let (code, reason, setup_path) = match status.describe() {
+            Some(reason) => (
+                Some(status.code()),
+                Some(reason),
+                fixable_on_the_node.then(setup_path),
+            ),
+            None => {
+                let not_served = if node_id == CONTROL_PLANE_NODE_ID {
+                    self.local.get().and_then(|local| local.not_serving(kind))
+                } else {
+                    None
+                };
+                match not_served {
+                    Some(why) => (
+                        Some(KIND_NOT_SERVED),
+                        Some(format!(
+                            "this host's egress recorder does not serve {noun}s: {why}"
+                        )),
+                        None,
+                    ),
+                    None => (None, None, None),
+                }
+            }
+        };
+        NodeAnswer {
+            node: EgressRecordingNode {
+                node_id,
+                node_name,
+                recording: code.is_none(),
+                reason_code: code.map(str::to_string),
+                reason,
+                setup_path,
+            },
+            code,
+        }
+    }
+
+    /// Each node the workload runs on, and whether it can record it.
     async fn nodes_of(
         &self,
+        adapter: &dyn WorkloadEgressAdapter,
         workload: &RecordedWorkload,
-    ) -> Result<Vec<EgressRecordingNode>, EgressRecordingError> {
-        let names = self.node_names(&workload.nodes).await?;
+    ) -> Result<Vec<NodeAnswer>, EgressRecordingError> {
+        let mut names = self.node_names(&workload.nodes).await?;
         Ok(workload
             .nodes
             .iter()
             .map(|node_id| {
-                let status = self.capabilities.status(*node_id);
-                // The node's page fixes only an agent that is not reporting
-                // or is too old; nothing in the console fixes a platform or
-                // a proxy that is not serving, so those get no link.
-                let fixable_on_the_node = matches!(
-                    status,
-                    NodeRecordingStatus::NotReporting { .. }
-                        | NodeRecordingStatus::AgentPredatesRecording
-                );
-                let reason = status.describe();
-                EgressRecordingNode {
-                    node_id: *node_id,
-                    node_name: names.get(node_id).cloned().unwrap_or_default(),
-                    recording: reason.is_none(),
-                    reason_code: reason.is_some().then(|| status.code().to_string()),
-                    setup_path: (reason.is_some() && fixable_on_the_node).then(|| {
-                        if *node_id == CONTROL_PLANE_NODE_ID {
-                            NODES_SETUP_PATH.to_string()
-                        } else {
-                            format!("{NODES_SETUP_PATH}/{node_id}")
-                        }
-                    }),
-                    reason,
-                }
+                let name = names.remove(node_id).unwrap_or_default();
+                self.node_answer(workload.workload.kind, adapter.noun(), *node_id, name)
             })
             .collect())
     }
@@ -244,32 +323,41 @@ impl EgressRecordingService {
     /// Why recording cannot work now. A workload that runs nowhere yet is
     /// not blocked: it records wherever it starts, if that node can. One
     /// that runs on several nodes is blocked only when none of them can.
-    fn blocker(&self, nodes: &[EgressRecordingNode]) -> Option<Blocker> {
+    fn blocker(&self, workload: &RecordedWorkload, nodes: &[NodeAnswer]) -> Option<Blocker> {
         if self.store.is_none() {
             return Some(Blocker {
                 code: "otel_unavailable",
                 reason: "OpenTelemetry storage is not enabled on this control plane".to_string(),
                 setup_path: None,
-                node: None,
+                on: BlockedOn::Storage,
             });
         }
-        if nodes.is_empty() || nodes.iter().any(|node| node.recording) {
+        if let Some(reason) = &workload.unrecordable {
+            return Some(Blocker {
+                code: NOT_RECORDABLE,
+                reason: reason.clone(),
+                setup_path: None,
+                on: BlockedOn::Workload,
+            });
+        }
+        if nodes.is_empty() || nodes.iter().any(|answer| answer.code.is_none()) {
             return None;
         }
-        let node = nodes.first()?;
-        let status = self.capabilities.status(node.node_id);
+        let answer = nodes.first()?;
         Some(Blocker {
-            code: status.code(),
-            reason: node.reason.clone().unwrap_or_default(),
-            setup_path: node.setup_path.clone(),
-            node: Some((node.node_id, node.node_name.clone())),
+            code: answer.code?,
+            reason: answer.node.reason.clone().unwrap_or_default(),
+            setup_path: answer.node.setup_path.clone(),
+            on: BlockedOn::Node(answer.node.node_id, answer.node.node_name.clone()),
         })
     }
 
+    /// The status of `workload`, given what its nodes answered.
     async fn status_of(
         &self,
         adapter: &dyn WorkloadEgressAdapter,
         workload: &RecordedWorkload,
+        nodes: Vec<NodeAnswer>,
     ) -> Result<EgressRecordingStatus, EgressRecordingError> {
         let logs_path = match workload.project_id {
             Some(project_id) => projects::Entity::find_by_id(project_id)
@@ -282,8 +370,7 @@ impl EgressRecordingService {
                 }),
             None => None,
         };
-        let nodes = self.nodes_of(workload).await?;
-        let blocker = self.blocker(&nodes);
+        let blocker = self.blocker(workload, &nodes);
         Ok(EgressRecordingStatus {
             workload_kind: workload.workload.kind.as_str().to_string(),
             workload_id: workload.public_id.clone(),
@@ -292,7 +379,7 @@ impl EgressRecordingService {
             reason_code: blocker.as_ref().map(|b| b.code.to_string()),
             reason: blocker.as_ref().map(|b| b.reason.clone()),
             setup_path: blocker.and_then(|b| b.setup_path),
-            nodes,
+            nodes: nodes.into_iter().map(|answer| answer.node).collect(),
             project_id: workload.project_id,
             logs_path,
         })
@@ -305,13 +392,19 @@ impl EgressRecordingService {
         workload: &RecordedWorkload,
     ) -> Result<EgressRecordingStatus, EgressRecordingError> {
         let adapter = self.adapter(workload.workload.kind)?;
-        self.status_of(adapter.as_ref(), workload).await
+        let nodes = self.nodes_of(adapter.as_ref(), workload).await?;
+        self.status_of(adapter.as_ref(), workload, nodes).await
     }
 
     /// Turns recording on or off for `workload`, which the caller has
     /// resolved and may change. Turning it off always succeeds; turning it
     /// on is refused when it could not work. Returns the value before and
     /// the status after, for the audit log.
+    ///
+    /// Everything the answer needs is read before anything is written, so
+    /// a failed read leaves recording as it was and the caller's error is
+    /// true: a change is never committed behind an error the audit log
+    /// never sees.
     pub async fn set_enabled(
         &self,
         workload: &RecordedWorkload,
@@ -319,22 +412,26 @@ impl EgressRecordingService {
     ) -> Result<(bool, EgressRecordingStatus), EgressRecordingError> {
         let adapter = self.adapter(workload.workload.kind)?;
         let previous = workload.enabled;
+        let nodes = self.nodes_of(adapter.as_ref(), workload).await?;
         if enabled {
-            let nodes = self.nodes_of(workload).await?;
-            if let Some(blocker) = self.blocker(&nodes) {
-                return Err(match blocker.node {
-                    Some((node_id, node_name)) => EgressRecordingError::Unavailable {
-                        noun: adapter.noun(),
-                        id: workload.public_id.clone(),
+            if let Some(blocker) = self.blocker(workload, &nodes) {
+                let noun = adapter.noun();
+                let id = workload.public_id.clone();
+                return Err(match blocker.on {
+                    BlockedOn::Node(node_id, node_name) => EgressRecordingError::Unavailable {
+                        noun,
+                        id,
                         node_id,
                         node_name,
                         code: blocker.code,
                         reason: blocker.reason,
                     },
-                    None => EgressRecordingError::OtelUnavailable {
-                        noun: adapter.noun(),
-                        id: workload.public_id.clone(),
+                    BlockedOn::Workload => EgressRecordingError::NotRecordable {
+                        noun,
+                        id,
+                        reason: blocker.reason,
                     },
+                    BlockedOn::Storage => EgressRecordingError::OtelUnavailable { noun, id },
                 });
             }
         }
@@ -342,6 +439,7 @@ impl EgressRecordingService {
             enabled,
             ..workload.clone()
         };
+        let status = self.status_of(adapter.as_ref(), &now, nodes).await?;
         if previous != enabled {
             adapter.set_enabled(workload.workload, enabled).await?;
             adapter.changed(&now).await;
@@ -354,7 +452,7 @@ impl EgressRecordingService {
             to = enabled,
             "egress recording updated"
         );
-        Ok((previous, self.status_of(adapter.as_ref(), &now).await?))
+        Ok((previous, status))
     }
 }
 

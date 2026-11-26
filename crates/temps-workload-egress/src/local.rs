@@ -21,13 +21,22 @@
 //! address no recorded workload holds is refused.
 //!
 //! **Linux only**, where the control plane runs its workloads' Docker; node
-//! 0 reports that it can record only while the proxy serves somewhere.
+//! 0 reports that it can record only while the proxy serves somewhere, and
+//! only the kinds it serves ([`LocalServing`]): one kind's listener may be
+//! up while another's could not start.
 //!
-//! **Its port is stable** ([`RECORDING_PROXY_PORT`]): workloads carry the
-//! address (a sidecar's hand-off, a container's proxy variables), so a port
-//! that changed on every restart would mean replacing them on every
-//! restart. Only when the port is taken does a listener take any free one,
-//! saying so.
+//! **Its port is fixed** ([`RECORDING_PROXY_PORT`]): workloads carry the
+//! address (a sidecar's hand-off, a container's proxy variables), and a
+//! container started with one cannot be re-pointed. When the port is taken
+//! the kind is not served, saying why, rather than served on a port its
+//! workloads would lose on the next restart.
+//!
+//! **One refresh at a time.** A refresh reads every source and replaces the
+//! whole table, so two overlapping ones could let the older finish last and
+//! put back what the newer had just removed or never had. Refreshes take a
+//! turn; each reads what is current when its turn comes. Work that may
+//! itself ask for a refresh (re-pointing a sidecar) runs outside the turn,
+//! in [`LocalTraffic::maintain`].
 //!
 //! **Cost.** Per source, each refresh is whatever the source reads (one
 //! query for its opted-in workloads; only when there are some, one local
@@ -37,7 +46,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -87,6 +96,11 @@ pub trait LocalTraffic: Send + Sync {
     /// The recorder began serving this kind at `address`.
     async fn started(&self, _address: SocketAddr) {}
 
+    /// Follow-up work after a refresh, run outside the refresh's turn so it
+    /// may ask for another refresh itself (retrying a sidecar that could
+    /// not be replaced). Nothing by default.
+    async fn maintain(&self) {}
+
     /// The recorder does not serve this kind (it stopped, could not start,
     /// or this host cannot record): stop sending it traffic.
     async fn stopped(&self) {}
@@ -103,6 +117,59 @@ impl LocalCapability for temps_network_policy::NetworkPolicyService {
     }
 }
 
+/// Which workload kinds this host's recorder serves now, and why not when
+/// it does not. Shared with [`EgressRecordingService`], which reports node 0
+/// able to record only the kinds served here.
+#[derive(Debug, Default)]
+pub struct LocalServing {
+    kinds: RwLock<HashMap<WorkloadKind, Result<SocketAddr, String>>>,
+}
+
+impl LocalServing {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Where `kind` is served now, if it is.
+    pub fn address(&self, kind: WorkloadKind) -> Option<SocketAddr> {
+        match self.read().get(&kind) {
+            Some(Ok(address)) => Some(*address),
+            _ => None,
+        }
+    }
+
+    /// Why `kind` is not served here, in a sentence; `None` when it is.
+    pub fn not_serving(&self, kind: WorkloadKind) -> Option<String> {
+        match self.read().get(&kind) {
+            Some(Ok(_)) => None,
+            Some(Err(reason)) => Some(reason.clone()),
+            None => Some("its listener has not started on this host".to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_for_tests(&self, kind: WorkloadKind, state: Result<SocketAddr, String>) {
+        self.set(kind, state);
+    }
+
+    fn any(&self) -> bool {
+        self.read().values().any(Result::is_ok)
+    }
+
+    fn set(&self, kind: WorkloadKind, state: Result<SocketAddr, String>) {
+        self.kinds
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(kind, state);
+    }
+
+    fn read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<WorkloadKind, Result<SocketAddr, String>>> {
+        self.kinds.read().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// The proxy and its batcher, started with the first source.
 struct Running {
     proxy: Arc<EgressProxy>,
@@ -115,8 +182,10 @@ pub struct LocalEgressRecorder {
     table: Arc<ArcSwap<EgressTable>>,
     running: tokio::sync::OnceCell<Option<Running>>,
     sources: Mutex<Vec<Arc<dyn LocalTraffic>>>,
-    /// Where each kind is served now.
-    serving: Mutex<HashMap<WorkloadKind, SocketAddr>>,
+    /// Where each kind is served now, and why not.
+    serving: Arc<LocalServing>,
+    /// Held for the whole of a refresh: one at a time.
+    refreshing: tokio::sync::Mutex<()>,
     /// Each kind's last good answer, kept while a refresh of it fails.
     last: Mutex<HashMap<WorkloadKind, RecordedTraffic>>,
     /// What node 0 was last told about recording, to tell it only changes.
@@ -129,10 +198,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl LocalEgressRecorder {
-    /// A recorder that serves nothing until a source is added.
+    /// A recorder that serves nothing until a source is added. `serving` is
+    /// where it says which kinds it serves; give the same one to the
+    /// service ([`EgressRecordingService::set_local_serving`]).
     pub fn new(
         service: Arc<EgressRecordingService>,
         capability: Arc<dyn LocalCapability>,
+        serving: Arc<LocalServing>,
     ) -> Arc<Self> {
         Arc::new(Self {
             service,
@@ -140,7 +212,8 @@ impl LocalEgressRecorder {
             table: Arc::new(ArcSwap::from_pointee(EgressTable::default())),
             running: tokio::sync::OnceCell::new(),
             sources: Mutex::new(Vec::new()),
-            serving: Mutex::new(HashMap::new()),
+            serving,
+            refreshing: tokio::sync::Mutex::new(()),
             last: Mutex::new(HashMap::new()),
             reported: Mutex::new(None),
             wake: Notify::new(),
@@ -151,16 +224,26 @@ impl LocalEgressRecorder {
     /// source's address to exist, then listens there. On a host that
     /// cannot record, the source is told so at once.
     pub async fn add_source(self: &Arc<Self>, source: Arc<dyn LocalTraffic>) {
+        let kind = source.kind();
         if !cfg!(target_os = "linux") {
             info!(
                 os = std::env::consts::OS,
-                kind = %source.kind(),
+                %kind,
                 "egress recording: the control plane records only on Linux"
+            );
+            self.serving.set(
+                kind,
+                Err(format!(
+                    "the control plane records only on Linux, and this one runs {}",
+                    std::env::consts::OS
+                )),
             );
             source.stopped().await;
             return;
         }
         let Some(running) = self.running().await else {
+            self.serving
+                .set(kind, Err("the egress proxy could not be built".to_string()));
             source.stopped().await;
             return;
         };
@@ -213,7 +296,7 @@ impl LocalEgressRecorder {
 
     /// Where `kind` is served now, if it is.
     pub fn address(&self, kind: WorkloadKind) -> Option<SocketAddr> {
-        lock(&self.serving).get(&kind).copied()
+        self.serving.address(kind)
     }
 
     /// Asks for a refresh soon, without waiting for it.
@@ -221,23 +304,19 @@ impl LocalEgressRecorder {
         self.wake.notify_one();
     }
 
-    /// Notes where `kind` is served, or that it no longer is.
-    fn set_serving(&self, kind: WorkloadKind, address: Option<SocketAddr>) {
-        match address {
-            Some(address) => {
-                lock(&self.serving).insert(kind, address);
-            }
-            None => {
-                lock(&self.serving).remove(&kind);
-                lock(&self.last).remove(&kind);
-            }
+    /// Notes where `kind` is served, or why it no longer is.
+    fn set_serving(&self, kind: WorkloadKind, state: Result<SocketAddr, String>) {
+        if state.is_err() {
+            lock(&self.last).remove(&kind);
         }
+        self.serving.set(kind, state);
     }
 
     /// Tells node 0's capability report when the recorder starts or stops
-    /// serving anything at all.
+    /// serving anything at all; which kinds it serves is in
+    /// [`LocalServing`].
     fn report_capability(&self) {
-        let serving = !lock(&self.serving).is_empty();
+        let serving = self.serving.any();
         let mut reported = lock(&self.reported);
         if *reported != Some(serving) {
             *reported = Some(serving);
@@ -257,11 +336,16 @@ impl LocalEgressRecorder {
                         info!(%kind, "egress recording waits for this kind's network on this host");
                         waiting_logged = true;
                     }
+                    self.set_serving(
+                        kind,
+                        Err("its network does not exist on this host yet".to_string()),
+                    );
                     tokio::time::sleep(REFRESH_INTERVAL).await;
                     continue;
                 }
                 Err(error) => {
                     warn!(%kind, %error, "egress recording: could not find where to listen");
+                    self.set_serving(kind, Err(error));
                     tokio::time::sleep(REFRESH_INTERVAL).await;
                     continue;
                 }
@@ -273,7 +357,7 @@ impl LocalEgressRecorder {
                         .unwrap_or_else(|_| SocketAddr::new(host, RECORDING_PROXY_PORT));
                     // The table first, then the capability, then the
                     // source: nothing is steered here before it is known.
-                    self.set_serving(kind, Some(address));
+                    self.set_serving(kind, Ok(address));
                     self.refresh().await;
                     self.report_capability();
                     info!(%kind, %address, "egress recording proxy serving the control plane's workloads");
@@ -292,13 +376,20 @@ impl LocalEgressRecorder {
                         }
                     }
                     warn!(%kind, %address, "egress recording proxy stopped; restarting it");
-                    self.set_serving(kind, None);
+                    self.set_serving(
+                        kind,
+                        Err(format!(
+                            "its listener on {address} stopped and is restarting"
+                        )),
+                    );
                     self.report_capability();
-                    source.stopped().await;
                     self.refresh().await;
+                    source.stopped().await;
                 }
                 Err(error) => {
                     warn!(%kind, %error, "egress recording proxy could not start");
+                    self.set_serving(kind, Err(error));
+                    self.report_capability();
                     // Workloads stop handing traffic to a proxy that is
                     // not there, so they keep their way out.
                     source.stopped().await;
@@ -315,23 +406,33 @@ impl LocalEgressRecorder {
                 _ = self.wake.notified() => {}
             }
             self.refresh().await;
+            let sources: Vec<Arc<dyn LocalTraffic>> = lock(&self.sources).clone();
+            for source in sources {
+                if self.serving.address(source.kind()).is_some() {
+                    source.maintain().await;
+                }
+            }
         }
     }
 
     /// Rebuilds the table from every source that is being served. A source
     /// whose refresh fails keeps its last answer, so one failed read never
     /// drops its workloads from the table.
+    ///
+    /// One refresh at a time: a caller waits its turn, then reads the
+    /// sources and what is served as they are then, so a refresh that
+    /// started earlier can never replace the table after a later one.
     pub async fn refresh(&self) {
+        let _turn = self.refreshing.lock().await;
         let sources: Vec<Arc<dyn LocalTraffic>> = lock(&self.sources).clone();
-        let serving = lock(&self.serving).clone();
         let mut policies = Vec::new();
         let mut identities = IdentityMap::new();
         for source in sources {
             let kind = source.kind();
-            let Some(address) = serving.get(&kind) else {
+            let Some(address) = self.serving.address(kind) else {
                 continue;
             };
-            let traffic = match source.refresh(*address).await {
+            let traffic = match source.refresh(address).await {
                 Ok(traffic) => {
                     lock(&self.last).insert(kind, traffic.clone());
                     traffic
@@ -354,24 +455,17 @@ impl LocalEgressRecorder {
     }
 }
 
-/// A listener on `host`, on `port` unless it is taken, then on any free
-/// port, saying so.
+/// A listener on `host` and `port`, or why there is none. Never another
+/// port: a workload started with an address keeps it, so a listener that
+/// moved would strand it on the next restart.
 async fn bind(host: IpAddr, port: u16) -> Result<TcpListener, String> {
-    let preferred = SocketAddr::new(host, port);
-    match TcpListener::bind(preferred).await {
-        Ok(listener) => Ok(listener),
-        Err(error) => {
-            warn!(
-                address = %preferred,
-                %error,
-                "egress recording: the recorder's port is taken; listening on a free port, so \
-                 recorded workloads are re-pointed on every restart"
-            );
-            TcpListener::bind(SocketAddr::new(host, 0))
-                .await
-                .map_err(|e| format!("could not listen on {host}: {e}"))
-        }
-    }
+    let address = SocketAddr::new(host, port);
+    TcpListener::bind(address).await.map_err(|error| {
+        format!(
+            "it cannot listen on {address} ({error}); free port {port} on that address and \
+             it starts on its own"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -446,7 +540,7 @@ mod tests {
         let (service, _) = f.service();
         let capability = Arc::new(Capability::default());
         (
-            LocalEgressRecorder::new(service, capability.clone()),
+            LocalEgressRecorder::new(service, capability.clone(), LocalServing::new()),
             capability,
         )
     }
@@ -476,13 +570,13 @@ mod tests {
         recorder.refresh().await;
         assert_eq!(owner("172.30.0.5"), None, "nothing is served yet");
 
-        recorder.set_serving(WorkloadKind::Sandbox, Some(listening));
+        recorder.set_serving(WorkloadKind::Sandbox, Ok(listening));
         recorder.refresh().await;
         recorder.report_capability();
         assert_eq!(owner("172.30.0.5"), Some(WorkloadKind::Sandbox));
         assert_eq!(owner("172.18.0.9"), None);
 
-        recorder.set_serving(WorkloadKind::Deployment, Some(listening));
+        recorder.set_serving(WorkloadKind::Deployment, Ok(listening));
         recorder.refresh().await;
         recorder.report_capability();
         assert_eq!(owner("172.18.0.9"), Some(WorkloadKind::Deployment));
@@ -495,12 +589,12 @@ mod tests {
             "a failed refresh keeps the last answer"
         );
 
-        recorder.set_serving(WorkloadKind::Sandbox, None);
+        recorder.set_serving(WorkloadKind::Sandbox, Err("stopped".into()));
         recorder.refresh().await;
         recorder.report_capability();
         assert_eq!(owner("172.30.0.5"), None, "a kind no longer served is gone");
         assert_eq!(owner("172.18.0.9"), Some(WorkloadKind::Deployment));
-        recorder.set_serving(WorkloadKind::Deployment, None);
+        recorder.set_serving(WorkloadKind::Deployment, Err("stopped".into()));
         recorder.report_capability();
         assert_eq!(
             *capability.0.lock().unwrap(),
@@ -509,11 +603,11 @@ mod tests {
         );
     }
 
-    /// A listener keeps the recorder's port, so a restart keeps the address
-    /// recorded workloads carry; only when that port is taken does it take
-    /// a free one.
+    /// The recorder serves only its own port: when it is taken there is no
+    /// listener, and the reason says what to free. A workload started with
+    /// an address keeps it, so a listener that moved would strand it.
     #[tokio::test]
-    async fn a_listener_keeps_the_port_unless_it_is_taken() {
+    async fn a_taken_port_is_reported_not_replaced_by_another() {
         let loopback = IpAddr::from([127, 0, 0, 1]);
         let Ok(occupant) =
             std::net::TcpListener::bind(SocketAddr::new(loopback, RECORDING_PROXY_PORT))
@@ -521,15 +615,131 @@ mod tests {
             eprintln!("port {RECORDING_PROXY_PORT} is in use on this host; skipping");
             return;
         };
-        let taken = bind(loopback, RECORDING_PROXY_PORT).await.expect("bind");
-        assert_ne!(taken.local_addr().unwrap().port(), RECORDING_PROXY_PORT);
-        drop(taken);
+        let reason = bind(loopback, RECORDING_PROXY_PORT)
+            .await
+            .expect_err("the port is taken");
+        assert!(
+            reason.contains("127.0.0.1:13128") && reason.contains("free port 13128"),
+            "{reason}"
+        );
         drop(occupant);
 
         let free = bind(loopback, RECORDING_PROXY_PORT).await.expect("bind");
         assert_eq!(
             free.local_addr().unwrap(),
             SocketAddr::new(loopback, RECORDING_PROXY_PORT)
+        );
+    }
+
+    /// Which kinds are served, and why one is not: what the service reports
+    /// for node 0, kind by kind.
+    #[test]
+    fn serving_is_known_kind_by_kind_with_a_reason() {
+        let serving = LocalServing::new();
+        let address: SocketAddr = "172.30.0.1:13128".parse().unwrap();
+        assert!(!serving.any());
+        assert_eq!(
+            serving.not_serving(WorkloadKind::Deployment).as_deref(),
+            Some("its listener has not started on this host")
+        );
+        serving.set(WorkloadKind::Sandbox, Ok(address));
+        serving.set(
+            WorkloadKind::Deployment,
+            Err("it cannot listen on 172.18.0.1:13128".into()),
+        );
+        assert!(serving.any());
+        assert_eq!(serving.address(WorkloadKind::Sandbox), Some(address));
+        assert_eq!(serving.not_serving(WorkloadKind::Sandbox), None);
+        assert_eq!(serving.address(WorkloadKind::Deployment), None);
+        assert_eq!(
+            serving.not_serving(WorkloadKind::Deployment).as_deref(),
+            Some("it cannot listen on 172.18.0.1:13128")
+        );
+    }
+
+    /// A source whose answer is read when its refresh starts and handed
+    /// back only when the gate opens: a slow container list.
+    struct SlowSource {
+        generation: std::sync::atomic::AtomicU32,
+        calls: std::sync::atomic::AtomicU32,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl LocalTraffic for SlowSource {
+        fn kind(&self) -> WorkloadKind {
+            WorkloadKind::Sandbox
+        }
+
+        async fn listen_address(&self) -> Result<Option<IpAddr>, String> {
+            Ok(None)
+        }
+
+        async fn refresh(&self, _address: SocketAddr) -> Result<RecordedTraffic, String> {
+            let generation = self.generation.load(Ordering::SeqCst);
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            if first {
+                // Held until the test lets the first refresh finish.
+                let _permit = self.gate.acquire().await.map_err(|e| e.to_string())?;
+            }
+            let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(generation));
+            Ok(RecordedTraffic {
+                policies: vec![EgressPolicy {
+                    subject,
+                    rules: Vec::new(),
+                    record: true,
+                    public_only: true,
+                }],
+                identities: IdentityMap::new().with(subject, "172.30.0.5".parse().unwrap()),
+            })
+        }
+    }
+
+    /// A refresh that started before a change and finishes after a refresh
+    /// that saw the change must not put the old table back: refreshes take
+    /// turns, and each reads its sources when its turn comes.
+    #[tokio::test]
+    async fn an_older_refresh_never_replaces_a_newer_table() {
+        let Some(f) = fixture().await else { return };
+        let (recorder, _) = recorder(&f);
+        let source = Arc::new(SlowSource {
+            generation: std::sync::atomic::AtomicU32::new(1),
+            calls: std::sync::atomic::AtomicU32::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        lock(&recorder.sources).push(source.clone());
+        recorder.set_serving(
+            WorkloadKind::Sandbox,
+            Ok("127.0.0.1:13128".parse().unwrap()),
+        );
+
+        let older = {
+            let recorder = recorder.clone();
+            tokio::spawn(async move { recorder.refresh().await })
+        };
+        while source.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // The change lands while the older refresh is still reading.
+        source.generation.store(2, Ordering::SeqCst);
+        let newer = {
+            let recorder = recorder.clone();
+            tokio::spawn(async move { recorder.refresh().await })
+        };
+        tokio::task::yield_now().await;
+        source.gate.add_permits(1);
+        older.await.unwrap();
+        newer.await.unwrap();
+
+        let owner = recorder
+            .table
+            .load()
+            .lookup("172.30.0.5".parse().unwrap())
+            .map(|rules| rules.workload);
+        assert_eq!(
+            owner,
+            Some(WorkloadRef::new(WorkloadKind::Sandbox, 2)),
+            "the table is the newer refresh's"
         );
     }
 }

@@ -63,8 +63,18 @@ pub fn validate(record: &ConnectionRecord) -> Result<(), String> {
                 host.len()
             ));
         }
-        if host.chars().any(|c| c.is_control() || c.is_whitespace()) {
-            return Err("host contains control or whitespace characters".to_string());
+        // A hostname or an address literal, nothing else: a query, a
+        // fragment or credentials that reached the host would otherwise be
+        // stored as the destination.
+        if !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+        {
+            return Err(
+                "host carries characters no hostname or address has (a query, a fragment, \
+                 credentials, whitespace or control characters)"
+                    .to_string(),
+            );
         }
     }
     if let Some(method) = &record.method {
@@ -442,6 +452,17 @@ mod tests {
     #[test]
     fn records_outside_the_proxy_bounds_are_invalid() {
         assert!(validate(&tunnel()).is_ok());
+        for host in [
+            "93.184.216.34",
+            "2606:4700::1111",
+            "under_score.example.com",
+        ] {
+            let record = ConnectionRecord {
+                host: Some(host.into()),
+                ..tunnel()
+            };
+            assert!(validate(&record).is_ok(), "{host}");
+        }
         let bad = [
             ConnectionRecord {
                 host: Some("a".repeat(300)),
@@ -449,6 +470,18 @@ mod tests {
             },
             ConnectionRecord {
                 host: Some("evil host".into()),
+                ..tunnel()
+            },
+            ConnectionRecord {
+                host: Some("api.example.com?token=secret".into()),
+                ..tunnel()
+            },
+            ConnectionRecord {
+                host: Some("user:pass@api.example.com".into()),
+                ..tunnel()
+            },
+            ConnectionRecord {
+                host: Some("api.example.com#frag".into()),
                 ..tunnel()
             },
             ConnectionRecord {

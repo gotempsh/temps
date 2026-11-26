@@ -95,6 +95,23 @@ traffic source: where on the host its workloads reach the proxy, which
 workloads record and under what policy, and what to do when the proxy starts
 or stops serving it.
 
+- **Per kind, not per node.** Each kind has its own listener, and node 0 is
+  reported able to record a kind only while that kind's listener serves. One
+  kind's listener being up says nothing about another's.
+- **A fixed port.** A listener uses port 13128 or does not start, saying
+  what to free: workloads carry the address, and one started with a
+  different port would be stranded by the next restart.
+- **One refresh at a time.** A refresh rebuilds the whole table, so
+  refreshes take turns and each reads its sources when its turn comes; an
+  older one can never put back what a newer one removed.
+- **What the kind cannot route is refused, not accepted.** A workload whose
+  traffic nothing steers to the proxy (a sandbox on a microVM backend, a
+  Compose environment) cannot turn recording on, and its status says why.
+- **Policy changes reach the proxy before they are reported done.** A
+  recorded sandbox's new policy refreshes the proxy within the update, and
+  re-pointing a sidecar takes the same claim the policy update takes, so it
+  always applies the policy stored last.
+
 How traffic reaches the proxy is the one part that really differs:
 
 - **Sandboxes** have no other way out. Their sidecar hands recorded traffic
@@ -113,7 +130,10 @@ How traffic reaches the proxy is the one part that really differs:
     proxy being up, including across a control-plane restart;
   - only replicas on the control plane are recorded until worker agents
     serve the proxy, and only replicas of image deployments: a Compose
-    stack's containers are not steered;
+    environment cannot turn recording on;
+  - a first deployment's replicas are let through unrecorded until the
+    deployment is marked complete and the database places them on the node;
+    later replicas of a placed environment are recorded from the start;
   - the proxy knows a caller by the address Docker gave its container, so
     the deploy path announces a new replica to the recorder as soon as it is
     created. A connection made in the instant before that is refused.

@@ -167,6 +167,7 @@ pub(crate) async fn fixture() -> Option<Fixture> {
                 nodes,
                 enabled: false,
                 live: true,
+                unrecordable: None,
             },
         );
     }
@@ -902,4 +903,146 @@ async fn the_node_endpoint_takes_batches_only_with_the_node_token() {
     let accepted = post(Some(NODE_TOKEN), body).await.unwrap();
     assert_eq!(accepted.status(), StatusCode::OK);
     assert_eq!(store.0.lock().unwrap().len(), 1);
+}
+
+/// Node 0 records only the kinds this host's recorder serves: a node-wide
+/// "can record" says nothing about a kind whose listener could not start.
+#[tokio::test]
+async fn the_control_plane_records_only_the_kinds_its_recorder_serves() {
+    let Some(f) = fixture().await else { return };
+    let (service, _) = f.service();
+    let serving = crate::local::LocalServing::new();
+    service.set_local_serving(serving.clone());
+
+    let status = service.status(&f.row(ON_CONTROL_PLANE)).await.unwrap();
+    assert!(!status.configured, "{status:?}");
+    assert_eq!(status.reason_code.as_deref(), Some("kind_not_served"));
+    assert!(
+        status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("does not serve boxs") && r.contains("not started")),
+        "{status:?}"
+    );
+    assert_eq!(
+        status.nodes[0].reason_code.as_deref(),
+        Some("kind_not_served")
+    );
+    let refused = service
+        .set_enabled(&f.row(ON_CONTROL_PLANE), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            EgressRecordingError::Unavailable {
+                code: "kind_not_served",
+                node_id: CONTROL_PLANE_NODE_ID,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(!f.row(ON_CONTROL_PLANE).enabled, "nothing was written");
+
+    // A worker is not this host: its own report decides.
+    assert!(service.status(&f.row(ON_WORKER)).await.unwrap().configured);
+
+    serving.set_for_tests(KIND, Ok("127.0.0.1:13128".parse().unwrap()));
+    let status = service.status(&f.row(ON_CONTROL_PLANE)).await.unwrap();
+    assert!(status.configured, "{status:?}");
+    service
+        .set_enabled(&f.row(ON_CONTROL_PLANE), true)
+        .await
+        .unwrap();
+}
+
+/// A workload nothing routes to a recorder is refused with the kind's own
+/// reason, wherever it runs, and says so in its status.
+#[tokio::test]
+async fn a_workload_the_recorder_cannot_see_cannot_record() {
+    let Some(f) = fixture().await else { return };
+    let (service, _) = f.service();
+    let reason = "boxes on the vm backend have no route to the egress proxy";
+    f.adapter
+        .rows
+        .lock()
+        .unwrap()
+        .get_mut(&ON_WORKER)
+        .unwrap()
+        .unrecordable = Some(reason.to_string());
+    let status = service.status(&f.row(ON_WORKER)).await.unwrap();
+    assert!(!status.configured);
+    assert_eq!(status.reason_code.as_deref(), Some("not_recordable"));
+    assert_eq!(status.reason.as_deref(), Some(reason));
+    let refused = service
+        .set_enabled(&f.row(ON_WORKER), true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, EgressRecordingError::NotRecordable { noun: "box", reason: r, .. } if r == reason),
+        "{refused:?}"
+    );
+    assert!(!f.row(ON_WORKER).enabled);
+    // Turning it off is never refused.
+    service.set_enabled(&f.row(ON_WORKER), false).await.unwrap();
+}
+
+/// Everything the answer needs is read before the change is written: when
+/// that read fails, the request fails and recording is left as it was, so
+/// no change is ever committed behind an error the audit log never sees.
+#[tokio::test]
+async fn a_failed_status_read_leaves_recording_unchanged() {
+    let Some(f) = fixture().await else { return };
+    let (service, _) = f.service();
+    service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
+    assert!(f.row(ON_WORKER).enabled);
+    f.adapter.changed.lock().unwrap().clear();
+
+    // The project lookup the answer needs now fails.
+    f.db.connection()
+        .execute_unprepared("ALTER TABLE projects RENAME TO projects_unavailable")
+        .await
+        .unwrap();
+    let error = service
+        .set_enabled(&f.row(ON_WORKER), false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, EgressRecordingError::Database { .. }),
+        "{error:?}"
+    );
+    assert!(f.row(ON_WORKER).enabled, "the change was not written");
+    assert!(
+        f.adapter.changed.lock().unwrap().is_empty(),
+        "nothing was steered"
+    );
+}
+
+/// A page past what a database offset can address is empty, with the real
+/// total, instead of an error from a negative offset.
+#[tokio::test]
+async fn a_page_past_any_offset_is_empty_not_an_error() {
+    let Some(f) = fixture().await else { return };
+    let service = f.service_with_otel();
+    service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
+    service
+        .ingest(
+            f.worker_a,
+            batch(vec![record(
+                ON_WORKER,
+                "api.example.com",
+                ConnectionOutcome::Allowed,
+            )]),
+        )
+        .await
+        .unwrap();
+    for page in [u64::MAX, u64::MAX / 20 + 2] {
+        let result = service
+            .activity(&f.row(ON_WORKER), Some(page), None, None)
+            .await
+            .unwrap();
+        assert!(result.records.is_empty() && !result.has_more, "{page}");
+        assert_eq!(result.total, 1, "{page}");
+    }
 }

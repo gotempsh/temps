@@ -552,6 +552,15 @@ async fn wire_egress_recording(context: &PluginContext) {
         recorder: recorder.clone(),
         traffic: traffic.clone(),
     });
+    // A recorded sandbox's new policy reaches the recorder before the
+    // policy update answers.
+    if let Some(service) = context.get_service::<SandboxService>() {
+        service.set_egress_observer(Arc::new(
+            crate::services::egress_recording::RecorderPolicyRefresh {
+                recorder: recorder.clone(),
+            },
+        ));
+    }
     recorder.add_source(traffic).await;
 }
 

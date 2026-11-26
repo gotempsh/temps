@@ -62,6 +62,15 @@ impl From<EgressRecordingError> for Problem {
                 .with_value("node_id", *node_id)
                 .with_value("node_name", node_name.clone())
                 .with_value("reason_code", code.to_string()),
+            EgressRecordingError::NotRecordable { noun, id, .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/egress-recording-unavailable")
+                    .with_title("Egress Recording Unavailable For This Workload")
+                    .with_detail(detail)
+                    .with_value("workload", noun.to_string())
+                    .with_value("workload_id", id.clone())
+                    .with_value("reason_code", crate::service::NOT_RECORDABLE)
+            }
             EgressRecordingError::OtelUnavailable { noun, id } => {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_type("https://temps.sh/probs/egress-recording-unavailable")

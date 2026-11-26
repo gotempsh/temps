@@ -119,7 +119,9 @@ pub async fn get_environment_egress_recording(
 /// stay direct. While it is on, the environment's outbound HTTP(S) depends
 /// on the node's egress proxy being up. Turning it on fails with 422 when
 /// no node the environment runs on can record, naming the environment, the
-/// node and what is missing.
+/// node and what is missing, or when it is a Docker Compose environment,
+/// whose containers are never sent through the proxy (`reason_code` is then
+/// `not_recordable`).
 #[utoipa::path(
     tag = "Environments",
     put,
@@ -135,7 +137,7 @@ pub async fn get_environment_egress_recording(
         (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 404, description = "Environment not found", body = temps_core::problemdetails::ProblemDetails),
-        (status = 422, description = "Recording cannot work for this environment: no node it runs on can record", body = temps_core::problemdetails::ProblemDetails),
+        (status = 422, description = "Recording cannot work for this environment: no node it runs on can record, or it is a Compose environment", body = temps_core::problemdetails::ProblemDetails),
         (status = 503, description = "OpenTelemetry storage is not enabled", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
     ),

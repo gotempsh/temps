@@ -173,9 +173,43 @@ fn an_unrelated_cidr_allow_does_not_open_public_literals() {
         Err(Refusal::NotAllowed)
     );
     assert_eq!(
-        rules.check_addresses(&[inside, public], 443, Admission::ByAddress),
+        rules.admissible_addresses(&[public, inside], 443, Admission::ByAddress),
+        Ok(vec![inside]),
+        "only the answer inside an allowed CIDR is connected to, as the sidecar does"
+    );
+    assert_eq!(
+        rules.admissible_addresses(&[public], 443, Admission::ByAddress),
         Err(Refusal::NotAllowed),
-        "one answer outside the allowed CIDRs refuses the whole name"
+        "no answer inside an allowed CIDR refuses the name"
+    );
+}
+
+/// A sandbox's own policy (public addresses only) with a CIDR rule, where
+/// the name resolves to two public addresses and only one is inside it: the
+/// sidecar connects to that one, and so must the proxy that records it.
+#[test]
+fn recording_admits_what_the_sidecar_admits_for_a_cidr_rule() {
+    let rules = CompiledRules::new(&EgressPolicy {
+        subject: sandbox(1),
+        rules: vec![cidr_rule(1, "93.184.216.0/24", Some(443), Action::Allow)],
+        record: true,
+        public_only: true,
+    });
+    let inside: IpAddr = "93.184.216.34".parse().unwrap();
+    let outside: IpAddr = "8.8.8.8".parse().unwrap();
+    let admission = rules.check_host("svc.example.net", 443).unwrap();
+    assert_eq!(admission, Admission::ByAddress);
+    for answers in [[inside, outside], [outside, inside]] {
+        assert_eq!(
+            rules.admissible_addresses(&answers, 443, admission),
+            Ok(vec![inside]),
+            "{answers:?}"
+        );
+    }
+    // One private answer still refuses the whole name.
+    assert_eq!(
+        rules.admissible_addresses(&[inside, "10.0.0.5".parse().unwrap()], 443, admission),
+        Err(Refusal::Private)
     );
 }
 
@@ -232,6 +266,45 @@ fn the_public_check_matches_the_sidecar() {
         "::ffff:1.1.1.1",
     ] {
         assert!(is_public(public.parse().unwrap()), "{public}");
+    }
+}
+
+/// The authority of an absolute URL ends at the first `/`, `?` or `#`: a
+/// query on a host-only URL is a query, forwarded as the request's own and
+/// never read as part of the host, which is what gets recorded.
+#[test]
+fn a_query_on_a_host_only_url_is_never_part_of_the_host() {
+    for (target, path) in [
+        ("http://example.test?token=abc123", "/?token=abc123"),
+        ("http://example.test:8080?token=abc123", "/?token=abc123"),
+        ("http://example.test#frag", "/"),
+        ("http://example.test/a?b=1#frag", "/a?b=1"),
+        ("http://example.test", "/"),
+    ] {
+        let head = format!("GET {target} HTTP/1.1\r\nHost: example.test\r\n\r\n");
+        let parsed = parse_request(head.as_bytes()).unwrap();
+        let RequestKind::Forward {
+            host, path: got, ..
+        } = parsed.kind
+        else {
+            panic!("{target}: {:?}", parsed.kind);
+        };
+        assert_eq!(host, "example.test", "{target}");
+        assert_eq!(got, path, "{target}");
+        assert!(!record::recorded_path(&got).contains("token"), "{target}");
+    }
+    // Nothing that is not a hostname or an address is ever a host.
+    for target in [
+        "http://exa mple.test/",
+        "http://example.test;x=1/",
+        "http://exa%41mple/",
+    ] {
+        let head = format!("GET {target} HTTP/1.1\r\n\r\n");
+        let parsed = parse_request(head.as_bytes());
+        assert!(
+            !matches!(parsed.map(|p| p.kind), Some(RequestKind::Forward { .. })),
+            "{target}"
+        );
     }
 }
 

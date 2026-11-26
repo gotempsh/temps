@@ -31,6 +31,11 @@ pub struct RecordedWorkload {
     pub enabled: bool,
     /// `false` once it is destroyed or deleted: nothing is recorded for it.
     pub live: bool,
+    /// Why no recorder can see this workload's traffic, whatever its node
+    /// can do: it runs on a backend or is deployed in a way nothing steers
+    /// to the egress proxy. `None` when it can be recorded. Turning
+    /// recording on is refused with this reason.
+    pub unrecordable: Option<String>,
 }
 
 /// One workload kind's side of recording.

@@ -304,16 +304,44 @@ impl CompiledRules {
         Ok(Admission::ByRule)
     }
 
-    /// Whether every resolved address may be connected to.
+    /// Whether the resolved addresses may be connected to: `Ok` when
+    /// [`CompiledRules::admissible_addresses`] leaves at least one.
     pub fn check_addresses(
         &self,
         addrs: &[IpAddr],
         port: u16,
         admission: Admission,
     ) -> Result<(), Refusal> {
+        self.admissible_addresses(addrs, port, admission)
+            .map(|_| ())
+    }
+
+    /// The resolved addresses that may be connected to, in their order.
+    ///
+    /// - With `public_only`, one non-public answer refuses the whole name
+    ///   (the DNS-rebinding fallback), as does an answer inside a denied
+    ///   CIDR, whatever the admission.
+    /// - [`Admission::ByRule`]: an allow rule named the destination, so
+    ///   every answer must be public or inside an allowed CIDR, and all of
+    ///   them are admissible.
+    /// - [`Admission::ByAddress`]: no rule named the hostname, so only the
+    ///   answers inside an allowed CIDR on this port are admissible, and the
+    ///   name is refused only when none is. This is the sandbox sidecar's
+    ///   decision too: it connects to the first answer a CIDR rule allows,
+    ///   so recording a sandbox never changes what it may reach.
+    ///
+    /// The proxy connects to an address from this list, never to one it did
+    /// not check.
+    pub fn admissible_addresses(
+        &self,
+        addrs: &[IpAddr],
+        port: u16,
+        admission: Admission,
+    ) -> Result<Vec<IpAddr>, Refusal> {
         if addrs.is_empty() {
             return Err(Refusal::Unresolved);
         }
+        let mut admissible = Vec::with_capacity(addrs.len());
         for &addr in addrs {
             let addr = unmap(addr);
             if self.public_only && !is_public(addr) {
@@ -327,16 +355,19 @@ impl CompiledRules {
                 return Err(Refusal::Denied);
             }
             if self.allow.iter().any(|r| in_cidr(&r)) {
+                admissible.push(addr);
                 continue;
             }
-            if admission == Admission::ByAddress {
-                return Err(Refusal::NotAllowed);
-            }
-            if !is_public(addr) {
-                return Err(Refusal::Private);
+            match admission {
+                Admission::ByAddress => {}
+                Admission::ByRule if is_public(addr) => admissible.push(addr),
+                Admission::ByRule => return Err(Refusal::Private),
             }
         }
-        Ok(())
+        if admissible.is_empty() {
+            return Err(Refusal::NotAllowed);
+        }
+        Ok(admissible)
     }
 }
 
@@ -1029,8 +1060,8 @@ impl EgressProxy {
                 }
             }
         };
-        rules
-            .check_addresses(&addrs, port, admission)
+        let addrs = rules
+            .admissible_addresses(&addrs, port, admission)
             .map_err(refuse)?;
         let target = addrs
             .iter()
@@ -1304,19 +1335,25 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
         let (host, port) = split_authority(target, 443)?;
         RequestKind::Connect { host, port }
     } else if let Some(rest) = target.strip_prefix("http://") {
-        let (authority, path) = match rest.find('/') {
+        // The authority ends at the first `/`, `?` or `#` (RFC 3986 3.2), so
+        // a query on a host-only URL (`http://host?token=…`) is never read
+        // as part of the host, where it would be recorded as the
+        // destination. The fragment is never sent.
+        let (authority, rest) = match rest.find(['/', '?', '#']) {
             Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
+            None => (rest, ""),
+        };
+        let rest = rest.split('#').next().unwrap_or_default();
+        let path = if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
         };
         if authority.contains('@') {
             RequestKind::Refused(EgressReason::CredentialsInUrl)
         } else {
             let (host, port) = split_authority(authority, 80)?;
-            RequestKind::Forward {
-                host,
-                port,
-                path: path.to_string(),
-            }
+            RequestKind::Forward { host, port, path }
         }
     } else if target.starts_with("/.temps/") {
         match relay_target(&method, target) {
@@ -1361,7 +1398,14 @@ fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> 
             None => (authority, default_port),
         }
     };
-    if host.is_empty() || port == 0 {
+    // A hostname or an address literal, nothing else: anything that would
+    // make a credential or a query part of the host is not a destination.
+    if host.is_empty()
+        || port == 0
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+    {
         return None;
     }
     Some((host.trim_end_matches('.').to_ascii_lowercase(), port))

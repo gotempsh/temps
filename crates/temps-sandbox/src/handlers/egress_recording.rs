@@ -78,7 +78,9 @@ pub async fn get_egress_recording(
 /// plain HTTP), outcome and refusal reason, bytes each way and duration.
 /// Never headers, bodies or query strings. Off by default. A sandbox needs
 /// no project to record. Turning it on fails with 422 when its node cannot
-/// record, naming the sandbox, the node and what is missing.
+/// record, naming the sandbox, the node and what is missing, or when the
+/// sandbox runs on a backend the recorder cannot see (only Docker sandboxes
+/// record; `reason_code` is then `not_recordable`).
 #[utoipa::path(
     tag = "Sandboxes",
     put,
@@ -91,7 +93,7 @@ pub async fn get_egress_recording(
         (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
         (status = 404, description = "Sandbox not found", body = temps_core::problemdetails::ProblemDetails),
-        (status = 422, description = "Recording cannot work for this sandbox: its node cannot record", body = temps_core::problemdetails::ProblemDetails),
+        (status = 422, description = "Recording cannot work for this sandbox: its node cannot record, or its backend has no route to the recorder", body = temps_core::problemdetails::ProblemDetails),
         (status = 503, description = "OpenTelemetry storage is not enabled", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
     ),
