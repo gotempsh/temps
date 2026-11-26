@@ -2033,6 +2033,7 @@ impl BackupCommand {
                 source_config: service_config,
                 pool: db,
                 gate: &temps_providers::externalsvc::NoopRestoreGate,
+                restored_login: temps_providers::externalsvc::RestoredLogin::AsConfigured,
             };
             service
                 .restore_in_place(restore_context)

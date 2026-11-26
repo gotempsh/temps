@@ -553,6 +553,7 @@ impl PostgresService {
         live_target_config: &ServiceConfig,
         recovery_target: Option<&crate::externalsvc::RecoveryTarget>,
         target_user_data: Option<&str>,
+        restored_login: crate::externalsvc::RestoredLogin,
         gate: &dyn crate::externalsvc::RestoreGate,
     ) -> Result<()> {
         self.restore_from_walg(
@@ -562,6 +563,7 @@ impl PostgresService {
             Some(live_target_config),
             recovery_target,
             target_user_data,
+            restored_login,
             gate,
         )
         .await
@@ -580,6 +582,7 @@ impl PostgresService {
         live_target_config: Option<&ServiceConfig>,
         recovery_target: Option<&crate::externalsvc::RecoveryTarget>,
         target_user_data: Option<&str>,
+        restored_login: crate::externalsvc::RestoredLogin,
         gate: &dyn crate::externalsvc::RestoreGate,
     ) -> Result<()> {
         use bollard::exec::CreateExecOptions;
@@ -969,7 +972,12 @@ impl PostgresService {
             // backup explicitly restores the pinned write destination and
             // verifies active archiving before it can succeed.
             Ok(()) => match self
-                .start_restored(&container_name, &swap_recreate, &postgres_config)
+                .start_restored(
+                    &container_name,
+                    &swap_recreate,
+                    &postgres_config,
+                    restored_login,
+                )
                 .await
             {
                 Ok(()) => None,

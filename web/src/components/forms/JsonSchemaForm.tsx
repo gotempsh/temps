@@ -28,6 +28,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { customAlphabet } from 'nanoid'
 import { ChevronDown, Eye, EyeOff, Loader2, Sparkles } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { type FieldErrors, useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import * as z from 'zod'
@@ -96,6 +97,16 @@ interface JsonSchemaFormProps {
    * even when their current override value is undefined/empty.
    */
   presetOwnedFields?: string[]
+  /**
+   * Every field goes into the collapsed advanced section, so the form asks for
+   * nothing up front and submits the schema defaults unless the user opens it.
+   * Requires `serviceType` (grouping); the groups keep their headings inside.
+   */
+  allFieldsAdvanced?: boolean
+  /** Rendered first inside the advanced section (e.g. placement controls). */
+  advancedContent?: ReactNode
+  /** The advanced section's title. */
+  advancedLabel?: string
 }
 
 /** Acronyms that should stay uppercase when humanizing snake_case field names. */
@@ -195,7 +206,7 @@ const GROUP_LABELS: Record<FieldGroup, string> = {
   basic: 'Basic',
   connection: 'Connection',
   credentials: 'Credentials',
-  advanced: 'Advanced',
+  advanced: 'Other',
 }
 
 /** nanoid alphabet for passwords: letters + digits, no ambiguous chars. */
@@ -240,6 +251,9 @@ export function JsonSchemaForm({
   managedByTemps = false,
   fieldOverrides,
   presetOwnedFields,
+  allFieldsAdvanced = false,
+  advancedContent,
+  advancedLabel = 'Advanced configuration',
 }: JsonSchemaFormProps) {
   const ownedFields = useMemo(
     () => presetOwnedFields ?? Object.keys(fieldOverrides ?? {}),
@@ -392,6 +406,19 @@ export function JsonSchemaForm({
       return
     }
 
+    // A field the user cannot see does not explain the refusal: open the
+    // collapsed section that holds it.
+    const collapsedFailures = fieldNames.filter(
+      (name) =>
+        allFieldsAdvanced ||
+        resolveGroup(name, serviceType, managedByTemps) === 'advanced'
+    )
+    if (collapsedFailures.length > 0 && !advancedOpen) {
+      // The fields mount when the section opens; validate them again once
+      // they have, so their messages show.
+      flushSync(() => setAdvancedOpen(true))
+      void form.trigger(collapsedFailures as (keyof FormValues)[])
+    }
     toast.error('Check the highlighted fields before creating this service')
   }
 
@@ -626,8 +653,20 @@ export function JsonSchemaForm({
   })
 
   const useGrouping = !!serviceType
-  const hasAdvanced = grouped.advanced.length > 0
   const nonAdvancedGroups: FieldGroup[] = ['basic', 'connection', 'credentials']
+  // Groups shown up front, and those inside the collapsed section.
+  const upfrontGroups = allFieldsAdvanced ? [] : nonAdvancedGroups
+  const collapsedGroups: FieldGroup[] = allFieldsAdvanced
+    ? [...nonAdvancedGroups, 'advanced']
+    : ['advanced']
+  const collapsedFieldCount = collapsedGroups.reduce(
+    (count, group) => count + grouped[group].length,
+    0
+  )
+  const hasAdvanced = collapsedFieldCount > 0 || !!advancedContent
+  const visibleCollapsedGroups = collapsedGroups.filter(
+    (group) => grouped[group].length > 0
+  )
 
   return (
     <Form {...form}>
@@ -637,14 +676,14 @@ export function JsonSchemaForm({
       >
         {useGrouping ? (
           <>
-            {nonAdvancedGroups.map((group) => {
+            {upfrontGroups.map((group) => {
               const names = grouped[group]
               if (names.length === 0) return null
               return (
                 <section key={group} className="space-y-4">
                   {/* Only show the group header when there are multiple visible groups */}
-                  {nonAdvancedGroups.filter((g) => grouped[g].length > 0)
-                    .length > 1 && (
+                  {upfrontGroups.filter((g) => grouped[g].length > 0).length >
+                    1 && (
                     <h3 className="text-sm font-medium text-muted-foreground">
                       {GROUP_LABELS[group]}
                     </h3>
@@ -662,11 +701,13 @@ export function JsonSchemaForm({
                     className="flex w-full items-center justify-between rounded-md border bg-muted/30 px-4 py-3 text-sm font-medium hover:bg-muted/50 transition-colors"
                   >
                     <span className="flex items-center gap-2">
-                      Advanced configuration
-                      <span className="text-xs font-normal text-muted-foreground">
-                        {grouped.advanced.length} field
-                        {grouped.advanced.length === 1 ? '' : 's'}
-                      </span>
+                      {advancedLabel}
+                      {collapsedFieldCount > 0 && !advancedContent && (
+                        <span className="text-xs font-normal text-muted-foreground">
+                          {collapsedFieldCount} field
+                          {collapsedFieldCount === 1 ? '' : 's'}
+                        </span>
+                      )}
                     </span>
                     <ChevronDown
                       className={`h-4 w-4 transition-transform ${
@@ -677,7 +718,19 @@ export function JsonSchemaForm({
                 </CollapsibleTrigger>
                 <CollapsibleContent className="pt-4">
                   <div className="space-y-6 border-l-2 border-muted pl-4">
-                    {renderFieldList(grouped.advanced)}
+                    {advancedContent}
+                    {visibleCollapsedGroups.map((group) => (
+                      <section key={group} className="space-y-4">
+                        {visibleCollapsedGroups.length > 1 && (
+                          <h3 className="text-sm font-medium text-muted-foreground">
+                            {GROUP_LABELS[group]}
+                          </h3>
+                        )}
+                        <div className="space-y-6">
+                          {renderFieldList(grouped[group])}
+                        </div>
+                      </section>
+                    ))}
                   </div>
                 </CollapsibleContent>
               </Collapsible>

@@ -72,6 +72,12 @@ pub struct Model {
     /// serialized nor debug-printed: it is a credential, sealed or not.
     #[serde(skip_serializing, default)]
     pub restored_login_encrypted: Option<String>,
+    /// The databases and login roles the restore brought back, read from the
+    /// target right after a PostgreSQL restore completed:
+    /// `{"databases": [..], "roles": [{"name": .., "superuser": ..}]}`.
+    /// Names only. `NULL` for other engines, runs that predate the column,
+    /// and when the list could not be read.
+    pub restored_inventory: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for Model {
@@ -102,6 +108,7 @@ impl std::fmt::Debug for Model {
                 "has_restored_login",
                 &self.restored_login_encrypted.is_some(),
             )
+            .field("restored_inventory", &self.restored_inventory)
             .finish()
     }
 }
@@ -197,6 +204,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: Some(SEALED.into()),
+            restored_inventory: None,
         }
     }
 

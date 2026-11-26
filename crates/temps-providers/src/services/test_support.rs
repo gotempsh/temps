@@ -322,7 +322,7 @@ pub(super) fn encrypted_service_model(
     }
 }
 
-pub(super) fn environment_preview_project(id: i32) -> projects::Model {
+pub(crate) fn environment_preview_project(id: i32) -> projects::Model {
     let now = Utc::now();
     projects::Model {
         id,

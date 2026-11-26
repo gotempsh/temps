@@ -228,6 +228,17 @@ pub struct ExternalServiceProjectLinkedAudit {
     pub custom_database_name: Option<String>,
 }
 
+/// A link now gives its project's apps another database.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceProjectDatabaseChangedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub project_id: i32,
+    pub database_provisioning_mode: crate::services::DatabaseProvisioningMode,
+    pub custom_database_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceProjectUnlinkedAudit {
     pub context: AuditContext,
@@ -598,6 +609,28 @@ impl AuditOperation for ExternalServiceStatusChangedAudit {
 impl AuditOperation for ExternalServiceProjectLinkedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_PROJECT_LINKED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for ExternalServiceProjectDatabaseChangedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_PROJECT_DATABASE_CHANGED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

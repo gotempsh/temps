@@ -776,6 +776,7 @@ pub async fn mongodb_restore_on_node(
             live_target_config: request.service_config,
             pool: &pool,
             gate: writes.as_ref(),
+            restored_login: crate::externalsvc::RestoredLogin::AsConfigured,
         })
         .await;
     match result {

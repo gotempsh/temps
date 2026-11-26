@@ -15,6 +15,7 @@ mod lifecycle;
 mod node_recreate;
 mod restore;
 mod restore_swap;
+mod restored_login;
 pub mod sandbox;
 mod service_impl;
 mod walg;

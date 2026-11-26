@@ -538,6 +538,9 @@ sha2-rsa = { package = "sha2", version = "0.10", features = ["oid"] }
 sha2_010 = { package = "sha2", version = "0.10.9" }
 shlex = "2.0"
 sourcemap = "9"
+# SASLprep (RFC 4013) for SCRAM verifiers of non-ASCII passwords; already in
+# the tree through the PostgreSQL client crates.
+stringprep = "0.1.5"
 subtle = "2.6.1"
 temp-dir = "0.2"
 temps-agent-runtime = { git = "https://github.com/gotempsh/agent-runtime-sdk.git", rev = "ac661d29974eb020f3bd7bd1a286445d5cb820cd" }
