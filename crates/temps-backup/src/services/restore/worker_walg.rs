@@ -220,24 +220,27 @@ async fn archive_window(
 }
 
 /// The window from the oldest completed backup's stop sentinel upload and
-/// the newest archived WAL object's upload.
+/// the newest archived WAL object's upload, or unknown (`(None, None)`) when
+/// no WAL object is newer than that sentinel.
 ///
 /// WAL-G uploads a backup's last WAL segment before it writes the stop
 /// sentinel, so right after a backup (the first one especially) the newest
 /// WAL object is older than the sentinel, until the next segment is
 /// archived, which on a quiet database can take a long time. Reporting that
-/// as the end of the window would invert it (latest before earliest). A
-/// completed backup's consistency point is recoverable on its own, so the
-/// window then ends where it starts: that one point.
+/// as the end of the window would invert it (latest before earliest). Nor
+/// can the window be the sentinel's upload time alone: a restore replays WAL
+/// up to its target time, and no archived WAL reaches past that upload, so
+/// recovery would end before the target. Until a segment is archived after
+/// the sentinel, the window is reported as unknown, like a service whose
+/// window cannot be read.
 fn pitr_window(
     oldest_backup_stop: Option<chrono::DateTime<Utc>>,
     newest_wal: Option<chrono::DateTime<Utc>>,
 ) -> Window {
-    let Some(earliest) = oldest_backup_stop else {
-        return (None, None);
-    };
-    let latest = newest_wal.map_or(earliest, |wal| wal.max(earliest));
-    (Some(earliest), Some(latest))
+    match (oldest_backup_stop, newest_wal) {
+        (Some(earliest), Some(latest)) if latest > earliest => (Some(earliest), Some(latest)),
+        _ => (None, None),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -557,8 +560,8 @@ mod tests {
     }
 
     /// Right after a backup the newest WAL object predates the stop
-    /// sentinel (WAL-G uploads the segment first). The window must end at
-    /// the backup's consistency point, never before its start.
+    /// sentinel (WAL-G uploads the segment first). The window must never end
+    /// before it starts, nor offer a time no archived WAL reaches.
     #[test]
     fn the_pitr_window_is_never_inverted_right_after_a_backup() {
         let sentinel = chrono::DateTime::parse_from_rfc3339("2026-03-04T10:00:00.808Z")
@@ -569,13 +572,18 @@ mod tests {
             .with_timezone(&Utc);
         assert_eq!(
             pitr_window(Some(sentinel), Some(last_segment)),
-            (Some(sentinel), Some(sentinel)),
-            "a WAL object older than the sentinel must not end the window before it starts"
+            (None, None),
+            "with no WAL past the sentinel, no time can be replayed to: unknown, not inverted"
+        );
+        assert_eq!(
+            pitr_window(Some(sentinel), Some(sentinel)),
+            (None, None),
+            "WAL uploaded at the sentinel's own instant reaches no later time"
         );
         assert_eq!(
             pitr_window(Some(sentinel), None),
-            (Some(sentinel), Some(sentinel)),
-            "a backup with no WAL listed yet is recoverable to its consistency point"
+            (None, None),
+            "a backup with no WAL listed yet has no window to replay"
         );
 
         // WAL archived after the backup extends the window.
