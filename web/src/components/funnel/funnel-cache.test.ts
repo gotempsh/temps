@@ -9,7 +9,7 @@ import {
   getFunnelQueryKey,
   listFunnelsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { refreshSavedFunnel } from './funnel-cache'
+import { forgetDeletedFunnel, refreshSavedFunnel } from './funnel-cache'
 
 const at = '2026-01-01T00:00:00Z'
 
@@ -77,12 +77,18 @@ test('a saved funnel replaces its cached read and refreshes its lists and metric
   expect(invalidated(client, keys.otherProjectList)).toBe(false)
 })
 
-test('a bare operation name, the key the pages used before, matches no generated query', () => {
+test('a deleted funnel is dropped from the cache and its project lists refetch', () => {
   const { client, keys } = seeded()
 
-  void client.invalidateQueries({ queryKey: ['listFunnels'] })
-  void client.invalidateQueries({ queryKey: ['getFunnel'] })
+  forgetDeletedFunnel(client, 3, 7)
 
-  expect(invalidated(client, keys.firstPage)).toBe(false)
-  expect(invalidated(client, keys.funnel)).toBe(false)
+  expect(client.getQueryState(keys.funnel)).toBeUndefined()
+  expect(client.getQueryState(keys.metrics)).toBeUndefined()
+  expect(invalidated(client, keys.firstPage)).toBe(true)
+  expect(invalidated(client, keys.secondPage)).toBe(true)
+  // Another funnel and another project's list are left alone.
+  expect(client.getQueryData<FunnelResponse>(keys.otherFunnel)?.name).toBe(
+    'Untouched'
+  )
+  expect(invalidated(client, keys.otherProjectList)).toBe(false)
 })

@@ -30,6 +30,7 @@ import { useNavigate } from 'react-router'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageInRange } from '@/hooks/usePageInRange'
 import { FunnelCard } from './FunnelCard'
+import { forgetDeletedFunnel } from './funnel-cache'
 
 const FUNNELS_PER_PAGE = 20
 
@@ -90,8 +91,8 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
     meta: {
       errorTitle: 'Failed to delete funnel',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
+    onSuccess: (_, { path }) => {
+      forgetDeletedFunnel(queryClient, path.project_id, path.funnel_id)
     },
   })
 

@@ -34,3 +34,21 @@ export function refreshSavedFunnel(
     queryKey: getFunnelMetricsQueryKey({ path }),
   })
 }
+
+/**
+ * Brings the cached funnel queries up to date after funnel `funnelId` was
+ * deleted: every page of the project's funnel list is refetched, and the
+ * funnel's own read and metrics are dropped so nothing shows it again.
+ */
+export function forgetDeletedFunnel(
+  queryClient: QueryClient,
+  projectId: number,
+  funnelId: number
+) {
+  const path = { project_id: projectId, funnel_id: funnelId }
+  void queryClient.invalidateQueries({
+    queryKey: listFunnelsQueryKey({ path: { project_id: projectId } }),
+  })
+  queryClient.removeQueries({ queryKey: getFunnelQueryKey({ path }) })
+  queryClient.removeQueries({ queryKey: getFunnelMetricsQueryKey({ path }) })
+}
