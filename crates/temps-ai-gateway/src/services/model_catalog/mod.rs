@@ -54,6 +54,9 @@ pub const DEFAULT_CATALOG_URL: &str =
 
 /// Default hours between background refreshes.
 pub const DEFAULT_REFRESH_INTERVAL_HOURS: i32 = 24;
+/// Active provider key IDs read per page by the background discovery pass.
+const DISCOVERY_KEY_PAGE: u64 = 100;
+
 /// Bounds of `refresh_interval_hours` (the table's CHECK constraint).
 pub const MIN_REFRESH_INTERVAL_HOURS: i32 = 1;
 pub const MAX_REFRESH_INTERVAL_HOURS: i32 = 168;
@@ -183,9 +186,10 @@ pub struct ModelCatalogEntry {
     pub cache_write_per_million: Option<f64>,
     pub context_window: Option<i64>,
     pub max_output_tokens: Option<i64>,
-    pub supports_tools: bool,
-    pub supports_vision: bool,
-    pub supports_reasoning: bool,
+    /// `null` when the catalog does not say.
+    pub supports_tools: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub supports_reasoning: Option<bool>,
     pub deprecated: bool,
     pub release_date: Option<String>,
     pub source_url: String,
@@ -205,9 +209,9 @@ impl From<ai_model_catalog_entries::Model> for ModelCatalogEntry {
             cache_write_per_million: row.cache_write_per_million,
             context_window: row.context_window,
             max_output_tokens: row.max_output_tokens,
-            supports_tools: row.supports_tools,
-            supports_vision: row.supports_vision,
-            supports_reasoning: row.supports_reasoning,
+            supports_tools: row.tools_stated.then_some(row.supports_tools),
+            supports_vision: row.vision_stated.then_some(row.supports_vision),
+            supports_reasoning: row.reasoning_stated.then_some(row.supports_reasoning),
             deprecated: row.deprecated,
             release_date: row.release_date,
             source_url: row.source_url,
@@ -401,9 +405,14 @@ fn entry_row(
         cache_write_per_million: Set(model.cache_write_per_million),
         context_window: Set(model.context_window),
         max_output_tokens: Set(model.max_output_tokens),
-        supports_tools: Set(model.supports_tools),
-        supports_vision: Set(model.supports_vision),
-        supports_reasoning: Set(model.supports_reasoning),
+        // An unknown capability is stored as `false` with `*_stated` unset, so
+        // a previous binary that reads only `supports_*` still decodes it.
+        supports_tools: Set(model.supports_tools.unwrap_or(false)),
+        supports_vision: Set(model.supports_vision.unwrap_or(false)),
+        supports_reasoning: Set(model.supports_reasoning.unwrap_or(false)),
+        tools_stated: Set(model.supports_tools.is_some()),
+        vision_stated: Set(model.supports_vision.is_some()),
+        reasoning_stated: Set(model.supports_reasoning.is_some()),
         deprecated: Set(model.deprecated),
         release_date: Set(model.release_date.clone()),
         source_url: Set(source_url.to_string()),
@@ -737,6 +746,11 @@ impl ModelCatalogService {
     /// Apply the stored catalog's prices. Run once at startup so a restart
     /// without network access keeps the last catalog.
     pub async fn load_stored(&self) -> Result<usize, ModelCatalogError> {
+        // Read and install under the refresh lock: a refresh that commits a
+        // newer catalog while this SELECT is in flight must not have its
+        // prices replaced by this older snapshot afterwards. Waits for a
+        // refresh already running, then reads what it stored.
+        let _flight = self.refresh_lock.lock().await;
         let rows = ai_model_catalog_entries::Entity::find()
             .order_by_asc(ai_model_catalog_entries::Column::Provider)
             .order_by_asc(ai_model_catalog_entries::Column::ModelId)
@@ -864,45 +878,69 @@ impl ModelCatalogService {
         Ok((saved, pricing::install_catalog_prices(&prices)))
     }
 
-    /// Rediscover every active provider key's models, one key at a time.
+    /// Rediscover the models of every provider key active when the pass
+    /// starts, one key at a time. Keys created during the pass wait for the
+    /// next one, so a steady stream of new keys cannot keep this pass (and
+    /// the price refresh scheduled after it) from finishing.
     async fn discover_provider_models(&self) -> Result<(), ModelCatalogError> {
-        let keys = match self.provider_key_service.list_active().await {
-            Ok(keys) => keys,
+        let mut keys = 0usize;
+        let mut refreshed = 0usize;
+        let mut after_id = 0;
+        let through_id = match self.provider_key_service.last_key_id().await {
+            Ok(last) => last.unwrap_or(0),
             Err(error) => {
-                tracing::warn!(%error, "Could not list provider keys for AI model discovery");
+                tracing::warn!(
+                    %error,
+                    "Could not read the last provider key for AI model discovery"
+                );
                 return Ok(());
             }
         };
-        let mut refreshed = 0usize;
-        for key in &keys {
-            match tokio::time::timeout(
-                DISCOVERY_TIMEOUT,
-                self.provider_model_service.refresh(key.id),
-            )
-            .await
+        loop {
+            let page = match self
+                .provider_key_service
+                .active_key_ids_after(after_id, through_id, DISCOVERY_KEY_PAGE)
+                .await
             {
-                Ok(Ok(_)) => refreshed += 1,
-                Ok(Err(error)) => tracing::warn!(
-                    provider_key_id = key.id,
-                    %error,
-                    "Background AI model discovery failed for a provider key; its models are unchanged"
-                ),
-                Err(_) => tracing::warn!(
-                    provider_key_id = key.id,
-                    timeout_secs = DISCOVERY_TIMEOUT.as_secs(),
-                    "Background AI model discovery timed out for a provider key"
-                ),
+                Ok(page) => page,
+                Err(error) => {
+                    tracing::warn!(
+                        after_id,
+                        %error,
+                        "Could not list provider keys for AI model discovery"
+                    );
+                    return Ok(());
+                }
+            };
+            let Some(&last) = page.last() else { break };
+            after_id = last;
+            keys += page.len();
+            for key_id in page {
+                match tokio::time::timeout(
+                    DISCOVERY_TIMEOUT,
+                    self.provider_model_service.refresh(key_id),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => refreshed += 1,
+                    Ok(Err(error)) => tracing::warn!(
+                        provider_key_id = key_id,
+                        %error,
+                        "Background AI model discovery failed for a provider key; its models are unchanged"
+                    ),
+                    Err(_) => tracing::warn!(
+                        provider_key_id = key_id,
+                        timeout_secs = DISCOVERY_TIMEOUT.as_secs(),
+                        "Background AI model discovery timed out for a provider key"
+                    ),
+                }
             }
         }
         let row = Self::ensure_settings_row(self.db.as_ref()).await?;
         let mut done: ai_model_catalog_settings::ActiveModel = row.into();
         done.last_discovery_at = Set(Some(Utc::now()));
         done.update(self.db.as_ref()).await?;
-        tracing::info!(
-            keys = keys.len(),
-            refreshed,
-            "Background AI model discovery finished"
-        );
+        tracing::info!(keys, refreshed, "Background AI model discovery finished");
         Ok(())
     }
 

@@ -13,8 +13,10 @@ import {
   resolveEnvironmentParam,
   runPollInterval,
   selectAudience,
+  unavailableByReason,
   unfinishedRun,
   writePageParams,
+  type PageAudience,
 } from './reachability-page'
 
 const controlPlane = {
@@ -304,4 +306,30 @@ test('an environment is settled only when every address is reachable and setup e
   ] as const) {
     expect(isEnvironmentSettled([reachable], run)).toBe(false)
   }
+})
+
+test('audiences that cannot work here are grouped by reason, each reason once', () => {
+  const card = (audience: PageAudience, reason: string | null) => ({
+    audience,
+    available: reason === null,
+    blocked: reason === null ? null : { reason },
+    entries: [],
+  })
+  const groups = unavailableByReason([
+    card('public', null),
+    card('signed_in', 'No sign-in is configured.'),
+    card('private', 'It runs on the control plane.'),
+    card('tailnet_users', 'It runs on the control plane.'),
+  ])
+  expect(groups).toEqual([
+    {
+      audiences: ['signed_in'],
+      blocked: { reason: 'No sign-in is configured.' },
+    },
+    {
+      audiences: ['private', 'tailnet_users'],
+      blocked: { reason: 'It runs on the control plane.' },
+    },
+  ])
+  expect(unavailableByReason([card('public', null)])).toEqual([])
 })

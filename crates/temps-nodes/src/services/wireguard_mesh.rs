@@ -215,6 +215,13 @@ pub struct WireguardMeshStatusResponse {
     /// What prevents enabling it, when `can_enable` is false and the mesh is
     /// off. Rendered verbatim.
     pub enable_blocker: Option<String>,
+    /// Whether `DELETE /nodes/wireguard` can turn the mesh off now: it is
+    /// on and nothing depends on it.
+    pub can_disable: bool,
+    /// What prevents turning it off, when the mesh is on and `can_disable`
+    /// is false (nodes on the mesh, pairings in progress, the control
+    /// plane's overlay on its mesh address). Rendered verbatim.
+    pub disable_blocker: Option<String>,
     /// CLI equivalent of enabling, for the control-plane host.
     pub enable_command: String,
     /// The configured external URL: what `temps join` should point at.
@@ -390,6 +397,13 @@ impl WireguardMeshService {
         } else {
             None
         };
+        let disable_blocker = if settings.is_some() {
+            temps_network::mesh::disable_blocker(db)
+                .await
+                .map_err(mesh("check what depends on the mesh"))?
+        } else {
+            None
+        };
         // Onboarding only: a settings read failure leaves the join URL out
         // rather than failing the whole status.
         let join_url = self
@@ -411,6 +425,8 @@ impl WireguardMeshService {
             ca_rotation_required,
             can_enable: settings.is_none() && blocker.is_none() && !ca_rotation_required,
             enable_blocker: blocker,
+            can_disable: settings.is_some() && disable_blocker.is_none(),
+            disable_blocker,
             enable_command: ENABLE_MESH_COMMAND.to_string(),
             join_url,
             handshake_error,
@@ -441,6 +457,18 @@ impl WireguardMeshService {
         )
         .await
         .map_err(mesh("turn the mesh on"))
+    }
+
+    /// Turn the mesh off, returning the settings it had (`None` when it was
+    /// already off). Refused with `DisableBlocked` while anything depends on
+    /// it; see [`temps_network::mesh::disable`] for what changes.
+    pub async fn disable(&self) -> Result<Option<MeshSettings>, WireguardMeshError> {
+        // The settings come from the row `disable` locked, so a concurrent
+        // enable or pool change cannot make them disagree with what it
+        // turned off.
+        temps_network::mesh::disable(self.db.as_ref())
+            .await
+            .map_err(mesh("turn the mesh off"))
     }
 
     /// Make `hub` the mesh hub, or remove it (`None`).

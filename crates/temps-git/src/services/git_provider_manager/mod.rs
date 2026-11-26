@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 mod connections;
+mod credentials;
 mod error;
 mod git_push;
 mod health;
@@ -47,6 +48,7 @@ mod tokens;
 mod types;
 mod validation;
 
+pub use credentials::{CredentialsUpdated, ProviderCredentialsUpdate};
 pub use error::GitProviderManagerError;
 pub(crate) use git_push::CommitCancellation;
 pub use types::{

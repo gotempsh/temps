@@ -413,3 +413,27 @@ export function hubCandidates(
       .map((node) => ({ value: `node:${node.node_id}`, label: node.name })),
   ]
 }
+
+/**
+ * Whether the mesh can be turned off from here: already off, available, or
+ * refused for the reason the server gives (a node is on it, a pairing is in
+ * progress, the cluster network runs over it).
+ */
+export type MeshTurnOff =
+  { kind: 'off' } | { kind: 'available' } | { kind: 'blocked'; reason: string }
+
+export function meshTurnOff(
+  mesh: Pick<
+    WireguardMeshStatusResponse,
+    'state' | 'can_disable' | 'disable_blocker'
+  >
+): MeshTurnOff {
+  if (mesh.state === 'disabled') return { kind: 'off' }
+  if (mesh.can_disable) return { kind: 'available' }
+  return {
+    kind: 'blocked',
+    reason:
+      mesh.disable_blocker ??
+      'The server did not say why the mesh cannot be turned off.',
+  }
+}

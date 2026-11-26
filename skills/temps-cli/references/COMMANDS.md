@@ -4386,13 +4386,14 @@ WireGuard mesh: lets nodes that only share the internet with the control plane j
 
 **Subcommands:**
 
-- `enable` - Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it cannot be turned off again
+- `enable` - Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it can be turned off again only while no node is on it
+- `disable` - Turn the WireGuard mesh off. Refused, with the reason, while a node is on it, a pairing is in progress or the cluster network runs over it. The control plane stops tending its end; the interface itself goes away when `temps serve` restarts
 - `hub` - Mesh hub: a member that relays between members that cannot reach each other (two nodes behind NAT). Shows the hub and every pair it carries
 - `doctor` - Check the mesh from the control plane: its end, every node link and every pairing in progress, each failure with what fixes it. Exits 1 when a check fails. For a node's own end, run `temps doctor mesh` on it
 
 #### `nodes mesh enable`
 
-Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it cannot be turned off again
+Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it can be turned off again only while no node is on it
 
 **Options:**
 
@@ -4401,6 +4402,17 @@ Turn the WireGuard mesh on. The control plane and every agent move onto it withi
 | `--cidr <cidr>` | Mesh address pool (private IPv4, clear of the compute pool) | - | No |
 | `--port <port>` | UDP port every node must accept from the others | - | No |
 | `--node-api-port <port>` | TCP port nodes reach this control plane on over the mesh (default: the mesh port) | - | No |
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes mesh disable`
+
+Turn the WireGuard mesh off. Refused, with the reason, while a node is on it, a pairing is in progress or the cluster network runs over it. The control plane stops tending its end; the interface itself goes away when `temps serve` restarts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
 | `--json` | Output in JSON format | - | No |
 

@@ -1616,10 +1616,65 @@ pub fn is_priced_for(provider: &str, model: &str) -> bool {
     effective().load().rates_for(provider, model).is_some()
 }
 
+/// A bundled row with a catalog price applied, reporting the rates the
+/// estimator charges (`rates`, from `catalog_rates`) rather than the raw
+/// catalog fields: a cache rate the catalog leaves out is the bundled one
+/// scaled to the new input price, and the dearest cache-write tier is what
+/// every write is billed at.
+fn apply_catalog_price(row: &mut ModelPricing, price: &CatalogPrice, rates: Option<Rates>) {
+    let bundled_input = row.input_per_million;
+    let base_unchanged = bundled_input == price.input_per_million
+        && row.output_per_million == price.output_per_million;
+    row.input_per_million = price.input_per_million;
+    row.output_per_million = price.output_per_million;
+    if let Some(rates) = rates.map(|rates| rates.base) {
+        if row.cache_hit_per_million.is_some() || price.cache_read_per_million.is_some() {
+            row.cache_hit_per_million = Some(rates.cache_read);
+        }
+        if row.cache_write_1h_per_million.is_some() {
+            // The catalog's one write price is the shortest-lived tier; the
+            // 1-hour tier is the dearest one the estimator bills.
+            row.cache_write_5m_per_million = price
+                .cache_write_per_million
+                .filter(|rate| is_valid_catalog_price(*rate))
+                .or(row
+                    .cache_write_5m_per_million
+                    .map(|rate| rate * scale_ratio(price.input_per_million, bundled_input)))
+                .map(|rate| rate.min(rates.cache_write));
+            row.cache_write_1h_per_million = Some(rates.cache_write);
+        } else if row.cache_write_5m_per_million.is_some()
+            || price.cache_write_per_million.is_some()
+        {
+            row.cache_write_5m_per_million = Some(rates.cache_write);
+        }
+    }
+    // Batch rates are published per model and no catalog carries them: they
+    // still hold while the base prices they discount are unchanged.
+    if !base_unchanged {
+        row.batch_input_per_million = None;
+        row.batch_output_per_million = None;
+    }
+    row.deprecated = row.deprecated || price.deprecated;
+    row.source = PriceSource::Catalog;
+}
+
+/// Ratio of `new_input` to `old_input`, or 1 when the old one is zero.
+fn scale_ratio(new_input: f64, old_input: f64) -> f64 {
+    if old_input > 0.0 {
+        new_input / old_input
+    } else {
+        1.0
+    }
+}
+
 /// The effective price list: the bundled rows with runtime catalog prices
 /// applied, followed by the models only the catalog lists.
 pub fn effective_pricing() -> Vec<ModelPricing> {
-    let current = effective().load();
+    pricing_list(&effective().load())
+}
+
+/// The price list `current` describes (see `effective_pricing`).
+fn pricing_list(current: &EffectivePricing) -> Vec<ModelPricing> {
     let mut rows = build_pricing();
     let mut seen = std::collections::HashSet::new();
     for row in &mut rows {
@@ -1627,16 +1682,12 @@ pub fn effective_pricing() -> Vec<ModelPricing> {
             .applied
             .get(&(row.provider.clone(), row.model.clone()))
         {
-            row.input_per_million = price.input_per_million;
-            row.output_per_million = price.output_per_million;
-            row.cache_hit_per_million = price.cache_read_per_million;
-            if price.cache_write_per_million.is_some() {
-                row.cache_write_5m_per_million = price.cache_write_per_million;
-            }
-            row.batch_input_per_million = None;
-            row.batch_output_per_million = None;
-            row.deprecated = row.deprecated || price.deprecated;
-            row.source = PriceSource::Catalog;
+            let rates = current
+                .by_provider
+                .get(&row.provider)
+                .and_then(|by_model| by_model.get(&row.model))
+                .copied();
+            apply_catalog_price(row, price, rates);
         }
         seen.insert((row.provider.clone(), row.model.clone()));
     }

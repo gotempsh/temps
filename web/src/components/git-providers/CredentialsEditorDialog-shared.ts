@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ProviderResponse } from '@/api/client/types.gen'
-import { type UpdateProviderCredentialsBody } from '@/lib/git-providers'
+import type {
+  ProviderResponse,
+  UpdateProviderCredentialsRequest,
+} from '@/api/client/types.gen'
+
+/** The credential fields the editor can send (the generated request body). */
+export type UpdateProviderCredentialsBody = UpdateProviderCredentialsRequest
 
 export interface FieldSpec {
   key: keyof UpdateProviderCredentialsBody
@@ -10,6 +15,8 @@ export interface FieldSpec {
   type: 'text' | 'password' | 'textarea'
   placeholder: string
   help?: string
+  /** A field that must be replaced together with this one. */
+  pairedWith?: keyof UpdateProviderCredentialsBody
 }
 
 export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
@@ -102,7 +109,66 @@ export function fieldsForProvider(provider: ProviderResponse): FieldSpec[] {
     ]
   }
 
+  if (method === 'basic') {
+    return [
+      {
+        key: 'username',
+        label: 'Username',
+        type: 'text',
+        placeholder: 'Leave blank to keep current value',
+      },
+      {
+        key: 'password',
+        label: type === 'bitbucket' ? 'App password' : 'Password or token',
+        type: 'password',
+        placeholder: 'Leave blank to keep current value',
+      },
+    ]
+  }
+
+  if (method === 'ssh') {
+    return [
+      {
+        key: 'private_key',
+        label: 'Private key',
+        type: 'textarea',
+        placeholder: 'Leave blank to keep current value',
+        help: 'Paste the full key including BEGIN/END lines. Replace it together with the public key.',
+        pairedWith: 'public_key',
+      },
+      {
+        key: 'public_key',
+        label: 'Public key',
+        type: 'textarea',
+        placeholder: 'ssh-ed25519 AAAA… deploy@example',
+        pairedWith: 'private_key',
+      },
+    ]
+  }
+
   return []
+}
+
+/**
+ * Errors to show beside fields before Save: a paired field (an SSH key pair)
+ * left blank while its partner is filled in, which the server would refuse.
+ * Keyed by field; empty when the values can be submitted.
+ */
+export function credentialFieldErrors(
+  fields: FieldSpec[],
+  values: Record<string, string | undefined>
+): Partial<Record<keyof UpdateProviderCredentialsBody, string>> {
+  const filled = (key: string) => (values[key] ?? '').trim().length > 0
+  const errors: Partial<Record<keyof UpdateProviderCredentialsBody, string>> =
+    {}
+  for (const field of fields) {
+    const partner = fields.find((other) => other.key === field.pairedWith)
+    if (partner && !filled(field.key) && filled(partner.key)) {
+      errors[field.key] =
+        `Required: the ${partner.label.toLowerCase()} is replaced together with the ${field.label.toLowerCase()}.`
+    }
+  }
+  return errors
 }
 
 /** True when the provider's auth method has editable fields. Use to gate

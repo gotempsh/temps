@@ -3,7 +3,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, QuerySelect, Set,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -69,6 +69,17 @@ pub enum CatalogMembership {
 pub struct ProviderKeyService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
+}
+
+/// What a replacement credential is verified on, see
+/// [`ProviderKeyService::replacement_check`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementCheck {
+    /// The model to verify on; `None` when nothing names one (a self-hosted
+    /// key with no default and no catalog), which verification reports.
+    pub model: Option<String>,
+    /// Routing chose `model`, not a default the administrator set.
+    pub chosen_by_routing: bool,
 }
 
 impl ProviderKeyService {
@@ -178,6 +189,45 @@ impl ProviderKeyService {
             .await?;
 
         Ok(keys)
+    }
+
+    /// The highest provider key ID right now, active or not; `None` with no
+    /// keys. A background pass reads it once and stops there, so keys
+    /// created while it runs wait for the next pass instead of extending
+    /// this one without end.
+    pub async fn last_key_id(&self) -> Result<Option<i32>, AiGatewayError> {
+        let last = ai_provider_keys::Entity::find()
+            .select_only()
+            .column(ai_provider_keys::Column::Id)
+            .order_by_desc(ai_provider_keys::Column::Id)
+            .into_tuple::<i32>()
+            .one(self.db.as_ref())
+            .await?;
+        Ok(last)
+    }
+
+    /// Up to `limit` active key IDs greater than `after_id` and at most
+    /// `through_id`, ascending: a background pass pages through them by ID
+    /// instead of holding every key's row (credentials included) for its
+    /// whole run, and ends at the [`Self::last_key_id`] it started with.
+    pub async fn active_key_ids_after(
+        &self,
+        after_id: i32,
+        through_id: i32,
+        limit: u64,
+    ) -> Result<Vec<i32>, AiGatewayError> {
+        let ids = ai_provider_keys::Entity::find()
+            .select_only()
+            .column(ai_provider_keys::Column::Id)
+            .filter(ai_provider_keys::Column::IsActive.eq(true))
+            .filter(ai_provider_keys::Column::Id.gt(after_id))
+            .filter(ai_provider_keys::Column::Id.lte(through_id))
+            .order_by_asc(ai_provider_keys::Column::Id)
+            .limit(limit)
+            .into_tuple::<i32>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(ids)
     }
 
     pub async fn get_by_id(&self, id: i32) -> Result<ai_provider_keys::Model, AiGatewayError> {
@@ -403,6 +453,69 @@ impl ProviderKeyService {
         Ok(result)
     }
 
+    /// The model a replacement credential for `key` is verified on: the one
+    /// internal calls will go to through the key after the update. That is
+    /// the default model requested in the same update, else what routing
+    /// picks for the key with its resulting pin (the pin when its catalog
+    /// serves it, else the catalog's default): an unpinned key whose catalog
+    /// enables only `gpt-5-nano` is verified on `gpt-5-nano`, not on the
+    /// provider's newest low-cost model. `requested_default` is the update's
+    /// `default_model` field: absent, cleared, or set.
+    pub async fn replacement_check(
+        &self,
+        key: &ai_provider_keys::Model,
+        requested_default: Option<Option<&str>>,
+    ) -> Result<ReplacementCheck, AiGatewayError> {
+        let pin = match requested_default {
+            Some(Some(model)) => {
+                return Ok(ReplacementCheck {
+                    model: Some(model.to_string()),
+                    chosen_by_routing: false,
+                })
+            }
+            Some(None) => None,
+            None => key.default_model.as_deref(),
+        };
+        let model = crate::services::ai_service::key_routed_model(
+            self.db.as_ref(),
+            key.id,
+            &key.provider,
+            pin,
+        )
+        .await?;
+        let chosen_by_routing = model.as_deref() != pin.map(str::trim);
+        Ok(ReplacementCheck {
+            model,
+            chosen_by_routing,
+        })
+    }
+
+    /// The error for a replacement credential that failed verification on
+    /// `check`'s model. The current key is kept either way; when routing
+    /// (not the administrator) chose that model, the message says so and
+    /// how to pick one the new credential can use.
+    pub fn replacement_verification_failed(
+        key: &ai_provider_keys::Model,
+        check: &ReplacementCheck,
+        reason: &str,
+    ) -> AiGatewayError {
+        let message = match (check.model.as_deref(), check.chosen_by_routing) {
+            (Some(model), true) => format!(
+                "The replacement API key for provider key {} ('{}') could not be verified on \
+                 '{model}', the model this key sends internal requests to; the current key was \
+                 kept: {reason}. If the new key cannot use '{model}', set the default model to \
+                 one it can use in the same update.",
+                key.id, key.display_name
+            ),
+            _ => format!(
+                "API key verification failed for provider key {} ('{}'); the current key was \
+                 kept: {reason}",
+                key.id, key.display_name
+            ),
+        };
+        AiGatewayError::Validation { message }
+    }
+
     pub async fn delete(&self, id: i32) -> Result<(), AiGatewayError> {
         let _ = self.get_by_id(id).await?;
         if temps_entities::ai_gateway_objects::Entity::find()
@@ -426,6 +539,194 @@ impl ProviderKeyService {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
+
+    fn catalog_row(model_id: &str) -> temps_entities::ai_provider_models::Model {
+        let now = chrono::Utc::now();
+        temps_entities::ai_provider_models::Model {
+            id: 1,
+            provider_key_id: 1,
+            model_id: model_id.to_string(),
+            display_name: model_id.to_string(),
+            source: "discovered".to_string(),
+            is_available: true,
+            is_enabled: true,
+            owned_by: None,
+            metadata: None,
+            last_seen_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn check_service(db: MockDatabase) -> ProviderKeyService {
+        ProviderKeyService::new(Arc::new(db.into_connection()), test_encryption())
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_replacement_is_verified_on_the_model_its_catalog_routes_to() {
+        // Only gpt-5-nano is enabled and available: internal calls use it,
+        // so the replacement is verified on it, not on the provider's newest
+        // low-cost model.
+        let service = check_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![catalog_row("gpt-5-nano")]]),
+        );
+        let check = service
+            .replacement_check(&sample_key(), None)
+            .await
+            .expect("check target");
+        assert_eq!(
+            check,
+            ReplacementCheck {
+                model: Some("gpt-5-nano".to_string()),
+                chosen_by_routing: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replacement_is_verified_on_the_pin_its_catalog_serves() {
+        let mut key = sample_key();
+        key.default_model = Some("gpt-5-mini".to_string());
+        // The catalog is not empty and serves the pin.
+        let service = check_service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
+                vec![catalog_row("gpt-5-nano")],
+                vec![catalog_row("gpt-5-mini")],
+            ]),
+        );
+        let check = service.replacement_check(&key, None).await.expect("check");
+        assert_eq!(check.model.as_deref(), Some("gpt-5-mini"));
+        assert!(!check.chosen_by_routing);
+    }
+
+    #[tokio::test]
+    async fn a_pin_the_catalog_no_longer_serves_is_not_what_is_verified() {
+        let mut key = sample_key();
+        key.default_model = Some("gpt-4o".to_string());
+        // Not empty, the pin is not enabled, the catalog routes to gpt-5-nano.
+        let service = check_service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
+                vec![catalog_row("gpt-5-nano")],
+                vec![],
+                vec![catalog_row("gpt-5-nano")],
+            ]),
+        );
+        let check = service.replacement_check(&key, None).await.expect("check");
+        assert_eq!(check.model.as_deref(), Some("gpt-5-nano"));
+        assert!(check.chosen_by_routing);
+    }
+
+    #[tokio::test]
+    async fn a_default_set_in_the_same_update_is_verified_without_a_lookup() {
+        // No query results: a lookup would fail the test.
+        let service = check_service(MockDatabase::new(DatabaseBackend::Postgres));
+        let check = service
+            .replacement_check(&sample_key(), Some(Some("gpt-5-mini")))
+            .await
+            .expect("check");
+        assert_eq!(
+            check,
+            ReplacementCheck {
+                model: Some("gpt-5-mini".to_string()),
+                chosen_by_routing: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_never_refreshed_catalog_routes_to_the_providers_low_cost_default() {
+        let service = check_service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::ai_provider_models::Model>::new()]),
+        );
+        // Clearing the pin in the same update routes like an unpinned key.
+        let mut key = sample_key();
+        key.default_model = Some("gpt-5-mini".to_string());
+        let check = service
+            .replacement_check(&key, Some(None))
+            .await
+            .expect("check");
+        assert_eq!(
+            check.model.as_deref(),
+            crate::providers::low_cost_default_model("openai")
+        );
+        assert!(check.chosen_by_routing);
+    }
+
+    #[tokio::test]
+    async fn a_catalog_read_failure_is_an_error_not_a_guess() {
+        let service = check_service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_errors([
+                sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+                    "connection reset while reading the catalog of key 1".to_string(),
+                )),
+            ]),
+        );
+        assert!(matches!(
+            service.replacement_check(&sample_key(), None).await,
+            Err(AiGatewayError::Database(_))
+        ));
+    }
+
+    #[test]
+    fn a_failed_replacement_names_the_routed_model_and_the_fix() {
+        let key = sample_key();
+        let routed = ReplacementCheck {
+            model: Some("gpt-5-nano".to_string()),
+            chosen_by_routing: true,
+        };
+        let AiGatewayError::Validation { message } =
+            ProviderKeyService::replacement_verification_failed(&key, &routed, "model not found")
+        else {
+            panic!("a validation error");
+        };
+        assert!(
+            message.contains("provider key 1 ('OpenAI Production')"),
+            "{message}"
+        );
+        assert!(message.contains("verified on 'gpt-5-nano'"), "{message}");
+        assert!(
+            message.contains("current key was kept: model not found"),
+            "{message}"
+        );
+        assert!(message.contains("set the default model"), "{message}");
+
+        let chosen = ReplacementCheck {
+            chosen_by_routing: false,
+            ..routed
+        };
+        let AiGatewayError::Validation { message } =
+            ProviderKeyService::replacement_verification_failed(&key, &chosen, "unauthorized")
+        else {
+            panic!("a validation error");
+        };
+        assert!(
+            message.starts_with("API key verification failed for provider key 1"),
+            "{message}"
+        );
+        assert!(!message.contains("set the default model"), "{message}");
+    }
+
+    /// A failed page must be an error, never an empty page: discovery reads an
+    /// empty page as "every key seen" and records the pass as complete.
+    #[tokio::test]
+    async fn a_failed_active_key_page_is_an_error_not_an_empty_page() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+                    "connection reset while reading page after key 911".to_string(),
+                ))])
+                .into_connection(),
+        );
+        let service = ProviderKeyService::new(db, test_encryption());
+        match service.active_key_ids_after(911, i32::MAX, 100).await {
+            Err(AiGatewayError::Database(error)) => {
+                assert!(error.to_string().contains("after key 911"), "{error}");
+            }
+            other => panic!("expected a database error, got {other:?}"),
+        }
+    }
 
     fn test_encryption() -> Arc<EncryptionService> {
         Arc::new(EncryptionService::new("01234567890123456789012345678901").unwrap())

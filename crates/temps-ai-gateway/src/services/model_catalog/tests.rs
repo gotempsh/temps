@@ -139,7 +139,7 @@ const SAMPLE: &str = r#"{
         "cost": { "input": 4, "output": 20, "cache_read": 0.4, "cache_write": 5,
                   "context_over_200k": { "input": 8, "output": 30 } }
       },
-      "example-retired": { "name": "Retired", "status": "deprecated",
+      "example-retired": { "name": "Retired", "status": "deprecated", "tool_call": false,
                             "cost": { "input": 1, "output": 2 } },
       "example-negative": { "cost": { "input": -1, "output": 2 } },
       "example-string-price": { "cost": { "input": "1.00", "output": 2 } },
@@ -188,21 +188,68 @@ fn a_models_dev_document_is_read_for_supported_providers_only() {
     assert_eq!(next.cache_write_per_million, Some(5.0));
     assert_eq!(next.context_window, Some(1_000_000));
     assert_eq!(next.max_output_tokens, Some(128_000));
-    assert!(next.supports_tools && next.supports_vision && next.supports_reasoning);
+    assert_eq!(
+        (
+            next.supports_tools,
+            next.supports_vision,
+            next.supports_reasoning
+        ),
+        (Some(true), Some(true), Some(true))
+    );
     assert_eq!(next.release_date.as_deref(), Some("2026-12-01"));
     assert!(next.price().is_some());
 
     let retired = &parsed.models[1];
     assert!(retired.deprecated);
+    // A stated "no" is kept; a field the catalog leaves out is unknown, not
+    // "no".
+    assert_eq!(
+        (
+            retired.supports_tools,
+            retired.supports_vision,
+            retired.supports_reasoning
+        ),
+        (Some(false), None, None)
+    );
 
     let gemini = &parsed.models[2];
     assert_eq!(gemini.display_name, "example-gemini-next");
-    assert!(gemini.supports_vision);
+    assert_eq!(
+        gemini.supports_vision,
+        Some(true),
+        "image input means vision"
+    );
+    assert_eq!(gemini.supports_tools, None);
     // Out-of-range limits are dropped, not stored.
     assert_eq!(gemini.context_window, None);
     assert_eq!(gemini.max_output_tokens, None);
     // No price published: listed, but never priced.
     assert!(gemini.price().is_none());
+}
+
+#[test]
+fn modalities_that_list_only_outputs_leave_vision_unknown() {
+    let body = br#"{"openai": {"models": {
+        "example-output-only": {"modalities": {"output": ["text"]}},
+        "example-text-input": {"modalities": {"input": ["text"], "output": ["text"]}},
+        "example-stated-no": {"attachment": false, "modalities": {"output": ["text"]}}
+    }}}"#;
+    let parsed = parse_catalog("https://catalog.example.com/api.json", body).unwrap();
+    let vision = |id: &str| {
+        parsed
+            .models
+            .iter()
+            .find(|model| model.model_id == id)
+            .unwrap_or_else(|| panic!("{id} parsed"))
+            .supports_vision
+    };
+    assert_eq!(vision("example-output-only"), None, "inputs not listed");
+    assert_eq!(vision("example-text-input"), Some(false), "inputs listed");
+    assert_eq!(
+        vision("example-stated-no"),
+        Some(false),
+        "attachment stated"
+    );
 }
 
 #[test]
@@ -482,9 +529,9 @@ fn model(provider: &str, id: &str, price: Option<(f64, f64)>) -> CatalogModel {
         cache_write_per_million: None,
         context_window: Some(200_000),
         max_output_tokens: None,
-        supports_tools: true,
-        supports_vision: false,
-        supports_reasoning: false,
+        supports_tools: Some(true),
+        supports_vision: Some(false),
+        supports_reasoning: None,
         deprecated: false,
         release_date: Some("2026-12-01".into()),
     }
@@ -594,6 +641,86 @@ async fn a_stored_catalog_replaces_the_previous_one_and_survives_a_restart() {
     assert_eq!(status.entry_count, 1);
     assert!(status.applied_price_count >= 1);
     assert!(!status.refreshing);
+    pricing::install_catalog_prices(&[]);
+}
+
+/// A capability the catalog does not state is listed as unknown, and is stored
+/// so the previous binary, which reads `supports_*` as a plain boolean, still
+/// decodes every row after a binary-only rollback.
+#[tokio::test]
+async fn unknown_capabilities_round_trip_and_stay_readable_by_the_previous_binary() {
+    use sea_orm::ConnectionTrait;
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let _serial = CATALOG_TEST_LOCK.lock().await;
+    let db = test_db.connection_arc();
+    let service = service_on(db.clone());
+    let mut stated = model("openai", "example-stated", Some((1.0, 2.0)));
+    stated.supports_reasoning = Some(false);
+    let mut silent = model("openai", "example-silent", Some((1.0, 2.0)));
+    silent.supports_tools = None;
+    silent.supports_vision = None;
+    silent.supports_reasoning = None;
+    let catalog = ParsedCatalog {
+        models: vec![stated, silent],
+        skipped: 0,
+    };
+    service
+        .store_and_apply(&catalog, "https://catalog.example.com/api.json")
+        .await
+        .unwrap();
+
+    let page = service
+        .list_entries(ModelCatalogEntryFilter::default(), 1, 20)
+        .await
+        .unwrap();
+    let listed = |id: &str| {
+        let entry = page
+            .items
+            .iter()
+            .find(|entry| entry.model_id == id)
+            .unwrap_or_else(|| panic!("{id} listed"));
+        (
+            entry.supports_tools,
+            entry.supports_vision,
+            entry.supports_reasoning,
+        )
+    };
+    assert_eq!(
+        listed("example-stated"),
+        (Some(true), Some(false), Some(false))
+    );
+    assert_eq!(listed("example-silent"), (None, None, None));
+
+    // Exactly the columns the previous binary selects, decoded as it does.
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT model_id, supports_tools, supports_vision, supports_reasoning \
+             FROM ai_model_catalog_entries ORDER BY model_id"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let previous: Vec<(String, bool, bool, bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get("", "model_id").unwrap(),
+                row.try_get("", "supports_tools").unwrap(),
+                row.try_get("", "supports_vision").unwrap(),
+                row.try_get("", "supports_reasoning").unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        previous,
+        vec![
+            ("example-silent".to_string(), false, false, false),
+            ("example-stated".to_string(), true, false, false),
+        ]
+    );
     pricing::install_catalog_prices(&[]);
 }
 
@@ -842,4 +969,85 @@ async fn a_model_disabled_mid_scan_does_not_hide_a_later_unpriced_one() {
         .unwrap();
     assert_eq!(report.total, 1);
     assert_eq!(report.models[0].model_id, "vendor/c-unknown");
+}
+
+#[tokio::test]
+async fn the_startup_load_waits_for_a_refresh_in_flight() {
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    // `load_stored` installs this (empty) catalog into the process-wide price
+    // table, so it must not run while another test relies on its prices.
+    let _serial = CATALOG_TEST_LOCK.lock().await;
+    let service = Arc::new(service_on(test_db.connection_arc()));
+    // A refresh holds the lock from before its SELECT until its prices are
+    // installed; the startup load must not read and install an older
+    // snapshot in between.
+    let refresh = service.refresh_lock.lock().await;
+    let load = tokio::spawn({
+        let service = service.clone();
+        async move { service.load_stored().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!load.is_finished(), "the startup load ran during a refresh");
+    drop(refresh);
+    tokio::time::timeout(std::time::Duration::from_secs(10), load)
+        .await
+        .expect("the load finishes once the refresh ends")
+        .expect("task")
+        .expect("load");
+}
+
+#[tokio::test]
+async fn discovery_pages_through_active_key_ids_only() {
+    use sea_orm::ConnectionTrait;
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active) VALUES \
+         (911, 'openai', 'First', 'enc', true), \
+         (912, 'openai', 'Disabled', 'enc', false), \
+         (913, 'anthropic', 'Second', 'enc', true), \
+         (914, 'xai', 'Third', 'enc', true)",
+    )
+    .await
+    .unwrap();
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
+    );
+    let keys = ProviderKeyService::new(db.clone(), encryption);
+    // A pass reads where it ends once, before paging.
+    let through = keys.last_key_id().await.unwrap().expect("keys exist");
+    assert_eq!(through, 914);
+    // A key created during the pass waits for the next one.
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active) VALUES \
+         (915, 'openai', 'Created during the pass', 'enc', true)",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        keys.active_key_ids_after(910, through, 2).await.unwrap(),
+        vec![911, 913]
+    );
+    assert_eq!(
+        keys.active_key_ids_after(913, through, 2).await.unwrap(),
+        vec![914]
+    );
+    assert!(keys
+        .active_key_ids_after(914, through, 2)
+        .await
+        .unwrap()
+        .is_empty());
+    // The next pass reaches it.
+    let next = keys.last_key_id().await.unwrap().expect("keys exist");
+    assert_eq!(
+        keys.active_key_ids_after(914, next, 2).await.unwrap(),
+        vec![915]
+    );
 }

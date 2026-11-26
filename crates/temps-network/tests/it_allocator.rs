@@ -754,9 +754,14 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     // Peer lists: a worker sees the control plane (once published) and the
     // other worker, never itself; the control plane sees every worker.
     let cp_key = mesh_key(9);
-    mesh::publish_control_plane(&db, &cp_key, Some("192.0.2.1:51820".parse().unwrap()))
-        .await
-        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &cp_key,
+        Some("192.0.2.1:51820".parse().unwrap()),
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
+    )
+    .await
+    .unwrap();
     let for_a = mesh::peers(&db, Some(node_a)).await.unwrap();
     assert_eq!(
         for_a
@@ -892,9 +897,14 @@ async fn a_pairing_reserves_an_address_and_hands_it_to_the_node_it_enrolls() {
     mesh::enable(&db, Some("10.203.0.0/24"), Some(51820), None)
         .await
         .unwrap();
-    mesh::publish_control_plane(&db, &mesh_key(90), None)
-        .await
-        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &mesh_key(90),
+        None,
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
+    )
+    .await
+    .unwrap();
 
     let a = pairing::create(&db, new("paired-a", token_a, "198.51.100.7:51820"))
         .await
@@ -1166,9 +1176,14 @@ async fn mesh_links_keep_byte_order_under_a_locale_collation() {
         .await
         .unwrap();
     // 90 → "Wl…", 56 → "ODg…", 112 → "cHB…".
-    mesh::publish_control_plane(&db, &mesh_key(90), None)
-        .await
-        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &mesh_key(90),
+        None,
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
+    )
+    .await
+    .unwrap();
     for (name, seed, ip) in [
         ("node-o", 56, "203.0.113.10"),
         ("node-c", 112, "203.0.113.11"),
@@ -1209,9 +1224,14 @@ async fn a_hub_carries_pairs_that_never_connected_until_it_is_removed() {
     mesh::enable(&db, Some("10.201.0.0/24"), Some(51820), None)
         .await
         .unwrap();
-    mesh::publish_control_plane(&db, &mesh_key(90), None)
-        .await
-        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &mesh_key(90),
+        None,
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
+    )
+    .await
+    .unwrap();
     let a = insert_node(&db, "node-a", Some("203.0.113.10")).await;
     let b = insert_node(&db, "node-b", Some("198.51.100.20")).await;
     let off_mesh = insert_node(&db, "node-off", Some("198.51.100.30")).await;
@@ -1339,9 +1359,14 @@ async fn a_pairing_cancelled_after_the_link_check_never_links() {
     mesh::enable(&db, Some("10.204.0.0/24"), Some(51820), None)
         .await
         .unwrap();
-    mesh::publish_control_plane(&db, &mesh_key(90), None)
-        .await
-        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &mesh_key(90),
+        None,
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
+    )
+    .await
+    .unwrap();
     let token = enrollment_token("late-cancel")
         .insert(db.as_ref())
         .await
@@ -1401,9 +1426,14 @@ async fn pairings_refuse_taken_keys_and_link_atomically() {
     mesh::enable(&db, Some("10.203.0.0/24"), Some(51820), None)
         .await
         .unwrap();
-    mesh::publish_control_plane(&db, &mesh_key(90), None)
-        .await
-        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &mesh_key(90),
+        None,
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
+    )
+    .await
+    .unwrap();
     let minutes = chrono::Duration::minutes;
     let token_a = enrollment_token("paired-a")
         .insert(db.as_ref())
@@ -1785,6 +1815,7 @@ async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_end
         &db,
         &mesh_key(90),
         Some("203.0.113.1:51820".parse().unwrap()),
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
     )
     .await
     .unwrap();
@@ -1975,6 +2006,7 @@ async fn a_node_registers_on_the_mesh_without_an_endpoint() {
         &db,
         &mesh_key(90),
         Some("203.0.113.1:51820".parse().unwrap()),
+        &mesh::load_settings(&db).await.unwrap().unwrap(),
     )
     .await
     .unwrap();

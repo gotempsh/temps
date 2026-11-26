@@ -96,9 +96,17 @@ pub struct RouteUserWithRoles {
     pub roles: Vec<RouteRole>,
 }
 
+/// Body of `POST /users/{user_id}/roles`. The target user comes from the
+/// path; the body names only the role.
 #[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AssignRoleRequest {
-    pub user_id: i32,
+    /// Deprecated: the target is the path's `user_id`. Still accepted for
+    /// older clients, but only when it equals the path id (otherwise 400).
+    #[serde(default)]
+    #[schema(deprecated)]
+    pub user_id: Option<i32>,
+    #[schema(example = "admin")]
     pub role_type: String,
 }
 
@@ -112,12 +120,37 @@ pub struct CreateUserRequest {
     pub must_change_password: bool,
 }
 
+/// Body of `PATCH /users/{user_id}`. Unknown fields are rejected so a
+/// misspelt field is an error instead of a silent no-op.
 #[derive(Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateUserRequest {
     #[schema(example = "john.doe@example.com")]
     pub email: Option<String>,
-    #[schema(example = "John Doe")]
+    /// The new username, as in `CreateUserRequest`.
+    #[serde(default)]
+    #[schema(example = "john.doe")]
+    pub username: Option<String>,
+    /// Deprecated: the old name of `username`, still accepted. Sending both
+    /// with different values is refused.
+    #[serde(default)]
+    #[schema(deprecated, example = "john.doe")]
     pub name: Option<String>,
+}
+
+impl UpdateUserRequest {
+    /// The username the request asks for: `username`, or the deprecated
+    /// `name`. Both set to different values is an error naming the two.
+    pub fn requested_username(&self) -> Result<Option<String>, String> {
+        match (&self.username, &self.name) {
+            (Some(username), Some(name)) if username != name => Err(format!(
+                "username '{username}' and the deprecated name '{name}' disagree; \
+                 send only username"
+            )),
+            (Some(username), _) => Ok(Some(username.clone())),
+            (None, name) => Ok(name.clone()),
+        }
+    }
 }
 
 // Add a new route for self-modification

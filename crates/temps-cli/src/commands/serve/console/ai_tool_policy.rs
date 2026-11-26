@@ -231,6 +231,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "NodeSshEnrollmentGet",
             "NodeSshEnrollmentList",
             "NodeSshHostKey",
+            "WireguardMeshDisable",
             "WireguardMeshEnable",
             "WireguardMeshHubSet",
             "admin_attach_environment_volume",

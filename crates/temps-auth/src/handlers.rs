@@ -2096,12 +2096,14 @@ fn authorize_admin_target(
 fn authorize_role_assignment(
     auth: &AuthContext,
     path_user_id: i32,
-    body_user_id: i32,
+    body_user_id: Option<i32>,
 ) -> Result<i32, RoleChangeDenied> {
     if !auth.has_permission(&Permission::UsersManage) {
         return Err(RoleChangeDenied::MissingPermission);
     }
-    if path_user_id != body_user_id {
+    // The path is the target. A body `user_id` is a deprecated echo of it,
+    // accepted only when the two agree.
+    if body_user_id.is_some_and(|body_user_id| body_user_id != path_user_id) {
         return Err(RoleChangeDenied::TargetMismatch);
     }
     let target_user_id = path_user_id;
@@ -2117,8 +2119,8 @@ fn authorize_role_assignment(
     path = "/users/{user_id}/roles",
     request_body = AssignRoleRequest,
     responses(
-        (status = 200, description = "Role assigned successfully"),
-        (status = 400, description = "Invalid role type"),
+        (status = 200, description = "Role assigned; the user and all of its roles", body = RouteUserWithRoles),
+        (status = 400, description = "Invalid role type, or a deprecated body user_id that differs from the path"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Admin role required or self-modification forbidden"),
         (status = 404, description = "User or role not found"),
@@ -2141,7 +2143,7 @@ async fn assign_role(
 ) -> Result<impl IntoResponse, Problem> {
     info!(
         "Assigning role {} to user {}",
-        assign_req.role_type, assign_req.user_id
+        assign_req.role_type, user_id
     );
 
     // Authorize and resolve the single target: role mutation requires the
@@ -2157,7 +2159,11 @@ async fn assign_role(
             );
             match denied {
                 RoleChangeDenied::TargetMismatch => temps_core::error_builder::bad_request()
-                    .detail("Path user_id and body user_id must match".to_string())
+                    .detail(format!(
+                        "Body user_id {} does not match the path user_id {user_id}; the target \
+                         user is taken from the path, so omit user_id from the body",
+                        assign_req.user_id.unwrap_or_default()
+                    ))
                     .build(),
                 RoleChangeDenied::MissingPermission | RoleChangeDenied::SelfModification => {
                     temps_core::error_builder::forbidden().build()
@@ -2188,9 +2194,11 @@ async fn assign_role(
         .get_user_by_id(target_user_id)
         .await?;
 
-    app_state
+    // The grant and the read-back of the user's roles commit together, so
+    // the response, the stored roles and the audit record agree.
+    let updated = app_state
         .user_service
-        .assign_role_by_type(target_user_id, role_type)
+        .assign_role_returning_user(target_user_id, role_type)
         .await?;
 
     info!("Role successfully assigned to user {}", target_user_id);
@@ -2213,7 +2221,7 @@ async fn assign_role(
         error!("Failed to create audit log: {}", e);
     }
 
-    Ok((StatusCode::OK, "Role assigned successfully").into_response())
+    Ok((StatusCode::OK, Json(RouteUserWithRoles::from(updated))).into_response())
 }
 
 /// Create a new user with roles
@@ -2570,8 +2578,14 @@ async fn update_user(
 
     info!("Admin {} updating user {}", auth.user_id(), user_id);
 
+    let username = update_req.requested_username().map_err(|reason| {
+        temps_core::error_builder::bad_request()
+            .detail(format!("Cannot update user {user_id}: {reason}"))
+            .build()
+    })?;
+
     // Don't allow empty updates
-    if update_req.email.is_none() && update_req.name.is_none() {
+    if update_req.email.is_none() && username.is_none() {
         return Err(temps_core::error_builder::bad_request()
             .detail("No fields to update")
             .build());
@@ -2579,7 +2593,7 @@ async fn update_user(
 
     let updated_user = app_state
         .user_service
-        .update_user(user_id, update_req.email.clone(), update_req.name.clone())
+        .update_user(user_id, update_req.email.clone(), username.clone())
         .await?;
     info!("Successfully updated user {}", user_id);
 
@@ -2595,7 +2609,7 @@ async fn update_user(
         username: updated_user.user.name.clone(),
         new_values: UpdatedFields {
             email: update_req.email,
-            name: update_req.name,
+            name: username,
         },
     };
 
@@ -3709,7 +3723,7 @@ mod tests {
     fn admin_assigning_to_another_user_is_allowed() {
         // caller=1 (admin) assigns to user 2, path and body agree.
         let auth = session_auth(Role::Admin);
-        assert_eq!(authorize_role_assignment(&auth, 2, 2), Ok(2));
+        assert_eq!(authorize_role_assignment(&auth, 2, Some(2)), Ok(2));
     }
 
     #[test]
@@ -3720,7 +3734,7 @@ mod tests {
         assert!(auth.has_permission(&Permission::UsersWrite));
         assert!(!auth.is_admin());
         assert_eq!(
-            authorize_role_assignment(&auth, 2, 2),
+            authorize_role_assignment(&auth, 2, Some(2)),
             Err(RoleChangeDenied::MissingPermission)
         );
         assert_eq!(
@@ -3735,7 +3749,7 @@ mod tests {
         assert!(auth.has_permission(&Permission::UsersWrite));
         assert!(!auth.is_admin());
         assert_eq!(
-            authorize_role_assignment(&auth, 2, 2),
+            authorize_role_assignment(&auth, 2, Some(2)),
             Err(RoleChangeDenied::MissingPermission)
         );
         assert_eq!(
@@ -3748,7 +3762,7 @@ mod tests {
     fn admin_scoped_api_key_can_apply_admin_only_mutations_to_another_user() {
         let auth = api_key_auth(Some(Role::Admin), None);
         assert!(auth.is_admin());
-        assert_eq!(authorize_role_assignment(&auth, 2, 2), Ok(2));
+        assert_eq!(authorize_role_assignment(&auth, 2, Some(2)), Ok(2));
         assert_eq!(authorize_admin_target(&auth, 2), Ok(()));
     }
 
@@ -3760,12 +3774,12 @@ mod tests {
         let manage_key = api_key_auth(None, Some(vec![Permission::UsersManage]));
         assert!(!manage_key.is_admin());
         assert!(manage_key.has_permission(&Permission::UsersManage));
-        assert_eq!(authorize_role_assignment(&manage_key, 2, 2), Ok(2));
+        assert_eq!(authorize_role_assignment(&manage_key, 2, Some(2)), Ok(2));
         assert_eq!(authorize_admin_target(&manage_key, 2), Ok(()));
 
         let write_only_key = api_key_auth(None, Some(vec![Permission::UsersWrite]));
         assert_eq!(
-            authorize_role_assignment(&write_only_key, 2, 2),
+            authorize_role_assignment(&write_only_key, 2, Some(2)),
             Err(RoleChangeDenied::MissingPermission)
         );
         assert_eq!(
@@ -3781,8 +3795,58 @@ mod tests {
         // mutation acted on the caller. The mismatch is now rejected outright.
         let auth = session_auth(Role::Admin);
         assert_eq!(
-            authorize_role_assignment(&auth, 2, 1),
+            authorize_role_assignment(&auth, 2, Some(1)),
             Err(RoleChangeDenied::TargetMismatch)
+        );
+    }
+
+    #[test]
+    fn the_role_target_comes_from_the_path_when_the_body_omits_user_id() {
+        let auth = session_auth(Role::Admin);
+        assert_eq!(authorize_role_assignment(&auth, 2, None), Ok(2));
+        assert_eq!(
+            authorize_role_assignment(&auth, 1, None),
+            Err(RoleChangeDenied::SelfModification),
+            "the path target still cannot be the caller"
+        );
+    }
+
+    #[test]
+    fn assign_role_body_needs_only_the_role_and_rejects_unknown_fields() {
+        let body: AssignRoleRequest = serde_json::from_str(r#"{"role_type":"admin"}"#).unwrap();
+        assert_eq!(body.user_id, None);
+        assert_eq!(body.role_type, "admin");
+        let legacy: AssignRoleRequest =
+            serde_json::from_str(r#"{"role_type":"admin","user_id":2}"#).unwrap();
+        assert_eq!(legacy.user_id, Some(2));
+        assert!(
+            serde_json::from_str::<AssignRoleRequest>(r#"{"role_type":"admin","user":2}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn update_user_takes_username_keeps_name_as_alias_and_rejects_unknown_fields() {
+        let current: UpdateUserRequest = serde_json::from_str(r#"{"username":"renamed"}"#).unwrap();
+        assert_eq!(current.username.as_deref(), Some("renamed"));
+        assert_eq!(
+            current.requested_username(),
+            Ok(Some("renamed".to_string()))
+        );
+        let legacy: UpdateUserRequest = serde_json::from_str(r#"{"name":"renamed"}"#).unwrap();
+        assert_eq!(legacy.requested_username(), Ok(Some("renamed".to_string())));
+        let both: UpdateUserRequest =
+            serde_json::from_str(r#"{"username":"renamed","name":"renamed"}"#).unwrap();
+        assert_eq!(both.requested_username(), Ok(Some("renamed".to_string())));
+        let conflicting: UpdateUserRequest =
+            serde_json::from_str(r#"{"username":"one","name":"other"}"#).unwrap();
+        let reason = conflicting.requested_username().unwrap_err();
+        assert!(
+            reason.contains("'one'") && reason.contains("'other'"),
+            "{reason}"
+        );
+        assert!(
+            serde_json::from_str::<UpdateUserRequest>(r#"{"user_name":"renamed"}"#).is_err(),
+            "a misspelt field is an error, not a silent no-op"
         );
     }
 
@@ -3791,7 +3855,7 @@ mod tests {
         // caller=1, path=body=1 -> still a self-modification.
         let auth = session_auth(Role::Admin);
         assert_eq!(
-            authorize_role_assignment(&auth, 1, 1),
+            authorize_role_assignment(&auth, 1, Some(1)),
             Err(RoleChangeDenied::SelfModification)
         );
         assert_eq!(
@@ -3805,7 +3869,7 @@ mod tests {
         // A non-admin must be denied regardless of how the ids line up.
         let auth = session_auth(Role::PlatformAdmin);
         assert_eq!(
-            authorize_role_assignment(&auth, 2, 1),
+            authorize_role_assignment(&auth, 2, Some(1)),
             Err(RoleChangeDenied::MissingPermission)
         );
     }
@@ -3818,7 +3882,7 @@ mod tests {
             Extension(request_metadata()),
             Path(2),
             Json(AssignRoleRequest {
-                user_id: 2,
+                user_id: None,
                 role_type: "admin".to_string(),
             }),
         )
@@ -3838,7 +3902,7 @@ mod tests {
             Extension(request_metadata()),
             Path(2),
             Json(AssignRoleRequest {
-                user_id: 2,
+                user_id: None,
                 role_type: "admin".to_string(),
             }),
         )
@@ -3858,7 +3922,7 @@ mod tests {
             Extension(request_metadata()),
             Path(2),
             Json(AssignRoleRequest {
-                user_id: 3,
+                user_id: Some(3),
                 role_type: "user".to_string(),
             }),
         )
@@ -3954,6 +4018,7 @@ mod tests {
                 Path(2),
                 Json(UpdateUserRequest {
                     email: Some("changed@example.com".to_string()),
+                    username: None,
                     name: None,
                 }),
             )
@@ -4269,6 +4334,7 @@ mod tests {
                 Path(2),
                 Json(UpdateUserRequest {
                     email: Some("changed@example.com".to_string()),
+                    username: None,
                     name: None,
                 }),
             )
@@ -4744,6 +4810,132 @@ mod tests {
         /// Issue #1590: a user who lost both their authenticator and their
         /// recovery codes had no way back in, because nothing let an admin
         /// remove another account's second factor.
+        /// `POST /users/{id}/roles` takes the target from the path, answers
+        /// with the user and its roles as JSON, and refuses a body id that
+        /// disagrees with the path (#2047).
+        #[tokio::test]
+        async fn role_assignment_takes_the_path_target_and_answers_json() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let admin =
+                insert_user(&db, &format!("admin-{}@example.com", uuid::Uuid::new_v4())).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            let target =
+                insert_user(&db, &format!("target-{}@example.com", uuid::Uuid::new_v4())).await;
+            let uri = format!("/users/{}/roles", target.id);
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                &uri,
+                None,
+                Some(serde_json::json!({"role_type": "admin"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                &uri,
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({"role_type": "admin", "user_id": admin.id})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                &uri,
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({"role_type": "admin"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["user"]["id"], target.id, "{body}");
+            let roles: Vec<&str> = body["roles"]
+                .as_array()
+                .expect("roles array")
+                .iter()
+                .filter_map(|role| role["name"].as_str())
+                .collect();
+            assert!(roles.contains(&"admin"), "{body}");
+        }
+
+        /// `PATCH /users/{id}` renames with `username`, still accepts the
+        /// deprecated `name`, and rejects an unknown field (#2047).
+        #[tokio::test]
+        async fn user_update_renames_with_username() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let admin =
+                insert_user(&db, &format!("admin-{}@example.com", uuid::Uuid::new_v4())).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            let target =
+                insert_user(&db, &format!("target-{}@example.com", uuid::Uuid::new_v4())).await;
+            let uri = format!("/users/{}", target.id);
+
+            let (status, body) = send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({"username": "renamed-user"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["user"]["username"], "renamed-user", "{body}");
+
+            let (status, body) = send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({"name": "legacy-name"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["user"]["username"], "legacy-name", "{body}");
+
+            let (status, body) = send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({"username": "one", "name": "other"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("disagree"),
+                "{body}"
+            );
+
+            let (status, _) = send(
+                &app,
+                "PATCH",
+                &uri,
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({"user_name": "ignored"})),
+            )
+            .await;
+            assert!(status.is_client_error(), "unknown field: {status}");
+        }
+
         #[tokio::test]
         async fn admin_mfa_reset_lets_a_user_who_lost_every_factor_sign_in_again() {
             use sea_orm::EntityTrait;

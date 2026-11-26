@@ -9,6 +9,7 @@ import {
   nodePairingCancel,
   nodePairingCreate,
   nodePairingList,
+  wireguardMeshDisable,
   wireguardMeshEnable,
   wireguardMeshHubSet,
   wireguardMeshStatusGet,
@@ -340,7 +341,7 @@ export function registerNodesCommands(program: Command): void {
     .command('enable')
     .description(
       'Turn the WireGuard mesh on. The control plane and every agent move onto it within a ' +
-        'minute; it cannot be turned off again'
+        'minute; it can be turned off again only while no node is on it'
     )
     .option('--cidr <cidr>', 'Mesh address pool (private IPv4, clear of the compute pool)')
     .option('--port <port>', 'UDP port every node must accept from the others', parsePortOption)
@@ -352,6 +353,17 @@ export function registerNodesCommands(program: Command): void {
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .option('--json', 'Output in JSON format')
     .action(meshEnableAction)
+
+  mesh
+    .command('disable')
+    .description(
+      'Turn the WireGuard mesh off. Refused, with the reason, while a node is on it, a ' +
+        'pairing is in progress or the cluster network runs over it. The control plane stops ' +
+        'tending its end; the interface itself goes away when `temps serve` restarts'
+    )
+    .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
+    .option('--json', 'Output in JSON format')
+    .action(meshDisableAction)
 
   const hub = mesh
     .command('hub')
@@ -667,7 +679,8 @@ async function meshEnableAction(options: {
     const confirmed = await promptConfirm({
       message:
         'Turn on the WireGuard mesh? Every node must accept its UDP port from the others, ' +
-        'cross-node traffic pauses while nodes switch, and it cannot be turned off again.',
+        'cross-node traffic pauses while nodes switch, and it can be turned off again only ' +
+        'while no node is on it.',
       default: false,
     })
     if (!confirmed) {
@@ -695,6 +708,39 @@ async function meshEnableAction(options: {
     return
   }
   success(`WireGuard mesh enabled (${result.cidr}, UDP ${result.listen_port})`)
+  printMesh(result)
+}
+
+async function meshDisableAction(options: { yes?: boolean; json?: boolean }): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message:
+        'Turn off the WireGuard mesh? Nodes can no longer join over the internet until it is ' +
+        'turned on again.',
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  const result = await withSpinner('Turning the WireGuard mesh off...', async () => {
+    const { data, error } = await wireguardMeshDisable()
+    if (error || !data) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+  success('WireGuard mesh turned off')
   printMesh(result)
 }
 

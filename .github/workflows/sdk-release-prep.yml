@@ -4,9 +4,10 @@
 name: SDK Release Prep
 
 # Prepares SDK releases for a server tag so nobody picks versions by hand.
-# `sdk_release.py prepare` derives each catalog package's next version from
-# the Conventional Commits that touched it since its last package tag, bumps
-# the manifests and lockfiles, and records the selection for the tag in
+# `sdk_release.py prepare` sets every catalog package to the server tag's
+# version (a package whose catalog `versioning` keeps its own line, such as the
+# CLI, is bumped from the Conventional Commits since its last package tag),
+# bumps the manifests and lockfiles, and records the selection for the tag in
 # .github/releases/prepared.json. A PR carries that change to main; the
 # release.yml run for the server tag then tests, publishes and tags exactly
 # the versions it lists.
@@ -86,7 +87,7 @@ jobs:
 
       # Preparation reads main. A release branch merges into the tag, so an SDK
       # commit only on that branch would ship unversioned; it must land on main.
-      - name: Prepare SDK versions from Conventional Commits
+      - name: Prepare SDK versions for the server tag
         id: prepare
         env:
           TARGET: ${{ steps.target.outputs.tag }}
@@ -212,9 +213,10 @@ jobs:
           git commit -q -s -F - <<EOF
           chore(release): prepare SDKs for ${TARGET}
 
-          Versions derived by scripts/sdk_release.py prepare from the
-          Conventional Commits since each package's last release. The
-          release.yml run for ${TARGET} publishes them.
+          Versions derived by scripts/sdk_release.py prepare: the server
+          version, or for packages on their own line the Conventional Commits
+          since their last release. The release.yml run for ${TARGET}
+          publishes them.
           EOF
 
           # Only ever replace this workflow's own commits on the branch.
