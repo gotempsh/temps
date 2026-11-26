@@ -118,6 +118,22 @@ fn scope_change(
     }))
 }
 
+/// Longest part of a refused key or service name repeated in an error. The
+/// input itself can be up to the request body limit, and an error must not
+/// echo all of it back.
+const MAX_ECHOED_CHARS: usize = 64;
+
+/// `value` as an error repeats it: whole when short, otherwise its first
+/// [`MAX_ECHOED_CHARS`] characters followed by `…`.
+fn echoed(value: &str) -> String {
+    if value.chars().count() <= MAX_ECHOED_CHARS {
+        return value.to_string();
+    }
+    let mut shown: String = value.chars().take(MAX_ECHOED_CHARS).collect();
+    shown.push('…');
+    shown
+}
+
 /// Validates a secret key. Keys become file names under `/run/secrets/` and
 /// are commonly consumed as env-var-like identifiers, so we require the same
 /// conservative shape: uppercase letters, digits, and underscores; must start
@@ -125,33 +141,33 @@ fn scope_change(
 fn validate_secret_key(key: &str) -> Result<(), SecretError> {
     if key.is_empty() {
         return Err(SecretError::InvalidKey {
-            key: key.to_string(),
+            key: echoed(key),
             reason: "key cannot be empty".to_string(),
         });
     }
     if key.len() > 255 {
         return Err(SecretError::InvalidKey {
-            key: key.to_string(),
+            key: echoed(key),
             reason: format!("key length {} exceeds 255", key.len()),
         });
     }
     let mut chars = key.chars();
     let Some(first) = chars.next() else {
         return Err(SecretError::InvalidKey {
-            key: key.to_string(),
+            key: echoed(key),
             reason: "key cannot be empty".to_string(),
         });
     };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Err(SecretError::InvalidKey {
-            key: key.to_string(),
+            key: echoed(key),
             reason: "key must start with a letter or underscore".to_string(),
         });
     }
     for c in chars {
         if !(c.is_ascii_alphanumeric() || c == '_') {
             return Err(SecretError::InvalidKey {
-                key: key.to_string(),
+                key: echoed(key),
                 reason: format!("invalid character '{}' (allowed: A-Z, a-z, 0-9, _)", c),
             });
         }
@@ -169,19 +185,19 @@ fn validate_secret_key(key: &str) -> Result<(), SecretError> {
 fn validate_compose_service_name(name: &str) -> Result<(), SecretError> {
     if name.is_empty() {
         return Err(SecretError::InvalidComposeService {
-            service: name.to_string(),
+            service: echoed(name),
             reason: "service name cannot be empty".to_string(),
         });
     }
     if name.len() > 255 {
         return Err(SecretError::InvalidComposeService {
-            service: name.to_string(),
+            service: echoed(name),
             reason: format!("service name length {} exceeds 255", name.len()),
         });
     }
     if name == "." || name == ".." {
         return Err(SecretError::InvalidComposeService {
-            service: name.to_string(),
+            service: echoed(name),
             reason: "service name cannot be '.' or '..'".to_string(),
         });
     }
@@ -190,7 +206,7 @@ fn validate_compose_service_name(name: &str) -> Result<(), SecretError> {
         .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-'))
     {
         return Err(SecretError::InvalidComposeService {
-            service: name.to_string(),
+            service: echoed(name),
             reason: format!("invalid character '{c}' (allowed: A-Z, a-z, 0-9, '.', '_', '-')"),
         });
     }
@@ -614,19 +630,28 @@ impl SecretService {
         Ok(result)
     }
 
-    /// Updates a secret's value and/or environment membership. Key is
-    /// immutable here — rotating a secret keeps the same key so consumers
-    /// don't need config changes.
+    /// Updates a secret's value and/or scope. Key is immutable here —
+    /// rotating a secret keeps the same key so consumers don't need config
+    /// changes.
+    ///
+    /// `None` keeps the stored value of that field: the ciphertext, the
+    /// environments, the preview flag or the compose services. Only a field
+    /// that is given replaces what is stored, so rotating a value never
+    /// changes who can read it. `Some(vec![])` for `environment_ids` scopes
+    /// the secret to every environment of the project, and for
+    /// `compose_services` to every service, as on create.
     pub async fn update(
         &self,
         project_id: i32,
         secret_id: i32,
         new_value: Option<String>,
-        environment_ids: Vec<i32>,
-        include_in_preview: bool,
-        compose_services: Vec<String>,
+        environment_ids: Option<Vec<i32>>,
+        include_in_preview: Option<bool>,
+        compose_services: Option<Vec<String>>,
     ) -> Result<SecretWithEnvironments, SecretError> {
-        let compose_services = normalize_compose_services(compose_services)?;
+        let compose_services = compose_services
+            .map(normalize_compose_services)
+            .transpose()?;
         if let Some(v) = &new_value {
             if v.len() > SECRET_VALUE_MAX_BYTES {
                 // Key unknown here without a DB read; use a placeholder that the
@@ -670,117 +695,86 @@ impl SecretService {
                 let compose_services = compose_services.clone();
                 Box::pin(async move {
                     let row = Self::lock_for_write(txn, project_id, secret_id).await?;
-                    // Bindings to deleted environments survive the update
-                    // (see `bound_deleted_environments`). Their ids may come
-                    // back from a client that echoes the secret's current
-                    // environments; treat them as "keep as-is". Any other
-                    // deleted or foreign id is still rejected below.
-                    let preserved_environments =
-                        Self::bound_deleted_environments(txn, project_id, secret_id).await?;
-                    let preserved_ids = preserved_environments
-                        .iter()
-                        .map(|environment| environment.id)
-                        .collect::<Vec<_>>();
-                    let requested_ids = environment_ids
-                        .into_iter()
-                        .filter(|environment_id| !preserved_ids.contains(environment_id))
-                        .collect::<Vec<_>>();
-                    let scoped_environments =
-                        Self::environments_in_project(txn, project_id, &requested_ids).await?;
-                    let environment_ids = scoped_environments
-                        .iter()
-                        .map(|environment| environment.id)
-                        .collect::<Vec<_>>();
-                    // The scope the secret ends up with, preserved bindings
-                    // included: what collisions and history are judged on.
-                    let final_environment_ids = environment_ids
-                        .iter()
-                        .chain(preserved_ids.iter())
-                        .copied()
-                        .collect::<Vec<_>>();
-                    Self::claim_key_scope(
-                        txn,
-                        project_id,
-                        &row.key,
-                        &final_environment_ids,
-                        Some(secret_id),
-                    )
-                    .await?;
 
-                    let previous_environments = secret_environments::Entity::find()
+                    let previous_bindings = secret_environments::Entity::find()
                         .filter(secret_environments::Column::SecretId.eq(secret_id))
+                        .find_also_related(environments::Entity)
+                        .order_by_asc(secret_environments::Column::EnvironmentId)
                         .all(txn)
-                        .await?
-                        .into_iter()
-                        .map(|junction| junction.environment_id)
+                        .await?;
+                    let previous_environments = previous_bindings
+                        .iter()
+                        .map(|(junction, _)| junction.environment_id)
                         .collect::<Vec<_>>();
                     let previous_services = secret_compose_services::Entity::find()
                         .filter(secret_compose_services::Column::SecretId.eq(secret_id))
+                        .order_by_asc(secret_compose_services::Column::ServiceName)
                         .all(txn)
                         .await?
                         .into_iter()
                         .map(|junction| junction.service_name)
                         .collect::<Vec<_>>();
 
+                    let (envs, final_environment_ids) = match environment_ids {
+                        Some(environment_ids) => {
+                            Self::replace_environments(
+                                txn,
+                                project_id,
+                                secret_id,
+                                &row.key,
+                                environment_ids,
+                            )
+                            .await?
+                        }
+                        // The scope is not part of the update: keep every
+                        // binding as it is.
+                        None => (
+                            previous_bindings
+                                .into_iter()
+                                .filter_map(|(_, environment)| environment)
+                                .map(|env| SecretEnvironmentRef {
+                                    id: env.id,
+                                    name: env.name,
+                                    main_url: env.subdomain,
+                                })
+                                .collect::<Vec<_>>(),
+                            previous_environments.clone(),
+                        ),
+                    };
+
                     let mut active: secrets::ActiveModel = row.into();
                     if let Some(v) = encrypted_new {
                         active.value = Set(v);
                     }
-                    active.include_in_preview = Set(include_in_preview);
+                    if let Some(include_in_preview) = include_in_preview {
+                        active.include_in_preview = Set(include_in_preview);
+                    }
                     active.updated_at = Set(chrono::Utc::now());
                     let row = active.update(txn).await?;
 
-                    let mut replaced_bindings = secret_environments::Entity::delete_many()
-                        .filter(secret_environments::Column::SecretId.eq(secret_id));
-                    if !preserved_ids.is_empty() {
-                        replaced_bindings = replaced_bindings.filter(
-                            secret_environments::Column::EnvironmentId
-                                .is_not_in(preserved_ids.iter().copied()),
-                        );
-                    }
-                    replaced_bindings.exec(txn).await?;
-
-                    let mut envs = preserved_environments
-                        .into_iter()
-                        .map(|env| SecretEnvironmentRef {
-                            id: env.id,
-                            name: env.name,
-                            main_url: env.subdomain,
-                        })
-                        .collect::<Vec<_>>();
-                    for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
-                        let junction = secret_environments::ActiveModel {
-                            secret_id: Set(row.id),
-                            environment_id: Set(*env_id),
-                            created_at: Set(chrono::Utc::now()),
-                            ..Default::default()
-                        };
-                        junction.insert(txn).await?;
-
-                        envs.push(SecretEnvironmentRef {
-                            id: env.id,
-                            name: env.name,
-                            main_url: env.subdomain,
-                        });
-                    }
-
-                    // Replace the scope wholesale, same as environments above:
-                    // a PATCH that omits a service must remove that service's
-                    // access, not silently keep it.
-                    secret_compose_services::Entity::delete_many()
-                        .filter(secret_compose_services::Column::SecretId.eq(secret_id))
-                        .exec(txn)
-                        .await?;
-                    for service in &compose_services {
-                        secret_compose_services::ActiveModel {
-                            secret_id: Set(row.id),
-                            service_name: Set(service.clone()),
-                            created_at: Set(chrono::Utc::now()),
-                            ..Default::default()
+                    let compose_services = match compose_services {
+                        Some(compose_services) => {
+                            // Replace the scope wholesale, same as
+                            // environments: a list that leaves a service out
+                            // removes that service's access.
+                            secret_compose_services::Entity::delete_many()
+                                .filter(secret_compose_services::Column::SecretId.eq(secret_id))
+                                .exec(txn)
+                                .await?;
+                            for service in &compose_services {
+                                secret_compose_services::ActiveModel {
+                                    secret_id: Set(row.id),
+                                    service_name: Set(service.clone()),
+                                    created_at: Set(chrono::Utc::now()),
+                                    ..Default::default()
+                                }
+                                .insert(txn)
+                                .await?;
+                            }
+                            compose_services
                         }
-                        .insert(txn)
-                        .await?;
-                    }
+                        None => previous_services.clone(),
+                    };
 
                     if let Some(details) = scope_change(
                         previous_environments,
@@ -815,6 +809,88 @@ impl SecretService {
             .await?;
 
         Ok(result)
+    }
+
+    /// Replaces a secret's environment bindings with `environment_ids` and
+    /// returns the environments it is bound to afterwards, with their ids.
+    async fn replace_environments(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        secret_id: i32,
+        key: &str,
+        environment_ids: Vec<i32>,
+    ) -> Result<(Vec<SecretEnvironmentRef>, Vec<i32>), SecretError> {
+        // Bindings to deleted environments survive the update (see
+        // `bound_deleted_environments`). Their ids may come back from a
+        // client that echoes the secret's current environments; treat them
+        // as "keep as-is". Any other deleted or foreign id is still rejected
+        // below.
+        let preserved_environments =
+            Self::bound_deleted_environments(txn, project_id, secret_id).await?;
+        let preserved_ids = preserved_environments
+            .iter()
+            .map(|environment| environment.id)
+            .collect::<Vec<_>>();
+        let requested_ids = environment_ids
+            .into_iter()
+            .filter(|environment_id| !preserved_ids.contains(environment_id))
+            .collect::<Vec<_>>();
+        let scoped_environments =
+            Self::environments_in_project(txn, project_id, &requested_ids).await?;
+        let environment_ids = scoped_environments
+            .iter()
+            .map(|environment| environment.id)
+            .collect::<Vec<_>>();
+        // The scope the secret ends up with, preserved bindings included:
+        // what collisions and history are judged on.
+        let final_environment_ids = environment_ids
+            .iter()
+            .chain(preserved_ids.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        Self::claim_key_scope(
+            txn,
+            project_id,
+            key,
+            &final_environment_ids,
+            Some(secret_id),
+        )
+        .await?;
+
+        let mut replaced_bindings = secret_environments::Entity::delete_many()
+            .filter(secret_environments::Column::SecretId.eq(secret_id));
+        if !preserved_ids.is_empty() {
+            replaced_bindings = replaced_bindings.filter(
+                secret_environments::Column::EnvironmentId.is_not_in(preserved_ids.iter().copied()),
+            );
+        }
+        replaced_bindings.exec(txn).await?;
+
+        let mut envs = preserved_environments
+            .into_iter()
+            .map(|env| SecretEnvironmentRef {
+                id: env.id,
+                name: env.name,
+                main_url: env.subdomain,
+            })
+            .collect::<Vec<_>>();
+        for (env_id, env) in environment_ids.iter().zip(scoped_environments) {
+            secret_environments::ActiveModel {
+                secret_id: Set(secret_id),
+                environment_id: Set(*env_id),
+                created_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            }
+            .insert(txn)
+            .await?;
+
+            envs.push(SecretEnvironmentRef {
+                id: env.id,
+                name: env.name,
+                main_url: env.subdomain,
+            });
+        }
+        Ok((envs, final_environment_ids))
     }
 
     /// Locks a secret for update or delete, together with the credential checks
@@ -1093,6 +1169,50 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SecretError::InvalidKey { .. }));
+    }
+
+    #[tokio::test]
+    async fn refusals_of_oversized_names_do_not_echo_them_in_full() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = SecretService::new(db, make_encryption_service());
+        let huge = "s".repeat(200_000);
+
+        let err = service
+            .create(
+                10,
+                vec![],
+                "API_TOKEN".to_string(),
+                "v".to_string(),
+                false,
+                vec![huge.clone()],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SecretError::InvalidComposeService { .. }));
+        let message = err.to_string();
+        assert!(message.len() < 512, "{} bytes", message.len());
+        assert!(message.contains("exceeds 255"), "{message}");
+        assert!(message.contains('…'), "{message}");
+
+        let err = service
+            .create(10, vec![], huge, "v".to_string(), false, vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SecretError::InvalidKey { .. }));
+        let message = err.to_string();
+        assert!(message.len() < 512, "{} bytes", message.len());
+        assert!(message.contains("exceeds 255"), "{message}");
+    }
+
+    #[test]
+    fn short_refused_names_are_echoed_whole() {
+        let err = validate_compose_service_name("web/api").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid compose service name 'web/api': invalid character '/' (allowed: A-Z, a-z, 0-9, '.', '_', '-')"
+        );
+        assert_eq!(echoed(&"x".repeat(64)), "x".repeat(64));
+        assert_eq!(echoed(&"x".repeat(65)), format!("{}…", "x".repeat(64)));
     }
 
     #[tokio::test]
@@ -1608,9 +1728,9 @@ mod integration_tests {
                 project.id,
                 original.id,
                 Some("replacement".to_string()),
-                vec![staging.id],
-                true,
-                vec!["web".to_string()],
+                Some(vec![staging.id]),
+                Some(true),
+                Some(vec!["web".to_string()]),
             )
             .await
             .expect_err("moving onto an occupied key scope should fail");
@@ -1803,9 +1923,9 @@ mod integration_tests {
                     project_id,
                     secret.id,
                     None,
-                    vec![target_id],
-                    false,
-                    Vec::new(),
+                    Some(vec![target_id]),
+                    Some(false),
+                    Some(Vec::new()),
                 )
                 .await
         });
@@ -1906,9 +2026,9 @@ mod integration_tests {
                     project_id,
                     secret.id,
                     None,
-                    vec![target_id],
-                    false,
-                    Vec::new(),
+                    Some(vec![target_id]),
+                    Some(false),
+                    Some(Vec::new()),
                 )
                 .await
         });
@@ -1966,9 +2086,9 @@ mod integration_tests {
                             project_id,
                             secret_id,
                             Some("rotated".into()),
-                            vec![],
-                            false,
-                            vec![],
+                            Some(vec![]),
+                            Some(false),
+                            Some(vec![]),
                         )
                         .await
                         .map(|_| ())
@@ -2040,9 +2160,9 @@ mod integration_tests {
                 project.id,
                 secret.id,
                 Some("rotated".into()),
-                vec![removed.id],
-                false,
-                Vec::new(),
+                Some(vec![removed.id]),
+                Some(false),
+                Some(Vec::new()),
             )
             .await
             .expect("a stale id for a bound deleted environment must not block the save");
@@ -2066,7 +2186,14 @@ mod integration_tests {
         // Clearing the selection must not drop the deleted binding: with no
         // bindings left the secret would be mounted in every environment.
         service
-            .update(project.id, secret.id, None, vec![], false, Vec::new())
+            .update(
+                project.id,
+                secret.id,
+                None,
+                Some(vec![]),
+                Some(false),
+                Some(Vec::new()),
+            )
             .await
             .expect("clearing the live selection should succeed");
         assert_eq!(
@@ -2080,9 +2207,9 @@ mod integration_tests {
                 project.id,
                 secret.id,
                 None,
-                vec![live.id],
-                false,
-                Vec::new(),
+                Some(vec![live.id]),
+                Some(false),
+                Some(Vec::new()),
             )
             .await
             .expect("adding a live environment should succeed");
@@ -2110,9 +2237,9 @@ mod integration_tests {
                 project.id,
                 secret.id,
                 None,
-                vec![live.id, foreign.id],
-                false,
-                Vec::new(),
+                Some(vec![live.id, foreign.id]),
+                Some(false),
+                Some(Vec::new()),
             )
             .await
             .expect_err("another project's environment must be rejected");
@@ -2145,7 +2272,14 @@ mod integration_tests {
 
         // Re-saving the same scope and preview flag records nothing.
         service
-            .update(project.id, secret.id, None, vec![staging.id], false, vec![])
+            .update(
+                project.id,
+                secret.id,
+                None,
+                Some(vec![staging.id]),
+                Some(false),
+                Some(vec![]),
+            )
             .await
             .expect("no-op update should succeed");
         assert_eq!(
@@ -2158,9 +2292,9 @@ mod integration_tests {
                 project.id,
                 secret.id,
                 Some("rotated-plaintext".into()),
-                vec![production.id],
-                true,
-                vec![],
+                Some(vec![production.id]),
+                Some(true),
+                Some(vec![]),
             )
             .await
             .expect("update should succeed");
@@ -2202,5 +2336,190 @@ mod integration_tests {
             .expect("delete should succeed");
         assert_eq!(key, "TLS_CERT");
         assert!(secret_history_kinds(&test_db, secret.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rotating_only_the_value_keeps_the_secret_scope() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = secret_service(&test_db);
+        let project = create_project(&test_db, "rotate-only").await;
+        let production = create_environment(&test_db, project.id, "rotate-production").await;
+        let staging = create_environment(&test_db, project.id, "rotate-staging").await;
+        let secret = service
+            .create(
+                project.id,
+                vec![production.id],
+                "API_TOKEN".to_string(),
+                "first".to_string(),
+                true,
+                vec!["web".to_string()],
+            )
+            .await
+            .expect("secret should be created");
+
+        let rotated = service
+            .update(
+                project.id,
+                secret.id,
+                Some("second".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("a value-only update should succeed");
+
+        assert_eq!(
+            rotated
+                .environments
+                .iter()
+                .map(|env| env.id)
+                .collect::<Vec<_>>(),
+            vec![production.id],
+            "the response reports the kept environments"
+        );
+        assert!(rotated.include_in_preview, "the preview flag is kept");
+        assert_eq!(rotated.compose_services, vec!["web".to_string()]);
+        assert_eq!(
+            bound_environment_ids(&test_db, secret.id).await,
+            vec![production.id],
+            "the stored bindings are untouched"
+        );
+
+        let production_secrets = service
+            .get_for_deploy(project.id, Some(production.id))
+            .await
+            .expect("production secrets should load");
+        assert_eq!(
+            production_secrets.get("API_TOKEN").map(String::as_str),
+            Some("second")
+        );
+        let staging_secrets = service
+            .get_for_deploy(project.id, Some(staging.id))
+            .await
+            .expect("staging secrets should load");
+        assert!(
+            !staging_secrets.contains_key("API_TOKEN"),
+            "a production-only secret must not reach staging after a rotation"
+        );
+
+        let stored = service
+            .get(project.id, secret.id)
+            .await
+            .expect("secret should load");
+        assert!(stored.include_in_preview);
+        assert_eq!(stored.compose_services, vec!["web".to_string()]);
+        assert!(
+            !secret_history_kinds(&test_db, secret.id)
+                .await
+                .contains(&"scope_changed".to_string()),
+            "a value rotation is not a scope change"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_scope_field_is_replaced_only_when_given() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = secret_service(&test_db);
+        let project = create_project(&test_db, "one-field").await;
+        let production = create_environment(&test_db, project.id, "one-field-production").await;
+        let staging = create_environment(&test_db, project.id, "one-field-staging").await;
+        let secret = service
+            .create(
+                project.id,
+                vec![production.id],
+                "SIGNING_KEY".to_string(),
+                "value".to_string(),
+                true,
+                vec!["web".to_string(), "worker".to_string()],
+            )
+            .await
+            .expect("secret should be created");
+
+        // Only the preview flag.
+        let updated = service
+            .update(project.id, secret.id, None, None, Some(false), None)
+            .await
+            .expect("preview-only update should succeed");
+        assert!(!updated.include_in_preview);
+        assert_eq!(
+            bound_environment_ids(&test_db, secret.id).await,
+            vec![production.id]
+        );
+        assert_eq!(
+            updated.compose_services,
+            vec!["web".to_string(), "worker".to_string()]
+        );
+
+        // Only the compose services.
+        let updated = service
+            .update(
+                project.id,
+                secret.id,
+                None,
+                None,
+                None,
+                Some(vec!["worker".to_string()]),
+            )
+            .await
+            .expect("services-only update should succeed");
+        assert_eq!(updated.compose_services, vec!["worker".to_string()]);
+        assert!(!updated.include_in_preview);
+        assert_eq!(
+            bound_environment_ids(&test_db, secret.id).await,
+            vec![production.id]
+        );
+
+        // Only the environments.
+        let updated = service
+            .update(
+                project.id,
+                secret.id,
+                None,
+                Some(vec![staging.id]),
+                None,
+                None,
+            )
+            .await
+            .expect("environments-only update should succeed");
+        assert_eq!(
+            bound_environment_ids(&test_db, secret.id).await,
+            vec![staging.id]
+        );
+        assert_eq!(updated.compose_services, vec!["worker".to_string()]);
+        assert!(!updated.include_in_preview);
+
+        // An explicit empty list still means every environment, as on create.
+        let updated = service
+            .update(project.id, secret.id, None, Some(vec![]), None, None)
+            .await
+            .expect("an explicit project-wide scope should be accepted");
+        assert!(updated.environments.is_empty());
+        assert!(bound_environment_ids(&test_db, secret.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn value_only_update_of_a_missing_secret_names_it() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = secret_service(&test_db);
+        let project = create_project(&test_db, "missing").await;
+
+        let error = service
+            .update(project.id, 999_999, Some("x".to_string()), None, None, None)
+            .await
+            .expect_err("a missing secret must be reported");
+        assert!(
+            matches!(
+                error,
+                SecretError::NotFound { secret_id: 999_999, project_id } if project_id == project.id
+            ),
+            "{error:?}"
+        );
     }
 }
