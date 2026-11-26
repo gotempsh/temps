@@ -5,6 +5,7 @@ import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { FunnelForm, FunnelFormData } from '@/components/funnel/FunnelForm'
 import { funnelFormData } from '@/components/funnel/funnel-form-data'
+import { refreshSavedFunnel } from '@/components/funnel/funnel-cache'
 import {
   getFunnelOptions,
   updateFunnelMutation,
@@ -64,10 +65,8 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
     meta: {
       errorTitle: 'Failed to update funnel',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
-      queryClient.invalidateQueries({ queryKey: ['getFunnel'] })
-      queryClient.invalidateQueries({ queryKey: ['getFunnelMetrics'] })
+    onSuccess: (saved) => {
+      refreshSavedFunnel(queryClient, project.id, saved)
       setFeedback({ type: 'success', message: 'Funnel updated successfully!' })
     },
     onError: (error) => {

@@ -3,6 +3,7 @@
 
 import { ProjectResponse } from '@/api/client/types.gen'
 import { FunnelForm, FunnelFormData } from '@/components/funnel/FunnelForm'
+import { refreshSavedFunnel } from '@/components/funnel/funnel-cache'
 import { createFunnelMutation } from '@/api/client/@tanstack/react-query.gen'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
@@ -45,8 +46,8 @@ export function CreateFunnel({ project }: CreateFunnelProps) {
     meta: {
       errorTitle: 'Failed to create funnel',
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['listFunnels'] })
+    onSuccess: (saved) => {
+      refreshSavedFunnel(queryClient, project.id, saved)
       setFeedback({ type: 'success', message: 'Funnel created successfully!' })
     },
     onError: (error) => {
