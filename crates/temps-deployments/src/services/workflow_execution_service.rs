@@ -5515,6 +5515,89 @@ mod tests {
         Ok(())
     }
 
+    /// A teardown holds the serving deployment it read before taking the
+    /// environment's lifecycle lock. If a rollback moved the environment back
+    /// to an older deployment meanwhile, that deployment is serving again and
+    /// keeps its containers, although its state is still one a teardown sweeps.
+    #[tokio::test]
+    async fn test_a_teardown_from_a_stale_read_leaves_a_rolled_back_deployment_running(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel};
+        use temps_entities::deployment_containers;
+
+        if !temps_test_utils::docker_available().await {
+            eprintln!("Skipping rolled-back teardown test: Docker unavailable");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, newer) = create_test_data(&db).await?;
+        let rolled_back_to = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("rolled-back-to".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(30)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(rolled_back_to.id),
+            container_id: Set("rolled-back-serving".to_string()),
+            container_name: Set("rolled-back-serving".to_string()),
+            container_port: Set(Some(3000)),
+            status: Set(Some("running".to_string())),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        // The rollback: the environment serves the older deployment again.
+        let mut serving = environment.clone().into_active_model();
+        serving.current_deployment_id = Set(Some(rolled_back_to.id));
+        serving.update(db.as_ref()).await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let config_service = create_mock_config_service(db.clone());
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            Arc::new(queue) as Arc<dyn temps_core::JobQueue>,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service.clone(),
+            Arc::new(ScreenshotService::new(config_service).await?),
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_local_defaults()?,
+            ))),
+        );
+
+        // Torn down with the newer deployment it read as serving.
+        service
+            .teardown_previous_deployment(project.id, environment.id, &newer)
+            .await?;
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("row exists");
+        assert!(
+            row.deleted_at.is_none(),
+            "the deployment the environment serves keeps its containers"
+        );
+        Ok(())
+    }
+
     /// Greptile on #1395: cleanup of retired worker containers must not be
     /// starved by one unreachable worker. A failed attempt moves the row to
     /// the back (its `deleted_at` is re-stamped), and containers on offline
