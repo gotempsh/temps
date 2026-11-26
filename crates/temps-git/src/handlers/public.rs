@@ -586,9 +586,10 @@ pub struct PublicBranchQueryParams {
 
 /// Look up one branch of a public repository by exact name
 ///
-/// Answers with one provider request, so it is exact for repositories with
-/// more branches than `.../branches` returns. A 404 here is the only sound
-/// basis for telling a user a branch does not exist.
+/// Reads the branch by name (after the visibility check every public route
+/// makes), so it is exact for repositories with more branches than
+/// `.../branches` returns. A 404 here is the only sound basis for telling a
+/// user a branch does not exist.
 #[utoipa::path(
     get,
     path = "/git/public/{provider}/{owner}/{repo}/branch",
@@ -637,13 +638,26 @@ pub async fn get_public_branch(
         .await
         .map_err(|e| map_error(e, &owner, &repo))?;
 
+    public_branch_response(found, &info.default_branch, &owner, &repo, &branch_name).map(Json)
+}
+
+/// The provider's answer as the endpoint's response: the branch with
+/// `is_default` from the repository's default, or a 404 Problem naming the
+/// repository and the branch.
+fn public_branch_response(
+    found: Option<crate::services::public_repo::PublicBranch>,
+    default_branch: &str,
+    owner: &str,
+    repo: &str,
+    branch_name: &str,
+) -> Result<BranchInfo, Problem> {
     match found {
-        Some(branch) => Ok(Json(BranchInfo {
-            is_default: branch.name == info.default_branch,
+        Some(branch) => Ok(BranchInfo {
+            is_default: branch.name == default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
-        })),
+        }),
         None => Err(problem_new(StatusCode::NOT_FOUND)
             .with_title("Branch Not Found")
             .with_detail(format!(
@@ -1203,6 +1217,9 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     )
 )]
 pub struct PublicRepositoriesApiDoc;
+
+#[cfg(test)]
+mod branch_tests;
 
 #[cfg(test)]
 mod tests {

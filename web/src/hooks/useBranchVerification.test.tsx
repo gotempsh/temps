@@ -152,3 +152,47 @@ test('refresh spends no provider request when nothing is being verified', async 
   await waitFor(() => expect(view.getByText('not-needed:none')).toBeTruthy())
   expect(api.called('GET', '/repositories/temps/example/branch')).toBe(false)
 })
+
+test('a refresh that answers 404 reports the branch missing, not the cached find', async () => {
+  let deleted = false
+  const { view } = renderProbe({
+    'GET /repositories/temps/example/branch': () =>
+      deleted
+        ? jsonResponse({ title: 'Branch Not Found' }, 404)
+        : jsonResponse({
+            name: 'main',
+            commit_sha: 'a'.repeat(40),
+            protected: false,
+            is_default: false,
+          }),
+  })
+
+  await waitFor(() =>
+    expect(view.getByText(`found:${'a'.repeat(40)}`)).toBeTruthy()
+  )
+  deleted = true
+  fireEvent.click(view.getByText('refresh'))
+  await waitFor(() => expect(view.getByText('missing:none')).toBeTruthy())
+})
+
+test('a refresh that fails for another reason leaves the branch unverified', async () => {
+  let limited = false
+  const { view } = renderProbe({
+    'GET /repositories/temps/example/branch': () =>
+      limited
+        ? jsonResponse({ title: 'Rate limit exceeded' }, 429)
+        : jsonResponse({
+            name: 'main',
+            commit_sha: 'a'.repeat(40),
+            protected: false,
+            is_default: false,
+          }),
+  })
+
+  await waitFor(() =>
+    expect(view.getByText(`found:${'a'.repeat(40)}`)).toBeTruthy()
+  )
+  limited = true
+  fireEvent.click(view.getByText('refresh'))
+  await waitFor(() => expect(view.getByText('unverified:none')).toBeTruthy())
+})

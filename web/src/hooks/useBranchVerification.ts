@@ -117,7 +117,10 @@ export function useBranchVerification({
 
   return useMemo<BranchVerification>(() => {
     if (!asked) return { status: 'not-needed', refresh }
-    if (query.data) return { status: 'found', branch: query.data, refresh }
+    // The latest answer wins. React Query keeps the last successful `data`
+    // when a refetch fails, so checking `data` first would keep reporting a
+    // branch deleted since (a refresh answering 404) as found, with its old
+    // SHA.
     if (query.isError) {
       // Only the server saying "no such branch" settles the question. A 401,
       // 403, 429, 502 or network failure leaves it open, and claiming the
@@ -127,6 +130,7 @@ export function useBranchVerification({
         refresh,
       }
     }
+    if (query.data) return { status: 'found', branch: query.data, refresh }
     return { status: 'checking', refresh }
   }, [asked, query.data, query.error, query.isError, refresh])
 }

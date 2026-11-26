@@ -232,42 +232,7 @@ impl RepoToolsProvider {
             Ok(b) => b,
             Err(e) => return format!("Could not list branches for {owner}/{repo}: {e}"),
         };
-        let capped_by_provider = listed.truncated;
-        let branches = listed.branches;
-
-        if branches.is_empty() {
-            return format!("No branches found in {owner}/{repo}.");
-        }
-
-        let truncated = branches.len() > MAX_BRANCH_COUNT;
-        let shown = if truncated {
-            &branches[..MAX_BRANCH_COUNT]
-        } else {
-            &branches[..]
-        };
-
-        let mut out = format!("Branches in {owner}/{repo} (default: '{default_ref}'):\n");
-        for b in shown {
-            if b.name == default_ref {
-                out.push_str(&format!("  * {} (default)\n", b.name));
-            } else {
-                out.push_str(&format!("    {}\n", b.name));
-            }
-        }
-        if truncated {
-            out.push_str(&format!(
-                "\n[truncated — showing {MAX_BRANCH_COUNT} of {} branches]\n",
-                branches.len()
-            ));
-        }
-        // Say so, or the model reads this list as the repository's whole set
-        // and tells the user an unlisted branch does not exist.
-        if capped_by_provider {
-            out.push_str(
-                "\n[the git provider's own branch listing was capped, so this is not every branch in the repository]\n",
-            );
-        }
-        out
+        format_branch_listing(&owner, &repo, &default_ref, listed)
     }
 
     /// Execute `list_repo_tags`: list tag names.
@@ -519,6 +484,52 @@ impl ConversationContextProvider for RepoToolsProvider {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The `list_repo_branches` result the model reads: the branch names, the
+/// default marked, and a notice whenever the list is not the whole set.
+fn format_branch_listing(
+    owner: &str,
+    repo: &str,
+    default_ref: &str,
+    listed: temps_git::services::git_provider::BranchList,
+) -> String {
+    let capped_by_provider = listed.truncated;
+    let branches = listed.branches;
+
+    if branches.is_empty() {
+        return format!("No branches found in {owner}/{repo}.");
+    }
+
+    let truncated = branches.len() > MAX_BRANCH_COUNT;
+    let shown = if truncated {
+        &branches[..MAX_BRANCH_COUNT]
+    } else {
+        &branches[..]
+    };
+
+    let mut out = format!("Branches in {owner}/{repo} (default: '{default_ref}'):\n");
+    for b in shown {
+        if b.name == default_ref {
+            out.push_str(&format!("  * {} (default)\n", b.name));
+        } else {
+            out.push_str(&format!("    {}\n", b.name));
+        }
+    }
+    if truncated {
+        out.push_str(&format!(
+            "\n[truncated — showing {MAX_BRANCH_COUNT} of {} branches]\n",
+            branches.len()
+        ));
+    }
+    // Say so, or the model reads this list as the repository's whole set
+    // and tells the user an unlisted branch does not exist.
+    if capped_by_provider {
+        out.push_str(
+            "\n[the git provider's own branch listing was capped, so this is not every branch in the repository]\n",
+        );
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -838,5 +849,69 @@ mod tests {
             identical_build_mode: Default::default(),
             identical_build_scope: Default::default(),
         }
+    }
+
+    fn branches(names: &[&str]) -> Vec<temps_git::services::git_provider::Branch> {
+        names
+            .iter()
+            .map(|name| temps_git::services::git_provider::Branch {
+                name: (*name).to_string(),
+                commit_sha: "a".repeat(40),
+                protected: false,
+            })
+            .collect()
+    }
+
+    const CAP_NOTICE: &str = "the git provider's own branch listing was capped";
+
+    #[test]
+    fn a_listing_the_provider_capped_tells_the_model_it_is_not_every_branch() {
+        use temps_git::services::git_provider::BranchList;
+        let out = format_branch_listing(
+            "temps",
+            "example",
+            "main",
+            BranchList::truncated(branches(&["main", "topic"])),
+        );
+
+        assert!(out.contains("  * main (default)"), "{out}");
+        assert!(out.contains("    topic"), "{out}");
+        assert!(out.contains(CAP_NOTICE), "{out}");
+    }
+
+    #[test]
+    fn a_whole_listing_carries_no_cap_notice() {
+        use temps_git::services::git_provider::BranchList;
+        let out = format_branch_listing(
+            "temps",
+            "example",
+            "main",
+            BranchList::complete(branches(&["main", "topic"])),
+        );
+
+        assert!(!out.contains(CAP_NOTICE), "{out}");
+        assert!(!out.contains("[truncated"), "{out}");
+    }
+
+    #[test]
+    fn a_capped_and_shortened_listing_says_both() {
+        use temps_git::services::git_provider::BranchList;
+        let names: Vec<String> = (0..=MAX_BRANCH_COUNT).map(|n| format!("b-{n}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let out = format_branch_listing(
+            "temps",
+            "example",
+            "main",
+            BranchList::truncated(branches(&refs)),
+        );
+
+        assert!(
+            out.contains(&format!(
+                "[truncated — showing {MAX_BRANCH_COUNT} of {} branches]",
+                MAX_BRANCH_COUNT + 1
+            )),
+            "{out}"
+        );
+        assert!(out.contains(CAP_NOTICE), "{out}");
     }
 }
