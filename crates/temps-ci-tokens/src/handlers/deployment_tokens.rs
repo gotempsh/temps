@@ -293,7 +293,7 @@ async fn get_deployment_token(
     request_body = UpdateDeploymentTokenRequest,
     responses(
         (status = 200, description = "Deployment token updated successfully", body = DeploymentTokenResponse),
-        (status = 400, description = "Invalid request: blank name, empty permissions or an expiry in the past"),
+        (status = 400, description = "Invalid request: blank name, empty permissions or a new expiry in the past (the token's current expiry may be sent back unchanged)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Deployment token not found"),

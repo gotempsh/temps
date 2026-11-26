@@ -124,9 +124,10 @@ async fn test_create_deployment_token_invalid_permission() {
     let result = service.create_token(project.id, None, request).await;
 
     assert!(result.is_err());
-    matches!(
-        result.unwrap_err(),
-        DeploymentTokenServiceError::ValidationError(_)
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, DeploymentTokenServiceError::ValidationError(_)),
+        "{error:?}"
     );
 }
 
@@ -160,9 +161,10 @@ async fn test_create_deployment_token_duplicate_name() {
     let result = service.create_token(project.id, None, request2).await;
 
     assert!(result.is_err());
-    matches!(
-        result.unwrap_err(),
-        DeploymentTokenServiceError::Conflict(_)
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, DeploymentTokenServiceError::Conflict(_)),
+        "{error:?}"
     );
 }
 
@@ -431,9 +433,10 @@ async fn test_validate_expired_token() {
     let result = service.validate_token(&created.token).await;
 
     assert!(result.is_err());
-    matches!(
-        result.unwrap_err(),
-        DeploymentTokenServiceError::Unauthorized(_)
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, DeploymentTokenServiceError::Unauthorized(_)),
+        "{error:?}"
     );
 }
 
@@ -446,9 +449,10 @@ async fn test_validate_invalid_token() {
     let result = service.validate_token("dt_invalidtoken123456").await;
 
     assert!(result.is_err());
-    matches!(
-        result.unwrap_err(),
-        DeploymentTokenServiceError::Unauthorized(_)
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, DeploymentTokenServiceError::Unauthorized(_)),
+        "{error:?}"
     );
 }
 
@@ -1632,4 +1636,67 @@ fn update_request_tells_null_expiry_from_an_absent_one() {
     let set: UpdateDeploymentTokenRequest =
         serde_json::from_str(r#"{"expires_at":"2030-01-01T00:00:00Z"}"#).unwrap();
     assert!(matches!(set.expires_at, Some(Some(_))));
+}
+
+/// The UPDATE a resent, unchanged expiry produces: it must leave the column
+/// alone, so it cannot overwrite an expiry changed by a concurrent request.
+#[tokio::test]
+async fn resending_the_stored_expiry_does_not_write_it() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    let now = Utc::now();
+    let stored = temps_entities::deployment_tokens::Model {
+        id: 7,
+        project_id: 3,
+        environment_id: None,
+        deployment_id: None,
+        name: "lapsed".to_string(),
+        token_hash: "hash".to_string(),
+        token_prefix: "dt_lapse".to_string(),
+        encrypted_token: None,
+        permissions: None,
+        is_active: true,
+        expires_at: Some(now - Duration::days(3)),
+        last_used_at: None,
+        created_at: now,
+        updated_at: now,
+        created_by: None,
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stored.clone()]])
+            .append_query_results([vec![temps_entities::deployment_tokens::Model {
+                is_active: false,
+                ..stored.clone()
+            }]])
+            .into_connection(),
+    );
+    let service = DeploymentTokenService::new(
+        db.clone(),
+        Arc::new(EncryptionService::new(TEST_ENCRYPTION_KEY).unwrap()),
+    );
+    service
+        .update_token(
+            3,
+            7,
+            UpdateDeploymentTokenRequest {
+                is_active: Some(false),
+                expires_at: Some(stored.expires_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    drop(service);
+
+    let log = Arc::try_unwrap(db)
+        .unwrap_or_else(|_| panic!("the service was dropped"))
+        .into_transaction_log();
+    let update = log
+        .iter()
+        .map(|t| format!("{t:?}"))
+        .find(|t| t.contains("UPDATE"))
+        .expect("the token is updated");
+    let set = update.split(" WHERE ").next().unwrap_or_default();
+    assert!(set.contains("is_active"), "{update}");
+    assert!(!set.contains("expires_at"), "{update}");
 }

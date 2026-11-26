@@ -40,7 +40,7 @@ pub struct DeploymentTokenResponse {
     pub token_prefix: String,
     pub permissions: Option<Vec<String>>,
     pub is_active: bool,
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub last_used_at: Option<UtcDateTime>,
@@ -81,7 +81,7 @@ pub struct CreateDeploymentTokenResponse {
     pub permissions: Option<Vec<String>>,
     /// The full token value - only returned on creation
     pub token: String,
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
     #[schema(value_type = String, format = "date-time", example = "2024-01-01T00:00:00Z")]
     pub created_at: UtcDateTime,
@@ -113,7 +113,7 @@ pub struct CreateDeploymentTokenRequest {
     pub permissions: Option<Vec<String>>,
     /// When the token stops working. Must be in the future; leave it out for
     /// a token that does not expire.
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
 }
 
@@ -127,13 +127,14 @@ pub struct UpdateDeploymentTokenRequest {
     #[schema(example = json!(["visitors:enrich", "emails:send"]))]
     pub permissions: Option<Vec<String>>,
     /// A future time sets a new expiry, `null` removes it (the token no
-    /// longer expires), and leaving the field out keeps the current one.
+    /// longer expires), and leaving the field out, or sending the current
+    /// expiry back unchanged (even one that has passed), keeps it.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "explicit_null"
     )]
-    #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
+    #[schema(value_type = Option<String>, format = "date-time", example = "2030-12-31T23:59:59Z")]
     pub expires_at: Option<Option<UtcDateTime>>,
 }
 
@@ -600,6 +601,7 @@ impl DeploymentTokenService {
             }
         }
 
+        let stored_expiry = token.expires_at;
         let mut token_active: DeploymentTokenActiveModel = token.into();
 
         if let Some(name) = name {
@@ -609,8 +611,12 @@ impl DeploymentTokenService {
             token_active.is_active = Set(is_active);
         }
         // `Some(None)` is an explicit `null`: the token no longer expires.
+        // Only a change is written: resending the stored expiry must not
+        // overwrite one another request changed in the meantime.
         if let Some(expires_at) = request.expires_at {
-            token_active.expires_at = Set(expires_at);
+            if expires_at != stored_expiry {
+                token_active.expires_at = Set(expires_at);
+            }
         }
         if let Some(ref perms) = request.permissions {
             // Validate permissions
