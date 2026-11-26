@@ -97,28 +97,57 @@ pub struct DeploymentTokenListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateDeploymentTokenRequest {
+    /// Up to 255 characters, unique within the project. Surrounding
+    /// whitespace is trimmed; a blank name is refused.
     pub name: String,
-    /// Optional environment ID - if not set, token applies to all environments
+    /// Optional environment of this project - if not set, token applies to
+    /// all environments. An environment of another project is refused.
     pub environment_id: Option<i32>,
-    /// Optional deployment ID - if set, token is scoped to a specific deployment
+    /// Optional deployment of this project (and of `environment_id`, when
+    /// set) - if set, token is scoped to a specific deployment.
     pub deployment_id: Option<i32>,
-    /// List of permissions (e.g., ["visitors:enrich", "emails:send"])
-    /// If not provided, defaults to full access
+    /// List of permissions (e.g., ["visitors:enrich", "emails:send"]).
+    /// If not provided, defaults to full access (`["*"]`). An empty list is
+    /// refused: the token could do nothing.
     #[schema(example = json!(["visitors:enrich", "emails:send"]))]
     pub permissions: Option<Vec<String>>,
+    /// When the token stops working. Must be in the future; leave it out for
+    /// a token that does not expire.
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
     pub expires_at: Option<UtcDateTime>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpdateDeploymentTokenRequest {
+    /// New name. Leave it out to keep the current one.
     pub name: Option<String>,
     pub is_active: Option<bool>,
+    /// Replaces the token's permissions. Leave it out to keep them; an empty
+    /// list is refused.
     #[schema(example = json!(["visitors:enrich", "emails:send"]))]
     pub permissions: Option<Vec<String>>,
+    /// A future time sets a new expiry, `null` removes it (the token no
+    /// longer expires), and leaving the field out keeps the current one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "explicit_null"
+    )]
     #[schema(value_type = Option<String>, format = "date-time", example = "2024-12-31T23:59:59Z")]
-    pub expires_at: Option<UtcDateTime>,
+    pub expires_at: Option<Option<UtcDateTime>>,
 }
+
+/// `Some(None)` for an explicit `null`, `None` when the field is absent.
+fn explicit_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// Longest accepted token name, in characters.
+pub const TOKEN_NAME_MAX_CHARS: usize = 255;
 
 #[derive(Error, Debug)]
 pub enum DeploymentTokenServiceError {
@@ -139,6 +168,52 @@ pub enum DeploymentTokenServiceError {
 
     #[error("Internal server error: {0}")]
     InternalServerError(String),
+
+    #[error("Project {project_id} not found")]
+    ProjectNotFound { project_id: i32 },
+
+    #[error(
+        "Environment {environment_id} was not found in project {project_id}; a deployment \
+         token can only be scoped to an environment of its own project"
+    )]
+    EnvironmentNotInProject {
+        project_id: i32,
+        environment_id: i32,
+    },
+
+    #[error(
+        "Deployment {deployment_id} was not found in project {project_id}; a deployment \
+         token can only be scoped to a deployment of its own project"
+    )]
+    DeploymentNotInProject { project_id: i32, deployment_id: i32 },
+
+    #[error(
+        "Deployment {deployment_id} belongs to environment {deployment_environment_id}, not \
+         to the requested environment {environment_id}"
+    )]
+    DeploymentNotInEnvironment {
+        deployment_id: i32,
+        environment_id: i32,
+        deployment_environment_id: i32,
+    },
+
+    #[error("Deployment token name for project {project_id} is invalid: {reason}")]
+    InvalidName {
+        project_id: i32,
+        reason: &'static str,
+    },
+
+    #[error(
+        "expires_at {expires_at} is in the past; use a future time, or leave expires_at out \
+         for a token that does not expire"
+    )]
+    ExpiryInPast { expires_at: UtcDateTime },
+
+    #[error(
+        "permissions for a deployment token of project {project_id} is empty, so the token \
+         could do nothing; list at least one permission, or leave permissions out for full access"
+    )]
+    EmptyPermissions { project_id: i32 },
 }
 
 impl DeploymentTokenServiceError {
@@ -188,8 +263,83 @@ impl DeploymentTokenServiceError {
                     .value("error_code", "INTERNAL_SERVER_ERROR")
                     .build()
             }
+            DeploymentTokenServiceError::ProjectNotFound { .. } => {
+                ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .type_("https://temps.sh/probs/project-not-found")
+                    .title("Project Not Found")
+                    .detail(self.to_string())
+                    .value("error_code", "PROJECT_NOT_FOUND")
+                    .build()
+            }
+            DeploymentTokenServiceError::EnvironmentNotInProject { .. } => {
+                ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .type_("https://temps.sh/probs/environment-not-found")
+                    .title("Environment Not Found")
+                    .detail(self.to_string())
+                    .value("error_code", "ENVIRONMENT_NOT_FOUND")
+                    .build()
+            }
+            DeploymentTokenServiceError::DeploymentNotInProject { .. } => {
+                ErrorBuilder::new(StatusCode::NOT_FOUND)
+                    .type_("https://temps.sh/probs/deployment-not-found")
+                    .title("Deployment Not Found")
+                    .detail(self.to_string())
+                    .value("error_code", "DEPLOYMENT_NOT_FOUND")
+                    .build()
+            }
+            DeploymentTokenServiceError::DeploymentNotInEnvironment { .. }
+            | DeploymentTokenServiceError::InvalidName { .. }
+            | DeploymentTokenServiceError::ExpiryInPast { .. }
+            | DeploymentTokenServiceError::EmptyPermissions { .. } => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .type_("https://temps.sh/probs/validation-error")
+                    .title("Validation Error")
+                    .detail(self.to_string())
+                    .value("error_code", "VALIDATION_ERROR")
+                    .build()
+            }
         }
     }
+}
+
+/// Trims a requested token name and checks it is usable.
+fn normalize_token_name(
+    project_id: i32,
+    name: &str,
+) -> Result<String, DeploymentTokenServiceError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(DeploymentTokenServiceError::InvalidName {
+            project_id,
+            reason: "the name is blank",
+        });
+    }
+    if name.chars().count() > TOKEN_NAME_MAX_CHARS {
+        return Err(DeploymentTokenServiceError::InvalidName {
+            project_id,
+            reason: "the name is longer than 255 characters",
+        });
+    }
+    Ok(name.to_string())
+}
+
+/// Refuses an expiry that has already passed: the token could never work.
+fn require_future_expiry(expires_at: UtcDateTime) -> Result<(), DeploymentTokenServiceError> {
+    if expires_at <= Utc::now() {
+        return Err(DeploymentTokenServiceError::ExpiryInPast { expires_at });
+    }
+    Ok(())
+}
+
+/// Refuses an explicit empty permission list: the token could do nothing.
+fn require_permissions(
+    project_id: i32,
+    permissions: &[String],
+) -> Result<(), DeploymentTokenServiceError> {
+    if permissions.is_empty() {
+        return Err(DeploymentTokenServiceError::EmptyPermissions { project_id });
+    }
+    Ok(())
 }
 
 pub struct DeploymentTokenService {
@@ -205,6 +355,57 @@ impl DeploymentTokenService {
         }
     }
 
+    /// Checks that the project exists and that the requested environment and
+    /// deployment belong to it, so a token never spans two projects' scopes.
+    async fn validate_scope(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+    ) -> Result<(), DeploymentTokenServiceError> {
+        let project = temps_entities::projects::Entity::find_by_id(project_id)
+            .filter(temps_entities::projects::Column::IsDeleted.eq(false))
+            .filter(temps_entities::projects::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?;
+        if project.is_none() {
+            return Err(DeploymentTokenServiceError::ProjectNotFound { project_id });
+        }
+        if let Some(environment_id) = environment_id {
+            let environment = temps_entities::environments::Entity::find_by_id(environment_id)
+                .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+                .filter(temps_entities::environments::Column::DeletedAt.is_null())
+                .one(self.db.as_ref())
+                .await?;
+            if environment.is_none() {
+                return Err(DeploymentTokenServiceError::EnvironmentNotInProject {
+                    project_id,
+                    environment_id,
+                });
+            }
+        }
+        if let Some(deployment_id) = deployment_id {
+            let deployment = temps_entities::deployments::Entity::find_by_id(deployment_id)
+                .filter(temps_entities::deployments::Column::ProjectId.eq(project_id))
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(DeploymentTokenServiceError::DeploymentNotInProject {
+                    project_id,
+                    deployment_id,
+                })?;
+            if let Some(environment_id) = environment_id {
+                if deployment.environment_id != environment_id {
+                    return Err(DeploymentTokenServiceError::DeploymentNotInEnvironment {
+                        deployment_id,
+                        environment_id,
+                        deployment_environment_id: deployment.environment_id,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new deployment token for a project
     pub async fn create_token(
         &self,
@@ -212,8 +413,13 @@ impl DeploymentTokenService {
         user_id: Option<i32>,
         request: CreateDeploymentTokenRequest,
     ) -> Result<CreateDeploymentTokenResponse, DeploymentTokenServiceError> {
+        let name = normalize_token_name(project_id, &request.name)?;
+        if let Some(expires_at) = request.expires_at {
+            require_future_expiry(expires_at)?;
+        }
         // Validate permissions if provided
         let permissions_json = if let Some(ref perms) = request.permissions {
+            require_permissions(project_id, perms)?;
             for perm_str in perms {
                 if DeploymentTokenPermission::from_str(perm_str).is_none() {
                     return Err(DeploymentTokenServiceError::ValidationError(format!(
@@ -233,10 +439,13 @@ impl DeploymentTokenService {
             Some(serde_json::json!(["*"]))
         };
 
+        self.validate_scope(project_id, request.environment_id, request.deployment_id)
+            .await?;
+
         // Check if name is unique for this project
         let existing = DeploymentTokenEntity::find()
             .filter(temps_entities::deployment_tokens::Column::ProjectId.eq(project_id))
-            .filter(temps_entities::deployment_tokens::Column::Name.eq(&request.name))
+            .filter(temps_entities::deployment_tokens::Column::Name.eq(&name))
             .one(self.db.as_ref())
             .await?;
 
@@ -263,16 +472,14 @@ impl DeploymentTokenService {
             })?;
 
         let now = Utc::now();
-        let expires_at = request.expires_at.or({
-            // Default expiration: never (None)
-            None
-        });
+        // Without an expiry the token never expires.
+        let expires_at = request.expires_at;
 
         let new_token = DeploymentTokenActiveModel {
             project_id: Set(project_id),
             environment_id: Set(request.environment_id),
             deployment_id: Set(request.deployment_id),
-            name: Set(request.name.clone()),
+            name: Set(name),
             token_hash: Set(token_hash),
             token_prefix: Set(token_prefix.clone()),
             encrypted_token: Set(Some(encrypted_token)),
@@ -359,8 +566,20 @@ impl DeploymentTokenService {
                 DeploymentTokenServiceError::NotFound("Deployment token not found".to_string())
             })?;
 
+        let name = request
+            .name
+            .as_deref()
+            .map(|name| normalize_token_name(project_id, name))
+            .transpose()?;
+        if let Some(Some(expires_at)) = request.expires_at {
+            require_future_expiry(expires_at)?;
+        }
+        if let Some(ref perms) = request.permissions {
+            require_permissions(project_id, perms)?;
+        }
+
         // Check if new name conflicts
-        if let Some(ref new_name) = request.name {
+        if let Some(ref new_name) = name {
             if new_name != &token.name {
                 let existing = DeploymentTokenEntity::find()
                     .filter(temps_entities::deployment_tokens::Column::ProjectId.eq(project_id))
@@ -379,14 +598,15 @@ impl DeploymentTokenService {
 
         let mut token_active: DeploymentTokenActiveModel = token.into();
 
-        if let Some(name) = request.name {
+        if let Some(name) = name {
             token_active.name = Set(name);
         }
         if let Some(is_active) = request.is_active {
             token_active.is_active = Set(is_active);
         }
+        // `Some(None)` is an explicit `null`: the token no longer expires.
         if let Some(expires_at) = request.expires_at {
-            token_active.expires_at = Set(Some(expires_at));
+            token_active.expires_at = Set(expires_at);
         }
         if let Some(ref perms) = request.permissions {
             // Validate permissions

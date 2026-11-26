@@ -410,13 +410,23 @@ async fn test_validate_expired_token() {
         environment_id: None,
         deployment_id: None,
         permissions: None,
-        expires_at: Some(Utc::now() - Duration::days(1)), // Already expired
+        expires_at: Some(Utc::now() + Duration::hours(1)),
     };
 
     let created = service
         .create_token(project.id, None, request)
         .await
         .unwrap();
+
+    // A past expiry is refused on create, so let the stored one lapse.
+    let stored = DeploymentTokenEntity::find_by_id(created.id)
+        .one(_db.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stored: DeploymentTokenActiveModel = stored.into();
+    stored.expires_at = Set(Some(Utc::now() - Duration::days(1)));
+    stored.update(_db.db.as_ref()).await.unwrap();
 
     let result = service.validate_token(&created.token).await;
 
@@ -1088,4 +1098,476 @@ async fn test_revoke_token_by_id_nonexistent_is_noop() {
         result.is_ok(),
         "revoking a non-existent token must not return an error"
     );
+}
+
+// ---- scope and input validation -----------------------------------------
+
+/// A second project with one environment and one deployment in it.
+async fn other_project_scope(
+    db: &TestDatabase,
+) -> (
+    projects::Model,
+    temps_entities::environments::Model,
+    temps_entities::deployments::Model,
+) {
+    let project = projects::ActiveModel {
+        name: Set("Other Project".to_string()),
+        slug: Set(format!("other-project-{}", uuid::Uuid::new_v4())),
+        repo_owner: Set("test-owner".to_string()),
+        repo_name: Set("other-repo".to_string()),
+        main_branch: Set("main".to_string()),
+        preset: Set(temps_entities::preset::Preset::NextJs),
+        directory: Set("/".to_string()),
+        created_at: Set(Utc::now()),
+        updated_at: Set(Utc::now()),
+        ..Default::default()
+    }
+    .insert(db.db.as_ref())
+    .await
+    .unwrap();
+    let (environment, deployment) = environment_with_deployment(db, project.id, "other").await;
+    (project, environment, deployment)
+}
+
+async fn environment_with_deployment(
+    db: &TestDatabase,
+    project_id: i32,
+    name: &str,
+) -> (
+    temps_entities::environments::Model,
+    temps_entities::deployments::Model,
+) {
+    let environment = temps_entities::environments::ActiveModel {
+        name: Set(name.to_string()),
+        slug: Set(format!("{name}-{}", uuid::Uuid::new_v4())),
+        subdomain: Set(format!("{name}-{}", uuid::Uuid::new_v4())),
+        host: Set(String::new()),
+        upstreams: Set(temps_entities::upstream_config::UpstreamList::default()),
+        project_id: Set(project_id),
+        ..Default::default()
+    }
+    .insert(db.db.as_ref())
+    .await
+    .unwrap();
+    let deployment = temps_entities::deployments::ActiveModel {
+        project_id: Set(project_id),
+        environment_id: Set(environment.id),
+        slug: Set(format!("{name}-deployment-{}", uuid::Uuid::new_v4())),
+        state: Set("completed".to_string()),
+        metadata: Set(Some(
+            temps_entities::deployments::DeploymentMetadata::default(),
+        )),
+        ..Default::default()
+    }
+    .insert(db.db.as_ref())
+    .await
+    .unwrap();
+    (environment, deployment)
+}
+
+fn named(name: &str) -> CreateDeploymentTokenRequest {
+    CreateDeploymentTokenRequest {
+        name: name.to_string(),
+        environment_id: None,
+        deployment_id: None,
+        permissions: None,
+        expires_at: None,
+    }
+}
+
+async fn token_count(db: &TestDatabase) -> u64 {
+    DeploymentTokenEntity::find()
+        .count(db.db.as_ref())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn create_accepts_an_environment_and_deployment_of_its_own_project() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let (environment, deployment) = environment_with_deployment(&db, project.id, "prod").await;
+
+    let created = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                environment_id: Some(environment.id),
+                deployment_id: Some(deployment.id),
+                ..named("scoped")
+            },
+        )
+        .await
+        .expect("an environment and deployment of the project are accepted");
+
+    assert_eq!(created.project_id, project.id);
+    assert_eq!(created.environment_id, Some(environment.id));
+    assert_eq!(created.deployment_id, Some(deployment.id));
+}
+
+#[tokio::test]
+async fn create_refuses_an_environment_of_another_project() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let (_, other_environment, _) = other_project_scope(&db).await;
+
+    let error = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                environment_id: Some(other_environment.id),
+                ..named("cross-project")
+            },
+        )
+        .await
+        .expect_err("another project's environment must be refused");
+
+    match &error {
+        DeploymentTokenServiceError::EnvironmentNotInProject {
+            project_id,
+            environment_id,
+        } => {
+            assert_eq!(*project_id, project.id);
+            assert_eq!(*environment_id, other_environment.id);
+        }
+        other => panic!("expected EnvironmentNotInProject, got {other:?}"),
+    }
+    assert_eq!(error.to_problem().status_code, StatusCode::NOT_FOUND);
+    assert_eq!(token_count(&db).await, 0, "nothing is stored");
+}
+
+#[tokio::test]
+async fn create_refuses_a_deleted_or_unknown_environment() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let (environment, _) = environment_with_deployment(&db, project.id, "gone").await;
+    let mut deleted: temps_entities::environments::ActiveModel = environment.clone().into();
+    deleted.deleted_at = Set(Some(Utc::now()));
+    deleted.update(db.db.as_ref()).await.unwrap();
+
+    for environment_id in [environment.id, i32::MAX] {
+        let error = service
+            .create_token(
+                project.id,
+                None,
+                CreateDeploymentTokenRequest {
+                    environment_id: Some(environment_id),
+                    ..named(&format!("env-{environment_id}"))
+                },
+            )
+            .await
+            .expect_err("a deleted or unknown environment must be refused");
+        assert!(
+            matches!(
+                error,
+                DeploymentTokenServiceError::EnvironmentNotInProject { .. }
+            ),
+            "{error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_refuses_a_deployment_of_another_project() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let (_, _, other_deployment) = other_project_scope(&db).await;
+
+    let error = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                deployment_id: Some(other_deployment.id),
+                ..named("cross-project-deployment")
+            },
+        )
+        .await
+        .expect_err("another project's deployment must be refused");
+
+    match &error {
+        DeploymentTokenServiceError::DeploymentNotInProject {
+            project_id,
+            deployment_id,
+        } => {
+            assert_eq!(*project_id, project.id);
+            assert_eq!(*deployment_id, other_deployment.id);
+        }
+        other => panic!("expected DeploymentNotInProject, got {other:?}"),
+    }
+    assert_eq!(error.to_problem().status_code, StatusCode::NOT_FOUND);
+    assert_eq!(token_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn create_refuses_a_deployment_of_a_different_environment() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let (production, _) = environment_with_deployment(&db, project.id, "production").await;
+    let (staging, staging_deployment) =
+        environment_with_deployment(&db, project.id, "staging").await;
+
+    let error = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                environment_id: Some(production.id),
+                deployment_id: Some(staging_deployment.id),
+                ..named("mismatched")
+            },
+        )
+        .await
+        .expect_err("a deployment of another environment must be refused");
+
+    match &error {
+        DeploymentTokenServiceError::DeploymentNotInEnvironment {
+            deployment_id,
+            environment_id,
+            deployment_environment_id,
+        } => {
+            assert_eq!(*deployment_id, staging_deployment.id);
+            assert_eq!(*environment_id, production.id);
+            assert_eq!(*deployment_environment_id, staging.id);
+        }
+        other => panic!("expected DeploymentNotInEnvironment, got {other:?}"),
+    }
+    assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn create_refuses_a_missing_project_with_not_found() {
+    let Some((db, service, _project)) = setup_test_env().await else {
+        return;
+    };
+
+    let error = service
+        .create_token(i32::MAX, None, named("orphan"))
+        .await
+        .expect_err("a missing project must be refused");
+
+    assert!(
+        matches!(
+            error,
+            DeploymentTokenServiceError::ProjectNotFound { project_id } if project_id == i32::MAX
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.to_problem().status_code, StatusCode::NOT_FOUND);
+    assert_eq!(token_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn create_refuses_an_expiry_in_the_past() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let past = Utc::now() - Duration::days(1);
+
+    let error = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                expires_at: Some(past),
+                ..named("already-expired")
+            },
+        )
+        .await
+        .expect_err("a token that can never work must be refused");
+
+    assert!(
+        matches!(error, DeploymentTokenServiceError::ExpiryInPast { expires_at } if expires_at == past),
+        "{error:?}"
+    );
+    let problem = error.to_problem();
+    assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(token_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn create_trims_the_name_and_refuses_a_blank_one() {
+    let Some((_db, service, project)) = setup_test_env().await else {
+        return;
+    };
+
+    for blank in ["", "   ", "\t\n"] {
+        let error = service
+            .create_token(project.id, None, named(blank))
+            .await
+            .expect_err("a blank name must be refused");
+        assert!(
+            matches!(error, DeploymentTokenServiceError::InvalidName { .. }),
+            "{blank:?}: {error:?}"
+        );
+        assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+    }
+
+    let too_long = "x".repeat(TOKEN_NAME_MAX_CHARS + 1);
+    let error = service
+        .create_token(project.id, None, named(&too_long))
+        .await
+        .expect_err("an over-long name must be refused");
+    assert!(matches!(
+        error,
+        DeploymentTokenServiceError::InvalidName { .. }
+    ));
+    assert!(
+        !error.to_string().contains(&too_long),
+        "the refusal does not echo the name"
+    );
+
+    let created = service
+        .create_token(project.id, None, named("  padded  "))
+        .await
+        .unwrap();
+    assert_eq!(created.name, "padded");
+    let duplicate = service
+        .create_token(project.id, None, named("padded "))
+        .await
+        .expect_err("the trimmed name is what must be unique");
+    assert!(matches!(
+        duplicate,
+        DeploymentTokenServiceError::Conflict(_)
+    ));
+}
+
+#[tokio::test]
+async fn create_refuses_an_empty_permission_list() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+
+    let error = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                permissions: Some(vec![]),
+                ..named("powerless")
+            },
+        )
+        .await
+        .expect_err("a token that can do nothing must be refused");
+
+    assert!(
+        matches!(error, DeploymentTokenServiceError::EmptyPermissions { project_id } if project_id == project.id),
+        "{error:?}"
+    );
+    assert_eq!(error.to_problem().status_code, StatusCode::BAD_REQUEST);
+    assert_eq!(token_count(&db).await, 0);
+}
+
+#[tokio::test]
+async fn update_null_expiry_removes_it_and_an_absent_one_keeps_it() {
+    let Some((_db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let expiry = Utc::now() + Duration::days(7);
+    let created = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                expires_at: Some(expiry),
+                ..named("expiring")
+            },
+        )
+        .await
+        .unwrap();
+
+    // Leaving expires_at out keeps the stored expiry.
+    let request: UpdateDeploymentTokenRequest =
+        serde_json::from_str(r#"{"name":"renamed"}"#).unwrap();
+    assert_eq!(request.expires_at, None);
+    let renamed = service
+        .update_token(project.id, created.id, request)
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "renamed");
+    assert_eq!(
+        renamed.expires_at.map(|t| t.timestamp()),
+        Some(expiry.timestamp())
+    );
+
+    // An explicit null removes it.
+    let request: UpdateDeploymentTokenRequest =
+        serde_json::from_str(r#"{"expires_at":null}"#).unwrap();
+    assert_eq!(request.expires_at, Some(None));
+    let cleared = service
+        .update_token(project.id, created.id, request)
+        .await
+        .unwrap();
+    assert_eq!(cleared.expires_at, None);
+    assert_eq!(cleared.name, "renamed", "other fields are kept");
+    let stored = service.get_token(project.id, created.id).await.unwrap();
+    assert_eq!(stored.expires_at, None);
+}
+
+#[tokio::test]
+async fn update_refuses_a_past_expiry_blank_name_and_empty_permissions() {
+    let Some((_db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let created = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                permissions: Some(vec!["analytics:read".to_string()]),
+                ..named("kept")
+            },
+        )
+        .await
+        .unwrap();
+
+    let refusals = [
+        UpdateDeploymentTokenRequest {
+            expires_at: Some(Some(Utc::now() - Duration::minutes(1))),
+            ..Default::default()
+        },
+        UpdateDeploymentTokenRequest {
+            name: Some("  ".to_string()),
+            ..Default::default()
+        },
+        UpdateDeploymentTokenRequest {
+            permissions: Some(vec![]),
+            ..Default::default()
+        },
+    ];
+    for request in refusals {
+        let error = service
+            .update_token(project.id, created.id, request)
+            .await
+            .expect_err("the update must be refused");
+        assert_eq!(
+            error.to_problem().status_code,
+            StatusCode::BAD_REQUEST,
+            "{error:?}"
+        );
+    }
+
+    let stored = service.get_token(project.id, created.id).await.unwrap();
+    assert_eq!(stored.name, "kept");
+    assert_eq!(stored.expires_at, None);
+    assert_eq!(stored.permissions, Some(vec!["analytics:read".to_string()]));
+}
+
+#[test]
+fn update_request_tells_null_expiry_from_an_absent_one() {
+    let absent: UpdateDeploymentTokenRequest = serde_json::from_str("{}").unwrap();
+    assert_eq!(absent.expires_at, None);
+    let null: UpdateDeploymentTokenRequest =
+        serde_json::from_str(r#"{"expires_at":null}"#).unwrap();
+    assert_eq!(null.expires_at, Some(None));
+    let set: UpdateDeploymentTokenRequest =
+        serde_json::from_str(r#"{"expires_at":"2030-01-01T00:00:00Z"}"#).unwrap();
+    assert!(matches!(set.expires_at, Some(Some(_))));
 }
