@@ -30,6 +30,7 @@ import {
 import { CopyAiPromptButton } from '@/components/ui/ai-prompt-code-block'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { HAND_OFF_LABEL } from '@/lib/agent-handoff'
 import { monitoringSetupPrompt } from '@/lib/monitoring-setup-prompt'
 import {
   analyticsBrowserSnippet,
@@ -86,7 +87,7 @@ export function CopySetupPromptButton({
   if (!setup) {
     return (
       <Button variant="outline" size="sm" disabled>
-        Copy AI prompt
+        {HAND_OFF_LABEL}
       </Button>
     )
   }

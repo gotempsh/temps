@@ -813,6 +813,18 @@ jobs:
       - name: Web unit tests
         run: cd web && bun run test
 
+      # "Hand off to agent" prints CLI commands for a coding agent to run.
+      # This resolves every command and flag the console can emit against the
+      # CLI's own command definitions, so a renamed command fails here and not
+      # in someone's agent. A step here rather than a job: it reuses this
+      # checkout and Bun. The scenario workflow runs the same test for
+      # CLI-only changes, which skip this job.
+      - name: Check handoff prompt commands against the CLI
+        run: |
+          cd apps/temps-cli
+          bun install --frozen-lockfile
+          bun test src/commands/agent-handoff.drift.test.ts
+
       - name: Web ESLint
         run: cd web && bunx eslint . --quiet
 

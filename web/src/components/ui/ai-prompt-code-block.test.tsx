@@ -8,7 +8,7 @@ test('AI prompt action is rendered without provider configuration or hover', () 
   const html = renderToStaticMarkup(
     <CopyAiPromptButton prompt="Integrate KV" />
   )
-  expect(html).toContain('aria-label="Copy AI prompt"')
+  expect(html).toContain('aria-label="Hand off to agent"')
   expect(html).toContain('wand-sparkles')
   expect(html).not.toContain('opacity-0')
 })
@@ -20,7 +20,7 @@ test('examples retain code copy alongside the separate AI prompt action', () => 
       prompt="Adapt this example"
     />
   )
-  expect(html).toContain('Copy AI prompt')
+  expect(html).toContain('Hand off to agent')
   expect(html).toContain('aria-label="Copy"')
   expect(html).toContain('const value = 1')
 })

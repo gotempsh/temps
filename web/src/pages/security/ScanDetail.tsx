@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ErrorBoundary } from '@/components/error/ErrorBoundary'
+import { HAND_OFF_LABEL } from '@/lib/agent-handoff'
 import { scanVulnerabilities } from '@/lib/scan-vulnerabilities'
 import {
   getScanOptions,
@@ -566,7 +567,7 @@ function ScanDetailContent() {
               <PopoverTrigger asChild>
                 <Button variant="outline" size="sm">
                   <Sparkles className="h-4 w-4 mr-2" />
-                  Copy AI prompt
+                  {HAND_OFF_LABEL}
                 </Button>
               </PopoverTrigger>
               <PopoverContent

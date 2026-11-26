@@ -106,6 +106,14 @@ jobs:
           bun install --frozen-lockfile
           bun run typecheck
 
+      # The console's "Hand off to agent" prompt names CLI commands and flags.
+      # rust-tests.yml checks them when web/ changes; this covers a CLI-only
+      # change, which skips that job. One shard is enough: it reads no server.
+      - name: Check handoff prompt commands against the CLI
+        if: matrix.shard == 'core'
+        working-directory: apps/temps-cli
+        run: bun test src/commands/agent-handoff.drift.test.ts
+
       - name: Recover an S3-only PostgreSQL snapshot on a second Temps server
         if: matrix.shard == 'recovery'
         working-directory: apps/temps-e2e
