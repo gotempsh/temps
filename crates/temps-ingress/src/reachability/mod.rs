@@ -46,6 +46,8 @@ pub mod run;
 pub mod serve_entries;
 pub mod service;
 pub mod token_check;
+#[cfg(test)]
+pub(crate) mod wire_shape;
 
 pub use environment_address::EnvironmentAddressService;
 pub use environment_hosts::EnvironmentHostService;

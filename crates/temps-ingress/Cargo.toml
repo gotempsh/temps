@@ -11,6 +11,7 @@ authors.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
+temps-connector-pins = { path = "../temps-connector-pins" }
 temps-auth = { path = "../temps-auth" }
 temps-entities = { path = "../temps-entities" }
 temps-dns = { path = "../temps-dns" }

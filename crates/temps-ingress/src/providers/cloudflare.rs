@@ -22,7 +22,8 @@ use tracing::{info, warn};
 
 use crate::error::IngressError;
 use crate::provider::{
-    DnsIntent, TunnelContext, TunnelHandle, TunnelHealth, TunnelLink, TunnelProvider,
+    Capabilities, DnsIntent, Ja4Header, Origin, Reach, TunnelContext, TunnelHandle, TunnelHealth,
+    TunnelLink, TunnelProvider,
 };
 use crate::wire::{
     Artifact, ContainerSpec, DriverChoice, ForwardedJa4, NodeConnectorSpec, ProcessSpec, Readiness,
@@ -31,14 +32,13 @@ use crate::wire::{
 pub const KIND: &str = "cloudflare_tunnel";
 const API: &str = "https://api.cloudflare.com/client/v4";
 
-/// cloudflared pinned by release and checksum. `TUNNEL_TOKEN_FILE` needs
-/// 2025.4.0 or later.
-const CLOUDFLARED_VERSION: &str = "2026.10.1";
-const CLOUDFLARED_AMD64_SHA256: &str =
-    "3bfc539f45d2620c71debb7a86be0efa737ed5ccbad9eb85c787116900e5c586";
-const CLOUDFLARED_ARM64_SHA256: &str =
-    "2c65dfabf616c40efc7545d107d7a57ad5e21377e2964b7e88af19a238074a46";
-const CLOUDFLARED_IMAGE: &str = "cloudflare/cloudflared:2026.10.1@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5";
+// cloudflared is pinned by release and checksum in `temps-connector-pins`,
+// which the node agent trusts too. `TUNNEL_TOKEN_FILE` needs 2025.4.0 or later.
+use temps_connector_pins::cloudflared as pins;
+
+pub mod edge_rules;
+pub mod live;
+pub mod run;
 
 pub struct CloudflareTunnelProvider {
     http: reqwest::Client,
@@ -411,32 +411,24 @@ impl TunnelProvider for CloudflareTunnelProvider {
         let readiness = Readiness::HttpReady {
             url: "http://{metrics_addr}/ready".into(),
         };
-        let release = format!(
-            "https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}"
-        );
         let drivers = vec![
             DriverChoice::Process(ProcessSpec {
-                artifacts: vec![
-                    Artifact {
-                        os: "linux".into(),
-                        arch: "x86_64".into(),
-                        url: format!("{release}/cloudflared-linux-amd64"),
-                        sha256: CLOUDFLARED_AMD64_SHA256.into(),
-                    },
-                    Artifact {
-                        os: "linux".into(),
-                        arch: "aarch64".into(),
-                        url: format!("{release}/cloudflared-linux-arm64"),
-                        sha256: CLOUDFLARED_ARM64_SHA256.into(),
-                    },
-                ],
+                artifacts: pins::BINARIES
+                    .iter()
+                    .map(|pin| Artifact {
+                        os: pin.os.into(),
+                        arch: pin.arch.into(),
+                        url: pin.url.into(),
+                        sha256: pin.sha256.into(),
+                    })
+                    .collect(),
                 args: args.clone(),
                 env: env.clone(),
                 readiness: readiness.clone(),
                 stop_grace_secs: 35,
             }),
             DriverChoice::Container(ContainerSpec {
-                image: CLOUDFLARED_IMAGE.into(),
+                image: pins::IMAGE.into(),
                 args,
                 env,
                 readiness,
@@ -449,11 +441,11 @@ impl TunnelProvider for CloudflareTunnelProvider {
             provider: KIND.into(),
             revision: String::new(),
             edge_port,
-            client_address_header: Some("CF-Connecting-IP".into()),
-            // Cloudflare sends it with Bot Management's request headers.
+            // The headers nodes trust are the ones `capabilities` declares.
+            client_address_header: Some(CLIENT_ADDRESS_HEADER.into()),
             client_ja4: Some(ForwardedJa4 {
-                header: "cf-ja4".into(),
-                source: "cloudflare".into(),
+                header: JA4.header.into(),
+                source: JA4.source.into(),
             }),
             drivers,
             secrets,
@@ -688,6 +680,28 @@ pub struct CloudflareTunnelFactory;
 const FIELD_ACCOUNT: &str = "dns_provider_id";
 const FIELD_DOMAIN: &str = "domain";
 
+/// The visitor's address, as Cloudflare's edge sets it.
+const CLIENT_ADDRESS_HEADER: &str = "CF-Connecting-IP";
+/// Cloudflare sends it with Bot Management's request headers.
+const JA4: Ja4Header = Ja4Header {
+    header: "cf-ja4",
+    source: "cloudflare",
+};
+
+/// What every Cloudflare Tunnel connector is (ADR-116 D2): public, through
+/// ADR-107 D3's loopback origin with Cloudflare's client-address and JA4
+/// headers, with DNS that Temps writes.
+pub fn capabilities() -> Capabilities {
+    Capabilities {
+        reach: Reach::Public,
+        origin: Origin::LoopbackHttp {
+            client_address_header: CLIENT_ADDRESS_HEADER,
+            ja4: Some(JA4),
+        },
+        dns: crate::registry::DnsHandling::Automatic,
+    }
+}
+
 #[async_trait]
 impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
     fn info(&self) -> crate::registry::ProviderInfo {
@@ -730,6 +744,13 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
         }
     }
 
+    fn capabilities(
+        &self,
+        _connector: Option<&temps_entities::ingress_connectors::Model>,
+    ) -> Capabilities {
+        capabilities()
+    }
+
     async fn validate(
         &self,
         deps: &crate::registry::ProviderDeps<'_>,
@@ -745,6 +766,20 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
         Ok(())
     }
 
+    fn tunnels(&self) -> Option<&dyn crate::registry::TunnelFactory> {
+        Some(self)
+    }
+
+    fn run<'a>(
+        &self,
+        live: &'a crate::reachability::service::LiveOps,
+    ) -> Option<Box<dyn crate::reachability::run::ProviderRun + 'a>> {
+        Some(Box::new(run::CloudflareRun::new(live)))
+    }
+}
+
+#[async_trait]
+impl crate::registry::TunnelFactory for CloudflareTunnelFactory {
     async fn build(
         &self,
         deps: &crate::registry::ProviderDeps<'_>,

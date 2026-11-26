@@ -11,17 +11,16 @@
 //!   container or compiled-in library) and supervises it. See
 //!   `temps_node_agent::connectors`.
 
-pub mod cloudflare;
 pub mod control_plane;
 pub mod control_plane_private;
 pub mod error;
 pub mod handlers;
 pub mod plugin;
 pub mod provider;
+mod providers;
 pub mod reachability;
 pub mod registry;
 pub mod service;
-pub mod tailscale;
 pub mod wire;
 
 pub use control_plane::{ControlPlaneConnectors, LocalConnectorRuntime};

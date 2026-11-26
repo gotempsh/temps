@@ -19,7 +19,7 @@ impl Plan {
             return None;
         };
         let connector = self.connector(*id)?;
-        (connector.model.provider == crate::cloudflare::KIND
+        (connector.writes_dns
             && connector.model.external_id.is_some()
             && connector.model.secret_encrypted.is_some()
             && publication.is_some_and(|row| row.connector_id == *id && row.state == "error"))

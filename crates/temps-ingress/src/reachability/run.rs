@@ -43,18 +43,15 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::access::{AccessApp, AccessPolicyAnswer};
-use super::edge_rules::{same_rule, EdgeRuleError, EdgeRulePurpose, EdgeRuleSeen, HttpPolicy};
+use super::edge_rules::HttpPolicy;
 use super::model::{
     AccessBinding, AddressAudience, AddressReachability, Audience, Decision, DnsRecordState,
     Intent, JournalEntry, JournalState, LookupAuthority, PlanOptionKind, PlanStep, PlannedRecord,
     PreviousChoice, ReachState, RunResource, RunState, RunStep, RunStepStatus, StepKind,
     UndoResult,
 };
+use super::model::{ServiceDefinition, ServiceHost};
 use super::plan::NamedId;
-use super::token_check::TokenCheckResult;
-use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
-use temps_core::tailnet::messages as tailnet_messages;
-use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT, REPORT_ERROR};
 
 /// A managed zone's state under one DNS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +133,7 @@ pub struct ServiceEntryHost {
 }
 
 impl ServiceEntryHost {
-    fn hosts(&self, host: &ServiceHost) -> bool {
+    pub(crate) fn hosts(&self, host: &ServiceHost) -> bool {
         host.is(self.tailscale_node_id.as_deref(), self.dns_name.as_deref())
     }
 }
@@ -200,7 +197,7 @@ pub(crate) fn unrecorded_message(service: &str, hosts: &[String]) -> String {
 }
 
 /// Whether `addrs` is non-empty and every one is a Tailscale address.
-fn tailscale_addrs(addrs: &[String]) -> bool {
+pub(crate) fn tailscale_addrs(addrs: &[String]) -> bool {
     !addrs.is_empty()
         && addrs.iter().all(|a| {
             a.parse::<IpAddr>()
@@ -253,10 +250,10 @@ pub enum ServeRelease {
     Removing,
 }
 
-/// Everything a run does to the rest of Temps.
+/// Everything a run does to the rest of Temps. A provider's own calls are
+/// its own ops trait, reached through [`RunOps::providers`] (ADR-116 D3).
 #[async_trait]
 pub trait RunOps: Send + Sync {
-    async fn check_token(&self, token: &str, zone: &str) -> TokenCheckResult;
     /// Finds what `intent` describes, if it exists: how a pending journal
     /// entry is resolved.
     async fn find(&self, intent: &Intent) -> Result<Option<RunResource>, String>;
@@ -269,15 +266,6 @@ pub trait RunOps: Send + Sync {
     async fn set_auto_manage(&self, provider_id: i32, zone: &str, on: bool) -> Result<(), String>;
     async fn verify_zone(&self, provider_id: i32, zone: &str) -> Result<bool, String>;
     async fn remove_managed_zone(&self, provider_id: i32, zone: &str) -> Result<(), String>;
-    /// Creates a tunnel that publishes only the hostnames chosen for it.
-    /// On failure, the id of a tunnel that was saved anyway.
-    async fn create_tunnel(
-        &self,
-        name: &str,
-        provider_id: i32,
-        domain: &str,
-        node_ids: &[i32],
-    ) -> Result<(i32, TunnelStatus), (Option<i32>, String)>;
     async fn tunnel_status(&self, id: i32) -> Result<TunnelStatus, String>;
     /// Marks the connector `id` named `name` `deleting`, so sync never
     /// recreates it; returns its provider tunnel id. `Ok(None)` when it is
@@ -382,148 +370,15 @@ pub trait RunOps: Send + Sync {
     async fn http_policy(&self, host: &str) -> Result<Option<Option<HttpPolicy>>, String>;
     /// Records the HTTPS-only choice of `host`; `None` forgets it.
     async fn set_http_policy(&self, host: &str, policy: Option<HttpPolicy>) -> Result<(), String>;
-    /// Access application `id` in `provider_id`'s account (ADR 065 D9);
-    /// `None` when it no longer exists.
-    async fn access_app(&self, provider_id: i32, id: &str) -> Result<Option<AccessApp>, String>;
-    /// Creates the Access application `name` protecting `host`, letting in
-    /// who `policy` says.
-    async fn create_access_app(
-        &self,
-        provider_id: i32,
-        name: &str,
-        host: &str,
-        policy: &AccessPolicyAnswer,
-    ) -> Result<AccessApp, WriteError>;
-    async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String>;
-    /// Creates the `(node, address)` Serve entry with this run's reference,
-    /// or adds a reference to the same one, in one transaction holding the
-    /// entry's advisory lock (and the Service's first) (ADR 065 D4).
-    async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String>;
-    /// This run's reference to the `(node, address)` entry: `(entry id,
-    /// created)`.
-    async fn serve_reference(
-        &self,
-        run_id: i32,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<Option<(i32, bool)>, String>;
-    async fn serve_entry(
-        &self,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<Option<ServeEntryStatus>, String>;
-    /// Drops this run's reference under the entry's lock; the last one
-    /// decides what happens to the entry by the agent's last report.
-    async fn release_serve_entry(
-        &self,
-        run_id: i32,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<ServeRelease, String>;
-    /// Deletes a `removing` entry the user decided to leave on the worker
-    /// as it is, so nothing more is asked of the agent.
-    async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String>;
-    /// Proves a pasted Tailscale OAuth client's scopes and saves it, sealed,
-    /// under `name` (ADR 065 D2); returns its row id.
-    async fn save_tailscale_credential(
-        &self,
-        name: &str,
-        credential: &TailscaleCredential,
-    ) -> Result<i32, String>;
-    /// Removes the credential row unless a Service setup still needs it:
-    /// `Some(why)` when it is kept.
-    async fn release_tailscale_credential(&self, id: i32) -> Result<Option<String>, String>;
-    /// The Service `name` in the cluster's tailnet, as the API has it now.
-    async fn read_service(&self, name: &str) -> Result<Option<ServiceDefinition>, String>;
-    /// `PUT`, only ever to create (ADR 065 D4).
-    async fn create_service(&self, definition: &ServiceDefinition) -> Result<(), WriteError>;
-    /// The devices advertising `name`.
-    async fn service_hosts(&self, name: &str) -> Result<Vec<ServiceHost>, String>;
-    /// Every Serve entry naming `name`, on any node.
-    async fn service_entries(&self, name: &str) -> Result<Vec<ServiceEntryHost>, String>;
-    /// The Service run `creator_run_id` of this install journaled as
-    /// `created`, with when: `None` when no journal records creating it.
-    async fn service_creation(
-        &self,
-        name: &str,
-        creator_run_id: i32,
-    ) -> Result<Option<(ServiceDefinition, temps_core::DBDateTime)>, String>;
-    /// The confirmed delete (ADR 065 D4): under the Service's lock, no
-    /// Serve entry names it, no host advertises it, and a read made just
-    /// before the `DELETE` still carries this install's marker for
-    /// `creator_run_id` and equals `shown`; else it is kept.
-    async fn delete_service(
-        &self,
-        tailnet: &str,
-        name: &str,
-        creator_run_id: i32,
-        shown: &ServiceDefinition,
-    ) -> Result<ServiceDeletion, String>;
     /// Whether connector `id` publishes every environment's host
     /// (ADR 068 D3).
     async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String>;
     /// Turns it on or off; off withdraws every host it generated.
     async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String>;
-    /// Add `purpose`'s Cloudflare rule for `host` (ADR 070), with the token
-    /// of `connector_id`'s DNS provider (else the one managing the zone), or
-    /// find one doing the same already.
-    async fn create_edge_rule(
-        &self,
-        run_id: i32,
-        connector_id: Option<i32>,
-        host: &str,
-        purpose: EdgeRulePurpose,
-    ) -> Result<EdgeRuleMade, EdgeRuleError>;
-    /// The rule run `run_id` added for `host`, found by its reference.
-    async fn find_edge_rule(
-        &self,
-        run_id: i32,
-        connector_id: Option<i32>,
-        host: &str,
-        purpose: EdgeRulePurpose,
-    ) -> Result<Option<RunResource>, String>;
-    /// The rule `rule` names as Cloudflare has it now; `None` when gone.
-    async fn edge_rule(&self, rule: &EdgeRuleAt) -> Result<Option<EdgeRuleSeen>, String>;
-    async fn delete_edge_rule(&self, rule: &EdgeRuleAt) -> Result<(), String>;
     async fn sleep(&self, duration: Duration);
-}
-
-/// Where a rule a run added lives at Cloudflare (ADR 070).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeRuleAt {
-    pub provider_id: i32,
-    pub zone_id: String,
-    pub ruleset_id: String,
-    pub rule_id: String,
-}
-
-impl EdgeRuleAt {
-    pub fn of(resource: &RunResource) -> Option<Self> {
-        match resource {
-            RunResource::EdgeRule {
-                provider_id,
-                zone_id,
-                ruleset_id,
-                rule_id,
-                ..
-            } => Some(Self {
-                provider_id: *provider_id,
-                zone_id: zone_id.clone(),
-                ruleset_id: ruleset_id.clone(),
-                rule_id: rule_id.clone(),
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// What adding a rule did (ADR 070 D1).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeRuleMade {
-    /// Added: a [`RunResource::EdgeRule`].
-    Created(Box<RunResource>),
-    /// A rule doing the same was there already; used as found.
-    AlreadyThere(String),
+    /// The providers whose steps and journal entries this run hands over
+    /// (ADR-116 D3), over this same set of effects.
+    fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>>;
 }
 
 /// A write that failed.
@@ -556,6 +411,192 @@ impl WriteError {
 pub fn lookup_backoff(failures: u32) -> Duration {
     let base = 30u64.saturating_mul(1u64 << failures.saturating_sub(1).min(5));
     Duration::from_secs(base.min(15 * 60))
+}
+
+/// A provider's part of a run (ADR-116 D3): the steps only it has, and the
+/// journal entries they write, which only it can find again and undo. The
+/// engine keeps the journal, its order and its rules (ADR 064 D4); a provider
+/// step writes to the journal only through [`StepRun`], so it cannot skip the
+/// pending entry before a creating call.
+#[async_trait]
+pub trait ProviderRun: Send + Sync {
+    /// Whether steps of `kind` are this provider's.
+    fn runs(&self, kind: StepKind) -> bool;
+    /// Run one of its steps.
+    async fn step(&self, run: &mut dyn StepRun, kind: StepKind) -> Outcome;
+    /// Whether journal entries for `intent` are this provider's.
+    fn owns(&self, intent: &Intent) -> bool;
+    /// Whether `resource` is this provider's.
+    fn owns_resource(&self, resource: &RunResource) -> bool;
+    /// Find what `intent` made, by the provider's own authority.
+    async fn look(&self, run_id: i32, intent: &Intent) -> Result<Found, String>;
+    /// Before undo removes `resource`: whether it is still what the run
+    /// made. `checked`: the user said to remove it whatever it holds now.
+    async fn check_undo(&self, resource: &RunResource, checked: bool) -> UndoCheck;
+    /// Remove `resource`.
+    async fn remove(&self, resource: &RunResource) -> Result<(), String>;
+    /// Where removing `resource` stands when its removal finishes elsewhere
+    /// (a worker takes it off its configuration); `None` when removing is
+    /// one call, and a pending entry is looked up instead.
+    async fn removal(&self, _resource: &RunResource) -> Option<Result<Found, String>> {
+        None
+    }
+    /// What a person decided about one of this provider's entries in
+    /// conflict, by its rules; `None` leaves it to the engine's.
+    fn decide(
+        &self,
+        _entry: &mut JournalEntry,
+        _decision: Decision,
+        _undoing: bool,
+    ) -> Option<Result<(), String>> {
+        None
+    }
+    /// What undo waits for while removing `intent` finishes elsewhere.
+    fn waiting_for(&self, _intent: &Intent) -> Option<String> {
+        None
+    }
+    /// Undo `resource` wholly, when that is more than a check and a
+    /// removal; [`ProviderUndo::Engine`] leaves it to [`Self::check_undo`]
+    /// and [`Self::remove`].
+    async fn undo(
+        &self,
+        _entry: &mut JournalEntry,
+        _resource: &RunResource,
+        _run_id: i32,
+        _now: temps_core::DBDateTime,
+    ) -> ProviderUndo {
+        ProviderUndo::Engine
+    }
+}
+
+/// Where a provider's own undo of one entry left the undo.
+pub enum ProviderUndo {
+    /// Not undone here: the engine checks and removes it.
+    Engine,
+    /// Settled; undo carries on, with what to report (boxed: it is much
+    /// larger than a stop).
+    Settled(Option<Box<UndoResult>>),
+    /// Undo stops here.
+    Stop(Stop),
+    /// The entry changed and is saved before undo stops with `then`;
+    /// `unrecorded` says what happened when it cannot be saved.
+    RecordThenStop { then: Stop, unrecorded: String },
+}
+
+/// What a provider found before undo removes one of its resources.
+pub enum UndoCheck {
+    /// Still what the run made: remove it.
+    Remove,
+    /// Already gone: nothing to remove.
+    Gone,
+    /// No longer the run's to remove, though still there; undo leaves it,
+    /// saying why.
+    Left(String),
+    /// Someone changed it since; undo pauses on it, saying what it is now.
+    Changed(String),
+    /// It could not be read; undo stops, touching nothing from there on.
+    Unreadable(String),
+}
+
+/// What a provider step may use of the run (ADR-116 D3).
+#[async_trait]
+pub trait StepRun: Send {
+    fn input(&self) -> &RunInput;
+    /// The tunnel an earlier step of this run made or chose.
+    fn connector_id(&self) -> Option<i32>;
+    /// The journal entry under `key`, as it is now.
+    fn entry(&self, key: &str) -> Option<JournalEntry>;
+    /// Before a creating call: reuse what an earlier attempt made, else
+    /// store a pending entry first.
+    async fn begin(&mut self, intent: &Intent) -> Result<Begin, Hold>;
+    /// After the call: `Some` what it made, `None` nothing.
+    async fn finish(&mut self, key: &str, resource: Option<RunResource>);
+    /// After a failed call that may have made something anyway.
+    async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool);
+    /// The gate now in front of the address, which attaching it records.
+    fn protect_with(&mut self, binding: AccessBinding);
+    /// The DNS provider an earlier step of this run saved or chose.
+    fn dns_provider_id(&self) -> Option<i32>;
+    /// The tunnel this step made, which later steps publish through.
+    fn set_connector(&mut self, id: i32);
+    /// The run's journal as it is now.
+    fn journal(&self) -> &[JournalEntry];
+    /// Record `resource` as done under `intent` without a call: what the
+    /// step found rather than made.
+    async fn record_found(&mut self, intent: &Intent, resource: RunResource);
+    /// Replace what the entry under `key` holds with what the step read
+    /// back since, and save.
+    async fn update_resource(&mut self, key: &str, resource: RunResource);
+    /// The private address id of the run's address, from what attached it.
+    async fn address_id(&self) -> Result<String, String>;
+    fn timing(&self) -> Timing;
+    async fn sleep(&self, duration: Duration);
+}
+
+#[async_trait]
+impl StepRun for Runner<'_> {
+    fn input(&self) -> &RunInput {
+        self.input
+    }
+
+    fn connector_id(&self) -> Option<i32> {
+        self.ctx.connector_id
+    }
+
+    fn entry(&self, key: &str) -> Option<JournalEntry> {
+        self.record.journal.iter().find(|e| e.key == key).cloned()
+    }
+
+    async fn begin(&mut self, intent: &Intent) -> Result<Begin, Hold> {
+        Runner::begin(self, intent).await
+    }
+
+    async fn finish(&mut self, key: &str, resource: Option<RunResource>) {
+        Runner::finish(self, key, resource).await
+    }
+
+    async fn finish_failed(&mut self, intent: &Intent, maybe_applied: bool) {
+        Runner::finish_failed(self, intent, maybe_applied).await
+    }
+
+    fn protect_with(&mut self, binding: AccessBinding) {
+        self.ctx.access = Some(binding);
+    }
+
+    fn dns_provider_id(&self) -> Option<i32> {
+        self.ctx.provider_id
+    }
+
+    fn set_connector(&mut self, id: i32) {
+        self.ctx.connector_id = Some(id);
+    }
+
+    fn journal(&self) -> &[JournalEntry] {
+        &self.record.journal
+    }
+
+    async fn record_found(&mut self, intent: &Intent, resource: RunResource) {
+        Runner::record_found(self, intent, resource).await
+    }
+
+    async fn update_resource(&mut self, key: &str, resource: RunResource) {
+        if let Some(entry) = self.record.journal.iter_mut().find(|e| e.key == key) {
+            entry.resource = Some(resource);
+        }
+        self.save().await;
+    }
+
+    async fn address_id(&self) -> Result<String, String> {
+        Runner::address_id(self).await
+    }
+
+    fn timing(&self) -> Timing {
+        self.timing
+    }
+
+    async fn sleep(&self, duration: Duration) {
+        self.ops.sleep(duration).await
+    }
 }
 
 /// After this long an entry Temps still cannot resolve is shown with what
@@ -707,6 +748,25 @@ pub struct RunInput {
     pub tailscale_credential: Option<TailscaleCredential>,
 }
 
+/// A Tailscale OAuth client, decrypted for the length of a call.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TailscaleCredential {
+    pub client_id: String,
+    pub client_secret: String,
+    /// The tailnet's API name, or `-` for the client's own.
+    pub tailnet: String,
+}
+
+impl std::fmt::Debug for TailscaleCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TailscaleCredential")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .field("tailnet", &self.tailnet)
+            .finish()
+    }
+}
+
 /// The Cloudflare Access application a run puts in front of its address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessRun {
@@ -781,7 +841,7 @@ pub fn created(journal: &[JournalEntry]) -> Vec<RunResource> {
 
 /// What looking an intent up found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Found {
+pub enum Found {
     Made(Box<RunResource>),
     Missing,
     /// It holds something neither the run nor what it replaced had.
@@ -809,6 +869,9 @@ fn holds_this_run(record: &DnsRecordState, content: &str, run_id: i32) -> bool {
 }
 
 async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, String> {
+    if let Some(provider) = ops.providers().into_iter().find(|p| p.owns(intent)) {
+        return provider.look(run_id, intent).await;
+    }
     match intent {
         Intent::DnsRecord {
             hostname,
@@ -846,61 +909,6 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
             Some(record) if record.unchanged_from(before) => Found::Missing,
             other => Found::Changed(describe_record(other.as_ref())),
         }),
-        // The row and this run's reference to it: Temps' own rows.
-        Intent::TailscaleServe {
-            node_id,
-            node_name,
-            address_id,
-            hostname,
-            ..
-        } => Ok(
-            match ops.serve_reference(run_id, *node_id, address_id).await? {
-                Some((entry_id, created)) => Found::Made(Box::new(RunResource::TailscaleServe {
-                    node_id: *node_id,
-                    node_name: node_name.clone(),
-                    address_id: address_id.clone(),
-                    hostname: hostname.clone(),
-                    entry_id,
-                    created,
-                })),
-                None => Found::Missing,
-            },
-        ),
-        // Created by this run only when it carries this run's marker.
-        Intent::TailscaleService {
-            tailnet,
-            name,
-            marker,
-        } => Ok(match ops.read_service(name).await? {
-            None => Found::Missing,
-            Some(definition) if definition.comment == *marker => {
-                Found::Made(Box::new(RunResource::TailscaleService {
-                    tailnet: tailnet.clone(),
-                    name: name.clone(),
-                    created: true,
-                    creator_run_id: run_id,
-                    definition,
-                }))
-            }
-            Some(definition) => Found::Changed(format!(
-                "`{name}` with the comment `{}`, which this run did not write",
-                definition.comment
-            )),
-        }),
-        // Found by this run's reference at Cloudflare (ADR 070 D2).
-        Intent::EdgeRule {
-            hostname,
-            purpose,
-            connector_id,
-        } => Ok(
-            match ops
-                .find_edge_rule(run_id, *connector_id, hostname, *purpose)
-                .await?
-            {
-                Some(resource) => Found::Made(Box::new(resource)),
-                None => Found::Missing,
-            },
-        ),
         // The address's own column (ADR 070 D1): set when it holds the
         // choice, not set while it still holds what it held before.
         Intent::HttpPolicy {
@@ -934,40 +942,18 @@ fn policy_text(policy: Option<HttpPolicy>) -> String {
     }
 }
 
-/// Where taking a Serve entry off its worker stands (ADR 065 D4): the
-/// entry is gone once the agent reported `removed` or `absent`.
-async fn serve_removal(ops: &dyn RunOps, resource: &RunResource) -> Result<Found, String> {
-    let RunResource::TailscaleServe {
-        node_id,
-        node_name,
-        address_id,
-        hostname,
-        entry_id,
-        ..
-    } = resource
-    else {
-        return Ok(Found::Missing);
-    };
-    Ok(match ops.serve_entry(*node_id, address_id).await? {
-        Some(status) if status.entry_id == *entry_id && status.removing => {
-            if status.worker_gone {
-                Found::Changed(format!(
-                    "`{node_name}` left the cluster while it served `{hostname}`. Remove it \
-                     from the tailnet, or run `tailscale serve reset` on it, then confirm"
-                ))
-            } else if status.report.as_deref() == Some(REPORT_CONFLICT) {
-                Found::Changed(
-                    status
-                        .detail
-                        .unwrap_or_else(|| "a Serve entry Temps did not write".to_string()),
-                )
-            } else {
-                Found::Made(Box::new(resource.clone()))
-            }
-        }
-        // Removed, or replaced by a new entry since.
-        _ => Found::Missing,
-    })
+/// Where removing a `deleting` entry's resource stands, when its provider
+/// finishes removing it elsewhere.
+async fn removal(ops: &dyn RunOps, entry: &JournalEntry) -> Option<Result<Found, String>> {
+    if !entry.deleting {
+        return None;
+    }
+    let resource = entry.resource.as_ref()?;
+    let provider = ops
+        .providers()
+        .into_iter()
+        .find(|p| p.owns_resource(resource))?;
+    provider.removal(resource).await
 }
 
 /// What resolving a pending entry decided.
@@ -1005,11 +991,10 @@ pub async fn resolve_pending(
     if entry.next_lookup_at.is_some_and(|at| at > now) {
         return Resolution::Pending;
     }
-    // Undo is taking a Serve entry off its worker: done once it is gone.
-    if let (true, Some(resource @ RunResource::TailscaleServe { .. })) =
-        (entry.deleting, entry.resource.clone())
-    {
-        return match serve_removal(ops, &resource).await {
+    // Undo is removing it and the removal finishes elsewhere: done once it
+    // is gone.
+    if let Some(removal) = removal(ops, entry).await {
+        return match removal {
             Ok(Found::Missing) => {
                 entry.state = JournalState::Absent;
                 entry.conflict = None;
@@ -1147,6 +1132,7 @@ pub fn decide(
     key: &str,
     decision: Decision,
     undoing: bool,
+    providers: &[Box<dyn ProviderRun + '_>],
 ) -> Result<(), String> {
     let entry = journal
         .iter_mut()
@@ -1170,49 +1156,13 @@ pub fn decide(
             entry.conflict.as_deref().unwrap_or("something else")
         ));
     }
-    if let Intent::TailscaleServe {
-        node_name,
-        hostname,
-        ..
-    } = &entry.intent
+    // A provider's own entries are decided by its rules (ADR-116 D3).
+    if let Some(decided) = providers
+        .iter()
+        .find(|p| p.owns(&entry.intent))
+        .and_then(|p| p.decide(entry, decision, undoing))
     {
-        // ADR 065 D4: Temps never removes a handler it did not write, so
-        // the only answer is to leave the worker as it is and forget the
-        // entry; undo then deletes the row and carries on.
-        if decision == Decision::Overwrite || !undoing {
-            return Err(format!(
-                "Temps never changes Serve configuration it did not write, so it cannot take \
-                 {hostname} off {node_name} for you. Remove it there yourself, or keep it."
-            ));
-        }
-        entry.at = chrono::Utc::now();
-        entry.undo_decision = Some(Decision::Keep);
-        entry.state = JournalState::Done;
-        return Ok(());
-    }
-    if let Intent::TailscaleService { name, tailnet, .. } = &entry.intent {
-        // ADR 065 D4: Temps never updates a Service, so going forward
-        // there is nothing to decide; undo deletes one only when a person
-        // confirms the definition they were shown.
-        if !undoing {
-            return Err(format!(
-                "Temps never changes a Tailscale Service, so it cannot take `{name}` over. Check \
-                 it in the admin console, then plan again with another name or once it is fixed."
-            ));
-        }
-        entry.at = chrono::Utc::now();
-        entry.undo_decision = Some(decision);
-        entry.state = match decision {
-            Decision::Keep => JournalState::Absent,
-            Decision::Overwrite if entry.shown_service.is_some() => JournalState::Done,
-            Decision::Overwrite => {
-                return Err(format!(
-                    "Temps deletes `{name}` from {tailnet} only after showing you what it \
-                     deletes, and nothing was shown for it. Undo again to see it."
-                ))
-            }
-        };
-        return Ok(());
+        return decided;
     }
     entry.at = chrono::Utc::now();
     if undoing {
@@ -1250,7 +1200,7 @@ pub fn decide(
     Ok(())
 }
 
-enum Outcome {
+pub enum Outcome {
     Done(Option<String>),
     Skipped(String),
     Failed(String),
@@ -1262,7 +1212,7 @@ enum Outcome {
 }
 
 /// Whether a journaled step has to make its call.
-enum Begin {
+pub enum Begin {
     /// An earlier attempt created it already.
     Have(Box<RunResource>),
     /// The pending entry is stored; make the call.
@@ -1270,7 +1220,7 @@ enum Begin {
 }
 
 /// Why a journaled step cannot make its call.
-enum Hold {
+pub enum Hold {
     Failed(String),
     /// An earlier attempt may have made it; Temps cannot tell yet.
     Wait(String),
@@ -1304,7 +1254,7 @@ struct Runner<'a> {
 }
 
 /// Why a step waits for an earlier attempt's outcome.
-fn wait_message(entry: &JournalEntry, now: temps_core::DBDateTime) -> String {
+pub fn wait_message(entry: &JournalEntry, now: temps_core::DBDateTime) -> String {
     format!(
         "An earlier attempt may have made {} already, and Temps cannot tell yet{}. It never \
          makes it twice: it checks again every minute; resume once it has.{}",
@@ -1329,30 +1279,6 @@ fn conflict_message(entry: &JournalEntry) -> String {
         entry.intent.describe(),
         entry.conflict.as_deref().unwrap_or("something else")
     )
-}
-
-/// What a skipped edge rule step says (ADR 070 D3): what is missing,
-/// whose token, what stays exposed, and the fix.
-pub fn degraded_message(host: &str, purpose: EdgeRulePurpose, error: &EdgeRuleError) -> String {
-    let whose = error
-        .provider
-        .as_deref()
-        .map(|p| format!("The API token of DNS provider `{p}`"))
-        .unwrap_or_else(|| "The Cloudflare API token".to_string());
-    match error.missing_permission {
-        Some(permission) => format!(
-            "Not set up: {whose} lacks {permission}, so {}. {host} is published anyway. Add \
-             {permission} to the token in Cloudflare (My Profile → API Tokens), then make the \
-             address reachable again to add the rule.",
-            purpose.exposure(host)
-        ),
-        None => format!(
-            "Not set up: {} {host} is published anyway, but {}. Fix that in Cloudflare, then \
-             make the address reachable again to add the rule.",
-            error.message.trim_end_matches('.').to_string() + ".",
-            purpose.exposure(host)
-        ),
-    }
 }
 
 fn record_type(ip: IpAddr) -> &'static str {
@@ -1509,94 +1435,6 @@ impl Runner<'_> {
         resolution
     }
 
-    /// Put a Cloudflare Access app in front of `host` (ADR 065 D9): the
-    /// one the plan found, re-read so a deleted or moved app is not used,
-    /// or one this run creates and journals.
-    async fn access_app(&mut self, host: &str) -> Outcome {
-        let input = self.input;
-        let Some(access) = input.access.clone() else {
-            return Outcome::Failed(format!(
-                "This run has no Cloudflare Access app to put in front of {host}. Plan again."
-            ));
-        };
-        if let Some(existing) = &access.existing {
-            return match self.ops.access_app(access.provider_id, &existing.id).await {
-                Ok(Some(app)) if super::access::covers(&app, host) => {
-                    self.ctx.access = Some(AccessBinding {
-                        provider_id: access.provider_id,
-                        app_id: app.id.clone(),
-                        aud: app.aud.clone(),
-                    });
-                    Outcome::Skipped(format!(
-                        "Access app {} already protects {host}; used as it is.",
-                        app.name
-                    ))
-                }
-                Ok(Some(app)) => Outcome::Failed(format!(
-                    "Access app {} no longer protects {host} (it is for {}). Plan again.",
-                    app.name, app.domain
-                )),
-                Ok(None) => Outcome::Failed(format!(
-                    "Access app {} was deleted in Cloudflare after planning. Plan again.",
-                    existing.name
-                )),
-                Err(error) => Outcome::Failed(error),
-            };
-        }
-        let name = super::access::run_app_name(&access.name, input.run_id);
-        let intent = Intent::AccessApp {
-            provider_id: access.provider_id,
-            name: name.clone(),
-            hostname: host.to_string(),
-        };
-        let bind = |ctx: &mut Context, resource: &RunResource| {
-            if let RunResource::AccessApp {
-                provider_id,
-                id,
-                aud,
-                ..
-            } = resource
-            {
-                ctx.access = Some(AccessBinding {
-                    provider_id: *provider_id,
-                    app_id: id.clone(),
-                    aud: aud.clone(),
-                });
-            }
-        };
-        match self.begin(&intent).await {
-            Err(hold) => hold.into(),
-            Ok(Begin::Have(resource)) => {
-                bind(&mut self.ctx, &resource);
-                Outcome::Done(Some(format!("{} protects {host}.", resource.describe())))
-            }
-            Ok(Begin::Go) => match self
-                .ops
-                .create_access_app(access.provider_id, &name, host, &access.policy)
-                .await
-            {
-                Ok(app) => {
-                    let resource = RunResource::AccessApp {
-                        provider_id: access.provider_id,
-                        id: app.id,
-                        name: app.name,
-                        hostname: host.to_string(),
-                        aud: app.aud,
-                        policies: app.policies,
-                    };
-                    bind(&mut self.ctx, &resource);
-                    let detail = format!("{} protects {host}.", resource.describe());
-                    self.finish(&intent.key(input.run_id), Some(resource)).await;
-                    Outcome::Done(Some(detail))
-                }
-                Err(error) => {
-                    self.finish_failed(&intent, error.maybe_applied).await;
-                    Outcome::Failed(error.message)
-                }
-            },
-        }
-    }
-
     /// Records on the address what it answers besides HTTPS (ADR 070 D1),
     /// so making it reachable again offers the same choice. Nothing is
     /// journaled when the address already keeps it.
@@ -1687,77 +1525,6 @@ impl Runner<'_> {
     /// Add `purpose`'s Cloudflare rule for `host` (ADR 070 D1). A token
     /// without the permission, or any refusal, publishes anyway: the step
     /// is skipped and says what is missing and what stays exposed (D3).
-    async fn edge_rule(&mut self, host: &str, purpose: EdgeRulePurpose) -> Outcome {
-        let input = self.input;
-        let connector_id = input
-            .tunnel
-            .as_ref()
-            .map(|t| t.id)
-            .or(self.ctx.connector_id);
-        let intent = Intent::EdgeRule {
-            hostname: host.to_string(),
-            purpose,
-            connector_id,
-        };
-        match self.begin(&intent).await {
-            Err(hold) => hold.into(),
-            Ok(Begin::Have(resource)) => {
-                Outcome::Done(Some(format!("{} is in place.", resource.describe())))
-            }
-            Ok(Begin::Go) => match self
-                .ops
-                .create_edge_rule(input.run_id, connector_id, host, purpose)
-                .await
-            {
-                Ok(EdgeRuleMade::Created(resource)) => {
-                    let detail = format!("Added the {}.", resource.describe());
-                    self.finish(&intent.key(input.run_id), Some(*resource))
-                        .await;
-                    Outcome::Done(Some(detail))
-                }
-                Ok(EdgeRuleMade::AlreadyThere(found)) => {
-                    self.finish(&intent.key(input.run_id), None).await;
-                    Outcome::Skipped(format!(
-                        "The zone already has a rule doing this ({found}); used as it is, and \
-                         undo leaves it."
-                    ))
-                }
-                Err(error) if error.maybe_applied => {
-                    self.finish_failed(&intent, true).await;
-                    let key = intent.key(input.run_id);
-                    let entry = self.record.journal.iter().find(|e| e.key == key).cloned();
-                    match entry {
-                        Some(entry) if entry.state == JournalState::Done => Outcome::Done(
-                            entry
-                                .resource
-                                .map(|r| format!("Added the {}.", r.describe())),
-                        ),
-                        Some(entry) if entry.state == JournalState::Absent => {
-                            Outcome::Skipped(degraded_message(host, purpose, &error))
-                        }
-                        Some(entry) => Outcome::Stalled(format!(
-                            "{} {}",
-                            error.message,
-                            wait_message(&entry, chrono::Utc::now())
-                        )),
-                        None => Outcome::Failed(error.message),
-                    }
-                }
-                Err(error) => {
-                    self.finish(&intent.key(input.run_id), None).await;
-                    tracing::warn!(
-                        run = input.run_id,
-                        host,
-                        missing_permission = error.missing_permission,
-                        "could not add a Cloudflare edge rule; publishing without it: {}",
-                        error.message
-                    );
-                    Outcome::Skipped(degraded_message(host, purpose, &error))
-                }
-            },
-        }
-    }
-
     /// Point `host` at `ip` (ADR 064 D4): read the record just before
     /// writing, write nothing when it is not what the plan saw, journal a
     /// change with the value it replaces.
@@ -1991,154 +1758,6 @@ impl Runner<'_> {
         Ok(temps_core::worker_ingress::private_address_id(true, id))
     }
 
-    /// ADR 065 D4: declare the worker's Serve entry, referenced by this
-    /// run, then wait for its agent to apply it. Done only on `applied`;
-    /// the agent never overwrites what it did not write, so neither does
-    /// this step.
-    async fn configure_serve(&mut self, target: &ServeTarget) -> Outcome {
-        let input = self.input;
-        let host = input.address.clone();
-        let node = target.node_name.clone();
-        let address_id = match self.address_id().await {
-            Ok(id) => id,
-            Err(error) => return Outcome::Failed(error),
-        };
-        let intent = Intent::TailscaleServe {
-            node_id: target.node_id,
-            node_name: node.clone(),
-            address_id: address_id.clone(),
-            hostname: host.clone(),
-            service: target.service.clone(),
-        };
-        match self.begin(&intent).await {
-            Err(hold) => return hold.into(),
-            Ok(Begin::Have(_)) => {}
-            Ok(Begin::Go) => {
-                let wish = ServeWish {
-                    target: target.clone(),
-                    address_id: address_id.clone(),
-                    hostname: host.clone(),
-                    service_addrs: self.service_resource().map_or_else(Vec::new, |r| match r {
-                        RunResource::TailscaleService { definition, .. } => definition.addrs,
-                        _ => Vec::new(),
-                    }),
-                };
-                let key = intent.key(input.run_id);
-                match self.ops.claim_serve_entry(input.run_id, &wish).await {
-                    Ok(claim @ (ServeClaim::Created { .. } | ServeClaim::Found { .. })) => {
-                        let (entry_id, created) = match claim {
-                            ServeClaim::Created { entry_id } => (entry_id, true),
-                            ServeClaim::Found { entry_id } => (entry_id, false),
-                            ServeClaim::Differs(_) | ServeClaim::Removing => (0, false),
-                        };
-                        self.finish(
-                            &key,
-                            Some(RunResource::TailscaleServe {
-                                node_id: target.node_id,
-                                node_name: node.clone(),
-                                address_id: address_id.clone(),
-                                hostname: host.clone(),
-                                entry_id,
-                                created,
-                            }),
-                        )
-                        .await;
-                    }
-                    Ok(ServeClaim::Differs(what)) => {
-                        self.finish(&key, None).await;
-                        return Outcome::Conflict(format!(
-                            "{node} already has a Serve entry for {host} that another Temps \
-                             setup asked for: {what}. Temps changes nothing there: undo that \
-                             setup first, then resume this one."
-                        ));
-                    }
-                    Ok(ServeClaim::Removing) => {
-                        self.finish(&key, None).await;
-                        return Outcome::Stalled(format!(
-                            "{node} is still taking an earlier Serve entry for {host} off its \
-                             config, and Temps never revives one being removed. Resume once \
-                             it has; its agent reports every 30 seconds."
-                        ));
-                    }
-                    Err(error) => {
-                        self.finish_failed(&intent, true).await;
-                        return Outcome::Failed(error);
-                    }
-                }
-            }
-        }
-        let mut waited = Duration::ZERO;
-        let mut last = format!(
-            "{node} has not applied the Serve entry for {host} yet; its agent applies it on its \
-             next pass, every 30 seconds."
-        );
-        loop {
-            match self.ops.serve_entry(target.node_id, &address_id).await {
-                Ok(None) => {
-                    return Outcome::Failed(format!(
-                        "The Serve entry for {host} on {node} is gone: something removed it \
-                         while this run waited."
-                    ))
-                }
-                Ok(Some(status)) if status.removing => {
-                    return Outcome::Failed(format!(
-                        "The Serve entry for {host} on {node} is being removed: another run's \
-                         undo took it off while this run waited."
-                    ))
-                }
-                Ok(Some(status)) if status.funnel => {
-                    return Outcome::Conflict(tailnet_messages::funnel(&node))
-                }
-                Ok(Some(status)) => match status.report.as_deref() {
-                    Some(REPORT_APPLIED) => {
-                        return Outcome::Done(Some(format!(
-                            "{node} serves {host} with Tailscale Serve."
-                        )))
-                    }
-                    Some(REPORT_CONFLICT) => {
-                        return Outcome::Conflict(tailnet_messages::slot_taken(
-                            &host,
-                            status
-                                .detail
-                                .as_deref()
-                                .unwrap_or("a Serve entry Temps did not write"),
-                        ))
-                    }
-                    Some(REPORT_ERROR) => {
-                        last = format!(
-                            "{node} could not apply the Serve entry for {host}: {}",
-                            status.detail.unwrap_or_default()
-                        )
-                    }
-                    _ => {
-                        if let Some(error) = status.worker_error {
-                            last = error;
-                        }
-                    }
-                },
-                Err(error) => last = format!("Could not read the Serve entry for {host}: {error}"),
-            }
-            if waited >= self.timing.publish {
-                return Outcome::Stalled(last);
-            }
-            self.ops.sleep(self.timing.poll).await;
-            waited += self.timing.poll.max(Duration::from_millis(1));
-        }
-    }
-
-    /// The Tailscale Service this run defined, as journaled.
-    fn service_resource(&self) -> Option<RunResource> {
-        let name = &self.input.tailscale_service.as_ref()?.name;
-        self.record.journal.iter().find_map(|e| match &e.resource {
-            Some(r @ RunResource::TailscaleService { name: n, .. })
-                if n == name && e.state == JournalState::Done =>
-            {
-                Some(r.clone())
-            }
-            _ => None,
-        })
-    }
-
     /// Record `resource` as done under `intent`'s key without a call: what
     /// this run found rather than made.
     async fn record_found(&mut self, intent: &Intent, resource: RunResource) {
@@ -2159,371 +1778,6 @@ impl Runner<'_> {
         entry.pending_since = None;
         entry.at = now;
         self.save().await;
-    }
-
-    /// ADR 065 D2: prove a pasted OAuth client's scopes and save it.
-    async fn save_tailscale_credential(&mut self) -> Outcome {
-        let input = self.input;
-        let Some(plan) = &input.tailscale_service else {
-            return Outcome::Skipped("No Tailscale Service.".into());
-        };
-        let intent = Intent::TailscaleCredential {
-            name: plan.credential_name.clone(),
-        };
-        let key = intent.key(input.run_id);
-        let resource = match self.begin(&intent).await {
-            Err(hold) => return hold.into(),
-            Ok(Begin::Have(resource)) => *resource,
-            Ok(Begin::Go) => {
-                let Some(credential) = &input.tailscale_credential else {
-                    self.finish(&key, None).await;
-                    return Outcome::Failed(
-                        "Paste the Tailscale OAuth client again: Temps never stores it until the \
-                         run saves it."
-                            .into(),
-                    );
-                };
-                match self
-                    .ops
-                    .save_tailscale_credential(&plan.credential_name, credential)
-                    .await
-                {
-                    Ok(id) => {
-                        let resource = RunResource::TailscaleCredential {
-                            id,
-                            name: plan.credential_name.clone(),
-                        };
-                        self.finish(&key, Some(resource.clone())).await;
-                        resource
-                    }
-                    Err(error) => {
-                        self.finish_failed(&intent, true).await;
-                        return Outcome::Failed(error);
-                    }
-                }
-            }
-        };
-        match resource {
-            RunResource::TailscaleCredential { name, .. } => {
-                Outcome::Done(Some(format!("Every scope is there; saved as {name}.")))
-            }
-            _ => Outcome::Failed("The saved Tailscale OAuth client could not be found.".into()),
-        }
-    }
-
-    /// ADR 065 D4: create the Service only when absent, find this install's
-    /// own, and check the whole definition and its hosts back.
-    async fn define_service(&mut self) -> Outcome {
-        let input = self.input;
-        let Some(plan) = input.tailscale_service.clone() else {
-            return Outcome::Skipped("No Tailscale Service.".into());
-        };
-        let name = plan.name.clone();
-        let marker = tailscale::marker(&plan.install_id, input.run_id);
-        let intent = Intent::TailscaleService {
-            tailnet: plan.tailnet.clone(),
-            name: name.clone(),
-            marker: marker.clone(),
-        };
-        let key = intent.key(input.run_id);
-        let resource = match self.service_resource() {
-            Some(resource) => resource,
-            None => {
-                let pending = self
-                    .record
-                    .journal
-                    .iter()
-                    .any(|e| e.key == key && e.state == JournalState::Pending);
-                // A pending create is resolved by its lookup, never by a
-                // second read that could take it for someone else's.
-                let read = if pending {
-                    None
-                } else {
-                    match self.ops.read_service(&name).await {
-                        Ok(read) => Some(read),
-                        Err(error) => {
-                            return Outcome::Failed(format!(
-                                "Temps could not read `{name}` from your tailnet, so it created \
-                                 nothing: {error}"
-                            ))
-                        }
-                    }
-                };
-                match read {
-                    None | Some(None) => match self.begin(&intent).await {
-                        Err(hold) => return hold.into(),
-                        Ok(Begin::Have(resource)) => *resource,
-                        Ok(Begin::Go) => {
-                            let fixed = ServiceDefinition::fixed(&name, &plan.tag, &marker);
-                            match self.ops.create_service(&fixed).await {
-                                Ok(()) => {
-                                    let resource = RunResource::TailscaleService {
-                                        tailnet: plan.tailnet.clone(),
-                                        name: name.clone(),
-                                        created: true,
-                                        creator_run_id: input.run_id,
-                                        definition: fixed,
-                                    };
-                                    self.finish(&key, Some(resource.clone())).await;
-                                    resource
-                                }
-                                Err(error) => {
-                                    self.finish_failed(&intent, error.maybe_applied).await;
-                                    return Outcome::Failed(error.message);
-                                }
-                            }
-                        }
-                    },
-                    // A resumed run whose earlier PUT landed.
-                    Some(Some(found)) if found.comment == marker => {
-                        let resource = RunResource::TailscaleService {
-                            tailnet: plan.tailnet.clone(),
-                            name: name.clone(),
-                            created: true,
-                            creator_run_id: input.run_id,
-                            definition: found,
-                        };
-                        self.record_found(&intent, resource.clone()).await;
-                        resource
-                    }
-                    Some(Some(found)) => {
-                        match tailscale::ownership(&found, &plan.install_id) {
-                            Ownership::Ours { creator_run_id } => {
-                                match plan.seen.as_ref().map(|seen| found.differs_from(seen)) {
-                                    // D1 option 1: this install's, as the plan read it.
-                                    Some(None) => {
-                                        let resource = RunResource::TailscaleService {
-                                            tailnet: plan.tailnet.clone(),
-                                            name: name.clone(),
-                                            created: false,
-                                            creator_run_id,
-                                            definition: found,
-                                        };
-                                        self.record_found(&intent, resource.clone()).await;
-                                        resource
-                                    }
-                                    Some(Some(why)) => {
-                                        return Outcome::Conflict(format!(
-                                            "{why} since this run was planned. Temps wrote \
-                                             nothing to it: check it, then plan again."
-                                        ))
-                                    }
-                                    None => {
-                                        return Outcome::Conflict(format!(
-                                            "`{name}` was created by another setup of this Temps \
-                                             install (run {creator_run_id}) after this run was \
-                                             planned. Temps wrote nothing to it: plan again to \
-                                             use it."
-                                        ))
-                                    }
-                                }
-                            }
-                            Ownership::Foreign => {
-                                return Outcome::Conflict(tailnet_messages::service_taken(&name))
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        self.check_service(resource, &plan, &marker).await
-    }
-
-    /// When the Service step is done (ADR 065 D4): its marker, the fixed
-    /// definition, Tailscale addresses, and only recorded hosts.
-    async fn check_service(
-        &mut self,
-        resource: RunResource,
-        plan: &ServicePlan,
-        marker: &str,
-    ) -> Outcome {
-        let RunResource::TailscaleService {
-            created,
-            creator_run_id,
-            ..
-        } = resource.clone()
-        else {
-            return Outcome::Failed("The Tailscale Service could not be recorded.".into());
-        };
-        let name = plan.name.as_str();
-        // Tailscale assigns the TailVIPs: wait for them to show.
-        let mut waited = Duration::ZERO;
-        let read = loop {
-            match self.ops.read_service(name).await {
-                Ok(Some(read)) if !read.addrs.is_empty() || waited >= self.timing.publish => {
-                    break read
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return Outcome::Failed(format!(
-                        "`{name}` is gone from your tailnet: something deleted it while this run \
-                         worked on it."
-                    ))
-                }
-                Err(error) if waited >= self.timing.publish => {
-                    return Outcome::Stalled(format!(
-                        "Could not read `{name}` back from your tailnet: {error}"
-                    ))
-                }
-                Err(_) => {}
-            }
-            self.ops.sleep(self.timing.poll).await;
-            waited += self.timing.poll.max(Duration::from_millis(1));
-        };
-        let owned = if created {
-            (read.comment == marker).then_some(())
-        } else {
-            matches!(
-                tailscale::ownership(&read, &plan.install_id),
-                Ownership::Ours { .. }
-            )
-            .then_some(())
-        };
-        if owned.is_none() {
-            return Outcome::Conflict(format!(
-                "`{name}` now carries the comment `{}`, not this Temps install's marker. Temps \
-                 writes nothing to it: check who changed it.",
-                read.comment
-            ));
-        }
-        if let Some(why) = read.differs_from_fixed(&plan.tag) {
-            return Outcome::Conflict(format!("{why}. Temps never changes a Service: check it."));
-        }
-        if !tailscale_addrs(&read.addrs) {
-            return Outcome::Conflict(format!(
-                "`{name}` has the addresses {:?}, not Tailscale ones, so Temps does not trust it.",
-                read.addrs
-            ));
-        }
-        if !created {
-            match self.ops.service_creation(name, creator_run_id).await {
-                Ok(Some((journaled, _))) if journaled.addrs.is_empty() => {}
-                Ok(Some((journaled, _))) => {
-                    if let Some(why) = read.differs_from(&ServiceDefinition {
-                        comment: read.comment.clone(),
-                        ..journaled
-                    }) {
-                        return Outcome::Conflict(format!("{why}. Temps never changes a Service."));
-                    }
-                }
-                Ok(None) => {
-                    return Outcome::Conflict(format!(
-                        "No setup of this Temps install records creating `{name}` (run \
-                         {creator_run_id}), so Temps does not use it. Pick another name."
-                    ))
-                }
-                Err(error) => return Outcome::Failed(error),
-            }
-        }
-        if let Err(outcome) = self.unrecorded(name).await {
-            return outcome;
-        }
-        // Journal what was read, with the addresses Tailscale assigned.
-        let resource = RunResource::TailscaleService {
-            tailnet: plan.tailnet.clone(),
-            name: name.to_string(),
-            created,
-            creator_run_id,
-            definition: read.clone(),
-        };
-        let key = Intent::TailscaleService {
-            tailnet: plan.tailnet.clone(),
-            name: name.to_string(),
-            marker: marker.to_string(),
-        }
-        .key(self.input.run_id);
-        if let Some(entry) = self.record.journal.iter_mut().find(|e| e.key == key) {
-            entry.resource = Some(resource);
-        }
-        self.save().await;
-        Outcome::Done(Some(format!(
-            "`{name}` is in your tailnet at {}{}.",
-            read.addrs.join(", "),
-            if created {
-                ""
-            } else {
-                ", as this Temps install made it"
-            }
-        )))
-    }
-
-    /// Every host advertising the Service must match one of this address's
-    /// Serve entries for it (ADR 065 D4); `Err` the outcome when one does
-    /// not, or the hosts cannot be read.
-    async fn unrecorded(&self, name: &str) -> Result<Vec<ServiceHost>, Outcome> {
-        let hosts = self.ops.service_hosts(name).await.map_err(|error| {
-            Outcome::Failed(format!(
-                "Temps could not read which machines host `{name}`, which it checks before \
-                 trusting it: {error}"
-            ))
-        })?;
-        let entries = self
-            .ops
-            .service_entries(name)
-            .await
-            .map_err(Outcome::Failed)?;
-        let address_id = match self.address_id().await {
-            Ok(id) => id,
-            Err(error) => return Err(Outcome::Failed(error)),
-        };
-        let foreign = unrecorded_hosts(&hosts, &entries, Some(&address_id));
-        if foreign.is_empty() {
-            Ok(hosts)
-        } else {
-            Err(Outcome::Conflict(unrecorded_message(name, &foreign)))
-        }
-    }
-
-    /// ADR 065 D4: wait for the tailnet admin to approve the worker as the
-    /// Service's host. It never approves; waiting is not a failure.
-    async fn wait_for_approval(&mut self) -> Outcome {
-        let input = self.input;
-        let (Some(plan), Some(target)) = (&input.tailscale_service, &input.serve) else {
-            return Outcome::Skipped("No Tailscale Service.".into());
-        };
-        let name = plan.name.as_str();
-        let node = target.node_name.as_str();
-        let mut waited = Duration::ZERO;
-        let mut last;
-        loop {
-            // Deleted after the define step: no one recreates it behind
-            // the user's back, so the run stops and undo takes it apart.
-            if let Ok(None) = self.ops.read_service(name).await {
-                return Outcome::Failed(format!(
-                    "`{name}` is gone from your tailnet: something deleted it after this run \
-                     defined it. Undo, then make the address reachable again."
-                ));
-            }
-            let hosts = match self.unrecorded(name).await {
-                Ok(hosts) => hosts,
-                Err(outcome) => return outcome,
-            };
-            let mine = match self.ops.service_entries(name).await {
-                Ok(entries) => entries.into_iter().find(|e| e.node_id == target.node_id),
-                Err(error) => return Outcome::Failed(error),
-            };
-            let host = mine
-                .as_ref()
-                .and_then(|e| hosts.iter().find(|h| e.hosts(h)));
-            match host.map(|h| h.approved) {
-                Some(Some(true)) => {
-                    return Outcome::Done(Some(format!("{node} is the approved host of `{name}`.")))
-                }
-                Some(_) => last = tailnet_messages::not_approved(name, node, &plan.tag),
-                None => {
-                    last = format!(
-                        "`{node}` does not advertise `{name}` yet; its agent does on its next \
-                         pass, every 30 seconds. Then {}",
-                        tailnet_messages::not_approved(name, node, &plan.tag)
-                    )
-                }
-            }
-            if waited >= self.timing.publish {
-                return Outcome::Stalled(last);
-            }
-            self.ops.sleep(self.timing.poll).await;
-            waited += self.timing.poll.max(Duration::from_millis(1));
-        }
     }
 
     /// ADR 065 D9: an Access address names the app whose JWTs the listener
@@ -2564,25 +1818,13 @@ impl Runner<'_> {
     }
 
     async fn step(&mut self, index: usize, kind: StepKind) -> Outcome {
+        let ops = self.ops;
+        if let Some(provider) = ops.providers().into_iter().find(|p| p.runs(kind)) {
+            return provider.step(self, kind).await;
+        }
         let input = self.input;
         let address = input.address.clone();
         match kind {
-            StepKind::CheckToken => {
-                let (Some(token), Some(new)) = (&input.token, &input.new_tunnel) else {
-                    return Outcome::Failed(
-                        "Paste the Cloudflare API token again: Temps never stores it until \
-                         the run saves it."
-                            .into(),
-                    );
-                };
-                let result = self.ops.check_token(token, &new.zone).await;
-                match result.refusal() {
-                    Some(reason) => Outcome::Failed(reason),
-                    None => Outcome::Done(Some(
-                        "Every permission is there, for this zone only.".into(),
-                    )),
-                }
-            }
             StepKind::SaveDnsProvider => {
                 let Some(new) = &input.new_tunnel else {
                     return Outcome::Skipped("No new tunnel.".into());
@@ -2744,72 +1986,6 @@ impl Runner<'_> {
                 } else {
                     "Added and verified.".into()
                 }))
-            }
-            StepKind::CreateTunnel => {
-                let Some(new) = input.new_tunnel.clone() else {
-                    return Outcome::Skipped("No new tunnel.".into());
-                };
-                let Some(provider_id) = self.ctx.provider_id else {
-                    return Outcome::Failed(
-                        "No Cloudflare account to create the tunnel with.".into(),
-                    );
-                };
-                let intent = Intent::Connector {
-                    name: new.name.clone(),
-                };
-                match self.begin(&intent).await {
-                    Err(hold) => hold.into(),
-                    Ok(Begin::Have(resource)) => {
-                        if let RunResource::Connector { id, .. } = *resource {
-                            self.ctx.connector_id = Some(id);
-                        }
-                        Outcome::Done(Some(format!(
-                            "Tunnel {} for {} (created earlier).",
-                            new.name, new.domain
-                        )))
-                    }
-                    Ok(Begin::Go) => match self
-                        .ops
-                        .create_tunnel(&new.name, provider_id, &new.domain, &[new.worker.id])
-                        .await
-                    {
-                        Ok((id, status)) => {
-                            self.ctx.connector_id = Some(id);
-                            self.finish(
-                                &intent.key(input.run_id),
-                                Some(RunResource::Connector {
-                                    id,
-                                    name: new.name.clone(),
-                                }),
-                            )
-                            .await;
-                            if status.status == "error" {
-                                return Outcome::Failed(
-                                    status
-                                        .last_error
-                                        .unwrap_or_else(|| "Cloudflare refused the tunnel.".into()),
-                                );
-                            }
-                            Outcome::Done(Some(format!("Tunnel {} for {}.", new.name, new.domain)))
-                        }
-                        Err((saved, error)) => {
-                            match saved {
-                                Some(id) => {
-                                    self.finish(
-                                        &intent.key(input.run_id),
-                                        Some(RunResource::Connector {
-                                            id,
-                                            name: new.name.clone(),
-                                        }),
-                                    )
-                                    .await
-                                }
-                                None => self.finish_failed(&intent, true).await,
-                            }
-                            Outcome::Failed(error)
-                        }
-                    },
-                }
             }
             StepKind::WaitForTunnel => {
                 let (Some(id), Some(new)) = (self.ctx.connector_id, &input.new_tunnel) else {
@@ -3253,25 +2429,18 @@ impl Runner<'_> {
                     },
                 }
             }
-            StepKind::AccessApp => self.access_app(&address).await,
-            StepKind::RedirectToHttps => {
-                self.edge_rule(&address, EdgeRulePurpose::HttpsRedirect)
-                    .await
-            }
-            StepKind::StandardPortsOnly => {
-                self.edge_rule(&address, EdgeRulePurpose::StandardPorts)
-                    .await
+            StepKind::CheckToken
+            | StepKind::CreateTunnel
+            | StepKind::AccessApp
+            | StepKind::RedirectToHttps
+            | StepKind::StandardPortsOnly
+            | StepKind::ConfigureTailscaleServe
+            | StepKind::SaveTailscaleCredential
+            | StepKind::DefineTailscaleService
+            | StepKind::WaitForServiceApproval => {
+                Outcome::Failed(format!("No provider runs {kind:?} steps here."))
             }
             StepKind::SetHttpPolicy => self.record_http_policy(&address).await,
-            StepKind::ConfigureTailscaleServe => {
-                let Some(target) = input.serve.clone() else {
-                    return Outcome::Skipped("No worker serves it through Tailscale.".into());
-                };
-                self.configure_serve(&target).await
-            }
-            StepKind::SaveTailscaleCredential => self.save_tailscale_credential().await,
-            StepKind::DefineTailscaleService => self.define_service().await,
-            StepKind::WaitForServiceApproval => self.wait_for_approval().await,
             StepKind::CheckReachability => {
                 let verdict = self.ops.reachability(&address).await;
                 if verdict.state == ReachState::Reachable {
@@ -3564,191 +2733,16 @@ fn journaled_hostnames(journal: &[JournalEntry]) -> std::collections::BTreeSet<S
 }
 
 /// Mark the entry at `index` in conflict with `current` and stop there.
-fn pause(entry: &mut JournalEntry, current: String, now: temps_core::DBDateTime) -> Stop {
+pub(crate) fn pause(
+    entry: &mut JournalEntry,
+    current: String,
+    now: temps_core::DBDateTime,
+) -> Stop {
     entry.state = JournalState::Conflict;
     entry.unwritten = false;
     entry.conflict = Some(current);
     entry.at = now;
     Stop::Conflict(undo_conflict_message(entry))
-}
-
-/// Whether `current` still carries the marker run `creator_run_id` of
-/// `install` gave it (ADR 065 D4): no marker, another install's or another
-/// run's is never written to or deleted. Why not, when it is not.
-pub(crate) fn still_ours(
-    current: &ServiceDefinition,
-    name: &str,
-    install: &str,
-    creator_run_id: i32,
-) -> Result<(), String> {
-    let ours = !install.is_empty()
-        && tailscale::ownership(current, install) == Ownership::Ours { creator_run_id };
-    if ours {
-        return Ok(());
-    }
-    let now = current.comment.trim();
-    Err(if now.is_empty() {
-        format!("`{name}` no longer carries the marker this Temps install gave it, so it is not Temps' to delete")
-    } else {
-        format!(
-            "`{name}` now carries `{now}`, not the marker this Temps install gave it (`{}`), so it \
-             is not Temps' to delete",
-            tailscale::marker(install, creator_run_id)
-        )
-    })
-}
-
-/// Where undoing a Tailscale Service left the undo.
-enum ServiceUndo {
-    /// Carry on, with what to report (boxed: it is much larger than a stop).
-    Done(Option<Box<UndoResult>>),
-    Stop(Stop),
-}
-
-/// Undo a Tailscale Service (ADR 065 D4): keep it while any Serve entry
-/// names it, never delete one no journal of this install records as
-/// created, pause on a changed definition or an unrecorded host, and
-/// otherwise ask the user; delete only once they confirmed what they were
-/// shown, with the checks made again under the Service's lock.
-async fn undo_service(
-    entry: &mut JournalEntry,
-    resource: &RunResource,
-    ops: &dyn RunOps,
-    now: temps_core::DBDateTime,
-) -> ServiceUndo {
-    let RunResource::TailscaleService {
-        tailnet,
-        name,
-        creator_run_id,
-        ..
-    } = resource
-    else {
-        return ServiceUndo::Done(None);
-    };
-    let kept = |entry: &mut JournalEntry, why: String| {
-        entry.state = JournalState::Absent;
-        entry.at = now;
-        ServiceUndo::Done(Some(Box::new(UndoResult {
-            label: format!("Kept `{name}`: {why}"),
-            resource: resource.clone(),
-            ok: true,
-            error: None,
-        })))
-    };
-    let failed = |what: &str, error: String| {
-        ServiceUndo::Stop(Stop::Failed(format!(
-            "Temps could not {what} `{name}`, so it left it and everything this run did before \
-             it: {error} Undo again to retry."
-        )))
-    };
-    // A person confirmed the delete of what they were shown.
-    if entry.undo_decision == Some(Decision::Overwrite) {
-        let Some(shown) = entry.shown_service.clone() else {
-            return kept(entry, "nothing was shown to confirm".to_string());
-        };
-        return match ops
-            .delete_service(tailnet, name, *creator_run_id, &shown)
-            .await
-        {
-            Ok(ServiceDeletion::Deleted) => {
-                entry.state = JournalState::Absent;
-                entry.at = now;
-                ServiceUndo::Done(Some(Box::new(UndoResult {
-                    label: format!("Deleted `{name}` from {tailnet}"),
-                    resource: resource.clone(),
-                    ok: true,
-                    error: None,
-                })))
-            }
-            Ok(ServiceDeletion::Gone) => {
-                entry.state = JournalState::Absent;
-                entry.at = now;
-                ServiceUndo::Done(None)
-            }
-            Ok(ServiceDeletion::Kept(why)) => kept(entry, why),
-            Err(error) => failed("delete", error),
-        };
-    }
-    // Still in use: expected, not a conflict.
-    let entries = match ops.service_entries(name).await {
-        Ok(entries) => entries,
-        Err(error) => return failed("tell what uses", error),
-    };
-    if let Some(user) = entries.first() {
-        return kept(
-            entry,
-            format!("it still serves {} on {}", user.hostname, user.node_name),
-        );
-    }
-    // Never deleted without this install's journal of creating it.
-    let creation = match ops.service_creation(name, *creator_run_id).await {
-        Ok(Some(creation)) => creation,
-        Ok(None) => {
-            return kept(
-                entry,
-                "no setup of this Temps install records creating it".to_string(),
-            )
-        }
-        Err(error) => return failed("find who created", error),
-    };
-    let current = match ops.read_service(name).await {
-        Ok(Some(current)) => current,
-        Ok(None) => {
-            entry.state = JournalState::Absent;
-            entry.at = now;
-            return ServiceUndo::Done(None);
-        }
-        Err(error) => return failed("read", error),
-    };
-    // A Service that no longer carries the marker this run gave it is not
-    // Temps' any more, whatever the journal says (D4): never offered for
-    // deletion.
-    let owner = tailscale::parse_marker(&creation.0.comment)
-        .map(|(install, _)| install)
-        .unwrap_or_default();
-    if let Err(why) = still_ours(&current, name, &owner, *creator_run_id) {
-        return kept(entry, why);
-    }
-    let changed = if creation.0.addrs.is_empty() {
-        current.differs_from(&ServiceDefinition {
-            addrs: current.addrs.clone(),
-            ..creation.0.clone()
-        })
-    } else {
-        current.differs_from(&creation.0)
-    };
-    let question = match changed {
-        Some(why) => format!(
-            "{why}, which Temps did not set. Keep it, or delete it anyway? Temps deletes it only \
-             if it still is exactly what you see here."
-        ),
-        None => {
-            let hosts = match ops.service_hosts(name).await {
-                Ok(hosts) => hosts,
-                Err(error) => return failed("read the hosts of", error),
-            };
-            let foreign = unrecorded_hosts(&hosts, &[], None);
-            if foreign.is_empty() {
-                format!(
-                    "Delete `{name}` from tailnet `{tailnet}`? It was created by this Temps \
-                     install on {} and nothing uses it now.",
-                    creation.1.format("%-d %B")
-                )
-            } else {
-                format!(
-                    "`{name}` is now also hosted by {}, which no Temps setup configured. Keep \
-                     it, or delete it anyway?",
-                    foreign
-                        .iter()
-                        .map(|h| format!("`{h}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-        }
-    };
-    entry.shown_service = Some(current);
-    ServiceUndo::Stop(pause(entry, question, now))
 }
 
 /// Remove what a run created and put back what it changed, newest first,
@@ -3812,14 +2806,12 @@ pub async fn undo(
                 },
                 Resolution::Absent => continue,
                 Resolution::Pending if entry.deleting => {
-                    let what = match &entry.intent {
-                        Intent::TailscaleServe {
-                            node_name,
-                            hostname,
-                            ..
-                        } => format!("{node_name} to take {hostname} off its Serve config"),
-                        other => format!("{} to be removed", other.describe()),
-                    };
+                    let what = ops
+                        .providers()
+                        .iter()
+                        .find(|p| p.owns(&entry.intent))
+                        .and_then(|p| p.waiting_for(&entry.intent))
+                        .unwrap_or_else(|| format!("{} to be removed", entry.intent.describe()));
                     return stop(
                         results,
                         Stop::Pending(format!(
@@ -3851,137 +2843,56 @@ pub async fn undo(
             },
         };
         let checked = entry.undo_decision == Some(Decision::Overwrite);
-        // ADR 065 D4: this run's reference goes first; the entry, and the
-        // worker's configuration, only with the last one.
-        if let RunResource::TailscaleServe {
-            node_id,
-            node_name,
-            address_id,
-            hostname,
-            entry_id,
-            ..
-        } = &resource
-        {
-            if entry.deleting && entry.undo_decision == Some(Decision::Keep) {
-                let outcome = ops.forget_serve_entry(*entry_id).await;
-                if outcome.is_ok() {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                }
-                results.push(UndoResult {
-                    label: format!(
-                        "Left {node_name}'s Serve config as it is and forgot Temps' entry for \
-                         {hostname}"
-                    ),
-                    resource: resource.clone(),
-                    ok: outcome.is_ok(),
-                    error: outcome.err(),
-                });
-                continue;
-            }
-            if entry.deleting {
-                // Still waiting on the agent (resolved above when pending).
-                return stop(
-                    results,
-                    Stop::Pending(format!(
-                        "Waiting for {node_name} to take {hostname} off its Serve config; \
-                         undo carries on once its agent reports it."
-                    )),
-                );
-            }
-            match ops.release_serve_entry(run_id, *node_id, address_id).await {
-                Ok(ServeRelease::Gone) => {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                }
-                Ok(ServeRelease::Kept(why)) => {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                    results.push(UndoResult {
-                        label: format!("Kept {hostname} on {node_name}: {why}"),
-                        resource: resource.clone(),
-                        ok: true,
-                        error: None,
-                    });
-                }
-                Ok(ServeRelease::Deleted) => {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                    results.push(UndoResult {
-                        label: format!(
-                            "Removed Temps' Serve entry for {hostname} ({node_name} had written \
-                             nothing for it)"
-                        ),
-                        resource: resource.clone(),
-                        ok: true,
-                        error: None,
-                    });
-                }
-                Ok(ServeRelease::Removing) => {
-                    entry.deleting = true;
-                    entry.state = JournalState::Pending;
-                    entry.pending_since = Some(now);
-                    entry.next_lookup_at = None;
-                    entry.failed_lookups = 0;
-                    entry.at = now;
-                    if let Err(error) = sink.save_journal(journal).await {
-                        return stop(
-                            results,
-                            Stop::Failed(format!(
-                                "{node_name} is taking {hostname} off its Serve config, but \
-                                 Temps could not record that: {error} Undo again to carry on."
-                            )),
-                        );
-                    }
-                    return stop(
-                        results,
-                        Stop::Pending(format!(
-                            "{node_name} is taking {hostname} off its Serve config; undo \
-                             carries on once its agent reports it, within a minute."
-                        )),
-                    );
-                }
-                Err(error) => {
-                    return stop(
-                        results,
-                        Stop::Failed(format!(
-                            "Temps could not release its Serve entry for {hostname} on \
-                             {node_name}, so it touched nothing from there on: {error} Undo \
-                             again to retry."
-                        )),
-                    )
-                }
-            }
-            continue;
-        }
-        if let RunResource::TailscaleService { .. } = &resource {
-            match undo_service(entry, &resource, ops, now).await {
-                ServiceUndo::Done(result) => {
+        // A provider's own resource is undone, or checked, by the provider
+        // (ADR-116 D3).
+        let provider = ops
+            .providers()
+            .into_iter()
+            .find(|p| p.owns_resource(&resource));
+        if let Some(provider) = &provider {
+            match provider.undo(entry, &resource, run_id, now).await {
+                ProviderUndo::Engine => {}
+                ProviderUndo::Settled(result) => {
                     if let Some(result) = result {
                         results.push(*result);
                     }
                     continue;
                 }
-                ServiceUndo::Stop(why) => return stop(results, why),
+                ProviderUndo::Stop(why) => return stop(results, why),
+                ProviderUndo::RecordThenStop { then, unrecorded } => {
+                    if let Err(error) = sink.save_journal(journal).await {
+                        return stop(
+                            results,
+                            Stop::Failed(format!(
+                                "{unrecorded}, but Temps could not record that: {error} Undo \
+                                 again to carry on."
+                            )),
+                        );
+                    }
+                    return stop(results, then);
+                }
             }
-        }
-        if let RunResource::TailscaleCredential { id, name } = &resource {
-            let outcome = ops.release_tailscale_credential(*id).await;
-            let label = match &outcome {
-                Ok(Some(why)) => format!("Kept Tailscale OAuth client {name}: {why}"),
-                _ => format!("Removed Tailscale OAuth client {name}"),
-            };
-            if outcome.is_ok() {
-                entry.state = JournalState::Absent;
-                entry.at = now;
+            match provider.check_undo(&resource, checked).await {
+                UndoCheck::Remove => {}
+                UndoCheck::Gone => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    continue;
+                }
+                UndoCheck::Left(label) => {
+                    entry.state = JournalState::Absent;
+                    entry.at = now;
+                    results.push(UndoResult {
+                        label,
+                        resource: resource.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                    continue;
+                }
+                UndoCheck::Changed(now_is) => return stop(results, pause(entry, now_is, now)),
+                UndoCheck::Unreadable(why) => return stop(results, Stop::Failed(why)),
             }
-            results.push(UndoResult {
-                label,
-                resource: resource.clone(),
-                ok: outcome.is_ok(),
-                error: outcome.err(),
-            });
-            continue;
         }
         match &resource {
             // The choice goes with the address this undo removes.
@@ -4208,95 +3119,6 @@ pub async fn undo(
                     )
                 }
             },
-            // An Access app goes only while it is still this address's
-            // app, and, unless the user said to delete it anyway, while its
-            // policies are what the run created (ADR 065 D9).
-            RunResource::AccessApp {
-                provider_id,
-                id,
-                name,
-                hostname,
-                policies,
-                ..
-            } => match ops.access_app(*provider_id, id).await {
-                Ok(None) => {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                    continue;
-                }
-                Ok(Some(app))
-                    if !app
-                        .domain
-                        .trim_end_matches('.')
-                        .eq_ignore_ascii_case(hostname.trim_end_matches('.')) =>
-                {
-                    entry.state = JournalState::Absent;
-                    entry.at = now;
-                    results.push(UndoResult {
-                        label: format!(
-                            "Left Access app {name}: it protects {} now, not {hostname}",
-                            app.domain
-                        ),
-                        resource: resource.clone(),
-                        ok: true,
-                        error: None,
-                    });
-                    continue;
-                }
-                Ok(Some(app)) if !checked && app.policies != *policies => {
-                    return stop(
-                        results,
-                        pause(entry, "its policies were changed".to_string(), now),
-                    )
-                }
-                Ok(Some(_)) => {}
-                Err(error) => {
-                    return stop(
-                        results,
-                        Stop::Failed(format!(
-                            "Temps could not read Access app {name} to check it is still the \
-                             one this run created, so it touched nothing from there on: \
-                             {error} Undo again to retry."
-                        )),
-                    )
-                }
-            },
-            // A rule goes only while it still does what the run wrote
-            // (ADR 070 D2): its expression and action, and for the
-            // redirect its target, status and query string. Unless the
-            // user said to delete it anyway.
-            RunResource::EdgeRule {
-                hostname, purpose, ..
-            } => {
-                let Some(at) = EdgeRuleAt::of(&resource) else {
-                    continue;
-                };
-                match ops.edge_rule(&at).await {
-                    Ok(None) => {
-                        entry.state = JournalState::Absent;
-                        entry.at = now;
-                        continue;
-                    }
-                    Ok(Some(rule)) if !checked && !same_rule(&rule, *purpose, hostname) => {
-                        return stop(
-                            results,
-                            pause(entry, format!("it is now {}", rule.summary()), now),
-                        );
-                    }
-                    Ok(Some(_)) => {}
-                    Err(error) => {
-                        return stop(
-                            results,
-                            Stop::Failed(format!(
-                                "Temps could not read the {} to check it is still the one this \
-                                 run added, so it touched nothing from there on: {error} Undo \
-                                 again to retry.",
-                                purpose.describe(hostname)
-                            )),
-                        )
-                    }
-                }
-            }
             // A tunnel is checked for what else it serves, then marked
             // `deleting`, and that journaled, before any provider call:
             // sync then never brings it back, and an interrupted undo
@@ -4356,68 +3178,66 @@ pub async fn undo(
             _ => {}
         }
         let entry = &mut journal[index];
-        let outcome = match &resource {
-            RunResource::DnsProvider { id, .. } => ops.delete_dns_provider(*id).await,
-            RunResource::ManagedDomain {
-                provider_id,
-                domain,
-            } => ops.remove_managed_zone(*provider_id, domain).await,
-            RunResource::AutoManageEnabled {
-                provider_id,
-                domain,
-            } => ops.set_auto_manage(*provider_id, domain, false).await,
-            RunResource::Connector { id, .. } => {
-                ops.delete_tunnel(*id, entry.tunnel_id.as_deref()).await
-            }
-            RunResource::CustomDomain { id, .. } => ops.detach_domain(*id).await,
-            RunResource::HostnameChoice {
-                hostname, previous, ..
-            } => ops.restore_hostname_choice(hostname, *previous).await,
-            RunResource::DnsRecord {
-                hostname,
-                label,
-                record_type,
-                ..
-            } => ops.remove_dns_record(hostname, label, record_type).await,
-            RunResource::DnsChange {
-                hostname,
-                record_type,
-                before,
-                ..
-            } => ops
-                .write_dns_record(
+        let outcome = match (&provider, &resource) {
+            (Some(provider), resource) => provider.remove(resource).await,
+            (None, resource) => match resource {
+                RunResource::DnsProvider { id, .. } => ops.delete_dns_provider(*id).await,
+                RunResource::ManagedDomain {
+                    provider_id,
+                    domain,
+                } => ops.remove_managed_zone(*provider_id, domain).await,
+                RunResource::AutoManageEnabled {
+                    provider_id,
+                    domain,
+                } => ops.set_auto_manage(*provider_id, domain, false).await,
+                RunResource::Connector { id, .. } => {
+                    ops.delete_tunnel(*id, entry.tunnel_id.as_deref()).await
+                }
+                RunResource::CustomDomain { id, .. } => ops.detach_domain(*id).await,
+                RunResource::HostnameChoice {
+                    hostname, previous, ..
+                } => ops.restore_hostname_choice(hostname, *previous).await,
+                RunResource::DnsRecord {
+                    hostname,
+                    label,
+                    record_type,
+                    ..
+                } => ops.remove_dns_record(hostname, label, record_type).await,
+                RunResource::DnsChange {
                     hostname,
                     record_type,
-                    &before.content,
-                    before.run_id,
-                    // Put back exactly what was there, its proxy flag
-                    // included; one read before this was kept was DNS
-                    // only, as every run wrote then.
-                    Some(before.proxied.unwrap_or(false)),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|e| e.message),
-            RunResource::AddressAudience {
-                hostname, before, ..
-            } => ops.set_address_audience(hostname, before).await,
-            RunResource::HttpPolicy {
-                hostname, before, ..
-            } => ops.set_http_policy(hostname, *before).await,
-            RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
-            RunResource::AccessApp {
-                provider_id, id, ..
-            } => ops.delete_access_app(*provider_id, id).await,
-            // Handled above, before anything is removed.
-            RunResource::TailscaleServe { .. }
-            | RunResource::TailscaleService { .. }
-            | RunResource::TailscaleCredential { .. } => Ok(()),
-            RunResource::EnvironmentHosts { connector_id, .. } => {
-                ops.set_environment_hosts(*connector_id, false).await
-            }
-            RunResource::EdgeRule { .. } => match EdgeRuleAt::of(&resource) {
-                Some(at) => ops.delete_edge_rule(&at).await,
-                None => Ok(()),
+                    before,
+                    ..
+                } => ops
+                    .write_dns_record(
+                        hostname,
+                        record_type,
+                        &before.content,
+                        before.run_id,
+                        // Put back exactly what was there, its proxy flag
+                        // included; one read before this was kept was DNS
+                        // only, as every run wrote then.
+                        Some(before.proxied.unwrap_or(false)),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.message),
+                RunResource::AddressAudience {
+                    hostname, before, ..
+                } => ops.set_address_audience(hostname, before).await,
+                RunResource::HttpPolicy {
+                    hostname, before, ..
+                } => ops.set_http_policy(hostname, *before).await,
+                RunResource::Certificate { domain } => ops.delete_certificate(domain).await,
+                // Only a provider removes its own resources.
+                RunResource::TailscaleServe { .. }
+                | RunResource::TailscaleService { .. }
+                | RunResource::TailscaleCredential { .. } => Ok(()),
+                RunResource::EnvironmentHosts { connector_id, .. } => {
+                    ops.set_environment_hosts(*connector_id, false).await
+                }
+                // Only a provider removes its own resources.
+                RunResource::EdgeRule { .. } | RunResource::AccessApp { .. } => Ok(()),
             },
         };
         let label = match &resource {
@@ -4483,8 +3303,29 @@ pub async fn undo(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::tailscale;
+    use crate::providers::tailscale::run::{still_ours, TailscaleOps};
     use crate::reachability::model::{AddressSource, Audience};
-    use crate::reachability::token_check::{PermissionCheck, PermissionState, TokenPermission};
+    use crate::reachability::token_check::{
+        PermissionCheck, PermissionState, TokenCheckResult, TokenPermission,
+    };
+    use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT};
+
+    /// [`super::decide`] with the providers every test run has.
+    fn decide(
+        journal: &mut [JournalEntry],
+        key: &str,
+        decision: Decision,
+        undoing: bool,
+    ) -> Result<(), String> {
+        super::decide(
+            journal,
+            key,
+            decision,
+            undoing,
+            &Fake::default().providers(),
+        )
+    }
 
     fn done(intent: Intent, resource: RunResource) -> JournalEntry {
         JournalEntry {
@@ -4521,6 +3362,10 @@ mod tests {
         }
     }
     use std::sync::Mutex;
+
+    use crate::providers::cloudflare::edge_rules::{same_rule, EdgeRuleError, EdgeRuleSeen};
+    use crate::providers::cloudflare::run::{EdgeRuleAt, EdgeRuleMade};
+    use crate::reachability::edge_rules::EdgeRulePurpose;
 
     /// Records every call; fails the ones named in `fail`.
     #[derive(Default)]
@@ -4602,29 +3447,6 @@ mod tests {
 
     #[async_trait]
     impl RunOps for Fake {
-        async fn check_token(&self, _token: &str, _zone: &str) -> TokenCheckResult {
-            self.log("check_token");
-            let state = if self.fail.contains(&"check_token") {
-                PermissionState::Missing
-            } else {
-                PermissionState::Present
-            };
-            TokenCheckResult {
-                valid: true,
-                error: None,
-                zones: vec!["example.com".into()],
-                checked_zone: Some("example.com".into()),
-                permissions: vec![PermissionCheck {
-                    permission: TokenPermission::DnsEdit,
-                    label: "Zone · DNS · Edit".into(),
-                    state,
-                    detail: String::new(),
-                }],
-                scope: None,
-                ready: state == PermissionState::Present,
-                template_url: String::new(),
-            }
-        }
         async fn find(&self, intent: &Intent) -> Result<Option<RunResource>, String> {
             self.log(format!("find {}", intent.key(0)));
             if self.fail.contains(&"find") {
@@ -4671,26 +3493,6 @@ mod tests {
         async fn remove_managed_zone(&self, _p: i32, zone: &str) -> Result<(), String> {
             self.log(format!("remove_managed_zone {zone}"));
             Ok(())
-        }
-        async fn create_tunnel(
-            &self,
-            _name: &str,
-            _provider_id: i32,
-            _domain: &str,
-            _node_ids: &[i32],
-        ) -> Result<(i32, TunnelStatus), (Option<i32>, String)> {
-            self.log("create_tunnel");
-            if self.fail.contains(&"create_tunnel") {
-                return Err((Some(40), "Cloudflare refused it".into()));
-            }
-            Ok((
-                40,
-                TunnelStatus {
-                    status: "ready".into(),
-                    last_error: None,
-                    replicas: Vec::new(),
-                },
-            ))
         }
         async fn tunnel_status(&self, _id: i32) -> Result<TunnelStatus, String> {
             self.log("tunnel_status");
@@ -4920,45 +3722,33 @@ mod tests {
             *self.http_policy.lock().expect("lock") = policy;
             Ok(())
         }
-        async fn access_app(
-            &self,
-            _provider_id: i32,
-            id: &str,
-        ) -> Result<Option<AccessApp>, String> {
-            self.result("access_app")?;
-            Ok(self
-                .access_apps
-                .lock()
-                .expect("lock")
-                .iter()
-                .find(|a| a.id == id)
-                .cloned())
+        async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
+            self.log(format!("environment_hosts {connector_id}"));
+            Ok(*self.environment_hosts.lock().expect("lock"))
         }
-        async fn create_access_app(
-            &self,
-            provider_id: i32,
-            name: &str,
-            host: &str,
-            policy: &AccessPolicyAnswer,
-        ) -> Result<AccessApp, WriteError> {
-            self.log(format!(
-                "create_access_app {provider_id} {name} {host} {}",
-                policy.emails.join(",")
-            ));
-            if self.fail.contains(&"create_access_app") {
-                return Err(WriteError::refused("Cloudflare refused it"));
-            }
-            let app = access_app_named("app-1", name, host, "policy-v1");
-            self.access_apps.lock().expect("lock").push(app.clone());
-            Ok(app)
-        }
-        async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
-            self.log(format!("delete_access_app {provider_id} {id}"));
-            self.access_apps
-                .lock()
-                .expect("lock")
-                .retain(|a| a.id != id);
+        async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
+            self.result("set_environment_hosts")?;
+            self.log(format!("set_environment_hosts {connector_id} {on}"));
+            *self.environment_hosts.lock().expect("lock") = on;
             Ok(())
+        }
+        async fn sleep(&self, _duration: Duration) {}
+
+        fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>> {
+            vec![
+                Box::new(crate::providers::cloudflare::run::CloudflareRun::new(self)),
+                Box::new(crate::providers::tailscale::run::TailscaleRun::new(self)),
+            ]
+        }
+    }
+
+    #[async_trait]
+    impl TailscaleOps for Fake {
+        async fn find_credential(&self, name: &str) -> Result<Option<RunResource>, String> {
+            self.find(&Intent::TailscaleCredential {
+                name: name.to_string(),
+            })
+            .await
         }
         async fn claim_serve_entry(
             &self,
@@ -5091,16 +3881,10 @@ mod tests {
             self.log(format!("delete_service {tailnet} {name} {}", shown.comment));
             Ok(self.deletion.clone().unwrap_or(ServiceDeletion::Deleted))
         }
-        async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
-            self.log(format!("environment_hosts {connector_id}"));
-            Ok(*self.environment_hosts.lock().expect("lock"))
-        }
-        async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
-            self.result("set_environment_hosts")?;
-            self.log(format!("set_environment_hosts {connector_id} {on}"));
-            *self.environment_hosts.lock().expect("lock") = on;
-            Ok(())
-        }
+    }
+
+    #[async_trait]
+    impl crate::providers::cloudflare::run::CloudflareOps for Fake {
         async fn create_edge_rule(
             &self,
             run_id: i32,
@@ -5123,11 +3907,13 @@ mod tests {
                     rule.description.clone().unwrap_or_default(),
                 ));
             }
-            let reference = super::super::edge_rules::rule_ref("abcd", run_id, purpose);
+            let reference =
+                crate::providers::cloudflare::edge_rules::rule_ref("abcd", run_id, purpose);
             // The rule as Cloudflare would return it: Temps' body, with an id.
-            let mut body = super::super::edge_rules::rule_body(purpose, host, &reference);
+            let mut body =
+                crate::providers::cloudflare::edge_rules::rule_body(purpose, host, &reference);
             body["id"] = serde_json::json!(format!("rule-{}", rules.len() + 1));
-            let rule = super::super::edge_rules::parse_rule(&body).expect("rule");
+            let rule = crate::providers::cloudflare::edge_rules::parse_rule(&body).expect("rule");
             rules.push((purpose, rule.clone()));
             Ok(EdgeRuleMade::Created(Box::new(RunResource::EdgeRule {
                 hostname: host.to_string(),
@@ -5172,7 +3958,103 @@ mod tests {
                 .retain(|(_, r)| r.id != rule.rule_id);
             Ok(())
         }
-        async fn sleep(&self, _duration: Duration) {}
+
+        async fn find_access_app(
+            &self,
+            provider_id: i32,
+            name: &str,
+            host: &str,
+        ) -> Result<Option<RunResource>, String> {
+            self.find(&Intent::AccessApp {
+                provider_id,
+                name: name.to_string(),
+                hostname: host.to_string(),
+            })
+            .await
+        }
+        async fn access_app(
+            &self,
+            _provider_id: i32,
+            id: &str,
+        ) -> Result<Option<AccessApp>, String> {
+            self.result("access_app")?;
+            Ok(self
+                .access_apps
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|a| a.id == id)
+                .cloned())
+        }
+        async fn create_access_app(
+            &self,
+            provider_id: i32,
+            name: &str,
+            host: &str,
+            policy: &AccessPolicyAnswer,
+        ) -> Result<AccessApp, WriteError> {
+            self.log(format!(
+                "create_access_app {provider_id} {name} {host} {}",
+                policy.emails.join(",")
+            ));
+            if self.fail.contains(&"create_access_app") {
+                return Err(WriteError::refused("Cloudflare refused it"));
+            }
+            let app = access_app_named("app-1", name, host, "policy-v1");
+            self.access_apps.lock().expect("lock").push(app.clone());
+            Ok(app)
+        }
+        async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
+            self.log(format!("delete_access_app {provider_id} {id}"));
+            self.access_apps
+                .lock()
+                .expect("lock")
+                .retain(|a| a.id != id);
+            Ok(())
+        }
+        async fn check_token(&self, _token: &str, _zone: &str) -> TokenCheckResult {
+            self.log("check_token");
+            let state = if self.fail.contains(&"check_token") {
+                PermissionState::Missing
+            } else {
+                PermissionState::Present
+            };
+            TokenCheckResult {
+                valid: true,
+                error: None,
+                zones: vec!["example.com".into()],
+                checked_zone: Some("example.com".into()),
+                permissions: vec![PermissionCheck {
+                    permission: TokenPermission::DnsEdit,
+                    label: "Zone · DNS · Edit".into(),
+                    state,
+                    detail: String::new(),
+                }],
+                scope: None,
+                ready: state == PermissionState::Present,
+                template_url: String::new(),
+            }
+        }
+        async fn create_tunnel(
+            &self,
+            _name: &str,
+            _provider_id: i32,
+            _domain: &str,
+            _node_ids: &[i32],
+        ) -> Result<(i32, TunnelStatus), (Option<i32>, String)> {
+            self.log("create_tunnel");
+            if self.fail.contains(&"create_tunnel") {
+                return Err((Some(40), "Cloudflare refused it".into()));
+            }
+            Ok((
+                40,
+                TunnelStatus {
+                    status: "ready".into(),
+                    last_error: None,
+                    replicas: Vec::new(),
+                },
+            ))
+        }
     }
 
     fn access_app_named(id: &str, name: &str, host: &str, policies: &str) -> AccessApp {
@@ -7311,12 +6193,12 @@ mod tests {
                 id: "user-https".into(),
                 reference: None,
                 description: Some("mine".into()),
-                expression: super::super::edge_rules::expression(
+                expression: crate::providers::cloudflare::edge_rules::expression(
                     EdgeRulePurpose::HttpsRedirect,
                     "myapp.example.com",
                 ),
                 action: "redirect".into(),
-                action_parameters: super::super::edge_rules::action_parameters(
+                action_parameters: crate::providers::cloudflare::edge_rules::action_parameters(
                     EdgeRulePurpose::HttpsRedirect,
                 ),
                 enabled: true,
@@ -7354,9 +6236,10 @@ mod tests {
             reachable: true,
             ..Default::default()
         };
-        let mut elsewhere =
-            super::super::edge_rules::action_parameters(EdgeRulePurpose::HttpsRedirect)
-                .expect("redirect");
+        let mut elsewhere = crate::providers::cloudflare::edge_rules::action_parameters(
+            EdgeRulePurpose::HttpsRedirect,
+        )
+        .expect("redirect");
         elsewhere["from_value"]["target_url"]["expression"] =
             serde_json::json!("concat(\"http://elsewhere.example.net\", http.request.uri.path)");
         ops.edge_rules.lock().expect("lock").push((
@@ -7365,7 +6248,7 @@ mod tests {
                 id: "user-elsewhere".into(),
                 reference: None,
                 description: Some("mine".into()),
-                expression: super::super::edge_rules::expression(
+                expression: crate::providers::cloudflare::edge_rules::expression(
                     EdgeRulePurpose::HttpsRedirect,
                     "myapp.example.com",
                 ),
@@ -7513,6 +6396,43 @@ mod tests {
             .calls()
             .iter()
             .any(|c| c.starts_with("set_environment_hosts")));
+    }
+
+    /// `reachability_runs.context` stores the run input and a resume reads
+    /// it back (ADR-116 D5): every way in's fixture, as paths and types.
+    #[test]
+    fn a_stored_run_input_keeps_its_shape() {
+        use crate::reachability::wire_shape::{assert_golden, paths};
+        let inputs = [
+            token_input(),
+            access_input(None),
+            access_input(Some(access_app_named(
+                "app-1",
+                "Grafana",
+                "app.example.com",
+                "p",
+            ))),
+            direct_input(7, PlannedRecord::default()),
+            private_input(7),
+            edge_input(),
+            policy_input(HttpPolicy::HttpsOnly),
+            serve_input(),
+            service_input(),
+        ];
+        let mut shape = std::collections::BTreeSet::new();
+        for input in &inputs {
+            let stored = serde_json::to_value(input).expect("a run input serializes");
+            paths(&stored, &mut shape);
+            let back: RunInput =
+                serde_json::from_value(stored.clone()).expect("a stored run input reads back");
+            assert_eq!(serde_json::to_value(&back).expect("serializes"), stored);
+        }
+        let actual = shape.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+        assert_golden(
+            "run_input.txt",
+            include_str!("wire_shape/run_input.txt"),
+            &actual,
+        );
     }
 
     #[test]
@@ -7738,15 +6658,53 @@ mod tests {
         assert!(!ops.calls().iter().any(|c| c.starts_with("detach_domain")));
         assert!(journal.iter().any(|e| e.deleting));
 
-        // Still removing: still waiting.
+        // Still removing: still waiting, saying for what.
         let again = undo(&mut journal, &ops, 0, &sink).await;
-        assert!(matches!(again.stopped, Some(Stop::Pending(_))));
+        let Some(Stop::Pending(why)) = &again.stopped else {
+            panic!("expected to wait, got {:?}", again.stopped);
+        };
+        assert!(
+            why.starts_with(
+                "Waiting for homelab to take homelab.example.ts.net off its Serve config"
+            ),
+            "{why}"
+        );
 
         // The agent reported `removed`: the row is gone, undo carries on.
         *ops.serve_status.lock().expect("lock") = None;
         let done = undo(&mut journal, &ops, 0, &sink).await;
         assert_eq!(done.stopped, None, "{:?}", done.results);
         assert!(ops.calls().contains(&"detach_domain 50".into()));
+    }
+
+    /// Waiting on the agent is recorded before undo stops; when it cannot
+    /// be, undo says so and stops as failed, so the next undo retries.
+    #[tokio::test]
+    async fn undo_that_cannot_record_the_agent_is_removing_the_entry_fails() {
+        struct Unsaved;
+        #[async_trait]
+        impl JournalSink for Unsaved {
+            async fn save_journal(&self, _journal: &[JournalEntry]) -> Result<(), String> {
+                Err("the database is down.".into())
+            }
+        }
+        let ops = Fake {
+            reachable: true,
+            serve_status: Mutex::new(Some(applied())),
+            ..Default::default()
+        };
+        let record = execute(&serve_input(), &ops, &Saved::default(), timing()).await;
+        let mut journal = record.journal.clone();
+        let outcome = undo(&mut journal, &ops, 0, &Unsaved).await;
+        assert_eq!(
+            outcome.stopped,
+            Some(Stop::Failed(
+                "homelab is taking homelab.example.ts.net off its Serve config, but Temps could \
+                 not record that: the database is down. Undo again to carry on."
+                    .into()
+            ))
+        );
+        assert!(!ops.calls().iter().any(|c| c.starts_with("detach_domain")));
     }
 
     /// ADR 065 D4: something else took the slot while the entry was being
@@ -8102,6 +7060,89 @@ mod tests {
                 "{case}: nothing is shown to confirm"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_pending_serve_entry_is_found_by_this_runs_reference() {
+        let intent = Intent::TailscaleServe {
+            node_id: 3,
+            node_name: "worker-1".into(),
+            address_id: "custom:9".into(),
+            hostname: "myapp.example.com".into(),
+            service: None,
+        };
+        let ops = Fake::default();
+        assert_eq!(look(&ops, 7, &intent).await, Ok(Found::Missing));
+        *ops.serve_ref.lock().expect("lock") = Some((21, true));
+        assert_eq!(
+            look(&ops, 7, &intent).await,
+            Ok(Found::Made(Box::new(RunResource::TailscaleServe {
+                node_id: 3,
+                node_name: "worker-1".into(),
+                address_id: "custom:9".into(),
+                hostname: "myapp.example.com".into(),
+                entry_id: 21,
+                created: true,
+            })))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_oauth_client_save_is_found_by_its_name() {
+        let intent = Intent::TailscaleCredential {
+            name: "Tailscale example.ts.net".into(),
+        };
+        let ops = Fake::default();
+        assert_eq!(look(&ops, 7, &intent).await, Ok(Found::Missing));
+        let saved = RunResource::TailscaleCredential {
+            id: 12,
+            name: "Tailscale example.ts.net".into(),
+        };
+        ops.found
+            .lock()
+            .expect("lock")
+            .push((intent.key(0), saved.clone()));
+        assert_eq!(
+            look(&ops, 7, &intent).await,
+            Ok(Found::Made(Box::new(saved)))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_service_create_is_this_runs_only_with_its_own_marker() {
+        let marker = tailscale::marker(INSTALL, 7);
+        let intent = Intent::TailscaleService {
+            tailnet: "example.ts.net".into(),
+            name: "svc:myapp".into(),
+            marker: marker.clone(),
+        };
+        let ops = Fake::default();
+        assert_eq!(look(&ops, 7, &intent).await, Ok(Found::Missing));
+
+        let ours = ServiceDefinition::fixed("svc:myapp", "tag:temps", &marker);
+        *ops.service.lock().expect("lock") = Some(ours.clone());
+        match look(&ops, 7, &intent).await {
+            Ok(Found::Made(resource)) => assert_eq!(
+                *resource,
+                RunResource::TailscaleService {
+                    tailnet: "example.ts.net".into(),
+                    name: "svc:myapp".into(),
+                    created: true,
+                    creator_run_id: 7,
+                    definition: ours,
+                }
+            ),
+            other => panic!("expected the run's own Service, got {other:?}"),
+        }
+
+        // Another run's marker, even of this install, is not this run's.
+        let theirs =
+            ServiceDefinition::fixed("svc:myapp", "tag:temps", &tailscale::marker(INSTALL, 8));
+        *ops.service.lock().expect("lock") = Some(theirs);
+        assert!(matches!(
+            look(&ops, 7, &intent).await,
+            Ok(Found::Changed(what)) if what.contains("which this run did not write")
+        ));
     }
 
     #[test]
