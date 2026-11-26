@@ -3103,6 +3103,15 @@ Manage platform settings
 - `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
+- `fields` - List every instance setting, or print the value at a field path (e.g. shield, otel_ingest.max_spans_per_second)
+- `apply` - Change any instance setting by field path: field=value (JSON or text), field:=text, or a bare field with --value-stdin
+- `admin-gate` - Show, or change with flags, which hosts and source IPs may reach the console and API listener
+- `telemetry` - Show anonymous telemetry status, or turn it on/off with --enable/--disable
+- `ci-builder` - Configure the external CI builder that runs builds off the control plane
+- `disk-status` - Show the control plane's disk usage and alert threshold
+- `public-ingress` - Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
+- `refresh-routes` - Rebuild the proxy route table now instead of waiting for the next change
+- `weekly-digest` - Generate and send the weekly digest now
 
 ### `settings show` (alias: `get`)
 
@@ -3170,6 +3179,146 @@ Set the preview domain pattern
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--domain <domain>` | Preview domain pattern | - | Yes |
+
+### `settings fields`
+
+List every instance setting, or print the value at a field path (e.g. shield, otel_ingest.max_spans_per_second)
+
+**Usage:** `settings fields [path] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings apply`
+
+Change any instance setting by field path: field=value (JSON or text), field:=text, or a bare field with --value-stdin
+
+**Usage:** `settings apply [assignments...] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from-file <path>` | Merge a JSON object of settings from a file (- for stdin) | - | No |
+| `--value-stdin` | Read the value of the one bare field from stdin (for secrets) | - | No |
+| `-y, --yes` | Do not ask before changing a setting that can lock you out | - | No |
+| `--json` | Print the saved settings response as JSON | - | No |
+
+### `settings admin-gate`
+
+Show, or change with flags, which hosts and source IPs may reach the console and API listener
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--allowed-host <host>` | Host header to allow (repeatable; replaces the list) | - | No |
+| `--allowed-ip <ip-or-cidr>` | Source IP or CIDR to allow (repeatable; replaces the list) | - | No |
+| `--clear-hosts` | Allow any Host header | - | No |
+| `--clear-ips` | Allow any source address | - | No |
+| `--trust-forwarded-for` | Trust X-Forwarded-For from loopback peers | - | No |
+| `--no-trust-forwarded-for` | Ignore X-Forwarded-For | - | No |
+| `-y, --yes` | Do not ask before saving a gate that may lock you out | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `settings telemetry`
+
+Show anonymous telemetry status, or turn it on/off with --enable/--disable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Send anonymous telemetry | - | No |
+| `--disable` | Stop sending anonymous telemetry | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `settings ci-builder`
+
+Configure the external CI builder that runs builds off the control plane
+
+**Subcommands:**
+
+- `show` - Show whether the CI builder is configured, and its settings (credentials are never returned)
+- `set` - Save CI builder settings from --from-file and/or field=value assignments (e.g. limits.concurrency=2)
+- `provision` - Create the builder repository and its pinned runner shim at the configured provider
+
+#### `settings ci-builder show`
+
+Show whether the CI builder is configured, and its settings (credentials are never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings ci-builder set`
+
+Save CI builder settings from --from-file and/or field=value assignments (e.g. limits.concurrency=2)
+
+**Usage:** `settings ci-builder set [assignments...] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from-file <path>` | JSON object of CI builder settings (- for stdin) | - | No |
+| `--dispatch-token-stdin` | Read the dispatch token from stdin | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings ci-builder provision`
+
+Create the builder repository and its pinned runner shim at the configured provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+
+### `settings disk-status`
+
+Show the control plane's disk usage and alert threshold
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings public-ingress`
+
+Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings refresh-routes`
+
+Rebuild the proxy route table now instead of waiting for the next change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings weekly-digest`
+
+Generate and send the weekly digest now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ## `users`
 
@@ -4334,6 +4483,10 @@ Cluster-wide multi-node operations
 **Subcommands:**
 
 - `dns` - Cluster DNS resolver (ADR-024) operations
+- `network` - The compute network workloads get their addresses from
+- `join-token` - The shared token worker nodes join with
+- `enrollment-tokens` - Short-lived, single-use tokens a new node enrolls with
+- `rotate-ca` - Replace a compromised cluster CA: every node re-enrolls and outstanding enrollment tokens are revoked
 
 ### `cluster dns`
 
@@ -4342,6 +4495,11 @@ Cluster DNS resolver (ADR-024) operations
 **Subcommands:**
 
 - `status` - Show whether cluster DNS is healthy across every node — resolver status, last sync, and errors — without SSHing into a node to read logs
+- `resolvers` - Each node's resolver: health, version, records served and last sync
+- `records` - The internal zone's records and who owns them, newest first
+- `queries` - Recent queries the internal resolvers answered, newest first
+- `traffic` - Queries per outcome over time for one node's resolver
+- `resolve` - Resolve a name from one node's resolver, optionally as a project or sandbox would see it
 
 #### `cluster dns status`
 
@@ -4351,6 +4509,220 @@ Show whether cluster DNS is healthy across every node — resolver status, last 
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns resolvers`
+
+Each node's resolver: health, version, records served and last sync
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns records`
+
+The internal zone's records and who owns them, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--search <text>` | Only records whose name contains this | - | No |
+| `--node <id>` | Only records served by this node | - | No |
+| `--owner-kind <kind>` | Only records owned by this kind (e.g. environment, service, sandbox) | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Records per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns queries`
+
+Recent queries the internal resolvers answered, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Only this node | - | No |
+| `--outcome <outcome>` | Only this outcome (e.g. answered, nxdomain, refused) | - | No |
+| `--zone <zone>` | Only this zone | - | No |
+| `--name <name>` | Only this queried name | - | No |
+| `--project <id>` | Only queries from this project ID | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Queries per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns traffic`
+
+Queries per outcome over time for one node's resolver
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node (default: the control plane) | - | No |
+| `--range <range>` | Time range, e.g. 1h, 24h, 7d | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns resolve`
+
+Resolve a name from one node's resolver, optionally as a project or sandbox would see it
+
+**Usage:** `cluster dns resolve <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node whose resolver answers | - | Yes |
+| `--type <type>` | Record type (A, AAAA, CNAME, SRV, TXT) | - | No |
+| `--project <id>` | Ask as this project ID | - | No |
+| `--sandbox <id>` | Ask as this sandbox | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cluster network`
+
+The compute network workloads get their addresses from
+
+**Subcommands:**
+
+- `show` - Show the compute pool, whether it can change, and each node's allocation
+- `set` - Change the compute pool (only while no allocation uses it)
+- `new-network-id` - Give this cluster its own VXLAN network ID, so it cannot collide with another cluster on the same network
+
+#### `cluster network show`
+
+Show the compute pool, whether it can change, and each node's allocation
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster network set`
+
+Change the compute pool (only while no allocation uses it)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--compute-pool <cidr>` | CIDR workloads get addresses from | - | Yes |
+| `--overlay-network <name>` | Docker overlay network name | - | No |
+| `--subnet-prefix <len>` | Per-node subnet prefix length | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster network new-network-id`
+
+Give this cluster its own VXLAN network ID, so it cannot collide with another cluster on the same network
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cluster join-token`
+
+The shared token worker nodes join with
+
+**Subcommands:**
+
+- `status` - Show whether a join token is configured
+- `generate` - Generate a new join token (replaces the current one; shown once)
+- `revoke` - Revoke the join token; no new node can join with it
+
+#### `cluster join-token status`
+
+Show whether a join token is configured
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster join-token generate`
+
+Generate a new join token (replaces the current one; shown once)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask before replacing an existing token | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster join-token revoke`
+
+Revoke the join token; no new node can join with it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cluster enrollment-tokens`
+
+Short-lived, single-use tokens a new node enrolls with
+
+**Subcommands:**
+
+- `list` (`ls`) - List valid enrollment tokens (the tokens themselves are never returned)
+- `create` (`mint`) - Mint an enrollment token (shown once)
+- `revoke` - Revoke an enrollment token
+
+#### `cluster enrollment-tokens list` (alias: `ls`)
+
+List valid enrollment tokens (the tokens themselves are never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster enrollment-tokens create` (alias: `mint`)
+
+Mint an enrollment token (shown once)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ttl <seconds>` | How long it is valid | - | No |
+| `--max-uses <n>` | How many nodes may enroll with it | - | No |
+| `--node <name>` | Only a node with this name may use it | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster enrollment-tokens revoke`
+
+Revoke an enrollment token
+
+**Usage:** `cluster enrollment-tokens revoke <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `cluster rotate-ca`
+
+Replace a compromised cluster CA: every node re-enrolls and outstanding enrollment tokens are revoked
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expected-fingerprint <sha256>` | Fingerprint of the current CA, read through a trusted channel just before | - | Yes |
+| `-y, --yes` | Do not ask; sends the confirmation "ROTATE CLUSTER CA" for you | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `nodes`
@@ -4365,6 +4737,14 @@ Worker nodes and workload placement
 - `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
 - `resources` - What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
 - `state-status` - Show the workload plane's desired-state stream: whether it runs here, its lag and counters
+- `show` - Show one node: status, addresses, labels and capacity
+- `containers` - List the containers running on a node
+- `drain` - Stop scheduling on a node and move its replicas elsewhere (redeploys the affected environments)
+- `undrain` - Let a drained node accept new deployments again
+- `remove` (`rm`) - Remove a drained node from the cluster and from every placement that targets it
+- `build-limits` - Show a worker node's build limits, or change them with flags
+- `public-ingress` - Show or change whether a node serves public HTTP(S) traffic itself, and on which ports and addresses
+- `workload-mode` - Show an environment's workload mode, or set it (legacy, shadow, enforce); operator-only
 
 ### `nodes capability`
 
@@ -4515,6 +4895,8 @@ Add servers over SSH: the control plane logs in, installs temps if needed, pairs
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Page to show (default 1) | - | No |
+| `--per-page <n>` | Servers per page (default 20, max 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 **Subcommands:**
@@ -4602,6 +4984,7 @@ Change a node's resource policy or reservation. Giving only one of --reserve-cpu
 | `--policy <policy>` | best_effort (reservations not checked) or enforced (placements that do not fit are refused) | - | No |
 | `--reserve-cpu <millis>` | CPU kept for the OS and Temps, in millicores (1000 = one core) | - | No |
 | `--reserve-memory <mb>` | Memory kept for the OS and Temps, in MB | - | No |
+| `--reset-reserved` | Go back to the default reservation for the node's role | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `nodes state-status`
@@ -4612,6 +4995,119 @@ Show the workload plane's desired-state stream: whether it runs here, its lag an
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes show`
+
+Show one node: status, addresses, labels and capacity
+
+**Usage:** `nodes show <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes containers`
+
+List the containers running on a node
+
+**Usage:** `nodes containers <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes drain`
+
+Stop scheduling on a node and move its replicas elsewhere (redeploys the affected environments)
+
+**Usage:** `nodes drain <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status` | Only show drain progress | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes undrain`
+
+Let a drained node accept new deployments again
+
+**Usage:** `nodes undrain <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes remove` (alias: `rm`)
+
+Remove a drained node from the cluster and from every placement that targets it
+
+**Usage:** `nodes remove <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--force` | Remove even if the node is not drained (its containers are not moved first) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes build-limits`
+
+Show a worker node's build limits, or change them with flags
+
+**Usage:** `nodes build-limits <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--timeout <seconds>` | Longest a build may run | - | No |
+| `--concurrency <n>` | Builds that may run at once | - | No |
+| `--queue-wait <seconds>` | Longest a build may wait for a slot | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes public-ingress`
+
+Show or change whether a node serves public HTTP(S) traffic itself, and on which ports and addresses
+
+**Usage:** `nodes public-ingress <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Serve public traffic on this node | - | No |
+| `--disable` | Stop serving public traffic on this node | - | No |
+| `--http-port <port>` | HTTP port to listen on | - | No |
+| `--https-port <port>` | HTTPS port to listen on | - | No |
+| `--listen-address <addr>` | Local address to bind ("" for automatic) | - | No |
+| `--public-address <addr>` | Address DNS points at ("" for the listen address) | - | No |
+| `--toggle-only` | Only flip enabled with --enable/--disable, without saving ports or addresses | - | No |
+| `--check` | Check from the control plane that the node answers on its public address | - | No |
+| `-y, --yes` | Do not ask before disabling | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes workload-mode`
+
+Show an environment's workload mode, or set it (legacy, shadow, enforce); operator-only
+
+**Usage:** `nodes workload-mode <environment-id> [mode] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask before changing it | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `tunnels`
@@ -5630,6 +6126,11 @@ Resource usage of the machine running the Temps control plane (what /monitoring/
 
 - `status` - Latest CPU, memory, disk, block I/O and network I/O sample for the control-plane host
 - `metrics` - Time series of one control-plane host metric, e.g. node.cpu_percent or node.network_rx_bytes_total
+- `cluster-metrics` - Time series of one metric combined across nodes (counters summed, ratios averaged)
+- `cluster-latest` - Latest value of every metric, combined across nodes
+- `reporting` - Whether each worker reports metrics, and why not
+- `disk-health` - Latest software RAID and drive SMART health for a node
+- `alert-rules` - CPU, memory and disk alerts on a node
 - `docker-disk-usage` (`df`) - Docker disk usage by images, containers, volumes and build cache (docker system df) on the control-plane host
 
 ### `server status`
@@ -5653,8 +6154,98 @@ Time series of one control-plane host metric, e.g. node.cpu_percent or node.netw
 |------|-------------|---------|----------|
 | `--metric <name>` | Metric name (node.cpu_percent, node.memory_used_bytes, node.disk_used_bytes, node.disk_read_bytes_total, node.network_tx_bytes_total, ...) | - | Yes |
 | `--range <range>` | Time window: 1h, 6h, 24h, 7d | `1h` | No |
+| `--start <time>` | Start of an explicit window (ISO 8601); with --end, instead of --range | - | No |
+| `--end <time>` | End of an explicit window (ISO 8601) | - | No |
+| `--percentile <p>` | Aggregate each bucket at this percentile (e.g. 0.95) instead of the mean | - | No |
 | `--node <id>` | Node ID (0 = control plane) | `0` | No |
 | `--json` | Output in JSON format | - | No |
+
+### `server cluster-metrics`
+
+Time series of one metric combined across nodes (counters summed, ratios averaged)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--metric <name>` | Metric name, e.g. node.cpu_percent | - | Yes |
+| `--nodes <ids>` | Comma-separated node IDs, e.g. 0,1,2 | - | Yes |
+| `--range <range>` | Time window, e.g. 1h, 24h, 7d | - | No |
+| `--start <time>` | Start of an explicit window (ISO 8601) | - | No |
+| `--end <time>` | End of an explicit window (ISO 8601) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `server cluster-latest`
+
+Latest value of every metric, combined across nodes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--nodes <ids>` | Comma-separated node IDs | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `server reporting`
+
+Whether each worker reports metrics, and why not
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `server disk-health`
+
+Latest software RAID and drive SMART health for a node
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `server alert-rules`
+
+CPU, memory and disk alerts on a node
+
+**Subcommands:**
+
+- `create` - Alert when a node metric crosses a threshold
+- `delete` (`rm`) - Delete a node's resource alert
+
+#### `server alert-rules create`
+
+Alert when a node metric crosses a threshold
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `--name <name>` | Rule name | - | Yes |
+| `--metric <name>` | Metric, e.g. node.cpu_percent or node.disk_used_percent | - | Yes |
+| `--comparator <op>` | One of >, <, >=, <=, or gt, lt, gte, lte | - | Yes |
+| `--threshold <value>` | Threshold value | - | Yes |
+| `--severity <level>` | One of warning, critical | `warning` | No |
+| `--for <seconds>` | How long the condition must hold before it fires | - | No |
+| `--disabled` | Create it turned off | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `server alert-rules delete` (alias: `rm`)
+
+Delete a node's resource alert
+
+**Usage:** `server alert-rules delete <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
 
 ### `server docker-disk-usage` (alias: `df`)
 
@@ -9727,6 +10318,10 @@ View platform and server information
 
 **Subcommands:**
 
+- `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+- `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
+- `geo` - Look up the location of an IP address in the server's geolocation database
+- `file` - Print a file from the server's static directory (or save it with -o)
 - `info` - Get platform information
 - `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
@@ -9734,6 +10329,55 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform operations` (alias: `ops`)
+
+List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <status>` | Which ones: running, waiting, finished, all (default: the server's) | - | No |
+| `--kind <kind>` | Only one kind: deployment, rollback, promotion, restore, backup, autofix | - | No |
+| `--project <id>` | Only this project ID | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Operations per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `platform maturity`
+
+Show the compatibility promise (stable, beta, experimental) for every feature
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform geo`
+
+Look up the location of an IP address in the server's geolocation database
+
+**Usage:** `platform geo <ip> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform file`
+
+Print a file from the server's static directory (or save it with -o)
+
+**Usage:** `platform file <path> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <file>` | Write it to a file instead of stdout | - | No |
 
 ### `platform info`
 

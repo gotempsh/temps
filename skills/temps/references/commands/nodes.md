@@ -4,6 +4,23 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`nodes capability`](#nodes-capability)
+- [`nodes mesh`](#nodes-mesh)
+- [`nodes pair`](#nodes-pair)
+- [`nodes ssh`](#nodes-ssh)
+- [`nodes resources`](#nodes-resources)
+- [`nodes state-status`](#nodes-state-status)
+- [`nodes show`](#nodes-show)
+- [`nodes containers`](#nodes-containers)
+- [`nodes drain`](#nodes-drain)
+- [`nodes undrain`](#nodes-undrain)
+- [`nodes remove`](#nodes-remove)
+- [`nodes build-limits`](#nodes-build-limits)
+- [`nodes public-ingress`](#nodes-public-ingress)
+- [`nodes workload-mode`](#nodes-workload-mode)
+
 ## `nodes`
 
 Worker nodes and workload placement
@@ -16,6 +33,14 @@ Worker nodes and workload placement
 - `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
 - `resources` - What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
 - `state-status` - Show the workload plane's desired-state stream: whether it runs here, its lag and counters
+- `show` - Show one node: status, addresses, labels and capacity
+- `containers` - List the containers running on a node
+- `drain` - Stop scheduling on a node and move its replicas elsewhere (redeploys the affected environments)
+- `undrain` - Let a drained node accept new deployments again
+- `remove` (`rm`) - Remove a drained node from the cluster and from every placement that targets it
+- `build-limits` - Show a worker node's build limits, or change them with flags
+- `public-ingress` - Show or change whether a node serves public HTTP(S) traffic itself, and on which ports and addresses
+- `workload-mode` - Show an environment's workload mode, or set it (legacy, shadow, enforce); operator-only
 
 ### `nodes capability`
 
@@ -166,6 +191,8 @@ Add servers over SSH: the control plane logs in, installs temps if needed, pairs
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Page to show (default 1) | - | No |
+| `--per-page <n>` | Servers per page (default 20, max 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 **Subcommands:**
@@ -253,6 +280,7 @@ Change a node's resource policy or reservation. Giving only one of --reserve-cpu
 | `--policy <policy>` | best_effort (reservations not checked) or enforced (placements that do not fit are refused) | - | No |
 | `--reserve-cpu <millis>` | CPU kept for the OS and Temps, in millicores (1000 = one core) | - | No |
 | `--reserve-memory <mb>` | Memory kept for the OS and Temps, in MB | - | No |
+| `--reset-reserved` | Go back to the default reservation for the node's role | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `nodes state-status`
@@ -263,4 +291,117 @@ Show the workload plane's desired-state stream: whether it runs here, its lag an
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes show`
+
+Show one node: status, addresses, labels and capacity
+
+**Usage:** `nodes show <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes containers`
+
+List the containers running on a node
+
+**Usage:** `nodes containers <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes drain`
+
+Stop scheduling on a node and move its replicas elsewhere (redeploys the affected environments)
+
+**Usage:** `nodes drain <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status` | Only show drain progress | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes undrain`
+
+Let a drained node accept new deployments again
+
+**Usage:** `nodes undrain <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes remove` (alias: `rm`)
+
+Remove a drained node from the cluster and from every placement that targets it
+
+**Usage:** `nodes remove <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--force` | Remove even if the node is not drained (its containers are not moved first) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes build-limits`
+
+Show a worker node's build limits, or change them with flags
+
+**Usage:** `nodes build-limits <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--timeout <seconds>` | Longest a build may run | - | No |
+| `--concurrency <n>` | Builds that may run at once | - | No |
+| `--queue-wait <seconds>` | Longest a build may wait for a slot | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes public-ingress`
+
+Show or change whether a node serves public HTTP(S) traffic itself, and on which ports and addresses
+
+**Usage:** `nodes public-ingress <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Serve public traffic on this node | - | No |
+| `--disable` | Stop serving public traffic on this node | - | No |
+| `--http-port <port>` | HTTP port to listen on | - | No |
+| `--https-port <port>` | HTTPS port to listen on | - | No |
+| `--listen-address <addr>` | Local address to bind ("" for automatic) | - | No |
+| `--public-address <addr>` | Address DNS points at ("" for the listen address) | - | No |
+| `--toggle-only` | Only flip enabled with --enable/--disable, without saving ports or addresses | - | No |
+| `--check` | Check from the control plane that the node answers on its public address | - | No |
+| `-y, --yes` | Do not ask before disabling | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes workload-mode`
+
+Show an environment's workload mode, or set it (legacy, shadow, enforce); operator-only
+
+**Usage:** `nodes workload-mode <environment-id> [mode] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask before changing it | - | No |
 | `--json` | Output in JSON format | - | No |

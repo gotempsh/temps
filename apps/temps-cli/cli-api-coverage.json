@@ -432,7 +432,6 @@
     "GET /otel/trace-summaries",
     "GET /otel/traces",
     "GET /otel/traces/cross-project/{trace_id}",
-    "GET /otel/traces/{project_id}/{trace_id}",
     "GET /performance/has-metrics",
     "GET /platform/compose-status",
     "GET /projects query.project_group_id",
