@@ -6,7 +6,9 @@ import { initialRows } from './env'
 import {
   detectedFrom,
   linkAliases,
+  newProjects,
   projectNameFrom,
+  projectsBaseline,
   projectVariables,
   providedNames,
   rootPreset,
@@ -76,5 +78,49 @@ describe('ship', () => {
     })
     expect(rootPreset([{ path: 'apps/web' }])).toEqual({ path: 'apps/web' })
     expect(rootPreset([])).toBeNull()
+  })
+})
+
+describe('new projects', () => {
+  const at = (id: number, created: string) => ({ id, created_at: created })
+  const opened = 'Thu, 26 Nov 2026 10:00:00 GMT'
+
+  test('an older project redeployed onto the page is not new; one created after the step opened is', () => {
+    const baseline = projectsBaseline([at(1, '2026-11-01T00:00:00Z')], opened)
+    const later = [
+      at(30, '2026-11-26T10:00:04Z'),
+      // Created long before, listed now because it was just redeployed.
+      at(21, '2026-10-01T00:00:00Z'),
+      at(1, '2026-11-01T00:00:00Z'),
+    ]
+    expect(newProjects(baseline, later).map((p) => p.id)).toEqual([30])
+  })
+
+  test('the server clock decides, so a browser clock that is off changes nothing', () => {
+    // The step opened at 10:00 server time; the browser's clock is not read.
+    const baseline = projectsBaseline([], opened)
+    expect(newProjects(baseline, [at(2, '2026-11-26T09:59:59Z')])).toEqual([])
+    expect(newProjects(baseline, [at(3, '2026-11-26T10:00:00Z')])).toHaveLength(
+      1
+    )
+  })
+
+  test('without a Date header, a project must be newer than every one listed when the step opened', () => {
+    const baseline = projectsBaseline(
+      [at(5, '2026-11-20T00:00:00Z'), at(4, '2026-11-01T00:00:00Z')],
+      null
+    )
+    expect(newProjects(baseline, [at(9, '2026-11-10T00:00:00Z')])).toEqual([])
+    expect(
+      newProjects(baseline, [at(10, '2026-11-21T00:00:00Z')])
+    ).toHaveLength(1)
+    // With nothing listed, any project that appears is new.
+    expect(
+      newProjects(projectsBaseline([], null), [at(1, '2026-01-01T00:00:00Z')])
+    ).toHaveLength(1)
+  })
+
+  test('nothing is new before the step has its first listing', () => {
+    expect(newProjects(null, [at(1, '2026-11-26T10:00:00Z')])).toEqual([])
   })
 })

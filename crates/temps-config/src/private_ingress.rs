@@ -148,15 +148,19 @@ pub struct PrivateIngressStatus {
 
 impl PrivateIngressStatus {
     /// The status from the consent and row `0`, if there is one. A report
-    /// older than the consent is not about it, so it is left out.
+    /// that answers another consent (an earlier one, however late it was
+    /// written) is not about this one, so it is left out.
     pub fn from_report(
         consent: Option<PrivateIngressConsent>,
         row: Option<&temps_entities::node_public_ingress::Model>,
     ) -> Self {
         let row = row.filter(|row| {
-            consent
-                .as_ref()
-                .is_some_and(|c| row.updated_at >= c.updated_at)
+            consent.as_ref().is_some_and(|c| {
+                temps_core::private_ingress::report_answers_consent(
+                    row.listening.as_ref(),
+                    c.updated_at,
+                )
+            })
         });
         let listening = row.and_then(|r| r.listening.as_ref());
         let text = |key: &str| {
@@ -358,11 +362,10 @@ impl PrivateIngressService {
         txn.commit().await?;
         if let Some(runtime) = &self.runtime {
             // A withdrawn consent stops serving now, not when the loop next
-            // gets to it (it may be in the middle of inside checks).
-            if consent.is_none() {
-                runtime.set_serving(None);
-            }
-            runtime.notify_changed();
+            // gets to it (it may be in the middle of inside checks), and a
+            // pass that read the consent before this write can no longer
+            // publish what it decided from it.
+            runtime.consent_written(consent.is_none());
         }
         Ok(before)
     }
@@ -457,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn the_status_reads_the_report_made_after_the_consent() {
+    fn the_status_reads_the_report_that_answers_the_consent() {
         let consent = PrivateIngressConsent {
             listen: "tailscale".into(),
             admit: vec![],
@@ -466,11 +469,13 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
         };
+        let answers = consent.updated_at;
         let served = report(
             serde_json::json!({
                 "https": "100.101.102.103:443",
                 "error": null,
-                "admit": ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+                "admit": ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
+                "consent_at": answers,
             }),
             "2026-11-24T10:00:05Z",
         );
@@ -480,21 +485,29 @@ mod tests {
         assert_eq!(status.error, None);
 
         let refused = report(
-            serde_json::json!({"https": null, "error": "The proxy listens on 203.0.113.7:443 only."}),
+            serde_json::json!({
+                "https": null,
+                "error": "The proxy listens on 203.0.113.7:443 only.",
+                "consent_at": answers,
+            }),
             "2026-11-24T10:00:05Z",
         );
         let status = PrivateIngressStatus::from_report(Some(consent.clone()), Some(&refused));
         assert_eq!(status.serving, None);
         assert!(status.error.unwrap().contains("203.0.113.7:443"));
 
-        // A report from before the consent changed says nothing about it.
-        let stale = report(
-            serde_json::json!({"https": "100.101.102.103:443"}),
-            "2026-11-24T09:00:00Z",
-        );
-        let status = PrivateIngressStatus::from_report(Some(consent), Some(&stale));
-        assert_eq!(status.serving, None);
-        assert_eq!(status.reported_at, None);
+        // A report of an earlier consent says nothing about this one, even
+        // written after it by a pass that read the earlier one.
+        let earlier = serde_json::json!({
+            "https": "100.101.102.103:443",
+            "consent_at": "2026-11-24T09:00:00Z",
+        });
+        for written in ["2026-11-24T09:00:01Z", "2026-11-24T10:00:05Z"] {
+            let stale = report(earlier.clone(), written);
+            let status = PrivateIngressStatus::from_report(Some(consent.clone()), Some(&stale));
+            assert_eq!(status.serving, None);
+            assert_eq!(status.reported_at, None);
+        }
 
         let status = PrivateIngressStatus::from_report(None, Some(&served));
         assert_eq!(status.serving, None);
@@ -595,16 +608,21 @@ mod tests {
             .append_query_results([vec![updated]])
             .into_connection();
         let runtime = temps_core::private_ingress::ControlPlanePrivateIngress::new();
-        runtime.set_serving(Some(
-            temps_core::private_ingress::PrivateIngressServing::new(
-                "10.8.0.1".parse().unwrap(),
-                vec!["10.8.0.0/24".parse().unwrap()],
-            )
-            .unwrap(),
-        ));
+        let serving = temps_core::private_ingress::PrivateIngressServing::new(
+            "10.8.0.1".parse().unwrap(),
+            vec!["10.8.0.0/24".parse().unwrap()],
+        )
+        .unwrap();
+        runtime.set_serving(Some(serving.clone()));
+        // A loop pass read the consent and is awaiting the machine's
+        // networks when the withdrawal commits.
+        let pass_read = runtime.consent_generation();
         let service = PrivateIngressService::new(Arc::new(db), Some(runtime.clone()));
         let before = service.delete().await.unwrap();
         assert_eq!(before.map(|c| c.listen), Some("10.8.0.1".to_string()));
+        assert_eq!(runtime.serving(), None);
+        // That pass decided from the withdrawn consent: it cannot serve it again.
+        assert!(!runtime.set_serving_for(pass_read, Some(serving)));
         assert_eq!(runtime.serving(), None);
         tokio::time::timeout(std::time::Duration::from_secs(1), runtime.changed())
             .await

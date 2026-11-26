@@ -170,6 +170,36 @@ impl SandboxProvider for LocalSandboxProvider {
             })
     }
 
+    /// Reads at most one byte past `max_bytes`, however large the file is
+    /// or grows while it is read, so an oversized file is refused without
+    /// being buffered in this process.
+    async fn read_file_bounded(
+        &self,
+        handle: &SandboxHandle,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AgentError> {
+        use tokio::io::AsyncReadExt;
+        let failed = |e: std::io::Error| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!("read_file: read {} failed: {}", path, e),
+        };
+        let file = tokio::fs::File::open(path).await.map_err(failed)?;
+        if file.metadata().await.map_err(failed)?.len() > max_bytes {
+            return Err(super::file_too_large(handle, path, max_bytes));
+        }
+        let mut contents = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut contents)
+            .await
+            .map_err(failed)?;
+        if contents.len() as u64 > max_bytes {
+            return Err(super::file_too_large(handle, path, max_bytes));
+        }
+        Ok(contents)
+    }
+
     async fn write_directory(
         &self,
         _handle: &SandboxHandle,
@@ -333,6 +363,45 @@ mod tests {
             idle_timeout: Duration::from_secs(3600),
             backend: None,
         }
+    }
+
+    /// The bounded read refuses a file over the limit with the size error,
+    /// and returns one within it whole.
+    #[tokio::test]
+    async fn a_bounded_read_refuses_a_file_over_the_limit() {
+        let provider = LocalSandboxProvider::new();
+        let work_dir = tempfile::tempdir().unwrap();
+        let handle = provider
+            .create(test_config(7, work_dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let file = work_dir.path().join("big.log");
+        tokio::fs::write(&file, vec![b'x'; 64]).await.unwrap();
+        let path = file.to_str().unwrap();
+
+        let error = provider
+            .read_file_bounded(&handle, path, 16)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AgentError::Validation { message } if message.contains("larger than the 16 byte")),
+            "{error:?}"
+        );
+        assert_eq!(
+            provider
+                .read_file_bounded(&handle, path, 64)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
+        let missing = work_dir.path().join("missing.log");
+        assert!(matches!(
+            provider
+                .read_file_bounded(&handle, missing.to_str().unwrap(), 16)
+                .await,
+            Err(AgentError::SandboxExecFailed { .. })
+        ));
     }
 
     #[tokio::test]

@@ -219,6 +219,20 @@ async fn run(
         let target = resolve(&local, desired.as_ref());
         let private = local.mode == IngressMode::Private;
         let mut error = None;
+
+        // ADR-115 D8: who the private listener admits, decided from where it
+        // is to listen and published before it is bound, moved or checked: a
+        // new listener never serves with nobody admitted, a narrowed consent
+        // stops admitting a removed range before a slow check batch rather
+        // than after it, and the checks below run against the ranges in
+        // force. A range over a container network, or no range to admit,
+        // admits nobody, with the reason.
+        let admit_decision = admit_for_target(&local, &target, &local_networks());
+        let admit = match &admit_decision {
+            Some(Ok(admit)) => admit.clone(),
+            _ => Vec::new(),
+        };
+        store.set_private_admit(admit.clone());
         match target {
             Ok(None) => {
                 if let Some(current) = bound.take() {
@@ -340,25 +354,20 @@ async fn run(
             None
         };
 
-        // ADR-115 D8: who the private listener admits. A range over a
-        // container network, or no range to admit, stops the control plane
-        // from making new addresses private here, with the reason.
-        // The same ranges gate every private request here, so routes already
-        // in the snapshot follow the consent as it is now, not as it was when
-        // their address was applied; an error admits nobody.
-        let admit = match bound.as_ref().filter(|b| b.private) {
-            Some(b) => match private_admit(&local, b.https.ip(), &local_networks()) {
-                Ok(admit) => admit,
-                Err(why) => {
-                    if error.is_none() {
-                        error = Some(why);
-                    }
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
+        // What was admitted above, reported only while a private listener
+        // is bound. A refusal stops the control plane from making new
+        // addresses private here, with the reason; the same ranges gate
+        // every private request here, so routes already in the snapshot
+        // follow the consent as it is now, not as it was when their address
+        // was applied.
+        let admit = if bound.as_ref().is_some_and(|b| b.private) {
+            if let (None, Some(Err(why))) = (&error, &admit_decision) {
+                error = Some(why.clone());
+            }
+            admit
+        } else {
+            Vec::new()
         };
-        store.set_private_admit(admit.clone());
         let report = ListenerReport {
             admit: admit.iter().map(ToString::to_string).collect(),
             interfaces: host_interfaces(),
@@ -547,6 +556,21 @@ pub fn local_networks() -> Vec<temps_core::private_network::LocalNetwork> {
 /// What a private listener on `listener` admits (ADR-115 D8): the ranges
 /// its owner named, else the listen interface's subnet (Tailscale's ranges
 /// on Tailscale), never a range over one of this host's container bridges.
+/// Who a private listener at `target` admits, before it is bound: `None`
+/// when nothing private is to be served there.
+pub fn admit_for_target(
+    local: &LocalIngress,
+    target: &Result<Option<(SocketAddr, SocketAddr)>, String>,
+    own: &[temps_core::private_network::LocalNetwork],
+) -> Option<Result<Vec<temps_core::private_network::IpNet>, String>> {
+    match target {
+        Ok(Some((_, https))) if local.mode == IngressMode::Private => {
+            Some(private_admit(local, https.ip(), own))
+        }
+        _ => None,
+    }
+}
+
 pub fn private_admit(
     local: &LocalIngress,
     listener: IpAddr,
@@ -1012,6 +1036,50 @@ mod tests {
         };
         let (http, _) = resolve(&local, None).unwrap().unwrap();
         assert!(http.ip().is_unspecified());
+    }
+
+    /// The ranges are decided from where the listener is to be bound, so
+    /// they are published before it is: a private target admits its
+    /// network, anything else admits nobody.
+    #[test]
+    fn who_a_listener_admits_is_known_before_it_is_bound() {
+        use temps_core::private_network::LocalNetwork;
+        let own = vec![LocalNetwork {
+            interface: "wg0".into(),
+            address: "10.8.0.1".parse().unwrap(),
+            prefix: 24,
+            tailscale: false,
+        }];
+        let target = |https: &str| -> Result<Option<(SocketAddr, SocketAddr)>, String> {
+            let https: SocketAddr = https.parse().unwrap();
+            Ok(Some((SocketAddr::new(https.ip(), 80), https)))
+        };
+        let private = LocalIngress {
+            mode: IngressMode::Private,
+            ..LocalIngress::default()
+        };
+        let admitted = admit_for_target(&private, &target("10.8.0.1:443"), &own)
+            .expect("a private target")
+            .expect("its network is admitted");
+        assert_eq!(admitted, vec!["10.8.0.0/24".parse().unwrap()]);
+        // An address that is not this worker's admits nobody, with the reason.
+        let refused = admit_for_target(&private, &target("10.9.0.1:443"), &own)
+            .expect("a private target")
+            .unwrap_err();
+        assert!(refused.contains("no longer an address"), "{refused}");
+        assert_eq!(admit_for_target(&private, &Ok(None), &own), None);
+        assert_eq!(
+            admit_for_target(&private, &Err("unbound".into()), &own),
+            None
+        );
+        let public = LocalIngress {
+            mode: IngressMode::Fixed,
+            ..LocalIngress::default()
+        };
+        assert_eq!(
+            admit_for_target(&public, &target("10.8.0.1:443"), &own),
+            None
+        );
     }
 
     #[test]

@@ -12,7 +12,16 @@ import { ShipStep } from './ShipStep'
 installBrowserWindow()
 afterEach(cleanup)
 
-const project = (id: number, name: string) => ({ id, name, slug: name })
+// The server's clock when the step first lists projects.
+const OPENED = 'Thu, 26 Nov 2026 10:00:00 GMT'
+const BEFORE = '2026-11-01T00:00:00Z'
+const AFTER = '2026-11-26T10:00:05Z'
+const project = (id: number, name: string, created_at = BEFORE) => ({
+  id,
+  name,
+  slug: name,
+  created_at,
+})
 
 function renderStep() {
   const client = new QueryClient({
@@ -37,8 +46,16 @@ function mock(status: 'connected' | 'missing', projects: () => unknown[]) {
   const api = mockApi({
     'GET /api-keys/ai-harness/status': () =>
       jsonResponse({ status, reason: null, connected_via: null }),
-    'GET /projects': () =>
-      jsonResponse({ projects: projects(), page: 1, per_page: 20, total: 0 }),
+    'GET /projects': () => {
+      const response = jsonResponse({
+        projects: projects(),
+        page: 1,
+        per_page: 20,
+        total: 0,
+      })
+      response.headers.set('Date', OPENED)
+      return response
+    },
     'PATCH /settings/onboarding': async (request) => {
       patches.push(await request.json())
       return jsonResponse({ done: [], later: [] })
@@ -68,12 +85,15 @@ test('with an agent connected, it leads, and the operator opens the new project 
 
   // A project that was already there is not offered; a new one is, without
   // claiming the agent made it.
-  list = [project(2, 'my-app'), ...list]
+  list = [project(2, 'my-app', AFTER), ...list]
   await act(() => client.refetchQueries())
   await view.findByText(/New since this step opened/)
   expect(view.queryByText(/Your agent created/)).toBeNull()
   expect(view.queryByRole('button', { name: 'Open existing' })).toBeNull()
-  fireEvent.click(view.getByRole('button', { name: 'Open my-app' }))
+  // The label stays short; the project's name is beside it and in its name.
+  const openNew = view.getByRole('button', { name: 'Open my-app' })
+  expect(openNew.textContent).toBe('Open')
+  fireEvent.click(openNew)
   await view.findByText('Project page')
   expect(patches).toEqual([{ done: ['app'], completed: true }])
   api.restore()
@@ -85,18 +105,33 @@ test('a project another operator creates meanwhile is offered, not credited, and
   const { view, client } = renderStep()
   await view.findByText('Waiting for a new project…')
 
-  list = [project(2, 'someone-elses'), ...list]
+  list = [project(2, 'someone-elses', AFTER), ...list]
   await act(() => client.refetchQueries())
   await view.findByRole('button', { name: 'Open someone-elses' })
   // Nothing is completed until the operator opens one.
   expect(patches).toEqual([])
 
   // A later project still appears beside it, so the agent's is reachable.
-  list = [project(3, 'agents-app'), ...list]
+  list = [project(3, 'agents-app', AFTER), ...list]
   await act(() => client.refetchQueries())
   fireEvent.click(await view.findByRole('button', { name: 'Open agents-app' }))
   await view.findByText('Project page')
   expect(patches).toEqual([{ done: ['app'], completed: true }])
+  api.restore()
+})
+
+test('an older project redeployed onto the first page is not offered as new', async () => {
+  let list = [project(1, 'existing')]
+  const { api, patches } = mock('connected', () => list)
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  // Project 21 was on page two; a redeploy moves it to the top of the list.
+  list = [project(21, 'old-app', '2026-10-01T00:00:00Z'), ...list]
+  await act(() => client.refetchQueries())
+  expect(view.queryByRole('button', { name: 'Open old-app' })).toBeNull()
+  expect(view.getByText('Waiting for a new project…')).toBeTruthy()
+  expect(patches).toEqual([])
   api.restore()
 })
 

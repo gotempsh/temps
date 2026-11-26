@@ -31,11 +31,14 @@ describe('bridge settings', () => {
     expect(() => checkBridgeAddress('http://192.168.1.10:8080')).toThrow('plain HTTP')
   })
 
-  test('the key comes from TEMPS_API_KEY, or else from the file TEMPS_API_KEY_FILE names', () => {
+  test('the key comes from the file TEMPS_API_KEY_FILE names, or else from TEMPS_API_KEY', () => {
     const file = join(SCRATCH, 'bridge.key')
     writeFileSync(file, `${KEY}\n`, { mode: 0o600 })
     expect(bridgeApiKey({ TEMPS_API_KEY_FILE: file })).toBe(KEY)
-    expect(bridgeApiKey({ TEMPS_API_KEY: 'direct', TEMPS_API_KEY_FILE: file })).toBe('direct')
+    // The entry's file is for the entry's --url; a key inherited from the
+    // app's environment may be another instance's, and is never sent.
+    expect(bridgeApiKey({ TEMPS_API_KEY: 'inherited', TEMPS_API_KEY_FILE: file })).toBe(KEY)
+    expect(bridgeApiKey({ TEMPS_API_KEY: 'direct' })).toBe('direct')
     expect(bridgeApiKey({})).toBe('')
   })
 

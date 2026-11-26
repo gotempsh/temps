@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
-import { createApiKey, getSettings, updateSettings } from '../../api/sdk.gen.js'
+import { createApiKey, deleteApiKey, getSettings, updateSettings } from '../../api/sdk.gen.js'
 import type { AppSettings } from '../../api/types.gen.js'
 import { loginWithDevice } from '../auth/login.js'
 import { getActiveContext, getContext, listContexts } from '../../config/contexts.js'
@@ -18,6 +18,7 @@ import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups
 import { probeMcpEndpoint } from './probe.js'
 import { bridgeAction, bridgePackageSpec, checkBridgeAddress, resolveFolder } from './bridge.js'
 import * as fs from 'node:fs'
+import { randomBytes } from 'node:crypto'
 import { addCredentialSources } from '../../lib/value-source.js'
 
 /**
@@ -408,6 +409,9 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   let apiKey = options.apiKey
   // Whether this command minted the key: only then may it be shown, once.
   let mintedKey = false
+  // The key this command minted, deleted again if the app is not configured
+  // with it, so a failed or retried install leaves no unused credential.
+  let mintedKeyId: number | undefined
   if (!apiKey) {
     // Read-only must not install this login's credential, which may be able
     // to write: without --write, -y mints a reader key. With --write, -y
@@ -424,7 +428,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
         const { data, error } = await createApiKey({
           client,
           body: {
-            name: `mcp-${adapter.id}-${new Date().toISOString().slice(0, 10)}`,
+            name: mintedKeyName(adapter.id),
             role_type: write ? 'user' : 'reader',
             expires_at: null,
             permissions: null,
@@ -436,6 +440,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
       })
       apiKey = created.api_key
       mintedKey = true
+      mintedKeyId = created.id
       newline()
       success(`Created API key "${created.name}" (${created.key_prefix}...)`)
     } else {
@@ -483,11 +488,14 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   const result = await adapter.addServer({ url, apiKey, bridge })
   if (!result.success) {
     warning(`Failed to configure ${adapter.label}: ${result.reason}`)
+    if (mintedKeyId !== undefined) await deleteMintedKey(mintedKeyId)
     return
   }
 
   if (result.alreadyInstalled) {
     info(`${adapter.label} is already configured with this exact setup.`)
+    // The existing entry kept its own key, so the one minted above is unused.
+    if (mintedKeyId !== undefined) await deleteMintedKey(mintedKeyId)
   } else {
     success(`${adapter.label} configured.`)
   }
@@ -522,6 +530,28 @@ export function codexTokenExportLine(apiKey: string, minted: boolean): string {
   return minted
     ? `  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`
     : `  export ${CODEX_TOKEN_ENV_VAR}='Bearer <your Temps API key>'`
+}
+
+/**
+ * The name of a key `mcp add` creates: the app and the day, plus a random
+ * suffix, because names are unique per user and a second install on the same
+ * day (a retry after a failure, or after `mcp remove`) must not be refused.
+ */
+export function mintedKeyName(clientId: string, now: Date = new Date()): string {
+  return `mcp-${clientId}-${now.toISOString().slice(0, 10)}-${randomBytes(3).toString('hex')}`
+}
+
+/** Delete a key this command created for an install that did not happen; says so if it cannot. */
+async function deleteMintedKey(id: number): Promise<void> {
+  try {
+    const { error } = await deleteApiKey({ client, path: { id } })
+    if (error) throw new Error(getErrorMessage(error))
+    info('Deleted the API key created for this install.')
+  } catch (error) {
+    warning(
+      `The API key created for this install (ID ${id}) was not deleted: ${error instanceof Error ? error.message : String(error)}. Delete it under Settings > API keys.`,
+    )
+  }
 }
 
 async function removeAction(clientArg: string | undefined): Promise<void> {

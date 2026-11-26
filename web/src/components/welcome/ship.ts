@@ -106,11 +106,46 @@ export function linkAliases(
   return { [String(serviceId)]: option.envAliases }
 }
 
-/** Projects on the page now that were not there when the step opened, newest first as listed. */
-export function newProjects<T extends { id: number }>(
-  before: Set<number> | null,
+/**
+ * What the ship step saw when it opened: the projects listed, and the moment
+ * a project must be created after to count as new.
+ */
+export interface ProjectsBaseline {
+  ids: Set<number>
+  /** Milliseconds since the epoch, on the server's clock. */
+  since: number
+}
+
+/**
+ * The baseline from the step's first listing. The list is ordered by last
+ * deployment, so redeploying an older project can bring it onto the page:
+ * not being listed before does not make a project new, being created after
+ * the step opened does. `serverDate` is that response's `Date` header, the
+ * server's clock, so a skewed browser clock can neither hide the agent's
+ * project nor invent one; without it, the newest project listed.
+ */
+export function projectsBaseline(
+  list: { id: number; created_at: string }[],
+  serverDate: string | null
+): ProjectsBaseline {
+  const opened = serverDate ? Date.parse(serverDate) : Number.NaN
+  const newest = Math.max(
+    Number.NEGATIVE_INFINITY,
+    ...list.map((p) => Date.parse(p.created_at)).filter(Number.isFinite)
+  )
+  return {
+    ids: new Set(list.map((p) => p.id)),
+    since: Number.isFinite(opened) ? opened : newest,
+  }
+}
+
+/** Projects created since the step opened, in the order listed. */
+export function newProjects<T extends { id: number; created_at: string }>(
+  baseline: ProjectsBaseline | null,
   list: T[] | undefined
 ): T[] {
-  if (!before || !list) return []
-  return list.filter((p) => !before.has(p.id))
+  if (!baseline || !list) return []
+  return list.filter(
+    (p) => !baseline.ids.has(p.id) && Date.parse(p.created_at) >= baseline.since
+  )
 }

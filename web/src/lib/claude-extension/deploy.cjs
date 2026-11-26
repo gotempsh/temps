@@ -441,6 +441,42 @@ async function readIgnoreIfFile(directory, base, limits) {
 }
 
 /**
+ * Whether `absolute` is, now, the file `stat` described inside the folder:
+ * no symlink anywhere on its path (its real path is itself), the same file on
+ * a second look, and, when given, its directory still the one listed. A
+ * directory swapped for a symlink between listing and the file's lstat makes
+ * that lstat describe a file outside; this refuses it rather than record the
+ * outside file under an in-folder name.
+ */
+async function stillInside(absolute, stat, directory, listed) {
+  try {
+    if ((await fsp.realpath(absolute)) !== absolute) return false
+    const again = await fsp.lstat(absolute)
+    if (!again.isFile() || again.ino !== stat.ino || again.dev !== stat.dev) {
+      return false
+    }
+    if (!listed) return true
+    const now = await fsp.lstat(directory)
+    return now.isDirectory() && now.ino === listed.ino && now.dev === listed.dev
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Where an open file is, from the kernel, when the platform says (Linux);
+ * null elsewhere.
+ */
+async function openedPath(handle) {
+  if (process.platform !== 'linux') return null
+  try {
+    return await fsp.readlink(`/proc/self/fd/${handle.fd}`)
+  } catch {
+    return null
+  }
+}
+
+/**
  * The files to upload under `root`, and what was left out. Throws when the
  * folder is over the limits, naming what to leave out. Each file is recorded
  * with its device and inode, which `packZip` checks the file it opens against.
@@ -508,6 +544,11 @@ async function collectFiles(root, limits = LIMITS) {
       }
       const stat = await fsp.lstat(absolute)
       if (!stat.isFile()) continue
+      if (!(await stillInside(absolute, stat, directory, before))) {
+        throw new Error(
+          `${name} changed while the folder was read. Try again once the folder has stopped changing.`
+        )
+      }
       files.push({
         name,
         absolute,
@@ -585,10 +626,15 @@ async function packZip(collected, limits = LIMITS) {
       if (!stat.isFile()) continue
       // The file listed, not another one a folder swapped for a symlink
       // above it now leads to (O_NOFOLLOW covers only the last part).
+      // And that file is still where it was listed, with no symlink on the
+      // way: the kernel's path for what was opened when it gives one.
+      const opened = await openedPath(handle)
       if (
         file.ino === undefined ||
         stat.ino !== file.ino ||
-        stat.dev !== file.dev
+        stat.dev !== file.dev ||
+        (opened !== null && opened !== file.absolute) ||
+        !(await stillInside(file.absolute, stat))
       ) {
         throw new Error(
           `${file.name} changed while the folder was packed. Try again once it has stopped changing.`

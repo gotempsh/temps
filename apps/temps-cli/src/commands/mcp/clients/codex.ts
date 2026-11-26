@@ -10,8 +10,11 @@ import {
   localBridgeCommand,
   MCP_SERVER_NAME,
   redactSecrets,
-  removeBridgeKeyFile,
+  removeBridgeKeyFiles,
+  restoreBridgeKeyFile,
+  sameOrigin,
   writeBridgeKeyFile,
+  type CliAdapterOptions,
   type InstallResult,
   type McpClientAdapter,
   type McpServerEntry,
@@ -52,9 +55,12 @@ const CODEX_ID = 'codex'
  * while `codex mcp add` runs, so the entry names the private key file
  * (`bridgeKeyFilePath`) that `addServer` writes, never the key itself.
  */
-export function codexAddArgs(entry: McpServerEntry): string[] {
+export function codexAddArgs(
+  entry: McpServerEntry,
+  keyFile: string = bridgeKeyFilePath(CODEX_ID, entry.url, codexHome()),
+): string[] {
   if (entry.bridge) {
-    const command = localBridgeCommand(entry, entry.bridge, bridgeKeyFilePath(CODEX_ID))
+    const command = localBridgeCommand(entry, entry.bridge, keyFile)
     return [
       'mcp',
       'add',
@@ -68,9 +74,14 @@ export function codexAddArgs(entry: McpServerEntry): string[] {
   return ['mcp', 'add', MCP_SERVER_NAME, '--url', entry.url, '--bearer-token-env-var', TOKEN_ENV_VAR]
 }
 
+/** Codex's config directory: CODEX_HOME, one per profile, or ~/.codex. */
+export function codexHome(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
+  return path.resolve(env.CODEX_HOME || path.join(home, '.codex'))
+}
+
 /** Codex's settings file. */
-export function codexConfigPath(): string {
-  return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml')
+export function codexConfigPath(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
+  return path.join(codexHome(env, home), 'config.toml')
 }
 
 // Same rationale as Claude Code: shell out to the official `codex` CLI so
@@ -80,7 +91,27 @@ export class CodexAdapter implements McpClientAdapter {
   readonly label = 'Codex'
   private binary: string | null | undefined
 
+  constructor(private readonly options: CliAdapterOptions = {}) {}
+
+  private get home(): string {
+    return this.options.home ?? os.homedir()
+  }
+
+  private get env(): NodeJS.ProcessEnv {
+    return this.options.env ?? process.env
+  }
+
+  /** Each CODEX_HOME is its own profile, so each keeps its own key files. */
+  private profile(): string {
+    return codexHome(this.env, this.home)
+  }
+
+  private keyFile(entry: McpServerEntry): string {
+    return bridgeKeyFilePath(CODEX_ID, entry.url, this.profile(), this.home)
+  }
+
   private findBinary(): string | null {
+    if (this.options.binary) return this.options.binary
     if (this.binary !== undefined) return this.binary
     this.binary = resolveOnPath('codex')
     return this.binary
@@ -96,7 +127,10 @@ export class CodexAdapter implements McpClientAdapter {
   // "temps" (e.g. a server hosted at some-app.temps.example.com).
   private getServerEntry(binary: string): string | null {
     try {
-      return execFileSync(binary, ['mcp', 'get', MCP_SERVER_NAME], { stdio: ['ignore', 'pipe', 'pipe'] }).toString()
+      return execFileSync(binary, ['mcp', 'get', MCP_SERVER_NAME], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: this.env,
+      }).toString()
     } catch {
       return null
     }
@@ -119,26 +153,37 @@ export class CodexAdapter implements McpClientAdapter {
   async addServer(entry: McpServerEntry): Promise<InstallResult> {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The codex CLI was not found on PATH.' }
-    if (entry.bridge) {
+    const keyFile = entry.bridge ? this.keyFile(entry) : undefined
+    let previousKey: string | null = null
+    if (keyFile) {
       try {
-        await writeBridgeKeyFile(CODEX_ID, entry.apiKey)
+        previousKey = await writeBridgeKeyFile(keyFile, entry.apiKey)
       } catch (error) {
         return {
           success: false,
-          reason: `Could not save the API key to ${bridgeKeyFilePath(CODEX_ID)} (${redactSecrets(execErrorMessage(error))}).`,
+          reason: `Could not save the API key to ${keyFile} (${redactSecrets(execErrorMessage(error))}).`,
         }
       }
     }
     try {
-      execFileSync(binary, codexAddArgs(entry), {
+      execFileSync(binary, codexAddArgs(entry, keyFile), {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, [TOKEN_ENV_VAR]: `Bearer ${entry.apiKey}` },
+        env: { ...this.env, [TOKEN_ENV_VAR]: `Bearer ${entry.apiKey}` },
       })
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
+      // Codex kept whatever it had, so the key file goes back to what that
+      // entry reads: a refused install never changes the key it sends.
+      if (keyFile) await restoreBridgeKeyFile(keyFile, previousKey).catch(() => undefined)
       if (/already (installed|exists|added|registered)/i.test(reason)) {
-        return { success: true, alreadyInstalled: true }
+        const installed = await this.getServerUrl()
+        if (sameOrigin(installed, entry.url)) return { success: true, alreadyInstalled: true }
+        const where = installed ? ` for ${new URL(installed).origin}` : ''
+        return {
+          success: false,
+          reason: `Codex already has a ${MCP_SERVER_NAME} server${where}. Run temps mcp remove codex, then add it again.`,
+        }
       }
       return { success: false, reason }
     }
@@ -148,13 +193,13 @@ export class CodexAdapter implements McpClientAdapter {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The codex CLI was not found on PATH.' }
     try {
-      execFileSync(binary, ['mcp', 'remove', MCP_SERVER_NAME], { stdio: ['ignore', 'pipe', 'pipe'] })
-      await removeBridgeKeyFile(CODEX_ID)
+      execFileSync(binary, ['mcp', 'remove', MCP_SERVER_NAME], { stdio: ['ignore', 'pipe', 'pipe'], env: this.env })
+      await removeBridgeKeyFiles(CODEX_ID, this.profile(), this.home)
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
       if (/not found|no such/i.test(reason)) {
-        await removeBridgeKeyFile(CODEX_ID).catch(() => undefined)
+        await removeBridgeKeyFiles(CODEX_ID, this.profile(), this.home).catch(() => undefined)
         return { success: true, alreadyInstalled: true }
       }
       return { success: false, reason }
@@ -162,6 +207,6 @@ export class CodexAdapter implements McpClientAdapter {
   }
 
   async describeTarget(): Promise<string> {
-    return `codex mcp add ${MCP_SERVER_NAME} (${codexConfigPath()})`
+    return `codex mcp add ${MCP_SERVER_NAME} (${codexConfigPath(this.env, this.home)})`
   }
 }

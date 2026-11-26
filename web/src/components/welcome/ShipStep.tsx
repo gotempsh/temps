@@ -3,9 +3,9 @@
 
 import {
   getAiHarnessStatusOptions,
-  getProjectsOptions,
   getProjectsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { getProjects } from '@/api/client/sdk.gen'
 import { Badge } from '@/components/ui/badge'
 import { CopyButton } from '@/components/ui/copy-button'
 import { problemDetail } from '@/lib/api-problem'
@@ -15,7 +15,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ChoiceList } from './ChoiceList'
 import { LATER_REASONS, deployAppPrompt } from './onboarding'
-import { newProjects } from './ship'
+import { newProjects, projectsBaseline, type ProjectsBaseline } from './ship'
 import { useUpdateOnboarding } from './useOnboarding'
 
 type Source = 'agent' | 'project'
@@ -41,19 +41,30 @@ export function ShipStep() {
   const origin = window.location.origin
   const prompt = deployAppPrompt(origin)
 
-  // The projects that existed when the step opened. One that isn't among
-  // them is only new: projects carry no creator, and another operator may
-  // create one meanwhile, so the operator says which is their agent's and
-  // the step keeps watching until they do.
-  const [before, setBefore] = useState<Set<number> | null>(null)
+  // The projects created since the step opened. One is only new:
+  // projects carry no creator, and another operator may create one
+  // meanwhile, so the operator says which is their agent's and the step
+  // keeps watching until they do.
+  const [before, setBefore] = useState<ProjectsBaseline | null>(null)
   const projects = useQuery({
-    ...getProjectsOptions({ query: { page: 1, per_page: 20 } }),
+    // Its own key: the value carries the response's Date header, the
+    // server's clock, which the shared project list does not.
+    queryKey: ['welcome', 'ship', 'projects'],
+    queryFn: async ({ signal }) => {
+      const { data, response } = await getProjects({
+        query: { page: 1, per_page: 20 },
+        signal,
+        throwOnError: true,
+      })
+      return { list: data.projects, serverDate: response.headers.get('date') }
+    },
     refetchInterval: source === 'agent' ? 3000 : false,
   })
-  const list = projects.data?.projects
+  const list = projects.data?.list
   // Recorded once, during render: React's pattern for state derived from
   // the first value of something else.
-  if (list && before === null) setBefore(new Set(list.map((p) => p.id)))
+  if (projects.data && before === null)
+    setBefore(projectsBaseline(projects.data.list, projects.data.serverDate))
   const appeared = newProjects(before, list)
 
   const finish = async (path: string) => {
@@ -158,8 +169,10 @@ export function ShipStep() {
                       busyLabel="Opening…"
                       aria-disabled={pending || undefined}
                       onClick={() => !pending && openCreated.mutate(p.slug)}
+                      title={`Open ${p.name}`}
+                      aria-label={`Open ${p.name}`}
                     >
-                      {`Open ${p.name}`}
+                      Open
                     </Button>
                   </li>
                 ))}

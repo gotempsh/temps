@@ -12,9 +12,19 @@
 //! The proxy reads [`ControlPlanePrivateIngress`] per connection (one
 //! `ArcSwap` load, no lock); the control plane's private-ingress loop sets
 //! the consented address and reads which addresses the proxy listens on.
+//!
+//! A pass of the loop reads the consent, then awaits the machine's networks;
+//! a consent written meanwhile must win. Every consent write bumps a
+//! generation after it commits, and a pass publishes what it decided only if
+//! the generation is still the one it read before the consent
+//! ([`ControlPlanePrivateIngress::set_serving_for`]), so a withdrawn consent
+//! is never served again by a pass that started before the withdrawal.
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+
+use chrono::{DateTime, Utc};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use tokio::sync::Notify;
@@ -80,6 +90,29 @@ pub struct ControlPlanePrivateIngress {
     /// Woken when the consent changes, so the loop applies it at once, and
     /// when the proxy records its listeners.
     changed: Notify,
+    /// Bumped by every consent write, after it commits.
+    consent_generation: AtomicU64,
+    /// Held while `serving` is written, so a pass's publication and a
+    /// consent write never interleave. Writers only: the proxy reads
+    /// `serving` without it.
+    serving_write: Mutex<()>,
+}
+
+/// The key a report from the control plane's loop is stamped with in
+/// `node_public_ingress.listening`: when the consent it answers was given.
+pub const REPORT_CONSENT_AT_KEY: &str = "consent_at";
+
+/// Whether row `0`'s report (its `listening` document) answers the consent
+/// given at `consent_at`: it was built from that consent, not from one
+/// before it written late. A report without the stamp answers none.
+pub fn report_answers_consent(
+    listening: Option<&serde_json::Value>,
+    consent_at: DateTime<Utc>,
+) -> bool {
+    listening
+        .and_then(|l| l.get(REPORT_CONSENT_AT_KEY))
+        .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok())
+        == Some(consent_at)
 }
 
 impl ControlPlanePrivateIngress {
@@ -102,12 +135,57 @@ impl ControlPlanePrivateIngress {
         self.proxy_listeners.get().map(Vec::as_slice)
     }
 
-    /// Serve private addresses on `serving`, or stop with `None`.
-    pub fn set_serving(&self, serving: Option<PrivateIngressServing>) {
+    fn serving_write(&self) -> MutexGuard<'_, ()> {
+        // The guard protects no data, so a panic while held leaves nothing
+        // inconsistent.
+        self.serving_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn store_serving(&self, serving: Option<PrivateIngressServing>) {
         let unchanged = self.serving.load().as_deref() == serving.as_ref();
         if !unchanged {
             self.serving.store(serving.map(Arc::new));
         }
+    }
+
+    /// Serve private addresses on `serving`, or stop with `None`, whatever
+    /// the consent is now.
+    pub fn set_serving(&self, serving: Option<PrivateIngressServing>) {
+        let _write = self.serving_write();
+        self.store_serving(serving);
+    }
+
+    /// The consent generation now; read it before reading the consent.
+    pub fn consent_generation(&self) -> u64 {
+        self.consent_generation.load(Ordering::Acquire)
+    }
+
+    /// Serve `serving`, decided from the consent read at `generation`, only
+    /// if no consent was written since. `false` when one was: nothing is
+    /// published, and the caller decides again from the new consent.
+    pub fn set_serving_for(&self, generation: u64, serving: Option<PrivateIngressServing>) -> bool {
+        let _write = self.serving_write();
+        if self.consent_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.store_serving(serving);
+        true
+    }
+
+    /// A consent write committed: a pass that read the consent before it
+    /// can no longer publish, a withdrawal stops serving now, and the loop
+    /// wakes to apply it.
+    pub fn consent_written(&self, withdrawn: bool) {
+        {
+            let _write = self.serving_write();
+            self.consent_generation.fetch_add(1, Ordering::AcqRel);
+            if withdrawn {
+                self.store_serving(None);
+            }
+        }
+        self.changed.notify_one();
     }
 
     /// The address private addresses are served on now.
@@ -127,9 +205,9 @@ impl ControlPlanePrivateIngress {
         self.networks.load().as_ref().clone()
     }
 
-    /// Wake the loop: the consent changed.
+    /// The consent changed (and was not withdrawn): [`Self::consent_written`].
     pub fn notify_changed(&self) {
-        self.changed.notify_one();
+        self.consent_written(false);
     }
 
     /// Wait until [`Self::notify_changed`] is called.
@@ -226,6 +304,48 @@ mod tests {
 
     fn tailscale() -> Vec<IpNet> {
         vec!["100.64.0.0/10".parse().unwrap()]
+    }
+
+    #[test]
+    fn a_pass_that_read_the_consent_before_a_write_cannot_publish() {
+        let runtime = ControlPlanePrivateIngress::new();
+        let serving = PrivateIngressServing::new(ip("100.101.102.103"), tailscale()).unwrap();
+        let read = runtime.consent_generation();
+        assert!(runtime.set_serving_for(read, Some(serving.clone())));
+        assert_eq!(runtime.serving(), Some(serving.clone()));
+
+        // A pass reads the consent; it is withdrawn while the pass awaits
+        // the machine's networks. The withdrawal stops serving at once, and
+        // the pass's decision, from the old consent, is not published.
+        let read = runtime.consent_generation();
+        runtime.consent_written(true);
+        assert_eq!(runtime.serving(), None);
+        assert!(!runtime.set_serving_for(read, Some(serving.clone())));
+        assert_eq!(runtime.serving(), None);
+
+        // A narrower consent written meanwhile: the old decision is refused
+        // too, and what is served stays as it was until the next pass.
+        assert!(runtime.set_serving_for(runtime.consent_generation(), Some(serving.clone())));
+        let read = runtime.consent_generation();
+        runtime.notify_changed();
+        assert!(!runtime.set_serving_for(read, None));
+        assert_eq!(runtime.serving(), Some(serving));
+    }
+
+    #[test]
+    fn a_report_answers_only_the_consent_it_was_stamped_with() {
+        let given: DateTime<Utc> = "2026-11-26T10:00:00.123456Z".parse().unwrap();
+        let earlier: DateTime<Utc> = "2026-11-26T09:00:00Z".parse().unwrap();
+        let report = serde_json::json!({ "https": "10.8.0.2:443", REPORT_CONSENT_AT_KEY: given });
+        assert!(report_answers_consent(Some(&report), given));
+        // A report built from an earlier consent, however late it was
+        // written, answers only that one.
+        assert!(!report_answers_consent(Some(&report), earlier));
+        assert!(!report_answers_consent(
+            Some(&serde_json::json!({ "https": "10.8.0.2:443" })),
+            given
+        ));
+        assert!(!report_answers_consent(None, given));
     }
 
     #[test]

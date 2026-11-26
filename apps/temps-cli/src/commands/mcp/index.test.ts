@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test, spyOn } from 'bun:test'
-import { codexTokenExportLine, formatMcpAccess, originOf, registerMcpCommands } from './index.js'
+import { codexTokenExportLine, formatMcpAccess, mintedKeyName, originOf, registerMcpCommands } from './index.js'
 
 // originOf is the comparison primitive that decides whether a credential
 // bound to one URL may be reused for another (see ensureMcpAuth /
@@ -142,6 +142,58 @@ describe('mcp add -y', () => {
         expect(created).toEqual([])
         expect(installed).toBe('login-key')
       }
+    } finally {
+      add.mockRestore()
+      spies.forEach((spy) => spy.mockRestore())
+    }
+  })
+})
+
+describe('the key mcp add creates', () => {
+  test('two installs on the same day get different names, so a retry is not refused', () => {
+    const day = new Date('2026-11-26T10:00:00Z')
+    const first = mintedKeyName('cursor', day)
+    expect(first).toMatch(/^mcp-cursor-2026-11-26-[0-9a-f]{6}$/)
+    expect(mintedKeyName('cursor', day)).not.toBe(first)
+  })
+
+  test.each([
+    [{ success: false, reason: 'the app refused it' }],
+    [{ success: true, alreadyInstalled: true }],
+  ] as const)('is deleted again when the app is not configured with it (%o)', async (outcome) => {
+    const { Command } = await import('commander')
+    const contexts = await import('../../config/contexts.js')
+    const api = await import('../../lib/api-client.js')
+    const sdk = await import('../../api/sdk.gen.js')
+    const probe = await import('./probe.js')
+    const { getClientAdapter } = await import('./clients/index.js')
+    const adapter = getClientAdapter('cursor')!
+    const deleted: unknown[] = []
+    const spies = [
+      spyOn(contexts, 'listContexts').mockResolvedValue([
+        { name: 'test', url: 'https://temps.example.test', apiKey: 'login-key', email: 'test@example.test' },
+      ]),
+      spyOn(api, 'setupClient').mockResolvedValue(undefined),
+      spyOn(probe, 'probeMcpEndpoint').mockResolvedValue({ supported: true }),
+      spyOn(adapter, 'isClientSupported').mockResolvedValue(true),
+      spyOn(adapter, 'describeTarget').mockResolvedValue('test configuration'),
+      spyOn(console, 'log').mockImplementation(() => {}),
+      spyOn(sdk, 'createApiKey').mockImplementation((async () => ({
+        data: { id: 41, api_key: 'tk_reader', name: 'mcp-cursor', key_prefix: 'tk_r' },
+        error: undefined,
+      })) as never),
+      spyOn(sdk, 'deleteApiKey').mockImplementation((async (options: { path: unknown }) => {
+        deleted.push(options.path)
+        return { data: undefined, error: undefined }
+      }) as never),
+    ]
+    const add = spyOn(adapter, 'addServer').mockResolvedValue(outcome)
+    try {
+      const program = new Command().exitOverride()
+      registerMcpCommands(program)
+      await program.parseAsync(['mcp', 'add', 'cursor', '--url', 'https://temps.example.test', '-y'], { from: 'user' })
+      expect(add).toHaveBeenCalledTimes(1)
+      expect(deleted).toEqual([{ id: 41 }])
     } finally {
       add.mockRestore()
       spies.forEach((spy) => spy.mockRestore())

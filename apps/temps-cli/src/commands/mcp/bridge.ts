@@ -41,16 +41,16 @@ export interface BridgeOptions {
 const MAX_KEY_FILE_BYTES = 4096
 
 /**
- * The API key the bridge sends: TEMPS_API_KEY, or else the contents of the
- * file TEMPS_API_KEY_FILE names (what `temps mcp add` installs for apps whose
- * installer takes the environment as arguments). Empty when neither is set,
- * which the bridge reports as a missing key. Throws when the file cannot be
- * read, saying which file.
+ * The API key the bridge sends: the contents of the file TEMPS_API_KEY_FILE
+ * names, or else TEMPS_API_KEY. The file wins: `temps mcp add` sets it in the
+ * app's entry, next to the `--url` it was minted for, while TEMPS_API_KEY may
+ * be inherited from wherever the app was started and belong to another
+ * instance. Empty when neither is set, which the bridge reports as a missing
+ * key. Throws when the file cannot be read, saying which file.
  */
 export function bridgeApiKey(env: NodeJS.ProcessEnv): string {
-  if (env.TEMPS_API_KEY) return env.TEMPS_API_KEY
   const file = env.TEMPS_API_KEY_FILE?.trim()
-  if (!file) return ''
+  if (!file) return env.TEMPS_API_KEY ?? ''
   let handle: number | undefined
   try {
     handle = fs.openSync(file, 'r')
@@ -70,8 +70,8 @@ export function bridgeApiKey(env: NodeJS.ProcessEnv): string {
 
 /**
  * `temps mcp bridge`: the Temps MCP server over stdio, for AI apps that run
- * it on this computer. The API key comes from TEMPS_API_KEY or the file
- * TEMPS_API_KEY_FILE names, never a flag, so it does not show in the process
+ * it on this computer. The API key comes from the file TEMPS_API_KEY_FILE
+ * names or TEMPS_API_KEY, never a flag, so it does not show in the process
  * list. Writes only MCP messages to stdout; everything else goes to stderr.
  */
 export function bridgeAction(options: BridgeOptions): void {

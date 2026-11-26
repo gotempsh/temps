@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterAll, describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, spyOn, test } from 'bun:test'
 import {
   appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  promises as fsPromises,
   realpathSync,
   renameSync,
   rmSync,
@@ -331,6 +332,37 @@ describe('a folder that changes while it is packed', () => {
     await expect(
       deploy.collectFiles(join(root, 'linked', 'sub'))
     ).rejects.toThrow('changed while it was read')
+  })
+
+  test("a folder swapped for a symlink between its listing and a file's lstat is refused", async () => {
+    const root = join(SCRATCH, 'swapped-mid-walk')
+    tree(root, { 'package.json': '{}', 'config/app.json': '{"mine":true}' })
+    tree(join(SCRATCH, 'outside-mid-walk'), { 'app.json': 'NOT YOURS' })
+    const target = join(root, 'config', 'app.json')
+    const lstat = fsPromises.lstat
+    let swapped = false
+    // config/ is listed and checked, then swapped for a symlink to a folder
+    // outside just before its file is looked at, so that look describes the
+    // outside file.
+    const spy = spyOn(fsPromises, 'lstat').mockImplementation((async (
+      file: string,
+      ...rest: unknown[]
+    ) => {
+      if (file === target && !swapped) {
+        swapped = true
+        renameSync(join(root, 'config'), join(root, 'config-old'))
+        symlinkSync(join(SCRATCH, 'outside-mid-walk'), join(root, 'config'))
+      }
+      return (lstat as (...args: unknown[]) => unknown)(file, ...rest)
+    }) as never)
+    try {
+      await expect(deploy.collectFiles(root)).rejects.toThrow(
+        'config/app.json changed while the folder was read'
+      )
+      expect(swapped).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   test('a file that grew after listing is not read past the limit', async () => {

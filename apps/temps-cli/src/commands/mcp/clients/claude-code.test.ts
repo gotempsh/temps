@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
-import { bridgeKeyFilePath } from './base.js'
-import { claudeCodeAddArgs, parseClaudeCodeMcpGetOutput } from './claude-code.js'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { bridgeKeyFilePath, type McpServerEntry } from './base.js'
+import { ClaudeCodeAdapter, claudeCodeAddArgs, parseClaudeCodeMcpGetOutput } from './claude-code.js'
 
 describe('parseClaudeCodeMcpGetOutput', () => {
   test('extracts the URL from a well-formed mcp get entry', () => {
@@ -71,7 +74,7 @@ describe('claudeCodeAddArgs', () => {
       'user',
       'temps',
       '-e',
-      `TEMPS_API_KEY_FILE=${bridgeKeyFilePath('claude-code')}`,
+      `TEMPS_API_KEY_FILE=${bridgeKeyFilePath('claude-code', 'https://temps.example.com')}`,
       '--',
       'npx',
       '-y',
@@ -96,5 +99,82 @@ describe('claudeCodeAddArgs', () => {
     const output =
       'temps:\n  Scope: User config\n  Type: stdio\n  Command: npx\n  Args: -y @temps-sdk/cli@1.2.3 mcp bridge --url https://temps.example.com --folder /srv/apps\n'
     expect(parseClaudeCodeMcpGetOutput(output)).toBe('https://temps.example.com/mcp?write=1')
+  })
+})
+
+/**
+ * A stand-in for the app's CLI: `mcp get` prints the saved entry, `mcp add`
+ * refuses a name that exists (as `claude` does) unless REPLACE is set (as
+ * `codex` does), `mcp remove` deletes it. State lives in STATE_DIR.
+ */
+function fakeCli(dir: string): string {
+  const file = join(dir, 'fake-cli')
+  writeFileSync(
+    file,
+    [
+      '#!/bin/sh',
+      'entry="$STATE_DIR/entry"',
+      'case "$2" in',
+      '  get) [ -f "$entry" ] && cat "$entry" && exit 0; echo "No MCP server found with name: temps" >&2; exit 1;;',
+      '  add) if [ -f "$entry" ] && [ -z "$REPLACE" ]; then echo "MCP server temps already exists in user config" >&2; exit 1; fi',
+      '       mkdir -p "$STATE_DIR"; echo "Args: $*" > "$entry"; exit 0;;',
+      '  remove) [ -f "$entry" ] || { echo "No MCP server found with name: temps" >&2; exit 1; }; rm "$entry"; exit 0;;',
+      'esac',
+      'exit 2',
+    ].join('\n'),
+    { mode: 0o755 },
+  )
+  return file
+}
+
+const bridgeTo = (origin: string, apiKey: string): McpServerEntry => ({
+  url: `${origin}/mcp?write=1`,
+  apiKey,
+  bridge: { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
+})
+
+/** The key file an installed entry reads, from the entry the stand-in saved. */
+function installedKeyFile(stateDir: string): string {
+  const match = readFileSync(join(stateDir, 'entry'), 'utf8').match(/TEMPS_API_KEY_FILE=(\S+)/)
+  if (!match?.[1]) throw new Error('the saved entry names no key file')
+  return match[1]
+}
+
+describe('ClaudeCodeAdapter.addServer with a bridge', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'temps-claude-adapter-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  test('a refused install for another instance keeps the installed entry\'s key, and says why', async () => {
+    const env = { PATH: process.env.PATH, STATE_DIR: join(dir, 'state') }
+    const adapter = new ClaudeCodeAdapter({ binary: fakeCli(dir), home: dir, env })
+    expect(await adapter.addServer(bridgeTo('https://a.example.test', 'key-a'))).toEqual({ success: true })
+    const fileA = installedKeyFile(env.STATE_DIR)
+    expect(readFileSync(fileA, 'utf8').trim()).toBe('key-a')
+
+    const result = await adapter.addServer(bridgeTo('https://b.example.test', 'key-b'))
+    expect(result.success).toBe(false)
+    expect(result.reason).toContain('already has a temps server for https://a.example.test')
+    // The entry still reads A's file, which still holds A's key, and B's key
+    // is nowhere on disk.
+    expect(installedKeyFile(env.STATE_DIR)).toBe(fileA)
+    expect(readFileSync(fileA, 'utf8').trim()).toBe('key-a')
+    const keys = readdirSync(join(dir, '.temps', 'mcp')).map((name) => readFileSync(join(dir, '.temps', 'mcp', name), 'utf8'))
+    expect(keys.join('')).not.toContain('key-b')
+  })
+
+  test('a refused install for the same instance is already installed, and leaves the key the entry sends', async () => {
+    const env = { PATH: process.env.PATH, STATE_DIR: join(dir, 'state') }
+    const adapter = new ClaudeCodeAdapter({ binary: fakeCli(dir), home: dir, env })
+    await adapter.addServer(bridgeTo('https://a.example.test', 'key-a'))
+    expect(await adapter.addServer(bridgeTo('https://a.example.test', 'key-a2'))).toEqual({
+      success: true,
+      alreadyInstalled: true,
+    })
+    expect(readFileSync(installedKeyFile(env.STATE_DIR), 'utf8').trim()).toBe('key-a')
+    expect((await adapter.removeServer()).success).toBe(true)
+    expect(readdirSync(join(dir, '.temps', 'mcp'))).toEqual([])
   })
 })

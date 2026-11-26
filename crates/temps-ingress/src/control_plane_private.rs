@@ -311,6 +311,10 @@ impl ControlPlanePrivateIngressLoop {
     }
 
     async fn sync(&self, state: &mut LoopState) -> Pass {
+        // Read before the consent: a consent written after this, while the
+        // pass awaits the machine's networks or its checks, outdates every
+        // decision the pass makes, and nothing it decided is published.
+        let generation = self.runtime.consent_generation();
         let consent = match self.consent.get().await {
             Ok(consent) => consent,
             Err(error) => {
@@ -335,7 +339,13 @@ impl ControlPlanePrivateIngressLoop {
             .set_networks(network_options(&own, &containers));
         let decision = decide(input, &own, &containers, &self.runtime);
         let before = self.runtime.serving();
-        self.runtime.set_serving(decision.serving.clone());
+        if !self
+            .runtime
+            .set_serving_for(generation, decision.serving.clone())
+        {
+            debug!("the private ingress consent changed during the pass; syncing again");
+            return Pass::Interrupted;
+        }
         if before != decision.serving {
             match &decision.serving {
                 Some(serving) => {
@@ -349,6 +359,9 @@ impl ControlPlanePrivateIngressLoop {
             state.reported_consent_at = None;
             state.last_checks.clear();
             state.last_hosts.clear();
+            if self.runtime.consent_generation() != generation {
+                return Pass::Interrupted;
+            }
             if let Err(error) = self.clear_report().await {
                 warn!(%error, "could not clear node 0's private ingress report");
             }
@@ -393,8 +406,15 @@ impl ControlPlanePrivateIngressLoop {
         if !must_write(state, &report, ran_checks, consent_at) {
             return Pass::Done;
         }
+        // Not a report of an outdated consent. One written in the instant
+        // after this check is still stamped with the consent it answers,
+        // which the planner and the status compare with the consent now.
+        if self.runtime.consent_generation() != generation {
+            debug!("the private ingress consent changed during the pass; syncing again");
+            return Pass::Interrupted;
+        }
         match temps_routes::public_ingress_store::PublicIngressStore::new(&self.db)
-            .record_listener_report(CONTROL_PLANE_NODE_ID, report.clone())
+            .record_control_plane_report(report.clone(), consent_at)
             .await
         {
             Ok(()) => {
@@ -474,6 +494,138 @@ mod tests {
 
     fn wildcard() -> Arc<ControlPlanePrivateIngress> {
         runtime(&["0.0.0.0:80", "0.0.0.0:443"])
+    }
+
+    struct Machine;
+    impl LocalAddresses for Machine {
+        fn addresses(&self) -> Vec<LocalNetwork> {
+            own()
+        }
+    }
+
+    /// No container networks, or, given a runtime, a lookup during which the
+    /// consent is withdrawn.
+    struct Containers(Option<Arc<ControlPlanePrivateIngress>>);
+    #[async_trait]
+    impl ContainerNetworks for Containers {
+        async fn networks(&self) -> Vec<(String, IpNet)> {
+            if let Some(runtime) = &self.0 {
+                runtime.consent_written(true);
+            }
+            Vec::new()
+        }
+    }
+
+    /// Inside checks that never finish on their own (a DNS timeout per
+    /// host), saying when they start.
+    struct Hanging(Arc<Notify>);
+    #[async_trait]
+    impl InsideChecker for Hanging {
+        async fn check(&self, _: Vec<(String, PrivateAddress)>) -> Vec<PrivateCheck> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    /// A loop whose one consent read finds `listen` 10.8.0.1, with node 0
+    /// serving one private address.
+    fn pass_loop(
+        runtime: &Arc<ControlPlanePrivateIngress>,
+        containers: Containers,
+        checks_started: Arc<Notify>,
+    ) -> Arc<ControlPlanePrivateIngressLoop> {
+        let settings = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({
+                "private_ingress": {"listen": "10.8.0.1", "updated_at": "2026-11-26T10:00:00Z"}
+            }),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![settings]])
+            .into_connection();
+        let route_table = Arc::new(CachedPeerTable::new(Arc::new(
+            DatabaseConnection::Disconnected,
+        )));
+        route_table.insert_private_route_for_test(
+            "app.internal.example.com",
+            temps_routes::route_table::PrivateRoute {
+                route: temps_routes::route_table::RouteInfo {
+                    backend: temps_routes::route_table::BackendType::StaticDir {
+                        path: "/srv/app".into(),
+                    },
+                    redirect_to: None,
+                    status_code: None,
+                    project: None,
+                    environment: None,
+                    deployment: None,
+                    cert_eligible: false,
+                },
+                address: PrivateAddress {
+                    address_id: "env:1".into(),
+                    range: Some("10.8.0.0/24".into()),
+                    node_id: Some(CONTROL_PLANE_NODE_ID),
+                    listener: Some("10.8.0.1".into()),
+                    via: Some("listener".into()),
+                    principals: None,
+                },
+            },
+        );
+        ControlPlanePrivateIngressLoop::new(
+            Arc::new(db),
+            Arc::clone(runtime),
+            route_table,
+            Arc::new(Machine),
+            Arc::new(containers),
+            Arc::new(Hanging(checks_started)),
+        )
+    }
+
+    /// A consent change while the inside checks are pending ends the pass
+    /// at once, without waiting for them, so the next pass applies it.
+    #[tokio::test]
+    async fn a_consent_change_during_the_inside_checks_ends_the_pass() {
+        let runtime = wildcard();
+        let started = Arc::new(Notify::new());
+        let pass_loop = pass_loop(&runtime, Containers(None), Arc::clone(&started));
+        let mut state = LoopState::default();
+        let change = async {
+            started.notified().await;
+            runtime.notify_changed();
+        };
+        // The wake-up the proxy's listeners left, which the loop consumes
+        // while it waits for them before its first pass.
+        tokio::time::timeout(Duration::from_secs(1), runtime.changed())
+            .await
+            .expect("the listeners woke the loop");
+        let (pass, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(pass_loop.sync(&mut state), change)
+        })
+        .await
+        .expect("the pass ends without waiting for the checks");
+        assert_eq!(pass, Pass::Interrupted);
+        assert!(state.last_report.is_none(), "nothing is reported of it");
+    }
+
+    /// A withdrawal that commits while a pass awaits the machine's networks
+    /// is not undone by that pass: what it decided from the consent it read
+    /// is not published, and the pass ends to read the consent again.
+    #[tokio::test]
+    async fn a_pass_does_not_serve_a_consent_withdrawn_while_it_ran() {
+        let runtime = wildcard();
+        let pass_loop = pass_loop(
+            &runtime,
+            Containers(Some(Arc::clone(&runtime))),
+            Arc::new(Notify::new()),
+        );
+        let mut state = LoopState::default();
+        let pass = tokio::time::timeout(Duration::from_secs(5), pass_loop.sync(&mut state))
+            .await
+            .expect("the pass ends");
+        assert_eq!(pass, Pass::Interrupted);
+        assert_eq!(runtime.serving(), None);
+        assert!(state.last_report.is_none());
     }
 
     #[tokio::test]

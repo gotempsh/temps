@@ -12,7 +12,9 @@ import {
   bridgeUrlFromText,
   JsonConfigMcpClientAdapter,
   localBridgeCommand,
-  removeBridgeKeyFile,
+  removeBridgeKeyFiles,
+  restoreBridgeKeyFile,
+  sameOrigin,
   writeBridgeKeyFile,
   type McpServerEntry,
 } from './base.js'
@@ -202,20 +204,55 @@ describe('the local bridge entry', () => {
   })
 
   test('the key file is written for this user only, replaced in place, and removed', async () => {
-    const file = await writeBridgeKeyFile('codex', 'secret-key', dir)
-    expect(file).toBe(bridgeKeyFilePath('codex', dir))
-    expect(file).toBe(join(dir, '.temps', 'mcp', 'codex.key'))
+    const file = bridgeKeyFilePath('codex', 'https://a.example.test/mcp?write=1', '/profile', dir)
+    expect(file.startsWith(join(dir, '.temps', 'mcp', 'codex-'))).toBe(true)
+    expect(await writeBridgeKeyFile(file, 'secret-key')).toBeNull()
     expect(readFileSync(file, 'utf8').trim()).toBe('secret-key')
     expect(statSync(file).mode & 0o777).toBe(0o600)
     expect(statSync(join(dir, '.temps', 'mcp')).mode & 0o777).toBe(0o700)
     // A file a looser earlier version left behind is replaced at 0600.
     chmodSync(file, 0o644)
-    await writeBridgeKeyFile('codex', 'second-key', dir)
+    expect(await writeBridgeKeyFile(file, 'second-key')).toBe('secret-key\n')
     expect(readFileSync(file, 'utf8').trim()).toBe('second-key')
     expect(statSync(file).mode & 0o777).toBe(0o600)
-    await removeBridgeKeyFile('codex', dir)
-    await removeBridgeKeyFile('codex', dir)
+    await removeBridgeKeyFiles('codex', '/profile', dir)
+    await removeBridgeKeyFiles('codex', '/profile', dir)
     expect(() => statSync(file)).toThrow()
+  })
+
+  test('each profile and instance has its own key file, and removing one profile keeps the others', async () => {
+    const a = bridgeKeyFilePath('codex', 'https://a.example.test/mcp', '/profile-1', dir)
+    const b = bridgeKeyFilePath('codex', 'https://b.example.test/mcp', '/profile-1', dir)
+    const other = bridgeKeyFilePath('codex', 'https://a.example.test/mcp', '/profile-2', dir)
+    // Same instance, same profile: the same file, whatever the path or query.
+    expect(bridgeKeyFilePath('codex', 'https://a.example.test/', '/profile-1', dir)).toBe(a)
+    expect(new Set([a, b, other]).size).toBe(3)
+    await writeBridgeKeyFile(a, 'key-a')
+    await writeBridgeKeyFile(b, 'key-b')
+    await writeBridgeKeyFile(other, 'key-other')
+    await removeBridgeKeyFiles('codex', '/profile-1', dir)
+    expect(() => statSync(a)).toThrow()
+    expect(() => statSync(b)).toThrow()
+    expect(readFileSync(other, 'utf8').trim()).toBe('key-other')
+  })
+
+  test('restoring a key file puts back what it held, or removes one that did not exist', async () => {
+    const file = bridgeKeyFilePath('claude-code', 'https://a.example.test', '', dir)
+    const fresh = await writeBridgeKeyFile(file, 'new-key')
+    await restoreBridgeKeyFile(file, fresh)
+    expect(() => statSync(file)).toThrow()
+    await writeBridgeKeyFile(file, 'old-key')
+    const previous = await writeBridgeKeyFile(file, 'new-key')
+    await restoreBridgeKeyFile(file, previous)
+    expect(readFileSync(file, 'utf8').trim()).toBe('old-key')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
+  test('sameOrigin compares scheme, host and port only', () => {
+    expect(sameOrigin('https://a.example.test/mcp?write=1', 'https://a.example.test/mcp')).toBe(true)
+    expect(sameOrigin('http://a.example.test/mcp', 'https://a.example.test/mcp')).toBe(false)
+    expect(sameOrigin('https://b.example.test/mcp', 'https://a.example.test/mcp')).toBe(false)
+    expect(sameOrigin(null, 'https://a.example.test/mcp')).toBe(false)
   })
 
   test('a JSON-config app gets a stdio entry, and status reads it back as read/write', async () => {

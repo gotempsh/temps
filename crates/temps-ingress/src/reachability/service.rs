@@ -4070,17 +4070,23 @@ pub const CONTROL_PLANE_PRIVATE_COMMAND: &str =
     "bunx @temps-sdk/cli ingress private --listen <this machine's private address, or tailscale>";
 
 /// Node 0 as a private worker (ADR-115 D6), from the consent and row 0.
-/// `None` without consent. With consent and no row yet, or only a row
-/// written before the consent (it describes the listener of an earlier
-/// consent, which may be another address), the loop has not applied it, or
-/// none runs in this process. The loop answers every new consent with a
-/// fresh report, so waiting for one is short.
+/// `None` without consent. With consent and no row yet, or only a row that
+/// answers another consent (a pass that read an earlier one may write after
+/// the new one is given, and it describes that consent's listener, which may
+/// be another address), the loop has not applied it, or none runs in this
+/// process. The loop answers every new consent with a fresh report, so
+/// waiting for one is short.
 pub fn control_plane_private_fact(
     consent: Option<&temps_config::private_ingress::PrivateIngressConsent>,
     row: Option<&node_public_ingress::Model>,
 ) -> Option<PrivateWorkerFact> {
     let consent = consent?;
-    let row = row.filter(|row| row.updated_at >= consent.updated_at);
+    let row = row.filter(|row| {
+        temps_core::private_ingress::report_answers_consent(
+            row.listening.as_ref(),
+            consent.updated_at,
+        )
+    });
     let id = temps_core::CONTROL_PLANE_NODE_ID;
     Some(match row {
         Some(row) => private_worker_fact(id, CONTROL_PLANE_PRIVATE_NAME, row),
@@ -4563,54 +4569,111 @@ impl TunnelMoveGuard for WaysIn {
 mod tests {
     use super::*;
 
-    /// A report from before the consent describes an earlier listener (a
-    /// consent moved from address A to B): planning must not use A, so node 0
-    /// counts as not having applied the consent until it reports again.
+    /// A report built from an earlier consent describes that consent's
+    /// listener (a consent moved from address A to B): planning must not use
+    /// A, however late the report was written, so node 0 counts as not
+    /// having applied the consent until it reports on B.
     #[test]
-    fn node_0_reports_older_than_the_consent_are_not_planned_on() {
+    fn node_0_reports_of_another_consent_are_not_planned_on() {
         let at = |t: &str| {
             chrono::DateTime::parse_from_rfc3339(t)
                 .unwrap()
                 .with_timezone(&chrono::Utc)
         };
+        let consent_a = at("2026-11-24T09:00:00Z");
         let consent = temps_config::private_ingress::PrivateIngressConsent {
             listen: "10.8.0.2".into(),
             admit: vec![],
             tailscale_serve: false,
             updated_at: at("2026-11-24T10:00:00Z"),
         };
-        let row = |updated: &str| node_public_ingress::Model {
-            node_id: 0,
-            listen_address: None,
-            http_port: 80,
-            https_port: 443,
-            public_address: None,
-            interfaces: None,
-            listening: Some(serde_json::json!({
-                "https": "10.8.0.1:443",
+        let row = |https: &str, answers: Option<chrono::DateTime<chrono::Utc>>, written: &str| {
+            let mut listening = serde_json::json!({
+                "https": https,
                 "admit": ["10.8.0.0/24"],
-            })),
-            mode: Some("private".into()),
-            last_check: None,
-            private_checks: None,
-            tailscale: None,
-            checked_at: None,
-            created_at: at(updated),
-            updated_at: at(updated),
+            });
+            if let Some(answers) = answers {
+                listening[temps_core::private_ingress::REPORT_CONSENT_AT_KEY] =
+                    serde_json::json!(answers);
+            }
+            node_public_ingress::Model {
+                node_id: 0,
+                listen_address: None,
+                http_port: 80,
+                https_port: 443,
+                public_address: None,
+                interfaces: None,
+                listening: Some(listening),
+                mode: Some("private".into()),
+                last_check: None,
+                private_checks: None,
+                tailscale: None,
+                checked_at: None,
+                created_at: at(written),
+                updated_at: at(written),
+            }
         };
-        let stale = control_plane_private_fact(Some(&consent), Some(&row("2026-11-24T09:59:59Z")))
-            .expect("consent exists");
-        assert_eq!(stale.listener, None);
-        assert_eq!(stale.ready(), None);
-        assert!(stale
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("has not applied"));
-        let fresh = control_plane_private_fact(Some(&consent), Some(&row("2026-11-24T10:00:01Z")))
-            .expect("consent exists");
-        assert_eq!(fresh.ready(), Some("10.8.0.1".parse().unwrap()));
-        assert!(control_plane_private_fact(None, Some(&row("2026-11-24T10:00:01Z"))).is_none());
+        let not_applied = |fact: PrivateWorkerFact| {
+            assert_eq!(fact.listener, None);
+            assert_eq!(fact.ready(), None);
+            assert!(fact
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("has not applied"));
+        };
+        // Written before B, about A.
+        not_applied(
+            control_plane_private_fact(
+                Some(&consent),
+                Some(&row(
+                    "10.8.0.1:443",
+                    Some(consent_a),
+                    "2026-11-24T09:59:59Z",
+                )),
+            )
+            .expect("consent exists"),
+        );
+        // Written after B by a pass that read A: still about A.
+        not_applied(
+            control_plane_private_fact(
+                Some(&consent),
+                Some(&row(
+                    "10.8.0.1:443",
+                    Some(consent_a),
+                    "2026-11-24T10:00:01Z",
+                )),
+            )
+            .expect("consent exists"),
+        );
+        // A report that answers no consent (an earlier version wrote it).
+        not_applied(
+            control_plane_private_fact(
+                Some(&consent),
+                Some(&row("10.8.0.1:443", None, "2026-11-24T10:00:01Z")),
+            )
+            .expect("consent exists"),
+        );
+        let fresh = control_plane_private_fact(
+            Some(&consent),
+            Some(&row(
+                "10.8.0.2:443",
+                Some(consent.updated_at),
+                "2026-11-24T10:00:01Z",
+            )),
+        )
+        .expect("consent exists");
+        assert_eq!(fresh.ready(), Some("10.8.0.2".parse().unwrap()));
+        assert_eq!(fresh.admit.as_deref(), Some("10.8.0.0/24"));
+        assert!(control_plane_private_fact(
+            None,
+            Some(&row(
+                "10.8.0.2:443",
+                Some(consent.updated_at),
+                "2026-11-24T10:00:01Z"
+            ))
+        )
+        .is_none());
     }
 
     fn run_row(journal: Value, steps: Value) -> reachability_runs::Model {

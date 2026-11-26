@@ -11,8 +11,11 @@ import {
   localBridgeCommand,
   MCP_SERVER_NAME,
   redactSecrets,
-  removeBridgeKeyFile,
+  removeBridgeKeyFiles,
+  restoreBridgeKeyFile,
+  sameOrigin,
   writeBridgeKeyFile,
+  type CliAdapterOptions,
   type InstallResult,
   type McpClientAdapter,
   type McpServerEntry,
@@ -39,9 +42,12 @@ const CLAUDE_CODE_ID = 'claude-code'
  * the bridge entry names the private key file (`bridgeKeyFilePath`) that
  * `addServer` writes, never the key itself.
  */
-export function claudeCodeAddArgs(entry: McpServerEntry): string[] {
+export function claudeCodeAddArgs(
+  entry: McpServerEntry,
+  keyFile: string = bridgeKeyFilePath(CLAUDE_CODE_ID, entry.url),
+): string[] {
   if (entry.bridge) {
-    const command = localBridgeCommand(entry, entry.bridge, bridgeKeyFilePath(CLAUDE_CODE_ID))
+    const command = localBridgeCommand(entry, entry.bridge, keyFile)
     return [
       'mcp',
       'add',
@@ -76,10 +82,30 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
   readonly label = 'Claude Code'
   private binary: string | null | undefined
 
+  constructor(private readonly options: CliAdapterOptions = {}) {}
+
+  private get home(): string {
+    return this.options.home ?? os.homedir()
+  }
+
+  private get env(): NodeJS.ProcessEnv {
+    return this.options.env ?? process.env
+  }
+
+  /** Claude Code keeps one user configuration per config directory; key files are kept apart the same way. */
+  private profile(): string {
+    return this.env.CLAUDE_CONFIG_DIR ? path.resolve(this.env.CLAUDE_CONFIG_DIR) : ''
+  }
+
+  private keyFile(entry: McpServerEntry): string {
+    return bridgeKeyFilePath(CLAUDE_CODE_ID, entry.url, this.profile(), this.home)
+  }
+
   private findBinary(): string | null {
+    if (this.options.binary) return this.options.binary
     if (this.binary !== undefined) return this.binary
     const candidates = [
-      path.join(os.homedir(), '.claude', 'local', 'claude'),
+      path.join(this.home, '.claude', 'local', 'claude'),
       '/usr/local/bin/claude',
       '/opt/homebrew/bin/claude',
     ]
@@ -103,7 +129,10 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
   // "temps" (e.g. a server hosted at some-app.temps.example.com).
   private getServerEntry(binary: string): string | null {
     try {
-      return execFileSync(binary, ['mcp', 'get', MCP_SERVER_NAME], { stdio: ['ignore', 'pipe', 'pipe'] }).toString()
+      return execFileSync(binary, ['mcp', 'get', MCP_SERVER_NAME], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: this.env,
+      }).toString()
     } catch {
       return null
     }
@@ -126,13 +155,15 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
   async addServer(entry: McpServerEntry): Promise<InstallResult> {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The claude CLI was not found on PATH.' }
-    if (entry.bridge) {
+    const keyFile = entry.bridge ? this.keyFile(entry) : undefined
+    let previousKey: string | null = null
+    if (keyFile) {
       try {
-        await writeBridgeKeyFile(CLAUDE_CODE_ID, entry.apiKey)
+        previousKey = await writeBridgeKeyFile(keyFile, entry.apiKey)
       } catch (error) {
         return {
           success: false,
-          reason: `Could not save the API key to ${bridgeKeyFilePath(CLAUDE_CODE_ID)} (${redactSecrets(execErrorMessage(error))}).`,
+          reason: `Could not save the API key to ${keyFile} (${redactSecrets(execErrorMessage(error))}).`,
         }
       }
     }
@@ -144,11 +175,22 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
       // key is briefly visible in this process's argv (e.g. /proc/<pid>/cmdline
       // on Linux) for the duration of the exec call. Tracked as a known
       // upstream limitation rather than worked around with a fragile hack.
-      execFileSync(binary, claudeCodeAddArgs(entry), { stdio: ['ignore', 'pipe', 'pipe'] })
+      execFileSync(binary, claudeCodeAddArgs(entry, keyFile), { stdio: ['ignore', 'pipe', 'pipe'], env: this.env })
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
-      if (/already exists/i.test(reason)) return { success: true, alreadyInstalled: true }
+      // Claude kept whatever it had, so the key file goes back to what that
+      // entry reads: a refused install never changes the key it sends.
+      if (keyFile) await restoreBridgeKeyFile(keyFile, previousKey).catch(() => undefined)
+      if (/already exists/i.test(reason)) {
+        const installed = await this.getServerUrl()
+        if (sameOrigin(installed, entry.url)) return { success: true, alreadyInstalled: true }
+        const where = installed ? ` for ${new URL(installed).origin}` : ''
+        return {
+          success: false,
+          reason: `Claude Code already has a ${MCP_SERVER_NAME} server${where}. Run temps mcp remove claude-code, then add it again.`,
+        }
+      }
       return { success: false, reason }
     }
   }
@@ -159,13 +201,14 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
     try {
       execFileSync(binary, ['mcp', 'remove', '--scope', 'user', MCP_SERVER_NAME], {
         stdio: ['ignore', 'pipe', 'pipe'],
+        env: this.env,
       })
-      await removeBridgeKeyFile(CLAUDE_CODE_ID)
+      await removeBridgeKeyFiles(CLAUDE_CODE_ID, this.profile(), this.home)
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
       if (/no such|not found/i.test(reason)) {
-        await removeBridgeKeyFile(CLAUDE_CODE_ID).catch(() => undefined)
+        await removeBridgeKeyFiles(CLAUDE_CODE_ID, this.profile(), this.home).catch(() => undefined)
         return { success: true, alreadyInstalled: true }
       }
       return { success: false, reason }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -58,40 +59,85 @@ export function localBridgeCommand(entry: McpServerEntry, bridge: LocalBridge, k
   }
 }
 
-/** Where the bridge key for an app installed through its own CLI is kept: readable by this user only. */
-export function bridgeKeyFilePath(clientId: string, home: string = os.homedir()): string {
-  return path.join(home, '.temps', 'mcp', `${clientId}.key`)
+function shortHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 16)
+}
+
+function keyFilePrefix(clientId: string, profile: string): string {
+  return `${clientId}-${shortHash(profile)}-`
 }
 
 /**
- * Write the bridge key to `bridgeKeyFilePath(clientId)`, created at 0600 in a
- * 0700 directory and moved into place, so it is never readable by another
- * user, even for an instant. Returns the path.
+ * Where the bridge key for one entry of an app installed through its own CLI
+ * is kept, readable by this user only. One file per app profile (`profile`:
+ * the app's config directory, empty when it has one per user) and Temps
+ * instance, so installing for another instance, or in another profile, never
+ * replaces the key an existing entry reads and sends to its own address.
  */
-export async function writeBridgeKeyFile(
-  clientId: string,
-  apiKey: string,
-  home: string = os.homedir(),
-): Promise<string> {
-  const file = bridgeKeyFilePath(clientId, home)
+export function bridgeKeyFilePath(clientId: string, url: string, profile = '', home: string = os.homedir()): string {
+  const name = `${keyFilePrefix(clientId, profile)}${shortHash(new URL(url).origin)}.key`
+  return path.join(home, '.temps', 'mcp', name)
+}
+
+/**
+ * Write a bridge key to `file`, created at 0600 in a 0700 directory and moved
+ * into place, so it is never readable by another user, even for an instant.
+ * Returns what the file held before (null when it did not exist), for
+ * `restoreBridgeKeyFile` when the app then refuses the entry.
+ */
+export async function writeBridgeKeyFile(file: string, apiKey: string): Promise<string | null> {
   const dir = path.dirname(file)
   await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
   await fs.promises.chmod(dir, 0o700)
+  const previous = await fs.promises.readFile(file, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw error
+  })
+  await replaceKeyFile(file, `${apiKey}\n`)
+  return previous
+}
+
+/** Put a key file back as `writeBridgeKeyFile` found it: removed when it did not exist. */
+export async function restoreBridgeKeyFile(file: string, previous: string | null): Promise<void> {
+  if (previous === null) await fs.promises.rm(file, { force: true })
+  else await replaceKeyFile(file, previous)
+}
+
+async function replaceKeyFile(file: string, content: string): Promise<void> {
   const temporary = `${file}.${process.pid}.tmp`
   await fs.promises.rm(temporary, { force: true })
-  await fs.promises.writeFile(temporary, `${apiKey}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+  await fs.promises.writeFile(temporary, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
   try {
     await fs.promises.rename(temporary, file)
   } catch (error) {
     await fs.promises.rm(temporary, { force: true })
     throw error
   }
-  return file
 }
 
-/** Delete an app's bridge key file; a missing file is not an error. */
-export async function removeBridgeKeyFile(clientId: string, home: string = os.homedir()): Promise<void> {
-  await fs.promises.rm(bridgeKeyFilePath(clientId, home), { force: true })
+/** Delete the bridge key files of one app profile, whatever instance they are for; other profiles keep theirs. */
+export async function removeBridgeKeyFiles(clientId: string, profile = '', home: string = os.homedir()): Promise<void> {
+  const dir = path.join(home, '.temps', 'mcp')
+  const prefix = keyFilePrefix(clientId, profile)
+  const names = await fs.promises.readdir(dir).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return [] as string[]
+    throw error
+  })
+  await Promise.all(
+    names
+      .filter((name) => name.startsWith(prefix) && name.endsWith('.key'))
+      .map((name) => fs.promises.rm(path.join(dir, name), { force: true })),
+  )
+}
+
+/** Whether two URLs point at the same Temps instance (scheme, host and port). */
+export function sameOrigin(a: string | null, b: string): boolean {
+  if (!a) return false
+  try {
+    return new URL(a).origin === new URL(b).origin
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -117,6 +163,16 @@ export function bridgeUrlFromArgs(args: unknown): string | null {
 export function bridgeUrlFromText(text: string): string | null {
   const match = text.match(/\bmcp\s+bridge\b[\s\S]*?--url\s+(\S+)/)
   return match?.[1] ? bridgeUrlFromArgs(['mcp', 'bridge', '--url', match[1]]) : null
+}
+
+/** For adapters that drive an app's own CLI: where it is and what it sees. Defaults are this process's. */
+export interface CliAdapterOptions {
+  /** The app's CLI, instead of finding it on PATH. */
+  binary?: string
+  /** The user's home directory, where key files are kept. */
+  home?: string
+  /** The environment the app's CLI runs with, which also picks its profile. */
+  env?: NodeJS.ProcessEnv
 }
 
 export interface InstallResult {
