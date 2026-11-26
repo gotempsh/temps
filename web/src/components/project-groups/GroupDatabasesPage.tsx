@@ -593,9 +593,14 @@ export function GroupDatabaseRow({
   )
 }
 
+/** Databases listed to link before the rest are found by search. */
+const LINKABLE_ROWS = 6
+
 /**
- * The server's other databases, to link one to `target`. Loaded only when
- * asked for, as on a service's Databases page.
+ * The server's other databases, listed to link one to `target`. Shown only
+ * once one can be: with none left to link (none on the server, or every
+ * one already linked), the section is not shown. The list is the one the
+ * sidebar's Server row reads, so asking for it with the page is cheap.
  */
 function LinkExistingDatabase({
   target,
@@ -609,71 +614,56 @@ function LinkExistingDatabase({
   busy: boolean
   onLink: (database: ExternalServiceInfo) => void
 }) {
-  const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   const all = useQuery({
     ...listServicesOptions(),
-    enabled: open,
     retry: false,
   })
   const term = search.trim().toLowerCase()
-  const available = (all.data ?? []).filter(
-    (database) =>
-      !linked.some((used) => used.id === database.id) &&
-      `${database.name} ${database.service_type}`.toLowerCase().includes(term)
+  const linkable = (all.data ?? []).filter(
+    (database) => !linked.some((used) => used.id === database.id)
   )
+  const matching = linkable.filter((database) =>
+    `${database.name} ${database.service_type}`.toLowerCase().includes(term)
+  )
+  const available = matching.slice(0, LINKABLE_ROWS)
+  // Nothing to link, or not known yet: no section. One that could not be
+  // loaded is shown, so its retry is reachable.
+  if (!all.isError && linkable.length === 0) return null
 
   return (
     <section aria-labelledby="link-existing-database" className="space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2
-          id="link-existing-database"
-          className="text-sm font-medium text-foreground"
-        >
-          Link an existing database
-        </h2>
-        {!open && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setOpen(true)}
-            title="Choose from the databases on this server"
-          >
-            Choose database
-          </Button>
-        )}
-      </div>
-      {open &&
-        (all.isLoading ? (
-          <div
-            role="status"
-            aria-label="Loading databases on this server"
-            className="h-24 animate-pulse rounded-lg bg-muted"
-          />
-        ) : all.isError ? (
-          <Alert variant="destructive">
-            <AlertTitle>
-              The databases on this server could not be loaded
-            </AlertTitle>
-            <AlertDescription>
-              The databases linked above are unaffected.
-              <Button
-                variant="outline"
-                size="sm"
-                className="ml-3"
-                onClick={() => void all.refetch()}
-              >
-                Retry
-              </Button>
-            </AlertDescription>
-          </Alert>
-        ) : (
-          <>
-            <p className="text-xs text-muted-foreground">
-              Databases on this server that {target.name} is not linked to.
-              Linking makes its connection settings available from the next
-              deployment.
-            </p>
+      <h2
+        id="link-existing-database"
+        className="text-sm font-medium text-foreground"
+      >
+        Link an existing database
+      </h2>
+      {all.isError ? (
+        <Alert variant="destructive">
+          <AlertTitle>
+            The databases on this server could not be loaded
+          </AlertTitle>
+          <AlertDescription>
+            The databases linked above are unaffected.
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-3"
+              onClick={() => void all.refetch()}
+            >
+              Retry
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ) : (
+        <>
+          <p className="text-xs text-muted-foreground">
+            Linking gives {target.name} its connection settings from the next
+            deployment.
+          </p>
+          {/* A few are read at a glance; more are found by name. */}
+          {linkable.length > LINKABLE_ROWS && (
             <Input
               aria-label="Search existing databases"
               placeholder="Search by name or database type…"
@@ -681,13 +671,13 @@ function LinkExistingDatabase({
               value={search}
               onChange={(event) => setSearch(event.target.value)}
             />
-            {available.length === 0 ? (
-              <p className="py-4 text-sm text-muted-foreground">
-                {search
-                  ? 'No databases match your search.'
-                  : `Every database on this server is already linked to ${target.name}.`}
-              </p>
-            ) : (
+          )}
+          {available.length === 0 ? (
+            <p className="py-4 text-sm text-muted-foreground">
+              No databases match your search.
+            </p>
+          ) : (
+            <>
               <ul
                 role="list"
                 className="divide-y divide-border overflow-hidden rounded-lg border border-border"
@@ -723,9 +713,15 @@ function LinkExistingDatabase({
                   </li>
                 ))}
               </ul>
-            )}
-          </>
-        ))}
+              {matching.length > available.length && (
+                <p className="text-xs text-muted-foreground">
+                  {`${matching.length - available.length} more. Search to find them.`}
+                </p>
+              )}
+            </>
+          )}
+        </>
+      )}
     </section>
   )
 }

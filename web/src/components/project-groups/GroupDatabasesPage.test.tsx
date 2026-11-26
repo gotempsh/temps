@@ -151,8 +151,7 @@ describe("a project's databases", () => {
     const apiOption = screen.getByRole('radio', { name: 'api' })
     expect(apiOption.querySelector('span[aria-hidden="true"]')).toBeTruthy()
     fireEvent.click(apiOption)
-    fireEvent.click(screen.getByRole('button', { name: 'Choose database' }))
-    // orders-db is already linked to api; cache and sessions are not.
+    // Listed with no click to show them. orders-db is already linked to api; cache and sessions are not.
     expect(await screen.findByText('sessions')).toBeTruthy()
     expect(
       screen
@@ -174,7 +173,6 @@ describe("a project's databases", () => {
         jsonResponse([orders, database(10, 'reports', 'postgres')]),
     })
     await screen.findByRole('button', { name: 'cache, used by web' })
-    fireEvent.click(screen.getByRole('button', { name: 'Choose database' }))
     await screen.findByText('reports')
     fireEvent.click(
       screen
@@ -183,6 +181,18 @@ describe("a project's databases", () => {
     )
     expect(await screen.findByRole('dialog')).toBeTruthy()
     expect(mock.called('POST', '/external-services/10/projects')).toBe(false)
+    mock.restore()
+  })
+
+  test('linking is not offered when the server has no other database', async () => {
+    const mock = renderPage(project(web, api), {
+      'GET /external-services': () => jsonResponse([orders]),
+    })
+    await screen.findByRole('button', { name: 'cache, used by web' })
+    await waitFor(() =>
+      expect(mock.called('GET', '/external-services')).toBe(true)
+    )
+    expect(screen.queryByText('Link an existing database')).toBeNull()
     mock.restore()
   })
 

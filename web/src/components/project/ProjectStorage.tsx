@@ -358,13 +358,15 @@ export function ServiceRow({
   )
 }
 
+/** Databases listed to link before the rest are found by search. */
+const LINKABLE_ROWS = 6
+
 export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [isCreateDropdownOpen, setIsCreateDropdownOpen] = useState(false)
   const [search, setSearch] = useState('')
   // The server-wide list is loaded only when the operator asks to link an
   // existing database: by default this page shows this service's own.
-  const [pickerOpen, setPickerOpen] = useState(false)
   const [servicePendingLink, setServicePendingLink] =
     useState<ExternalServiceInfo | null>(null)
   // The last link change, until the operator redeploys or dismisses it: the
@@ -384,12 +386,11 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
 
   const {
     data: services,
-    isLoading: isLoadingServices,
     refetch: refetchServices,
     isError: servicesError,
   } = useQuery({
+    // Asked for with the page: it decides whether linking is offered.
     ...listServicesOptions(),
-    enabled: pickerOpen,
     retry: false,
   })
 
@@ -573,6 +574,15 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     servicesLinked ?? [],
     search
   )
+  // Linking is offered only once a database can be linked: none on the
+  // server, or every one already linked, and the section is not shown.
+  // One that could not be loaded is shown, so its retry is reachable.
+  const linkableCount = linkableDatabases(
+    services ?? [],
+    servicesLinked ?? [],
+    ''
+  ).length
+  const canLink = servicesError || linkableCount > 0
 
   return (
     <div className="flex-1 overflow-auto">
@@ -623,33 +633,18 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           )}
         </section>
 
-        <section aria-labelledby="link-existing-database" className="space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2">
+        {canLink && (
+          <section
+            aria-labelledby="link-existing-database"
+            className="space-y-3"
+          >
             <h2
               id="link-existing-database"
               className="text-sm font-medium text-foreground"
             >
               Link an existing database
             </h2>
-            {!pickerOpen && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setPickerOpen(true)}
-                title="Choose from the databases on this server"
-              >
-                Choose database
-              </Button>
-            )}
-          </div>
-          {pickerOpen &&
-            (isLoadingServices ? (
-              <div
-                role="status"
-                aria-label="Loading databases on this server"
-                className="h-24 animate-pulse rounded-lg bg-muted"
-              />
-            ) : servicesError ? (
+            {servicesError ? (
               <Alert variant="destructive">
                 <AlertTitle>
                   The databases on this server could not be loaded
@@ -669,43 +664,53 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
             ) : (
               <>
                 <p className="text-xs text-muted-foreground">
-                  Showing all databases on this server that this service is not
-                  linked to. Linking makes its connection settings available
-                  from the next deployment.
+                  Linking gives this service its connection settings from the
+                  next deployment.
                 </p>
-                <Input
-                  aria-label="Search existing databases"
-                  placeholder="Search by name or database type…"
-                  className="max-w-md"
-                  value={search}
-                  onChange={(event) => setSearch(event.target.value)}
-                />
+                {/* A few are read at a glance; more are found by name. */}
+                {linkableCount > LINKABLE_ROWS && (
+                  <Input
+                    aria-label="Search existing databases"
+                    placeholder="Search by name or database type…"
+                    className="max-w-md"
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                  />
+                )}
                 {availableServices.length === 0 ? (
                   <p className="py-4 text-sm text-muted-foreground">
-                    {search
-                      ? 'No databases match your search.'
-                      : 'Every database on this server is already linked to this service.'}
+                    No databases match your search.
                   </p>
                 ) : (
-                  <ul
-                    role="list"
-                    className="divide-y divide-border rounded-lg border border-border overflow-hidden"
-                  >
-                    {availableServices.map((service) => (
-                      <ServiceRow
-                        key={service.id}
-                        service={service}
-                        isLinked={false}
-                        isBusy={isToggling}
-                        projectSlug={project.slug}
-                        onToggle={() => handleServiceToggle(service.id)}
-                      />
-                    ))}
-                  </ul>
+                  <>
+                    <ul
+                      role="list"
+                      className="divide-y divide-border rounded-lg border border-border overflow-hidden"
+                    >
+                      {availableServices
+                        .slice(0, LINKABLE_ROWS)
+                        .map((service) => (
+                          <ServiceRow
+                            key={service.id}
+                            service={service}
+                            isLinked={false}
+                            isBusy={isToggling}
+                            projectSlug={project.slug}
+                            onToggle={() => handleServiceToggle(service.id)}
+                          />
+                        ))}
+                    </ul>
+                    {availableServices.length > LINKABLE_ROWS && (
+                      <p className="text-xs text-muted-foreground">
+                        {`${availableServices.length - LINKABLE_ROWS} more. Search to find them.`}
+                      </p>
+                    )}
+                  </>
                 )}
               </>
-            ))}
-        </section>
+            )}
+          </section>
+        )}
         {databaseTypes}
         <ConfirmDeleteDialog
           open={serviceToUnlink !== null}
