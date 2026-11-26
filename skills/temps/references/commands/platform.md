@@ -10,6 +10,7 @@ View platform and server information
 
 **Subcommands:**
 
+- `host-facts` - What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
 - `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
 - `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
 - `geo` - Look up the location of an IP address in the server's geolocation database
@@ -21,6 +22,16 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform host-facts`
+
+What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `platform operations` (alias: `ops`)
 

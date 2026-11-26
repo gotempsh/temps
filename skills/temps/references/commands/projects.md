@@ -227,6 +227,7 @@ Create a new service (git-based or manual deployment); add it to a project with 
 | `--no-is-web-app` | Set is_web_app to false | - | No |
 | `--performance-metrics-enabled` | Collect web performance metrics | - | No |
 | `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
 | `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
 | `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
@@ -291,6 +292,7 @@ Update service name and description
 | `--performance-metrics-enabled` | Collect web performance metrics | - | No |
 | `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
 | `--preset-config <json>` | Preset-specific build settings as JSON, e.g. {"buildCommand":"bun run build"} (JSON) | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
 | `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
 | `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 

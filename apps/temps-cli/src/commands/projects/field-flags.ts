@@ -29,6 +29,10 @@ export const CREATE_PROJECT_EXTRA = fieldFlags<CreateProjectRequest>({
   is_public_repo: { kind: 'bool', help: 'The repository is public (cloned without a git connection)' },
   is_web_app: { kind: 'bool', help: 'The app serves HTTP (false for a worker with no port)' },
   performance_metrics_enabled: { kind: 'bool', help: 'Collect web performance metrics' },
+  storage_service_env_aliases: {
+    kind: 'json',
+    help: 'Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}}',
+  },
   use_default_wildcard: { kind: 'bool', help: "Give environments a hostname under the instance's wildcard domain" },
 })
 
@@ -45,6 +49,10 @@ export const UPDATE_PROJECT_EXTRA = fieldFlags<NonNullable<UpdateProjectData['bo
   is_web_app: { kind: 'bool', help: 'The app serves HTTP (false for a worker with no port)' },
   performance_metrics_enabled: { kind: 'bool', help: 'Collect web performance metrics' },
   preset_config: { kind: 'json', help: 'Preset-specific build settings as JSON, e.g. {"buildCommand":"bun run build"}' },
+  storage_service_env_aliases: {
+    kind: 'json',
+    help: 'Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}}',
+  },
   use_default_wildcard: { kind: 'bool', help: "Give environments a hostname under the instance's wildcard domain" },
 })
 

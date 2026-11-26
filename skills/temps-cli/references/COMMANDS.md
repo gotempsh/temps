@@ -479,6 +479,7 @@ Create a new service (git-based or manual deployment); add it to a project with 
 | `--no-is-web-app` | Set is_web_app to false | - | No |
 | `--performance-metrics-enabled` | Collect web performance metrics | - | No |
 | `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
 | `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
 | `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
@@ -543,6 +544,7 @@ Update service name and description
 | `--performance-metrics-enabled` | Collect web performance metrics | - | No |
 | `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
 | `--preset-config <json>` | Preset-specific build settings as JSON, e.g. {"buildCommand":"bun run build"} (JSON) | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
 | `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
 | `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
@@ -2230,6 +2232,7 @@ Set an environment variable. For a secret, read the value from a file or stdin (
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
+| `--generate-secret [bytes]` | Have the server generate a random secret of this many bytes (16 to 64, 32 by default), stored as a secret and never shown; for a new variable, instead of a value | - | No |
 | `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -5130,6 +5133,7 @@ Link a service to a project
 | `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `--database-mode <mode>` | Which database deployments get: project (one per project), project_environment (one per environment) or custom | - | No |
 | `--database-name <name>` | With --database-mode custom: the exact database name | - | No |
+| `--env-alias <APP_NAME=INJECTED_NAME>` | Also inject a variable under the name the app reads, e.g. DATABASE_URL=POSTGRES_URL (repeatable) | - | No |
 
 ### `services unlink`
 
@@ -6253,6 +6257,7 @@ Manage platform settings
 - `public-ingress` - Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
 - `refresh-routes` - Rebuild the proxy route table now instead of waiting for the next change
 - `weekly-digest` - Generate and send the weekly digest now
+- `onboarding` - Onboarding commands
 - `oidc` - Oidc commands
 
 ### `settings show` (alias: `get`)
@@ -6460,6 +6465,42 @@ Generate and send the weekly digest now
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings onboarding`
+
+Onboarding commands
+
+**Subcommands:**
+
+- `get` - Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+- `update` - Change the install's first-run record
+
+#### `settings onboarding get`
+
+Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings onboarding update`
+
+Change the install's first-run record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--completed` | Mark the welcome flow finished (true) or reopen it (false) | - | No |
+| `--no-completed` | Set completed to false | - | No |
+| `--default-reach <json>` | How new apps are reached by default, e.g. {"audience":"public","way":"tunnel","naming":"wildcard","domain":"apps.example.com"} (JSON) | - | No |
+| `--done <value>` | Mark these steps done (one of: host, reach, agents, app) (repeatable) | - | No |
+| `--later <json>` | Leave steps for later with why, e.g. [{"step":"agents","reason":"no provider yet"}] (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `settings oidc`
@@ -16541,6 +16582,7 @@ View platform and server information
 
 **Subcommands:**
 
+- `host-facts` - What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
 - `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
 - `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
 - `geo` - Look up the location of an IP address in the server's geolocation database
@@ -16552,6 +16594,16 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform host-facts`
+
+What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `platform operations` (alias: `ops`)
 
