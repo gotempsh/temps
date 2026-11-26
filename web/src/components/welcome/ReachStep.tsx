@@ -10,14 +10,12 @@ import { useUpdateSettings } from '@/hooks/useSettings'
 import { problemDetail } from '@/lib/api-problem'
 import { Button, Callout, Field } from '@temps-sdk/ds'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
 import {
   AUDIENCES,
   audienceStatus,
   accessPlan,
-  defaultReachFor,
-  dnsProviderFor,
   domainField,
   domainProblem,
   flatNote,
@@ -33,6 +31,7 @@ import {
 } from './access'
 import { ChoiceList } from './ChoiceList'
 import { LATER_REASONS } from './onboarding'
+import { saveReach, type ReachSaveProgress } from './reach-save'
 import { useUpdateOnboarding } from './useOnboarding'
 
 const STAGE_TITLE: Record<AccessStage, string> = {
@@ -71,33 +70,34 @@ export function ReachStep({
   const set = (patch: Partial<AccessChoice>) =>
     setChoice((c) => ({ ...c, ...patch }))
 
+  // What an earlier, failed Save already wrote, so trying again never
+  // stores the pasted token in a second DNS provider.
+  const saved = useRef<ReachSaveProgress>({})
   const save = useMutation({
-    mutationFn: async () => {
-      const reach = defaultReachFor(choice)
-      if (
-        choice.way === 'direct' &&
-        reach.naming === 'wildcard' &&
-        reach.domain
-      ) {
-        await updateSettings.mutateAsync({ preview_domain: reach.domain })
-      }
-      const provider = dnsProviderFor(choice)
-      if (provider && facts.privateNetwork) {
-        // ADR-115: the record and the certificate need the provider, and
-        // this machine serves the apps only on its private network.
-        requireDeliveryData(await createDnsProvider({ body: provider }))
-        await putPrivateIngress({
-          body: { listen: facts.privateNetwork.listen, tailscale_serve: false },
-          throwOnError: true,
-        })
-        await queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
-      }
-      await updateOnboarding.mutateAsync({
-        default_reach: reach,
-        done: ['reach'],
-      })
-      return reach
-    },
+    mutationFn: () =>
+      saveReach(
+        choice,
+        facts,
+        {
+          setPreviewDomain: (domain) =>
+            updateSettings.mutateAsync({ preview_domain: domain }),
+          createDnsProvider: async (body) => {
+            requireDeliveryData(await createDnsProvider({ body }))
+            await queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
+          },
+          servePrivately: (listen) =>
+            putPrivateIngress({
+              body: { listen, tailscale_serve: false },
+              throwOnError: true,
+            }),
+          recordReach: (reach) =>
+            updateOnboarding.mutateAsync({
+              default_reach: reach,
+              done: ['reach'],
+            }),
+        },
+        saved.current
+      ),
     onSuccess: (reach) => {
       if (reach.way === 'tunnel') navigate(ingressSetupUrl({ via: 'tunnel' }))
       else onContinue()
