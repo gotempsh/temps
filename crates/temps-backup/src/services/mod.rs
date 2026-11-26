@@ -30,6 +30,10 @@ pub use restore::{
     PlanTarget, RestoreError, RestoreOriginBinding, RestorePlan, RestoreRequestMode,
     RestoreRunSourceBackup, RestoreRunView, RestoreService, RestoreServiceIdentity,
 };
+pub use restore::{
+    MissingLinkedDatabase, RestoredDatabase, RestoredDatabaseKind, RestoredDatabaseUse,
+    RestoredDatabasesReport, RestoredDatabasesResponse, RestoredRole,
+};
 pub use restore_cancel::{cancellable_phases, run_is_destructive, RestoreCancellations};
 pub use restore_reconcile::{
     active_restore_run_ids, reconcile_interrupted_restores, FenceTarget, ManagerRestoreFence,

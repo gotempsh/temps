@@ -165,7 +165,8 @@ impl DatabaseProvisioningConfig {
     }
 }
 
-pub(super) fn is_valid_custom_database_name(name: &str) -> bool {
+/// Whether `name` can be a link's custom database: `[a-z_][a-z0-9_]{0,62}`.
+pub fn is_valid_custom_database_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=63).contains(&bytes.len())
         && matches!(bytes[0], b'a'..=b'z' | b'_')

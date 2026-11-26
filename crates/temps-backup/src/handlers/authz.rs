@@ -154,6 +154,49 @@ pub(crate) async fn require_services_access(
     Ok(scopes)
 }
 
+/// The projects linked to `service_id` whose names the caller may see.
+/// `None` means every project: an instance administrator, or plain OSS with
+/// no team boundary. A deployment token sees its own project only.
+pub(crate) async fn visible_linked_projects(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    service_id: i32,
+    required_permission: Permission,
+    operation: &str,
+) -> Result<Option<BTreeSet<i32>>, Problem> {
+    if caller_is_instance_admin(auth) {
+        return Ok(None);
+    }
+    if let Some(project_id) = auth.project_id() {
+        return Ok(Some(BTreeSet::from([project_id])));
+    }
+    let Some(checker) = app_state.project_access_checker.as_deref() else {
+        return Ok(None);
+    };
+    let scopes = app_state
+        .backup_service
+        .project_scopes_for_services(&[service_id])
+        .await
+        .map_err(Problem::from)?;
+    let decisions = project_permission_decisions(
+        checker,
+        auth.user_id(),
+        scopes
+            .iter()
+            .flat_map(|scope| scope.project_ids.iter().copied()),
+        required_permission,
+        "external service",
+        operation,
+    )
+    .await?;
+    Ok(Some(
+        decisions
+            .into_iter()
+            .filter_map(|(project_id, granted)| granted.then_some(project_id))
+            .collect(),
+    ))
+}
+
 /// Require access to every project represented by a schedule. Global and
 /// ownerless schedules are administrators-only when project-aware auth is
 /// active. `None` means the caller bypassed scope checks (instance admin or

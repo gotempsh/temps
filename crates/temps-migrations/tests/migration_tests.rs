@@ -8819,6 +8819,73 @@ async fn test_restore_runs_restored_login_migration_up_and_down() -> anyhow::Res
     Ok(())
 }
 
+/// A restore run records which databases and login roles it brought back
+/// (`restored_inventory`), so the service page can show a linked project
+/// whose database the backup does not have. Existing runs read NULL; down
+/// drops it.
+#[tokio::test]
+async fn test_restore_runs_restored_inventory_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping restored inventory migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping restored inventory migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let name = "m20261126_000001_restore_runs_restored_inventory";
+    let before = Migrator::migrations().len() as u32 - steps_back_to(name);
+    Migrator::up(&db, Some(before)).await?;
+    async fn column_type(db: &DatabaseConnection) -> anyhow::Result<Option<String>> {
+        Ok(db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT data_type FROM information_schema.columns WHERE table_name = \
+                 'restore_runs' AND column_name = 'restored_inventory'"
+                    .to_string(),
+            ))
+            .await?
+            .map(|row| row.try_get::<String>("", "data_type"))
+            .transpose()?)
+    }
+    assert_eq!(column_type(&db).await?, None, "absent before the migration");
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(
+        column_type(&db).await?.as_deref(),
+        Some("jsonb"),
+        "added by the migration"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(name))).await?;
+    assert_eq!(column_type(&db).await?, None, "dropped by down");
+    Ok(())
+}
+
 /// ADR-105 D7: the alias owner kind is accepted by both constraints after the
 /// migration, refused before it, and `down` removes the aliases' rows and
 /// restores the constraints; an environment's own name is untouched.

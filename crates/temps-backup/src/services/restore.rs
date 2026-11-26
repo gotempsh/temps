@@ -197,6 +197,11 @@ mod worker_mariadb;
 mod worker_mongodb;
 mod worker_outcome;
 pub use worker_outcome::ManagerWorkerRestoreResume;
+mod restored_inventory;
+pub use restored_inventory::{
+    MissingLinkedDatabase, RestoredDatabase, RestoredDatabaseKind, RestoredDatabaseUse,
+    RestoredDatabasesReport, RestoredDatabasesResponse, RestoredRole,
+};
 mod worker_redis;
 mod worker_walg;
 
@@ -1000,6 +1005,26 @@ impl RestoreService {
                 mode.is_destructive(),
             ));
         }
+        // Data from another service or server keeps its own database names,
+        // which need not be the ones this server's links read.
+        if engine_lower == "postgres" && (sets_configured_login || origin_binding.cross_service) {
+            let expected: Vec<String> = if matches!(mode, RestoreRequestMode::InPlace) {
+                match self
+                    .external_service_manager
+                    .linked_databases(target.id)
+                    .await
+                {
+                    Ok(linked) => linked.links.into_iter().map(|link| link.database).collect(),
+                    Err(error) => {
+                        warn!(service_id = target.id, %error, "Could not read the databases linked projects expect for the restore preview");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            warnings.push(database_names_warning(&expected));
+        }
 
         if mode.is_destructive()
             && engine_preserves_source_credentials
@@ -1542,6 +1567,7 @@ impl RestoreService {
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
             restored_login_encrypted: Set(None),
+            restored_inventory: Set(None),
         };
         let run = insert_restore_run(
             self.db.as_ref(),
@@ -1667,6 +1693,53 @@ impl RestoreService {
             .all(self.db.as_ref())
             .await?;
         views_with_source_backups(self.db.as_ref(), runs).await
+    }
+
+    /// What the latest completed restore into PostgreSQL service
+    /// `service_id` brought back, compared with the database each linked
+    /// project reads. `visible_projects` limits the projects the report
+    /// names (`None`: all of them). `None` when that restore recorded
+    /// nothing.
+    pub async fn restored_databases(
+        &self,
+        service_id: i32,
+        visible_projects: Option<&BTreeSet<i32>>,
+    ) -> Result<Option<RestoredDatabasesReport>, RestoreError> {
+        let service = self
+            .external_service_manager
+            .get_service(service_id)
+            .await
+            .map_err(|error| match error {
+                temps_providers::ExternalServiceError::ServiceNotFound { .. } => {
+                    RestoreError::ServiceNotFound { service_id }
+                }
+                other => RestoreError::ExternalService {
+                    reason: format!("loading service {service_id}: {other}"),
+                },
+            })?;
+        if service.service_type != "postgres" {
+            return Ok(None);
+        }
+        let Some((run, inventory)) =
+            restored_inventory::latest_restored_inventory(self.db.as_ref(), service_id).await?
+        else {
+            return Ok(None);
+        };
+        let linked = self
+            .external_service_manager
+            .linked_databases(service_id)
+            .await
+            .map_err(|error| RestoreError::ExternalService {
+                reason: format!(
+                    "reading the databases the projects linked to service {service_id} read: {error}"
+                ),
+            })?;
+        Ok(Some(restored_inventory::build_report(
+            &run,
+            inventory,
+            &linked,
+            visible_projects,
+        )))
     }
 
     /// Resolve every external service that produced a backup. An empty result
@@ -1976,6 +2049,34 @@ fn users_from_another_server_warning(configured_user: Option<&str>, in_place: bo
          server that made it. Temps keeps all of them, and sets the password of {user} to \
          this service's password so Temps can manage the restored database. Every other \
          user keeps its password from the source server, so rotate any you do not trust.{rollback}"
+    )
+}
+
+/// The preview note about database names after a restore from another
+/// service or server. `expected` are the databases the target's linked
+/// projects read.
+fn database_names_warning(expected: &[String]) -> String {
+    let mut names: Vec<&str> = expected.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    names.dedup();
+    let linked = match names.as_slice() {
+        [] => "Linked apps read the database named for their project and environment on this \
+               server (such as 'shop_production')."
+            .to_string(),
+        names => format!(
+            "The projects linked to this service read {}.",
+            names
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    format!(
+        "Database names: the backup keeps the database names of the service that made it. \
+         {linked} A restored database with another name is kept, but no app reads it until \
+         you point the project's link at it. After the restore, the service page lists the \
+         restored databases and offers that change."
     )
 }
 
@@ -2566,6 +2667,7 @@ async fn run_restore_worker(
     // here as a `JoinError` instead of unwinding past the terminal-state
     // write below and leaving the run `running` with no owner.
     let fence = super::restore_reconcile::ManagerRestoreFence::new(mgr.clone());
+    let mgr_for_inventory = mgr.clone();
     let inner = tokio::spawn(run_restore_inner(
         db.clone(),
         mgr,
@@ -2641,6 +2743,9 @@ async fn run_restore_worker(
     // The worker is done with its cancellation token.
     drop(registration);
     let persisted = persist_terminal_state(&db, run_id, &result, TERMINAL_WRITE_RETRY).await;
+    if result.is_ok() && matches!(persisted, Ok(TerminalDisposition::WorkerResult)) {
+        restored_inventory::record_restored_inventory(&db, &mgr_for_inventory, run_id).await;
+    }
     let outcome = match persisted {
         Ok(disposition) => disposition.worker_outcome(run_id, result),
         Err(error) => {
@@ -5715,6 +5820,26 @@ mod tests {
     }
 
     #[test]
+    fn the_database_names_note_names_what_linked_projects_read() {
+        let generic = database_names_warning(&[]);
+        assert!(
+            generic.contains("named for their project and environment"),
+            "{generic}"
+        );
+        assert!(generic.contains("service page"), "{generic}");
+
+        let named = database_names_warning(&[
+            "shop_staging".to_string(),
+            "shop_production".to_string(),
+            "shop_staging".to_string(),
+        ]);
+        assert!(
+            named.contains("read 'shop_production', 'shop_staging'."),
+            "{named}"
+        );
+    }
+
+    #[test]
     fn physical_restore_warning_promises_rollback_only_where_it_exists() {
         let single = users_from_another_server_warning(Some("app"), true);
         assert!(single.contains("puts the original data back"), "{single}");
@@ -6753,6 +6878,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         };
         let view: RestoreRunView = model.clone().into();
         assert!(view.cancellable);
@@ -6793,6 +6919,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         };
         let v: RestoreRunView = model.into();
         assert_eq!(v.id, 42);
@@ -6956,6 +7083,7 @@ mod tests {
             cancel_requested_at: Some(now),
             cancel_requested_by: Some(1),
             restored_login_encrypted: None,
+            restored_inventory: None,
         };
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_exec_results([sea_orm::MockExecResult {
@@ -7857,6 +7985,7 @@ mod tests {
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
             restored_login_encrypted: Set(None),
+            restored_inventory: Set(None),
         }
     }
 
@@ -8486,6 +8615,7 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
             restored_login_encrypted: None,
+            restored_inventory: None,
         }
     }
 

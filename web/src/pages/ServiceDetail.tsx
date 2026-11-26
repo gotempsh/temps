@@ -33,6 +33,7 @@ import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
+import { RestoredDatabasesPanel } from '@/components/storage/RestoredDatabasesPanel'
 import { ServiceHealthcheckCard } from '@/components/storage/ServiceHealthcheckCard'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
@@ -1055,6 +1056,12 @@ export function ServiceDetail() {
             ) : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
+
+            {/* What the last restore brought back, and links missing its data. */}
+            <RestoredDatabasesPanel
+              serviceId={service.service.id}
+              serviceType={service.service.service_type}
+            />
 
             {/* This service's containers over the log ingestion budget. */}
             <LogIngestBudgetWarning

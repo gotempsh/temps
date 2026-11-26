@@ -50476,6 +50476,60 @@
         ],
         "type": "object"
       },
+      "MissingLinkedDatabase": {
+        "description": "A database a linked project reads that the backup does not have, while\nthe backup has databases no linked project reads.",
+        "properties": {
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode",
+            "description": "How the link picks its database: `project_environment`, `project`\nor `custom`."
+          },
+          "environment_name": {
+            "description": "`None` when every environment of the project reads the database.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_names": {
+            "description": "Environments of the project that would all read one database once\nthe link is pointed at a restored one.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "expected_database": {
+            "description": "The database the project's apps receive.",
+            "example": "shop_production",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "suggested_database": {
+            "description": "The unused restored database that most likely holds this project's\ndata, when one stands out.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "project_name",
+          "project_slug",
+          "expected_database",
+          "database_provisioning_mode",
+          "environment_names"
+        ],
+        "type": "object"
+      },
       "MkdirBody": {
         "additionalProperties": false,
         "properties": {
@@ -68606,6 +68660,156 @@
           "created_at",
           "cancellable",
           "source_backup"
+        ],
+        "type": "object"
+      },
+      "RestoredDatabase": {
+        "description": "One database the restore brought back.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/RestoredDatabaseKind"
+          },
+          "name": {
+            "example": "shop_prod",
+            "type": "string"
+          },
+          "usable_by_link": {
+            "description": "The name is one a link can be pointed at (`[a-z_][a-z0-9_]{0,62}`).",
+            "type": "boolean"
+          },
+          "used_by": {
+            "description": "The linked projects you can see that read it.",
+            "items": {
+              "$ref": "#/components/schemas/RestoredDatabaseUse"
+            },
+            "type": "array"
+          },
+          "used_by_other_projects": {
+            "description": "A project you cannot see also reads it.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "used_by",
+          "used_by_other_projects",
+          "usable_by_link"
+        ],
+        "type": "object"
+      },
+      "RestoredDatabaseKind": {
+        "description": "How a restored database relates to the service and its links.",
+        "enum": [
+          "linked",
+          "unused",
+          "service",
+          "system",
+          "sandbox"
+        ],
+        "type": "string"
+      },
+      "RestoredDatabaseUse": {
+        "description": "A linked project (or one of its environments) that reads a database.",
+        "properties": {
+          "environment_name": {
+            "description": "`None` when every environment of the project reads the database.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "project_name"
+        ],
+        "type": "object"
+      },
+      "RestoredDatabasesReport": {
+        "description": "What the latest restore of a PostgreSQL service brought back.",
+        "properties": {
+          "databases": {
+            "description": "Sorted by name.",
+            "items": {
+              "$ref": "#/components/schemas/RestoredDatabase"
+            },
+            "type": "array"
+          },
+          "missing": {
+            "description": "Linked databases the backup does not have. Empty when every restored\ndatabase is read by a link: then nothing restored is left unused.",
+            "items": {
+              "$ref": "#/components/schemas/MissingLinkedDatabase"
+            },
+            "type": "array"
+          },
+          "restore_run_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "restored_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "roles": {
+            "description": "Sorted by name.",
+            "items": {
+              "$ref": "#/components/schemas/RestoredRole"
+            },
+            "type": "array"
+          },
+          "truncated": {
+            "description": "A list was longer than Temps keeps and was cut.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "restore_run_id",
+          "restored_at",
+          "databases",
+          "roles",
+          "truncated",
+          "missing"
+        ],
+        "type": "object"
+      },
+      "RestoredDatabasesResponse": {
+        "description": "`GET /external-services/{id}/restored-databases`.",
+        "properties": {
+          "report": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RestoredDatabasesReport",
+                "description": "`None` when the service's latest completed restore recorded nothing\n(no restore yet, another engine, or the list could not be read)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RestoredRole": {
+        "description": "A login role the restore brought back. Names only.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "superuser": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "superuser"
         ],
         "type": "object"
       },
@@ -87895,6 +88099,27 @@
           "success",
           "message",
           "status"
+        ],
+        "type": "object"
+      },
+      "UpdateLinkDatabaseRequest": {
+        "description": "Which database the link gives the project's apps.",
+        "properties": {
+          "custom_database_name": {
+            "description": "The database every environment of the project reads, in `custom` mode.",
+            "example": "shop_prod",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_provisioning_mode": {
+            "$ref": "#/components/schemas/DatabaseProvisioningMode",
+            "description": "`project_environment` (one database per environment), `project` (one\nfor the whole project) or `custom` (the name below)."
+          }
+        },
+        "required": [
+          "database_provisioning_mode"
         ],
         "type": "object"
       },
@@ -126164,6 +126389,79 @@
         ]
       }
     },
+    "/external-services/{id}/projects/{project_id}/database": {
+      "put": {
+        "operationId": "update_link_database",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateLinkDatabaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectServiceInfo"
+                }
+              }
+            },
+            "description": "The link gives the project this database from its next deployment"
+          },
+          "400": {
+            "description": "Invalid database provisioning configuration"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to change this link"
+          },
+          "404": {
+            "description": "Service, project or link not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change the database a project's apps read from a service",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/{id}/projects/{project_id}/environment": {
       "get": {
         "description": "Returns an object mapping each variable name the service provides to the\nproject to `***`: this bulk read never returns values. Read one value\nthrough `GET /external-services/{id}/projects/{project_id}/environment/{var_name}`,\nwhich is audit-logged and says whether the variable is sensitive.",
@@ -126744,6 +127042,75 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Restore"
+        ]
+      }
+    },
+    "/external-services/{id}/restored-databases": {
+      "get": {
+        "description": "The databases and login roles the restore recorded, each restored database\nwith the linked projects that read it, and each linked database the backup\ndoes not have while restored data sits unused, with a restored database the\nlink could read instead.",
+        "operationId": "get_restored_databases",
+        "parameters": [
+          {
+            "description": "External service id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RestoredDatabasesResponse"
+                }
+              }
+            },
+            "description": "What the latest restore brought back; `report` is null when it recorded nothing"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "What the latest restore of a PostgreSQL service brought back",
         "tags": [
           "Restore"
         ]

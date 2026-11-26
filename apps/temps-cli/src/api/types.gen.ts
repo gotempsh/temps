@@ -23412,6 +23412,39 @@ export type MiscResult = {
     is_role_account: boolean;
 };
 
+/**
+ * A database a linked project reads that the backup does not have, while
+ * the backup has databases no linked project reads.
+ */
+export type MissingLinkedDatabase = {
+    /**
+     * How the link picks its database: `project_environment`, `project`
+     * or `custom`.
+     */
+    database_provisioning_mode: DatabaseProvisioningMode;
+    /**
+     * `None` when every environment of the project reads the database.
+     */
+    environment_name?: string | null;
+    /**
+     * Environments of the project that would all read one database once
+     * the link is pointed at a restored one.
+     */
+    environment_names: Array<string>;
+    /**
+     * The database the project's apps receive.
+     */
+    expected_database: string;
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+    /**
+     * The unused restored database that most likely holds this project's
+     * data, when one stands out.
+     */
+    suggested_database?: string | null;
+};
+
 export type MkdirBody = {
     path: string;
 };
@@ -32097,6 +32130,83 @@ export type RestoreRunView = {
     status: string;
     target_service_id?: number | null;
     target_service_name?: string | null;
+};
+
+/**
+ * One database the restore brought back.
+ */
+export type RestoredDatabase = {
+    kind: RestoredDatabaseKind;
+    name: string;
+    /**
+     * The name is one a link can be pointed at (`[a-z_][a-z0-9_]{0,62}`).
+     */
+    usable_by_link: boolean;
+    /**
+     * The linked projects you can see that read it.
+     */
+    used_by: Array<RestoredDatabaseUse>;
+    /**
+     * A project you cannot see also reads it.
+     */
+    used_by_other_projects: boolean;
+};
+
+/**
+ * How a restored database relates to the service and its links.
+ */
+export type RestoredDatabaseKind = 'linked' | 'unused' | 'service' | 'system' | 'sandbox';
+
+/**
+ * A linked project (or one of its environments) that reads a database.
+ */
+export type RestoredDatabaseUse = {
+    /**
+     * `None` when every environment of the project reads the database.
+     */
+    environment_name?: string | null;
+    project_id: number;
+    project_name: string;
+};
+
+/**
+ * What the latest restore of a PostgreSQL service brought back.
+ */
+export type RestoredDatabasesReport = {
+    /**
+     * Sorted by name.
+     */
+    databases: Array<RestoredDatabase>;
+    /**
+     * Linked databases the backup does not have. Empty when every restored
+     * database is read by a link: then nothing restored is left unused.
+     */
+    missing: Array<MissingLinkedDatabase>;
+    restore_run_id: number;
+    restored_at: string;
+    /**
+     * Sorted by name.
+     */
+    roles: Array<RestoredRole>;
+    /**
+     * A list was longer than Temps keeps and was cut.
+     */
+    truncated: boolean;
+};
+
+/**
+ * `GET /external-services/{id}/restored-databases`.
+ */
+export type RestoredDatabasesResponse = {
+    report?: RestoredDatabasesReport | null;
+};
+
+/**
+ * A login role the restore brought back. Names only.
+ */
+export type RestoredRole = {
+    name: string;
+    superuser: boolean;
 };
 
 /**
@@ -40956,6 +41066,21 @@ export type UpdateKvResponse = {
      * Whether the operation succeeded
      */
     success: boolean;
+};
+
+/**
+ * Which database the link gives the project's apps.
+ */
+export type UpdateLinkDatabaseRequest = {
+    /**
+     * The database every environment of the project reads, in `custom` mode.
+     */
+    custom_database_name?: string | null;
+    /**
+     * `project_environment` (one database per environment), `project` (one
+     * for the whole project) or `custom` (the name below).
+     */
+    database_provisioning_mode: DatabaseProvisioningMode;
 };
 
 /**
@@ -62439,6 +62564,54 @@ export type UnlinkServiceFromProjectResponses = {
 
 export type UnlinkServiceFromProjectResponse = UnlinkServiceFromProjectResponses[keyof UnlinkServiceFromProjectResponses];
 
+export type UpdateLinkDatabaseData = {
+    body: UpdateLinkDatabaseRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/projects/{project_id}/database';
+};
+
+export type UpdateLinkDatabaseErrors = {
+    /**
+     * Invalid database provisioning configuration
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to change this link
+     */
+    403: unknown;
+    /**
+     * Service, project or link not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateLinkDatabaseResponses = {
+    /**
+     * The link gives the project this database from its next deployment
+     */
+    200: ProjectServiceInfo;
+};
+
+export type UpdateLinkDatabaseResponse = UpdateLinkDatabaseResponses[keyof UpdateLinkDatabaseResponses];
+
 export type GetServiceEnvironmentVariablesData = {
     body?: never;
     path: {
@@ -62784,6 +62957,44 @@ export type ListRestoreRunsForServiceResponses = {
 };
 
 export type ListRestoreRunsForServiceResponse = ListRestoreRunsForServiceResponses[keyof ListRestoreRunsForServiceResponses];
+
+export type GetRestoredDatabasesData = {
+    body?: never;
+    path: {
+        /**
+         * External service id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/restored-databases';
+};
+
+export type GetRestoredDatabasesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+};
+
+export type GetRestoredDatabasesError = GetRestoredDatabasesErrors[keyof GetRestoredDatabasesErrors];
+
+export type GetRestoredDatabasesResponses = {
+    /**
+     * What the latest restore brought back; `report` is null when it recorded nothing
+     */
+    200: RestoredDatabasesResponse;
+};
+
+export type GetRestoredDatabasesResponse = GetRestoredDatabasesResponses[keyof GetRestoredDatabasesResponses];
 
 export type RetryClusterData = {
     body: RetryClusterRequest;
