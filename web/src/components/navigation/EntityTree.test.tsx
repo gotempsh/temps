@@ -15,6 +15,7 @@ import { SidebarProvider } from '@/components/ui/sidebar'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { EntityTree } from './EntityTree'
+import { RECENT_PROJECTS_KEY } from './use-recent-projects'
 import { TREE_FOLD_KEY } from './use-tree-fold'
 
 installBrowserWindow()
@@ -28,6 +29,20 @@ const service = (id: number, name: string) => ({
   name,
   slug: name,
   source_type: 'git',
+})
+
+const mainDb = {
+  id: 1,
+  name: 'main-db',
+  service_type: 'postgres',
+  status: 'running',
+}
+const cache = { id: 2, name: 'cache', service_type: 'redis', status: 'failed' }
+const link = (projectId: number, database: typeof mainDb) => ({
+  id: projectId * 10 + database.id,
+  database_provisioning_mode: 'shared',
+  project: { id: projectId },
+  service: database,
 })
 
 /** A server with one project of two services, and one service in none. */
@@ -57,6 +72,10 @@ const projects = {
         '9': { project_id: 9, status: 'no_monitors' },
       },
     }),
+  // Both services of Shop use its database; only the API uses the cache.
+  'GET /external-services/projects/4': () => jsonResponse([link(4, mainDb)]),
+  'GET /external-services/projects/5': () =>
+    jsonResponse([link(5, mainDb), link(5, cache)]),
 }
 
 function renderAt(path: string, routes: Parameters<typeof mockApi>[0]) {
@@ -91,10 +110,9 @@ describe('the tree', () => {
         a.getAttribute('href'),
       ])
     ).toEqual([
+      // What a user comes to work on, then one row for the server.
       ['Projects', '/projects'],
-      ['Databases', '/storage'],
-      ['Domains', '/domains'],
-      ['Servers', '/settings/nodes'],
+      ['Server', '/settings/nodes'],
     ])
     for (const data of ['/logs', '/errors', '/traces', '/analytics'])
       expect(hrefs(view.container)).not.toContain(data)
@@ -102,15 +120,83 @@ describe('the tree', () => {
       expect(view.queryByText(parent)).toBeNull()
   })
 
-  test('Projects opens to each project and its services, then services in none', async () => {
+  test('Projects opens to each project and what it is made of, then services in none', async () => {
     const { view } = renderAt('/projects', projects)
-    const list = await view.findByRole('list', { name: 'Shop services' })
-    expect(hrefs(list)).toEqual(['/projects/web', '/projects/api'])
+    const list = await view.findByRole('list', { name: 'Shop contents' })
+    // Its services, then the databases they use, each once.
+    await within(list).findByRole('link', { name: /cache/ })
+    expect(hrefs(list)).toEqual([
+      '/projects/web',
+      '/projects/api',
+      '/storage/2',
+      '/storage/1',
+    ])
+    expect(
+      within(list).getByRole('link', { name: /cache/ }).textContent
+    ).toContain('Failed')
     expect(
       hrefs(view.getByRole('list', { name: 'Projects' })).filter(
         (href) => !hrefs(list).includes(href)
       )
     ).toEqual(['/p/shop', '/projects/blog'])
+  })
+
+  test('an open project offers what it can hold: a service or a database', async () => {
+    const { view } = renderAt('/projects', projects)
+    const add = await view.findByRole('button', { name: 'Add to Shop' })
+    expect(add.textContent).toBe('Add')
+    fireEvent.pointerDown(add, { button: 0, ctrlKey: false })
+    const menu = await view.findByRole('menu')
+    expect(
+      [...menu.querySelectorAll('a')].map((a) => [
+        a.textContent,
+        a.getAttribute('href'),
+      ])
+    ).toEqual([
+      ['Service', '/projects/new?group=3'],
+      ['Database', '/p/shop/databases'],
+    ])
+  })
+
+  test('a folded project asks nothing about its databases', async () => {
+    window.localStorage.setItem(
+      TREE_FOLD_KEY,
+      JSON.stringify({ 'tree:project:3': false })
+    )
+    const { api, view } = renderAt('/projects', projects)
+    await view.findByRole('link', { name: /Shop/ })
+    await view.findByRole('link', { name: /blog/ })
+    expect(
+      api.calls.some((call) =>
+        call.path.startsWith('/external-services/projects')
+      )
+    ).toBe(false)
+  })
+
+  test('a project whose databases could not be loaded says so, and its services stay', async () => {
+    let fail = true
+    const { view } = renderAt('/projects', {
+      ...projects,
+      'GET /external-services/projects/5': () =>
+        fail
+          ? jsonResponse({ title: 'Boom' }, 500)
+          : jsonResponse([link(5, cache)]),
+    })
+    const list = await view.findByRole('list', { name: 'Shop contents' })
+    expect(
+      await within(list).findByText('Databases could not be loaded')
+    ).toBeTruthy()
+    expect(within(list).getByRole('link', { name: /api/ })).toBeTruthy()
+    fail = false
+    fireEvent.click(within(list).getByRole('button', { name: 'Retry' }))
+    expect(
+      await within(list).findByRole('link', { name: /cache/ })
+    ).toBeTruthy()
+    await waitFor(() =>
+      expect(
+        within(list).queryByText('Databases could not be loaded')
+      ).toBeNull()
+    )
   })
 
   test('a row says how its service is doing: trouble in a word, health quietly', async () => {
@@ -133,7 +219,7 @@ describe('the tree', () => {
     const { view } = renderAt('/projects', projects)
     const shop = await view.findByRole('link', { name: /Shop/ })
     await waitFor(() => expect(shop.textContent).toContain('Down'))
-    expect(view.queryByRole('list', { name: 'Shop services' })).toBeNull()
+    expect(view.queryByRole('list', { name: 'Shop contents' })).toBeNull()
   })
 
   test('asks one health answer for every service listed', async () => {
@@ -224,104 +310,174 @@ describe('where the user is', () => {
   })
 })
 
-describe('the other branches', () => {
-  const others = {
+describe('the Server row', () => {
+  const server = {
     ...projects,
-    'GET /external-services': () =>
-      jsonResponse([
-        { id: 1, name: 'main-db', service_type: 'postgres', status: 'running' },
-        { id: 2, name: 'cache', service_type: 'redis', status: 'failed' },
-      ]),
-    'GET /domains': () =>
-      jsonResponse({
-        domains: [{ id: 6, domain: 'example.test', status: 'pending_dns' }],
-        total: 14,
-      }),
+    'GET /external-services': () => jsonResponse([mainDb, cache]),
     'GET /internal/nodes': () =>
       jsonResponse({
-        nodes: [{ id: 2, name: 'worker-a', status: 'offline' }],
-        total: 1,
+        nodes: [
+          { id: 1, name: 'control', status: 'active' },
+          { id: 2, name: 'worker-a', status: 'offline' },
+        ],
+        total: 2,
       }),
   }
+  const serverRow = (view: ReturnType<typeof renderAt>['view']) =>
+    view.getByRole('link', { name: /^Server/ })
 
-  test('stay folded, and ask nothing, until opened or shown', async () => {
-    const { api, view } = renderAt('/projects', others)
+  test('says the worst of the machines and databases, counted', async () => {
+    const { view } = renderAt('/projects', server)
+    await waitFor(() =>
+      expect(serverRow(view).textContent).toBe('Server1 offline')
+    )
+    cleanup()
+    const healthy = renderAt('/projects', {
+      ...projects,
+      'GET /external-services': () => jsonResponse([mainDb]),
+      'GET /internal/nodes': () =>
+        jsonResponse({ nodes: [{ id: 1, name: 'a', status: 'active' }] }),
+    })
+    // Healthy is a dot, with its word for assistive technology only.
+    await waitFor(() =>
+      expect(
+        within(serverRow(healthy.view)).getByText('Healthy').className
+      ).toBe('sr-only')
+    )
+  })
+
+  test('says nothing when it cannot be asked', async () => {
+    const { view } = renderAt('/projects', projects)
     await view.findByRole('link', { name: /web/ })
-    for (const path of ['/external-services', '/domains', '/internal/nodes'])
-      expect(api.calls.some((call) => call.path === path)).toBe(false)
-
-    const toggle = view.getByRole('button', { name: 'Show Databases' })
-    expect(toggle.getAttribute('aria-expanded')).toBe('false')
-    fireEvent.click(toggle)
-    const list = await view.findByRole('list', { name: 'Databases' })
-    await within(list).findByRole('link', { name: /main-db/ })
-    expect(hrefs(list)).toEqual(['/storage/1', '/storage/2'])
-    expect(
-      within(list).getByRole('link', { name: /cache/ }).textContent
-    ).toContain('Failed')
-    expect(
-      view
-        .getByRole('button', { name: 'Hide Databases' })
-        .getAttribute('aria-expanded')
-    ).toBe('true')
-    // The choice is kept for the next visit.
-    expect(
-      JSON.parse(window.localStorage.getItem(TREE_FOLD_KEY) ?? '{}')
-    ).toMatchObject({ 'tree:databases': true })
+    expect(serverRow(view).textContent).toBe('Server')
   })
 
-  test('a record opens its branch and is marked there', async () => {
-    const { view } = renderAt('/storage/2/backups', others)
-    const list = await view.findByRole('list', { name: 'Databases' })
-    const cache = await within(list).findByRole('link', { name: /cache/ })
-    expect(cache.getAttribute('aria-current')).toBe('true')
+  test("is marked on any of the server's pages", async () => {
+    for (const [path, current] of [
+      ['/settings/nodes', 'page'],
+      ['/monitoring/server', 'true'],
+      ['/storage', 'true'],
+      ['/backups', 'true'],
+      ['/domains/4', 'true'],
+      ['/certificates', 'true'],
+    ]) {
+      const { view } = renderAt(path, server)
+      expect(serverRow(view).getAttribute('aria-current')).toBe(current)
+      expect(serverRow(view).getAttribute('data-active')).toBe('true')
+      cleanup()
+    }
   })
 
-  test('a long list points at its page for the rest', async () => {
-    const { view } = renderAt('/domains', others)
-    const list = await view.findByRole('list', { name: 'Domains' })
-    const more = await within(list).findByRole('link', { name: '13 more' })
-    expect(more.getAttribute('href')).toBe('/domains')
+  test('a database a project lists is marked there, not on the server', async () => {
+    const { view } = renderAt('/storage/2/backups', server)
+    const list = await view.findByRole('list', { name: 'Shop contents' })
+    const row = await within(list).findByRole('link', { name: /cache/ })
+    expect(row.getAttribute('aria-current')).toBe('true')
+    expect(serverRow(view).getAttribute('aria-current')).toBeNull()
+    cleanup()
+    // One no project uses is the server's.
+    const unused = renderAt('/storage/7', server)
+    await unused.view.findByRole('link', { name: /cache/ })
+    expect(serverRow(unused.view).getAttribute('aria-current')).toBe('true')
+  })
+})
+
+describe('Projects', () => {
+  /** A server of twelve projects of one service each. */
+  const large = (statuses: Record<number, string> = {}) => {
+    const groups = Array.from({ length: 12 }, (_, index) => ({
+      id: index + 1,
+      name: `Project ${index + 1}`,
+      slug: `project-${index + 1}`,
+      projects: [service(100 + index, `svc-${index + 1}`)],
+    }))
+    return {
+      'GET /project-groups': () => jsonResponse({ groups, total: 12 }),
+      'GET /projects': () =>
+        jsonResponse({
+          projects: groups.flatMap((group) => group.projects),
+          total: 12,
+        }),
+      'GET /monitors-health/projects': () =>
+        jsonResponse({
+          projects: Object.fromEntries(
+            Object.entries(statuses).map(([id, status]) => [
+              id,
+              { project_id: Number(id), status },
+            ])
+          ),
+        }),
+    }
+  }
+  const listed = (view: ReturnType<typeof renderAt>['view']) =>
+    [
+      ...view
+        .getByRole('list', { name: 'Projects' })
+        .querySelectorAll(':scope > li[data-project]'),
+    ].map((row) => row.getAttribute('data-project'))
+
+  test('a large server lists eight: trouble first, then those opened recently', async () => {
+    window.localStorage.setItem(
+      RECENT_PROJECTS_KEY,
+      JSON.stringify(['tree-key-of-nothing', 'project:12'])
+    )
+    const { view } = renderAt('/projects', large({ 110: 'down' }))
+    await view.findByRole('link', { name: /^Project 1\b/ })
+    await waitFor(() => expect(listed(view)[0]).toBe('project-11'))
+    expect(listed(view)).toEqual([
+      'project-11',
+      'project-1',
+      'project-2',
+      'project-3',
+      'project-4',
+      'project-5',
+      'project-6',
+      'project-12',
+    ])
+    const all = view.getByRole('link', { name: 'All projects (12)' })
+    expect(all.getAttribute('href')).toBe('/projects')
+  })
+
+  test('the project shown is always listed, and remembered as recent', async () => {
+    const { view } = renderAt('/p/project-10', large())
+    await waitFor(() => expect(listed(view)).toContain('project-10'))
+    expect(listed(view)).toHaveLength(8)
     expect(
-      within(list).getByRole('link', { name: /example\.test/ }).textContent
-    ).toContain('Pending')
+      JSON.parse(window.localStorage.getItem(RECENT_PROJECTS_KEY) ?? '[]')
+    ).toEqual(['project:10'])
   })
 
-  test('a server says when it is offline', async () => {
-    const { view } = renderAt('/settings/nodes', others)
-    const list = await view.findByRole('list', { name: 'Servers' })
-    const worker = await within(list).findByRole('link', { name: /worker-a/ })
-    expect(worker.getAttribute('href')).toBe('/settings/nodes/2')
-    expect(worker.textContent).toContain('Offline')
+  test('a server with few projects lists them all, with no link to the rest', async () => {
+    const { view } = renderAt('/projects', projects)
+    await view.findByRole('link', { name: /blog/ })
+    expect(view.queryByRole('link', { name: /^All projects/ })).toBeNull()
   })
 
-  test('an empty branch offers the one thing that fills it', async () => {
-    const { view } = renderAt('/storage', {
-      ...projects,
-      'GET /external-services': () => jsonResponse([]),
+  test('an empty server offers the one thing that fills it', async () => {
+    const { view } = renderAt('/projects', {
+      'GET /project-groups': () => jsonResponse({ groups: [], total: 0 }),
+      'GET /projects': () => jsonResponse({ projects: [], total: 0 }),
     })
-    const list = await view.findByRole('list', { name: 'Databases' })
-    const add = await within(list).findByRole('link', { name: 'Add database' })
-    expect(add.getAttribute('href')).toBe('/storage/create')
+    const list = await view.findByRole('list', { name: 'Projects' })
+    const add = await within(list).findByRole('link', {
+      name: 'Create service',
+    })
+    expect(add.getAttribute('href')).toBe('/projects/new')
   })
 
-  test('a branch that could not be loaded says so and offers a retry', async () => {
+  test('a list that could not be loaded says so and offers a retry', async () => {
     let fail = true
-    const { view } = renderAt('/storage', {
+    const { view } = renderAt('/projects', {
       ...projects,
-      'GET /external-services': () =>
-        fail ? jsonResponse({ title: 'Boom' }, 500) : jsonResponse([]),
+      'GET /projects': () =>
+        fail
+          ? jsonResponse({ title: 'Boom' }, 500)
+          : jsonResponse({ projects: [], total: 0 }),
     })
-    const list = await view.findByRole('list', { name: 'Databases' })
+    const list = await view.findByRole('list', { name: 'Projects' })
     expect(await within(list).findByText('Could not be loaded')).toBeTruthy()
-    // Never an empty list standing in for an answer that did not come.
-    expect(
-      within(list).queryByRole('link', { name: 'Add database' })
-    ).toBeNull()
     fail = false
     fireEvent.click(within(list).getByRole('button', { name: 'Retry' }))
-    expect(
-      await within(list).findByRole('link', { name: 'Add database' })
-    ).toBeTruthy()
+    expect(await within(list).findByRole('link', { name: /Shop/ })).toBeTruthy()
   })
 })

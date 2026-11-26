@@ -7,17 +7,20 @@ import { PageTabStrip } from '@/components/navigation/PageTabStrip'
 import { ViewMenuButton } from '@/components/navigation/ViewMenuButton'
 import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
 import {
+  heldSectionOf,
   projectEntityViewOf,
   projectRoot,
+  tabHoldsLocation,
   type ProjectNavLocation,
 } from '@/lib/project-navigation'
 
 /**
  * The pages of the view shown, as the one row of tabs of a service's page.
- * The views themselves (Deployments, Logs, Errors, Settings) are listed
- * under the service in the sidebar; on a phone a button names the one shown
- * and opens that list. A page that holds several (Errors' settings) is a tab
- * that opens a menu, never a second row.
+ * The views themselves (Overview, Deployments, Logs, Errors, Settings) are
+ * listed under the service in the sidebar; on a phone a button names the
+ * one shown and opens that list. A page that holds several (Errors'
+ * settings, the Overview's metrics) is a tab that opens a menu, never a
+ * second row.
  *
  * The tabs navigate between URLs, so they are links (new tab, copy link and
  * history work), and each keeps the selected environment.
@@ -31,7 +34,7 @@ export function ProjectSectionTabs({
 }) {
   const [searchParams] = useSearchParams()
   const { pathname } = useLocation()
-  const { tab, view } = location
+  const shownUrl = (location.view ?? location.tab).url
   const env = searchParams.get(ENVIRONMENT_PARAM)
   const query = env ? `?${ENVIRONMENT_PARAM}=${encodeURIComponent(env)}` : ''
   const root = projectRoot(project.slug)
@@ -54,13 +57,16 @@ export function ProjectSectionTabs({
             title: item.title,
             icon: item.icon,
             to: to(item.url),
-            active: item.url === tab.url,
+            active: tabHoldsLocation(item, location),
+            // A section held by this view (Traces in Logs) is where the
+            // quick tour points for it.
+            tour: heldSectionOf(shown, item),
             pages: item.views?.map((page) => ({
               key: page.url,
               title: page.title,
               icon: page.icon,
               to: to(page.url),
-              active: item.url === tab.url && page.url === view?.url,
+              active: page.url === shownUrl,
             })),
           }))}
         />

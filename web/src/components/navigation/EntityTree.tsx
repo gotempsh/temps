@@ -3,13 +3,12 @@
 
 import { useQuery } from '@tanstack/react-query'
 import {
+  Box,
   ChevronRight,
+  Database,
   Folder,
   FolderOpen,
-  Globe,
   Plus,
-  Server,
-  type LucideIcon,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { Link, useLocation } from 'react-router'
@@ -17,11 +16,16 @@ import {
   adminListNodesOptions,
   getProjectsMonitorHealthOptions,
   getProjectsOptions,
-  listDomainsOptions,
   listServicesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { useProjectGroups } from '@/components/project-groups/useProjectGroups'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import {
   SidebarGroup,
@@ -36,99 +40,44 @@ import {
   useSidebar,
 } from '@/components/ui/sidebar'
 import {
+  SERVER_BRANCHES,
   capRows,
   databaseState,
-  domainState,
   locateInTree,
+  pickProjects,
   projectNodes,
+  countedState,
   serverState,
   serviceState,
   worstState,
   type ProjectNode,
   type ServiceNode,
-  type TreeBranchId,
+  type TreeLocation,
   type TreeState,
 } from '@/lib/entity-tree'
 import { projectRoot } from '@/lib/project-navigation'
-import { SERVER_ENTITIES, SERVER_HOME } from '@/lib/server-navigation'
+import { SERVER_HOME, SERVER_PAGE } from '@/lib/server-navigation'
 import { groupHref } from '@/lib/terminology'
 import { cn } from '@/lib/utils'
-import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { RowState } from './RowState'
 import { CompactServiceViews, ServiceViewRows } from './ServiceViewRows'
+import { useRecentProjects } from './use-recent-projects'
+import { useTreeDatabases, type ProjectDatabases } from './use-tree-databases'
 import { useTreeFold } from './use-tree-fold'
 
 const ACTIVE = 'bg-sidebar-accent text-sidebar-accent-foreground'
 const QUERY = { staleTime: 60_000, retry: false } as const
-/** Rows a branch lists before it points at its own page for the rest. */
-const BRANCH_ROWS = 8
-/** Projects and services listed; the Projects page has the rest. */
-const PROJECT_ROWS = 20
+/**
+ * Projects listed on a large server; the Projects page, with search, has
+ * the rest. Few enough that the tree never grows with the server.
+ */
+const PROJECT_ROWS = 8
+/** Services listed under a project; its own page has the rest. */
+const SERVICE_ROWS = 20
 /** Services a monitor answer is asked for in one request. */
 const HEALTH_IDS = 100
 /** With this few projects, each opens on its own: the whole tree fits. */
 const OPEN_ALL_BELOW = 6
-
-interface Branch {
-  id: TreeBranchId
-  title: string
-  icon: LucideIcon
-  url: string
-  /** What to offer while the branch holds nothing. */
-  add?: { label: string; href: string }
-}
-
-/** The tree's branches: projects, then the other things the user owns. */
-const BRANCHES: Branch[] = [SERVER_HOME, ...SERVER_ENTITIES].map((area) => ({
-  id: area.id as TreeBranchId,
-  title: area.title,
-  icon: area.icon,
-  url: area.url,
-  add: area.add,
-}))
-
-function branchOf(id: TreeBranchId): Branch {
-  const found = BRANCHES.find((candidate) => candidate.id === id)
-  if (!found) throw new Error(`The tree has no "${id}" branch`)
-  return found
-}
-
-const TROUBLE_TEXT = {
-  warn: 'text-amber-700 dark:text-amber-400',
-  bad: 'text-red-700 dark:text-red-400',
-} as const
-
-/**
- * A row's state. Working and idle are a quiet dot, filled or hollow, so the
- * name keeps the row; trouble is said in a word, read and not guessed from
- * a colour.
- */
-function RowState({ state }: { state: TreeState | undefined }) {
-  if (!state) return null
-  if (state.tone === 'ok' || state.tone === 'idle')
-    return (
-      <span
-        title={state.label}
-        className={cn(
-          'ml-auto size-1.5 shrink-0 rounded-full',
-          state.tone === 'ok'
-            ? 'bg-emerald-500'
-            : 'border border-muted-foreground/60'
-        )}
-      >
-        <span className="sr-only">{state.label}</span>
-      </span>
-    )
-  return (
-    <span
-      className={cn(
-        'ml-auto shrink-0 text-xs font-medium',
-        TROUBLE_TEXT[state.tone]
-      )}
-    >
-      {state.label}
-    </span>
-  )
-}
 
 function Fold({
   name,
@@ -232,76 +181,100 @@ function LeafRow({
   )
 }
 
-/** The children of a branch, in whichever state their list is. */
-function BranchRows({
-  branch,
-  query,
-  rows,
-  more,
-  pathname,
-  onNavigate,
+/** A list that could not be loaded: said, with a retry. */
+function RetryRow({
+  label,
+  onRetry,
 }: {
-  branch: Branch
-  query: { isPending: boolean; isError: boolean; refetch: () => unknown }
-  rows: Leaf[]
-  /** How many more exist than are listed. */
-  more: number
-  pathname: string
-  onNavigate: () => void
+  label: string
+  onRetry: () => unknown
 }) {
-  if (query.isError)
-    return (
-      <SidebarMenuSubItem className="flex h-7 items-center gap-2 px-2 text-xs text-muted-foreground">
-        <span className="min-w-0 flex-1 truncate">Could not be loaded</span>
-        <button
-          type="button"
-          onClick={() => void query.refetch()}
-          className="shrink-0 rounded-sm font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-        >
-          Retry
-        </button>
-      </SidebarMenuSubItem>
-    )
-  if (query.isPending)
-    return (
-      <li aria-busy="true" aria-label={`Loading ${branch.title}`}>
-        <SidebarMenuSkeleton className="h-7" />
-        <SidebarMenuSkeleton className="h-7" />
-      </li>
-    )
-  if (rows.length === 0)
-    return branch.add ? (
-      <NoteRow to={branch.add.href} onNavigate={onNavigate}>
-        <Plus />
-        <span>{branch.add.label}</span>
-      </NoteRow>
-    ) : null
   return (
-    <>
-      {rows.map((leaf) => (
-        <LeafRow
-          key={leaf.key}
-          leaf={leaf}
-          pathname={pathname}
-          onNavigate={onNavigate}
-        />
-      ))}
-      {more > 0 && (
-        <NoteRow to={branch.url} onNavigate={onNavigate}>
-          <span>{`${more} more`}</span>
-        </NoteRow>
-      )}
-    </>
+    <SidebarMenuSubItem className="flex h-7 items-center gap-2 px-2 text-xs text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      <button
+        type="button"
+        onClick={() => void onRetry()}
+        className="shrink-0 rounded-sm font-medium text-foreground underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+      >
+        Retry
+      </button>
+    </SidebarMenuSubItem>
   )
 }
 
+/** "Add": what a project can hold, a service or a database. */
+function AddToProject({
+  node,
+  onNavigate,
+}: {
+  node: Extract<ProjectNode, { kind: 'project' }>
+  onNavigate: () => void
+}) {
+  return (
+    <SidebarMenuSubItem>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <SidebarMenuSubButton
+            asChild
+            className="w-full text-muted-foreground"
+          >
+            <button
+              type="button"
+              aria-label={`Add to ${node.name}`}
+              title="Add to this project"
+            >
+              <Plus aria-hidden="true" />
+              <span>Add</span>
+            </button>
+          </SidebarMenuSubButton>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent side="bottom" align="start" className="w-48">
+          <DropdownMenuItem asChild>
+            <Link
+              to={`/projects/new?group=${node.id}`}
+              onClick={onNavigate}
+              className="gap-2"
+            >
+              <Box
+                className="size-4 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+              />
+              Service
+            </Link>
+          </DropdownMenuItem>
+          <DropdownMenuItem asChild>
+            <Link
+              to={`${groupHref(node.slug)}/databases`}
+              onClick={onNavigate}
+              className="gap-2"
+            >
+              <Database
+                className="size-4 shrink-0 text-muted-foreground"
+                aria-hidden="true"
+              />
+              Database
+            </Link>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </SidebarMenuSubItem>
+  )
+}
+
+const isCurrentNode = (node: ProjectNode, location: TreeLocation) =>
+  node.kind === 'project'
+    ? node.slug === location.groupSlug ||
+      node.services.some((service) => service.slug === location.serviceSlug)
+    : node.service.slug === location.serviceSlug
+
 /**
  * The console's one menu: a tree of what the user owns. Projects open to
- * their services, and the service shown to its views (Deployments, Logs,
- * Settings); databases, domains and servers are listed under their own
- * branch. A row says how its entity is doing, so the tree answers "is
- * it working" before anything is opened. A folded branch asks the server
- * nothing.
+ * their services and the databases those use, and the service shown to its
+ * views (Deployments, Logs, Settings). Below them, one Server row stands
+ * for every record of the server. A row says how its entity is doing, so
+ * the tree answers "is it working" before anything is opened. A folded
+ * project asks the server nothing.
  */
 export function EntityTree() {
   const { pathname } = useLocation()
@@ -312,48 +285,27 @@ export function EntityTree() {
   }
   const location = locateInTree(pathname)
   const fold = useTreeFold()
-  const isOpen = (id: TreeBranchId) =>
-    !compact &&
-    // Projects is what most visits are for, so it starts open.
-    fold.isOpen(`tree:${id}`, id === 'projects' || location.branch === id)
+  // Projects is what most visits are for, so it starts open.
+  const projectsOpen = !compact && fold.isOpen('tree:projects', true)
 
   const groupList = useProjectGroups()
   const services = useQuery({
     ...getProjectsOptions({ query: { per_page: 100, page: 1 } }),
     ...QUERY,
-    enabled: isOpen('projects'),
-  })
-  const databases = useQuery({
-    ...listServicesOptions(),
-    ...QUERY,
-    enabled: isOpen('databases'),
-  })
-  const domains = useQuery({
-    ...listDomainsOptions({ query: { page: 1, page_size: BRANCH_ROWS } }),
-    ...QUERY,
-    enabled: isOpen('domains'),
-  })
-  const servers = useQuery({
-    ...adminListNodesOptions(),
-    ...QUERY,
-    enabled: isOpen('servers'),
+    enabled: projectsOpen,
   })
 
   const nodes = projectNodes(groupList.groups, services.data?.projects ?? [])
-  const isCurrentNode = (node: ProjectNode) =>
-    node.kind === 'project'
-      ? node.slug === location.groupSlug ||
-        node.services.some((service) => service.slug === location.serviceSlug)
-      : node.service.slug === location.serviceSlug
-  const projects = capRows(nodes, PROJECT_ROWS, isCurrentNode)
-  const unlisted =
-    projects.more +
-    (groupList.truncated ? 1 : 0) +
-    Math.max(
-      0,
-      (services.data?.total ?? 0) - (services.data?.projects.length ?? 0)
-    )
-  const healthIds = projects.shown
+  const current = nodes.find((node) => isCurrentNode(node, location))
+  const recent = useRecentProjects(current?.key)
+  const openAll = nodes.length < OPEN_ALL_BELOW
+  const isProjectOpen = (node: ProjectNode) =>
+    node.kind === 'project' &&
+    fold.isOpen(`tree:${node.key}`, isCurrentNode(node, location) || openAll)
+
+  // Health is asked for every project, not only those listed: on a large
+  // server it decides which are.
+  const healthIds = nodes
     .flatMap((node) =>
       node.kind === 'project'
         ? node.services.map((service) => service.id)
@@ -366,30 +318,85 @@ export function EntityTree() {
     }),
     ...QUERY,
     refetchInterval: 60_000,
-    enabled: isOpen('projects') && healthIds.length > 0,
+    enabled: projectsOpen && healthIds.length > 0,
   })
   const stateOf = (service: ServiceNode) =>
     serviceState(health.data?.projects[String(service.id)]?.status)
+  const nodeState = (node: ProjectNode) =>
+    node.kind === 'project'
+      ? worstState(node.services.map(stateOf))
+      : stateOf(node.service)
+  const projects = pickProjects(nodes, PROJECT_ROWS, {
+    isCurrent: (node) => node === current,
+    inTrouble: (node) => {
+      const tone = nodeState(node)?.tone
+      return tone === 'bad' || tone === 'warn'
+    },
+    recent,
+  })
+  // Services in no project past the first page of them, and projects past
+  // the groups' first page, are not counted: the count is then left out.
+  const exactTotal =
+    !groupList.truncated &&
+    (services.data?.total ?? 0) <= (services.data?.projects.length ?? 0)
+  const unlisted = projects.more > 0 || !exactTotal
+
+  const databases = useTreeDatabases(
+    projectsOpen
+      ? projects.shown.flatMap((node) =>
+          node.kind === 'project' && isProjectOpen(node) ? [node] : []
+        )
+      : []
+  )
+  // A database an open project lists is marked there; any other is the
+  // server's, and the Server row stands for it.
+  const listsCurrentDatabase =
+    location.branch === 'databases' &&
+    [...databases.values()].some((entry) =>
+      entry.databases.some((database) => database.id === location.recordId)
+    )
+
+  // The Server row says how the machines and databases are doing, so
+  // trouble shows without opening it.
+  const serverNodes = useQuery({
+    ...adminListNodesOptions(),
+    ...QUERY,
+    enabled: !compact,
+  })
+  const serverDatabases = useQuery({
+    ...listServicesOptions(),
+    ...QUERY,
+    enabled: !compact,
+  })
+  const onServer =
+    location.branch !== undefined &&
+    SERVER_BRANCHES.includes(location.branch) &&
+    !listsCurrentDatabase
+  const serverExact = pathname === SERVER_PAGE.url
 
   if (compact)
     return (
       <SidebarGroup className="py-2">
         <SidebarMenu aria-label="Your server">
-          {BRANCHES.map((branch) => (
-            <SidebarMenuItem key={branch.id}>
+          {[
+            {
+              ...SERVER_HOME,
+              marked: location.branch === 'projects',
+            },
+            { ...SERVER_PAGE, marked: onServer },
+          ].map((row) => (
+            <SidebarMenuItem key={row.url}>
               <SidebarMenuButton
                 asChild
-                tooltip={branch.title}
-                className={cn(
-                  'justify-center',
-                  location.branch === branch.id && ACTIVE
-                )}
+                tooltip={row.title}
+                className={cn('justify-center', row.marked && ACTIVE)}
               >
                 <Link
-                  to={branch.url}
-                  aria-current={pathname === branch.url ? 'page' : undefined}
+                  to={row.url}
+                  aria-label={row.title}
+                  aria-current={pathname === row.url ? 'page' : undefined}
                 >
-                  <branch.icon />
+                  <row.icon />
                 </Link>
               </SidebarMenuButton>
             </SidebarMenuItem>
@@ -411,175 +418,216 @@ export function EntityTree() {
     views: service,
   })
 
-  const databaseRows = capRows(
-    databases.data ?? [],
-    BRANCH_ROWS,
-    (database) => database.id === location.recordId
-  )
-  const domainRows = domains.data?.domains ?? []
-  const serverRows = capRows(
-    servers.data?.nodes ?? [],
-    BRANCH_ROWS,
-    (node) => node.id === location.recordId
-  )
-  const on = (branch: TreeBranchId, id: number) =>
-    location.branch === branch && location.recordId === id
-
-  const children: Record<TreeBranchId, ReactNode> = {
-    projects: (
-      <ProjectRows
-        query={
-          // Projects and the services in none are two lists; both must
-          // answer before the branch can say it is empty.
-          groupList.isError || groupList.isPending ? groupList : services
-        }
-        nodes={projects.shown}
-        more={unlisted}
-        openAll={nodes.length < OPEN_ALL_BELOW}
-        location={location}
-        pathname={pathname}
-        fold={fold}
-        leafOf={serviceLeaf}
-        stateOf={stateOf}
-        onNavigate={closeOnMobile}
-      />
-    ),
-    databases: (
-      <BranchRows
-        branch={branchOf('databases')}
-        query={databases}
-        more={databaseRows.more}
-        pathname={pathname}
-        onNavigate={closeOnMobile}
-        rows={databaseRows.shown.map((database) => ({
-          key: `database:${database.id}`,
-          name: database.name,
-          url: `/storage/${database.id}`,
-          icon: (
-            <ServiceLogo
-              service={database.service_type}
-              className="size-4 shrink-0"
-            />
-          ),
-          state: databaseState(database.status),
-          inside: on('databases', database.id),
-        }))}
-      />
-    ),
-    domains: (
-      <BranchRows
-        branch={branchOf('domains')}
-        query={domains}
-        more={Math.max(0, (domains.data?.total ?? 0) - domainRows.length)}
-        pathname={pathname}
-        onNavigate={closeOnMobile}
-        rows={domainRows.map((domain) => ({
-          key: `domain:${domain.id}`,
-          name: domain.domain,
-          url: `/domains/${domain.id}`,
-          icon: <Globe />,
-          state: domainState(domain.status),
-          inside: on('domains', domain.id),
-        }))}
-      />
-    ),
-    servers: (
-      <BranchRows
-        branch={branchOf('servers')}
-        query={servers}
-        more={serverRows.more}
-        pathname={pathname}
-        onNavigate={closeOnMobile}
-        rows={serverRows.shown.map((node) => ({
-          key: `server:${node.id}`,
-          name: node.name,
-          url: `${WORKER_NODES_URL}/${node.id}`,
-          icon: <Server />,
-          state: serverState(node.status),
-          inside: on('servers', node.id),
-        }))}
-      />
-    ),
-  }
+  const projectsExact = pathname === SERVER_HOME.url
+  // Folded, the branch itself marks where the user is.
+  const projectsMarked =
+    projectsExact || (location.branch === 'projects' && !projectsOpen)
 
   return (
     <SidebarGroup className="py-2">
       <SidebarMenu aria-label="Your server">
-        {BRANCHES.map((branch) => {
-          const open = isOpen(branch.id)
-          const inside = location.branch === branch.id
-          const exact = pathname === branch.url
-          // Folded, the branch itself marks where the user is.
-          const marked = exact || (inside && !open)
-          return (
-            <SidebarMenuItem key={branch.id} data-branch={branch.id}>
-              <SidebarMenuButton
-                asChild
-                className={cn('justify-start pr-8', marked && ACTIVE)}
-              >
-                <Link
-                  to={branch.url}
-                  aria-current={exact ? 'page' : undefined}
-                  onClick={closeOnMobile}
-                >
-                  <branch.icon />
-                  <span>{branch.title}</span>
-                </Link>
-              </SidebarMenuButton>
-              <Fold
-                name={branch.title}
-                open={open}
-                onToggle={(next) => fold.setOpen(`tree:${branch.id}`, next)}
+        <SidebarMenuItem data-branch="projects">
+          <SidebarMenuButton
+            asChild
+            className={cn('justify-start pr-8', projectsMarked && ACTIVE)}
+          >
+            <Link
+              to={SERVER_HOME.url}
+              aria-current={projectsExact ? 'page' : undefined}
+              onClick={closeOnMobile}
+            >
+              <SERVER_HOME.icon />
+              <span>{SERVER_HOME.title}</span>
+            </Link>
+          </SidebarMenuButton>
+          <Fold
+            name={SERVER_HOME.title}
+            open={projectsOpen}
+            onToggle={(next) => fold.setOpen('tree:projects', next)}
+          />
+          {projectsOpen && (
+            <SidebarMenuSub aria-label={SERVER_HOME.title}>
+              <ProjectRows
+                query={
+                  // Projects and the services in none are two lists; both
+                  // must answer before the branch can say it is empty.
+                  groupList.isError || groupList.isPending
+                    ? groupList
+                    : services
+                }
+                nodes={projects.shown}
+                all={
+                  unlisted
+                    ? exactTotal
+                      ? `All projects (${nodes.length})`
+                      : 'All projects'
+                    : undefined
+                }
+                location={location}
+                pathname={pathname}
+                isOpen={isProjectOpen}
+                onToggle={(node, next) =>
+                  fold.setOpen(`tree:${node.key}`, next)
+                }
+                databases={databases}
+                leafOf={serviceLeaf}
+                stateOf={stateOf}
+                onNavigate={closeOnMobile}
               />
-              {open && (
-                <SidebarMenuSub aria-label={branch.title}>
-                  {children[branch.id]}
-                </SidebarMenuSub>
-              )}
-            </SidebarMenuItem>
-          )
-        })}
+            </SidebarMenuSub>
+          )}
+        </SidebarMenuItem>
+        <SidebarMenuItem data-branch="server">
+          <SidebarMenuButton
+            asChild
+            isActive={onServer}
+            className={cn('justify-start', onServer && ACTIVE)}
+          >
+            <Link
+              to={SERVER_PAGE.url}
+              aria-current={
+                serverExact ? 'page' : onServer ? 'true' : undefined
+              }
+              onClick={closeOnMobile}
+            >
+              <SERVER_PAGE.icon />
+              <span>{SERVER_PAGE.title}</span>
+              <RowState
+                state={countedState([
+                  ...(serverNodes.data?.nodes ?? []).map((node) =>
+                    serverState(node.status)
+                  ),
+                  ...(serverDatabases.data ?? []).map((database) =>
+                    databaseState(database.status)
+                  ),
+                ])}
+              />
+            </Link>
+          </SidebarMenuButton>
+        </SidebarMenuItem>
       </SidebarMenu>
     </SidebarGroup>
   )
 }
 
-/** The rows under Projects: each project, foldable to its services. */
+/** The rows under an open project: its services, then their databases. */
+function ProjectChildren({
+  node,
+  databases,
+  location,
+  pathname,
+  leafOf,
+  onNavigate,
+}: {
+  node: Extract<ProjectNode, { kind: 'project' }>
+  databases: ProjectDatabases | undefined
+  location: TreeLocation
+  pathname: string
+  leafOf: (service: ServiceNode) => Leaf
+  onNavigate: () => void
+}) {
+  const url = groupHref(node.slug)
+  const services = capRows(
+    node.services,
+    SERVICE_ROWS,
+    (service) => service.slug === location.serviceSlug
+  )
+  return (
+    <>
+      {services.shown.map((service) => (
+        <LeafRow
+          key={service.id}
+          leaf={leafOf(service)}
+          pathname={pathname}
+          onNavigate={onNavigate}
+        />
+      ))}
+      {services.more > 0 && (
+        <NoteRow to={url} onNavigate={onNavigate}>
+          <span>{`${services.more} more`}</span>
+        </NoteRow>
+      )}
+      {databases?.databases.map((database) => (
+        <LeafRow
+          key={`database:${database.id}`}
+          leaf={{
+            key: `database:${database.id}`,
+            name: database.name,
+            url: `/storage/${database.id}`,
+            icon: (
+              <ServiceLogo
+                service={database.type}
+                className="size-4 shrink-0"
+              />
+            ),
+            state: databaseState(database.status),
+            inside:
+              location.branch === 'databases' &&
+              location.recordId === database.id,
+          }}
+          pathname={pathname}
+          onNavigate={onNavigate}
+        />
+      ))}
+      {databases?.failed && (
+        <RetryRow
+          label="Databases could not be loaded"
+          onRetry={databases.refetch}
+        />
+      )}
+      {databases?.truncated && (
+        <NoteRow to={`${url}/databases`} onNavigate={onNavigate}>
+          <span>All databases</span>
+        </NoteRow>
+      )}
+      <AddToProject node={node} onNavigate={onNavigate} />
+    </>
+  )
+}
+
+/** The rows under Projects: each project, foldable to what it is made of. */
 function ProjectRows({
   query,
   nodes,
-  more,
-  openAll,
+  all,
   location,
   pathname,
-  fold,
+  isOpen,
+  onToggle,
+  databases,
   leafOf,
   stateOf,
   onNavigate,
 }: {
   query: { isPending: boolean; isError: boolean; refetch: () => unknown }
   nodes: ProjectNode[]
-  more: number
-  openAll: boolean
-  location: ReturnType<typeof locateInTree>
+  /** The link to every project, when some are not listed. */
+  all: string | undefined
+  location: TreeLocation
   pathname: string
-  fold: ReturnType<typeof useTreeFold>
+  isOpen: (node: ProjectNode) => boolean
+  onToggle: (node: ProjectNode, open: boolean) => void
+  databases: Map<string, ProjectDatabases>
   leafOf: (service: ServiceNode) => Leaf
   stateOf: (service: ServiceNode) => TreeState | undefined
   onNavigate: () => void
 }) {
-  const branch = branchOf('projects')
-  if (query.isError || query.isPending || nodes.length === 0)
+  if (query.isError)
+    return <RetryRow label="Could not be loaded" onRetry={query.refetch} />
+  if (query.isPending)
     return (
-      <BranchRows
-        branch={branch}
-        query={query}
-        rows={[]}
-        more={0}
-        pathname={pathname}
-        onNavigate={onNavigate}
-      />
+      <li aria-busy="true" aria-label={`Loading ${SERVER_HOME.title}`}>
+        <SidebarMenuSkeleton className="h-7" />
+        <SidebarMenuSkeleton className="h-7" />
+      </li>
     )
+  if (nodes.length === 0)
+    return SERVER_HOME.add ? (
+      <NoteRow to={SERVER_HOME.add.href} onNavigate={onNavigate}>
+        <Plus />
+        <span>{SERVER_HOME.add.label}</span>
+      </NoteRow>
+    ) : null
   return (
     <>
       {nodes.map((node) => {
@@ -596,16 +644,10 @@ function ProjectRows({
         const holdsCurrent = node.services.some(
           (service) => service.slug === location.serviceSlug
         )
-        const inside = node.slug === location.groupSlug || holdsCurrent
-        const open = fold.isOpen(`tree:${node.key}`, inside || openAll)
+        const open = isOpen(node)
         // Its own page, or folded over the service shown.
         const marked =
           node.slug === location.groupSlug || (holdsCurrent && !open)
-        const services = capRows(
-          node.services,
-          PROJECT_ROWS,
-          (service) => service.slug === location.serviceSlug
-        )
         return (
           <SidebarMenuSubItem
             key={node.key}
@@ -633,41 +675,30 @@ function ProjectRows({
               nested
               name={node.name}
               open={open}
-              onToggle={(next) => fold.setOpen(`tree:${node.key}`, next)}
+              onToggle={(next) => onToggle(node, next)}
             />
             {open && (
               <SidebarMenuSub
-                aria-label={`${node.name} services`}
+                aria-label={`${node.name} contents`}
                 // Flush right, so states line up down the whole tree.
                 className="ml-2 mr-0 pl-2 pr-0"
               >
-                {services.shown.length === 0 ? (
-                  <NoteRow to={url} onNavigate={onNavigate}>
-                    <span>No service yet</span>
-                  </NoteRow>
-                ) : (
-                  services.shown.map((service) => (
-                    <LeafRow
-                      key={service.id}
-                      leaf={leafOf(service)}
-                      pathname={pathname}
-                      onNavigate={onNavigate}
-                    />
-                  ))
-                )}
-                {services.more > 0 && (
-                  <NoteRow to={url} onNavigate={onNavigate}>
-                    <span>{`${services.more} more`}</span>
-                  </NoteRow>
-                )}
+                <ProjectChildren
+                  node={node}
+                  databases={databases.get(node.key)}
+                  location={location}
+                  pathname={pathname}
+                  leafOf={leafOf}
+                  onNavigate={onNavigate}
+                />
               </SidebarMenuSub>
             )}
           </SidebarMenuSubItem>
         )
       })}
-      {more > 0 && (
-        <NoteRow to={branch.url} onNavigate={onNavigate}>
-          <span>More projects</span>
+      {all && (
+        <NoteRow to={SERVER_HOME.url} onNavigate={onNavigate}>
+          <span>{all}</span>
         </NoteRow>
       )}
     </>

@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   PROJECT_NAV_SECTIONS,
+  heldSectionOf,
   projectEntityViewOf,
   projectEntityViewsFor,
   projectEnvironmentScope,
@@ -249,21 +250,62 @@ describe('projectNavSectionsFor', () => {
 describe('projectEntityViewsFor', () => {
   const hosted = projectEntityViewsFor({ source_type: 'git' })
 
-  test('the tabs of a service: its views, then one Settings', () => {
+  test('the views of a service: the everyday seven, Settings last', () => {
     expect(hosted.map((view) => view.title)).toEqual([
       'Overview',
       'Deployments',
       'Logs',
       'Errors',
       'Variables',
-      'Traces',
-      'Metrics',
-      'Uptime',
       'Analytics',
-      'Alerts',
-      'Domains',
-      'Databases',
       'Settings',
+    ])
+  })
+
+  test('an occasional section is a tab of the view answering its question', () => {
+    const of = (id: string) => hosted.find((view) => view.id === id)
+    expect(of('overview')?.sections.map((section) => section.id)).toEqual([
+      'overview',
+      'metrics',
+      'uptime',
+      'alerts',
+      'domains',
+      'databases',
+    ])
+    expect(
+      of('overview')?.tabs.map((tab) => [
+        tab.title,
+        tab.views?.map((page) => page.title),
+      ])
+    ).toEqual([
+      ['Overview', undefined],
+      ['Activity', undefined],
+      ['Metrics', ['Metrics', 'Dashboards']],
+      ['Uptime', ['Monitors', 'Cron jobs', 'Check-ins', 'Workflows']],
+      ['Alerts', ['Error alerts', 'Metric alerts']],
+      ['Domains', undefined],
+      ['Databases', ['Databases', 'Key-value', 'Blob']],
+    ])
+    expect(of('logs')?.tabs.map((tab) => tab.title)).toEqual([
+      'Application',
+      'Requests',
+      'OpenTelemetry',
+      'Traces',
+    ])
+  })
+
+  test('the tour finds a held section by its tab', () => {
+    const overview = hosted[0]
+    expect(
+      overview.tabs.map((tab) => heldSectionOf(overview, tab) ?? null)
+    ).toEqual([
+      null,
+      null,
+      'metrics',
+      'uptime',
+      'alerts',
+      'domains',
+      'databases',
     ])
   })
 
@@ -348,6 +390,11 @@ describe('projectEntityViewOf', () => {
   test('a page belongs to the view whose section holds it', () => {
     expect(viewOf('environments')?.title).toBe('Deployments')
     expect(viewOf('errors/42')?.title).toBe('Errors')
+    expect(viewOf('metrics/dashboards/3')?.title).toBe('Overview')
+    expect(viewOf('errors/alert-rules')?.title).toBe('Overview')
+    expect(viewOf('cron-jobs')?.title).toBe('Overview')
+    expect(viewOf('traces/abc')?.title).toBe('Logs')
+    expect(viewOf('traces', 'external')?.title).toBe('Logs')
   })
 
   test('security, automation and the service settings are one Settings view', () => {

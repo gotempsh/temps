@@ -143,9 +143,11 @@ function tabOf(
 }
 
 /**
- * A service's views, in the order the sidebar lists them: what it is, the
- * data it has, what it owns, then how it is configured. One shape with a
- * project's, so a view is in the same place at both levels.
+ * A service's sections: what it is, the data it has, what it owns, then how
+ * it is configured. One shape with a project's, so a page is in the same
+ * place at both levels. The sidebar lists fewer views than this:
+ * `projectEntityViewsFor` puts the occasional sections in the everyday
+ * view they belong to.
  */
 export const PROJECT_NAV_SECTIONS: ProjectNavSection[] = [
   {
@@ -694,57 +696,107 @@ export function projectNavSectionsFor(project: {
   return PROJECT_NAV_SECTIONS.flatMap((section) => sectionFor(project, section))
 }
 
-/** The sections that are one view, Settings: its own page first. */
-const SETTINGS_SECTIONS: readonly ProjectSectionId[] = [
-  'general',
-  'access',
-  'automation',
-]
+/**
+ * The sections that are pages of another view rather than a view of their
+ * own, by the view that holds them: the occasional ones are tabs of the
+ * everyday view whose question they answer. Is it healthy? (Overview:
+ * metrics, uptime, alerts, what it owns.) What happened? (Logs: traces.)
+ * And what is configured once is Settings.
+ */
+const HELD_BY: Partial<Record<ProjectSectionId, ProjectSectionId>> = {
+  metrics: 'overview',
+  uptime: 'overview',
+  alerts: 'overview',
+  domains: 'overview',
+  databases: 'overview',
+  traces: 'logs',
+  access: 'general',
+  automation: 'general',
+}
 
-/** A view of a service: one section, or the settings ones together. */
+/** A view of a service: its section, with the sections it holds. */
 export interface ProjectEntityView {
   /** The section's id; Settings goes by `general`. */
   id: ProjectSectionId
   title: string
   icon: LucideIcon
-  /** The sections whose pages it holds: one, except for Settings. */
+  /** The sections whose pages it holds, its own first. */
   sections: ProjectNavSection[]
   /** Its pages, as the tabs of its page. The first is where it opens. */
   tabs: ProjectNavTab[]
 }
 
 /**
- * `project`'s views, as the sidebar lists them under it: one per section, in
- * order, with what is configured once (security, automation, the service's
- * own settings) together under one Settings view at the end, so the list
- * stays what is looked at every day.
+ * A held section as one tab of the view holding it: its page, or a tab
+ * that opens a menu of its pages. Settings lists each page as its own tab
+ * instead, since every one of them is a form of its own.
+ */
+function heldTabs(
+  section: ProjectNavSection,
+  flatten: boolean
+): ProjectNavTab[] {
+  if (flatten) return section.tabs
+  const [first, second, ...rest] = section.tabs.flatMap(pagesOf)
+  if (!second) return [{ ...first, title: section.title, icon: section.icon }]
+  return [tabOf(section.title, [first, second, ...rest], section.icon)]
+}
+
+/**
+ * `project`'s views, as the sidebar lists them under it: the everyday ones
+ * (Overview, Deployments, Logs, Errors, Variables, Analytics), each holding
+ * the occasional sections that answer the same question as its tabs, then
+ * Settings at the end. A held section whose view the project lacks is a
+ * view of its own, so no page is lost.
  */
 export function projectEntityViewsFor(project: {
   source_type?: string | null
 }): ProjectEntityView[] {
   const sections = projectNavSectionsFor(project)
+  const has = (id: ProjectSectionId | undefined) =>
+    id !== undefined && sections.some((section) => section.id === id)
   const views = sections
-    .filter((section) => !SETTINGS_SECTIONS.includes(section.id))
-    .map((section): ProjectEntityView => ({
-      id: section.id,
-      title: section.title,
-      icon: section.icon,
-      sections: [section],
-      tabs: section.tabs,
-    }))
-  const settings = SETTINGS_SECTIONS.flatMap((id) =>
-    sections.filter((section) => section.id === id)
-  )
-  const [first] = settings
-  if (first)
-    views.push({
-      id: 'general',
-      title: first.title,
-      icon: first.icon,
-      sections: settings,
-      tabs: settings.flatMap((section) => section.tabs),
+    .filter((section) => !has(HELD_BY[section.id]))
+    .map((section): ProjectEntityView => {
+      const held = sections.filter((other) => HELD_BY[other.id] === section.id)
+      return {
+        id: section.id,
+        title: section.title,
+        icon: section.icon,
+        sections: [section, ...held],
+        tabs: [
+          ...section.tabs,
+          ...held.flatMap((other) => heldTabs(other, section.id === 'general')),
+        ],
+      }
     })
-  return views
+  // Configured once, so last, whatever the order of the sections.
+  return [
+    ...views.filter((view) => view.id !== 'general'),
+    ...views.filter((view) => view.id === 'general'),
+  ]
+}
+
+/** The section of a held tab, as the quick tour names it, by its URL. */
+export function heldSectionOf(
+  view: ProjectEntityView,
+  tab: ProjectNavTab
+): ProjectSectionId | undefined {
+  const [own, ...held] = view.sections
+  if (own.tabs.includes(tab)) return undefined
+  return held.find((section) =>
+    section.tabs.some((candidate) =>
+      pagesOf(candidate).some((page) => page.url === tab.url)
+    )
+  )?.id
+}
+
+/** Whether `tab` (a page, or a tab of several) holds the page at `location`. */
+export function tabHoldsLocation(
+  tab: ProjectNavTab,
+  location: ProjectNavLocation
+): boolean {
+  const shown = (location.view ?? location.tab).url
+  return pagesOf(tab).some((page) => page.url === shown)
 }
 
 /** The view of `project` that holds the page at `location`. */

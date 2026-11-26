@@ -3,16 +3,9 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo } from 'react'
-import {
-  hasAnalyticsEventsOptions,
-  hasTracesOptions,
-  listCustomDomainsForProjectOptions,
-  listMonitorsOptions,
-  listProjectServicesOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { hasAnalyticsEventsOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
   UNKNOWN,
-  countStatus,
   rememberStates,
   rememberedStates,
   withRemembered,
@@ -45,10 +38,12 @@ const received = (yes: boolean): AreaStatus => ({
 })
 
 /**
- * Which views of one service hold anything, by section id: one small
- * request each, shared with the view's own page where it is the same
- * request, and not repeated for a minute. A view with no entry here needs
- * no set-up and is always a tab.
+ * Which views of one service hold anything, by section id. Only Analytics
+ * depends on it: a website receives page views and an API never does, so
+ * it is a row once it has some. Every other view is always a row, and what
+ * it holds nothing of yet (traces, monitors) is a tab showing how to set it
+ * up. One small request, shared with the Analytics page, and not repeated
+ * for a minute.
  */
 export function useServiceAreaStates(
   projectId: number | undefined
@@ -57,53 +52,18 @@ export function useServiceAreaStates(
   const path = { project_id: projectId ?? 0 }
   const scope = `service:${projectId ?? ''}`
 
-  const traces = useQuery({
-    ...hasTracesOptions({ path }),
-    ...QUERY,
-    enabled: known,
-  })
   const analytics = useQuery({
     ...hasAnalyticsEventsOptions({ path }),
     ...QUERY,
     enabled: known,
   })
-  const monitors = useQuery({
-    ...listMonitorsOptions({ path }),
-    ...QUERY,
-    enabled: known,
-  })
-  const domains = useQuery({
-    ...listCustomDomainsForProjectOptions({ path }),
-    ...QUERY,
-    enabled: known,
-  })
-  const databases = useQuery({
-    ...listProjectServicesOptions({ path }),
-    ...QUERY,
-    enabled: known,
-  })
-
-  const hasTraces = settled(traces)
   const hasEvents = settled(analytics)
-  const monitorList = settled(monitors)
-  const domainList = settled(domains)
-  const databaseList = settled(databases)
 
   const live = useMemo<AreaStatuses>(
     () => ({
-      traces: answered(hasTraces, (data) => received(data.has_traces)),
       analytics: answered(hasEvents, (data) => received(data.has_events)),
-      uptime: answered(monitorList, (list) =>
-        countStatus(list.length, 'monitor')
-      ),
-      domains: answered(domainList, (data) =>
-        countStatus(data.domains.length, 'custom domain')
-      ),
-      databases: answered(databaseList, (list) =>
-        countStatus(list.length, 'database')
-      ),
     }),
-    [hasTraces, hasEvents, monitorList, domainList, databaseList]
+    [hasEvents]
   )
 
   useEffect(() => {

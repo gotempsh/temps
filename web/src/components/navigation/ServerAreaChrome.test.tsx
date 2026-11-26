@@ -30,12 +30,6 @@ function renderAt(path: string) {
   )
 }
 
-const tabs = (root: HTMLElement) =>
-  [...root.querySelectorAll('nav a')].map((a) => [
-    a.textContent,
-    a.getAttribute('href'),
-  ])
-
 // A view with several pages is a button that opens a menu of them.
 const titles = (nav: HTMLElement) =>
   [...nav.querySelectorAll('[data-tab]')].map((tab) => tab.textContent)
@@ -115,23 +109,46 @@ describe('the Projects page carries what is seen across every project', () => {
   })
 })
 
-describe('the tab strip above a branch of the tree', () => {
-  test('shows the branch pages as links, with the page shown selected', () => {
-    const view = renderAt('/backups')
+describe('the Server page carries every record of the server', () => {
+  const VIEWS = ['Nodes', 'Databases', 'Domains']
+
+  test('its views are its tabs, each a menu of its pages', async () => {
+    for (const [path, current] of [
+      ['/settings/nodes', 'Nodes'],
+      ['/monitoring/server', 'NodesThis server'],
+      ['/storage', 'Databases'],
+      ['/backups', 'DatabasesBackups'],
+      ['/domains', 'Domains'],
+      ['/certificates', 'DomainsCertificates'],
+    ]) {
+      const view = renderAt(path)
+      const nav = view.getByRole('navigation', { name: 'Server views' })
+      // A tab with several pages also names the one shown.
+      expect(titles(nav)).toEqual(
+        VIEWS.map((title) => (current.startsWith(title) ? current : title))
+      )
+      expect(nav.querySelector('[aria-current]')?.textContent).toBe(current)
+      // One row, and no Logs or Errors beside a database.
+      expect(view.getAllByRole('navigation')).toHaveLength(1)
+      cleanup()
+    }
+    const view = renderAt('/storage')
+    fireEvent.pointerDown(view.getByRole('button', { name: /^Domains/ }), {
+      button: 0,
+      ctrlKey: false,
+    })
+    const menu = await view.findByRole('menu')
     expect(
-      view.getByRole('navigation', { name: 'Databases pages' })
-    ).toBeTruthy()
-    expect(tabs(view.container)).toEqual([
-      ['Databases', '/storage'],
-      ['Backups', '/backups'],
+      [...menu.querySelectorAll('a')].map((a) => [
+        a.textContent,
+        a.getAttribute('href'),
+      ])
+    ).toEqual([
+      ['Domains', '/domains'],
+      ['Certificates', '/certificates'],
+      ['DNS providers', '/dns-providers'],
+      ['Delivery', '/delivery-profiles'],
     ])
-    expect(
-      view.container.querySelector('nav [aria-current="page"]')?.textContent
-    ).toBe('Backups')
-    // Data is not among them: no Logs or Errors beside a database.
-    expect(
-      view.queryByRole('navigation', { name: 'Projects views' })
-    ).toBeNull()
   })
 
   test('the selected tab names the page, so its title is not shown twice', () => {
@@ -154,19 +171,30 @@ describe('the tab strip above a branch of the tree', () => {
     }
   })
 
-  test('gathers pages that live at unrelated URLs', () => {
-    expect(tabs(renderAt('/monitoring/server').container)).toEqual([
-      ['Nodes', '/settings/nodes'],
-      ['This server', '/monitoring/server'],
-    ])
-  })
-
   test('every tab leads with its icon, on a phone too', () => {
     const view = renderAt('/storage')
-    const icon = view.getByRole('link', { name: 'Backups' }).firstElementChild
-    expect(icon?.tagName.toLowerCase()).toBe('svg')
-    expect(icon?.getAttribute('aria-hidden')).toBe('true')
-    // No width at which it is dropped.
-    expect(icon?.getAttribute('class')).not.toContain('hidden')
+    const nav = view.getByRole('navigation', { name: 'Server views' })
+    for (const tab of nav.querySelectorAll('[data-tab]')) {
+      const icon = tab.firstElementChild
+      expect(icon?.tagName.toLowerCase()).toBe('svg')
+      expect(icon?.getAttribute('aria-hidden')).toBe('true')
+      // No width at which it is dropped.
+      expect(icon?.getAttribute('class')).not.toContain('hidden')
+    }
+  })
+})
+
+describe('an area of Settings with several pages', () => {
+  test('has them as its tabs, with the page shown selected', () => {
+    const view = renderAt('/ai-gateway/usage')
+    const nav = view.getByRole('navigation', { name: 'Providers pages' })
+    expect(titles(nav)).toEqual([
+      'Providers',
+      'Usage',
+      'Models',
+      'Limits',
+      'Activity',
+    ])
+    expect(current(nav)).toBe('Usage')
   })
 })

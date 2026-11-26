@@ -9,9 +9,5 @@ import type { ProjectSectionId } from '@/lib/project-navigation'
  * and is always a tab.
  */
 export const SERVICE_VIEW_MISSING: Partial<Record<ProjectSectionId, string>> = {
-  traces: 'No trace received yet.',
-  uptime: 'No monitor yet.',
   analytics: 'No page view received yet.',
-  domains: 'No custom domain yet.',
-  databases: 'No database linked yet.',
 }

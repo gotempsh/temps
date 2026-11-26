@@ -31,20 +31,6 @@ export function listsAsTab(status: AreaStatus | undefined): boolean {
   return status?.state !== 'inactive'
 }
 
-/** `count` things, as an area's status: none means not set up. */
-export function countStatus(
-  count: number | undefined,
-  singular: string,
-  plural = `${singular}s`
-): AreaStatus {
-  if (count === undefined) return UNKNOWN
-  if (count === 0) return { state: 'inactive' }
-  return {
-    state: 'active',
-    metric: `${count} ${count === 1 ? singular : plural}`,
-  }
-}
-
 const STORAGE_KEY = 'temps:nav:area-states'
 
 type Remembered = Record<string, Record<string, 'active' | 'inactive'>>

@@ -4,11 +4,13 @@
 /**
  * Every server-wide page, and where it lives.
  *
- * The sidebar is a tree of what the user owns: projects, databases, domains
- * and servers (`lib/entity-tree.ts`). Data is not an entry of it. What is
- * seen across every project (logs, errors, traces, analytics, alerts) is a
- * tab of the Projects page; what is set up once and then used from those
- * things (Git, email, model providers) is a page of Settings.
+ * The sidebar is a tree of what the user owns (`lib/entity-tree.ts`): its
+ * projects, each with its services and the databases they use, then one
+ * Server row. Data is not an entry of it. What is seen across every project
+ * (logs, errors, traces, analytics, alerts) is a tab of the Projects page;
+ * every record of the server (its nodes, databases and domains) is a tab of
+ * the Server page; what is set up once and then used from those things
+ * (Git, email, model providers) is a page of Settings.
  *
  * Every page has exactly one home here. The tree, the tab strips, the
  * Settings menu and the command palette all read this one list, so they
@@ -184,11 +186,41 @@ export const SERVER_VIEWS: ServerNavArea[] = [
   },
 ]
 
+const SERVER_NODES: ServerNavArea = {
+  id: 'servers',
+  title: 'Nodes',
+  icon: Server,
+  url: '/settings/nodes',
+  description: 'The machines that build and run your services.',
+  add: { label: 'Add server', href: '/settings/nodes' },
+  keywords: [
+    'servers',
+    'worker nodes',
+    'cpu',
+    'memory',
+    'disk',
+    'docker',
+    'host',
+  ],
+  tabs: [
+    {
+      title: 'Nodes',
+      icon: Network,
+      url: '/settings/nodes',
+      featureKey: 'multi-node-worker-join',
+    },
+    { title: 'This server', icon: Cpu, url: '/monitoring/server' },
+  ],
+}
+
 /**
- * What the user owns besides projects. Each is a branch of the sidebar's
- * tree, listing its records.
+ * Every record of the server, whichever project uses it: the tabs of the
+ * Server page. A project lists the databases its services use, and a
+ * service its custom domains; these lists are for the admin who needs all
+ * of them, and are where a record no project uses is found.
  */
 export const SERVER_ENTITIES: ServerNavArea[] = [
+  SERVER_NODES,
   {
     id: 'databases',
     title: 'Databases',
@@ -217,33 +249,17 @@ export const SERVER_ENTITIES: ServerNavArea[] = [
       { title: 'Delivery', icon: Truck, url: '/delivery-profiles' },
     ],
   },
-  {
-    id: 'servers',
-    title: 'Servers',
-    icon: Server,
-    url: '/settings/nodes',
-    description: 'The machines that build and run your services.',
-    add: { label: 'Add server', href: '/settings/nodes' },
-    keywords: [
-      'worker nodes',
-      'nodes',
-      'cpu',
-      'memory',
-      'disk',
-      'docker',
-      'host',
-    ],
-    tabs: [
-      {
-        title: 'Nodes',
-        icon: Network,
-        url: '/settings/nodes',
-        featureKey: 'multi-node-worker-join',
-      },
-      { title: 'This server', icon: Cpu, url: '/monitoring/server' },
-    ],
-  },
 ]
+
+/**
+ * The Server row of the tree, below the projects. It opens on the nodes,
+ * the machines everything else runs on.
+ */
+export const SERVER_PAGE = {
+  title: 'Server',
+  icon: Server,
+  url: SERVER_NODES.url,
+} as const
 
 /**
  * Set up once and then used from the things above, so they are pages of
@@ -427,7 +443,7 @@ export interface ServerNavLocation {
 
 /**
  * The area a server-wide URL belongs to. The one with the longest matching
- * prefix wins, so `/monitoring/server` is Servers, not Alerts.
+ * prefix wins, so `/monitoring/server` is the server's, not Alerts'.
  */
 export function resolveServerLocation(pathname: string): ServerNavLocation {
   let best: { area: ServerNavArea; length: number } | undefined
@@ -457,4 +473,9 @@ export function isProjectsView(area: ServerNavArea | undefined): boolean {
 export function isSettingsArea(pathname: string): boolean {
   const { area } = resolveServerLocation(pathname)
   return area !== undefined && SETTINGS_AREAS.includes(area)
+}
+
+/** Whether `area` is a tab of the Server page. */
+export function isServerPage(area: ServerNavArea | undefined): boolean {
+  return area !== undefined && SERVER_ENTITIES.includes(area)
 }

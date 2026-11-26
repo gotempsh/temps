@@ -15,28 +15,38 @@ async function hostedService(page: Page) {
   return { name, root: `/projects/${slug}` }
 }
 
-// The views every hosted service has, in the sidebar's order. The others
-// (Traces, Uptime, Analytics, Domains, Databases) are rows only once they
-// hold something, and are offered under "Add" until then.
+// The everyday views every hosted service has, in the sidebar's order.
+// Analytics is a row once the service receives page views, and offered
+// under "Add" until then; the occasional views are tabs of these.
 const ALWAYS = [
   'Overview',
   'Deployments',
   'Logs',
   'Errors',
   'Variables',
-  'Metrics',
-  'Alerts',
   'Settings',
 ]
 
 // Each view's pages, as the one row of tabs on its page. Naming them (rather
 // than only counting) is what catches a page being added, dropped or renamed.
 const VIEW_TABS = [
+  // Is it healthy, and what it owns.
+  [
+    'Overview',
+    [
+      'Overview',
+      'Activity',
+      'Metrics',
+      'Uptime',
+      'Alerts',
+      'Domains',
+      'Databases',
+    ],
+  ],
   ['Deployments', ['Deployments', 'Environments', 'Build']],
-  ['Logs', ['Application', 'Requests', 'OpenTelemetry']],
+  // What happened.
+  ['Logs', ['Application', 'Requests', 'OpenTelemetry', 'Traces']],
   ['Variables', ['Variables', 'Secrets', 'Deploy tokens']],
-  ['Metrics', ['Metrics', 'Dashboards']],
-  ['Alerts', ['Error alerts', 'Metric alerts']],
   [
     'Settings',
     [
@@ -69,7 +79,7 @@ test("a service's views are listed under it in the sidebar, and its page has one
   await expect(page).toHaveURL(/settings\/general$/)
 
   const views = page.getByRole('list', { name: `${name} views`, exact: true })
-  const listed = await views.getByRole('link').allTextContents()
+  const listed = await views.locator('a[data-view]').allTextContents()
   // In order, whatever else is listed between them.
   expect(listed.filter((title) => ALWAYS.includes(title))).toEqual(ALWAYS)
   await expect(
@@ -186,4 +196,40 @@ test('a legacy build link still lands on its section of the delivery settings', 
   await page.goto(`${root}/settings/build?tab=previews`)
   await expect(page).toHaveURL(/settings\/delivery\?section=previews$/)
   await expect(page.locator('#settings-section-previews')).toBeInViewport()
+})
+
+test('the tree lists the projects and one Server row, whose page has every record of the server as tabs', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.goto('/backups')
+  const tree = page.getByRole('list', { name: 'Your server', exact: true })
+  await expect(tree.locator(':scope > li > a')).toHaveText([
+    /^Projects/,
+    /^Server/,
+  ])
+  await expect(tree.locator('[data-branch="server"] a')).toHaveAttribute(
+    'aria-current',
+    'true'
+  )
+  const strip = page.getByRole('navigation', {
+    name: 'Server views',
+    exact: true,
+  })
+  // One row; the tab shown names its page.
+  await expect(
+    page.getByRole('navigation', { name: / (pages|views)$/ })
+  ).toHaveCount(1)
+  await expect(strip.locator('[data-tab]')).toHaveText([
+    'Nodes',
+    'DatabasesBackups',
+    'Domains',
+  ])
+  await strip.getByRole('button', { name: /^Domains/ }).click()
+  await page.getByRole('menuitem', { name: 'Certificates' }).click()
+  await expect(page).toHaveURL(/\/certificates$/)
+  await expect(tree.locator('[data-branch="server"] a')).toHaveAttribute(
+    'aria-current',
+    'true'
+  )
 })

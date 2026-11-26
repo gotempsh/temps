@@ -5,7 +5,6 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { installBrowserWindow } from '@/test/dom'
 import {
   UNKNOWN,
-  countStatus,
   listsAsTab,
   rememberStates,
   rememberedStates,
@@ -25,27 +24,6 @@ describe('listsAsTab', () => {
     expect(listsAsTab(UNKNOWN)).toBe(true)
     // A view with no set-up state is always a tab.
     expect(listsAsTab(undefined)).toBe(true)
-  })
-})
-
-describe('countStatus', () => {
-  test('none is not set up; some is active with its number', () => {
-    expect(countStatus(0, 'database')).toEqual({ state: 'inactive' })
-    expect(countStatus(1, 'database')).toEqual({
-      state: 'active',
-      metric: '1 database',
-    })
-    expect(countStatus(3, 'database')).toEqual({
-      state: 'active',
-      metric: '3 databases',
-    })
-    expect(countStatus(2, 'status page')).toMatchObject({
-      metric: '2 status pages',
-    })
-  })
-
-  test('no count is unknown, not zero', () => {
-    expect(countStatus(undefined, 'domain')).toBe(UNKNOWN)
   })
 })
 

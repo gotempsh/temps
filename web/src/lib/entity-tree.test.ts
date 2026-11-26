@@ -4,12 +4,16 @@
 import { describe, expect, test } from 'bun:test'
 import {
   capRows,
+  databaseRequests,
   databaseState,
   domainState,
   locateInTree,
+  pickProjects,
   projectNodes,
+  countedState,
   serverState,
   serviceState,
+  withRecent,
   worstState,
 } from './entity-tree'
 
@@ -188,5 +192,120 @@ describe('capRows', () => {
       more: 2,
     })
     expect(capRows(rows, 3, (row) => row === 2).shown).toEqual([1, 2, 3])
+  })
+})
+
+describe('countedState', () => {
+  test('counts trouble, since one of several is not the whole server', () => {
+    expect(
+      countedState([serverState('active'), serverState('offline')])
+    ).toEqual({ tone: 'bad', label: '1 offline' })
+    expect(
+      countedState([
+        serverState('offline'),
+        serverState('offline'),
+        databaseState('starting'),
+      ])
+    ).toEqual({ tone: 'bad', label: '2 offline' })
+    expect(
+      countedState([databaseState('running'), databaseState('failed')])
+    ).toEqual({ tone: 'bad', label: '1 failed' })
+  })
+
+  test('is healthy once anything is known and nothing is wrong', () => {
+    expect(
+      countedState([serverState('active'), databaseState('stopped')])
+    ).toEqual({ tone: 'ok', label: 'Healthy' })
+    expect(countedState([])).toBeUndefined()
+    expect(countedState([undefined])).toBeUndefined()
+  })
+})
+
+describe('databaseRequests', () => {
+  const services = (from: number, count: number) =>
+    Array.from({ length: count }, (_, index) => ({
+      id: from + index,
+      name: `s${from + index}`,
+      slug: `s${from + index}`,
+    }))
+
+  test('asks for every service of the open projects, in order', () => {
+    const { requests, truncated } = databaseRequests(
+      [
+        { key: 'a', services: services(1, 2) },
+        { key: 'b', services: services(10, 1) },
+      ],
+      25
+    )
+    expect(
+      requests.map((request) => [request.key, request.service.id])
+    ).toEqual([
+      ['a', 1],
+      ['a', 2],
+      ['b', 10],
+    ])
+    expect(truncated.size).toBe(0)
+  })
+
+  test('never asks for more than the limit, and says which projects it cut', () => {
+    const { requests, truncated } = databaseRequests(
+      [
+        { key: 'a', services: services(1, 3) },
+        { key: 'b', services: services(10, 3) },
+        { key: 'c', services: services(20, 1) },
+      ],
+      4
+    )
+    expect(requests).toHaveLength(4)
+    expect([...truncated]).toEqual(['b', 'c'])
+    expect(databaseRequests([], 4).requests).toEqual([])
+  })
+})
+
+describe('pickProjects', () => {
+  const nodes = Array.from({ length: 12 }, (_, index) => ({
+    key: `p${index}`,
+  }))
+  const keys = (picked: { shown: { key: string }[] }) =>
+    picked.shown.map((node) => node.key)
+  const none = { isCurrent: () => false, inTrouble: () => false, recent: [] }
+
+  test('lists every project when they fit, as they are', () => {
+    const few = nodes.slice(0, 8)
+    expect(pickProjects(few, 8, none)).toEqual({ shown: few, more: 0 })
+  })
+
+  test('lists trouble first, then the recent, the rest in their order', () => {
+    const picked = pickProjects(nodes, 5, {
+      isCurrent: () => false,
+      inTrouble: (node) => node.key === 'p9',
+      recent: ['p11', 'p4'],
+    })
+    expect(keys(picked)).toEqual(['p9', 'p0', 'p1', 'p4', 'p11'])
+    expect(picked.more).toBe(7)
+  })
+
+  test('the project shown is always listed, however full the list', () => {
+    const picked = pickProjects(nodes, 3, {
+      isCurrent: (node) => node.key === 'p10',
+      inTrouble: (node) => ['p1', 'p2', 'p3'].includes(node.key),
+      recent: [],
+    })
+    expect(keys(picked)).toContain('p10')
+    expect(picked.shown).toHaveLength(3)
+  })
+
+  test('a recent project that no longer exists is ignored', () => {
+    expect(keys(pickProjects(nodes, 2, { ...none, recent: ['gone'] }))).toEqual(
+      ['p0', 'p1']
+    )
+  })
+})
+
+describe('withRecent', () => {
+  test('puts the project first, once, and remembers at most eight', () => {
+    expect(withRecent(['a', 'b', 'c'], 'b')).toEqual(['b', 'a', 'c'])
+    const many = Array.from({ length: 8 }, (_, index) => `p${index}`)
+    expect(withRecent(many, 'new')).toEqual(['new', ...many.slice(0, 7)])
   })
 })

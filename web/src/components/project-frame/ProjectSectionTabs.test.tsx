@@ -60,9 +60,57 @@ test("a service's page has one row of tabs: the pages of the view shown", () => 
   )
 })
 
-test('a view with one page has no tabs', () => {
-  const view = renderTabs('domains')
-  expect(view.queryByRole('navigation')).toBeNull()
+test('the Overview holds what says whether the service is healthy, and what it owns', async () => {
+  const view = renderTabs('metrics/dashboards')
+  expect(view.getAllByRole('navigation')).toHaveLength(1)
+  const pages = view.getByRole('navigation', { name: 'Overview pages' })
+  expect(
+    [...pages.querySelectorAll('[data-tab]')].map((tab) => tab.textContent)
+  ).toEqual([
+    'Overview',
+    'Activity',
+    'MetricsDashboards',
+    'Uptime',
+    'Alerts',
+    'Domains',
+    'Databases',
+  ])
+  // A held section of several pages opens a menu, marked on any of them.
+  const metrics = view.getByRole('button', { name: /^Metrics/ })
+  expect(metrics.getAttribute('aria-current')).toBe('true')
+  // The quick tour points at it here.
+  expect(metrics.getAttribute('data-tour')).toBe('metrics')
+  open(metrics)
+  const menu = await view.findByRole('menu')
+  expect(
+    [...menu.querySelectorAll('a')].map((a) => [
+      a.textContent,
+      a.getAttribute('href'),
+    ])
+  ).toEqual([
+    ['Metrics', '/projects/synthetic-api/metrics/explore'],
+    ['Dashboards', '/projects/synthetic-api/metrics/dashboards'],
+  ])
+  expect(menu.querySelector('[aria-current="page"]')?.textContent).toBe(
+    'Dashboards'
+  )
+  cleanup()
+  // One of a single page is a plain tab.
+  const domains = renderTabs('domains')
+  const link = domains.getByRole('link', { name: 'Domains' })
+  expect(link.getAttribute('aria-current')).toBe('page')
+  expect(link.getAttribute('href')).toBe('/projects/synthetic-api/domains')
+})
+
+test('Logs holds the traces, as what happened', () => {
+  const view = renderTabs('ai-gateway')
+  const pages = view.getByRole('navigation', { name: 'Logs pages' })
+  expect(
+    [...pages.querySelectorAll('[data-tab]')].map((tab) => tab.textContent)
+  ).toEqual(['Application', 'Requests', 'OpenTelemetry', 'TracesAI traces'])
+  expect(
+    view.getByRole('button', { name: /^Traces/ }).getAttribute('data-tour')
+  ).toBe('traces')
 })
 
 test('security, automation and the service settings are the pages of Settings', () => {

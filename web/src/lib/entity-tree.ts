@@ -2,16 +2,28 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * The sidebar as a tree of what the user owns: projects with their
- * services, databases, domains and servers. Data (logs, errors, traces) is
- * not an entry of the tree; it is shown on the page of the thing it belongs
- * to. This module holds the tree's rules, apart from how it is drawn.
+ * The sidebar as a tree of what the user owns: projects, each with its
+ * services and the databases they use, then one Server row for every
+ * record of the server. Data (logs, errors, traces) is not an entry of the
+ * tree; it is shown on the page of the thing it belongs to. This module
+ * holds the tree's rules, apart from how it is drawn.
  */
 
 import { resolveConsoleScope } from '@/lib/console-scope'
 import { resolveServerLocation } from '@/lib/server-navigation'
 
+/**
+ * Where a page sits: under Projects, or one of the Server page's tabs
+ * (databases, domains, servers), which the Server row stands for.
+ */
 export type TreeBranchId = 'projects' | 'databases' | 'domains' | 'servers'
+
+/** The branches the Server row stands for. */
+export const SERVER_BRANCHES: readonly TreeBranchId[] = [
+  'databases',
+  'domains',
+  'servers',
+]
 
 /** The server areas each branch stands for, by area id. */
 const BRANCH_OF_AREA: Record<string, TreeBranchId> = {
@@ -122,7 +134,11 @@ export function domainState(status: string): TreeState | undefined {
       return state('bad', 'Failed')
     case 'pending':
     case 'pending_dns':
+    case 'dns_configured':
       return state('warn', 'Pending')
+    // A service's custom domain another service already serves.
+    case 'hostname_conflict':
+      return state('bad', 'Conflict')
     default:
       return undefined
   }
@@ -171,6 +187,26 @@ export function worstState(
   return same.length > 1
     ? state(worst.tone, `${same.length} ${worst.label.toLowerCase()}`)
     : worst
+}
+
+/**
+ * What one row says for several records (the Server row for every node and
+ * database, a service's Domains row for its domains): trouble counted ("1
+ * offline"), since one of several is not all of them; otherwise `healthy`,
+ * once anything is known.
+ */
+export function countedState(
+  states: readonly (TreeState | undefined)[],
+  healthy = 'Healthy'
+): TreeState | undefined {
+  const worst = worstState(states)
+  if (!worst) return undefined
+  if (worst.tone === 'ok' || worst.tone === 'idle') return state('ok', healthy)
+  const label = worst.label.replace(/^\d+ /, '').toLowerCase()
+  const count = states.filter(
+    (candidate) => candidate?.label.toLowerCase() === label
+  ).length
+  return state(worst.tone, `${count} ${label}`)
 }
 
 export interface ServiceNode {
@@ -243,4 +279,83 @@ export function capRows<T>(
   const current = rows.findIndex(isCurrent)
   if (current >= limit) shown[limit - 1] = rows[current]
   return { shown, more: rows.length - limit }
+}
+
+/** One service whose databases an open project asks for. */
+export interface DatabaseRequest {
+  /** The project's tree key. */
+  key: string
+  service: ServiceNode
+}
+
+/**
+ * The services whose databases are asked for, open project by open
+ * project, at most `limit` in all, and the projects left with some not
+ * asked for. The tree never asks more than `limit` at once, however many
+ * projects are open.
+ */
+export function databaseRequests(
+  projects: readonly { key: string; services: readonly ServiceNode[] }[],
+  limit: number
+): { requests: DatabaseRequest[]; truncated: Set<string> } {
+  const requests: DatabaseRequest[] = []
+  const truncated = new Set<string>()
+  for (const project of projects)
+    for (const service of project.services) {
+      if (requests.length >= limit) {
+        truncated.add(project.key)
+        break
+      }
+      requests.push({ key: project.key, service })
+    }
+  return { requests, truncated }
+}
+
+/**
+ * The projects listed on a server with more than `limit`: the one shown,
+ * those in trouble, those opened recently (most recent first), then the
+ * rest in their order, up to `limit`. Trouble is listed first; the others
+ * keep their order in the full list, so a row does not move as the user
+ * opens another. With `limit` or fewer, every project is listed as it is.
+ */
+export function pickProjects<T extends { key: string }>(
+  nodes: readonly T[],
+  limit: number,
+  rules: {
+    isCurrent: (node: T) => boolean
+    inTrouble: (node: T) => boolean
+    /** Keys of the projects opened recently, most recent first. */
+    recent: readonly string[]
+  }
+): { shown: T[]; more: number } {
+  if (nodes.length <= limit) return { shown: [...nodes], more: 0 }
+  const chosen = new Set<string>()
+  const add = (node: T) => {
+    if (chosen.size < limit) chosen.add(node.key)
+  }
+  nodes.filter(rules.isCurrent).forEach(add)
+  nodes.filter(rules.inTrouble).forEach(add)
+  const byKey = new Map(nodes.map((node) => [node.key, node]))
+  for (const key of rules.recent) {
+    const node = byKey.get(key)
+    if (node) add(node)
+  }
+  nodes.forEach(add)
+  const picked = nodes.filter((node) => chosen.has(node.key))
+  const shown = [
+    ...picked.filter(rules.inTrouble),
+    ...picked.filter((node) => !rules.inTrouble(node)),
+  ]
+  return { shown, more: nodes.length - shown.length }
+}
+
+/** Projects remembered as opened recently in this browser. */
+export const RECENT_PROJECTS = 8
+
+/** `key` first in the recent list, which stays at most `RECENT_PROJECTS`. */
+export function withRecent(recent: readonly string[], key: string): string[] {
+  return [key, ...recent.filter((other) => other !== key)].slice(
+    0,
+    RECENT_PROJECTS
+  )
 }

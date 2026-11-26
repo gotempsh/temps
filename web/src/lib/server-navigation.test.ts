@@ -8,10 +8,12 @@ import {
   SERVER_AREAS,
   SERVER_ENTITIES,
   SERVER_HOME,
+  SERVER_PAGE,
   SERVER_VIEWS,
   SETTINGS_AREA_GROUPS,
   areaOwnsPath,
   isProjectsView,
+  isServerPage,
   isSettingsArea,
   resolveServerLocation,
 } from './server-navigation'
@@ -27,13 +29,18 @@ const urlsOf = (id: string) => [
 ]
 
 describe('the server-wide pages', () => {
-  test('the tree holds what is owned: projects, databases, domains, servers', () => {
+  test('every record of the server is a tab of the Server page, which opens on its nodes', () => {
     expect(SERVER_HOME.url).toBe('/projects')
     expect(SERVER_ENTITIES.map((item) => [item.title, item.url])).toEqual([
+      ['Nodes', '/settings/nodes'],
       ['Databases', '/storage'],
       ['Domains', '/domains'],
-      ['Servers', '/settings/nodes'],
     ])
+    expect(SERVER_PAGE.url).toBe('/settings/nodes')
+    for (const entity of SERVER_ENTITIES)
+      expect(isServerPage(entity)).toBe(true)
+    expect(isServerPage(SERVER_HOME)).toBe(false)
+    expect(isServerPage(undefined)).toBe(false)
   })
 
   test('data is not an entry: it is a tab of the Projects page', () => {

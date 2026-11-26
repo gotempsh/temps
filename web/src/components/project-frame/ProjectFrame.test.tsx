@@ -173,12 +173,12 @@ test('a tab names the page of a view with several; the title is not printed twic
   )
 })
 
-test('a view with one page has no tabs, so its page prints its own title', () => {
+test("a page held by another view is named by that view's tab", () => {
   const view = renderPage('domains', 'Domains')
-  expect(view.queryByRole('navigation')).toBeNull()
-  expect(
-    view.getByRole('heading', { name: 'Domains' }).className
-  ).not.toContain('sr-only')
+  expect(view.getByRole('navigation', { name: 'Overview pages' })).toBeTruthy()
+  expect(view.getByRole('heading', { name: 'Domains' }).className).toContain(
+    'sr-only'
+  )
 })
 
 test('a record below a view prints its own title', () => {
