@@ -1471,6 +1471,7 @@ async function postSourceFile(
 ): Promise<
   { ok: true; result: SourceFileResponse } | { ok: false; status: number; text: string }
 > {
+  // api-coverage: POST /projects/{project_id}/releases/{release}/source-files
   const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(release)}/source-files`
   const formData = new FormData()
   // Copy into a fresh ArrayBuffer-backed view so it satisfies BlobPart.
@@ -1618,6 +1619,7 @@ async function listSourceFilesAction(options: SourceFileListOptions): Promise<vo
 
   const apiUrl = normalizeApiUrl(config.get('apiUrl'))
   const apiKey = await credentials.getApiKey()
+  // api-coverage: GET /projects/{project_id}/releases/{release}/source-files
   const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-files`
 
   const result = await withSpinner('Fetching source files...', async () => {
@@ -1667,6 +1669,7 @@ async function deleteSourceFilesAction(options: SourceFileDeleteOptions): Promis
 
   const apiUrl = normalizeApiUrl(config.get('apiUrl'))
   const apiKey = await credentials.getApiKey()
+  // api-coverage: DELETE /projects/{project_id}/releases/{release}/source-files
   const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-files`
 
   const result = await withSpinner('Deleting source files...', async () => {
@@ -1748,6 +1751,7 @@ async function listSourceMapReleases(options: SourceMapReleasesOptions): Promise
 
   const apiUrl = normalizeApiUrl(config.get('apiUrl'))
   const apiKey = await credentials.getApiKey()
+  // api-coverage: GET /projects/{project_id}/source-map-releases
   const url = `${apiUrl}/projects/${projectId}/source-map-releases`
 
   const result = await withSpinner('Fetching releases...', async () => {
