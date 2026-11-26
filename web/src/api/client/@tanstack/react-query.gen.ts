@@ -1913,7 +1913,7 @@ export const rejectBlueprintVersionMutation = (options?: Partial<Options<RejectB
 /**
  * Start a chat with the Temps assistant.
  *
- * The assistant runs on the AI gateway (an OpenRouter key is enough), has no
+ * The assistant runs on the AI gateway (one provider key is enough), has no
  * sandbox, and acts with the calling user's own permissions: every tool call
  * is replayed through the real router with their auth, and every change is a
  * proposal the user confirms in the UI. When no provider is configured this

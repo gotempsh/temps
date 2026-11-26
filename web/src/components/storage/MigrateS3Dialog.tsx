@@ -3,10 +3,8 @@
 
 import {
   getServiceQueryKey,
-  listServicesQueryKey,
   migrateS3ServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { listServices } from '@/api/client/sdk.gen'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -34,7 +32,7 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
-import { fetchAllPages } from '@/lib/fetch-all-pages'
+import { serverDatabasesQuery } from '@/lib/server-databases'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
@@ -76,19 +74,9 @@ export function MigrateS3Dialog({
     defaultValues: { source_service_id: '' },
   })
 
-  // The list endpoint pages and cannot filter by type, so every page is read:
-  // a source beyond the first 100 services must still be selectable.
+  // Every page is read: a source beyond the first page must be selectable.
   const { data: services, isPending: isLoadingServices } = useQuery({
-    queryKey: [...listServicesQueryKey(), 'all-pages'],
-    queryFn: ({ signal }) =>
-      fetchAllPages(async (page, pageSize) => {
-        const { data } = await listServices({
-          query: { page, page_size: pageSize },
-          signal,
-          throwOnError: true,
-        })
-        return data ?? []
-      }),
+    ...serverDatabasesQuery(),
     enabled: open,
   })
   const sources = (services ?? []).filter(

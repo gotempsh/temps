@@ -27,11 +27,10 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
-import { Link, useNavigate, useParams } from 'react-router'
+import { Link, useParams } from 'react-router'
 import {
   backupAlertsSchema,
   domainAlertsSchema,
@@ -50,7 +49,7 @@ import { AlertRulesManagement } from './AlertRulesManagement'
 import { NodeAlertRules } from './NodeAlertRules'
 import { Alarms } from '@/pages/Alarms'
 import {
-  MONITORING_SECTIONS,
+  DEFAULT_MONITORING_SECTION,
   monitoringSectionLabel,
 } from './monitoring-sections'
 import { PageHeader } from '@/components/layout/PageContainer'
@@ -908,9 +907,8 @@ function WeeklyDigest({
 }
 
 export function MonitoringSettings() {
-  const navigate = useNavigate()
   const { section } = useParams()
-  const currentSection = section || 'alerts'
+  const currentSection = section || DEFAULT_MONITORING_SECTION
 
   const { data: preferences, isLoading } = useQuery({
     queryKey: ['preferences'],
@@ -919,10 +917,6 @@ export function MonitoringSettings() {
       return data
     },
   })
-
-  const handleSectionChange = (value: string) => {
-    navigate(`/monitoring/${value}`)
-  }
 
   const handleProjectSave = async (data: ProjectAlertsFormData) => {
     if (!preferences) return false
@@ -1204,50 +1198,11 @@ export function MonitoringSettings() {
     }
   }
 
+  // The area's tab strip, above, names the section and switches between
+  // them, so the page prints neither a second title nor a second switcher.
   return (
     <div className="space-y-6">
-      <PageHeader title="Monitoring & alerts" />
-
-      {/* Mobile Select */}
-      <div className="sm:hidden">
-        <Select value={currentSection} onValueChange={handleSectionChange}>
-          <SelectTrigger className="w-full">
-            <SelectValue>
-              {monitoringSectionLabel(currentSection) || 'Select section'}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            {MONITORING_SECTIONS.map((section) => (
-              <SelectItem key={section.id} value={section.id}>
-                {section.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {/* Desktop Tabs */}
-      <div className="hidden sm:block">
-        <Tabs
-          value={currentSection}
-          onValueChange={handleSectionChange}
-          className="space-y-4"
-        >
-          <TabsList>
-            {MONITORING_SECTIONS.map((section) => (
-              <TabsTrigger
-                key={section.id}
-                value={section.id}
-                icon={section.icon}
-              >
-                {section.label}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-        </Tabs>
-      </div>
-
-      {/* Content - Shared between mobile and desktop */}
+      <PageHeader title={monitoringSectionLabel(currentSection) ?? 'Alerts'} />
       {renderContent()}
     </div>
   )

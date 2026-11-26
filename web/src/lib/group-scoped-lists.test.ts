@@ -142,6 +142,20 @@ describe('merging', () => {
     expect(merged[1].usedBy.map((m) => m.name)).toEqual(['web'])
   })
 
+  test("each service keeps its own link, for its database's name", () => {
+    const merged = mergeGroupDatabases(
+      [web, api],
+      [[link(2, 'cache')], [link(2, 'cache')]]
+    )
+    expect(
+      merged[0].links.map(({ member, link }) => [member.name, link.id])
+    ).toEqual([
+      ['web', 200],
+      ['api', 200],
+    ])
+    expect(merged[0].service.name).toBe('cache')
+  })
+
   test('a failed or pending service contributes nothing', () => {
     expect(mergeGroupDatabases([web, api], [undefined, undefined])).toEqual([])
   })

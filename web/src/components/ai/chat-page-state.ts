@@ -43,21 +43,26 @@ export function chatComposerSubmitAction(
 }
 
 /**
- * Whether a key press in a composer sends the message. On a phone Enter is a
- * new line (the soft keyboard has no Shift, and the send button is on screen);
- * elsewhere Enter sends and Shift+Enter breaks the line. Enter while an IME is
- * composing only confirms the candidate, so it never sends.
+ * Whether a key press in a composer sends the message. ⌘Enter and Ctrl+Enter
+ * send everywhere: they need a hardware keyboard, so they also work in a
+ * window narrow enough to be laid out as a phone. Plain Enter sends on a
+ * computer, where Shift+Enter breaks the line; on a phone it is a new line
+ * (the soft keyboard has no Shift, and the send button is on screen). Enter
+ * while an IME is composing only confirms the candidate, so it never sends.
  */
 export function enterSendsMessage(
-  event: { key: string; shiftKey: boolean; isComposing?: boolean },
+  event: {
+    key: string
+    shiftKey: boolean
+    metaKey?: boolean
+    ctrlKey?: boolean
+    isComposing?: boolean
+  },
   mobile: boolean
 ): boolean {
-  return (
-    !mobile &&
-    event.key === 'Enter' &&
-    !event.shiftKey &&
-    event.isComposing !== true
-  )
+  if (event.key !== 'Enter' || event.isComposing === true) return false
+  if (event.metaKey === true || event.ctrlKey === true) return true
+  return !mobile && !event.shiftKey
 }
 
 /** Clamp the growing composer while preserving an internal scroll escape hatch. */

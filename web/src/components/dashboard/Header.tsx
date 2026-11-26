@@ -5,7 +5,6 @@ import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { AgentHandoffButton } from '@/components/agent-handoff/AgentHandoffButton'
 import { AiAssistantButton } from '@/components/ai/AiAssistantButton'
 import { BackupAlertsButton } from '@/components/dashboard/BackupAlertsButton'
-import { DropButton } from '@/components/dashboard/DropButton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { OperationsTray } from '@/components/operations/OperationsTray'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
@@ -190,14 +189,12 @@ export function Header() {
           {headerActions?.map((action) => (
             <React.Fragment key={action.id}>{action.element}</React.Fragment>
           ))}
-          {/* The "+" quick-actions menu and the theme toggle used to live here.
-              Every entry it held is now in the command palette (⌘K), and
-              appearance moved into the account menu — so the header keeps only
-              what you reach for mid-task: dropping files, the assistant,
-              in-flight operations, and alerts. */}
-          {/* Shows itself on pages that declared what they are showing. */}
+          {/* One button stands here: the assistant. Everything else is in the
+              command palette (⌘K) or on its own page. The others show
+              themselves only while they have something to say: a handoff on
+              pages that declared what they are showing, work running or
+              waiting for review, and a backup that is overdue or stalled. */}
           <AgentHandoffButton />
-          <DropButton />
           <AiAssistantButton />
           <OperationsTray />
           <BackupAlertsButton />

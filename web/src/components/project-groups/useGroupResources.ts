@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useQueries } from '@tanstack/react-query'
+import { queryOptions, useQueries } from '@tanstack/react-query'
+import { getProjectsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import { getProjects } from '@/api/client/sdk.gen'
+import type { ProjectResponse } from '@/api/client'
 import {
   fanoutMembers,
   groupBackupQueries,
@@ -15,6 +18,43 @@ import {
   type GroupDatabase,
   type GroupMember,
 } from '@/lib/group-scoped-lists'
+
+/** Members per request; the API caps a page at 100. */
+const MEMBER_PAGE_SIZE = 100
+const MAX_MEMBER_PAGES = 20
+
+/** Every member of a group as full services, across all pages. */
+async function fetchGroupMembers(groupId: number, signal: AbortSignal) {
+  const members: ProjectResponse[] = []
+  for (let page = 1; page <= MAX_MEMBER_PAGES; page++) {
+    const { data } = await getProjects({
+      query: { project_group_id: groupId, page, per_page: MEMBER_PAGE_SIZE },
+      signal,
+      throwOnError: true,
+    })
+    members.push(...data.projects)
+    if (
+      data.projects.length < MEMBER_PAGE_SIZE ||
+      members.length >= data.total
+    ) {
+      break
+    }
+  }
+  return members
+}
+
+/**
+ * The project's services in full (the project itself carries only a
+ * summary of each), shared by every page that needs more than the summary.
+ */
+export function groupServicesQuery(groupId: number) {
+  return queryOptions({
+    queryKey: getProjectsQueryKey({
+      query: { project_group_id: groupId, per_page: MEMBER_PAGE_SIZE },
+    }),
+    queryFn: ({ signal }) => fetchGroupMembers(groupId, signal),
+  })
+}
 
 /** State shared by every project-scoped list. */
 export interface ScopedListState {

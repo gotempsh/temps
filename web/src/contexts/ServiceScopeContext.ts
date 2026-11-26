@@ -7,6 +7,8 @@ export interface ScopedService {
   id: number
   name: string
   slug: string
+  /** For its icon: a monitored service has no deployment to show. */
+  source_type?: string | null
 }
 
 /**
@@ -20,7 +22,7 @@ export interface ServiceScope {
   href: string
   services: ScopedService[]
   /** The same page for every service on the server. */
-  serverWide: { title: string; url: string }
+  serverWide: { label: string; title: string; url: string }
 }
 
 const ServiceScopeContext = createContext<ServiceScope | null>(null)

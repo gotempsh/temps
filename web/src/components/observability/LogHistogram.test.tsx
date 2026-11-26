@@ -43,7 +43,7 @@ test('configured log volume is always shown as a short chart, with nothing to ex
   expect(html).toContain('aria-label="Group log volume by"')
   // Kept short so the log lines stay the main thing on the page.
   expect(html).not.toContain('h-[180px]')
-  expect(html).toContain('h-20')
+  expect(html).toContain('h-24')
 })
 
 test('unconfigured log volume shows setup guidance in the same compact card', () => {

@@ -3,202 +3,239 @@
 import { expect, test, type Page } from '@playwright/test'
 import type { ProjectResponse } from '../../src/api/client'
 
-async function hostedProjectRoot(page: Page) {
+async function hostedService(page: Page) {
   const { projects } = await (await page.request.get('/api/projects')).json()
   expect(projects.length).toBeGreaterThan(0)
-  const project = projects.find(
+  const project: ProjectResponse | undefined = projects.find(
     (project: ProjectResponse) =>
       project.hosting === 'hosted' && project.source_type !== 'external'
   )
   expect(project, 'Hosted navigation needs a hosted project').toBeDefined()
-  return `/projects/${project.slug}`
+  const { name, slug } = project as ProjectResponse
+  return { name, root: `/projects/${slug}` }
 }
 
-// Each section's pages, in order. Naming them (rather than only counting) is
-// what catches a page being added, dropped or renamed; `toHaveText` with an
-// array also pins the count.
-const SECTION_TABS = [
-  ['Overview', ['Overview', 'Activity']],
-  ['Databases', ['Databases', 'Key-value store', 'Blob storage']],
-  ['Logs', ['Application', 'Requests', 'Telemetry']],
+// The everyday views every hosted service has, in the sidebar's order.
+// Analytics is a row once the service receives page views, and offered
+// under "Add" until then; the occasional views are tabs of these.
+const ALWAYS = [
+  'Overview',
+  'Deployments',
+  'Logs',
+  'Errors',
+  'Variables',
+  'Settings',
+]
+
+// Each view's pages, as the one row of tabs on its page. Naming them (rather
+// than only counting) is what catches a page being added, dropped or renamed.
+const VIEW_TABS = [
+  // Is it healthy, and what it owns.
   [
-    'Errors',
-    [
-      'Issues',
-      'Alerts',
-      'Feedback',
-      'Releases',
-      'Source maps',
-      'Inbound filters',
-      'Attachments',
-      'Ownership',
-      'SDK health',
-      'Setup',
-    ],
-  ],
-  ['Traces', ['Traces', 'AI traces']],
-  [
-    'Analytics',
+    'Overview',
     [
       'Overview',
-      'Visitors',
-      'Live',
-      'Globe',
-      'Journey',
-      'Sessions',
-      'Pages',
-      'Funnels',
-      'Surveys',
-      'Activity report',
-      'Web performance',
-      'AI visitors',
-      'AI crawlers',
-      'API traffic',
-      'Revenue',
-      'Traffic filters',
-    ],
-  ],
-  [
-    'Monitoring',
-    [
+      'Activity',
       'Metrics',
-      'Dashboards',
-      'Alerts',
       'Uptime',
-      'Cron jobs',
-      'Check-ins',
-      'Durable workflows',
+      'Alerts',
+      'Domains',
+      'Databases',
     ],
   ],
+  ['Deployments', ['Deployments', 'Environments', 'Build']],
+  // What happened.
+  ['Logs', ['Application', 'Requests', 'OpenTelemetry', 'Traces']],
+  ['Variables', ['Variables', 'Secrets', 'Deploy tokens']],
   [
-    'Variables & secrets',
-    ['Environment variables', 'Secrets', 'Deployment tokens'],
+    'Settings',
+    [
+      'General',
+      'Data ingest',
+      'Protection',
+      'Edge rules',
+      'Access',
+      'Scans',
+      'Automation',
+      'Integrations',
+    ],
   ],
-  ['Security & access', ['Protection', 'Edge rules', 'Access', 'Scans']],
-  ['Automation & integrations', ['Automation', 'Integrations', 'Telemetry']],
 ] as const
 
-// Errors sends a project that has never reported one to its Setup tab, so
-// its menu entry may land there instead of on Issues.
-const OPENS_ON: Partial<Record<string, readonly string[]>> = {
-  Errors: ['Issues', 'Setup'],
-}
+/** Every tab of a strip, a link or a tab that opens a menu. */
+const tabsOf = (page: Page, view: string) =>
+  page
+    .getByRole('navigation', { name: `${view} pages`, exact: true })
+    .locator('[data-tab]')
 
-test('the project menu groups its sections and each section lists its pages as tabs', async ({
+test("a service's views are listed under it in the sidebar, and its page has one row of tabs", async ({
   page,
 }) => {
-  const root = await hostedProjectRoot(page)
+  const { name, root } = await hostedService(page)
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(error.message))
   await page.setViewportSize({ width: 1440, height: 1000 })
   await page.goto(`${root}/settings`)
   await expect(page).toHaveURL(/settings\/general$/)
 
-  const menu = (name: string) => page.getByRole('list', { name, exact: true })
-  await expect(menu('Project').getByRole('link')).toHaveText(['Overview'])
-  await expect(menu('Ship').getByRole('link')).toHaveText([
-    'Deployments',
-    'Environments',
-    'Domains',
-    'Databases',
-  ])
-  await expect(menu('Observe').getByRole('link')).toHaveText([
-    'Logs',
-    'Errors',
-    'Traces',
-    'Analytics',
-    'Monitoring',
-  ])
-  await expect(menu('Configure').getByRole('link')).toHaveText([
-    'Build & deploy',
-    'Variables & secrets',
-    'Security & access',
-    'Automation & integrations',
-    'General',
-  ])
+  const views = page.getByRole('list', { name: `${name} views`, exact: true })
+  // In order, whatever else is listed between them. Polled: the tree loads
+  // its services on its own, after the page has redirected.
+  await expect
+    .poll(async () =>
+      (await views.locator('a[data-view]').allTextContents()).filter((title) =>
+        ALWAYS.includes(title)
+      )
+    )
+    .toEqual(ALWAYS)
   await expect(
-    menu('Configure').getByRole('link', { name: 'General', exact: true })
+    views.getByRole('link', { name: 'Settings', exact: true })
   ).toHaveAttribute('aria-current', 'page')
-  // General is a single page: no row of tabs above it.
-  await expect(
-    page.getByRole('navigation', { name: 'General pages' })
-  ).toHaveCount(0)
 
-  const sidebar = page.locator('[data-sidebar="sidebar"]')
-  for (const [section, tabs] of SECTION_TABS) {
-    const link = sidebar.getByRole('link', { name: section, exact: true })
+  for (const [view, tabs] of VIEW_TABS) {
+    const link = views.getByRole('link', { name: view, exact: true })
     await link.click()
     await expect(link).toHaveAttribute('aria-current', 'page')
-    const nav = page.getByRole('navigation', { name: `${section} pages` })
-    await expect(nav.getByRole('link')).toHaveText([...tabs])
-    // The menu entry opens the section's first page.
-    const current = nav.locator('a[aria-current="page"]')
-    await expect(current).toHaveCount(1)
-    await expect(current).toHaveText(
-      new RegExp(`^(${(OPENS_ON[section] ?? [tabs[0]]).join('|')})$`)
+    // One row of tabs on the page, never a second one under it.
+    await expect(page.getByRole('navigation', { name: / pages$/ })).toHaveCount(
+      1
     )
+    const row = tabsOf(page, view)
+    await expect(row).toHaveText([...tabs])
+    // The view opens on its first page; every tab leads with its icon.
+    await expect(row.first()).toHaveAttribute('aria-current', 'page')
+    await expect(row.locator('> svg:first-child')).toHaveCount(tabs.length)
   }
-  await page.screenshot({
-    path: '/tmp/temps-project-navigation.png',
-    fullPage: true,
-  })
 
-  // A tab other than the first keeps its section selected in the menu.
-  await sidebar.getByRole('link', { name: 'Monitoring', exact: true }).click()
-  const monitoring = page.getByRole('navigation', { name: 'Monitoring pages' })
-  await monitoring.getByRole('link', { name: 'Cron jobs', exact: true }).click()
-  await expect(page).toHaveURL(/\/cron-jobs$/)
-  await expect(
-    monitoring.getByRole('link', { name: 'Cron jobs', exact: true })
-  ).toHaveAttribute('aria-current', 'page')
-  await expect(
-    sidebar.getByRole('link', { name: 'Monitoring', exact: true })
-  ).toHaveAttribute('aria-current', 'page')
-  // Check-ins (jobs scheduled elsewhere) is a page of its own, not part of
-  // Cron jobs (jobs Temps runs).
-  await monitoring.getByRole('link', { name: 'Check-ins', exact: true }).click()
-  await expect(page).toHaveURL(/\/check-ins$/)
-  await expect(
-    monitoring.getByRole('link', { name: 'Check-ins', exact: true })
-  ).toHaveAttribute('aria-current', 'page')
+  // Settings stay in the column of every other page: the tabs do not move.
+  const settingsRow = await page
+    .getByRole('navigation', { name: 'Settings pages', exact: true })
+    .boundingBox()
+  await views.getByRole('link', { name: 'Deployments', exact: true }).click()
+  const deploymentsRow = await page
+    .getByRole('navigation', { name: 'Deployments pages', exact: true })
+    .boundingBox()
+  expect(settingsRow?.x).toBe(deploymentsRow?.x)
+  expect(settingsRow?.width).toBe(deploymentsRow?.width)
 
-  await sidebar
-    .getByRole('link', { name: 'Build & deploy', exact: true })
-    .click()
-  await expect(page).toHaveURL(/\/build-deploy$/)
+  // A page that holds several is a tab that opens a menu of them, and says
+  // which one is shown.
+  await page.goto(`${root}/errors/inbound-filters`)
+  const settings = page
+    .getByRole('navigation', { name: 'Errors pages', exact: true })
+    .getByRole('button', { name: /^Settings/ })
+  await expect(settings).toHaveAttribute('aria-current', 'true')
+  await expect(settings).toContainText('Inbound filters')
+  await settings.click()
+  const menu = page.getByRole('menu')
+  await expect(menu.getByRole('menuitem')).toHaveText([
+    'Source maps',
+    'Inbound filters',
+    'Attachments',
+    'Ownership',
+    'SDK health',
+    'Setup',
+  ])
+  await menu.getByRole('menuitem', { name: 'Ownership' }).click()
+  await expect(page).toHaveURL(/\/errors\/ownership$/)
+  await expect(settings).toContainText('Ownership')
   await expect(
-    page.getByRole('navigation', { name: 'Build & deploy pages' })
-  ).toHaveCount(0)
+    views.getByRole('link', { name: 'Errors', exact: true })
+  ).toHaveAttribute('aria-current', 'true')
   expect(errors).toEqual([])
 })
 
-test('legacy build links and the mobile project menu stay usable', async ({
+test('on a phone, the page names its view and opens the sidebar on the views', async ({
   page,
 }) => {
-  const root = await hostedProjectRoot(page)
+  const { name, root } = await hostedService(page)
   await page.setViewportSize({ width: 390, height: 844 })
-  // The old standalone build page redirects to its section of Build & deploy
-  // and scrolls it into view; every section is always open.
-  await page.goto(`${root}/settings/build?tab=previews`)
-  await expect(page).toHaveURL(/settings\/delivery\?section=previews$/)
-  await expect(page.locator('#settings-section-previews')).toBeInViewport()
+  await page.goto(`${root}/settings/automation`)
 
-  await page.getByRole('button', { name: 'Toggle sidebar' }).first().click()
-  const menu = page.getByRole('dialog')
-  await menu
-    .getByRole('link', { name: 'Automation & integrations', exact: true })
-    .click()
-  await expect(page).toHaveURL(/settings\/automation$/)
-  await expect(menu).not.toBeVisible()
+  // One row, cut to what fits: the tab shown stays, the rest are under More.
+  const row = page.getByRole('navigation', {
+    name: 'Settings pages',
+    exact: true,
+  })
   await expect(
-    page
-      .getByRole('navigation', { name: 'Automation & integrations pages' })
-      .getByRole('link', { name: 'Automation', exact: true })
-  ).toHaveAttribute('aria-current', 'page')
-  // The tabs scroll inside their row; the page itself never scrolls sideways.
+    row.getByRole('link', { name: 'Automation', exact: true })
+  ).toBeVisible()
+  await expect(
+    row.getByRole('button', { name: 'More Settings pages' })
+  ).toBeVisible()
+  // Nothing scrolls sideways, the strip included.
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= window.innerWidth
     )
   ).toBe(true)
+  expect(await row.evaluate((nav) => nav.scrollWidth <= nav.clientWidth)).toBe(
+    true
+  )
+
+  await page.getByRole('button', { name: 'Settings. Show all views' }).click()
+  const drawer = page.getByRole('dialog')
+  const views = drawer.getByRole('list', { name: `${name} views`, exact: true })
+  // Marked as the view the page is in; its own page is General.
+  await expect(
+    views.getByRole('link', { name: 'Settings', exact: true })
+  ).toHaveAttribute('aria-current', 'true')
+  await views.getByRole('link', { name: 'Logs', exact: true }).click()
+  await expect(page).toHaveURL(/\/runtime$/)
+  await expect(drawer).not.toBeVisible()
+  await expect(
+    page.getByRole('button', { name: 'Logs. Show all views' })
+  ).toBeVisible()
+  await expect(tabsOf(page, 'Logs').first()).toHaveAttribute(
+    'aria-current',
+    'page'
+  )
+})
+
+test('a legacy build link still lands on its section of the delivery settings', async ({
+  page,
+}) => {
+  const { root } = await hostedService(page)
+  await page.setViewportSize({ width: 390, height: 844 })
+  // The old standalone build page redirects to its section and scrolls it
+  // into view; every section is always open.
+  await page.goto(`${root}/settings/build?tab=previews`)
+  await expect(page).toHaveURL(/settings\/delivery\?section=previews$/)
+  await expect(page.locator('#settings-section-previews')).toBeInViewport()
+})
+
+test('the tree lists the projects and one Server row, whose page has every record of the server as tabs', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await page.goto('/backups')
+  const tree = page.getByRole('list', { name: 'Your server', exact: true })
+  await expect(tree.locator(':scope > li > a')).toHaveText([
+    /^Projects/,
+    /^Server/,
+  ])
+  await expect(tree.locator('[data-branch="server"] a')).toHaveAttribute(
+    'aria-current',
+    'true'
+  )
+  const strip = page.getByRole('navigation', {
+    name: 'Server views',
+    exact: true,
+  })
+  // One row; the tab shown names its page.
+  await expect(
+    page.getByRole('navigation', { name: / (pages|views)$/ })
+  ).toHaveCount(1)
+  await expect(strip.locator('[data-tab]')).toHaveText([
+    'Nodes',
+    'DatabasesBackups',
+    'Domains',
+  ])
+  await strip.getByRole('button', { name: /^Domains/ }).click()
+  await page.getByRole('menuitem', { name: 'Certificates' }).click()
+  await expect(page).toHaveURL(/\/certificates$/)
+  await expect(tree.locator('[data-branch="server"] a')).toHaveAttribute(
+    'aria-current',
+    'true'
+  )
 })

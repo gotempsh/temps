@@ -45,8 +45,16 @@ squeezed. The page shell picks one of two widths per route.
 
 | Width | About | For |
 |---|---|---|
-| `form` | 1024px (`mx-auto max-w-5xl`), centered with its header | Settings and other forms: Configure pages that are forms, environment settings |
+| `form` | 1024px (`max-w-5xl`) | Settings and other forms: Configure pages that are forms, environment settings |
 | `full` | the whole content area, inside the gutters | Everything else: overview, deployments, environments, errors, analytics, monitoring, logs, traces, session replay, environment variables, secrets, tokens, scans |
+
+**The pages of one entity share one column.** Going from a service's
+Deployments to its Settings must not move or resize the header and the tabs.
+So inside an entity (a service, a project, any record with several pages) the
+shell is `full` on every page, and `form` only keeps the *body* of a form page
+to the form measure, starting at the same left edge as the tabs above it;
+nothing is re-centred. A centred `form` column (`mx-auto`, header included) is
+for an area whose every page is a form, where there is nothing to jump from.
 
 A `full` page starts at the same left edge as the project/environment bar
 above it, so lists and dashboards line up with the header instead of floating
@@ -55,10 +63,12 @@ in a narrower column.
 - Use [PageContainer and PageHeader](web/src/components/layout/PageContainer.tsx).
   `PageContainer` takes `width="form" | "full"` (default `full`).
 - The route shell owns the width and the gutters (`px-4 py-6 sm:px-6 lg:px-8`),
-  not the page. In a project each section declares its width in
-  `web/src/lib/project-navigation.ts`, and a tab can override it. Pages do
-  not add their own `max-w-*`, `container` or `mx-auto` wrappers, so the width
-  is decided in one place.
+  not the page. In a service each section declares in
+  `web/src/lib/project-navigation.ts` whether its pages are forms, a tab can
+  override it, and the shell (`ProjectSectionChrome`) keeps a form's body to
+  the form measure inside the one `full` column. Pages do not add their own
+  `max-w-*`, `container` or `mx-auto` wrappers, so the width is decided in one
+  place.
 - The page header and section tabs sit inside the same column as the content,
   so the title, tabs and body share one left edge. App chrome above the page
   (the project/environment bar) stays full width so it does not move as you
@@ -72,11 +82,28 @@ in a narrower column.
 - Use `PageHeader` for every page title, never a hand-rolled `h1`/`h2`. When
   a section's tab strip already names the page (the "Metrics" tab on the
   Metrics page), the title stays for screen readers only and the description
-  and actions keep their place. One row of tabs per page: a page inside a
-  tabbed section does not add its own tab strip for the same pages.
+  and actions keep their place.
+- **One row of tabs per page, never two.** A strip stacked under another (a
+  row of views, a row of their pages below it, a third below that) is
+  forbidden: it reads as two navigations, costs a third of a phone screen and
+  each row is cut off at a different place.
+  - What would be the upper row is navigation and belongs in the sidebar. A
+    service's views (Deployments, Logs, Errors, Settings) are listed under
+    the service in the tree, at every width; on a phone the tree is a drawer,
+    and a button that names the view shown opens it (`ViewMenuButton`).
+    Folded to icons, the sidebar shows one icon per view.
+  - What would be a lower row is a menu. A tab that holds several pages
+    opens a menu of them and, while one of them is shown, says which beside
+    its own title (`PageTab.pages`).
+  - Every tab of the row leads with its icon, at every width, and so does
+    every entry of a tab's menu and of "More". `PageTabStrip` has no switch
+    to leave them off.
+  - `PageTabStrip` draws one row and has no levels, so a second row cannot be
+    asked for. A page inside a tabbed section does not add its own strip for
+    the same pages either.
 - Tabs that switch between sections of a page, or between choices in a
   form, carry an icon before the label through `TabsTrigger`'s `icon` prop
-  (never a hand-drawn icon in the children), every tab in the strip or none.
+  (never a hand-drawn icon in the children): every tab has one, always.
   Reuse the icon the sidebar or project navigation already gives the same
   concept. Counts go in the `count` prop, not in brackets in the label. Leave
   icons off code-language switchers, compact metric pickers beside a chart,
@@ -320,8 +347,12 @@ that needs it is a bug at that width, fixed by changing the layout.
 - Long identifiers, hosts and commands break (`overflow-wrap: anywhere`)
   rather than widening their column. Truncate only with a way to see the full
   value.
-- Cells pad less in a narrow table; tabs wrap to a second line; header actions
-  keep their width and the description wraps beside or under them.
+- Cells pad less in a narrow table; header actions keep their width and the
+  description wraps beside or under them.
+- A strip of page tabs (`PageTabStrip`) stays one row at any width: it keeps
+  the tabs that fit, always including the one shown, and lists the rest under
+  "More". It measures the width it has, so the sidebar counts. In-page `Tabs`
+  wrap to a second line.
 - Check every changed screen from 320px up, in the content area after the
   sidebar. The overflow wrappers around the shared Table and tab strips are a
   safety net, never the layout.
@@ -421,8 +452,8 @@ selected text after its hover background becomes light.
 
 - Check at 320px, 390px, 768px, and a wide desktop width. Widths are measured in the
   content area after the sidebar, not the entire viewport; on a wide screen a
-  `form` page is a centered, capped column including its header, and a
-  `full` page fills it.
+  `form` page is a capped column (inside an entity only its body is capped,
+  from the left edge its tabs start at), and a `full` page fills it.
 - Verify both light and dark mode, including hover, selected, pending, and
   disabled controls.
 - No horizontal scrolling at any width, in the document or in any surface
@@ -449,7 +480,9 @@ selected text after its hover background becomes light.
 
 Before handing off a changed screen:
 
-- [ ] The route's width (`form` or `full`), one padding owner, shared page header.
+- [ ] The route's width (`form` or `full`), one padding owner, shared page header;
+      the header and tabs do not move between the pages of one entity.
+- [ ] At most one row of tabs, at every width; no strip under another.
 - [ ] Primary content appears promptly below the heading: no paragraph
       explaining the page or a section under its title.
 - [ ] One collection surface; no nested dashed empty panel or decorative shadow.
@@ -504,8 +537,10 @@ styling overrides. Labels keep a constant font weight. Lead each label with a
 Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
 technology), so a strip can be scanned by shape as well as by word. The icon
 never replaces the label, on any screen size; below `sm` the trigger drops the
-icon and keeps the label, so a phone fits more of the strip. Give every tab in a strip an
-icon or none, keep icons distinct within a strip, and let a section's landing
+icon and keeps the label, so a phone fits more of the strip (a strip of page
+tabs, `PageTabStrip`, keeps its icons at every width and lists what does not
+fit under "More"). Give every tab an icon, always; keep icons distinct within
+a strip, and let a section's landing
 tab share the icon its section has in the menu. Add icons to a strip when
 touching it.
 

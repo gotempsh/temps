@@ -3,17 +3,17 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
-  GROUP_NAV_GROUPS,
   GROUP_NAV_SECTIONS,
   SERVER_WIDE_LISTS,
   groupSectionDestinations,
+  groupPathHref,
   groupSectionHref,
+  resolveGroupLocation,
   legacyGroupTabRedirect,
   resolveConsoleScope,
   resolveGroupSection,
 } from './console-scope'
-import { primaryPlatformGroups } from '@/components/dashboard/primary-navigation'
-import { platformToolGroups } from '@/components/platform/platform-tools'
+import { SERVER_AREAS } from './server-navigation'
 
 describe('resolveConsoleScope', () => {
   test('a project (group) and everything below it is project scope', () => {
@@ -70,10 +70,23 @@ describe('project navigation', () => {
       'analytics',
       'domains',
       'databases',
-      'backups',
       'variables',
       'settings',
     ])
+  })
+
+  test('Backups is a page of Databases, not an entry of its own', () => {
+    const databases = GROUP_NAV_SECTIONS.find((s) => s.id === 'databases')
+    expect(databases?.tabs?.map((tab) => [tab.title, tab.url])).toEqual([
+      ['Databases', 'databases'],
+      ['Backups', 'backups'],
+    ])
+    expect(resolveGroupSection('backups')).toBe('databases')
+    expect(resolveGroupLocation('backups').tab?.title).toBe('Backups')
+    expect(resolveGroupLocation('databases').tab?.title).toBe('Databases')
+    // A record below a tab is no tab's own page.
+    expect(resolveGroupLocation('backups/3').tab).toBeUndefined()
+    expect(resolveGroupLocation('backups/3').section?.id).toBe('databases')
   })
 
   test('holds no server-wide administration', () => {
@@ -86,13 +99,44 @@ describe('project navigation', () => {
       expect(titles).not.toContain(admin)
   })
 
-  test('groups sections by job, Overview first and unlabelled', () => {
-    expect(GROUP_NAV_GROUPS[0].label).toBeUndefined()
-    expect(GROUP_NAV_GROUPS.map((group) => group.label)).toEqual([
-      undefined,
-      'Observe',
-      'Resources',
-      'Configure',
+  test('is one list of views, with no parent grouping them by kind', () => {
+    expect(GROUP_NAV_SECTIONS.map((section) => section.title)).toEqual([
+      'Overview',
+      'Deployments',
+      'Logs',
+      'Errors',
+      'Traces',
+      'Analytics',
+      'Domains',
+      'Databases',
+      'Shared variables',
+      'Settings',
+    ])
+    // The former parents are not pages: their sub-paths are the overview's.
+    for (const path of ['observe', 'resources', 'configure'])
+      expect(resolveGroupLocation(path).section.id).toBe('overview')
+  })
+
+  test('a sub-path is a view, and the tab of it when the view has several', () => {
+    expect(resolveGroupLocation('').section.id).toBe('overview')
+    expect(resolveGroupLocation('logs')).toMatchObject({
+      section: { id: 'logs' },
+      tab: undefined,
+    })
+    expect(resolveGroupLocation('backups')).toMatchObject({
+      section: { id: 'databases' },
+      tab: { title: 'Backups' },
+    })
+    expect(groupPathHref('a b', 'backups')).toBe('/p/a%20b/backups')
+  })
+
+  test('a view that holds nothing until a service uses it says what is missing', () => {
+    const missing = GROUP_NAV_SECTIONS.filter((section) => section.missing)
+    expect(missing.map((section) => section.id)).toEqual([
+      'traces',
+      'analytics',
+      'domains',
+      'databases',
     ])
   })
 
@@ -113,14 +157,12 @@ describe('project navigation', () => {
 })
 
 describe('nothing becomes unreachable', () => {
-  const globalUrls = new Set([
-    ...primaryPlatformGroups.flatMap((group) =>
-      group.items.map((item) => item.url)
-    ),
-    ...platformToolGroups.flatMap((group) =>
-      group.items.map((item) => item.url)
-    ),
-  ])
+  const globalUrls = new Set(
+    SERVER_AREAS.flatMap((area) => [
+      area.url,
+      ...(area.tabs ?? []).map((tab) => tab.url),
+    ])
+  )
 
   test('every server-wide list a project page links to is in the global navigation', () => {
     for (const list of Object.values(SERVER_WIDE_LISTS))
@@ -139,6 +181,11 @@ describe('nothing becomes unreachable', () => {
     expect(new Set(destinations.map((d) => d.id)).size).toBe(
       destinations.length
     )
+    // A view's second page is a page too; the former parents are not.
+    expect(urls).not.toContain('/p/storefront/resources')
+    expect(
+      destinations.find((d) => d.url === '/p/storefront/backups')?.title
+    ).toBe('Storefront · Databases · Backups')
     expect(
       destinations.find((d) => d.url === '/p/storefront/databases')
     ).toMatchObject({
