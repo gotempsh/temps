@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { PageHeader } from '@/components/layout/PageContainer'
@@ -36,8 +36,12 @@ const tabs = (root: HTMLElement) =>
     a.getAttribute('href'),
   ])
 
+// A view with several pages is a button that opens a menu of them.
 const titles = (nav: HTMLElement) =>
-  [...nav.querySelectorAll('a')].map((a) => a.textContent)
+  [...nav.querySelectorAll('[data-tab]')].map((tab) => tab.textContent)
+
+const current = (nav: HTMLElement) =>
+  nav.querySelector('[aria-current]')?.textContent
 
 describe('the Projects page carries what is seen across every project', () => {
   const VIEWS = ['Projects', 'Logs', 'Errors', 'Traces', 'Analytics', 'Alerts']
@@ -55,27 +59,29 @@ describe('the Projects page carries what is seen across every project', () => {
       expect(nav.querySelector('[aria-current="page"]')?.textContent).toBe(
         current
       )
-      // A view with one page has no second row.
+      // One row, whatever the view.
       expect(view.getAllByRole('navigation')).toHaveLength(1)
       cleanup()
     }
   })
 
-  test('a view with several pages lists them in a second row', () => {
+  test('a view with several pages is a tab that opens a menu, not a second row', async () => {
     const view = renderAt('/monitoring/rules')
-    const nav = view.getByRole('navigation', { name: 'Projects views' })
-    expect(nav.querySelector('[aria-current="page"]')?.textContent).toBe(
-      'Alerts'
-    )
-    const pages = view.getByRole('navigation', { name: 'Alerts pages' })
-    expect(titles(pages)).toEqual([
+    expect(view.getAllByRole('navigation')).toHaveLength(1)
+    const alerts = view.getByRole('button', { name: /^Alerts/ })
+    expect(alerts.getAttribute('aria-current')).toBe('true')
+    // It says which of its pages is shown.
+    expect(alerts.textContent).toBe('AlertsRules')
+    fireEvent.pointerDown(alerts, { button: 0, ctrlKey: false })
+    const menu = await view.findByRole('menu')
+    expect([...menu.querySelectorAll('a')].map((a) => a.textContent)).toEqual([
       'Alarms',
       'Rules',
       'Events',
       'Channels',
       'Preferences',
     ])
-    expect(pages.querySelector('[aria-current="page"]')?.textContent).toBe(
+    expect(menu.querySelector('[aria-current="page"]')?.textContent).toBe(
       'Rules'
     )
   })
@@ -83,17 +89,13 @@ describe('the Projects page carries what is seen across every project', () => {
   test('gathers a page that lives at an unrelated URL', () => {
     const view = renderAt('/settings/notifications')
     expect(
-      view
-        .getByRole('navigation', { name: 'Alerts pages' })
-        .querySelector('[aria-current="page"]')?.textContent
-    ).toBe('Channels')
+      current(view.getByRole('navigation', { name: 'Projects views' }))
+    ).toBe('AlertsChannels')
     cleanup()
     const revenue = renderAt('/revenue')
     expect(
-      revenue
-        .getByRole('navigation', { name: 'Projects views' })
-        .querySelector('[aria-current="page"]')?.textContent
-    ).toBe('Analytics')
+      current(revenue.getByRole('navigation', { name: 'Projects views' }))
+    ).toBe('AnalyticsRevenue')
   })
 
   test('a form or a project below it stands alone, without the strip', () => {
@@ -159,11 +161,12 @@ describe('the tab strip above a branch of the tree', () => {
     ])
   })
 
-  test('tab icons sit before the label and drop on a phone', () => {
+  test('every tab leads with its icon, on a phone too', () => {
     const view = renderAt('/storage')
     const icon = view.getByRole('link', { name: 'Backups' }).firstElementChild
     expect(icon?.tagName.toLowerCase()).toBe('svg')
     expect(icon?.getAttribute('aria-hidden')).toBe('true')
-    expect(icon?.getAttribute('class')).toContain('max-sm:hidden')
+    // No width at which it is dropped.
+    expect(icon?.getAttribute('class')).not.toContain('hidden')
   })
 })

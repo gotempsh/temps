@@ -77,7 +77,7 @@ import {
 /** How wide a page may grow; see `PageWidth` in the design system. */
 export type { PageWidth }
 
-/** A page behind a tab that holds several: a row of a second strip. */
+/** A page behind a tab that holds several: an entry of the tab's menu. */
 export interface ProjectNavView {
   title: string
   /** Distinct within its tab; the first view shares the tab's icon. */
@@ -94,10 +94,10 @@ export interface ProjectNavView {
 
 export interface ProjectNavTab extends ProjectNavView {
   /**
-   * The tab's pages, when it holds more than one. They show as a second
-   * strip under the section's, so a section keeps a few tabs to look at and
-   * its narrower pages stay one click further. The first is the tab's own
-   * `url`.
+   * The tab's pages, when it holds more than one. The tab then opens a menu
+   * of them (a page never gets a second row of tabs), so a view keeps a few
+   * tabs to look at and its narrower pages stay one click further. The
+   * first is the tab's own `url`.
    */
   views?: [ProjectNavView, ProjectNavView, ...ProjectNavView[]]
 }
@@ -143,7 +143,7 @@ function tabOf(
 }
 
 /**
- * A service's views, in the order of the tabs of its page: what it is, the
+ * A service's views, in the order the sidebar lists them: what it is, the
  * data it has, what it owns, then how it is configured. One shape with a
  * project's, so a view is in the same place at both levels.
  */
@@ -564,11 +564,10 @@ export function resolveProjectLocation(route: string): ProjectNavLocation {
 }
 
 /**
- * Whether the tabs above already name the page at `route`: it is a view's,
- * a tab's or a sub-page's own page, not a record below it (`errors`, not
- * `errors/42`). The page then does not print its title a second time. The
- * Overview is the exception: its tab says "Overview", its page names the
- * service.
+ * Whether the page at `route` is a view's, a tab's or a sub-page's own page,
+ * not a record below it (`errors`, not `errors/42`). Where a tab names such
+ * a page, the page does not print its title a second time. The Overview is
+ * the exception: its page names the service.
  */
 export function projectTabNamesPage(
   route: string,
@@ -600,8 +599,11 @@ export function projectRoot(slug: string): string {
 const ENVIRONMENT_SETTINGS_VIEW = 'settings'
 
 /**
- * The width a project page gets. The environment settings view is a form,
- * though the rest of the Environments tab is a dashboard.
+ * How wide the body of a project page may grow. Every page of a service is
+ * in one column with one left edge, so its tabs and header stay where they
+ * are from page to page; `form` only keeps a form's body to a readable
+ * measure inside it. The environment settings view is a form, though the
+ * rest of the Environments tab is a dashboard.
  */
 export function projectPageWidth(
   location: ProjectNavLocation,
@@ -667,7 +669,7 @@ function tabFor(
   const views = tab.views.filter((view) => projectHasPage(project, view.url))
   const [first, second, ...rest] = views
   if (!first) return []
-  // One page left needs no second strip: the tab is that page.
+  // One page left needs no menu: the tab is that page.
   if (!second) return [{ ...first, title: tab.title, icon: tab.icon }]
   return [{ ...tab, url: first.url, views: [first, second, ...rest] }]
 }
@@ -699,7 +701,7 @@ const SETTINGS_SECTIONS: readonly ProjectSectionId[] = [
   'automation',
 ]
 
-/** A tab of a service's page: one section, or the settings ones together. */
+/** A view of a service: one section, or the settings ones together. */
 export interface ProjectEntityView {
   /** The section's id; Settings goes by `general`. */
   id: ProjectSectionId
@@ -707,15 +709,15 @@ export interface ProjectEntityView {
   icon: LucideIcon
   /** The sections whose pages it holds: one, except for Settings. */
   sections: ProjectNavSection[]
-  /** Its pages, as the row under the tabs. The first is where it opens. */
+  /** Its pages, as the tabs of its page. The first is where it opens. */
   tabs: ProjectNavTab[]
 }
 
 /**
- * The tabs of `project`'s page: a view per section, in order, with what is
- * configured once (security, automation, the service's own settings)
- * together under one Settings tab at the end, so the strip stays a list of
- * what is looked at every day.
+ * `project`'s views, as the sidebar lists them under it: one per section, in
+ * order, with what is configured once (security, automation, the service's
+ * own settings) together under one Settings view at the end, so the list
+ * stays what is looked at every day.
  */
 export function projectEntityViewsFor(project: {
   source_type?: string | null
@@ -743,6 +745,16 @@ export function projectEntityViewsFor(project: {
       tabs: settings.flatMap((section) => section.tabs),
     })
   return views
+}
+
+/** The view of `project` that holds the page at `location`. */
+export function projectEntityViewOf(
+  project: { source_type?: string | null },
+  location: ProjectNavLocation
+): ProjectEntityView | undefined {
+  return projectEntityViewsFor(project).find((view) =>
+    view.sections.some((section) => section.id === location.section.id)
+  )
 }
 
 /**

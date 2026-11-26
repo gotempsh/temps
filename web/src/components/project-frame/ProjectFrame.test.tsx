@@ -141,3 +141,69 @@ test('page titles inside a project are one level below the project name', () => 
   expect(view.getByRole('heading', { level: 2, name: 'KV store' })).toBeTruthy()
   expect(view.queryByRole('heading', { level: 1 })).toBeNull()
 })
+
+function renderPage(route: string, title: string) {
+  const query = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  query.setQueryData(
+    getEnvironmentsOptions({ path: { project_id: 1 } }).queryKey,
+    environments
+  )
+  const project = { id: 1, slug: 'first' } as ProjectResponse
+  return render(
+    <QueryClientProvider client={query}>
+      <MemoryRouter initialEntries={[`/projects/first/${route}`]}>
+        <ProjectFrame project={project}>
+          <ProjectSectionChrome project={project}>
+            <PageHeader title={title} />
+          </ProjectSectionChrome>
+        </ProjectFrame>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+test('a tab names the page of a view with several; the title is not printed twice', () => {
+  const view = renderPage('errors/feedback', 'Feedback')
+  expect(view.getByRole('navigation', { name: 'Errors pages' })).toBeTruthy()
+  // Kept for assistive technology.
+  expect(view.getByRole('heading', { name: 'Feedback' }).className).toContain(
+    'sr-only'
+  )
+})
+
+test('a view with one page has no tabs, so its page prints its own title', () => {
+  const view = renderPage('domains', 'Domains')
+  expect(view.queryByRole('navigation')).toBeNull()
+  expect(
+    view.getByRole('heading', { name: 'Domains' }).className
+  ).not.toContain('sr-only')
+})
+
+test('a record below a view prints its own title', () => {
+  const view = renderPage('errors/42', 'TypeError')
+  expect(
+    view.getByRole('heading', { name: 'TypeError' }).className
+  ).not.toContain('sr-only')
+})
+
+test('settings stay in the column of every other page; only the form body is kept narrow', () => {
+  const body = (route: string) => {
+    const view = renderPage(route, 'The page')
+    const found = view.container.querySelector('[data-page-body]')
+    const result = [
+      found?.getAttribute('data-page-body'),
+      found?.className ?? '',
+      // The tabs are outside the body, so they keep the column's width.
+      found?.querySelector('nav') === null,
+    ]
+    cleanup()
+    return result
+  }
+  expect(body('settings/general')).toEqual(['form', 'max-w-5xl', true])
+  // No centring: the body starts at the left edge the tabs start at.
+  expect(body('settings/general')[1]).not.toContain('mx-auto')
+  expect(body('deployments')).toEqual(['full', '', true])
+  expect(body('settings/edge-rules')).toEqual(['full', '', true])
+})

@@ -30,6 +30,12 @@ Imperative digest. If a rule and a screenshot disagree, fix the screenshot.
 - Nothing scrolls sideways, at any width: not the page, a table, or a tab
   strip. Tables show columns by priority with container queries and fold
   what is needed to act under the record's name (see Responsive).
+- One row of tabs per page, never a strip under another. An entity's views
+  belong in the sidebar, under the entity; a tab that holds several pages
+  opens a menu of them (see Canonical tabs).
+- The pages of one entity share one column: the header and the tabs do not
+  move or resize from page to page. A form among them keeps only its body to
+  the form measure, from the same left edge.
 - Color never decorates. It appears only through `Status` (badges, dots,
   chart series). If you reach for a raw color to convey meaning outside
   `Status`, stop and add a tone to `Status` instead. Existing provider logos
@@ -223,7 +229,9 @@ is not a container by itself: wrap it in `<div className="@container">`
 directly around the table, or the `@` classes measure some ancestor instead
 (and with none, the columns never show). Move
 what a hidden column says that is needed to act under the name. Long
-identifiers break (`overflow-wrap: anywhere`). Tabs wrap. Check from 320px up.
+identifiers break (`overflow-wrap: anywhere`). In-page tabs wrap; a strip of
+page tabs stays one row and lists what does not fit under "More". Check from
+320px up.
 `DataTable`'s overflow wrapper and `ScrollableTabsList` are a safety net and a
 legacy gap, not a layout; convert a table when touching it.
 
@@ -365,8 +373,8 @@ active tab. No pill container, selected-card background, shadow, or page-local
 styling overrides. Labels keep a constant font weight. Lead each label with a
 Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
 technology), so a strip can be scanned by shape as well as by word. The icon
-never replaces the label, on any screen size. Give every tab in a strip an
-icon or none, keep icons distinct within a strip, and let a section's landing
+never replaces the label, on any screen size. Give every tab an icon, always;
+keep icons distinct within a strip, and let a section's landing
 tab share the icon its section has in the menu. Add icons to a strip when
 touching it.
 
@@ -378,6 +386,23 @@ strips wrap to a second line rather than scroll (the shared scrolling strip is
 a legacy gap). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
+
+A page has one row of tabs at most. Never stack a second strip under the
+first, in any style: not a row of pills under the underline row, not a row of
+text links under that. Two stacked rows are two levels of navigation, and each
+has a better home:
+
+- The upper level (an entity's views: a service's Deployments, Logs, Errors,
+  Settings) goes in the sidebar, as rows under the entity, on a desktop and
+  on a phone alike. On a phone the page shows one button that names the view
+  and opens the sidebar on those rows.
+- The lower level (the pages behind one tab) is a menu: the tab opens it,
+  and while one of its pages is shown the tab says which.
+
+The console's `PageTabStrip` enforces this: it has no level or variant, a tab
+takes `pages` for its menu, and tabs that do not fit the width are listed
+under "More" rather than scrolled or wrapped. Every tab and every menu entry
+leads with its icon at every width; there is no switch to leave them off.
 
 The shared primitive applies this decision to its existing consumers. Remove
 legacy style overrides when touching a screen. The design-system Components

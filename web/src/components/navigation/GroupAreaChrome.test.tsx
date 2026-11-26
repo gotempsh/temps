@@ -51,19 +51,21 @@ function renderAt(
   )
 }
 
+// A view with several pages is a button that opens a menu of them.
 const titles = (nav: HTMLElement) =>
-  [...nav.querySelectorAll('a')].map((a) => a.textContent)
+  [...nav.querySelectorAll('[data-tab]')].map((tab) => tab.textContent)
 
 const VIEWS = 'Storefront views'
 
-test("the project's views are the tabs of its page", () => {
+test("the project's views are the one row of tabs of its page", () => {
   mockApi({})
   const view = renderAt('logs')
+  expect(view.getAllByRole('navigation')).toHaveLength(1)
   const nav = view.getByRole('navigation', { name: VIEWS })
   expect(
-    [...nav.querySelectorAll('a')].map((a) => [
-      a.textContent,
-      a.getAttribute('href'),
+    [...nav.querySelectorAll('[data-tab]')].map((tab) => [
+      tab.textContent,
+      tab.getAttribute('href'),
     ])
   ).toEqual([
     ['Overview', '/p/storefront'],
@@ -73,7 +75,8 @@ test("the project's views are the tabs of its page", () => {
     ['Traces', '/p/storefront/traces'],
     ['Analytics', '/p/storefront/analytics'],
     ['Domains', '/p/storefront/domains'],
-    ['Databases', '/p/storefront/databases'],
+    // Two pages: a menu, so it is not a link itself.
+    ['Databases', null],
     ['Shared variables', '/p/storefront/variables'],
     ['Settings', '/p/storefront/settings'],
   ])
@@ -123,17 +126,18 @@ test('a view none of its services can have is not offered at all', () => {
   expect(view.queryByRole('button', { name: 'Add' })).toBeNull()
 })
 
-test('Databases and Backups are one view with two pages', () => {
+test('Databases and Backups are one tab that opens a menu, not a second row', async () => {
   mockApi({})
   const view = renderAt('backups')
+  expect(view.getAllByRole('navigation')).toHaveLength(1)
+  const databases = view.getByRole('button', { name: /^Databases/ })
+  expect(databases.getAttribute('aria-current')).toBe('true')
+  // It says which of its pages is shown.
+  expect(databases.textContent).toBe('DatabasesBackups')
+  fireEvent.pointerDown(databases, { button: 0, ctrlKey: false })
+  const menu = await view.findByRole('menu')
   expect(
-    view
-      .getByRole('navigation', { name: VIEWS })
-      .querySelector('[aria-current="page"]')?.textContent
-  ).toBe('Databases')
-  const pages = view.getByRole('navigation', { name: 'Databases pages' })
-  expect(
-    [...pages.querySelectorAll('a')].map((a) => [
+    [...menu.querySelectorAll('a')].map((a) => [
       a.textContent,
       a.getAttribute('href'),
     ])
@@ -141,7 +145,7 @@ test('Databases and Backups are one view with two pages', () => {
     ['Databases', '/p/storefront/databases'],
     ['Backups', '/p/storefront/backups'],
   ])
-  expect(pages.querySelector('[aria-current="page"]')?.textContent).toBe(
+  expect(menu.querySelector('[aria-current="page"]')?.textContent).toBe(
     'Backups'
   )
 })

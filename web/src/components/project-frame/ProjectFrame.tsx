@@ -6,6 +6,7 @@ import type { ReactNode } from 'react'
 import type { ProjectResponse } from '@/api/client'
 import {
   useProjectLocation,
+  useProjectPageWidth,
   useProjectTabNamesPage,
 } from './use-project-location'
 import { ProjectEnvironmentProvider } from './ProjectEnvironmentProvider'
@@ -40,9 +41,13 @@ export function ProjectFrame({
 }
 
 /**
- * The service's views, and the pages of the one shown, as tabs above the
- * page. When a selected tab already names the page, the page's own title is
- * kept for screen readers only.
+ * The pages of the view shown, as one row of tabs above the page. When a
+ * selected tab already names the page, the page's own title is kept for
+ * screen readers only.
+ *
+ * Every page of a service shares one column, so the tabs do not move from
+ * page to page; a form keeps its body to a readable measure, from the same
+ * left edge.
  */
 export function ProjectSectionChrome({
   project,
@@ -53,11 +58,17 @@ export function ProjectSectionChrome({
 }) {
   const location = useProjectLocation(project)
   const tabNamesPage = useProjectTabNamesPage(project)
+  const width = useProjectPageWidth(project)
   return (
     <>
       <ProjectSectionTabs project={project} location={location} />
       <PageNamedByChromeContext.Provider value={tabNamesPage}>
-        {children}
+        <div
+          data-page-body={width}
+          className={width === 'form' ? 'max-w-5xl' : undefined}
+        >
+          {children}
+        </div>
       </PageNamedByChromeContext.Provider>
     </>
   )

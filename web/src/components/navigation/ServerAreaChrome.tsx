@@ -29,9 +29,10 @@ const tabsOf = (area: ServerNavArea, current: ServerNavTab): PageTab[] =>
  * The tabs above a server-wide page.
  *
  * The Projects page carries what is seen across every project (logs,
- * errors, traces, analytics, alerts) as its tabs, with the pages of the one
- * shown as a second row. A branch of the tree with several pages
- * (Databases and its backups) has those as its tabs.
+ * errors, traces, analytics, alerts) as its one row of tabs; a view with
+ * several pages (Alerts) is a tab that opens a menu of them. A branch of
+ * the tree with several pages (Databases and its backups) has those as its
+ * tabs.
  *
  * Only a list page gets a strip: a record or a form below it (a database,
  * "Add domain") is one task and stands alone. The strip owns the gutters
@@ -48,9 +49,6 @@ export function ServerAreaChrome({ children }: { children: ReactNode }) {
       <PageContainer width={tab?.width ?? 'full'} innerClassName="space-y-0">
         <PageTabStrip
           label="Projects views"
-          icons={false}
-          // The pages of the view shown sit right under it.
-          className={tab ? 'mb-3' : undefined}
           tabs={views.map((view) => ({
             key: view.id,
             title: view.title,
@@ -58,16 +56,15 @@ export function ServerAreaChrome({ children }: { children: ReactNode }) {
             to: view.url,
             active: view.id === area.id,
             featureKey: view.featureKey,
+            pages: view.tabs?.map((page) => ({
+              key: page.url,
+              title: page.title,
+              icon: page.icon,
+              to: page.url,
+              active: view.id === area.id && page.url === tab?.url,
+            })),
           }))}
         />
-        {tab && (
-          <PageTabStrip
-            level="secondary"
-            icons={false}
-            label={`${area.title} pages`}
-            tabs={tabsOf(area, tab)}
-          />
-        )}
         {/* The selected tab names the page; its title is not printed twice. */}
         <PageNamedByChromeContext.Provider value={true}>
           {children}

@@ -9,7 +9,8 @@
  * - `service`: one service (an API `project`, `/projects/:slug/*`).
  *
  * The sidebar is the same tree at all three; it opens to the project or
- * service shown, and that entity's views are the tabs of its page.
+ * service shown. A service's views are listed under it there; a project's
+ * are the one row of tabs of its page.
  */
 
 import {

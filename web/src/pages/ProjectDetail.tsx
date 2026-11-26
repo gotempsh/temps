@@ -35,9 +35,7 @@ import {
   ProjectFrame,
   ProjectSectionChrome,
 } from '@/components/project-frame/ProjectFrame'
-import { useProjectPageWidth } from '@/components/project-frame/use-project-location'
 import { PageContainer } from '@/components/layout/PageContainer'
-import type { ProjectResponse } from '@/api/client'
 import {
   ProjectDeploymentsPage,
   ProjectEnvironmentsPage,
@@ -118,7 +116,7 @@ import { ProjectAgentActivity } from './AiGateway'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Route,
   Routes,
@@ -521,7 +519,7 @@ export function ProjectDetail() {
             data-console-scroll
             className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden"
           >
-            <PageWidthShell project={project}>
+            <PageContainer innerClassName="space-y-0">
               <ProjectSectionChrome project={project}>
                 <Routes>
                   <Route index element={<RedirectWithQuery to="project" />} />
@@ -708,7 +706,7 @@ export function ProjectDetail() {
                   />
                 </Routes>
               </ProjectSectionChrome>
-            </PageWidthShell>
+            </PageContainer>
           </div>
         </div>
       </ProjectFrame>
@@ -753,9 +751,10 @@ export function ProjectDetail() {
           data-console-scroll
           className="flex-1 overflow-y-auto overflow-x-hidden"
         >
-          {/* One column, as wide as the page needs, holding the banners, the
-              section tabs and the page so they line up. */}
-          <PageWidthShell project={project}>
+          {/* One column for every page of the service, holding the banners,
+              the tabs and the page, so they line up and do not move from
+              page to page. */}
+          <PageContainer innerClassName="space-y-0">
             {/* Attack Mode Banner */}
             {(project as typeof project & { attack_mode?: boolean })
               .attack_mode && (
@@ -1157,7 +1156,7 @@ export function ProjectDetail() {
                 />
               </Routes>
             </ProjectSectionChrome>
-          </PageWidthShell>
+          </PageContainer>
         </div>
       </div>
     </div>
@@ -1169,24 +1168,5 @@ export function ProjectDetail() {
         {page}
       </ProjectDeployContext.Provider>
     </ProjectFrame>
-  )
-}
-
-/**
- * The page column: as wide as the current section asks for, with the one
- * set of gutters every project page shares.
- */
-function PageWidthShell({
-  project,
-  children,
-}: {
-  project: ProjectResponse
-  children: ReactNode
-}) {
-  const width = useProjectPageWidth(project)
-  return (
-    <PageContainer width={width} innerClassName="space-y-0">
-      {children}
-    </PageContainer>
   )
 }

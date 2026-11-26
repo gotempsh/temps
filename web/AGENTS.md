@@ -11,7 +11,11 @@ manager is `bun`.
   UI: the route shell, not the page, picks the width (`form`, about 1024px and
   centered with its header, for settings and forms; `full` for lists, tables,
   dashboards and logs), with one `PageContainer` padding owner and no
-  `max-w-*`/`mx-auto` wrappers of a page's own; compact empty states, shared
+  `max-w-*`/`mx-auto` wrappers of a page's own; the pages of one entity share
+  one column, so a service's settings keep the `full` column and only their
+  body is capped; one row of tabs per page, never a strip under another (a
+  service's views are in the sidebar, a tab with several pages opens a menu,
+  `PageTabStrip`); compact empty states, shared
   tables and pagination, shadcn controls. `web/packages/ds` (`@temps-sdk/ds`) codifies it into page, record,
   list and settings templates and a status vocabulary
   (`web/packages/ds/docs/RULES.md`); migrating `web/src` onto it is tracked in

@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Plus } from 'lucide-react'
-import type { ComponentType } from 'react'
 import { Link } from 'react-router'
 import {
   DropdownMenu,
@@ -11,15 +10,10 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { PageTabStrip } from './PageTabStrip'
+import { PageTabStrip, type PageTab } from './PageTabStrip'
 
 /** One view of an entity: its deployments, its logs, its settings. */
-export interface EntityView {
-  key: string
-  title: string
-  icon: ComponentType<{ className?: string }>
-  to: string
-  active: boolean
+export interface EntityView extends PageTab {
   /**
    * False once the view is known to hold nothing (no trace received, no
    * domain added). It is then offered under "Add" instead of taking a tab.
@@ -27,16 +21,50 @@ export interface EntityView {
   inUse: boolean
   /** What is missing, said beside the view under "Add". */
   missing?: string
-  featureKey?: string
-  /** The quick tour's anchor for this view. */
-  tour?: string
+}
+
+/** The views that hold nothing yet, as the entries of an "Add" menu. */
+export function UnusedViewItems({
+  views,
+  onNavigate,
+}: {
+  views: EntityView[]
+  onNavigate?: () => void
+}) {
+  return (
+    <>
+      <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+        Not set up yet
+      </DropdownMenuLabel>
+      {views.map((view) => (
+        <DropdownMenuItem key={view.key} asChild>
+          <Link
+            to={view.to}
+            onClick={onNavigate}
+            className="items-start gap-2.5"
+          >
+            <view.icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+            <span className="min-w-0">
+              <span className="block font-medium">{view.title}</span>
+              {view.missing && (
+                <span className="block text-xs text-muted-foreground">
+                  {view.missing}
+                </span>
+              )}
+            </span>
+          </Link>
+        </DropdownMenuItem>
+      ))}
+    </>
+  )
 }
 
 /**
- * An entity's views as the tabs of its page: the things it is (deployments,
- * logs, errors), then the data it has. A view that holds nothing yet is not
- * a tab; it is listed under "Add", so what is not set up stays one click
- * away without a tab that opens on an empty page.
+ * An entity's views as the one row of tabs of its page: the things it is
+ * (deployments, logs, errors), then the data it has. A view with several
+ * pages opens a menu of them. A view that holds nothing yet is not a tab;
+ * it is listed under "Add", so what is not set up stays one click away
+ * without a tab that opens on an empty page.
  */
 export function EntityViewTabs({
   label,
@@ -56,7 +84,6 @@ export function EntityViewTabs({
   return (
     <PageTabStrip
       label={label}
-      icons={false}
       className={className}
       tabs={views.filter(listed)}
       trailing={
@@ -67,24 +94,7 @@ export function EntityViewTabs({
               Add
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="w-72">
-              <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
-                Not set up yet
-              </DropdownMenuLabel>
-              {unused.map((view) => (
-                <DropdownMenuItem key={view.key} asChild>
-                  <Link to={view.to} className="items-start gap-2.5">
-                    <view.icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                    <span className="min-w-0">
-                      <span className="block font-medium">{view.title}</span>
-                      {view.missing && (
-                        <span className="block text-xs text-muted-foreground">
-                          {view.missing}
-                        </span>
-                      )}
-                    </span>
-                  </Link>
-                </DropdownMenuItem>
-              ))}
+              <UnusedViewItems views={unused} />
             </DropdownMenuContent>
           </DropdownMenu>
         )

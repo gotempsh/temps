@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   PROJECT_NAV_SECTIONS,
+  projectEntityViewOf,
   projectEntityViewsFor,
   projectEnvironmentScope,
   projectLocationFor,
@@ -335,6 +336,38 @@ describe('projectTabNamesPage', () => {
 
   test('the Overview names the service, whatever its tab says', () => {
     expect(names('project')).toBe(false)
+  })
+})
+
+describe('projectEntityViewOf', () => {
+  const viewOf = (route: string, sourceType = 'git') => {
+    const project = { source_type: sourceType }
+    return projectEntityViewOf(project, projectLocationFor(project, route))
+  }
+
+  test('a page belongs to the view whose section holds it', () => {
+    expect(viewOf('environments')?.title).toBe('Deployments')
+    expect(viewOf('errors/42')?.title).toBe('Errors')
+  })
+
+  test('security, automation and the service settings are one Settings view', () => {
+    for (const route of [
+      'settings/general',
+      'settings/security',
+      'settings/automation',
+      'security',
+    ])
+      expect(viewOf(route)?.id).toBe('general')
+    expect(viewOf('settings/security')?.tabs.map((tab) => tab.title)).toEqual([
+      'General',
+      'Data ingest',
+      'Protection',
+      'Edge rules',
+      'Access',
+      'Scans',
+      'Automation',
+      'Integrations',
+    ])
   })
 })
 

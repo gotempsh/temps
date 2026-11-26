@@ -165,6 +165,35 @@ describe('where the user is', () => {
     ).toBe('page')
   })
 
+  test('the service shown opens to its views, and the view carries the mark', async () => {
+    const { view } = renderAt('/projects/api/runtime', projects)
+    const views = await view.findByRole('list', { name: 'api views' })
+    const titles = [...views.querySelectorAll('a')].map((a) => a.textContent)
+    expect(titles.slice(0, 4)).toEqual([
+      'Overview',
+      'Deployments',
+      'Logs',
+      'Errors',
+    ])
+    expect(titles[titles.length - 1]).toBe('Settings')
+    const logs = within(views).getByRole('link', { name: 'Logs' })
+    expect(logs.getAttribute('aria-current')).toBe('page')
+    expect(logs.getAttribute('data-active')).toBe('true')
+    // The service reads as the one opened; the mark is on its view.
+    const api = view.getByRole('link', { name: /^api/ })
+    expect(api.getAttribute('aria-current')).toBe('true')
+    expect(api.getAttribute('data-active')).toBe('false')
+    // No other service lists its views.
+    expect(view.queryByRole('list', { name: 'web views' })).toBeNull()
+    expect(view.queryByRole('list', { name: 'blog views' })).toBeNull()
+  })
+
+  test('no service is opened to its views on a page that is not one of its own', async () => {
+    const { view } = renderAt('/p/shop/logs', projects)
+    await view.findByRole('link', { name: /api/ })
+    expect(view.queryByRole('list', { name: /views$/ })).toBeNull()
+  })
+
   test('a project is marked on its pages; folded over a service, it marks that', async () => {
     const { view } = renderAt('/p/shop/logs', projects)
     const shop = await view.findByRole('link', { name: /Shop/ })

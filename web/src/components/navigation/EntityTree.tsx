@@ -54,6 +54,7 @@ import { SERVER_ENTITIES, SERVER_HOME } from '@/lib/server-navigation'
 import { groupHref } from '@/lib/terminology'
 import { cn } from '@/lib/utils'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { CompactServiceViews, ServiceViewRows } from './ServiceViewRows'
 import { useTreeFold } from './use-tree-fold'
 
 const ACTIVE = 'bg-sidebar-accent text-sidebar-accent-foreground'
@@ -184,6 +185,8 @@ interface Leaf {
   state: TreeState | undefined
   /** The page shown is this entity's, or one below it. */
   inside: boolean
+  /** The service whose views are listed under the row while it is shown. */
+  views?: ServiceNode
 }
 
 function LeafRow({
@@ -195,22 +198,36 @@ function LeafRow({
   pathname: string
   onNavigate: () => void
 }) {
+  // With its views listed, the view shown carries the mark; the service
+  // only reads as the one opened.
+  const opened = leaf.inside && leaf.views !== undefined
   return (
     <SidebarMenuSubItem>
-      <SidebarMenuSubButton asChild isActive={leaf.inside}>
+      <SidebarMenuSubButton asChild isActive={leaf.inside && !opened}>
         <Link
           to={leaf.url}
           aria-current={
             pathname === leaf.url ? 'page' : leaf.inside ? 'true' : undefined
           }
           onClick={onNavigate}
-          className={cn(leaf.inside && ACTIVE)}
+          className={cn(
+            leaf.inside && !opened && ACTIVE,
+            opened && 'font-medium text-sidebar-accent-foreground'
+          )}
         >
           {leaf.icon}
           <span className="min-w-0 flex-1 truncate">{leaf.name}</span>
           <RowState state={leaf.state} />
         </Link>
       </SidebarMenuSubButton>
+      {opened && leaf.views && (
+        <SidebarMenuSub
+          aria-label={`${leaf.name} views`}
+          className="ml-2 mr-0 pl-2 pr-0"
+        >
+          <ServiceViewRows service={leaf.views} onNavigate={onNavigate} />
+        </SidebarMenuSub>
+      )}
     </SidebarMenuSubItem>
   )
 }
@@ -280,8 +297,9 @@ function BranchRows({
 
 /**
  * The console's one menu: a tree of what the user owns. Projects open to
- * their services; databases, domains and servers are listed under their
- * own branch. A row says how its entity is doing, so the tree answers "is
+ * their services, and the service shown to its views (Deployments, Logs,
+ * Settings); databases, domains and servers are listed under their own
+ * branch. A row says how its entity is doing, so the tree answers "is
  * it working" before anything is opened. A folded branch asks the server
  * nothing.
  */
@@ -377,6 +395,9 @@ export function EntityTree() {
             </SidebarMenuItem>
           ))}
         </SidebarMenu>
+        {location.serviceSlug && (
+          <CompactServiceViews slug={location.serviceSlug} />
+        )}
       </SidebarGroup>
     )
 
@@ -387,6 +408,7 @@ export function EntityTree() {
     icon: <ServiceIcon service={service} size="xxs" />,
     state: stateOf(service),
     inside: service.slug === location.serviceSlug,
+    views: service,
   })
 
   const databaseRows = capRows(

@@ -1357,7 +1357,6 @@ function NodeDetail({
       {/* The node's sections; its name above says whose they are. */}
       <PageTabStrip
         label={`${node.name} sections`}
-        icons={false}
         tabs={nodeSections(node.role).map((link) => ({
           key: link.section,
           title: link.title,

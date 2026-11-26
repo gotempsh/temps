@@ -17,15 +17,15 @@ import {
 } from '@/lib/service-kinds'
 import { listsAsTab } from './area-state'
 import { EntityViewTabs } from './EntityViewTabs'
-import { PageTabStrip } from './PageTabStrip'
 import { useGroupAreaStates } from './use-group-area-states'
 
 /**
- * A project's views as the tabs of its page (Deployments, Logs, Errors and
- * the data its services have), with the pages of the view shown as a second
- * row (Databases and its Backups). Only the views its services can have are
- * there: a project of static sites has no Databases. The strip owns the gutters here, so the
- * page inside lines up with it and adds none of its own.
+ * A project's views as the one row of tabs of its page (Deployments, Logs,
+ * Errors and the data its services have). A view with several pages
+ * (Databases and its Backups) is a tab that opens a menu of them. Only the
+ * views its services can have are there: a project of static sites has no
+ * Databases. The strip owns the gutters here, so the page inside lines up
+ * with it and adds none of its own.
  */
 export function GroupAreaChrome({
   group,
@@ -51,8 +51,6 @@ export function GroupAreaChrome({
     <PageContainer innerClassName="space-y-0">
       <EntityViewTabs
         label={`${group.name} views`}
-        // The pages of the view shown sit right under it.
-        className={tab ? 'mb-3' : undefined}
         // A view none of the project's services can have (domains of a
         // project that is only monitored) is not offered at all.
         views={GROUP_NAV_SECTIONS.filter(
@@ -67,22 +65,15 @@ export function GroupAreaChrome({
           active: item.id === section.id,
           inUse: listsAsTab(statuses[item.id]),
           missing: item.missing,
+          pages: item.tabs?.map((page) => ({
+            key: page.url,
+            title: page.title,
+            icon: page.icon,
+            to: groupPathHref(group.slug, page.url),
+            active: item.id === section.id && page.url === tab?.url,
+          })),
         }))}
       />
-      {section.tabs && tab && (
-        <PageTabStrip
-          level="secondary"
-          icons={false}
-          label={`${section.title} pages`}
-          tabs={section.tabs.map((item) => ({
-            key: item.url,
-            title: item.title,
-            icon: item.icon,
-            to: groupPathHref(group.slug, item.url),
-            active: item.url === tab.url,
-          }))}
-        />
-      )}
       {/* The selected tab names the page; the Overview names the project. */}
       <PageNamedByChromeContext.Provider value={section.id !== 'overview'}>
         {children}
