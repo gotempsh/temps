@@ -47,6 +47,7 @@ export function terminalWsUrl(
   id: string,
   params: Record<string, string | undefined>,
 ): string {
+  // api-coverage: GET /v1/sandboxes/{id}/terminal (a WebSocket upgrade)
   const http = sandboxUrl(baseUrl, `/${encodeURIComponent(id)}/terminal`)
   const ws = http.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
   const query = Object.entries(params)

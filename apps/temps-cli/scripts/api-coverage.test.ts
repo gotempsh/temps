@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   CLI_ROOT,
+  callsFunction,
   codeOf,
   computeCoverage,
   coverageDrift,
@@ -14,11 +16,13 @@ import {
   listOperations,
   mentions,
   normalizePath,
+  parentDirOf,
   rawFetchCalls,
   readAllowlist,
   repositoryCoverage,
   schemaProperties,
   sdkFunctionsByOperation,
+  stripComments,
   type Allowlist,
   type CommandAreas,
 } from './api-coverage'
@@ -178,6 +182,34 @@ describe('computeCoverage', () => {
     expect(computeCoverage(spec, sdk, areas({ widgets: source })).covered).toEqual([])
   })
 
+  test('an SDK name in an inline comment is not a call', () => {
+    const source = "import { listWidgets } from '../../api/sdk.gen.js'\nconst label = 'widgets' // listWidgets\nconst x = 1 /* listWidgets() */\n'--json'"
+    expect(computeCoverage(spec, sdk, areas({ widgets: source })).covered).toEqual([])
+  })
+
+  test('a reference that is never called does not count; a call or an endpoint() registration does', () => {
+    const referenced = "import { listWidgets } from '../../api/sdk.gen.js'\nconst handlers = { list: listWidgets }\nconst f = listWidgets\n'--json'"
+    expect(computeCoverage(spec, sdk, areas({ widgets: referenced })).covered).toEqual([])
+    expect(callsFunction('listWidgets({ query: {} })', 'listWidgets')).toBe(true)
+    expect(callsFunction('listWidgets<true>({})', 'listWidgets')).toBe(true)
+    expect(callsFunction('endpoint(group, listWidgets, { name: "list" })', 'listWidgets')).toBe(true)
+    expect(callsFunction('other.listWidgets({})', 'listWidgets')).toBe(false)
+    expect(callsFunction('api.listWidgets({})', 'listWidgets', ['api'])).toBe(true)
+  })
+
+  test('a namespace import of the SDK counts its qualified calls', () => {
+    const source = "import * as api from '../../api/sdk.gen.js'\nawait api.listWidgets({ query: { page } })\n'--json'"
+    expect(computeCoverage(spec, sdk, areas({ widgets: source })).covered).toEqual(['GET /widgets'])
+  })
+
+  test('stripComments keeps // inside strings and templates and blanks real comments', () => {
+    expect(stripComments("const u = 'https://x.example' // listWidgets")).toBe("const u = 'https://x.example' ")
+    expect(stripComments('const u = "a//b"; f()')).toBe('const u = "a//b"; f()')
+    expect(stripComments('const t = `//${a /* c */ + "//"}//` // tail')).toBe('const t = `//${a         + "//"}//` ')
+    expect(stripComments("a /* x\ny */ b")).toBe('a     \n     b')
+    expect(stripComments("const q = 'it\\'s // here' // c")).toBe("const q = 'it\\'s // here' ")
+  })
+
   test('an SDK function imported under another name counts where the local name is called', () => {
     const source = "import {\n  listWidgets as fetchWidgets,\n} from '../../api/sdk.gen.js'\nfetchWidgets({ query: { page } })\n'--json'"
     const report = computeCoverage(spec, sdk, areas({ widgets: source }))
@@ -192,9 +224,14 @@ describe('computeCoverage', () => {
     expect(mentions('page_size', 'page')).toBe(false)
   })
 
-  test('the CLI root is a filesystem path, not a URL path', () => {
-    expect(CLI_ROOT).not.toContain('%')
-    expect(CLI_ROOT.endsWith('/temps-cli/') || CLI_ROOT.endsWith('/temps-cli')).toBe(true)
+  test('the CLI root is the filesystem directory above scripts/', () => {
+    expect(CLI_ROOT).toBe(`${resolve(import.meta.dir, '..')}/`)
+  })
+
+  test('parentDirOf decodes a URL path with a space and a literal %', () => {
+    const url = 'file:///tmp/my%20check%25out/apps/temps-cli/scripts/api-coverage.ts'
+    expect(parentDirOf(url)).toBe('/tmp/my check%out/apps/temps-cli/')
+    expect(parentDirOf(new URL(url))).toBe('/tmp/my check%out/apps/temps-cli/')
   })
 
   test('a marker naming no operation is reported', () => {

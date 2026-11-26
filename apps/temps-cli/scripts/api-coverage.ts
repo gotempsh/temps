@@ -36,7 +36,16 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const CLI_ROOT = fileURLToPath(new URL('..', import.meta.url))
+/**
+ * The filesystem directory above the module at `moduleUrl`. `fileURLToPath`
+ * decodes the URL, so a checkout under `my dir` or `50%` resolves to the
+ * real path rather than `my%20dir` or `50%25`.
+ */
+export function parentDirOf(moduleUrl: string | URL): string {
+  return fileURLToPath(new URL('..', moduleUrl))
+}
+
+export const CLI_ROOT = parentDirOf(import.meta.url)
 export const ALLOWLIST_PATH = join(CLI_ROOT, 'cli-api-coverage.json')
 export const SPEC_FILE = join(CLI_ROOT, 'openapi.json')
 export const SDK_FILE = join(CLI_ROOT, 'src/api/sdk.gen.ts')
@@ -233,24 +242,124 @@ export function mentions(source: string, identifier: string): boolean {
 }
 
 /**
- * The code of an area without its import declarations and comment lines, so
- * an SDK function that is imported or named in a comment but never used does
+ * `source` with every comment blanked out (newlines kept), leaving strings
+ * and template literals intact, so `'https://x'` keeps its `//` while
+ * `const a = 1 // listWidgets` loses the comment. Regex literals are not
+ * parsed; one containing `//` unescaped would be cut, which this codebase
+ * does not have (a `/` in a regex is written `\/`).
+ */
+export function stripComments(source: string): string {
+  let out = ''
+  let i = 0
+  // Open template literals; each entry counts the `{` braces open inside its current `${...}`.
+  const templates: number[] = []
+  let quote: "'" | '"' | null = null
+  let inTemplate = false
+  while (i < source.length) {
+    const c = source[i] as string
+    const next = source[i + 1]
+    if (quote) {
+      out += c
+      if (c === '\\') {
+        out += next ?? ''
+        i += 2
+        continue
+      }
+      if (c === quote || c === '\n') quote = null
+      i++
+      continue
+    }
+    if (inTemplate) {
+      out += c
+      if (c === '\\') {
+        out += next ?? ''
+        i += 2
+        continue
+      }
+      if (c === '`') inTemplate = false
+      else if (c === '$' && next === '{') {
+        out += '{'
+        templates.push(0)
+        inTemplate = false
+        i += 2
+        continue
+      }
+      i++
+      continue
+    }
+    if (c === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') i++
+      continue
+    }
+    if (c === '/' && next === '*') {
+      const end = source.indexOf('*/', i + 2)
+      const stop = end === -1 ? source.length : end + 2
+      out += source.slice(i, stop).replace(/[^\n]/g, ' ')
+      i = stop
+      continue
+    }
+    if (c === "'" || c === '"') quote = c
+    else if (c === '`') inTemplate = true
+    else if (templates.length) {
+      const depth = templates.length - 1
+      const open = templates[depth] as number
+      if (c === '{') templates[depth] = open + 1
+      else if (c === '}') {
+        if (open === 0) {
+          templates.pop()
+          inTemplate = true
+        } else templates[depth] = open - 1
+      }
+    }
+    out += c
+    i++
+  }
+  return out
+}
+
+/**
+ * The code of an area without its import declarations and comments, so an
+ * SDK function that is imported or named in a comment but never used does
  * not count as called. Imports of the generated SDK under another name
  * (`listWidgets as fetchWidgets`) are returned so the local name counts.
  */
-export function codeOf(source: string): { code: string; aliases: Map<string, string[]> } {
+export function codeOf(source: string): { code: string; aliases: Map<string, string[]>; namespaces: string[] } {
   const aliases = new Map<string, string[]>()
-  const code = source
-    .replace(/^\s*import\s[\s\S]*?\sfrom\s+['"]([^'"]+)['"];?[ \t]*$/gm, (statement, from: string) => {
+  const namespaces: string[] = []
+  const code = stripComments(source).replace(
+    /^\s*import\s[\s\S]*?\sfrom\s+['"]([^'"]+)['"];?[ \t]*$/gm,
+    (statement, from: string) => {
       if (/api\/sdk\.gen(\.js)?$/.test(from)) {
+        // `import * as api from '.../sdk.gen.js'`: calls are `api.name(...)`.
+        const namespace = /^\s*import\s+\*\s+as\s+(\w+)/.exec(statement)
+        if (namespace) {
+          namespaces.push(namespace[1] as string)
+          return ''
+        }
         for (const m of statement.matchAll(/(\w+)\s+as\s+(\w+)/g)) {
           aliases.set(m[1] as string, [...(aliases.get(m[1] as string) ?? []), m[2] as string])
         }
       }
       return ''
-    })
-    .replace(/^\s*(?:\/\/|\/\*|\*).*$/gm, '')
-  return { code, aliases }
+    },
+  )
+  return { code, aliases, namespaces }
+}
+
+/**
+ * Whether `code` calls the SDK function `name` (`name(` or `name<T>(`, or
+ * `ns.name(` through a namespace import, never another object's `x.name(`)
+ * or registers it as a command (`endpoint(group, name, ...)`).
+ * A bare reference (`const f = name`, `{ list: name }`) is not a call.
+ */
+export function callsFunction(code: string, name: string, namespaces: readonly string[] = []): boolean {
+  const id = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const qualified = namespaces.map((ns) => `(?<![\\w$.])${ns}\\s*\\.\\s*${id}\\s*(?:<[^>()]*>\\s*)?\\(`)
+  return (
+    new RegExp(`(?<![\\w$.])${id}\\s*(?:<[^>()]*>\\s*)?\\(`).test(code) ||
+    qualified.some((pattern) => new RegExp(pattern).test(code)) ||
+    new RegExp(`\\bendpoint\\(\\s*[\\w$.]+\\s*,\\s*${id}\\s*[,)]`).test(code)
+  )
 }
 
 export interface CoverageReport {
@@ -286,10 +395,10 @@ export function computeCoverage(spec: unknown, sdkSource: string, areas: Command
     const normalized = `${op.method.toUpperCase()} ${normalizePath(op.path)}`
     const names = sdk.get(normalized) ?? []
     const callers = [...areas].filter(([area]) => {
-      const { code: text, aliases } = code.get(area) as { code: string; aliases: Map<string, string[]> }
+      const { code: text, aliases, namespaces } = code.get(area) as ReturnType<typeof codeOf>
       return (
         direct.get(area)?.has(normalized) ||
-        names.some((name) => [name, ...(aliases.get(name) ?? [])].some((local) => mentions(text, local)))
+        names.some((name) => [name, ...(aliases.get(name) ?? [])].some((local) => callsFunction(text, local, namespaces)))
       )
     })
     if (!callers.length) {

@@ -624,9 +624,9 @@ export function registerStatusPagesCommands(program: Command): void {
     })
 
   for (const [name, description, label, call, done] of [
-    ['publish', 'Publish the page at its public URL', 'Publishing...', publishStatusPage, 'Published'],
-    ['unpublish', 'Unpublish; the public URL returns 404 immediately', 'Unpublishing...', unpublishStatusPage, 'Unpublished'],
-    ['rotate-url', 'Replace the public URL; the old one stops working', 'Replacing URL...', rotateStatusPageUrl, 'Public URL replaced'],
+    ['publish', 'Publish the page at its public URL', 'Publishing...', (id: number) => publishStatusPage({ client, path: { status_page_id: id } }), 'Published'],
+    ['unpublish', 'Unpublish; the public URL returns 404 immediately', 'Unpublishing...', (id: number) => unpublishStatusPage({ client, path: { status_page_id: id } }), 'Unpublished'],
+    ['rotate-url', 'Replace the public URL; the old one stops working', 'Replacing URL...', (id: number) => rotateStatusPageUrl({ client, path: { status_page_id: id } }), 'Public URL replaced'],
   ] as const) {
     pages
       .command(name)
@@ -638,7 +638,7 @@ export function registerStatusPagesCommands(program: Command): void {
         await setupClient()
         const id = parseId(options.id, 'status page ID')
         if (id === null) return
-        const page = await run(label, () => call({ client, path: { status_page_id: id } }))
+        const page = await run(label, () => call(id))
         if (options.json) {
           json(page)
           return
