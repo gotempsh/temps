@@ -68,6 +68,8 @@ function renderModal(options: {
   lookup: (request: Request) => Response
   /** Omit to leave the lookup unmocked, i.e. still in flight / 404-by-default. */
   withLookup?: boolean
+  /** More routes, such as the head-commit lookup a found branch leads to. */
+  extraRoutes?: Record<string, (request: Request) => Response>
 }) {
   const api = mockApi({
     'GET /projects/by-slug/example': () => jsonResponse(project),
@@ -82,6 +84,7 @@ function renderModal(options: {
     ...(options.withLookup === false
       ? {}
       : { 'GET /repositories/temps/example/branch': options.lookup }),
+    ...options.extraRoutes,
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -101,6 +104,28 @@ function renderModal(options: {
     </QueryClientProvider>
   )
   return { api, view }
+}
+
+/**
+ * Pick the `staging` environment, which puts its (missing) branch in the
+ * field; production is preselected, so choosing it again would change
+ * nothing. Resolves with the manual-entry input the confirmed 404 shows.
+ */
+async function enterManualEntry(view: ReturnType<typeof render>) {
+  const trigger = await waitFor(() => {
+    const element = view.baseElement.querySelector<HTMLElement>('#environment')
+    if (!element || element.hasAttribute('data-disabled')) {
+      throw new Error('environment picker not ready')
+    }
+    return element
+  })
+  fireEvent.pointerDown(trigger, {
+    button: 0,
+    ctrlKey: false,
+    pointerType: 'mouse',
+  })
+  fireEvent.click(await view.findByRole('option', { name: 'staging' }))
+  return view.findByPlaceholderText('Enter branch name manually')
 }
 
 test('a branch the exact lookup finds raises no warning, however capped the list', async () => {
@@ -190,23 +215,7 @@ test('typing a replacement for a confirmed-missing branch keeps the field mounte
     },
   })
 
-  // Choosing an environment is what puts its branch in the field (production
-  // is preselected, so pick the other one to make a change).
-  const trigger = await waitFor(() => {
-    const element = view.baseElement.querySelector<HTMLElement>('#environment')
-    if (!element || element.hasAttribute('data-disabled')) {
-      throw new Error('environment picker not ready')
-    }
-    return element
-  })
-  fireEvent.pointerDown(trigger, {
-    button: 0,
-    ctrlKey: false,
-    pointerType: 'mouse',
-  })
-  fireEvent.click(await view.findByRole('option', { name: 'staging' }))
-
-  const input = await view.findByPlaceholderText('Enter branch name manually')
+  const input = await enterManualEntry(view)
   await waitFor(() => expect(view.getByText(NOT_FOUND)).toBeTruthy())
   input.focus()
   const lookupsBeforeTyping = looked.length
@@ -248,20 +257,7 @@ test('a lookup that failed in manual entry can be checked again', async () => {
     },
   })
 
-  const trigger = await waitFor(() => {
-    const element = view.baseElement.querySelector<HTMLElement>('#environment')
-    if (!element || element.hasAttribute('data-disabled')) {
-      throw new Error('environment picker not ready')
-    }
-    return element
-  })
-  fireEvent.pointerDown(trigger, {
-    button: 0,
-    ctrlKey: false,
-    pointerType: 'mouse',
-  })
-  fireEvent.click(await view.findByRole('option', { name: 'staging' }))
-  const input = await view.findByPlaceholderText('Enter branch name manually')
+  const input = await enterManualEntry(view)
 
   fireEvent.change(input, { target: { value: 'main-2' } })
   await waitFor(() => expect(view.getByText(UNVERIFIED)).toBeTruthy())
@@ -272,5 +268,70 @@ test('a lookup that failed in manual entry can be checked again', async () => {
   await waitFor(() => expect(view.queryByText(UNVERIFIED)).toBeNull())
   expect(view.queryByText(NOT_FOUND)).toBeNull()
   expect(replacementAttempts).toBe(2)
+  expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
+})
+
+test('a confirmed-missing branch can be checked again once it exists upstream', async () => {
+  let attempts = 0
+  const { view } = renderModal({
+    truncated: true,
+    lookup: () => {
+      attempts += 1
+      return attempts === 1
+        ? jsonResponse({ title: 'Branch Not Found' }, 404)
+        : jsonResponse({
+            name: 'main',
+            commit_sha: 'd'.repeat(40),
+            protected: false,
+            is_default: true,
+          })
+    },
+  })
+
+  const input = await enterManualEntry(view)
+  await waitFor(() => expect(view.getByText(NOT_FOUND)).toBeTruthy())
+
+  // The branch was created upstream: the same name is asked again in place.
+  fireEvent.click(view.getByRole('button', { name: 'Check again' }))
+  await waitFor(() => expect(view.queryByText(NOT_FOUND)).toBeNull())
+  expect(attempts).toBe(2)
+  expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
+})
+
+test('a branch the exact lookup finds in manual entry gets its commit preview', async () => {
+  const sha = 'c'.repeat(40)
+  const { view } = renderModal({
+    truncated: true,
+    extraRoutes: {
+      [`GET /repository/11/commits/${sha}`]: () =>
+        jsonResponse({
+          exists: true,
+          commit_sha: sha,
+          commit: {
+            sha,
+            message: 'Add the replacement branch',
+            author: 'Example Author',
+            author_email: 'author@example.com',
+            date: '2026-01-01T00:00:00Z',
+          },
+        }),
+    },
+    lookup: (request) =>
+      new URL(request.url).searchParams.get('name') === 'main-2'
+        ? jsonResponse({
+            name: 'main-2',
+            commit_sha: sha,
+            protected: false,
+            is_default: false,
+          })
+        : jsonResponse({ title: 'Branch Not Found' }, 404),
+  })
+  const input = await enterManualEntry(view)
+  fireEvent.change(input, { target: { value: 'main-2' } })
+
+  // The listing (not mounted in manual entry) never had `main-2`; the head
+  // commit is the one the exact lookup returned.
+  await waitFor(() => expect(view.getByText('Commit to deploy')).toBeTruthy())
+  expect(view.getByText(/Add the replacement branch/)).toBeTruthy()
   expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
 })

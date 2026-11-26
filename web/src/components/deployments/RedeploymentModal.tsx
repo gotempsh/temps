@@ -447,10 +447,19 @@ export function RedeploymentModal({
     checkedCurrentCommit && commitQuery.data?.exists && commitQuery.data.commit
   )
 
-  const selectedBranchCommitSha = branchCommitSha(
-    availableBranchDetails,
-    effectiveBranch
-  )
+  // The head commit comes from the listing when it holds the branch, and from
+  // the exact lookup otherwise: a branch past the listing cap, or one typed in
+  // manual entry (where the listing is not even mounted), still gets its
+  // "Commit to deploy" preview once the provider confirms it.
+  const verifiedBranchSha =
+    !branchEditPending &&
+    branchVerification.status === 'found' &&
+    branchVerification.branch?.name === effectiveBranch
+      ? branchVerification.branch.commit_sha
+      : null
+  const selectedBranchCommitSha =
+    branchCommitSha(availableBranchDetails, effectiveBranch) ??
+    verifiedBranchSha
   const branchCommitQuery = useQuery({
     ...checkCommitExistsOptions({
       path: {
@@ -991,11 +1000,25 @@ export function RedeploymentModal({
                     {branchNotFound && (
                       <Alert className="border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30">
                         <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-600" />
-                        <AlertDescription className="text-amber-800 dark:text-amber-400">
-                          The branch “{effectiveBranch}” for this environment
-                          was not found in the repository. You can continue with
-                          the current branch name, or switch to deploy by commit
-                          hash.
+                        <AlertDescription className="flex items-center justify-between gap-3 text-amber-800 dark:text-amber-400">
+                          <span>
+                            The branch “{effectiveBranch}” for this environment
+                            was not found in the repository. You can continue
+                            with the current branch name, or switch to deploy by
+                            commit hash.
+                          </span>
+                          {/* A branch created upstream since the lookup is
+                              found by asking again, without retyping it. */}
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0"
+                            disabled={isLoading}
+                            onClick={() => void branchVerification.refresh()}
+                          >
+                            Check again
+                          </Button>
                         </AlertDescription>
                       </Alert>
                     )}
