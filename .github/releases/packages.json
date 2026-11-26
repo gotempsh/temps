@@ -95,7 +95,8 @@
     "path": "apps/temps-cli",
     "name": "@temps-sdk/cli",
     "stamped": [
-      "skills/temps-cli/references/COMMANDS.md"
+      "skills/temps-cli/references/COMMANDS.md",
+      "web/src/lib/ai-onboarding.ts"
     ],
     "channel_pinned": [
       "skills/**/*.md",

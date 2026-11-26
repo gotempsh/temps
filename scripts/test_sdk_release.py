@@ -224,7 +224,7 @@ class ReleaseTests(unittest.TestCase):
         catalog = release.read_json(release.ROOT / '.github/releases/packages.json')
         self.assertEqual(catalog['cli'], {
             'kind': 'npm', 'path': 'apps/temps-cli', 'name': '@temps-sdk/cli',
-            'stamped': ['skills/temps-cli/references/COMMANDS.md'],
+            'stamped': ['skills/temps-cli/references/COMMANDS.md', 'web/src/lib/ai-onboarding.ts'],
             'channel_pinned': ['skills/**/*.md', 'skills/**/*.json'],
             # 0.1.38 and 0.2.0-beta.1 shipped before SDKs followed the server version.
             'versioning': 'until-server-passes'})
@@ -236,6 +236,18 @@ class ReleaseTests(unittest.TestCase):
         # The generated command reference names the current CLI version, so `prepare` can move it.
         reference = (release.ROOT / 'skills/temps-cli/references/COMMANDS.md').read_text()
         self.assertIn(f"`@temps-sdk/cli@{package['version']}`", reference)
+
+    def test_the_console_names_the_cli_released_with_it(self):
+        # The console's copied commands pin the CLI; `prepare` moves that pin with
+        # every CLI bump, which it can only do while it equals the manifest.
+        package = next(p for p in release.catalog_packages() if p['key'] == 'cli')
+        pin = 'web/src/lib/ai-onboarding.ts'
+        self.assertIn(pin, package['stamped'])
+        text = (release.ROOT / pin).read_text()
+        self.assertEqual(re.findall(r'@temps-sdk/cli@[0-9][0-9A-Za-z.+-]*', text), [f"@temps-sdk/cli@{package['version']}"])
+        edits = sdk_prepare.Edits(release.ROOT)
+        sdk_prepare.set_stamped_versions(edits, package, '9.9.9-beta.1')
+        self.assertIn("const TEMPS_CLI_PACKAGE = '@temps-sdk/cli@9.9.9-beta.1'", edits.files[pin])
 
     def test_npm_archive_checks_manifest_dependencies_and_entrypoints(self):
         package = dict(self.catalog['cli'], key='cli', version='1.2.3')

@@ -8,7 +8,16 @@ import type {
 } from '@/api/client'
 
 export const AI_HARNESS_KEY_NAME = 'Temps AI harness'
-export const TEMPS_CLI_VERSION = '0.1.38'
+/**
+ * The CLI release the console's copied commands run. The release rewrites this
+ * one package spec (the CLI's `stamped` files in `.github/releases/packages.json`)
+ * to the CLI version it publishes for the same server tag, so a console always
+ * names the CLI built from its own source. Keep it the only literal spec here.
+ */
+const TEMPS_CLI_PACKAGE = '@temps-sdk/cli@0.2.0-beta.1'
+export const TEMPS_CLI_VERSION = TEMPS_CLI_PACKAGE.slice(
+  TEMPS_CLI_PACKAGE.lastIndexOf('@') + 1
+)
 
 export type AiHarnessStatus = AiHarnessState
 

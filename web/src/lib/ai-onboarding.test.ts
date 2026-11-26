@@ -17,6 +17,7 @@ import {
   reconcileCreatedKey,
   resolveOnboardingStatus,
   shouldShowHarnessPendingBanner,
+  TEMPS_CLI_VERSION,
 } from './ai-onboarding'
 
 const STUB_BUNX = 'bunx() { printf "BUNX %s\\n" "$*"; }'
@@ -97,11 +98,17 @@ describe('AI harness onboarding commands', () => {
     ).toBe('bunx skills add gotempsh/temps --skill temps')
   })
 
+  test('pins a bare CLI version, read from the package spec the release rewrites', () => {
+    // The release moves `@temps-sdk/cli@<version>` in ai-onboarding.ts; the
+    // commands must get the version alone, never the package name with it.
+    expect(TEMPS_CLI_VERSION).toMatch(/^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/)
+  })
+
   test('connects the pinned CLI without putting the API key in command text', () => {
     const commands = buildAiHarnessCommands('https://temps.example.com/')
 
     expect(commands.connectCli).toContain(
-      'bunx @temps-sdk/cli@0.1.38 login https://temps.example.com'
+      `bunx @temps-sdk/cli@${TEMPS_CLI_VERSION} login https://temps.example.com`
     )
     expect(commands.connectCli).toContain('--api-key "$TEMPS_API_KEY"')
     expect(commands.connectCli).toContain('--context temps-example-com')
@@ -121,7 +128,7 @@ describe('AI harness onboarding commands', () => {
       () => {
         const { stdout } = runConnect(shell.name, 'tk_typed_example')
         expect(stdout).toContain(
-          'BUNX @temps-sdk/cli@0.1.38 login https://temps.example.com --api-key tk_typed_example --context temps-example-com'
+          `BUNX @temps-sdk/cli@${TEMPS_CLI_VERSION} login https://temps.example.com --api-key tk_typed_example --context temps-example-com`
         )
       }
     )
@@ -158,7 +165,7 @@ describe('AI harness onboarding commands', () => {
     const commands = buildAiHarnessCommands('http://localhost:3003')
 
     expect(commands.verifyIdentity).toBe(
-      'bunx @temps-sdk/cli@0.1.38 --target-context localhost whoami'
+      `bunx @temps-sdk/cli@${TEMPS_CLI_VERSION} --target-context localhost whoami`
     )
     expect(commands.verifyProjects).toContain(
       '--target-context localhost projects list --json'
