@@ -50,16 +50,24 @@ const OUTCOME_LINE: &str = "temps-login-outcome ";
 const SET_LOGIN_SCRIPT: &str = r#"set -u
 err=$(mktemp)
 deadline=$(( $(date +%s) + TEMPS_LOGIN_WAIT_SECONDS ))
-# Role names to sign in as over the trusted socket: the configured user,
-# postgres, then the names stored in the restored shared catalogs, pg_authid
-# (global/1260) first. A backup from another server keeps that server's
-# superuser, whose name nothing else records.
+# Role names to sign in as over the trusted socket, one per line: the
+# configured user, postgres, then the names stored in the restored shared
+# catalogs, pg_authid (global/1260) first. A backup from another server keeps
+# that server's superuser, whose name nothing else records. A name is a run of
+# printable (or UTF-8) bytes, kept whole so a quoted name such as
+# `origin-admin` is tried as it is; its alphanumeric pieces follow, for a name
+# the bytes next to it in the page ran into.
+catalog_names() {
+  { cat "$PGDATA/global/1260" 2>/dev/null; cat "$PGDATA"/global/* 2>/dev/null; } \
+    | LC_ALL=C tr -c '\40-\176\200-\377' '\n'
+}
 candidates() {
   printf '%s\n' "$TEMPS_LOGIN_ROLE" postgres
   if [ -n "${PGDATA:-}" ] && [ -d "$PGDATA/global" ]; then
-    { cat "$PGDATA/global/1260" 2>/dev/null; cat "$PGDATA"/global/* 2>/dev/null; } \
-      | tr -c 'A-Za-z0-9_' '\n' | grep -E '^[A-Za-z_][A-Za-z0-9_]{0,62}$' \
-      | grep -v '^pg_' | awk '!seen[$0]++' | head -n 200
+    { catalog_names | LC_ALL=C awk 'length($0) <= 63';
+      catalog_names | LC_ALL=C tr -c 'A-Za-z0-9_\n' '\n' \
+        | grep -E '^[A-Za-z_][A-Za-z0-9_]{0,62}$'; } \
+      | grep -v -e '^pg_' -e '^$' | LC_ALL=C awk '!seen[$0]++' | head -n 300
   fi
 }
 # Prints "<in recovery> <superuser>" (`f t`) for a role that signs in.
@@ -77,14 +85,17 @@ while :; do
     # A superuser can change any role's password; any other role that signs
     # in is kept as the fallback.
     fallback=
-    for candidate in $(candidates); do
+    names=$(mktemp)
+    candidates >"$names"
+    while IFS= read -r candidate; do
       if out=$(probe "$candidate"); then
         case "$out" in
           *" t") who=$candidate; state=${out%% *}; break ;;
           *) [ -n "$fallback" ] || { fallback=$candidate; fallback_state=${out%% *}; } ;;
         esac
       fi
-    done
+    done <"$names"
+    rm -f "$names"
     if [ -z "$who" ] && [ -n "$fallback" ]; then
       who=$fallback
       state=$fallback_state
@@ -111,7 +122,10 @@ psql -X -w -qAt -v ON_ERROR_STOP=1 -U "$who" -d template1 \
   -v role="$TEMPS_LOGIN_ROLE" -v secret="$TEMPS_LOGIN_SECRET" <<'SQL' || exit $?
 SET log_statement = 'none';
 SET log_min_duration_statement = -1;
+SET log_min_duration_sample = -1;
+SET log_transaction_sample_rate = 0;
 SET log_min_error_statement = 'panic';
+SET pg_stat_statements.track_utility = off;
 SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'role')
   THEN format('ALTER ROLE %I WITH LOGIN PASSWORD %L', :'role', :'secret')
   ELSE format('CREATE ROLE %I WITH SUPERUSER LOGIN PASSWORD %L', :'role', :'secret')
@@ -359,7 +373,20 @@ mod tests {
     fn login_script_carries_no_values_and_disables_statement_logging() {
         let script = set_login_script();
         assert!(!script.contains("TEMPS_LOGIN_WAIT_SECONDS"));
-        assert!(script.contains("SET log_statement = 'none'"));
+        // Every channel that can write the statement to the server log, or
+        // keep its text in pg_stat_statements, is off before the secret.
+        let secret_at = script.find(":'secret'").expect("secret is used");
+        for setting in [
+            "SET log_statement = 'none'",
+            "SET log_min_duration_statement = -1",
+            "SET log_min_duration_sample = -1",
+            "SET log_transaction_sample_rate = 0",
+            "SET log_min_error_statement = 'panic'",
+            "SET pg_stat_statements.track_utility = off",
+        ] {
+            let at = script.find(setting).unwrap_or(usize::MAX);
+            assert!(at < secret_at, "{setting} must come before the secret");
+        }
         assert!(script.contains(":'secret'"));
         assert!(script.contains("\"$TEMPS_LOGIN_SECRET\""));
     }
@@ -436,7 +463,7 @@ mod tests {
                 ContainerCreateBody {
                     image: Some(image.to_string()),
                     env: Some(vec![
-                        "POSTGRES_USER=origin".to_string(),
+                        "POSTGRES_USER=origin-admin".to_string(),
                         "POSTGRES_PASSWORD=origin-secret".to_string(),
                         "POSTGRES_DB=appdb".to_string(),
                     ]),
@@ -462,7 +489,7 @@ mod tests {
                 if sh(
                     &docker,
                     &container,
-                    "pg_isready -q -h \"$(hostname -i | cut -d' ' -f1)\" -U origin",
+                    "pg_isready -q -h \"$(hostname -i | cut -d' ' -f1)\" -U origin-admin",
                 )
                 .await
                 .is_ok()
@@ -478,7 +505,7 @@ mod tests {
             sh(
                 &docker,
                 &container,
-                "psql -X -qAt -U origin -d appdb -c \"CREATE ROLE reader LOGIN PASSWORD 'reader-secret'\"",
+                "psql -X -qAt -U origin-admin -d appdb -c \"CREATE ROLE reader LOGIN PASSWORD 'reader-secret'\"",
             )
             .await?;
 
@@ -487,7 +514,7 @@ mod tests {
                 "host": "localhost",
                 "port": "5432",
                 "database": "appdb",
-                "username": "origin",
+                "username": "origin-admin",
                 "password": "temps-managed-secret",
                 "max_connections": 100,
                 "docker_image": image,
@@ -499,13 +526,15 @@ mod tests {
                 .set_configured_login(&container, &config)
                 .await
                 .map_err(|error| error.to_string())?;
-            assert!(roles.contains(&"origin".to_string()), "{roles:?}");
+            assert!(roles.contains(&"origin-admin".to_string()), "{roles:?}");
             assert!(roles.contains(&"reader".to_string()), "{roles:?}");
-            assert!(tcp_login(&docker, &container, "origin", "temps-managed-secret").await);
-            assert!(!tcp_login(&docker, &container, "origin", "origin-secret").await);
+            assert!(tcp_login(&docker, &container, "origin-admin", "temps-managed-secret").await);
+            assert!(!tcp_login(&docker, &container, "origin-admin", "origin-secret").await);
             assert!(tcp_login(&docker, &container, "reader", "reader-secret").await);
 
-            // A role the backup does not have: created as a superuser.
+            // A role the backup does not have, with no `postgres` role either:
+            // the script finds the backup's superuser, whose name has a
+            // hyphen, in the restored catalog, and creates the role.
             config.username = "manager".to_string();
             config.password = "manager-secret".to_string();
             service
@@ -516,7 +545,7 @@ mod tests {
             let superuser = sh(
                 &docker,
                 &container,
-                "psql -X -qAt -U origin -d appdb -c \"SELECT rolsuper FROM pg_roles WHERE rolname = 'manager'\"",
+                "psql -X -qAt -U origin-admin -d appdb -c \"SELECT rolsuper FROM pg_roles WHERE rolname = 'manager'\"",
             )
             .await?;
             assert_eq!(superuser.trim(), "t");
@@ -524,7 +553,7 @@ mod tests {
             let stored = sh(
                 &docker,
                 &container,
-                "psql -X -qAt -U origin -d appdb -c \"SELECT rolpassword FROM pg_authid WHERE rolname = 'manager'\"",
+                "psql -X -qAt -U origin-admin -d appdb -c \"SELECT rolpassword FROM pg_authid WHERE rolname = 'manager'\"",
             )
             .await?;
             assert!(stored.trim().starts_with("SCRAM-SHA-256$4096:"), "{stored}");

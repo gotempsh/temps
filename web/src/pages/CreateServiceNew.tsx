@@ -27,6 +27,7 @@ import { JsonSchemaForm } from '@/components/forms/JsonSchemaForm'
 import { useServiceTypePreset } from '@/components/forms/ServiceTypePresets'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   Select,
   SelectContent,
@@ -115,6 +116,14 @@ const RESTORABLE_SERVICE_TYPES: CreatableServiceTypeRoute[] = [
 ]
 
 type StartFrom = 'empty' | 'backup'
+
+/** A service created to restore `backup` from storage source `sourceId` into. */
+interface RestoreTarget {
+  id: number
+  name: string
+  backup: SourceBackupEntry
+  sourceId: number
+}
 
 const DEFAULT_CLUSTER_ROLES: Record<string, string[]> = {
   postgres: ['monitor', 'replica'],
@@ -386,12 +395,16 @@ export function CreateService() {
       destinations.data?.find((source) => source.is_default) ??
       destinations.data?.[0]
     )?.id
-  // The pick is kept with its engine and source, so switching either drops it.
+  // The pick is kept with its engine and source. Choosing another source
+  // clears it, and so does opening the page for another engine.
   const [restorePick, setRestorePick] = useState<{
     engine: string
     sourceId: number
     backup: SourceBackupEntry
   } | null>(null)
+  if (restorePick && restorePick.engine !== serviceType) {
+    setRestorePick(null)
+  }
   const restoreBackup =
     restorePick &&
     restorePick.engine === serviceType &&
@@ -400,10 +413,8 @@ export function CreateService() {
       : null
   // A service created for a restore that has not started yet (verification
   // dismissed): the restore is retried for it, never a second service.
-  const [createdForRestore, setCreatedForRestore] = useState<{
-    id: number
-    name: string
-  } | null>(null)
+  const [createdForRestore, setCreatedForRestore] =
+    useState<RestoreTarget | null>(null)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -503,46 +514,43 @@ export function CreateService() {
   const startRestoreMut = useMutation({
     ...startRestoreMutation(),
     retry: false,
-    onSuccess: (run, variables) => {
-      const serviceId = variables.path.id
-      queryClient.setQueryData(restoreRunQuery(run.id).queryKey, run)
-      setCreatedForRestore(null)
-      toast.success('Restoring the backup into the new service')
-      navigate(restoreRunHref(serviceId, run.id))
-    },
-    onError: (error, variables) => {
-      if (
-        handleSensitiveActionError(error, () =>
-          startRestoreMut.mutate(variables)
-        )
-      ) {
-        return
-      }
-      const serviceId = variables.path.id
-      const orphan = !!variables.body.backup_location
-      toast.error('The service was created, but the restore did not start', {
-        description: restoreRequestFailure(error, 'start', orphan),
-      })
-      setCreatedForRestore(null)
-      if (restoreBackup && restoreSourceId !== undefined) {
-        navigate(
-          restoreSelectionHref(serviceId, restoreSourceId, restoreBackup)
-        )
-      } else {
-        navigate(`/storage/${serviceId}/restore`)
-      }
-    },
   })
 
-  const startRestoreInto = (serviceId: number) => {
-    if (!restoreBackup || restoreSourceId === undefined) {
-      navigate(`/storage/${serviceId}/restore`)
-      return
-    }
-    startRestoreMut.mutate({
-      path: { id: serviceId },
-      body: createFromBackupRestore(restoreBackup, restoreSourceId),
-    })
+  // Every value the restore uses is the one submitted, carried in `target`,
+  // never read from a later render.
+  const startRestoreInto = (target: RestoreTarget) => {
+    startRestoreMut.mutate(
+      {
+        path: { id: target.id },
+        body: createFromBackupRestore(target.backup, target.sourceId),
+      },
+      {
+        onSuccess: (run) => {
+          queryClient.setQueryData(restoreRunQuery(run.id).queryKey, run)
+          setCreatedForRestore(null)
+          toast.success('Restoring the backup into the new service')
+          navigate(restoreRunHref(target.id, run.id))
+        },
+        onError: (error, variables) => {
+          if (handleSensitiveActionError(error, () => startRestoreInto(target)))
+            return
+          toast.error(
+            'The service was created, but the restore did not start',
+            {
+              description: restoreRequestFailure(
+                error,
+                'start',
+                !!variables.body.backup_location
+              ),
+            }
+          )
+          setCreatedForRestore(null)
+          navigate(
+            restoreSelectionHref(target.id, target.sourceId, target.backup)
+          )
+        },
+      }
+    )
   }
 
   const createServiceMut = useMutation({
@@ -555,20 +563,8 @@ export function CreateService() {
         setNameError(message)
         nameInput.current?.focus()
       }),
-    onSuccess: (data) => {
-      if (startFrom === 'backup') {
-        setCreatedForRestore({ id: data.id, name: data.name })
-        startRestoreInto(data.id)
-        return
-      }
-      if (data.status === 'creating') {
-        toast.success('Cluster creation started — tracking progress...')
-      } else {
-        toast.success('Service created successfully')
-      }
-      navigate(creationBackupHref(data.id, backupDestination))
-    },
   })
+  const submitting = createServiceMut.isPending || startRestoreMut.isPending
 
   const handleSubmit = async (
     parameterValues: Record<string, string | null | number>
@@ -582,7 +578,7 @@ export function CreateService() {
       return
     }
     if (createdForRestore) {
-      startRestoreInto(createdForRestore.id)
+      startRestoreInto(createdForRestore)
       return
     }
     if (startFrom === 'backup' && !restoreBackup) {
@@ -617,21 +613,51 @@ export function CreateService() {
       delete cleanedParameters['port']
     }
 
-    await createServiceMut.mutateAsync({
-      body: {
-        service_type: serviceType,
-        name: serviceName,
-        parameters: cleanedParameters,
-        ...serviceProjectLink(projectId),
-        ...(topology === 'standalone' && {
-          node_id: placementNodeId(standaloneNodeId),
-        }),
-        ...(topology === 'cluster' && {
-          topology: 'cluster',
-          members: clusterMembers,
-        }),
-      },
-    })
+    // What was submitted: the choices on screen may change while the service
+    // is being created.
+    const submittedBackup = startFrom === 'backup' ? restoreBackup : null
+    const submittedSourceId = restoreSourceId
+    const submittedDestination = backupDestination
+
+    let data
+    try {
+      data = await createServiceMut.mutateAsync({
+        body: {
+          service_type: serviceType,
+          name: serviceName,
+          parameters: cleanedParameters,
+          ...serviceProjectLink(projectId),
+          ...(topology === 'standalone' && {
+            node_id: placementNodeId(standaloneNodeId),
+          }),
+          ...(topology === 'cluster' && {
+            topology: 'cluster',
+            members: clusterMembers,
+          }),
+        },
+      })
+    } catch {
+      // Reported by the mutation's onError.
+      return
+    }
+
+    if (submittedBackup && submittedSourceId !== undefined) {
+      const target: RestoreTarget = {
+        id: data.id,
+        name: data.name,
+        backup: submittedBackup,
+        sourceId: submittedSourceId,
+      }
+      setCreatedForRestore(target)
+      startRestoreInto(target)
+      return
+    }
+    if (data.status === 'creating') {
+      toast.success('Cluster creation started — tracking progress...')
+    } else {
+      toast.success('Service created successfully')
+    }
+    navigate(creationBackupHref(data.id, submittedDestination))
   }
 
   const { data: providers, isLoading: isLoadingProviders } = useQuery({
@@ -815,7 +841,7 @@ export function CreateService() {
         {supportsRestore && (
           <StartFromChoice
             value={startFrom}
-            disabled={createdForRestore !== null}
+            disabled={submitting || createdForRestore !== null}
             onChange={(next) => {
               setStartFrom(next)
               if (next === 'backup') {
@@ -834,7 +860,11 @@ export function CreateService() {
             engineName={providerMetadata?.display_name ?? serviceType}
             sources={destinations}
             sourceId={restoreSourceId}
-            onSourceChange={setRestoreSourceId}
+            onSourceChange={(id) => {
+              setRestoreSourceId(id)
+              setRestorePick(null)
+            }}
+            disabled={submitting || createdForRestore !== null}
             selected={restoreBackup}
             onSelect={(backup) =>
               restoreSourceId !== undefined &&
@@ -937,7 +967,7 @@ export function CreateService() {
             (startFrom === 'backup' && !restoreBackup) ||
             (topology === 'standalone' && standaloneNodeId === null)
           }
-          isSubmitting={createServiceMut.isPending || startRestoreMut.isPending}
+          isSubmitting={submitting}
           serviceType={serviceType}
           managedByTemps
           allFieldsAdvanced
@@ -1030,28 +1060,27 @@ function StartFromChoice({
   return (
     <div className="space-y-2">
       <Label id="start-from-label">Start from</Label>
-      <div
-        role="radiogroup"
+      <RadioGroup
         aria-labelledby="start-from-label"
+        value={value}
+        onValueChange={(next) => onChange(next as StartFrom)}
+        disabled={disabled}
         className="grid grid-cols-1 gap-3 sm:grid-cols-2"
       >
         {START_FROM_OPTIONS.map((option) => {
           const Icon = option.icon
-          const selected = option.value === value
+          const id = `start-from-${option.value}`
           return (
-            <button
+            <label
               key={option.value}
-              type="button"
-              role="radio"
-              aria-checked={selected}
-              disabled={disabled}
-              onClick={() => onChange(option.value)}
-              className={`flex items-start gap-3 rounded-lg border-2 p-4 text-left transition-colors disabled:opacity-60 ${
-                selected
+              htmlFor={id}
+              className={`flex cursor-pointer items-start gap-3 rounded-lg border-2 p-4 transition-colors has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60 ${
+                option.value === value
                   ? 'border-primary bg-primary/5'
                   : 'border-border hover:border-muted-foreground/50'
               }`}
             >
+              <RadioGroupItem id={id} value={option.value} className="mt-0.5" />
               <Icon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
               <span className="space-y-1">
                 <span className="block text-sm font-medium">
@@ -1061,15 +1090,14 @@ function StartFromChoice({
                   {option.detail}
                 </span>
               </span>
-            </button>
+            </label>
           )
         })}
-      </div>
+      </RadioGroup>
     </div>
   )
 }
 
-/** Where the service runs, and its backups: the advanced settings that are not parameters. */
 function AdvancedPlacement({
   showTopology,
   topology,

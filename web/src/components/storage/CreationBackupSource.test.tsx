@@ -128,3 +128,46 @@ test('without a storage source it says what is missing and links to add one', ()
       .getAttribute('href')
   ).toBe('/backups/s3-sources/new')
 })
+
+test('a failed refresh keeps the loaded sources on screen, with the error', () => {
+  const view = render(
+    withBackups(
+      [backup({})],
+      <CreationBackupSource
+        engine="postgres"
+        engineName="PostgreSQL"
+        sources={{ ...SOURCES, isError: true }}
+        sourceId={7}
+        onSourceChange={() => {}}
+        selected={null}
+        onSelect={() => {}}
+      />
+    )
+  )
+  expect(view.getByText('Storage sources could not be refreshed')).toBeTruthy()
+  expect(view.getByLabelText('Storage source')).toBeTruthy()
+  expect(view.getAllByRole('radio')).toHaveLength(1)
+})
+
+test('the backup list can be locked while the service is created', () => {
+  const picked: SourceBackupEntry[] = []
+  const view = render(
+    withBackups(
+      [backup({})],
+      <CreationBackupSource
+        engine="postgres"
+        engineName="PostgreSQL"
+        sources={SOURCES}
+        sourceId={7}
+        onSourceChange={() => {}}
+        selected={null}
+        onSelect={(entry) => picked.push(entry)}
+        disabled
+      />
+    )
+  )
+  const [option] = view.getAllByRole('radio')
+  expect(option.hasAttribute('disabled')).toBe(true)
+  fireEvent.click(option)
+  expect(picked).toEqual([])
+})

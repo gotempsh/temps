@@ -9,6 +9,7 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import {
   Select,
@@ -23,7 +24,6 @@ import { formatBytesBinary } from '@/lib/server-monitoring'
 import { cn } from '@/lib/utils'
 import { restoreSourceBackupsQuery } from '@/pages/service-restore/restore-queries'
 import { useQuery } from '@tanstack/react-query'
-import { CheckCircle2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link } from 'react-router'
 
@@ -42,6 +42,7 @@ export function CreationBackupSource({
   onSourceChange,
   selected,
   onSelect,
+  disabled = false,
 }: {
   engine: string
   engineName: string
@@ -55,6 +56,8 @@ export function CreationBackupSource({
   onSourceChange: (sourceId: number) => void
   selected: SourceBackupEntry | null
   onSelect: (backup: SourceBackupEntry) => void
+  /** Locks the choice, e.g. while the service is being created. */
+  disabled?: boolean
 }) {
   const [page, setPage] = useState(1)
   const backupsQuery = useQuery({
@@ -74,20 +77,36 @@ export function CreationBackupSource({
   const scanErrors = backupsQuery.data?.scan_errors ?? []
   const selectedKey = selected ? backupKey(selected) : null
 
-  if (sources.isError) {
+  const sourcesRefreshFailed = sources.isError && !!sources.data?.length
+  const backupsRefreshFailed = backupsQuery.isError && !!backupsQuery.data
+  const retrySources = (
+    <Button
+      type="button"
+      variant="link"
+      className="h-auto p-0"
+      onClick={() => void sources.refetch()}
+    >
+      Retry
+    </Button>
+  )
+  const retryBackups = (
+    <Button
+      type="button"
+      variant="link"
+      className="h-auto p-0"
+      onClick={() => void backupsQuery.refetch()}
+    >
+      Retry
+    </Button>
+  )
+
+  // A failed refresh keeps what was loaded on screen, with the error beside it.
+  if (sources.isError && !sources.data?.length) {
     return (
       <Alert variant="destructive">
         <AlertTitle>Storage sources could not be loaded</AlertTitle>
         <AlertDescription>
-          Backups are listed from a storage source.{' '}
-          <Button
-            type="button"
-            variant="link"
-            className="h-auto p-0"
-            onClick={() => void sources.refetch()}
-          >
-            Retry
-          </Button>
+          Backups are listed from a storage source. {retrySources}
         </AlertDescription>
       </Alert>
     )
@@ -125,9 +144,18 @@ export function CreationBackupSource({
 
   return (
     <div className="space-y-3">
+      {sourcesRefreshFailed && (
+        <Alert variant="destructive">
+          <AlertTitle>Storage sources could not be refreshed</AlertTitle>
+          <AlertDescription>
+            Showing the last list loaded. {retrySources}
+          </AlertDescription>
+        </Alert>
+      )}
       <div className="space-y-2">
         <Label htmlFor="restore-source">Storage source</Label>
         <Select
+          disabled={disabled}
           value={sourceId === undefined ? undefined : String(sourceId)}
           onValueChange={(value) => {
             setPage(1)
@@ -147,19 +175,21 @@ export function CreationBackupSource({
         </Select>
       </div>
 
-      {sourceId === undefined ? null : backupsQuery.isError ? (
+      {backupsRefreshFailed && (
+        <Alert variant="destructive">
+          <AlertTitle>Backups could not be refreshed</AlertTitle>
+          <AlertDescription>
+            Showing the last list loaded. {retryBackups}
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {sourceId === undefined ? null : backupsQuery.isError &&
+        !backupsQuery.data ? (
         <Alert variant="destructive">
           <AlertTitle>Backups could not be listed</AlertTitle>
           <AlertDescription>
-            Check that this server can read the bucket.{' '}
-            <Button
-              type="button"
-              variant="link"
-              className="h-auto p-0"
-              onClick={() => void backupsQuery.refetch()}
-            >
-              Retry
-            </Button>
+            Check that this server can read the bucket. {retryBackups}
           </AlertDescription>
         </Alert>
       ) : backupsQuery.isPending ? (
@@ -176,54 +206,55 @@ export function CreationBackupSource({
           </AlertDescription>
         </Alert>
       ) : (
-        <div
-          role="radiogroup"
-          aria-label="Backup to restore"
-          className="space-y-2"
-        >
-          {visible.map((backup) => {
-            const key = backupKey(backup)
-            const isSelected = key === selectedKey
-            return (
-              <button
-                key={key}
-                type="button"
-                role="radio"
-                aria-checked={isSelected}
-                onClick={() => onSelect(backup)}
-                className={cn(
-                  'flex w-full items-start gap-3 rounded-lg border p-3 text-left transition-colors',
-                  isSelected ? 'border-primary bg-primary/5' : 'hover:bg-accent'
-                )}
-              >
-                <CheckCircle2
+        <div className="space-y-2">
+          <RadioGroup
+            aria-label="Backup to restore"
+            disabled={disabled}
+            value={selectedKey ?? ''}
+            onValueChange={(key) => {
+              const backup = backups.find((entry) => backupKey(entry) === key)
+              if (backup) onSelect(backup)
+            }}
+            className="gap-2"
+          >
+            {visible.map((backup) => {
+              const key = backupKey(backup)
+              const id = `restore-backup-${key}`
+              return (
+                <label
+                  key={key}
+                  htmlFor={id}
                   className={cn(
-                    'mt-0.5 h-4 w-4 shrink-0',
-                    isSelected ? 'text-primary' : 'text-transparent'
+                    'flex w-full cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors',
+                    key === selectedKey
+                      ? 'border-primary bg-primary/5'
+                      : 'hover:bg-accent'
                   )}
-                />
-                <div className="min-w-0 flex-1 space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-sm font-medium [overflow-wrap:anywhere]">
-                      {backup.origin_service_name || backup.name}
+                >
+                  <RadioGroupItem id={id} value={key} className="mt-0.5" />
+                  <span className="min-w-0 flex-1 space-y-1">
+                    <span className="flex flex-wrap items-center gap-2">
+                      <span className="text-sm font-medium [overflow-wrap:anywhere]">
+                        {backup.origin_service_name || backup.name}
+                      </span>
+                      {backup.source === 's3_scan' && (
+                        <Badge variant="outline" className="text-xs">
+                          Found in S3
+                        </Badge>
+                      )}
                     </span>
-                    {backup.source === 's3_scan' && (
-                      <Badge variant="outline" className="text-xs">
-                        Found in S3
-                      </Badge>
-                    )}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    {new Date(backup.created_at).toLocaleString()}
-                    {backup.size_bytes ? (
-                      <> · {formatBytesBinary(backup.size_bytes)}</>
-                    ) : null}
-                    {backup.format ? <> · {backup.format}</> : null}
-                  </p>
-                </div>
-              </button>
-            )
-          })}
+                    <span className="block text-xs text-muted-foreground">
+                      {new Date(backup.created_at).toLocaleString()}
+                      {backup.size_bytes ? (
+                        <> · {formatBytesBinary(backup.size_bytes)}</>
+                      ) : null}
+                      {backup.format ? <> · {backup.format}</> : null}
+                    </span>
+                  </span>
+                </label>
+              )
+            })}
+          </RadioGroup>
           {totalPages > 1 && (
             <ResponsivePagination
               page={currentPage}

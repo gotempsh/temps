@@ -3040,23 +3040,6 @@ async fn run_restore_inner(
         );
     }
 
-    let restored_login = restored_login_for(
-        &target_service.service_type,
-        &backup_model.s3_location,
-        origin_service_id,
-        target_service.id,
-        origin_credentials_for_post_restore_patch.is_some(),
-    );
-    if restored_login == RestoredLogin::SetConfiguredPassword {
-        info!(
-            run_id,
-            service_id = target_service.id,
-            backup_id = backup_model.id,
-            "The backup's origin login is not held here: the restore sets service {}'s configured password inside the restored data",
-            target_service.id
-        );
-    }
-
     let instance = mgr
         .resolve_service_instance(&target_service.name, service_type)
         .await
@@ -3220,6 +3203,25 @@ async fn run_restore_inner(
         }
         super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "provision")
             .await?;
+    }
+
+    // Chosen once the location is final: a backup recorded without one is
+    // backfilled from S3 above, and may only now name a WAL-G base backup.
+    let restored_login = restored_login_for(
+        &target_service.service_type,
+        &backup_model.s3_location,
+        origin_service_id,
+        target_service.id,
+        origin_credentials_for_post_restore_patch.is_some(),
+    );
+    if restored_login == RestoredLogin::SetConfiguredPassword {
+        info!(
+            run_id,
+            service_id = target_service.id,
+            backup_id = backup_model.id,
+            "The backup's origin login is not held here: the restore sets service {}'s configured password inside the restored data",
+            target_service.id
+        );
     }
 
     let ctx = RestoreContext {
