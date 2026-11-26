@@ -1,6 +1,6 @@
 # The sidebar, from first principles
 
-**Status:** Proposal, not built
+**Status:** Steps 1 to 4 built; pins (step 5) not built
 **Date:** 2026-11-26
 **Builds on:** [Console navigation](./console-navigation-proposal.md) (revision 4, built), [Console page inventory](./console-page-inventory.md) (tiers and rules)
 
@@ -133,18 +133,23 @@ Settings
      Variables
      Analytics                       (once it receives page views)
      Settings
-     shop.example.com         ●      🌐
-     www.shop.example.com     Pending
+     + Add                           (a view not in use yet: Analytics)
+     Domains                  1 pending
 ```
 
 - **Seven rows at most,** the everyday tasks, in the order they are done:
   is it healthy, did the deploy work, logs, errors, variables. Analytics is a
   row only once the service receives page views (for a website it is
   everyday; for an API it never applies). Settings is last.
-- **Its custom domains are rows under it,** after its views, each with its
-  state, because a hostname routes to one service and fails on its own
-  (DNS not pointed yet, certificate pending). A service with no custom domain
-  shows none; adding one is on its Overview.
+- **Its custom domains are one Domains row,** after its views, once it has
+  any. A hostname routes to one service and fails on its own (DNS not
+  pointed yet, certificate pending), so the row counts the ones in trouble
+  ("1 pending"). It is one row rather than one per hostname because a
+  hostname does not fit the sidebar at that depth, and a name cut short is
+  not shown. Its name and state are never cut either: when both do not fit,
+  the state goes under the name. The row opens the Domains page, where each
+  hostname is read in full. A service with no custom domain has no row;
+  adding one is the Domains tab of its Overview.
 - **The server's domain records** (the certificates and DNS zones under
   Domains today, which several services can share) are not entities of one
   service. They move to the Server page with the other server-wide lists.
@@ -159,9 +164,9 @@ question they answer:
 
 | Row | Tabs | Moved in |
 |---|---|---|
-| Overview ("is it healthy?") | Overview, Metrics, Uptime, Alerts, Activity | Metrics, Uptime, Alerts |
+| Overview ("is it healthy?") | Overview, Activity, Metrics ▾, Uptime ▾, Alerts ▾, Domains, Databases ▾ | Metrics, Uptime, Alerts, Domains, Databases |
 | Deployments | Deployments, Environments, Build | |
-| Logs ("what happened?") | Application, Requests, OpenTelemetry, Traces | Traces |
+| Logs ("what happened?") | Application, Requests, OpenTelemetry, Traces ▾ | Traces |
 | Errors | Issues, Feedback, Releases, Settings ▾ | |
 | Variables | Variables, Secrets, Deploy tokens | |
 | Analytics | Overview, Visitors ▾, Pages ▾, Funnels ▾, Revenue, Settings ▾ | |
@@ -250,7 +255,7 @@ revision 4.
 | Top-level branches | 4 (Projects, Databases, Domains, Servers) | 1 (Projects), plus the Server row |
 | Rows under an open service | up to 13 | at most 7, plus its domains |
 | Where a database is listed | the Databases branch | its project |
-| Where a service's custom domain is listed | its Domains view | under the service, as a row |
+| Where a service's custom domain is listed | its Domains view | one Domains row under the service, and the Domains tab of its Overview |
 | Where the server's domain records (certificates, DNS) are listed | the Domains branch | a tab of the Server page |
 | Server-wide database and domain lists | top-level branches | tabs of the Server page |
 | A view not set up yet | under "Add" in the tree | a tab, showing its set-up state |
@@ -258,15 +263,17 @@ revision 4.
 
 ## Open questions
 
-1. **Custom domains under the service, or under the project?** A custom
-   domain routes to one service in the API, so under the service is one
-   home. A project with many services and domains might want them together.
+1. **Custom domains under the service, or under the project?** Built under
+   the service, as one Domains row. A project with many services and
+   domains might want them together.
 2. **Metrics, Uptime and Alerts as tabs of Overview.** They answer "is it
    healthy?", but Alerts also holds rules that are configured, not looked at.
    Should alert rules move to Settings and only firing alerts stay on the
    Overview?
 3. **The Server row for non-admins.** A member who cannot manage nodes sees
    nothing useful there. Hide the row, or show only the lists they can read?
+   Built: the row is shown to everyone and says nothing about a state it
+   could not read.
 4. **The tab strip's "More".** It is an overflow of the same row of tabs on a
    narrow screen, not a menu category, but it uses a word the inventory bans
    for menu entries. Keep it, or show the overflow count instead ("+4")?
@@ -279,9 +286,29 @@ revision 4.
 7. **Team pins.** Worth building with the first step, or only once users
    have pins of their own?
 
-## What would be built
+## What was built
 
-One PR, in this order, each step shippable:
+Steps 1 to 4 are built, with these choices where the proposal left one open:
+
+- **The Server row** opens on the nodes. Its page's tabs are Nodes (Nodes,
+  This server), Databases (Databases, Backups) and Domains (Domains,
+  Certificates, DNS providers, Delivery), each a tab that opens a menu of
+  its pages. It says the worst of the nodes and databases, counted.
+- **A project's databases** are asked for only while the project is open,
+  at most 25 services across every open project; one past that says "All
+  databases" and links to the project's Databases page. A database page
+  is marked under the open project that lists it, and on the Server row
+  otherwise.
+- **A service's views** are Overview, Deployments, Logs, Errors, Variables,
+  Analytics and Settings. The Overview's tabs are Overview, Activity,
+  Metrics, Uptime, Alerts, Domains and Databases; Logs' are Application,
+  Requests, OpenTelemetry and Traces. The quick tour points at the Metrics
+  and Traces tabs.
+- **With more than eight projects**, the list is the one shown, those in
+  trouble (listed first), those opened recently in this browser, then the
+  rest in order, up to eight, followed by "All projects (N)".
+
+The order they were planned in, each step shippable:
 
 1. Projects branch only at the top, the Server row and the server page tabs
    (Nodes, Databases, Domains, Backups).
