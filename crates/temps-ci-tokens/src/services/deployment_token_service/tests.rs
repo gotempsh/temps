@@ -1560,6 +1560,68 @@ async fn update_refuses_a_past_expiry_blank_name_and_empty_permissions() {
     assert_eq!(stored.permissions, Some(vec!["analytics:read".to_string()]));
 }
 
+#[tokio::test]
+async fn update_accepts_the_stored_expiry_of_an_expired_token_unchanged() {
+    let Some((db, service, project)) = setup_test_env().await else {
+        return;
+    };
+    let created = service
+        .create_token(
+            project.id,
+            None,
+            CreateDeploymentTokenRequest {
+                expires_at: Some(Utc::now() + Duration::hours(1)),
+                ..named("lapsed")
+            },
+        )
+        .await
+        .unwrap();
+    // A past expiry is refused on create, so let the stored one lapse.
+    let lapsed = Utc::now() - Duration::days(3) - Duration::microseconds(123_456);
+    let mut stored: DeploymentTokenActiveModel = DeploymentTokenEntity::find_by_id(created.id)
+        .one(db.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    stored.expires_at = Set(Some(lapsed));
+    stored.update(db.db.as_ref()).await.unwrap();
+
+    // A client sends the token back as it read it, with a new name.
+    let read =
+        serde_json::to_value(service.get_token(project.id, created.id).await.unwrap()).unwrap();
+    let request: UpdateDeploymentTokenRequest = serde_json::from_value(serde_json::json!({
+        "name": "lapsed-renamed",
+        "expires_at": read["expires_at"],
+    }))
+    .unwrap();
+    let updated = service
+        .update_token(project.id, created.id, request)
+        .await
+        .expect("an unchanged expiry is not a new one, even after it has passed");
+    assert_eq!(updated.name, "lapsed-renamed");
+    let kept: Option<chrono::DateTime<Utc>> =
+        serde_json::from_value(read["expires_at"].clone()).unwrap();
+    assert_eq!(updated.expires_at, kept);
+
+    // A different past expiry is still refused.
+    let error = service
+        .update_token(
+            project.id,
+            created.id,
+            UpdateDeploymentTokenRequest {
+                expires_at: Some(Some(lapsed - Duration::days(1))),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a new expiry in the past must be refused");
+    assert!(
+        matches!(error, DeploymentTokenServiceError::ExpiryInPast { .. }),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn update_request_tells_null_expiry_from_an_absent_one() {
     let absent: UpdateDeploymentTokenRequest = serde_json::from_str("{}").unwrap();

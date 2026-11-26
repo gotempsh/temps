@@ -571,8 +571,12 @@ impl DeploymentTokenService {
             .as_deref()
             .map(|name| normalize_token_name(project_id, name))
             .transpose()?;
+        // A client that sends the whole token back resends its stored expiry,
+        // even one that has passed; only a new expiry must be in the future.
         if let Some(Some(expires_at)) = request.expires_at {
-            require_future_expiry(expires_at)?;
+            if token.expires_at != Some(expires_at) {
+                require_future_expiry(expires_at)?;
+            }
         }
         if let Some(ref perms) = request.permissions {
             require_permissions(project_id, perms)?;

@@ -1892,6 +1892,71 @@ async fn update_keeps_or_extends_the_expiry_but_never_removes_it() {
 }
 
 #[tokio::test]
+async fn an_expired_key_can_be_renamed_or_deactivated_with_its_stored_expiry_resent() {
+    let (db, service, user) = setup_test_env().await;
+    let created = service
+        .create_api_key(user.id, key_request("lapsed", "reader"))
+        .await
+        .unwrap();
+    // A past expiry is refused on create, so let the stored one lapse, with a
+    // sub-second part as a stored timestamp has.
+    let lapsed = Utc::now() - Duration::days(3) - Duration::microseconds(123_456);
+    let mut model: ApiKeyActiveModel = ApiKeyEntity::find_by_id(created.id)
+        .one(db.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    model.expires_at = Set(Some(lapsed));
+    model.update(db.db.as_ref()).await.unwrap();
+
+    // The console's edit form reads the key and sends its expiry back as it
+    // read it, together with the fields the user changed.
+    let read =
+        serde_json::to_value(service.get_api_key(user.id, created.id).await.unwrap()).unwrap();
+    let body = serde_json::json!({
+        "name": "lapsed-renamed",
+        "is_active": false,
+        "expires_at": read["expires_at"],
+    });
+    let request: UpdateApiKeyRequest = serde_json::from_value(body).unwrap();
+    let updated = service
+        .update_api_key(user.id, created.id, request)
+        .await
+        .expect("an unchanged expiry is not a new one, even after it has passed");
+
+    assert_eq!(updated.name, "lapsed-renamed");
+    assert!(!updated.is_active);
+    let stored = ApiKeyEntity::find_by_id(created.id)
+        .one(db.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.expires_at, read_expiry(&read));
+
+    // A different past expiry is still refused.
+    let error = service
+        .update_api_key(
+            user.id,
+            created.id,
+            UpdateApiKeyRequest {
+                expires_at: Some(Some(lapsed - Duration::days(1))),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a new expiry in the past must be refused");
+    assert!(
+        matches!(error, ApiKeyServiceError::ExpiryInPast { .. }),
+        "{error:?}"
+    );
+}
+
+fn read_expiry(read: &serde_json::Value) -> Option<chrono::DateTime<Utc>> {
+    serde_json::from_value(read["expires_at"].clone()).unwrap()
+}
+
+#[tokio::test]
 async fn update_trims_the_name_and_refuses_a_blank_one() {
     let (_db, service, user) = setup_test_env().await;
     let created = service

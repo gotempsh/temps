@@ -570,6 +570,10 @@ impl ApiKeyService {
             }
         }
         match request.expires_at {
+            // The console's edit form sends the stored expiry back unchanged,
+            // even one that has passed; renaming or deactivating an expired key
+            // must not require extending it. Only a new expiry must be future.
+            Some(Some(expires_at)) if api_key.expires_at == Some(expires_at) => {}
             Some(Some(expires_at)) => {
                 require_future_expiry(name.as_deref().unwrap_or(&api_key.name), expires_at)?
             }
