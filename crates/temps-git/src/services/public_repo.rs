@@ -16,6 +16,11 @@ use temps_presets::stored_preset::StoredPresetExt;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Memory bound on one public branch listing. A repository with more branches
+/// than this yields a truncated [`PublicBranchList`], never a list that looks
+/// exhaustive.
+const MAX_PUBLIC_BRANCHES: usize = 1_000;
+
 /// Errors that can occur when accessing public repositories
 #[derive(Error, Debug)]
 pub enum PublicRepoError {
@@ -41,6 +46,17 @@ pub enum PublicRepoError {
 
     #[error("Branch not found: {branch}")]
     BranchNotFound { branch: String },
+
+    /// The provider cannot answer "does branch X exist?" exactly, and the
+    /// branch list it can produce was cut short by its safety cap, so the
+    /// branch is neither confirmed nor ruled out. Never report this as a
+    /// missing branch: it is an unverifiable lookup, not a negative answer.
+    #[error("Branch '{branch}' of repository '{repository}' could not be verified: it is absent from a branch list capped at {listed} branches, and this provider offers no single-branch lookup")]
+    BranchLookupUnavailable {
+        repository: String,
+        branch: String,
+        listed: usize,
+    },
 
     /// `subject` is the provider's name, or a sentence saying what it cannot do.
     #[error("Provider not supported: {subject}")]
@@ -76,6 +92,37 @@ pub struct PublicBranch {
     pub name: String,
     pub commit_sha: String,
     pub protected: bool,
+}
+
+/// Branches as a provider returned them, plus whether its safety cap stopped
+/// the walk before the repository ran out of branches.
+///
+/// The public counterpart of [`crate::services::git_provider::BranchList`],
+/// and the same rule holds: a branch absent from a truncated list is not a
+/// branch that does not exist. Use [`PublicRepoProvider::get_branch`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicBranchList {
+    pub branches: Vec<PublicBranch>,
+    /// `true` when the cap cut the list short.
+    pub truncated: bool,
+}
+
+impl PublicBranchList {
+    /// Every branch the repository has.
+    pub fn complete(branches: Vec<PublicBranch>) -> Self {
+        Self {
+            branches,
+            truncated: false,
+        }
+    }
+
+    /// Branches up to a provider's safety cap, with more left unread.
+    pub fn truncated(branches: Vec<PublicBranch>) -> Self {
+        Self {
+            branches,
+            truncated: true,
+        }
+    }
 }
 
 /// What a user-supplied ref name turned out to be.
@@ -158,29 +205,46 @@ pub trait PublicRepoProvider: Send + Sync {
         repo: &str,
     ) -> Result<PublicRepoInfo, PublicRepoError>;
 
-    /// List branches for a repository
+    /// List branches for a repository, up to the provider's safety cap.
+    ///
+    /// The result says whether that cap cut the list short, because a capped
+    /// list is not evidence that a branch missing from it does not exist.
     async fn list_branches(
         &self,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<PublicBranch>, PublicRepoError>;
+    ) -> Result<PublicBranchList, PublicRepoError>;
 
     /// Look up one branch by name; `Ok(None)` when the repository has no
     /// such branch. Providers answer this with a single request, so it works
     /// for repositories with thousands of branches, where
     /// [`Self::list_branches`] stops at its safety cap and would report an
     /// existing branch as missing.
+    ///
+    /// The default implementation scans that list and refuses to answer from
+    /// a truncated one, rather than turning "unread" into "absent".
     async fn get_branch(
         &self,
         owner: &str,
         repo: &str,
         branch: &str,
     ) -> Result<Option<PublicBranch>, PublicRepoError> {
-        Ok(self
-            .list_branches(owner, repo)
-            .await?
-            .into_iter()
-            .find(|b| b.name == branch))
+        let listed = self.list_branches(owner, repo).await?;
+        if let Some(found) = listed
+            .branches
+            .iter()
+            .find(|candidate| candidate.name == branch)
+        {
+            return Ok(Some(found.clone()));
+        }
+        if listed.truncated {
+            return Err(PublicRepoError::BranchLookupUnavailable {
+                repository: format!("{owner}/{repo}"),
+                branch: branch.to_string(),
+                listed: listed.branches.len(),
+            });
+        }
+        Ok(None)
     }
 
     /// The commit a tag points at, with annotated tags peeled; `Ok(None)`
@@ -663,7 +727,7 @@ impl PublicRepoProvider for GitHubPublicProvider {
         &self,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+    ) -> Result<PublicBranchList, PublicRepoError> {
         #[derive(Deserialize)]
         struct GitHubBranch {
             name: String,
@@ -702,20 +766,36 @@ impl PublicRepoProvider for GitHubPublicProvider {
             })?;
 
             let count = branches.len();
-            all_branches.extend(branches.into_iter().map(|b| PublicBranch {
+            // Keep the cap a real memory bound whatever the page size the
+            // provider actually answers with.
+            let remaining = MAX_PUBLIC_BRANCHES.saturating_sub(all_branches.len());
+            let dropped_by_cap = count > remaining;
+            all_branches.extend(branches.into_iter().take(remaining).map(|b| PublicBranch {
                 name: b.name,
                 commit_sha: b.commit.sha,
                 protected: b.protected,
             }));
 
-            // Last page if fewer results than requested, or safety cap at 1000
-            if count < per_page || all_branches.len() >= 1000 {
+            // The cap dropped part of this page, so the repository certainly
+            // has branches this listing never saw.
+            if dropped_by_cap {
+                return Ok(PublicBranchList::truncated(all_branches));
+            }
+            // Fewer results than requested means this was the last page, so
+            // the list is complete.
+            if count < per_page {
                 break;
+            }
+            // A full page with no budget left: more may follow, and saying so
+            // costs one exact lookup where claiming completeness would cost a
+            // false "branch not found".
+            if all_branches.len() >= MAX_PUBLIC_BRANCHES {
+                return Ok(PublicBranchList::truncated(all_branches));
             }
             page += 1;
         }
 
-        Ok(all_branches)
+        Ok(PublicBranchList::complete(all_branches))
     }
 
     async fn get_branch(
@@ -1275,7 +1355,7 @@ impl PublicRepoProvider for GitLabPublicProvider {
         &self,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+    ) -> Result<PublicBranchList, PublicRepoError> {
         let _egress_permit = self.acquire_custom_egress_permit().await?;
         #[derive(Deserialize)]
         struct GitLabBranch {
@@ -1312,19 +1392,36 @@ impl PublicRepoProvider for GitLabPublicProvider {
                     .await?;
 
             let count = branches.len();
-            all_branches.extend(branches.into_iter().map(|b| PublicBranch {
+            // Keep the cap a real memory bound whatever the page size the
+            // provider actually answers with.
+            let remaining = MAX_PUBLIC_BRANCHES.saturating_sub(all_branches.len());
+            let dropped_by_cap = count > remaining;
+            all_branches.extend(branches.into_iter().take(remaining).map(|b| PublicBranch {
                 name: b.name,
                 commit_sha: b.commit.id,
                 protected: b.protected,
             }));
 
-            if count < per_page || all_branches.len() >= 1000 {
+            // The cap dropped part of this page, so the repository certainly
+            // has branches this listing never saw.
+            if dropped_by_cap {
+                return Ok(PublicBranchList::truncated(all_branches));
+            }
+            // Fewer results than requested means this was the last page, so
+            // the list is complete.
+            if count < per_page {
                 break;
+            }
+            // A full page with no budget left: more may follow, and saying so
+            // costs one exact lookup where claiming completeness would cost a
+            // false "branch not found".
+            if all_branches.len() >= MAX_PUBLIC_BRANCHES {
+                return Ok(PublicBranchList::truncated(all_branches));
             }
             page += 1;
         }
 
-        Ok(all_branches)
+        Ok(PublicBranchList::complete(all_branches))
     }
 
     async fn get_branch(
@@ -2081,6 +2178,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_branch_listing_cut_short_by_the_cap_reports_itself_truncated() {
+        let mut server = mockito::Server::new_async().await;
+        // One oversized page: the listing stops at the cap with branches the
+        // repository has but this response never covered.
+        let body: Vec<serde_json::Value> = (0..=MAX_PUBLIC_BRANCHES)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("branch-{index}"),
+                    "commit": { "sha": format!("{index:040x}") },
+                    "protected": false
+                })
+            })
+            .collect();
+        let page = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex("^/repos/example/monorepo/branches\\?".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::Value::Array(body).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("token".to_string(), server.url());
+
+        let listed = provider
+            .list_branches("example", "monorepo")
+            .await
+            .expect("a capped listing still succeeds");
+
+        assert_eq!(listed.branches.len(), MAX_PUBLIC_BRANCHES);
+        assert!(
+            listed.truncated,
+            "a listing stopped by the cap must say branches were left unread"
+        );
+        page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn github_branch_listing_the_provider_finished_reports_itself_complete() {
+        let mut server = mockito::Server::new_async().await;
+        let page = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex("^/repos/example/monorepo/branches\\?".into()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!([
+                    { "name": "main", "commit": { "sha": "abc123" }, "protected": true }
+                ])
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("token".to_string(), server.url());
+
+        let listed = provider
+            .list_branches("example", "monorepo")
+            .await
+            .expect("a short page is the whole listing");
+
+        assert_eq!(listed.branches.len(), 1);
+        assert!(!listed.truncated);
+        page.assert_async().await;
+    }
+
+    /// A provider with no single-branch endpoint falls back to scanning the
+    /// list. From a truncated one it must refuse to answer rather than turn
+    /// "unread" into "absent".
+    #[tokio::test]
+    async fn the_default_branch_lookup_refuses_to_answer_from_a_capped_list() {
+        struct CappedListingOnly;
+
+        #[async_trait]
+        impl PublicRepoProvider for CappedListingOnly {
+            fn provider_name(&self) -> &'static str {
+                "capped"
+            }
+
+            async fn get_repository(
+                &self,
+                _owner: &str,
+                _repo: &str,
+            ) -> Result<PublicRepoInfo, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+
+            async fn list_branches(
+                &self,
+                _owner: &str,
+                _repo: &str,
+            ) -> Result<PublicBranchList, PublicRepoError> {
+                Ok(PublicBranchList::truncated(vec![PublicBranch {
+                    name: "branch-0".to_string(),
+                    commit_sha: "abc123".to_string(),
+                    protected: false,
+                }]))
+            }
+
+            async fn get_file_tree(
+                &self,
+                _owner: &str,
+                _repo: &str,
+                _reference: &str,
+            ) -> Result<Vec<String>, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+
+            async fn get_file_content(
+                &self,
+                _owner: &str,
+                _repo: &str,
+                _path: &str,
+                _reference: &str,
+            ) -> Result<FileContent, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+        }
+
+        let provider = CappedListingOnly;
+
+        let found = provider
+            .get_branch("example", "monorepo", "branch-0")
+            .await
+            .expect("a name present in the prefix is still an answer");
+        assert_eq!(found.map(|branch| branch.name).as_deref(), Some("branch-0"));
+
+        let error = provider
+            .get_branch("example", "monorepo", "release/2026")
+            .await
+            .expect_err("a capped list cannot rule a branch out");
+        match error {
+            PublicRepoError::BranchLookupUnavailable {
+                repository,
+                branch,
+                listed,
+            } => {
+                assert_eq!(repository, "example/monorepo");
+                assert_eq!(branch, "release/2026");
+                assert_eq!(listed, 1);
+            }
+            other => panic!("expected an unverifiable lookup, got {other}"),
+        }
+    }
+
+    #[tokio::test]
     async fn github_secondary_403_is_rate_limit_even_with_remaining_quota() {
         let mut server = mockito::Server::new_async().await;
         let response = server
@@ -2178,8 +2427,8 @@ mod tests {
             &self,
             _owner: &str,
             _repo: &str,
-        ) -> Result<Vec<PublicBranch>, PublicRepoError> {
-            Ok(Vec::new())
+        ) -> Result<PublicBranchList, PublicRepoError> {
+            Ok(PublicBranchList::complete(Vec::new()))
         }
 
         async fn get_branch(
@@ -2397,8 +2646,8 @@ mod tests {
                 &self,
                 _: &str,
                 _: &str,
-            ) -> Result<Vec<PublicBranch>, PublicRepoError> {
-                Ok(Vec::new())
+            ) -> Result<PublicBranchList, PublicRepoError> {
+                Ok(PublicBranchList::complete(Vec::new()))
             }
             async fn get_file_tree(
                 &self,
@@ -2762,8 +3011,8 @@ mod tests {
 
         match provider.list_branches("expressjs", "express").await {
             Ok(branches) => {
-                assert!(!branches.is_empty());
-                let has_master = branches.iter().any(|b| b.name == "master");
+                assert!(!branches.branches.is_empty());
+                let has_master = branches.branches.iter().any(|b| b.name == "master");
                 assert!(has_master, "Express should have a master branch");
             }
             Err(PublicRepoError::RateLimitExceeded) => {
@@ -2842,9 +3091,12 @@ mod tests {
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
             Ok(branches) => {
-                assert!(!branches.is_empty(), "GitLab Runner should have branches");
+                assert!(
+                    !branches.branches.is_empty(),
+                    "GitLab Runner should have branches"
+                );
                 // Verify branch structure - GitLab runner uses stable branches
-                let first_branch = &branches[0];
+                let first_branch = &branches.branches[0];
                 assert!(
                     !first_branch.name.is_empty(),
                     "Branch name should not be empty"

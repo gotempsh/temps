@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
+    AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError, GitProviderService,
+    GitProviderTag, GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User,
+    WebhookConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
+
+/// Memory bound on one branch listing. A repository with more branches than
+/// this yields a truncated [`BranchList`], never a list that looks exhaustive.
+const MAX_GITEA_BRANCHES: usize = 1_000;
 
 /// Gitea (and Forgejo) REST API provider.
 ///
@@ -625,7 +630,7 @@ impl GitProviderService for GiteaProvider {
         access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
         let client = self.get_client()?;
         let headers = self.get_headers(access_token)?;
 
@@ -662,19 +667,85 @@ impl GitProviderService for GiteaProvider {
             })?;
 
             let count = branches.len();
-            all_branches.extend(branches.into_iter().map(|b| Branch {
+            // Keep the cap a real memory bound whatever the page size the
+            // instance actually answers with.
+            let remaining = MAX_GITEA_BRANCHES.saturating_sub(all_branches.len());
+            let dropped_by_cap = count > remaining;
+            all_branches.extend(branches.into_iter().take(remaining).map(|b| Branch {
                 name: b.name,
                 commit_sha: b.commit.id,
                 protected: false, // Gitea branch API doesn't return protection status inline
             }));
 
-            if count < per_page || all_branches.len() >= 1000 {
+            // The cap dropped part of this page, so the repository certainly
+            // has branches this listing never saw.
+            if dropped_by_cap {
+                return Ok(BranchList::truncated(all_branches));
+            }
+            // A short page is the last one, so the list is complete.
+            if count < per_page {
                 break;
+            }
+            // A full page with no budget left: more may follow, and saying so
+            // costs one exact lookup where claiming completeness would cost a
+            // false "branch not found".
+            if all_branches.len() >= MAX_GITEA_BRANCHES {
+                return Ok(BranchList::truncated(all_branches));
             }
             page += 1;
         }
 
-        Ok(all_branches)
+        Ok(BranchList::complete(all_branches))
+    }
+
+    /// One request to `GET /repos/{owner}/{repo}/branches/{branch}`, so it is
+    /// exact however many branches the repository has.
+    async fn get_branch(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
+
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api_base(),
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+
+        let response = self
+            .send_with_retry(|| client.get(&url).headers(headers.clone()))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to read branch '{}' of {}/{}: {}",
+                branch,
+                owner,
+                repo,
+                response.status()
+            )));
+        }
+
+        let found: GiteaBranch = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse branch '{branch}' of {owner}/{repo}: {e}"
+            ))
+        })?;
+
+        Ok(Some(Branch {
+            name: found.name,
+            commit_sha: found.commit.id,
+            protected: false, // Gitea's branch API doesn't report protection inline
+        }))
     }
 
     async fn list_tags(
@@ -2018,5 +2089,164 @@ mod tests {
             updates.last().is_some_and(|last| *last < BODY_BYTES as u64),
             "updates past the buffer were dropped: {updates:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod branch_lookup_tests {
+    use super::*;
+
+    fn make_provider(base_url: &str) -> GiteaProvider {
+        GiteaProvider::new(
+            base_url.to_string(),
+            AuthMethod::PersonalAccessToken {
+                token: "test-token".to_string(),
+            },
+        )
+    }
+
+    fn branch_json(name: &str, sha: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "commit": { "id": sha }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_listing_cut_short_by_the_cap_reports_itself_truncated() {
+        let mut server = mockito::Server::new_async().await;
+        // Full pages all the way to the cap: Gitea has more to give, and the
+        // listing must not be read as the repository's whole branch set.
+        let mut pages = Vec::new();
+        for page_number in 1..=(MAX_GITEA_BRANCHES / 50) {
+            let body: Vec<serde_json::Value> = (0..50)
+                .map(|index| {
+                    let id = page_number * 50 + index;
+                    branch_json(&format!("branch-{id}"), &format!("{id:040x}"))
+                })
+                .collect();
+            pages.push(
+                server
+                    .mock("GET", "/api/v1/repos/temps/example/branches")
+                    .match_query(mockito::Matcher::Exact(format!(
+                        "limit=50&page={page_number}"
+                    )))
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_body(serde_json::Value::Array(body).to_string())
+                    .create_async()
+                    .await,
+            );
+        }
+
+        let listed = make_provider(&server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect("a capped listing still succeeds");
+
+        assert_eq!(listed.branches.len(), MAX_GITEA_BRANCHES);
+        assert!(
+            listed.truncated,
+            "a listing stopped by the cap must say branches were left unread"
+        );
+        for page in pages {
+            page.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listing_the_provider_finished_reports_itself_complete() {
+        let mut server = mockito::Server::new_async().await;
+        let page = server
+            .mock("GET", "/api/v1/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("limit=50&page=1".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!([
+                    branch_json("main", &"a".repeat(40)),
+                    branch_json("topic", &"b".repeat(40))
+                ])
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let listed = make_provider(&server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect("a short page is the whole listing");
+
+        assert_eq!(listed.branches.len(), 2);
+        assert!(!listed.truncated);
+        page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_branch_finds_a_branch_in_one_request() {
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock(
+                "GET",
+                "/api/v1/repos/temps/example/branches/release%2F2026-01",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(branch_json("release/2026-01", &"c".repeat(40)).to_string())
+            .create_async()
+            .await;
+
+        let found = make_provider(&server.url())
+            .get_branch("test-token", "temps", "example", "release/2026-01")
+            .await
+            .expect("the lookup should succeed")
+            .expect("the branch exists");
+
+        assert_eq!(found.name, "release/2026-01");
+        assert_eq!(found.commit_sha, "c".repeat(40));
+        lookup.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_branch_reports_a_404_as_a_missing_branch() {
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock("GET", "/api/v1/repos/temps/example/branches/gone")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"branch does not exist"}"#)
+            .create_async()
+            .await;
+
+        let found = make_provider(&server.url())
+            .get_branch("test-token", "temps", "example", "gone")
+            .await
+            .expect("a 404 is an answer, not a failure");
+
+        assert!(found.is_none());
+        lookup.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_branch_keeps_a_provider_failure_distinct_from_a_missing_branch() {
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock("GET", "/api/v1/repos/temps/example/branches/main")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"internal error"}"#)
+            // `send_with_retry` retries a 5xx, so the exact count is not the
+            // point here -- only that the failure never became `Ok(None)`.
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let error = make_provider(&server.url())
+            .get_branch("test-token", "temps", "example", "main")
+            .await
+            .expect_err("an unavailable provider must not read as a missing branch");
+
+        assert!(error.to_string().contains("500"), "{error}");
+        lookup.assert_async().await;
     }
 }

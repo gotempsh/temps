@@ -51,6 +51,18 @@ pub enum GitProviderError {
     #[error("A repository named '{name}' already exists on this account")]
     RepositoryAlreadyExists { name: String },
 
+    /// The provider cannot answer "does branch X exist?" exactly, and the
+    /// branch list it can produce was cut short by its safety cap, so the
+    /// branch is neither confirmed nor ruled out. Never report this as a
+    /// missing branch: it is an unverifiable lookup, not a negative answer.
+    #[error("{provider} could not verify branch '{branch}' of repository '{repository}': it is absent from a branch list capped at {listed} branches, and this provider offers no single-branch lookup")]
+    BranchLookupUnavailable {
+        provider: String,
+        repository: String,
+        branch: String,
+        listed: usize,
+    },
+
     /// The provider answered that the file does not exist at the revision.
     /// Distinct from [`Self::ApiError`] so callers can tell a missing file
     /// from an unavailable provider.
@@ -457,6 +469,73 @@ pub struct Branch {
     pub protected: bool,
 }
 
+/// Branches as a provider returned them, plus whether its safety cap stopped
+/// the walk before the repository ran out of branches.
+///
+/// A truncated list says nothing about a branch it omits: a repository with
+/// more branches than the cap keeps real branches out of it. No caller may
+/// read "absent from a truncated list" as "does not exist" — look the name up
+/// with [`GitProviderService::get_branch`] instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchList {
+    pub branches: Vec<Branch>,
+    /// `true` when the cap cut the list short. A repository holding exactly
+    /// the cap's worth of branches may report `true` with nothing missing,
+    /// which costs one exact lookup and never a false "branch not found".
+    pub truncated: bool,
+}
+
+impl BranchList {
+    /// Every branch the repository has.
+    pub fn complete(branches: Vec<Branch>) -> Self {
+        Self {
+            branches,
+            truncated: false,
+        }
+    }
+
+    /// Branches up to a provider's safety cap, with more left unread.
+    pub fn truncated(branches: Vec<Branch>) -> Self {
+        Self {
+            branches,
+            truncated: true,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.branches.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.branches.is_empty()
+    }
+
+    /// The branch named `name`, as far as this list can tell. `Ok(None)` means
+    /// the repository has no such branch; a truncated list that lacks it
+    /// cannot tell, and says so with
+    /// [`GitProviderError::BranchLookupUnavailable`] instead of guessing.
+    pub fn find_branch(
+        self,
+        provider: &str,
+        repository: &str,
+        name: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        let listed = self.branches.len();
+        if let Some(found) = self.branches.into_iter().find(|branch| branch.name == name) {
+            return Ok(Some(found));
+        }
+        if self.truncated {
+            return Err(GitProviderError::BranchLookupUnavailable {
+                provider: provider.to_string(),
+                repository: repository.to_string(),
+                branch: name.to_string(),
+                listed,
+            });
+        }
+        Ok(None)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Commit {
     pub sha: String,
@@ -690,13 +769,39 @@ pub trait GitProviderService: Send + Sync {
         repo: &str,
     ) -> Result<Repository, GitProviderError>;
 
-    /// List branches for a repository
+    /// List branches for a repository, up to the provider's safety cap.
+    ///
+    /// The result says whether that cap cut the list short, because a capped
+    /// list is not evidence that a branch missing from it does not exist.
     async fn list_branches(
         &self,
         access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError>;
+    ) -> Result<BranchList, GitProviderError>;
+
+    /// Look up one branch by name; `Ok(None)` when the repository has no such
+    /// branch.
+    ///
+    /// Providers answer this with a single request, so it is exact for
+    /// repositories with more branches than [`Self::list_branches`] returns.
+    /// The default implementation scans that list and refuses to answer from
+    /// a truncated one — a provider with a single-branch endpoint overrides it.
+    async fn get_branch(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        self.list_branches(access_token, owner, repo)
+            .await?
+            .find_branch(
+                &self.provider_type().to_string(),
+                &format!("{owner}/{repo}"),
+                branch,
+            )
+    }
 
     /// List tags for a repository
     async fn list_tags(
@@ -1289,6 +1394,64 @@ mod file_not_found_tests {
             GitProviderManagerError::RepositoryNotFound("owner/repo".to_string()),
         ] {
             assert!(!failure.is_file_not_found(), "{failure}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod branch_list_tests {
+    use super::{Branch, BranchList, GitProviderError};
+
+    fn branch(name: &str) -> Branch {
+        Branch {
+            name: name.to_string(),
+            commit_sha: "a".repeat(40),
+            protected: false,
+        }
+    }
+
+    #[test]
+    fn a_complete_list_answers_both_ways() {
+        let found = BranchList::complete(vec![branch("main"), branch("topic")])
+            .find_branch("github", "temps/example", "topic")
+            .expect("a complete list can answer")
+            .expect("the branch is in it");
+        assert_eq!(found.name, "topic");
+
+        let missing = BranchList::complete(vec![branch("main")])
+            .find_branch("github", "temps/example", "gone")
+            .expect("a complete list can answer");
+        assert!(
+            missing.is_none(),
+            "a name absent from a complete list does not exist"
+        );
+    }
+
+    #[test]
+    fn a_truncated_list_refuses_to_call_an_unread_branch_missing() {
+        let found = BranchList::truncated(vec![branch("main")])
+            .find_branch("github", "temps/example", "main")
+            .expect("a name present in the prefix is still an answer")
+            .expect("the branch is in it");
+        assert_eq!(found.name, "main");
+
+        let error = BranchList::truncated(vec![branch("main"), branch("topic")])
+            .find_branch("github", "temps/example", "release/2026-01")
+            .expect_err("a capped list cannot rule a branch out");
+
+        match error {
+            GitProviderError::BranchLookupUnavailable {
+                provider,
+                repository,
+                branch,
+                listed,
+            } => {
+                assert_eq!(provider, "github");
+                assert_eq!(repository, "temps/example");
+                assert_eq!(branch, "release/2026-01");
+                assert_eq!(listed, 2);
+            }
+            other => panic!("expected an unverifiable lookup, got {other}"),
         }
     }
 }

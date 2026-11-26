@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
+    AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError, GitProviderService,
+    GitProviderTag, GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User,
+    WebhookConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -37,6 +38,10 @@ const API_BASE: &str = "https://api.bitbucket.org/2.0";
 
 /// Bitbucket Cloud web base URL.
 const BASE_URL: &str = "https://bitbucket.org";
+
+/// Memory bound on one branch listing. A repository with more branches than
+/// this yields a truncated [`BranchList`], never a list that looks exhaustive.
+const MAX_BITBUCKET_BRANCHES: usize = 1_000;
 
 impl BitbucketProvider {
     /// Create a new Bitbucket Cloud provider.
@@ -635,7 +640,7 @@ impl GitProviderService for BitbucketProvider {
         _access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
         let client = self.get_client()?;
         let mut all_branches: Vec<Branch> = Vec::new();
         let per_page: u32 = 50;
@@ -666,19 +671,91 @@ impl GitProviderService for BitbucketProvider {
             })?;
 
             let has_next = page_data.next.is_some();
-            all_branches.extend(page_data.values.into_iter().map(|b| Branch {
-                name: b.name,
-                commit_sha: b.target.hash,
-                protected: false,
-            }));
+            let count = page_data.values.len();
+            // Keep the cap a real memory bound whatever the page size
+            // Bitbucket actually answers with.
+            let remaining = MAX_BITBUCKET_BRANCHES.saturating_sub(all_branches.len());
+            let dropped_by_cap = count > remaining;
+            all_branches.extend(
+                page_data
+                    .values
+                    .into_iter()
+                    .take(remaining)
+                    .map(|b| Branch {
+                        name: b.name,
+                        commit_sha: b.target.hash,
+                        protected: false,
+                    }),
+            );
 
-            if !has_next || all_branches.len() >= 1000 {
+            // The cap dropped part of this page, so the repository certainly
+            // has branches this listing never saw.
+            if dropped_by_cap {
+                return Ok(BranchList::truncated(all_branches));
+            }
+            // No next link means the list is complete.
+            if !has_next {
                 break;
+            }
+            // Another page waits but the budget is spent: say branches were
+            // left unread rather than letting a caller read the list as
+            // exhaustive.
+            if all_branches.len() >= MAX_BITBUCKET_BRANCHES {
+                return Ok(BranchList::truncated(all_branches));
             }
             page += 1;
         }
 
-        Ok(all_branches)
+        Ok(BranchList::complete(all_branches))
+    }
+
+    /// One request to `GET /repositories/{owner}/{repo}/refs/branches/{name}`,
+    /// so it is exact however many branches the repository has.
+    async fn get_branch(
+        &self,
+        _access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        let client = self.get_client()?;
+
+        let url = format!(
+            "{}/repositories/{}/{}/refs/branches/{}",
+            API_BASE,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+
+        let response = self
+            .send_with_retry(|| self.apply_auth(client.get(&url)))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to read branch '{}' of {}/{}: {}",
+                branch,
+                owner,
+                repo,
+                response.status()
+            )));
+        }
+
+        let found: BitbucketBranch = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse branch '{branch}' of {owner}/{repo}: {e}"
+            ))
+        })?;
+
+        Ok(Some(Branch {
+            name: found.name,
+            commit_sha: found.target.hash,
+            protected: false,
+        }))
     }
 
     async fn list_tags(

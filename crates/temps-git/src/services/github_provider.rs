@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    oauth_token_expiry, AuthMethod, Branch, Commit, FileContent, GitProviderError,
+    oauth_token_expiry, AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError,
     GitProviderService, GitProviderTag, GitProviderType, PullRequest, RefreshedOAuthToken,
     RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User, WebhookConfig,
 };
@@ -206,6 +206,13 @@ fn github_pagination_route(api_url: &str, next_url: &str) -> Result<String, GitP
     Ok(route)
 }
 
+/// Items read from a guarded page walk, and whether `max_items` ended it with
+/// more still on the server.
+struct GuardedGitHubPages<T> {
+    items: Vec<T>,
+    truncated: bool,
+}
+
 async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
     octocrab: &Octocrab,
     api_url: &str,
@@ -214,7 +221,7 @@ async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
     max_pages: usize,
     resource: &str,
     repository: (&str, &str),
-) -> Result<Vec<T>, GitProviderError> {
+) -> Result<GuardedGitHubPages<T>, GitProviderError> {
     let (owner, repo) = repository;
     let mut items = Vec::new();
     let mut pages_fetched = 1usize;
@@ -222,14 +229,27 @@ async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
 
     loop {
         let remaining = max_items.saturating_sub(items.len());
-        items.extend(page.take_items().into_iter().take(remaining));
-        if items.len() >= max_items {
-            break;
+        let page_items = page.take_items();
+        let page_len = page_items.len();
+        items.extend(page_items.into_iter().take(remaining));
+        // The cap dropped part of this page, so the server certainly has more.
+        if page_len > remaining {
+            return Ok(GuardedGitHubPages {
+                items,
+                truncated: true,
+            });
         }
 
         let Some(next_url) = page.next.as_ref() else {
             break;
         };
+        // Exactly at the cap with another page behind it.
+        if items.len() >= max_items {
+            return Ok(GuardedGitHubPages {
+                items,
+                truncated: true,
+            });
+        }
         if pages_fetched >= max_pages {
             return Err(GitProviderError::ApiError(format!(
                 "GitHub {resource} pagination for {owner}/{repo} exceeded the {max_pages}-page safety limit"
@@ -254,7 +274,10 @@ async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
         pages_fetched += 1;
     }
 
-    Ok(items)
+    Ok(GuardedGitHubPages {
+        items,
+        truncated: false,
+    })
 }
 
 // Response structs for API calls
@@ -1356,7 +1379,7 @@ impl GitProviderService for GitHubProvider {
         access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
         let octocrab = self.get_octocrab_client(access_token).await?;
 
         // Fetch the first page with the maximum page size, then walk bounded,
@@ -1388,6 +1411,7 @@ impl GitProviderService for GitHubProvider {
         .await?;
 
         let branches = all
+            .items
             .into_iter()
             .map(|b| Branch {
                 name: b.name,
@@ -1396,7 +1420,72 @@ impl GitProviderService for GitHubProvider {
             })
             .collect();
 
-        Ok(branches)
+        Ok(BranchList {
+            branches,
+            truncated: all.truncated,
+        })
+    }
+
+    /// One request to `GET /repos/{owner}/{repo}/branches/{branch}`, so it is
+    /// exact however many branches the repository has.
+    async fn get_branch(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
+
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+
+        let response = self
+            .send_with_retry(|| client.get(&url).headers(headers.clone()))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(github_response_error(
+                response,
+                format!("read branch {branch} of {owner}/{repo}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
+        }
+
+        #[derive(Deserialize)]
+        struct GitHubBranch {
+            name: String,
+            commit: GitHubBranchCommit,
+            #[serde(default)]
+            protected: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct GitHubBranchCommit {
+            sha: String,
+        }
+
+        let found: GitHubBranch = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse branch {branch} of {owner}/{repo}: {e}"
+            ))
+        })?;
+
+        Ok(Some(Branch {
+            name: found.name,
+            commit_sha: found.commit.sha,
+            protected: found.protected,
+        }))
     }
 
     async fn list_tags(
@@ -1434,8 +1523,8 @@ impl GitProviderService for GitHubProvider {
             (owner, repo),
         )
         .await?;
-        let mut tags = Vec::with_capacity(raw_tags.len());
-        append_github_tags(&mut tags, raw_tags);
+        let mut tags = Vec::with_capacity(raw_tags.items.len());
+        append_github_tags(&mut tags, raw_tags.items);
 
         Ok(tags)
     }
@@ -3868,5 +3957,166 @@ mod token_permission_tests {
 
         mock.assert_async().await;
         assert!(!valid);
+    }
+}
+
+#[cfg(test)]
+mod branch_lookup_tests {
+    use super::*;
+
+    fn install_test_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn provider(api_url: String) -> GitHubProvider {
+        GitHubProvider::new(
+            Some(api_url),
+            AuthMethod::PersonalAccessToken {
+                token: "test-token".to_string(),
+            },
+        )
+    }
+
+    fn branch_json(name: &str, sha: &str, protected: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "commit": {
+                "sha": sha,
+                "url": format!("https://api.github.test/repos/temps/example/commits/{sha}")
+            },
+            "protected": protected
+        })
+    }
+
+    #[tokio::test]
+    async fn a_listing_cut_short_by_the_cap_reports_itself_truncated() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        // One oversized page: the cap drops part of it, so the repository
+        // certainly holds branches this listing never saw.
+        let body: Vec<serde_json::Value> = (0..=MAX_GITHUB_BRANCHES)
+            .map(|index| branch_json(&format!("branch-{index}"), &format!("{index:040x}"), false))
+            .collect();
+        let page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::Value::Array(body).to_string())
+            .create_async()
+            .await;
+
+        let listed = provider(server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect("a capped listing still succeeds");
+
+        assert_eq!(listed.branches.len(), MAX_GITHUB_BRANCHES);
+        assert!(
+            listed.truncated,
+            "a listing stopped by the cap must say branches were left unread"
+        );
+        page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_listing_the_provider_finished_reports_itself_complete() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!([
+                    branch_json("main", "a".repeat(40).as_str(), true),
+                    branch_json("topic", "b".repeat(40).as_str(), false)
+                ])
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let listed = provider(server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect("a short page is the whole listing");
+
+        assert_eq!(listed.branches.len(), 2);
+        assert!(!listed.truncated);
+        page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_branch_finds_a_branch_in_one_request() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock("GET", "/repos/temps/example/branches/release%2F2026-01")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(branch_json("release/2026-01", &"c".repeat(40), true).to_string())
+            .create_async()
+            .await;
+
+        let found = provider(server.url())
+            .get_branch("test-token", "temps", "example", "release/2026-01")
+            .await
+            .expect("the lookup should succeed")
+            .expect("the branch exists");
+
+        assert_eq!(found.name, "release/2026-01");
+        assert_eq!(found.commit_sha, "c".repeat(40));
+        assert!(found.protected);
+        lookup.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_branch_reports_a_404_as_a_missing_branch() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock("GET", "/repos/temps/example/branches/gone")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Branch not found"}"#)
+            .create_async()
+            .await;
+
+        let found = provider(server.url())
+            .get_branch("test-token", "temps", "example", "gone")
+            .await
+            .expect("a 404 is an answer, not a failure");
+
+        assert!(found.is_none());
+        lookup.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_branch_keeps_a_provider_failure_distinct_from_a_missing_branch() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let lookup = server
+            .mock("GET", "/repos/temps/example/branches/main")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Server Error"}"#)
+            // `send_with_retry` retries a 5xx, so the exact count is not the
+            // point here -- only that the failure never became `Ok(None)`.
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .get_branch("test-token", "temps", "example", "main")
+            .await
+            .expect_err("an unavailable provider must not read as a missing branch");
+
+        assert!(
+            !matches!(error, GitProviderError::CommitNotFound { .. }),
+            "{error}"
+        );
+        lookup.assert_async().await;
     }
 }

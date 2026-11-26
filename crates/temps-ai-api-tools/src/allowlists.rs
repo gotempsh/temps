@@ -794,6 +794,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_tags_by_repository_id",
     "list_commits_by_repository_id",
     "get_repository_branches",
+    "get_repository_branch",
     "get_repository_tags",
     "get_repository_preset_live",
     // Git connection metadata (connection IDs, names, provider type).

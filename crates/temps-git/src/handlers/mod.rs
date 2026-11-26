@@ -67,7 +67,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
-mod public_route_tests {
+pub(crate) mod public_route_tests {
     //! ADR-051 D3: provider webhook receivers live on the public router, the
     //! browser-driven callbacks stay on the admin router, and every receiver
     //! bounds its request body.
@@ -124,16 +124,16 @@ mod public_route_tests {
     /// Handler state over a database that has nothing queued: any query a
     /// handler issues fails, so a response that needed no data proves the
     /// request was turned away before any database work.
-    pub(super) fn state() -> Arc<AppState> {
+    pub(crate) fn state() -> Arc<AppState> {
         state_over(MockDatabase::new(DatabaseBackend::Postgres))
     }
 
     /// Like [`state`], over a database the test has queued results on.
-    pub(super) fn state_over(database: MockDatabase) -> Arc<AppState> {
+    pub(crate) fn state_over(database: MockDatabase) -> Arc<AppState> {
         state_with_db(Arc::new(database.into_connection()))
     }
 
-    pub(super) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
+    pub(crate) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
         let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(
                 temps_config::ServerConfig::new(

@@ -228,10 +228,12 @@ impl RepoToolsProvider {
             Err(e) => return e,
         };
 
-        let branches = match service.list_branches(&token, &owner, &repo).await {
+        let listed = match service.list_branches(&token, &owner, &repo).await {
             Ok(b) => b,
             Err(e) => return format!("Could not list branches for {owner}/{repo}: {e}"),
         };
+        let capped_by_provider = listed.truncated;
+        let branches = listed.branches;
 
         if branches.is_empty() {
             return format!("No branches found in {owner}/{repo}.");
@@ -257,6 +259,13 @@ impl RepoToolsProvider {
                 "\n[truncated — showing {MAX_BRANCH_COUNT} of {} branches]\n",
                 branches.len()
             ));
+        }
+        // Say so, or the model reads this list as the repository's whole set
+        // and tells the user an unlisted branch does not exist.
+        if capped_by_provider {
+            out.push_str(
+                "\n[the git provider's own branch listing was capped, so this is not every branch in the repository]\n",
+            );
         }
         out
     }

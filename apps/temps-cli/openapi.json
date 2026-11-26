@@ -9840,10 +9840,15 @@
               "$ref": "#/components/schemas/BranchInfo"
             },
             "type": "array"
+          },
+          "truncated": {
+            "description": "Whether the git provider's safety cap stopped the listing before the\nrepository ran out of branches. When `true`, `branches` is a prefix of\nthe repository's branches and a name missing from it may still exist:\nclients must verify such a name with the single-branch lookup\n(`GET repositories/{owner}/{repo}/branch`) instead of reporting it\nmissing.",
+            "type": "boolean"
           }
         },
         "required": [
-          "branches"
+          "branches",
+          "truncated"
         ],
         "type": "object"
       },
@@ -131965,6 +131970,96 @@
         ]
       }
     },
+    "/git/public/{provider}/{owner}/{repo}/branch": {
+      "get": {
+        "description": "Answers with one provider request, so it is exact for repositories with\nmore branches than `.../branches` returns. A 404 here is the only sound\nbasis for telling a user a branch does not exist.",
+        "operationId": "get_public_branch",
+        "parameters": [
+          {
+            "description": "Git provider (github or gitlab)",
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository owner",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.",
+            "in": "query",
+            "name": "base_url",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Exact branch name to look up",
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchInfo"
+                }
+              }
+            },
+            "description": "The branch"
+          },
+          "400": {
+            "description": "Provider not supported, or empty branch name"
+          },
+          "401": {
+            "description": "Authentication required for custom GitLab origins"
+          },
+          "403": {
+            "description": "Git provider permission required"
+          },
+          "404": {
+            "description": "Repository or branch not found"
+          },
+          "429": {
+            "description": "API rate limit exceeded"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Look up one branch of a public repository by exact name",
+        "tags": [
+          "Public Repositories"
+        ]
+      }
+    },
     "/git/public/{provider}/{owner}/{repo}/branches": {
       "get": {
         "operationId": "get_public_branches",
@@ -190066,6 +190161,93 @@
         "summary": "Get repository preset by owner and name",
         "tags": [
           "Git Providers"
+        ]
+      }
+    },
+    "/repositories/{owner}/{repo}/branch": {
+      "get": {
+        "description": "Answers with one provider request, so it is exact for repositories with\nmore branches than `GET repositories/{owner}/{repo}/branches` returns.\nA 404 here is the only sound basis for telling a user a branch does not\nexist.",
+        "operationId": "get_repository_branch",
+        "parameters": [
+          {
+            "description": "Repository owner",
+            "in": "path",
+            "name": "owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Repository name",
+            "in": "path",
+            "name": "repo",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Git provider connection ID (required when multiple connections have the same repo)",
+            "in": "query",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Exact branch name to look up",
+            "in": "query",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BranchInfo"
+                }
+              }
+            },
+            "description": "The branch"
+          },
+          "400": {
+            "description": "Empty branch name"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Git provider permission required"
+          },
+          "404": {
+            "description": "Repository or branch not found"
+          },
+          "429": {
+            "description": "Branch lookup rate limit exceeded"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "Git provider request failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Look up one branch of a repository by exact name",
+        "tags": [
+          "Repositories"
         ]
       }
     },

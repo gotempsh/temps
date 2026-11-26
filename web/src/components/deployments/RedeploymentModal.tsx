@@ -56,6 +56,8 @@ import {
   Tag as TagIcon,
 } from 'lucide-react'
 import { BranchSelector, type ResolvedBranch } from './BranchSelector'
+import { useBranchVerification } from '@/hooks/useBranchVerification'
+import { parsePublicRepositoryUrl } from '@/lib/public-repository'
 import { gitProviderSetupPath, problemDetail } from '@/lib/api-problem'
 import {
   isValidCommitSha,
@@ -260,6 +262,10 @@ export function RedeploymentModal({
   const [availableBranchDetails, setAvailableBranchDetails] = useState<
     ResolvedBranch[]
   >([])
+  // Whether the provider's safety cap cut the branch listing short. A capped
+  // listing holds a prefix of the repository's branches, so a name it lacks
+  // may still exist and must never be reported as missing on its strength.
+  const [branchListTruncated, setBranchListTruncated] = useState(false)
   const [commitToCheck, setCommitToCheck] = useState('')
   const [tagToCheck, setTagToCheck] = useState('')
   // What the user typed over the default image for docker_image projects (e.g.
@@ -326,17 +332,49 @@ export function RedeploymentModal({
   const normalizedTag = selectedTag.trim()
   const commitFormatIsValid = isValidCommitSha(normalizedCommit)
   const tagHasValue = normalizedTag.length > 0
-  const branchNotFound = Boolean(
-    effectiveBranch &&
-    availableBranches.length > 0 &&
-    !availableBranches.includes(effectiveBranch)
-  )
   const projectDetails = projectQuery.data ?? project
   const shouldLookUpGitReference = Boolean(
     projectDetails.git_provider_connection_id &&
     projectDetails.repo_owner &&
     projectDetails.repo_name
   )
+
+  // A branch absent from the listing is a question, not an answer: providers
+  // cap their branch listings, so `main` can be missing from the list of a
+  // repository that has it. Confirm the name with the server's exact
+  // single-branch lookup before saying anything about it.
+  const branchMissingFromList = Boolean(
+    effectiveBranch &&
+    availableBranches.length > 0 &&
+    !availableBranches.includes(effectiveBranch)
+  )
+  const publicRepository = parsePublicRepositoryUrl(projectDetails.git_url)
+  const branchVerification = useBranchVerification({
+    repoOwner: projectDetails.repo_owner || '',
+    repoName: projectDetails.repo_name || '',
+    connectionId: projectDetails.git_provider_connection_id || undefined,
+    publicProvider: publicRepository?.provider ?? null,
+    publicInstanceUrl: publicRepository?.instanceUrl,
+    branch: effectiveBranch,
+    enabled: branchMissingFromList && deploymentType === 'branch',
+  })
+  // The server answering 404 is one sound basis for saying the branch does
+  // not exist; a listing the provider ran to the end is the other, since
+  // nothing was left unread. While the lookup is in flight, say nothing.
+  const branchNotFound =
+    branchVerification.status === 'missing' ||
+    (branchMissingFromList &&
+      !branchListTruncated &&
+      branchVerification.status !== 'found' &&
+      branchVerification.status !== 'checking')
+  // Missing from a capped list and the lookup failed for a reason other than
+  // 404 (rate limit, provider outage, a provider with no single-branch
+  // endpoint): say the branch could not be verified, never that it is gone.
+  const branchUnverified =
+    !branchNotFound &&
+    branchMissingFromList &&
+    branchListTruncated &&
+    branchVerification.status === 'unverified'
 
   const repositoryQuery = useQuery({
     ...getRepositoryByNameOptions({
@@ -928,10 +966,26 @@ export function RedeploymentModal({
                         </AlertDescription>
                       </Alert>
                     )}
+                    {branchUnverified && (
+                      <Alert className="border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30">
+                        <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-600" />
+                        <AlertDescription className="text-amber-800 dark:text-amber-400">
+                          The branch “{effectiveBranch}” could not be verified:
+                          this repository returns more branches than the{' '}
+                          {availableBranches.length} the list above holds, and
+                          the branch lookup did not answer. Deploying this
+                          branch still works if it exists.
+                        </AlertDescription>
+                      </Alert>
+                    )}
+                    {/* A branch missing from the list is not a reason to drop
+                        to free text: the list may simply be capped, and the
+                        combobox already offers the current branch plus a
+                        "use this exact ref" row. Free text is only for a
+                        branch the server has confirmed is gone. */}
                     {deploymentType === 'branch' &&
                     selectedEnvironment &&
-                    !availableBranches.includes(selectedBranch) &&
-                    availableBranches.length > 0 ? (
+                    branchNotFound ? (
                       <div className="space-y-2">
                         <Input
                           value={effectiveBranch}
@@ -948,10 +1002,11 @@ export function RedeploymentModal({
                           projectQuery.data?.git_provider_connection_id ||
                           undefined
                         }
-                        gitUrl={(projectQuery.data as any)?.git_url}
-                        defaultBranch={
-                          initialBranch || projectQuery.data?.main_branch
-                        }
+                        gitUrl={projectQuery.data?.git_url}
+                        // Only a placeholder hint: the "default" badge comes
+                        // from the server's `is_default`, never from the
+                        // environment's branch.
+                        defaultBranch={projectQuery.data?.main_branch}
                         value={effectiveBranch}
                         onChange={(branch) => {
                           setSelectedBranch(branch)
@@ -960,10 +1015,19 @@ export function RedeploymentModal({
                           setAvailableBranches(branches)
                         }
                         onBranchDetailsLoaded={setAvailableBranchDetails}
+                        onBranchListingLoaded={({ truncated }) =>
+                          setBranchListTruncated(truncated)
+                        }
                         disabled={isLoading}
                       />
                     )}
                     <div id="branch-lookup-status" aria-live="polite">
+                      {branchVerification.status === 'checking' && (
+                        <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2.5 text-sm text-muted-foreground">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Checking “{effectiveBranch}” with the Git provider…
+                        </div>
+                      )}
                       {selectedBranchCommitSha && shouldLookUpGitReference && (
                         <>
                           {(repositoryQuery.isLoading ||
