@@ -249,32 +249,48 @@ pub fn parse_log_line(
 /// What replaces the password of a `scheme://user:password@host` URI.
 const MASKED_PASSWORD: &str = "****";
 
+/// How a JSON encoder may write the `://` of a URI: JSON allows `\/` for `/`.
+const ESCAPED_SCHEME_SEPARATOR: &str = ":\\/\\/";
+
+/// Where the authority of the next URI at or after `from` starts, after its
+/// `://` or its JSON-escaped `:\/\/`.
+fn next_authority_start(line: &str, from: usize) -> Option<usize> {
+    let plain = line[from..].find("://").map(|i| from + i + 3);
+    let escaped = line[from..]
+        .find(ESCAPED_SCHEME_SEPARATOR)
+        .map(|i| from + i + ESCAPED_SCHEME_SEPARATOR.len());
+    match (plain, escaped) {
+        (Some(plain), Some(escaped)) => Some(plain.min(escaped)),
+        (plain, escaped) => plain.or(escaped),
+    }
+}
+
 /// `line` with the password of every `scheme://user:password@host` URI
 /// replaced by [`MASKED_PASSWORD`]; borrowed (no allocation) when it holds
-/// none, which is every line without `://`.
+/// none, which is every line without `://` (or its JSON-escaped `:\/\/`, so
+/// a JSON log line is masked before it is decoded).
 ///
-/// The authority ends at the first `/`, `?`, `#`, whitespace, quote or
-/// bracket-closing delimiter after `://`; its userinfo is everything before
-/// the last `@` in it, and the password whatever follows the first `:` of
-/// the userinfo. A URI without a password (`postgres://user@host`) is left
-/// as it is.
+/// The authority ends at the first `/`, `?`, `#`, `\`, whitespace, `"`, `` ` ``,
+/// `<` or `>` after `://`: none of them can appear unencoded in a userinfo.
+/// Its userinfo is everything before the last `@` in it, and the password
+/// whatever follows the first `:` of the userinfo, so a password holding
+/// characters a userinfo allows (`,`, `'`, `(`, `)`) is masked whole, and
+/// punctuation around the URI (`'postgres://u:p@h',`) stays outside it. A
+/// URI without a password (`postgres://user@host`) is left as it is.
 pub fn mask_uri_passwords(line: &str) -> std::borrow::Cow<'_, str> {
-    if !line.contains("://") {
+    if !line.contains("://") && !line.contains(ESCAPED_SCHEME_SEPARATOR) {
         return std::borrow::Cow::Borrowed(line);
     }
     let bytes = line.as_bytes();
     let mut out: Option<String> = None;
     let mut copied = 0;
     let mut search = 0;
-    while let Some(found) = line[search..].find("://") {
-        let authority_start = search + found + 3;
+    while let Some(authority_start) = next_authority_start(line, search) {
         let authority_end = bytes[authority_start..]
             .iter()
             .position(|b| {
-                matches!(
-                    b,
-                    b'/' | b'?' | b'#' | b'"' | b'\'' | b'`' | b'<' | b'>' | b')' | b','
-                ) || b.is_ascii_whitespace()
+                matches!(b, b'/' | b'?' | b'#' | b'\\' | b'"' | b'`' | b'<' | b'>')
+                    || b.is_ascii_whitespace()
             })
             .map_or(bytes.len(), |end| authority_start + end);
         let authority = &line[authority_start..authority_end];
@@ -927,6 +943,21 @@ mod tests {
             ),
             ("mongodb://admin:pw@db1,db2/admin", "mongodb://admin:****@db1,db2/admin"),
             ("postgresql://user:pw@host", "postgresql://user:****@host"),
+            // `,`, `'`, `(` and `)` are valid in a userinfo: the whole password goes.
+            (
+                "postgres://u:se,cr'et(1)@db/app",
+                "postgres://u:****@db/app",
+            ),
+            // ... while punctuation around the URI stays where it was.
+            (
+                "dsn='postgres://u:pw@db', retry (postgres://v:pw2@db2)",
+                "dsn='postgres://u:****@db', retry (postgres://v:****@db2)",
+            ),
+            // A JSON encoder may escape the slashes.
+            (
+                r#"{"msg":"postgres:\/\/u:secret@db\/app"}"#,
+                r#"{"msg":"postgres:\/\/u:****@db\/app"}"#,
+            ),
         ];
         for (raw, wanted) in cases {
             assert_eq!(mask_uri_passwords(raw), wanted, "{raw}");
@@ -971,6 +1002,18 @@ mod tests {
         let json = r#"{"level":"error","msg":"dial postgres://app:Zq81secret@db/app failed"}"#;
         let line = parse_log_line(json, Utc::now(), LogStream::Stderr, &service_ctx);
         assert!(!line.msg.contains("Zq81secret"), "{}", line.msg);
+
+        // Escaped slashes decode to a plain URI after the line is parsed, in
+        // the message and in any other field.
+        let escaped = r#"{"level":"error","msg":"dial postgres:\/\/app:Zq81secret@db\/app failed","conn":{"dsn":"postgres:\/\/app:Zq81secret@db\/app"}}"#;
+        let line = parse_log_line(escaped, Utc::now(), LogStream::Stderr, &service_ctx);
+        assert!(!line.msg.contains("Zq81secret"), "{}", line.msg);
+        assert!(
+            line.msg.contains("postgres://app:****@db/app"),
+            "{}",
+            line.msg
+        );
+        assert!(!format!("{:?}", line.fields).contains("Zq81secret"));
 
         let app = parse_log_line(raw, Utc::now(), LogStream::Stderr, &test_ctx());
         assert!(app.msg.contains("Zq81secret"));
