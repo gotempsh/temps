@@ -80,8 +80,9 @@ function fail(what: string, error: unknown): never {
 export function normalizePathname(raw: string): string {
   const pathname = raw.trim().replace(/^\/+/, '')
   if (!pathname) throw new ValidationError('A blob pathname cannot be empty')
-  if (pathname.split('/').some((segment) => segment === '..')) {
-    throw new ValidationError(`A blob pathname cannot contain "..": "${raw}"`)
+  // URLs collapse `.` and `..` segments, so such an object could never be read back.
+  if (pathname.split('/').some((segment) => segment === '..' || segment === '.')) {
+    throw new ValidationError(`A blob pathname cannot contain "." or ".." segments: "${raw}"`)
   }
   return pathname
 }
@@ -318,7 +319,9 @@ async function headAction(rawPathname: string, options: ProjectOptions): Promise
   const pathname = normalizePathname(rawPathname)
   const projectId = await prepare(options.project)
   // api-coverage: HEAD /blob/{project_id}/{path}
-  const { error, response } = await client.head({ url: blobObjectUrl(projectId, pathname) })
+  // 'stream' leaves the (empty) body unread and skips the JSON-reply check, so a
+  // blob stored as text/html is not mistaken for a console page.
+  const { error, response } = await client.head({ url: blobObjectUrl(projectId, pathname), parseAs: 'stream' })
   if (response?.status === 404) {
     warning(`Blob "${pathname}" does not exist`)
     process.exitCode = 1

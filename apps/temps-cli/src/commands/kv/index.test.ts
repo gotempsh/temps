@@ -63,6 +63,37 @@ describe('temps kv', () => {
     expect(run.requests).toEqual(['POST /kv/get'])
   })
 
+  test('a failure exits non-zero with --json too: missing key, unmet set condition, expire of a missing key', async () => {
+    const routes = { 'POST /kv/get': { value: null }, 'POST /kv/set': { result: null }, 'POST /kv/expire': { success: false } }
+    for (const argv of [
+      ['kv', 'get', 'missing'],
+      ['kv', 'set', 'k', 'v', '--nx'],
+      ['kv', 'expire', 'k', '30'],
+    ]) {
+      const run = await runWithApi(registerKvCommands, [...argv, '-p', '7', '--json'], routes)
+      expect(run.error).toBeUndefined()
+      expect(run.exitCode).toBe(1)
+      expect(() => JSON.parse(run.stdout)).not.toThrow()
+    }
+  })
+
+  test('an all-digit slug from the environment is looked up, not taken as an ID', async () => {
+    const savedProject = process.env.TEMPS_PROJECT
+    process.env.TEMPS_PROJECT = '2024'
+    try {
+      const run = await runWithApi(registerKvCommands, ['kv', 'get', 'k', '--json'], {
+        'GET /projects/by-slug/2024': { id: 31, slug: '2024', name: '2024' },
+        'POST /kv/get': { value: 'v' },
+      })
+      expect(run.error).toBeUndefined()
+      expect(run.requests).toEqual(['GET /projects/by-slug/2024', 'POST /kv/get'])
+      expect(run.bodies[0]?.body).toEqual({ key: 'k', project_id: 31 })
+    } finally {
+      if (savedProject === undefined) delete process.env.TEMPS_PROJECT
+      else process.env.TEMPS_PROJECT = savedProject
+    }
+  })
+
   test('set sends the JSON value with expiry and condition', async () => {
     const run = await runWithApi(
       registerKvCommands,

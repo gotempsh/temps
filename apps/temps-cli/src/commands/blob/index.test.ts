@@ -26,6 +26,11 @@ describe('blob helpers', () => {
     expect(() => normalizePathname('docs/../../etc/passwd')).toThrow(/\.\./)
   })
 
+  test('normalizePathname refuses "." segments, which a URL would collapse', () => {
+    for (const bad of ['docs/./x', './x', 'docs/.']) expect(() => normalizePathname(bad)).toThrow(/"\." or "\.\." segments/)
+    expect(normalizePathname('docs/.hidden')).toBe('docs/.hidden')
+  })
+
   test('buildEnableRequest needs the root user and password together', () => {
     expect(buildEnableRequest({})).toEqual({})
     expect(buildEnableRequest({ rootUser: 'admin', rootPassword: 'pw', image: 'rustfs/rustfs:1' })).toEqual({
@@ -121,6 +126,31 @@ describe('temps blob', () => {
       'HEAD /blob/7/gone.txt': new Response(null, { status: 404 }),
     })
     expect(missing.exitCode).toBe(1)
+  })
+
+  test('head of a blob stored as text/html reads its headers instead of rejecting it as a console page', async () => {
+    const run = await runWithApi(registerBlobCommands, ['blob', 'head', 'site/index.html', '-p', '7', '--json'], {
+      'HEAD /blob/7/site/index.html': new Response(null, { headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': '12' } }),
+    })
+    expect(run.error).toBeUndefined()
+    expect(JSON.parse(run.stdout)).toMatchObject({ contentType: 'text/html; charset=utf-8', size: 12 })
+  })
+
+  test('get -o - keeps stdout for the bytes: the project announcement goes to stderr', async () => {
+    const savedProject = process.env.TEMPS_PROJECT
+    process.env.TEMPS_PROJECT = 'web'
+    try {
+      const run = await runWithApi(registerBlobCommands, ['blob', 'get', 'a.txt', '-o', '-'], {
+        'GET /projects/by-slug/web': { id: 7, slug: 'web', name: 'web' },
+        'GET /blob/7/a.txt': new Response(''),
+      })
+      expect(run.error).toBeUndefined()
+      expect(run.stdout).not.toContain('Using project')
+      expect(run.stderr).toContain('Using project')
+    } finally {
+      if (savedProject === undefined) delete process.env.TEMPS_PROJECT
+      else process.env.TEMPS_PROJECT = savedProject
+    }
   })
 
   test('copy sends source and destination', async () => {

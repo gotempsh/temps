@@ -221,13 +221,14 @@ async function getAction(key: string, options: ProjectOptions): Promise<void> {
     if (error || !data) fail(`Could not read key "${key}"`, error)
     return data
   })
+  const missing = result.value === null || result.value === undefined
+  if (missing) process.exitCode = 1
   if (options.json) {
     json({ key, value: result.value ?? null })
     return
   }
-  if (result.value === null || result.value === undefined) {
+  if (missing) {
     info(`Key "${key}" does not exist`)
-    process.exitCode = 1
     return
   }
   console.log(typeof result.value === 'string' ? result.value : JSON.stringify(result.value, null, 2))
@@ -247,14 +248,14 @@ async function setAction(key: string, inline: string | undefined, options: SetOp
     if (error || !data) fail(`Could not set key "${key}"`, error)
     return data
   })
+  // With --nx/--xx a condition that does not hold is not an error from Redis; say so.
+  if (result.result !== 'OK') process.exitCode = 1
   if (options.json) {
     json({ key, ...result })
     return
   }
-  // With --nx/--xx a condition that does not hold is not an error from Redis; say so.
   if (result.result !== 'OK') {
     warning(`Key "${key}" was not set (${options.nx ? 'it already exists' : options.xx ? 'it does not exist' : result.result})`)
-    process.exitCode = 1
     return
   }
   success(`Set ${key}`)
@@ -325,13 +326,13 @@ async function expireAction(key: string, rawSeconds: string, options: ProjectOpt
     if (error || !data) fail(`Could not set the expiry of "${key}"`, error)
     return data
   })
+  if (!result.success) process.exitCode = 1
   if (options.json) {
     json({ key, ...result })
     return
   }
   if (!result.success) {
     warning(`Key "${key}" does not exist; nothing to expire`)
-    process.exitCode = 1
     return
   }
   success(`${key} expires in ${seconds}s`)

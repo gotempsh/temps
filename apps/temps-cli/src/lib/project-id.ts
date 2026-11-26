@@ -4,7 +4,8 @@
 import { requireProjectSlug } from '../config/resolve-project.js'
 import { getProjectBySlug } from '../api/sdk.gen.js'
 import { client, getErrorMessage } from './api-client.js'
-import { info, colors } from '../ui/output.js'
+import { colors, icons } from '../ui/output.js'
+import { isQuietMode } from '../ui/spinner.js'
 import { ValidationError } from '../utils/errors.js'
 
 /** A project as the commands that take `--project` need it. */
@@ -16,14 +17,17 @@ export interface ProjectRef {
 /**
  * Resolve `--project <slug-or-id>` (or the linked/default project) to its
  * numeric ID. A whole number is the ID itself; anything else is a slug looked
- * up with the API. Says where the project came from when it was not the flag.
+ * up with the API, and so is every project that did not come from the flag:
+ * a linked or default project's slug may be all digits. Says where the project
+ * came from when it was not the flag, on stderr, so it never mixes with
+ * output written to stdout (`temps blob get <path> -o -`).
  */
 export async function resolveProjectFlag(flagValue: string | undefined): Promise<ProjectRef> {
   const resolved = await requireProjectSlug(flagValue)
   if (resolved.source !== 'flag') {
-    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
+    if (!isQuietMode()) console.error(`${icons.info} ${colors.info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)}`)
   }
-  if (/^\d+$/.test(resolved.slug)) {
+  if (resolved.source === 'flag' && /^\d+$/.test(resolved.slug)) {
     const id = Number(resolved.slug)
     if (Number.isSafeInteger(id) && id > 0) return { id, slug: resolved.slug }
   }
