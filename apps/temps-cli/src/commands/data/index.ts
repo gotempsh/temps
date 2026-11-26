@@ -69,6 +69,7 @@ export function registerDataCommands(program: Command): void {
     .description('List tables, collections, keys or objects in a container')
     .requiredOption('--path <path>', 'Container path, slash-separated (e.g. mydb/public)')
     .option('--limit <n>', 'Maximum entities to return (default: 100)')
+    .option('--next-token <token>', 'Continue from the next_token of a previous page')
     .option('--json', 'Output in JSON format')
     .action(tablesCmd)
 
@@ -324,7 +325,7 @@ async function containersCmd(
 
 async function tablesCmd(
   serviceRef: string,
-  options: { path: string; limit?: string; json?: boolean },
+  options: { path: string; limit?: string; nextToken?: string; json?: boolean },
 ): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -335,7 +336,10 @@ async function tablesCmd(
     const { data, error } = await listEntities({
       client,
       path: { service_id: service.id, path: options.path },
-      query: options.limit ? { limit: Number(options.limit) } : undefined,
+      query: {
+        ...(options.limit && { limit: Number(options.limit) }),
+        ...(options.nextToken && { token: options.nextToken }),
+      },
     })
     if (error) throw new Error(getErrorMessage(error))
     return data

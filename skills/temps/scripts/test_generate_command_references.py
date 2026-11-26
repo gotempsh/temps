@@ -38,7 +38,7 @@ class CommandReferenceGeneratorTests(unittest.TestCase):
             destination = root / "commands"
             body = "\n".join(f"line {number}" for number in range(301))
             source.write_text(
-                f"# CLI\n\n## `services`\n\n### `services list`\n\n{body}\n",
+                f"# CLI\n\n## `services`\n\n### `services list`\n\n### `services remove` (alias: `rm`)\n\n{body}\n",
                 encoding="utf-8",
             )
 
@@ -47,6 +47,8 @@ class CommandReferenceGeneratorTests(unittest.TestCase):
             output = (destination / "services.md").read_text(encoding="utf-8")
             self.assertIn("## Contents", output)
             self.assertIn("[`services list`](#services-list)", output)
+            # A heading with an alias has the alias in its fragment.
+            self.assertIn("[`services remove`](#services-remove-alias-rm)", output)
 
     def test_rejects_nonempty_noncanonical_destination(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

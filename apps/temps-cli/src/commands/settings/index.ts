@@ -15,6 +15,7 @@ import type {
   GeoSettingsMasked,
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { registerAdvancedSettingsCommands } from './advanced.js'
 import { promptText, promptConfirm, promptSelect, promptNumber, promptPassword } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 
@@ -344,6 +345,8 @@ export function registerSettingsCommands(program: Command): void {
     .description('Set the preview domain pattern')
     .requiredOption('--domain <domain>', 'Preview domain pattern')
     .action(setPreviewDomain)
+
+  registerAdvancedSettingsCommands(settings)
 }
 
 async function showGeoStatus(options: { json?: boolean }): Promise<void> {

@@ -13,6 +13,7 @@ import {
   formatMemory,
   parseResourceUpdate,
   parseReplicaCount,
+  generateSecretRequest,
 } from './index.js'
 import { runWithApi } from '../../lib/mock-api.js'
 import { MAX_CPU_MILLICORES } from '../../lib/cpu.js'
@@ -403,6 +404,45 @@ describe('vars set value sources', () => {
     expect(run.error).toBeUndefined()
     expect(sentBody(run, 'POST /projects/4/env-vars').value).toBe('@team')
     expect(run.stderr).not.toContain('deprecated')
+  })
+
+  test('--generate-secret has the server make the value: none is sent, typed or printed', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'SESSION_SECRET', '--generate-secret', '48', '-e', 'production'], routes)
+    expect(run.error).toBeUndefined()
+    expect(sentBody(run, 'POST /projects/4/env-vars')).toMatchObject({
+      key: 'SESSION_SECRET',
+      value: '',
+      is_secret: true,
+      generate: { kind: 'secret', bytes: 48 },
+      environment_ids: [7],
+    })
+    expect(run.stdout).toContain('generated secret')
+  })
+
+  test('--generate-secret refuses a value beside it, --update and an existing variable', async () => {
+    const withValue = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'SESSION_SECRET', 'typed', '--generate-secret', '-e', 'production'], routes)
+    expect(withValue.error?.message).toContain('do not also pass one')
+    expect(withValue.requests).toEqual([])
+
+    const update = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'EXISTING', '--update', '--generate-secret'], routes)
+    expect(update.error?.message).toContain('--generate-secret creates EXISTING')
+    expect(update.requests).toEqual([])
+
+    const existing = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'EXISTING', '--generate-secret', '-e', 'production'], routes)
+    expect(existing.bodies.some(b => b.request === 'POST /projects/4/env-vars')).toBe(false)
+  })
+
+  test('the generated secret request: 32 bytes unless given, 16 to 64', () => {
+    expect(generateSecretRequest(undefined)).toBeUndefined()
+    expect(generateSecretRequest(true)).toEqual({ kind: 'secret' })
+    expect(generateSecretRequest('16')).toEqual({ kind: 'secret', bytes: 16 })
+    expect(() => generateSecretRequest('8')).toThrow('from 16 to 64')
+    expect(() => generateSecretRequest('65')).toThrow('from 16 to 64')
+    expect(() => generateSecretRequest('lots')).toThrow('from 16 to 64')
   })
 
   test('two sources fail before any request, naming the flags', async () => {

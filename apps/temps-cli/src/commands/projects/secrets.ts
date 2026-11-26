@@ -7,13 +7,15 @@ import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { findInPages, nextPageHint, pageQuery, type PageFlags } from '../../lib/page-options.js'
 import {
-  getProjectBySlug,
-  getEnvironments,
-  listProjectSecrets,
   createProjectSecret,
-  updateProjectSecret,
   deleteProjectSecret,
+  getEnvironments,
+  getProjectBySlug,
+  getProjectSecret,
+  listProjectSecrets,
+  updateProjectSecret,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type { ProjectSecretResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -154,6 +156,12 @@ export function registerProjectSecretsCommands(projects: Command): void {
       'Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).',
     )
 
+  endpoint(secrets, getProjectSecret, {
+    name: 'get',
+    description: "Show one project secret's metadata (the value is never returned)",
+    path: { project_id: 'project', secret_id: 'int' },
+  })
+
   secrets
     .command('list')
     .alias('ls')
@@ -245,7 +253,11 @@ async function listAction(options: ListOptions): Promise<void> {
     const { data, error } = await listProjectSecrets({
       client,
       path: { project_id: projectId },
-      query: { ...pageParams, ...(environmentId !== undefined ? { environment_id: environmentId } : {}) },
+      query: {
+        ...(pageParams.page !== undefined && { page: pageParams.page }),
+        ...(pageParams.page_size !== undefined && { page_size: pageParams.page_size }),
+        ...(environmentId !== undefined ? { environment_id: environmentId } : {}),
+      },
     })
     if (error) throw new Error(getErrorMessage(error))
     if (!data) throw new Error(`Failed to list secrets of project ${projectId}: empty response`)

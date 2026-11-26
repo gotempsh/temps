@@ -47,88 +47,91 @@ Use this index or search for a top-level command heading to load only the releva
 - [`whoami`](#whoami) - Display current authenticated user and active context
 - [`context`](#context) - Manage CLI contexts (one set of credentials per Temps server)
 - [`configure`](#configure) - Configure CLI settings (AWS-style wizard)
-- [`projects`](#projects) - Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
+- [`projects`](#projects-alias-project-p) - Manage services: each one deployable app (the console calls these Services). To group services that ship together into a Project, as the console calls it, use `project-groups`.
 - [`drop`](#drop) - Detect and deploy a local source directory or ZIP without Git
 - [`deploy`](#deploy) - Deploy a project from git
-- [`deploy:static`](#deploystatic) - Deploy static files (tar.gz, zip, or directory)
-- [`deploy:image`](#deployimage) - Deploy a pre-built Docker image
-- [`deploy:local-image`](#deploylocal-image) - Build and deploy a local Docker image (or deploy existing image with --image)
-- [`deployments`](#deployments) - Manage deployments
-- [`domains`](#domains) - Manage custom domains
-- [`environments`](#environments) - Manage environments and environment variables
-- [`providers`](#providers) - Manage Git providers
-- [`backups`](#backups) - Manage backup schedules and backups
-- [`runtime-logs`](#runtime-logs) - View runtime container logs (use -f to follow in real-time)
-- [`notifications`](#notifications) - Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
+- [`deploy:static`](#deploystatic-alias-deploy-static) - Deploy static files (tar.gz, zip, or directory)
+- [`deploy:image`](#deployimage-alias-deploy-image) - Deploy a pre-built Docker image
+- [`deploy:local-image`](#deploylocal-image-alias-deploy-local-image) - Build and deploy a local Docker image (or deploy existing image with --image)
+- [`deployments`](#deployments-alias-deploys) - Manage deployments
+- [`domains`](#domains-alias-domain) - Manage custom domains
+- [`environments`](#environments-alias-envs-env) - Manage environments and environment variables
+- [`providers`](#providers-alias-provider) - Manage Git providers
+- [`backups`](#backups-alias-backup) - Manage backup schedules and backups
+- [`runtime-logs`](#runtime-logs-alias-rlogs) - View runtime container logs (use -f to follow in real-time)
+- [`notifications`](#notifications-alias-notify) - Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 - [`dns`](#dns) - Manage DNS providers and Temps-managed DNS records
-- [`services`](#services) - Manage external services (databases, caches, storage)
+- [`services`](#services-alias-svc) - Manage external services (databases, caches, storage)
 - [`settings`](#settings) - Manage platform settings
 - [`users`](#users) - Manage platform users
 - [`teams`](#teams) - Manage teams and project access
 - [`access`](#access) - Manage which teams can reach a project
-- [`project-groups`](#project-groups) - Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
-- [`instantiations`](#instantiations) - Follow and retry template creations and imports
-- [`apikeys`](#apikeys) - Manage API keys for programmatic access
-- [`monitors`](#monitors) - Manage uptime monitors for status pages
-- [`webhooks`](#webhooks) - Manage webhooks for project events
-- [`containers`](#containers) - Manage project containers in environments
+- [`project-groups`](#project-groups-alias-pg) - Manage Projects (what the console calls a Project): groups of services that ship together and share a repository, variables and path routes. A service is what the `projects` command manages; the `services` command manages databases and caches, not these.
+- [`instantiations`](#instantiations-alias-inst) - Follow and retry template creations and imports
+- [`apikeys`](#apikeys-alias-keys) - Manage API keys for programmatic access
+- [`monitors`](#monitors-alias-monitoring) - Manage uptime monitors for status pages
+- [`webhooks`](#webhooks-alias-hooks) - Manage webhooks for project events
+- [`containers`](#containers-alias-cts) - Manage project containers in environments
 - [`cluster`](#cluster) - Cluster-wide multi-node operations
 - [`nodes`](#nodes) - Worker nodes and workload placement
 - [`tunnels`](#tunnels) - Ingress tunnels: publish apps on workers with no open ports or certificates. Apps under a tunnel's domain go live by adding the hostname to an environment
-- [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
-- [`errors`](#errors) - Manage error tracking and error groups
-- [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
+- [`tokens`](#tokens-alias-token) - Manage deployment tokens for project API access (KV, Blob, etc.)
+- [`errors`](#errors-alias-error) - Manage error tracking and error groups
+- [`metrics`](#metrics-alias-metric) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
 - [`server`](#server) - Resource usage of the machine running the Temps control plane (what /monitoring/server shows)
-- [`traces`](#traces) - Inspect distributed traces and operation latency
+- [`traces`](#traces-alias-trace) - Inspect distributed traces and operation latency
 - [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`ingress`](#ingress) - How this Temps machine receives traffic for your apps
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
-- [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
-- [`surveys`](#surveys) - Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
+- [`kv`](#kv) - Read and write a project's keys in the KV store, and manage the KV service
+- [`flags`](#flags-alias-flag) - Manage feature flags (runtime config that changes without a redeploy)
+- [`surveys`](#surveys-alias-survey) - Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
 - [`data`](#data) - Browse the data inside a service (tables, collections, keys, objects) — read-only
+- [`blob`](#blob) - Upload, download and list a project's files in Blob storage, and manage the Blob service
 - [`dsn`](#dsn) - Manage Data Source Names (DSNs) for error tracking and analytics
-- [`scans`](#scans) - Manage vulnerability scans
-- [`custom-domains`](#custom-domains) - Manage project custom domains
-- [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
-- [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
+- [`scans`](#scans-alias-scan) - Manage vulnerability scans
+- [`custom-domains`](#custom-domains-alias-cdom) - Manage project custom domains
+- [`dns-provider`](#dns-provider-alias-dnsp) - Manage DNS providers and managed domains
+- [`delivery-profiles`](#delivery-profiles-alias-delivery-profile) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
 - [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
-- [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
-- [`edge-rules`](#edge-rules) - Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
-- [`network-policy`](#network-policy) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
+- [`ip-access`](#ip-access-alias-ipa) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
+- [`preview-gateway`](#preview-gateway-alias-pgw) - Manage the preview gateway that serves workspace preview URLs (status, settings, logs, restart, upgrade)
+- [`edge-rules`](#edge-rules-alias-edge-rule) - Block, allow, challenge, redirect or log requests before they reach the app. Rules run top to bottom; the first match decides
+- [`network-policy`](#network-policy-alias-netpol) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
 - [`audit`](#audit) - View audit logs
-- [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
-- [`logs`](#logs) - Search collected logs across every project and database you can access
-- [`email-domains`](#email-domains) - Manage email domains for transactional email
-- [`email-providers`](#email-providers) - Manage email providers (SES, Scaleway) for transactional email
-- [`incidents`](#incidents) - Manage incidents for status pages and monitoring
-- [`status-pages`](#status-pages) - Publish public status pages showing monitors from any of your projects
-- [`alarms`](#alarms) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
-- [`emails`](#emails) - Manage and send emails
-- [`load-balancer`](#load-balancer) - Manage load balancer routes
-- [`migrate`](#migrate) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
-- [`templates`](#templates) - Browse templates and create them
-- [`platform`](#platform) - View platform and server information
-- [`presets`](#presets) - Browse available build presets
-- [`analytics`](#analytics) - View project analytics
-- [`funnels`](#funnels) - Manage analytics funnels for projects
-- [`notification-preferences`](#notification-preferences) - Manage notification preferences
-- [`skills`](#skills) - Manage AI skill definitions (global or project-scoped)
+- [`proxy-logs`](#proxy-logs-alias-plogs) - View proxy request logs and statistics
+- [`logs`](#logs-alias-glogs) - Search collected logs across every project and database you can access
+- [`email-domains`](#email-domains-alias-edom) - Manage email domains for transactional email
+- [`email-providers`](#email-providers-alias-eprov) - Manage email providers (SES, Scaleway) for transactional email
+- [`incidents`](#incidents-alias-incident) - Manage incidents for status pages and monitoring
+- [`status-pages`](#status-pages-alias-status-page) - Publish public status pages showing monitors from any of your projects
+- [`alarms`](#alarms-alias-alarm) - List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
+- [`emails`](#emails-alias-email) - Manage and send emails
+- [`load-balancer`](#load-balancer-alias-lb) - Manage load balancer routes
+- [`migrate`](#migrate-alias-imports-import) - Migrate a project from another platform (Vercel, Coolify, Dokploy, CapRover, Portainer, Kubernetes, Docker) into temps
+- [`templates`](#templates-alias-tpl) - Browse templates and create them
+- [`platform`](#platform-alias-plat) - View platform and server information
+- [`presets`](#presets-alias-preset) - Browse available build presets
+- [`analytics`](#analytics-alias-stats) - View project analytics
+- [`funnels`](#funnels-alias-funnel) - Manage analytics funnels for projects
+- [`notification-preferences`](#notification-preferences-alias-notif-prefs) - Manage notification preferences
+- [`skills`](#skills-alias-skill) - Manage AI skill definitions (global or project-scoped)
 - [`mcp-servers`](#mcp-servers) - Manage MCP server definitions (global or project-scoped)
 - [`mcp`](#mcp) - Configure this Temps instance as an MCP server for AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed)
-- [`secrets`](#secrets) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
+- [`secrets`](#secrets-alias-secret) - Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config. file-type: written to --mount-path in sandbox; reference that path.
 - [`sandbox`](#sandbox) - Manage standalone sandboxes (/v1/sandbox API)
-- [`workflow`](#workflow) - Trigger and inspect agent/workflow runs
+- [`workflow`](#workflow-alias-wf) - Trigger and inspect agent/workflow runs
 - [`workflows`](#workflows) - Durable application workflows
 - [`revenue`](#revenue) - Manage revenue integrations and import historical data
-- [`session-replay`](#session-replay) - Manage session replay recordings
+- [`session-replay`](#session-replay-alias-sessions-replay) - Manage session replay recordings
 - [`traefik-discovery`](#traefik-discovery) - Route containers Temps did not deploy by reading their Traefik labels (an existing docker-compose / Coolify / Dokploy stack)
 - [`init`](#init) - Initialize a Temps project in the current directory
 - [`link`](#link) - Link current directory to a Temps project
 - [`up`](#up) - Deploy the current project (runs setup wizard if not linked)
 - [`status`](#status) - Show project deployment status
 - [`ai`](#ai) - AI assistant status for a project
-- [`instances`](#instances) - Manage Temps server instances
+- [`instances`](#instances-alias-instance) - Manage Temps server instances
 - [`env:pull`](#envpull) - Pull environment variables to a .env file
 - [`env:push`](#envpush) - Push environment variables from a .env file
 - [`rollback`](#rollback) - Rollback to a previous deployment
@@ -138,6 +141,9 @@ Use this index or search for a top-level command heading to load only the releva
 - [`setup`](#setup) - PoC: install Temps on an existing Linux VPS over SSH and save a client context
 - [`start`](#start) - Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent
 - [`stop`](#stop) - Stop the Temps server and database started by `temps start`
+- [`agents`](#agents) - Project agents, their MCP servers, skills and AI providers
+- [`shield`](#shield) - Shield: bot and abuse protection rules, entries and proposals
+- [`vault`](#vault) - Access vaults, the services they hold and their sessions
 
 ## Commands
 
@@ -310,6 +316,27 @@ Manage services: each one deployable app (the console calls these Services). To 
 - `identical-builds` - Show or change what the project's builds do when an identical build (same repository, commit, build path and build-time values) is already running: build in parallel, queue, or build once and share the image
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a service
+- `create-from-template` - Create a new project from a template
+- `get-statistics` - Get project statistics
+- `get-compose-security` - Get compose security
+- `update-compose-security` - Update compose security
+- `update-automatic-deploy` - Update automatic deployment setting for a project
+- `get-resolved-environment-variables` - Resolved env vars for a project (manual + integration-sourced, merged)
+- `get-resolved-environment-variable-value` - Reveal the plaintext value of a resolved environment variable
+- `get-environment-variable` - Get one environment variable of a project by its ID
+- `dismiss-environment-variable-secret-suggestion` - Dismiss the "store as secret" suggestion for a regular variable
+- `get-environment` - Get a specific environment by ID or slug
+- `get-environment-domains` - Get all environment domains for a specific environment
+- `add-environment-domain` - Add a new environment domain
+- `delete-environment-domain` - Delete an environment domain
+- `update-environment-subdomain` - Rename the auto-managed subdomain for an environment
+- `teardown-environment` - Teardown an environment and all its active deployments
+- `reinstall-github-webhook` - Install or reinstall the GitHub repository webhook for a project
+- `reinstall-gitlab-webhook` - Reinstall the GitLab webhook for a project
+- `get-ingest-setup` - Get where this project's apps send telemetry
+- `update-service-template-runtime` - Update service template runtime
+- `get-service-template` - Return the immutable service-template release applied to a project together with catalog drift, missing..
+- `upgrade-service-template` - Upgrade project service template
 
 ### `projects secrets`
 
@@ -317,10 +344,24 @@ Manage project secrets — mounted into the deployed container as files at /run/
 
 **Subcommands:**
 
+- `get` - Show one project secret's metadata (the value is never returned)
 - `list` (`ls`) - List secrets for a project (values are never returned)
 - `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
+
+#### `projects secrets get`
+
+Show one project secret's metadata (the value is never returned)
+
+**Usage:** `projects secrets get <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `projects secrets list` (alias: `ls`)
 
@@ -401,6 +442,8 @@ List all services
 | `--json` | Output in JSON format | - | No |
 | `--page <n>` | Page number | - | No |
 | `--per-page <n>` | Items per page | - | No |
+| `--group <id>` | Only services in this project group (its numeric ID) | - | No |
+| `--ungrouped` | Only services in no project group | - | No |
 
 ### `projects create` (alias: `new`)
 
@@ -424,6 +467,21 @@ Create a new service (git-based or manual deployment); add it to a project with 
 | `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes) | - | No |
 | `--delivery-provider <provider>` | Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
+| `--cloudflare-enabled` | Serve through Cloudflare (overrides the instance default) | - | No |
+| `--no-cloudflare-enabled` | Set cloudflare_enabled to false | - | No |
+| `--custom-domain <value>` | Custom domain to attach to the production environment | - | No |
+| `--expected-slug <value>` | Fail unless the project gets exactly this URL slug | - | No |
+| `--is-on-demand` | Start containers on the first request and stop them when idle | - | No |
+| `--no-is-on-demand` | Set is_on_demand to false | - | No |
+| `--is-public-repo` | The repository is public (cloned without a git connection) | - | No |
+| `--no-is-public-repo` | Set is_public_repo to false | - | No |
+| `--is-web-app` | The app serves HTTP (false for a worker with no port) | - | No |
+| `--no-is-web-app` | Set is_web_app to false | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
+| `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
+| `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
 ### `projects cloudflare-capability` (alias: `delivery-capability`)
 
@@ -470,6 +528,25 @@ Update service name and description
 | `-d, --description <description>` | New project description | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided values (for automation) | - | No |
+| `--build-command <value>` | Build command (overrides the preset) | - | No |
+| `--install-command <value>` | Install command (overrides the preset) | - | No |
+| `--output-dir <value>` | Build output directory (static sites) | - | No |
+| `--cloudflare-enabled` | Serve through Cloudflare | - | No |
+| `--no-cloudflare-enabled` | Set cloudflare_enabled to false | - | No |
+| `--custom-domain <value>` | Custom domain of the production environment | - | No |
+| `--expected-slug <value>` | Fail unless the project keeps exactly this URL slug | - | No |
+| `--is-on-demand` | Start containers on the first request and stop them when idle | - | No |
+| `--no-is-on-demand` | Set is_on_demand to false | - | No |
+| `--is-public-repo` | The repository is public (cloned without a git connection) | - | No |
+| `--no-is-public-repo` | Set is_public_repo to false | - | No |
+| `--is-web-app` | The app serves HTTP (false for a worker with no port) | - | No |
+| `--no-is-web-app` | Set is_web_app to false | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--preset-config <json>` | Preset-specific build settings as JSON, e.g. {"buildCommand":"bun run build"} (JSON) | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
+| `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
+| `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
 ### `projects settings`
 
@@ -492,6 +569,24 @@ Update service settings (name, slug, attack mode, preview environments, vulnerab
 | `--reset-image-retention` | Clear the per-project image retention override and use the system default | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
+| `--ai-alert-summaries-enabled` | Summarize metric alert notifications with AI | - | No |
+| `--no-ai-alert-summaries-enabled` | Set ai_alert_summaries_enabled to false | - | No |
+| `--ai-api-traffic-summary-enabled` | Summarize API traffic analytics with AI | - | No |
+| `--no-ai-api-traffic-summary-enabled` | Set ai_api_traffic_summary_enabled to false | - | No |
+| `--cross-project-trace-sharing` | Show this project's spans in other projects' traces | - | No |
+| `--no-cross-project-trace-sharing` | Set cross_project_trace_sharing to false | - | No |
+| `--error-source-context-enabled` | Show source code in error stack traces (uploads source files) | - | No |
+| `--no-error-source-context-enabled` | Set error_source_context_enabled to false | - | No |
+| `--error-source-root <value>` | Source root for error source context, relative to the checkout | - | No |
+| `--log-ingest-lines-per-sec <n>` | Log ingestion budget for the project's containers, lines per second (0 lifts it) | - | No |
+| `--log-ingest-kib-per-sec <n>` | Log ingestion budget in KiB per second (0 lifts it) | - | No |
+| `--preview-envs-on-demand` | New preview environments start on demand and stop when idle | - | No |
+| `--no-preview-envs-on-demand` | Set preview_envs_on_demand to false | - | No |
+| `--preview-envs-idle-timeout-seconds <n>` | Idle seconds (60-86400) before an on-demand preview stops | - | No |
+| `--preview-envs-wake-timeout-seconds <n>` | Seconds (5-120) to wait for an on-demand preview to wake | - | No |
+| `--serves-own-temps-api` | Send /api/_temps* and /api/otel* on the project's domains to the app instead of Temps | - | No |
+| `--no-serves-own-temps-api` | Set serves_own_temps_api to false | - | No |
+| `--shield-mode <value>` | How Shield acts on its verdicts (one of: off, log, selective, attack) | - | No |
 
 ### `projects git`
 
@@ -510,6 +605,12 @@ Update git repository settings
 | `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided/existing values (for automation) | - | No |
+| `--is-public-repo` | The repository is public: clone it without a git connection | - | No |
+| `--no-is-public-repo` | Set is_public_repo to false | - | No |
+| `--git-url <value>` | Clone URL of a public repository | - | No |
+| `--preset-config <json>` | Preset-specific build settings as JSON, e.g. {"buildCommand":"bun run build"} (JSON) | - | No |
+| `--pull-only-root-directory` | Clone only --directory instead of the whole repository | - | No |
+| `--no-pull-only-root-directory` | Set pull_only_root_directory to false | - | No |
 
 ### `projects source`
 
@@ -584,6 +685,21 @@ Update deployment configuration (resources, replicas)
 | `--websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
+| `--build-location <value>` | Where a source deployment's image is built (one of: control_plane, node, ci) | - | No |
+| `--cross-architecture-builds` | Build one image per architecture the eligible nodes run | - | No |
+| `--no-cross-architecture-builds` | Set crossArchitectureBuilds to false | - | No |
+| `--cpu-request <n>` | CPU reserved per container, in microcores | - | No |
+| `--memory-request <n>` | Memory reserved per container, in MB | - | No |
+| `--exposed-port <n>` | Port the container listens on | - | No |
+| `--health <json>` | Health check settings as JSON, e.g. {"path":"/healthz"} (JSON) | - | No |
+| `--health-check-timeout-seconds <n>` | Seconds (30-3600) a new deployment's containers get to become ready | - | No |
+| `--stop-timeout-seconds <n>` | Seconds (1-3600) the previous deployment gets to finish in-flight requests | - | No |
+| `--load-balancing <json>` | Load balancing settings as JSON (JSON) | - | No |
+| `--max-concurrent-connections <n>` | Default cap on concurrent requests to an environment's upstream (0 = unlimited) | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performanceMetricsEnabled to false | - | No |
+| `--session-recording-enabled` | Record visitor sessions | - | No |
+| `--no-session-recording-enabled` | Set sessionRecordingEnabled to false | - | No |
 
 ### `projects delete` (alias: `rm`)
 
@@ -596,6 +712,321 @@ Delete a service
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+### `projects create-from-template`
+
+Create a new project from a template
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--automatic-deploy` | Enable automatic deployment on push (defaults to true) | - | No |
+| `--no-automatic-deploy` | Set automatic_deploy to false | - | No |
+| `--cloudflare-enabled` | Override the Cloudflare default for this new project | - | No |
+| `--no-cloudflare-enabled` | Set cloudflare_enabled to false | - | No |
+| `--command <value>` | Optional image entrypoint arguments (repeatable) | - | No |
+| `--cpu-limit <n>` | CPU limit override in microcores | - | No |
+| `--cpu-request <n>` | CPU request override in microcores (1_000_000 = one CPU core) | - | No |
+| `--delivery-provider <value>` | Body field delivery_provider | - | No |
+| `--environment-variables <json>` | Environment variables to set (key-value pairs) (JSON) | - | No |
+| `--exposed-port <n>` | Public container port override | - | No |
+| `--git-provider-connection-id <n>` | Git provider connection ID | - | No |
+| `--health-check-path <value>` | Relative HTTP health-check path override | - | No |
+| `--image <value>` | Optional prebuilt-image override | - | No |
+| `--memory-limit <n>` | Memory limit override in MiB | - | No |
+| `--memory-request <n>` | Memory request override in MiB | - | No |
+| `--private` | Whether to make the repository private (defaults to true) | - | No |
+| `--no-private` | Set private to false | - | No |
+| `--project-name <value>` | Name for the new project [required] | - | No |
+| `--repository-name <value>` | Name for the new repository to create | - | No |
+| `--repository-owner <value>` | Owner/organization for the new repository (defaults to authenticated user) | - | No |
+| `--storage-service-ids <n>` | External storage service IDs to attach to the project (repeatable) | - | No |
+| `--template-slug <value>` | Template slug to use as the base [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-statistics`
+
+Get project statistics
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-compose-security`
+
+Get compose security
+
+**Usage:** `projects get-compose-security <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `projects update-compose-security`
+
+Update compose security
+
+**Usage:** `projects update-compose-security <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--acknowledge-legacy-migration` | Body field acknowledge_legacy_migration | - | No |
+| `--no-acknowledge-legacy-migration` | Set acknowledge_legacy_migration to false | - | No |
+| `--acknowledge-risks` | Body field acknowledge_risks | - | No |
+| `--no-acknowledge-risks` | Set acknowledge_risks to false | - | No |
+| `--expected-policy <json>` | Policy read by the editor; compared while holding the project lock (JSON) [required] | - | No |
+| `--policy <json>` | Body field policy (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects update-automatic-deploy`
+
+Update automatic deployment setting for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--automatic-deploy` | Body field automatic_deploy [required] | - | No |
+| `--no-automatic-deploy` | Set automatic_deploy to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-resolved-environment-variables`
+
+Resolved env vars for a project (manual + integration-sourced, merged)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Optional environment ID to filter manual vars by | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-resolved-environment-variable-value`
+
+Reveal the plaintext value of a resolved environment variable
+
+**Usage:** `projects get-resolved-environment-variable-value <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Optional environment ID | - | No |
+| `--var-id <n>` | Exact manual environment-variable row ID | - | No |
+| `--service-id <n>` | Integration service ID shown by the resolved list | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-environment-variable`
+
+Get one environment variable of a project by its ID
+
+**Usage:** `projects get-environment-variable <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects dismiss-environment-variable-secret-suggestion`
+
+Dismiss the "store as secret" suggestion for a regular variable
+
+**Usage:** `projects dismiss-environment-variable-secret-suggestion <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-environment`
+
+Get a specific environment by ID or slug
+
+**Usage:** `projects get-environment <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-environment-domains`
+
+Get all environment domains for a specific environment
+
+**Usage:** `projects get-environment-domains <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects add-environment-domain`
+
+Add a new environment domain
+
+**Usage:** `projects add-environment-domain <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--domain <value>` | Body field domain [required] | - | No |
+| `--is-primary` | Body field is_primary [required] | - | No |
+| `--no-is-primary` | Set is_primary to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects delete-environment-domain`
+
+Delete an environment domain
+
+**Usage:** `projects delete-environment-domain <env-id> <domain-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects update-environment-subdomain`
+
+Rename the auto-managed subdomain for an environment
+
+**Usage:** `projects update-environment-subdomain <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--subdomain <value>` | New subdomain label [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects teardown-environment`
+
+Teardown an environment and all its active deployments
+
+**Usage:** `projects teardown-environment <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects reinstall-github-webhook`
+
+Install or reinstall the GitHub repository webhook for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects reinstall-gitlab-webhook`
+
+Reinstall the GitLab webhook for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-ingest-setup`
+
+Get where this project's apps send telemetry
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Attribute telemetry to this environment of the project | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects update-service-template-runtime`
+
+Update service template runtime
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--command <value>` | Empty means use the image's own default command (repeatable) | - | No |
+| `--cpu-limit <n>` | Body field cpuLimit | - | No |
+| `--cpu-request <n>` | Body field cpuRequest | - | No |
+| `--exposed-port <n>` | Body field exposedPort | - | No |
+| `--health-check-path <value>` | Body field healthCheckPath [required] | - | No |
+| `--image-ref <value>` | Body field imageRef [required] | - | No |
+| `--memory-limit <n>` | Body field memoryLimit | - | No |
+| `--memory-request <n>` | Body field memoryRequest | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects get-service-template`
+
+Return the immutable service-template release applied to a project together with catalog drift, missing..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `projects upgrade-service-template`
+
+Upgrade project service template
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-variables <json>` | Values for inputs introduced by the target release (JSON) | - | No |
+| `--target-version <value>` | Optimistic target selected from the preview [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `drop`
 
@@ -659,7 +1090,9 @@ Deploy a pre-built Docker image
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | Yes |
+| `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | No |
+| `--external-image-id <id>` | Deploy an image already registered with Temps instead of --image | - | No |
+| `--claim-local` | --image is on the platform host's Docker daemon, not in a registry: claim it | - | No |
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Target environment name | `production` | No |
 | `--environment-id <id>` | Target environment ID | - | No |
@@ -681,6 +1114,9 @@ Build and deploy a local Docker image (or deploy existing image with --image)
 | `-f, --dockerfile <path>` | Path to Dockerfile | `Dockerfile` | No |
 | `-c, --context <path>` | Build context directory | `.` | No |
 | `--build-arg <arg...>` | Build arguments (can be specified multiple times) | - | No |
+| `--build-command <cmd>` | With no Dockerfile: the build command in the one generated from the project's preset | - | No |
+| `--install-command <cmd>` | With no Dockerfile: the install command in the generated one | - | No |
+| `--output-dir <dir>` | With no Dockerfile: the static output directory in the generated one | - | No |
 | `--no-build` | Skip building, requires --image | - | No |
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Target environment name | `production` | No |
@@ -708,6 +1144,25 @@ Manage deployments
 - `logs` - Show deployment build logs
 - `container-logs` - Show live container logs, including retained failed deployments
 - `failure-report` - Preview or send a redacted deploy-failure trace
+- `get-activity-graph` - Get deployment activity graph showing daily deployment counts Similar to GitHub's contribution graph
+- `get-latest-media` - Get the latest deployment URL and screenshot location for multiple projects
+- `list-managed-environment-variables` - List the environment variables generated by Temps for a deployment preset
+- `metrics` - Metrics commands
+- `compose` - Compose commands
+- `purge-asset-cache` - Purge all cached static assets for a project
+- `list-container-logs` - List the captured (historical) container-log dumps for a deployment
+- `get-container-log-content` - Get the captured text content of a single historical container-log dump
+- `tail-job-logs` - Tail logs for a specific deployment job in real-time via WebSocket
+- `get-operations` - Get all operations for a deployment
+- `execute-operation` - Execute a deployment operation (deploy, mark_complete, take_screenshot)
+- `get-operation-status` - Get the status of a specific operation type
+- `promote` - Promote a deployment to another environment
+- `purge-environment-asset-cache` - Purge cached static assets for a specific environment
+- `get-container-logs` - Get logs for a container in an environment via WebSocket
+- `get-container-logs-by-id` - Get logs for a specific container by container ID via WebSocket
+- `deploy-from-image-upload` - Deploy from an uploaded Docker image tarball
+- `images` - Images commands
+- `static-bundles` - Static bundles commands
 
 ### `deployments list` (alias: `ls`)
 
@@ -860,6 +1315,515 @@ Send a failure report to the Temps team. Reads report text from --text-file, or 
 | `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
 | `--text-file <path>` | Read the (already-reviewed) report text from a file | - | No |
 
+### `deployments get-activity-graph`
+
+Get deployment activity graph showing daily deployment counts Similar to GitHub's contribution graph
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Filter by project ID (optional) | - | No |
+| `--environment-id <n>` | Filter by environment ID (optional) | - | No |
+| `--days <n>` | Number of days to include (default: 365) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments get-latest-media`
+
+Get the latest deployment URL and screenshot location for multiple projects
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-ids <value>` | Comma-separated project IDs [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments list-managed-environment-variables`
+
+List the environment variables generated by Temps for a deployment preset
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--preset <value>` | Framework preset used to select public browser variable names [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments metrics`
+
+Metrics commands
+
+**Subcommands:**
+
+- `get-range` - Fetch a time-series range for a single metric on a deployment
+- `toggle` - Enable or disable OTLP metric ingestion for a deployment
+- `get-latest` - Fetch the most-recent metric values for a deployment
+
+#### `deployments metrics get-range`
+
+Fetch a time-series range for a single metric on a deployment
+
+**Usage:** `deployments metrics get-range <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--metric <value>` | Metric name, e.g. '"pg.connections_active"' [required] | - | No |
+| `--range <value>` | Time window: '"1h"' \| '"6h"' \| '"24h"' \| '"7d"' | - | No |
+| `--percentile <number>` | Optional histogram percentile (0–100) | - | No |
+| `--start-time <value>` | Explicit window start (ISO 8601) | - | No |
+| `--end-time <value>` | Explicit window end (ISO 8601) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments metrics toggle`
+
+Enable or disable OTLP metric ingestion for a deployment
+
+**Usage:** `deployments metrics toggle <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enabled` | Whether to enable ('true') or disable ('false') metric ingestion [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--path <value>` | Prometheus scrape path (optional, defaults to '/metrics') | - | No |
+| `--port <n>` | Prometheus scrape port (optional) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments metrics get-latest`
+
+Fetch the most-recent metric values for a deployment
+
+**Usage:** `deployments metrics get-latest <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `deployments compose`
+
+Compose commands
+
+**Subcommands:**
+
+- `get-status` - The host's Docker Compose CLI, as probed at startup
+- `get-validation` - The project's most recent stored Compose check (from its last deployment or the revalidation after an..
+- `run-check` - Run the deploy job's Compose configuration check for a deployment, without deploying: the deployment's..
+- `get-placement` - Where this environment's Compose stack lives: its home node, a pending move, and whether the environment's..
+- `move-stack` - Move this environment's Compose stack to another node
+
+#### `deployments compose get-status`
+
+The host's Docker Compose CLI, as probed at startup
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments compose get-validation`
+
+The project's most recent stored Compose check (from its last deployment or the revalidation after an..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments compose run-check`
+
+Run the deploy job's Compose configuration check for a deployment, without deploying: the deployment's..
+
+**Usage:** `deployments compose run-check <deployment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments compose get-placement`
+
+Where this environment's Compose stack lives: its home node, a pending move, and whether the environment's..
+
+**Usage:** `deployments compose get-placement <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments compose move-stack`
+
+Move this environment's Compose stack to another node
+
+**Usage:** `deployments compose move-stack <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--acknowledge-data-loss` | The stack starts on the new node with empty volumes; the data on its current home is kept there but not copied | - | No |
+| `--no-acknowledge-data-loss` | Set acknowledge_data_loss to false | - | No |
+| `--node-id <n>` | The node to move the stack to; '0' is the control plane [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments purge-asset-cache`
+
+Purge all cached static assets for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments list-container-logs`
+
+List the captured (historical) container-log dumps for a deployment
+
+**Usage:** `deployments list-container-logs <deployment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments get-container-log-content`
+
+Get the captured text content of a single historical container-log dump
+
+**Usage:** `deployments get-container-log-content <deployment-id> <log-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments tail-job-logs`
+
+Tail logs for a specific deployment job in real-time via WebSocket
+
+**Usage:** `deployments tail-job-logs <deployment-id> <job-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments get-operations`
+
+Get all operations for a deployment
+
+**Usage:** `deployments get-operations <deployment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments execute-operation`
+
+Execute a deployment operation (deploy, mark_complete, take_screenshot)
+
+**Usage:** `deployments execute-operation <deployment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--operation <value>` | Body field operation [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments get-operation-status`
+
+Get the status of a specific operation type
+
+**Usage:** `deployments get-operation-status <deployment-id> <operation-type> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments promote`
+
+Promote a deployment to another environment
+
+**Usage:** `deployments promote <deployment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--target-environment-id <n>` | Target environment ID to promote the deployment to [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments purge-environment-asset-cache`
+
+Purge cached static assets for a specific environment
+
+**Usage:** `deployments purge-environment-asset-cache <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments get-container-logs`
+
+Get logs for a container in an environment via WebSocket
+
+**Usage:** `deployments get-container-logs <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--start-date <n>` | Start date for logs | - | No |
+| `--end-date <n>` | End date for logs | - | No |
+| `--tail <value>` | Number of lines to tail (or 'all') | - | No |
+| `--container-name <value>` | Optional container name (defaults to first/primary container) | - | No |
+| `--timestamps` | Include timestamps in log output (default: false) | - | No |
+| `--no-timestamps` | Set timestamps to false | - | No |
+| `--follow` | Follow log output in real-time (default: true) | - | No |
+| `--no-follow` | Set follow to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments get-container-logs-by-id`
+
+Get logs for a specific container by container ID via WebSocket
+
+**Usage:** `deployments get-container-logs-by-id <environment-id> <container-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--start-date <n>` | Start date for logs | - | No |
+| `--end-date <n>` | End date for logs | - | No |
+| `--tail <value>` | Number of lines to tail (or 'all') | - | No |
+| `--timestamps` | Include timestamps in log output (default: false) | - | No |
+| `--no-timestamps` | Set timestamps to false | - | No |
+| `--follow` | Follow log output in real-time (default: true) | - | No |
+| `--no-follow` | Set follow to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments deploy-from-image-upload`
+
+Deploy from an uploaded Docker image tarball
+
+**Usage:** `deployments deploy-from-image-upload <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--tag <value>` | Deprecated display hint retained for wire compatibility | - | No |
+| `--health-check-path <value>` | Optional HTTP health-check path override (e.g. "/api/healthz") | - | No |
+| `--upload-request-id <value>` | Client-generated UUID identifying this upload attempt | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments images`
+
+Images commands
+
+**Subcommands:**
+
+- `list-remote-external` - List external images for a project
+- `register-external` - Register an external Docker image
+- `delete-external` - Delete an external image
+- `get-remote-external` - Get details of a specific external image
+- `list-external` - List all external images for a project
+- `push-external` - Push an external Docker image
+- `get-external` - Get details of a specific external image
+
+#### `deployments images list-remote-external`
+
+List external images for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments images register-external`
+
+Register an external Docker image
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--digest <value>` | Image digest (sha256:...) | - | No |
+| `--image-ref <value>` | Docker image reference (e.g., "ghcr.io/org/app:v1.0") [required] | - | No |
+| `--metadata <json>` | Additional metadata (JSON) | - | No |
+| `--tag <value>` | Image tag | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments images delete-external`
+
+Delete an external image
+
+**Usage:** `deployments images delete-external <image-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments images get-remote-external`
+
+Get details of a specific external image
+
+**Usage:** `deployments images get-remote-external <image-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments images list-external`
+
+List all external images for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments images push-external`
+
+Push an external Docker image
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--image-ref <value>` | Body field image_ref [required] | - | No |
+| `--metadata <json>` | Body field metadata (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments images get-external`
+
+Get details of a specific external image
+
+**Usage:** `deployments images get-external <image-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `deployments static-bundles`
+
+Static bundles commands
+
+**Subcommands:**
+
+- `list` - List static bundles for a project
+- `delete` - Delete a static bundle
+- `get` - Get details of a specific static bundle
+
+#### `deployments static-bundles list`
+
+List static bundles for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments static-bundles delete`
+
+Delete a static bundle
+
+**Usage:** `deployments static-bundles delete <bundle-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `deployments static-bundles get`
+
+Get details of a specific static bundle
+
+**Usage:** `deployments static-bundles get <bundle-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `domains` (alias: `domain`)
 
 Manage custom domains
@@ -876,6 +1840,13 @@ Manage custom domains
 - `orders` (`order`) - Manage ACME orders for SSL certificate provisioning
 - `dns-challenge` - Setup DNS challenge records automatically using a DNS provider
 - `http-debug` - Debug HTTP-01 challenge for a domain
+- `get-by-host` - Get domain details by hostname
+- `get-on-demand-cert-status` - Get on-demand TLS certificate status for a hostname
+- `list-on-demand-certs` - List on-demand TLS certificate attempts
+- `get-certificate-settings` - Get certificate settings
+- `update-certificate-settings` - Update certificate settings
+- `get-by-id` - Get domain by ID
+- `get-challenge-token` - Get challenge token for a domain (returns plain text token)
 
 ### `domains list` (alias: `ls`)
 
@@ -886,6 +1857,9 @@ List domains
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--search <value>` | Only domains whose name contains this | - | No |
+| `--sort-by <value>` | Sort column (default created_at) (one of: created_at, domain, status, expiration) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `domains add`
 
@@ -977,6 +1951,8 @@ List all ACME orders
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 #### `domains orders show`
 
@@ -1043,6 +2019,98 @@ Debug HTTP-01 challenge for a domain
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
+### `domains get-by-host`
+
+Get domain details by hostname
+
+**Usage:** `domains get-by-host <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-on-demand-cert-status`
+
+Get on-demand TLS certificate status for a hostname
+
+**Usage:** `domains get-on-demand-cert-status <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains list-on-demand-certs`
+
+List on-demand TLS certificate attempts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Number of items per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-certificate-settings`
+
+Get certificate settings
+
+**Usage:** `domains get-certificate-settings <domain-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains update-certificate-settings`
+
+Update certificate settings
+
+**Usage:** `domains update-certificate-settings <domain-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--alert-days <n>` | Override the instance SSL expiry warning threshold; null inherits it | - | No |
+| `--alerts-enabled` | Override instance SSL expiry alerts; null inherits it | - | No |
+| `--no-alerts-enabled` | Set alerts_enabled to false | - | No |
+| `--challenge-type <value>` | Validation method for future ACME orders [required] | - | No |
+| `--renewal-days <n>` | Start ACME renewal this many days before expiry (1–90) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-by-id`
+
+Get domain by ID
+
+**Usage:** `domains get-by-id <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-challenge-token`
+
+Get challenge token for a domain (returns plain text token)
+
+**Usage:** `domains get-challenge-token <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `environments` (alias: `envs`, `env`)
 
 Manage environments and environment variables
@@ -1062,6 +2130,12 @@ Manage environments and environment variables
 - `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
 - `ingress` - Whether visitors must sign in to Temps to open an environment
 - `crons` - Manage cron jobs
+- `reachability` - Reachability commands
+- `create-ingress-login-grant` - Create ingress login grant
+- `sleep` - Sleep an on-demand environment
+- `wake` - Wake a sleeping on-demand environment
+- `health` - Health commands
+- `settings` - Change any setting of one environment (by its numeric ID); flags left out keep their value. `resources`, `timeouts` and `force-https` cover the common ones by name
 
 ### `environments list` (alias: `ls`)
 
@@ -1158,6 +2232,7 @@ Set an environment variable. For a secret, read the value from a file or stdin (
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
+| `--generate-secret [bytes]` | Have the server generate a random secret of this many bytes (16 to 64, 32 by default), stored as a secret and never shown; for a new variable, instead of a value | - | No |
 | `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -1442,6 +2517,10 @@ Whether visitors must sign in to Temps to open an environment
 
 - `show` - Show the login requirement and whether the proxy enforces it now
 - `set` - Require visitors to sign in to Temps, or stop requiring it
+- `delete-connector` - Delete a tunnel at the provider and unpublish every hostname it carries
+- `get-connector` - Get one tunnel
+- `retry-hostname-dns` - Retry DNS setup for a failed hostname publication on its current tunnel
+- `list-providers` - List the tunnel providers this control plane offers
 
 #### `environments ingress show`
 
@@ -1469,6 +2548,53 @@ Require visitors to sign in to Temps, or stop requiring it
 | `-p, --project <project>` | Project slug | - | No |
 | `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
 | `--no-require-login` | Visitors do not need to sign in | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress delete-connector`
+
+Delete a tunnel at the provider and unpublish every hostname it carries
+
+**Usage:** `environments ingress delete-connector <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress get-connector`
+
+Get one tunnel
+
+**Usage:** `environments ingress get-connector <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress retry-hostname-dns`
+
+Retry DNS setup for a failed hostname publication on its current tunnel
+
+**Usage:** `environments ingress retry-hostname-dns <id> <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress list-providers`
+
+List the tunnel providers this control plane offers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
@@ -1522,6 +2648,388 @@ Show cron job execution history
 | `--per-page <count>` | Items per page | `20` | No |
 | `--json` | Output in JSON format | - | No |
 
+### `environments reachability`
+
+Reachability commands
+
+**Subcommands:**
+
+- `get-certificate-methods` - Which ways to give a domain HTTPS work here
+- `check-cloudflare-token` - Check which permissions a pasted Cloudflare API token has
+- `get-connector-hosts` - What a tunnel publishes for environments, or would once turned on
+- `set-connector-hosts` - Turn a tunnel's environment hosts on or off
+- `get` - Whether visitors can reach each address of an environment
+- `apply` - Carry out one option of a stored plan
+- `get-choices` - Which audiences, and which ways in, can work for an environment
+- `plan` - What *Make it reachable* would do for an address
+- `list-runs` - The newest runs of an environment
+- `get-run` - One run, with the progress of each step and what it created
+- `decide-conflict` - Answer a conflict: a DNS record someone else changed while the run was setting it, or after it did (ADR..
+- `resume-run` - Carry on a waiting or interrupted run from its first step not done
+- `undo-run` - Remove exactly what a run created, newest first
+- `get-preview-domain-status` - Whether the preview domain can be reached
+
+#### `environments reachability get-certificate-methods`
+
+Which ways to give a domain HTTPS work here
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain <value>` | The domain to judge, such as 'my-app.example.com' or '*.example.com' | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability check-cloudflare-token`
+
+Check which permissions a pasted Cloudflare API token has
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--hostname <value>` | A hostname the token is meant to serve, when the zone is not known: the longest zone the token reaches... | - | No |
+| `--token-stdin` | The token, as pasted [required] (read from stdin) | - | No |
+| `--token-file <path>` | The token, as pasted [required] (read from a file) | - | No |
+| `--zone <value>` | The zone the token is meant for | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-connector-hosts`
+
+What a tunnel publishes for environments, or would once turned on
+
+**Usage:** `environments reachability get-connector-hosts <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability set-connector-hosts`
+
+Turn a tunnel's environment hosts on or off
+
+**Usage:** `environments reachability set-connector-hosts <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--confirm <value>` | The 'confirm_token' of the list that was shown and accepted: turning on publishes every host in it,... | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get`
+
+Whether visitors can reach each address of an environment
+
+**Usage:** `environments reachability get <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability apply`
+
+Carry out one option of a stored plan
+
+**Usage:** `environments reachability apply <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--answers <json>` | Answers to the option's fields by key. 'address', when given, must be the plan's; 'dns_provider_id' takes... (JSON) | - | No |
+| `--confirmed` | The user saw and accepted the option's 'confirmation' | - | No |
+| `--no-confirmed` | Set confirmed to false | - | No |
+| `--option <value>` | Which option of the plan to carry out (one of: existing_tunnel, direct_managed_dns, new_tunnel, new_tunnel_with_token, direct_manual_dns, private_worker, tailscale_serve, tailscale_service, tailscale_service_with_credential, tunnel_environment_hosts) [required] | - | No |
+| `--plan-id <value>` | The plan this acts on, from 'POST …/reachability/plan' [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-choices`
+
+Which audiences, and which ways in, can work for an environment
+
+**Usage:** `environments reachability get-choices <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability plan`
+
+What *Make it reachable* would do for an address
+
+**Usage:** `environments reachability plan <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--address <value>` | The hostname to make reachable; Temps suggests one without it | - | No |
+| `--audience <value>` | Who an address is for (one of: public, private, signed_in, tailnet_users, unsupported) | - | No |
+| `--gate <value>` | Which gate an address has (D7) (one of: temps, cloudflare_access, unsupported) | - | No |
+| `--principals <json>` | For 'tailnet_users': the tailnet logins and tags it admits (ADR 065 D6) (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability list-runs`
+
+The newest runs of an environment
+
+**Usage:** `environments reachability list-runs <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-run`
+
+One run, with the progress of each step and what it created
+
+**Usage:** `environments reachability get-run <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability decide-conflict`
+
+Answer a conflict: a DNS record someone else changed while the run was setting it, or after it did (ADR..
+
+**Usage:** `environments reachability decide-conflict <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--decision <value>` | A user's answer to a conflict (ADR 064 D4), journaled with the entry (one of: keep, overwrite) [required] | - | No |
+| `--key <value>` | The journal entry in conflict [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability resume-run`
+
+Carry on a waiting or interrupted run from its first step not done
+
+**Usage:** `environments reachability resume-run <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--answers <json>` | 'cloudflare_api_token', when the run had not saved the account yet (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability undo-run`
+
+Remove exactly what a run created, newest first
+
+**Usage:** `environments reachability undo-run <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-preview-domain-status`
+
+Whether the preview domain can be reached
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `environments create-ingress-login-grant`
+
+Create ingress login grant
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--host <value>` | The hostname, without a port [required] | - | No |
+| `--next <value>` | Path on the host to return to | - | No |
+| `--owner-id <n>` | Body field owner_id [required] | - | No |
+| `--owner-kind <value>` | 'environment' or 'sandbox' (a sandbox preview host) [required] | - | No |
+| `--port <n>` | The port the visitor reached the host on, when the proxy's request carries one (it leaves out the scheme's... | - | No |
+| `--scheme <value>` | 'http' or 'https': how the visitor reached the host [required] | - | No |
+| `--sig <value>` | Body field sig [required] | - | No |
+| `--ts <n>` | Unix seconds the proxy signed the request at [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments sleep`
+
+Sleep an on-demand environment
+
+**Usage:** `environments sleep <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments wake`
+
+Wake a sleeping on-demand environment
+
+**Usage:** `environments wake <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments health`
+
+Health commands
+
+**Subcommands:**
+
+- `get-runtime` - Get runtime health
+- `update-runtime` - Update runtime health
+- `get-project-runtime-health` - Get project runtime health
+
+#### `environments health get-runtime`
+
+Get runtime health
+
+**Usage:** `environments health get-runtime <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments health update-runtime`
+
+Update runtime health
+
+**Usage:** `environments health update-runtime <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--paused` | Body field paused [required] | - | No |
+| `--no-paused` | Set paused to false | - | No |
+| `--required-healthy <n>` | Body field required_healthy | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments health get-project-runtime-health`
+
+Get project runtime health
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments settings`
+
+Change any setting of one environment (by its numeric ID); flags left out keep their value. `resources`, `timeouts` and `force-https` cover the common ones by name
+
+**Usage:** `environments settings <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--branch <value>` | Branch this environment deploys | - | No |
+| `--automatic-deploy` | Deploy automatically on push | - | No |
+| `--no-automatic-deploy` | Set automatic_deploy to false | - | No |
+| `--protected` | Never deploy this environment automatically from a push | - | No |
+| `--no-protected` | Set protected to false | - | No |
+| `--replicas <n>` | Container replicas | - | No |
+| `--cpu-limit <n>` | CPU limit per container, in microcores | - | No |
+| `--cpu-request <n>` | CPU reserved per container, in microcores | - | No |
+| `--memory-limit <n>` | Memory limit per container, in MB | - | No |
+| `--memory-request <n>` | Memory reserved per container, in MB | - | No |
+| `--exposed-port <n>` | Port the container listens on (overrides the project's) | - | No |
+| `--anti-affinity` | Spread replicas across different nodes | - | No |
+| `--no-anti-affinity` | Set anti_affinity to false | - | No |
+| `--target-nodes <n>` | Only deploy to this node ID (repeatable) (repeatable) | - | No |
+| `--target-labels <json>` | Only deploy to nodes with these labels, as JSON, e.g. {"region":"eu"} (JSON) | - | No |
+| `--build-location <value>` | Where a source deployment's image is built (one of: control_plane, node, ci) | - | No |
+| `--cross-architecture-builds` | Build one image per architecture the eligible nodes run | - | No |
+| `--no-cross-architecture-builds` | Set cross_architecture_builds to false | - | No |
+| `--on-demand` | Start containers on the first request and stop them when idle | - | No |
+| `--no-on-demand` | Set on_demand to false | - | No |
+| `--idle-timeout-seconds <n>` | Idle seconds (60-86400) before an on-demand environment stops | - | No |
+| `--wake-timeout-seconds <n>` | Seconds (5-120) to wait for an on-demand environment to wake | - | No |
+| `--health <json>` | Health check settings as JSON, e.g. {"path":"/healthz"} (JSON) | - | No |
+| `--health-check-timeout-seconds <n>` | Seconds (30-3600) a new deployment's containers get to become ready | - | No |
+| `--stop-timeout-seconds <n>` | Seconds (1-3600) the previous deployment gets to finish in-flight requests | - | No |
+| `--load-balancing <json>` | Load balancing settings as JSON (JSON) | - | No |
+| `--max-concurrent-connections <n>` | Cap on concurrent requests to this environment's upstream (0 = unlimited) | - | No |
+| `--request-timeout-seconds <n>` | HTTP request timeout, in seconds | - | No |
+| `--sse-idle-timeout-seconds <n>` | Idle timeout of SSE streams, in seconds | - | No |
+| `--websocket-idle-timeout-seconds <n>` | Idle timeout of WebSocket connections, in seconds | - | No |
+| `--force-https` | Redirect HTTP to HTTPS | - | No |
+| `--no-force-https` | Set force_https to false | - | No |
+| `--password-stdin` | Password visitors must enter to open the environment (read from stdin) | - | No |
+| `--password-file <path>` | Password visitors must enter to open the environment (read from a file) | - | No |
+| `--security <json>` | Security settings (headers, rate limits) as JSON (JSON) | - | No |
+| `--attack-mode` | Ask visitors to solve a CAPTCHA | - | No |
+| `--no-attack-mode` | Set attack_mode to false | - | No |
+| `--shield-mode <value>` | How Shield acts on its verdicts (one of: off, log, selective, attack) | - | No |
+| `--shield-exempt-paths <value>` | Path Shield never challenges, e.g. /api/* (repeatable; replaces the list) (repeatable) | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--session-recording-enabled` | Record visitor sessions | - | No |
+| `--no-session-recording-enabled` | Set session_recording_enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `providers` (alias: `provider`)
 
 Manage Git providers
@@ -1538,6 +3046,8 @@ Manage Git providers
 - `deletion-check` - Check if a Git provider can be safely deleted
 - `git` - Manage Git providers
 - `connections` (`conn`) - Manage Git provider connections
+- `public-repos` - Public repos commands
+- `repos` - Repos commands
 
 ### `providers list` (alias: `ls`)
 
@@ -1646,6 +3156,19 @@ Manage Git providers
 
 - `connect` - Connect a Git provider (github, gitlab, bitbucket, gitea, generic)
 - `repos` - List available repositories
+- `complete-connection-reauthorization` - Complete connection reauthorization
+- `reauthorize-connection` - Reauthorize connection
+- `create` - Create a new git provider configuration
+- `start-github-manifest-flow` - Start creating a GitHub App from a manifest
+- `create-gitlab-oauth` - Create a GitLab OAuth provider
+- `update-credentials` - Partially update credentials for an existing git provider
+- `list-repositories-by` - List all repositories for a specific provider
+- `get-all-repositories-by-name` - Get all repositories with same owner/name from all git providers
+- `get-repository-preset-by-name` - Get repository preset by owner and name
+- `get-repository-compose-services-live` - Parse a compose file's services for a connected repository, live
+- `get-repository-compose-preview` - Render a redacted effective Compose preview for a connected repository
+- `get-repository-env-example-live` - Detect and parse a '.env.example'-style file for a connected repository
+- `get-repository-by-id` - Get repository by ID
 
 #### `providers git connect`
 
@@ -1687,6 +3210,220 @@ List available repositories
 | `--direction <dir>` | Sort direction: asc or desc | - | No |
 | `--language <lang>` | Filter by programming language | - | No |
 | `--owner <owner>` | Filter by repository owner | - | No |
+| `--updated-after <value>` | Only repositories updated on or after this time (RFC 3339) | - | No |
+| `--preset <value>` | Only repositories detected as this preset (e.g. nextjs); not with --id | - | No |
+| `--git-provider-connection-id <n>` | Only repositories of this connection; not with --id | - | No |
+
+#### `providers git complete-connection-reauthorization`
+
+Complete connection reauthorization
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--code <value>` | Empty when the user cancelled at the provider; the state is still consumed [required] | - | No |
+| `--state <value>` | Body field state [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git reauthorize-connection`
+
+Reauthorize connection
+
+**Usage:** `providers git reauthorize-connection <connection-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git create`
+
+Create a new git provider configuration
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Body field config (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--provider-type <value>` | Body field provider_type [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git start-github-manifest-flow`
+
+Start creating a GitHub App from a manifest
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git create-gitlab-oauth`
+
+Create a GitLab OAuth provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-url <value>` | Body field base_url | - | No |
+| `--client-id <value>` | Body field client_id [required] | - | No |
+| `--client-secret-stdin` | A credential [required] (read from stdin) | - | No |
+| `--client-secret-file <path>` | A credential [required] (read from a file) | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--redirect-uri <value>` | Body field redirect_uri [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git update-credentials`
+
+Partially update credentials for an existing git provider
+
+**Usage:** `providers git update-credentials <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--app-id <value>` | Application ID (GitHub App integer as string; GitLab App string) | - | No |
+| `--app-secret-stdin` | A credential (read from stdin) | - | No |
+| `--app-secret-file <path>` | A credential (read from a file) | - | No |
+| `--client-id <value>` | OAuth client ID (GitLab OAuth, GitHub App) | - | No |
+| `--client-secret-stdin` | A credential (read from stdin) | - | No |
+| `--client-secret-file <path>` | A credential (read from a file) | - | No |
+| `--password-stdin` | A credential (read from stdin) | - | No |
+| `--password-file <path>` | A credential (read from a file) | - | No |
+| `--private-key-stdin` | A credential (read from stdin) | - | No |
+| `--private-key-file <path>` | A credential (read from a file) | - | No |
+| `--public-key <value>` | SSH public key (one OpenSSH line) of an SSH-key provider | - | No |
+| `--redirect-uri <value>` | OAuth redirect URI (GitLab OAuth / GitLab App) | - | No |
+| `--token-stdin` | A credential (read from stdin) | - | No |
+| `--token-file <path>` | A credential (read from a file) | - | No |
+| `--username <value>` | Username of a basic-auth provider (generic Git server, Bitbucket app password) | - | No |
+| `--webhook-secret-stdin` | A credential (read from stdin) | - | No |
+| `--webhook-secret-file <path>` | A credential (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git list-repositories-by`
+
+List all repositories for a specific provider
+
+**Usage:** `providers git list-repositories-by <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number for pagination | - | No |
+| `--per-page <n>` | Number of items per page (max 100) | - | No |
+| `--sort <value>` | Sort field (name, created_at, updated_at, stars, watchers, size, issues) | - | No |
+| `--direction <value>` | Sort direction (asc, desc) | - | No |
+| `--search <value>` | Search term to filter repositories | - | No |
+| `--owner <value>` | Filter by repository owner | - | No |
+| `--language <value>` | Filter by programming language | - | No |
+| `--private` | Filter by private status (true/false) | - | No |
+| `--no-private` | Set private to false | - | No |
+| `--preset <value>` | Cached default-branch preset slug; __undetected__ means not inspected | - | No |
+| `--updated-after <value>` | Updated on or after this RFC3339 timestamp | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git get-all-repositories-by-name`
+
+Get all repositories with same owner/name from all git providers
+
+**Usage:** `providers git get-all-repositories-by-name <owner> <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git get-repository-preset-by-name`
+
+Get repository preset by owner and name
+
+**Usage:** `providers git get-repository-preset-by-name <owner> <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--branch <value>` | Git branch to check (defaults to repository's default branch) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git get-repository-compose-services-live`
+
+Parse a compose file's services for a connected repository, live
+
+**Usage:** `providers git get-repository-compose-services-live <repository-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--branch <value>` | Git branch to check (defaults to repository's default branch) | - | No |
+| `--path <value>` | Compose file path to fetch and parse [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git get-repository-compose-preview`
+
+Render a redacted effective Compose preview for a connected repository
+
+**Usage:** `providers git get-repository-compose-preview <repository-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--branch <value>` | Body field branch | - | No |
+| `--compose-override <value>` | Body field composeOverride | - | No |
+| `--environment-id <n>` | Environment whose variables resolve '${VAR}'; defaults to the project's production environment | - | No |
+| `--excluded-services <value>` | Body field excludedServices (repeatable) | - | No |
+| `--path <value>` | Body field path [required] | - | No |
+| `--preview-policy <json>` | Advisory preview only (JSON) | - | No |
+| `--project-id <n>` | The project this Compose file deploys | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git get-repository-env-example-live`
+
+Detect and parse a '.env.example'-style file for a connected repository
+
+**Usage:** `providers git get-repository-env-example-live <repository-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--branch <value>` | Git branch to check (defaults to repository's default branch) | - | No |
+| `--root-directory <value>` | Project root directory to search (defaults to repository root) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers git get-repository-by-id`
+
+Get repository by ID
+
+**Usage:** `providers git get-repository-by-id <repository-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `providers connections` (alias: `conn`)
 
@@ -1703,6 +3440,10 @@ Manage Git provider connections
 - `sync` - Sync repositories for a Git connection
 - `update-token` - Update access token for a Git connection
 - `validate` - Validate a Git connection
+- `run-health-check` - Run an on-demand health check for a git connection
+- `create-repository` - Create an empty repository through one of your git connections
+- `commit-repository-files` - Commit files to a repository through one of your git connections
+- `open-repository-pull-request` - Open a pull request through one of your git connections
 
 #### `providers connections list` (alias: `ls`)
 
@@ -1792,8 +3533,11 @@ Update access token for a Git connection
 |------|-------------|---------|----------|
 | `--id <id>` | Connection ID | - | Yes |
 | `-t, --token <token>` | New access token (prefer --token-file or --token-stdin, which keep it out of shell history) | - | No |
+| `--refresh-token <token>` | New refresh token, for providers whose access tokens expire (prefer --refresh-token-file or --refresh-token-stdin) | - | No |
 | `--token-file <path>` | Read the new access token from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the new access token from stdin instead of --token | - | No |
+| `--refresh-token-file <path>` | Read the new refresh token from a file (- reads stdin) instead of --refresh-token | - | No |
+| `--refresh-token-stdin` | Read the new refresh token from stdin instead of --refresh-token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `providers connections validate`
@@ -1805,6 +3549,244 @@ Validate a Git connection
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Connection ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers connections run-health-check`
+
+Run an on-demand health check for a git connection
+
+**Usage:** `providers connections run-health-check <connection-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `providers connections create-repository`
+
+Create an empty repository through one of your git connections
+
+**Usage:** `providers connections create-repository <connection-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--description <value>` | Short description, up to 350 characters | - | No |
+| `--name <value>` | Repository name: letters, digits, '-', '_' and '.', up to 100 characters [required] | - | No |
+| `--owner <value>` | Account or organization to create it under | - | No |
+| `--private` | Whether the repository is private | - | No |
+| `--no-private` | Set private to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers connections commit-repository-files`
+
+Commit files to a repository through one of your git connections
+
+**Usage:** `providers connections commit-repository-files <connection-id> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--branch <value>` | Branch to commit to | - | No |
+| `--files <json>` | Files to add or overwrite (1-100, at most 5 MiB in total) (JSON) [required] | - | No |
+| `--message <value>` | Commit message (at most 500 bytes) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers connections open-repository-pull-request`
+
+Open a pull request through one of your git connections
+
+**Usage:** `providers connections open-repository-pull-request <connection-id> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-branch <value>` | Branch to merge into | - | No |
+| `--body-body <value>` | Body field body | - | No |
+| `--head-branch <value>` | Branch holding the changes [required] | - | No |
+| `--title <value>` | Body field title [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `providers public-repos`
+
+Public repos commands
+
+**Subcommands:**
+
+- `get-repository` - Get information about a public repository (supports GitHub and GitLab)
+- `get-branches` - Get branches for a public repository (supports GitHub and GitLab)
+- `get-compose-services` - Parse a compose file's services for a public repository (supports GitHub and GitLab)
+- `get-compose-preview` - Render a redacted effective Compose preview for a public repository
+- `detect-env-example` - Detect and parse a '.env.example'-style file for a public repository (supports GitHub and GitLab)
+
+#### `providers public-repos get-repository`
+
+Get information about a public repository (supports GitHub and GitLab)
+
+**Usage:** `providers public-repos get-repository <provider> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-url <value>` | HTTPS/443 origin of a self-hosted GitLab instance | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers public-repos get-branches`
+
+Get branches for a public repository (supports GitHub and GitLab)
+
+**Usage:** `providers public-repos get-branches <provider> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-url <value>` | HTTPS/443 origin of a self-hosted GitLab instance | - | No |
+| `--fresh` | Force fetch fresh data, bypassing cache (default: false) | - | No |
+| `--no-fresh` | Set fresh to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers public-repos get-compose-services`
+
+Parse a compose file's services for a public repository (supports GitHub and GitLab)
+
+**Usage:** `providers public-repos get-compose-services <provider> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-url <value>` | HTTPS/443 origin of a self-hosted GitLab instance | - | No |
+| `--branch <value>` | Branch to read the compose file from (default: repository's default branch) | - | No |
+| `--path <value>` | Compose file path to fetch and parse (from the 'compose_files' list '/preset' already returned, or a... [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers public-repos get-compose-preview`
+
+Render a redacted effective Compose preview for a public repository
+
+**Usage:** `providers public-repos get-compose-preview <provider> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-url <value>` | HTTPS/443 origin of a self-hosted GitLab instance | - | No |
+| `--branch <value>` | Body field branch | - | No |
+| `--compose-override <value>` | Body field composeOverride | - | No |
+| `--excluded-services <value>` | Body field excludedServices (repeatable) | - | No |
+| `--path <value>` | Body field path [required] | - | No |
+| `--preview-policy <json>` | Advisory preview only (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers public-repos detect-env-example`
+
+Detect and parse a '.env.example'-style file for a public repository (supports GitHub and GitLab)
+
+**Usage:** `providers public-repos detect-env-example <provider> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-url <value>` | HTTPS/443 origin of a self-hosted GitLab instance | - | No |
+| `--branch <value>` | Branch name to inspect (default: repository's default branch) | - | No |
+| `--root-directory <value>` | Project root directory to search (default: repository root) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `providers repos`
+
+Repos commands
+
+**Subcommands:**
+
+- `get-repository-branches` - Get repository branches
+- `get-repository-tags` - Get repository tags
+- `get-branches-by-repository-id` - Get repository branches by repository ID
+- `check-commit-exists` - Check if a commit exists in a repository
+- `get-tags-by-repository-id` - Get repository tags by repository ID
+
+#### `providers repos get-repository-branches`
+
+Get repository branches
+
+**Usage:** `providers repos get-repository-branches <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--connection-id <n>` | Git provider connection ID (required when multiple connections have the same repo) [required] | - | No |
+| `--fresh` | Force fetch fresh data, bypassing cache (default: false) | - | No |
+| `--no-fresh` | Set fresh to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers repos get-repository-tags`
+
+Get repository tags
+
+**Usage:** `providers repos get-repository-tags <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--connection-id <n>` | Git provider connection ID (required when multiple connections have the same repo) [required] | - | No |
+| `--fresh` | Force fetch fresh data, bypassing cache (default: false) | - | No |
+| `--no-fresh` | Set fresh to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers repos get-branches-by-repository-id`
+
+Get repository branches by repository ID
+
+**Usage:** `providers repos get-branches-by-repository-id <repository-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--fresh` | Force fetch fresh data, bypassing cache (default: false) | - | No |
+| `--no-fresh` | Set fresh to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers repos check-commit-exists`
+
+Check if a commit exists in a repository
+
+**Usage:** `providers repos check-commit-exists <repository-id> <commit-sha> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `providers repos get-tags-by-repository-id`
+
+Get repository tags by repository ID
+
+**Usage:** `providers repos get-tags-by-repository-id <repository-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--fresh` | Force fetch fresh data, bypassing cache (default: false) | - | No |
+| `--no-fresh` | Set fresh to false | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `backups` (alias: `backup`)
@@ -1820,6 +3802,23 @@ Manage backup schedules and backups
 - `delete` (`rm`) - Permanently delete one terminal backup
 - `cleanup` - Delete backups expired by their schedule retention policy
 - `run-service` - Run a backup for an external service
+- `list-alerts` - List open backup alerts
+- `get-external-service-capability` - Report whether an existing service can produce a Cloud-restorable backup
+- `list-external-service` - List all backups for a specific external service (DB-only, no S3 scan)
+- `list-service-schedules` - List the schedules that target a specific external service
+- `test-s3-connection-preview` - Test S3 connectivity against a prospective source configuration (before creating it)
+- `set-default-s3-source` - Mark an S3 source as the default
+- `test-s3-source-connection` - Test connectivity to an existing S3 source using its stored credentials
+- `cancel-schedule-run` - Cancel every non-terminal child backup belonging to a schedule run
+- `list-schedule-run-jobs` - List the individual backup jobs for a single scheduler run
+- `update-schedule` - Update a backup schedule (partial update)
+- `run-schedule-now` - Immediately fan-out a run for the given schedule (Run Now)
+- `list-schedule-runs` - Paginated run history for a backup schedule (one row per scheduler tick)
+- `list-schedule-services` - List the external services attached to a backup schedule
+- `attach-schedule-services` - Attach one or more external services to a backup schedule
+- `detach-schedule-service` - Detach a single external service from a backup schedule
+- `cancel` - Cancel a single in-flight backup
+- `list-children` - List the external-service child backups that belong to a parent backup
 
 ### `backups schedules` (alias: `schedule`)
 
@@ -1859,6 +3858,12 @@ Create a backup schedule
 | `-d, --description <desc>` | Description | - | No |
 | `--s3-source-id <id>` | S3 Source ID | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--target-all-services` | Back up every external service (the default when no --service-ids) | - | No |
+| `--no-target-all-services` | Set target_all_services to false | - | No |
+| `--service-ids <n>` | Back up only these external services (repeatable) (repeatable) | - | No |
+| `--include-control-plane` | Also back up Temps' own database | - | No |
+| `--no-include-control-plane` | Set include_control_plane to false | - | No |
+| `--max-runtime-secs <n>` | Cancel a run that takes longer than this | - | No |
 
 #### `backups schedules show`
 
@@ -1943,6 +3948,12 @@ Create an S3 source
 | `--secret-key <key>` | Secret access key | - | No |
 | `--prefix <prefix>` | Bucket path/prefix | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--use-tls` | Connect to the endpoint over TLS (default true) | - | No |
+| `--no-use-tls` | Set use_tls to false | - | No |
+| `--worker-credentials <json>` | Separate credentials the backup workers use, as JSON (JSON) | - | No |
+| `--backing-service-id <n>` | The external service (S3/MinIO) that hosts this bucket | - | No |
+| `--is-default` | Make this the default backup destination | - | No |
+| `--no-is-default` | Set is_default to false | - | No |
 | `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
 | `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -1974,6 +3985,9 @@ Update an S3 source
 | `--access-key <key>` | New access key ID | - | No |
 | `--secret-key <key>` | New secret access key | - | No |
 | `--prefix <prefix>` | New bucket path/prefix | - | No |
+| `--use-tls` | Connect to the endpoint over TLS (default true) | - | No |
+| `--no-use-tls` | Set use_tls to false | - | No |
+| `--worker-credentials <json>` | Separate credentials the backup workers use, as JSON (JSON) | - | No |
 | `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
 | `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -2000,6 +4014,8 @@ List backups for an S3 source
 |------|-------------|---------|----------|
 | `--id <id>` | S3 source ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+| `--include-s3-scan` | Also list backups found in the bucket that this server has no record of | - | No |
+| `--no-include-s3-scan` | Set include_s3_scan to false | - | No |
 
 #### `backups sources run`
 
@@ -2073,6 +4089,249 @@ Run a backup for an external service
 | `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
 | `--confirm-restart` | Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on) | - | No |
 
+### `backups list-alerts`
+
+List open backup alerts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups get-external-service-capability`
+
+Report whether an existing service can produce a Cloud-restorable backup
+
+**Usage:** `backups get-external-service-capability <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups list-external-service`
+
+List all backups for a specific external service (DB-only, no S3 scan)
+
+**Usage:** `backups list-external-service <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (1-based) | - | No |
+| `--page-size <n>` | Items per page | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups list-service-schedules`
+
+List the schedules that target a specific external service
+
+**Usage:** `backups list-service-schedules <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups test-s3-connection-preview`
+
+Test S3 connectivity against a prospective source configuration (before creating it)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--access-key-id <value>` | Access key ID of the bucket's credentials, for example 'AKIA...' on AWS [required] | - | No |
+| `--backing-service-id <n>` | Managed RustFS/S3 service that supplies this destination | - | No |
+| `--bucket-name <value>` | Body field bucket_name [required] | - | No |
+| `--bucket-path <value>` | Body field bucket_path [required] | - | No |
+| `--endpoint <value>` | Optional endpoint for S3-compatible services like MinIO or RustFS, with or without a scheme | - | No |
+| `--force-path-style` | Whether to use path-style addressing (default: true) | - | No |
+| `--no-force-path-style` | Set force_path_style to false | - | No |
+| `--is-default` | When true, make this the default source (will swap out any existing default) | - | No |
+| `--no-is-default` | Set is_default to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--region <value>` | Body field region [required] | - | No |
+| `--secret-key-stdin` | Secret access key that goes with the access key ID [required] (read from stdin) | - | No |
+| `--secret-key-file <path>` | Secret access key that goes with the access key ID [required] (read from a file) | - | No |
+| `--use-tls` | Whether the endpoint is reached over TLS | - | No |
+| `--no-use-tls` | Set use_tls to false | - | No |
+| `--worker-credentials <value>` | What a worker node may receive from an S3 source (ADR-102) (one of: scoped, allow_full) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups set-default-s3-source`
+
+Mark an S3 source as the default
+
+**Usage:** `backups set-default-s3-source <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups test-s3-source-connection`
+
+Test connectivity to an existing S3 source using its stored credentials
+
+**Usage:** `backups test-s3-source-connection <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups cancel-schedule-run`
+
+Cancel every non-terminal child backup belonging to a schedule run
+
+**Usage:** `backups cancel-schedule-run <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups list-schedule-run-jobs`
+
+List the individual backup jobs for a single scheduler run
+
+**Usage:** `backups list-schedule-run-jobs <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups update-schedule`
+
+Update a backup schedule (partial update)
+
+**Usage:** `backups update-schedule <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--description <value>` | New human-readable description | - | No |
+| `--enabled` | Enable or disable the schedule | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--include-control-plane` | Toggle whether the control-plane backup is produced on every run | - | No |
+| `--no-include-control-plane` | Set include_control_plane to false | - | No |
+| `--max-runtime-secs <n>` | Per-schedule wall-clock timeout override (seconds) | - | No |
+| `--name <value>` | New schedule name | - | No |
+| `--retention-period <n>` | Days to retain backups produced by this schedule | - | No |
+| `--schedule-expression <value>` | New cron expression with a leading seconds field ('sec min hour day-of-month month day-of-week', e.g. '0 0... | - | No |
+| `--service-ids <n>` | Replace the explicit external-service selection atomically with the schedule update (repeatable) | - | No |
+| `--tags <value>` | Replace the full tag list (repeatable) | - | No |
+| `--target-all-services` | Toggle between "back up every database" ('true') and "back up only the explicit list" ('false') | - | No |
+| `--no-target-all-services` | Set target_all_services to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups run-schedule-now`
+
+Immediately fan-out a run for the given schedule (Run Now)
+
+**Usage:** `backups run-schedule-now <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups list-schedule-runs`
+
+Paginated run history for a backup schedule (one row per scheduler tick)
+
+**Usage:** `backups list-schedule-runs <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (1-based, defaults to 1, clamped to 1 if < 1) | - | No |
+| `--page-size <n>` | Items per page (defaults to 20, clamped to 100 if > 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups list-schedule-services`
+
+List the external services attached to a backup schedule
+
+**Usage:** `backups list-schedule-services <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `backups attach-schedule-services`
+
+Attach one or more external services to a backup schedule
+
+**Usage:** `backups attach-schedule-services <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--service-ids <n>` | External service ids to attach (repeatable) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups detach-schedule-service`
+
+Detach a single external service from a backup schedule
+
+**Usage:** `backups detach-schedule-service <id> <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups cancel`
+
+Cancel a single in-flight backup
+
+**Usage:** `backups cancel <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `backups list-children`
+
+List the external-service child backups that belong to a parent backup
+
+**Usage:** `backups list-children <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `runtime-logs` (alias: `rlogs`)
 
 View runtime container logs (use -f to follow in real-time)
@@ -2104,6 +4363,12 @@ Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 - `remove` (`rm`) - Remove a notification provider
 - `test` - Send a test notification
 - `routes` - Manage severity-based notification routes (which providers receive which severities)
+- `create-cloudflare-provider` - Create a new Cloudflare Email Sending notification provider
+- `update-cloudflare-provider` - Update a Cloudflare Email Sending notification provider
+- `create-email-provider` - Create a new Email notification provider
+- `create-webhook-provider` - Create a new Webhook notification provider
+- `update-webhook-provider` - Update a Webhook notification provider
+- `reveal-provider-config` - Reveal notification provider config
 
 ### `notifications list` (alias: `ls`)
 
@@ -2114,6 +4379,8 @@ List configured notification providers
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `notifications add`
 
@@ -2251,6 +4518,8 @@ Manage severity-based notification routes (which providers receive which severit
 - `create` - Create a notification route
 - `update` - Update a notification route
 - `remove` (`rm`) - Remove a notification route
+- `get-delivery-coverage` - Check whether a notification of the given severity would be delivered
+- `test` - Send a test notification through a route to each of its providers
 
 #### `notifications routes list` (alias: `ls`)
 
@@ -2261,6 +4530,8 @@ List notification routes
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 #### `notifications routes show`
 
@@ -2316,6 +4587,125 @@ Remove a notification route
 | `--id <id>` | Route ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+#### `notifications routes get-delivery-coverage`
+
+Check whether a notification of the given severity would be delivered
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--severity <value>` | Severity of the notification to check: debug, info, warning, error, critical or emergency [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes test`
+
+Send a test notification through a route to each of its providers
+
+**Usage:** `notifications routes test <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `notifications create-cloudflare-provider`
+
+Create a new Cloudflare Email Sending notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a Cloudflare Email Sending notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications update-cloudflare-provider`
+
+Update a Cloudflare Email Sending notification provider
+
+**Usage:** `notifications update-cloudflare-provider <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a Cloudflare Email Sending notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications create-email-provider`
+
+Create a new Email notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Request-side SMTP config (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications create-webhook-provider`
+
+Create a new Webhook notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a generic webhook notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications update-webhook-provider`
+
+Update a Webhook notification provider
+
+**Usage:** `notifications update-webhook-provider <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Configuration for a generic webhook notification provider (JSON) [required] | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications reveal-provider-config`
+
+Reveal notification provider config
+
+**Usage:** `notifications reveal-provider-config <id> <field> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ## `dns`
 
@@ -2532,6 +4922,47 @@ Manage external services (databases, caches, storage)
 - `import-data-run` - Show one data import: outcome, phase, timings, who started it and the transfer output
 - `import-data-cancel` - Cancel a running data import (refused once the data has been copied)
 - `wal-health` - Probe a PostgreSQL service's WAL / archive_command health right now (archiver failures, backlog, stale replication slots) — diagnoses "Cloud backup mirror unavailable ... check that PostgreSQL's archive_command is succeeding" warnings
+- `list-available-containers` - List available Docker containers that can be imported as services
+- `list-health-statuses` - Current health status for many services at once
+- `get-healthcheck-defaults` - Get the instance-wide default healthcheck of managed service containers
+- `update-healthcheck-defaults` - Replace the instance-wide default healthcheck of managed service containers
+- `list-project-services` - List services linked to a project
+- `get-environment-variables` - Get all environment variables for all services linked to a project
+- `get-providers-metadata` - Get provider metadata (display names, icons, descriptions)
+- `get-provider-metadata` - Get metadata for a specific provider
+- `get-cluster-health` - Per-member health for a Postgres HA cluster
+- `reveal-environment-variables` - Reveal a service's basic environment variables in plaintext, before it is linked to any project
+- `trigger-health-check` - Run a health check for one service right now
+- `get-health-status` - Persisted health status for an external service
+- `get-healthcheck` - Get a managed service's healthcheck
+- `update-healthcheck` - Replace a managed service's healthcheck overrides
+- `apply-healthcheck` - Recreate a managed service's container to apply its healthcheck now
+- `get-log-ingestion` - Get this service's own container log ingestion budget
+- `update-log-ingestion` - Replace this service's container log ingestion budget
+- `add-cluster-member` - Begin adding a single new member to a running cluster
+- `remove-cluster-member` - Remove a single member from a running cluster
+- `get-cluster-member` - Get a single cluster member's current state
+- `promote-cluster-member` - Promote a replica to primary by triggering a pg_auto_failover failover
+- `migrate-s3` - Copy every bucket of another managed S3 service into this one
+- `reveal-parameter` - Reveal one sensitive service parameter
+- `get-preview-environment-variables-masked` - Get environment variables preview with masked sensitive values
+- `get-preview-environment-variable-names` - Get environment variable names preview (safe - no sensitive values)
+- `issue-runtime-credentials` - Issue live connection credentials for a service in an environment
+- `update-resources` - Update a service's resource limits (memory, CPU caps)
+- `retry-cluster` - Retry a failed cluster service initialization
+- `get-runtime` - Inspect a service's container(s): status, restart count, OOM-killed flag, exit code, and the cgroup limits..
+- `get-stats` - Sample current CPU/memory usage from each of a service's containers
+- `get-tls` - Get service tls
+- `update-tls` - Update service tls
+- `get-managed-ca-certificate` - Get managed ca certificate
+- `test-wal-archive-target` - Test wal archive target
+- `get-workload-mode` - Get a database's workload mode (internal, operator-only)
+- `update-workload-mode` - Change a database's workload mode (internal, operator-only)
+- `get-workload-pending-changes` - List what a recreate from the workload spec would change (internal, operator-only)
+- `recreate-from-workload-spec` - Recreate a database's container from its workload spec (internal, operator-only)
+- `external-reset-pg-stat-statements` - Reset all statistics accumulated by 'pg_stat_statements' for a Postgres service
+- `query` - Query commands
+- `pg-upgrade` - Pg upgrade commands
 
 ### `services list` (alias: `ls`)
 
@@ -2556,6 +4987,9 @@ Create a new external service
 | `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
 | `--backend <backend>` | S3 storage engine: rustfs (default) or garage (s3/blob only) | - | No |
 | `--bucket <name>` | Bucket to create (repeatable, s3/blob only; the first is S3_BUCKET) | `` | No |
+| `--node <id>` | Worker node to run the service on (default: the control plane) | - | No |
+| `--topology <topology>` | standalone (default) or cluster (highly available, several members) | - | No |
+| `--member <role[@node]>` | With --topology cluster: a member, monitor, primary or replica, optionally on a node id (repeatable; exactly one monitor) | `` | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services show`
@@ -2697,6 +5131,9 @@ Link a service to a project
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
 | `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
+| `--database-mode <mode>` | Which database deployments get: project (one per project), project_environment (one per environment) or custom | - | No |
+| `--database-name <name>` | With --database-mode custom: the exact database name | - | No |
+| `--env-alias <APP_NAME=INJECTED_NAME>` | Also inject a variable under the name the app reads, e.g. DATABASE_URL=POSTGRES_URL (repeatable) | - | No |
 
 ### `services unlink`
 
@@ -2975,12 +5412,46 @@ Restore a service from a backup (in-place, new service, or PITR)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
-| `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
+| `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | No |
+| `--backup-location <s3-key>` | Instead of --backup-id: the S3 key of a backup this instance did not record (one found by an S3 scan, made by another Temps instance) | - | No |
+| `--backup-engine <engine>` | With --backup-location: postgres, redis, mongodb or s3 | - | No |
+| `--s3-source <id>` | With --backup-location: the S3 source the backup is in | - | No |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
 | `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
 | `--confirm-cross-service` | Confirm an in-place (or PITR in-place) restore of a backup produced by a different service. Required by the server for such restores; recorded in the audit log. | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--no-wait` | Return immediately without polling run status | - | No |
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `plan` - Plan restore
+
+#### `services restore plan`
+
+Plan restore
+
+**Usage:** `services restore plan <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | Body field mode (one of: in_place, new_service, pitr) [required] | - | No |
+| `--name <value>` | Name for the new service | - | No |
+| `--parameter-overrides <json>` | Optional parameter overrides (port, docker_image, database) (JSON) | - | No |
+| `--new-service-name <value>` | Required when 'to_new_service' is true | - | No |
+| `--target <json>` | Recovery target kind + value (JSON) | - | No |
+| `--to-new-service` | Whether PITR restores in place or creates a new service | - | No |
+| `--no-to-new-service` | Set to_new_service to false | - | No |
+| `--backup-engine <value>` | Engine of the backup when specified by 'backup_location' ("postgres", "redis", "mongodb", "s3") | - | No |
+| `--backup-id <n>` | DB id of the backup to restore from | - | No |
+| `--backup-location <value>` | Raw S3 URL / key of the backup — used when restoring a backup discovered by S3 scan (i.e., produced by... | - | No |
+| `--confirm-cross-service` | Explicit confirmation for a destructive cross-service restore | - | No |
+| `--no-confirm-cross-service` | Set confirm_cross_service to false | - | No |
+| `--s3-source-id <n>` | S3 source the 'backup_location' lives in | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `services restore-runs`
@@ -3094,6 +5565,678 @@ Probe a PostgreSQL service's WAL / archive_command health right now (archiver fa
 | `--id <id>` | Service ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
+### `services list-available-containers`
+
+List available Docker containers that can be imported as services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services list-health-statuses`
+
+Current health status for many services at once
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ids <value>` | Comma-separated service IDs | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-healthcheck-defaults`
+
+Get the instance-wide default healthcheck of managed service containers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services update-healthcheck-defaults`
+
+Replace the instance-wide default healthcheck of managed service containers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--interval-secs <n>` | Seconds between checks once healthy (5–3600) | - | No |
+| `--retries <n>` | Consecutive failures that make the container unhealthy (1–10) | - | No |
+| `--start-interval-secs <n>` | Seconds between checks while starting (1–60) | - | No |
+| `--start-period-secs <n>` | Seconds after start during which failures do not count (0–600) | - | No |
+| `--timeout-secs <n>` | Seconds one check may run (1–60, and shorter than the interval) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services list-project-services`
+
+List services linked to a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Number of items per page (max 100) | - | No |
+| `--sort-by <value>` | Query parameter sort_by | - | No |
+| `--sort-order <value>` | Query parameter sort_order | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-environment-variables`
+
+Get all environment variables for all services linked to a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-providers-metadata`
+
+Get provider metadata (display names, icons, descriptions)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-provider-metadata`
+
+Get metadata for a specific provider
+
+**Usage:** `services get-provider-metadata <service-type> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-cluster-health`
+
+Per-member health for a Postgres HA cluster
+
+**Usage:** `services get-cluster-health <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services reveal-environment-variables`
+
+Reveal a service's basic environment variables in plaintext, before it is linked to any project
+
+**Usage:** `services reveal-environment-variables <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services trigger-health-check`
+
+Run a health check for one service right now
+
+**Usage:** `services trigger-health-check <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-health-status`
+
+Persisted health status for an external service
+
+**Usage:** `services get-health-status <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--limit <n>` | Max number of recent checks (default 50, max 200) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-healthcheck`
+
+Get a managed service's healthcheck
+
+**Usage:** `services get-healthcheck <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services update-healthcheck`
+
+Replace a managed service's healthcheck overrides
+
+**Usage:** `services update-healthcheck <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--interval-secs <n>` | Seconds between checks once healthy (5–3600) | - | No |
+| `--retries <n>` | Consecutive failures that make the container unhealthy (1–10) | - | No |
+| `--start-interval-secs <n>` | Seconds between checks while starting (1–60) | - | No |
+| `--start-period-secs <n>` | Seconds after start during which failures do not count (0–600) | - | No |
+| `--timeout-secs <n>` | Seconds one check may run (1–60, and shorter than the interval) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services apply-healthcheck`
+
+Recreate a managed service's container to apply its healthcheck now
+
+**Usage:** `services apply-healthcheck <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-log-ingestion`
+
+Get this service's own container log ingestion budget
+
+**Usage:** `services get-log-ingestion <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services update-log-ingestion`
+
+Replace this service's container log ingestion budget
+
+**Usage:** `services update-log-ingestion <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--log-ingest-kib-per-sec <n>` | KiB of log text per second per container (0–1,048,576). null = platform default | - | No |
+| `--log-ingest-lines-per-sec <n>` | Lines per second per container (0–1,000,000). null = platform default | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services add-cluster-member`
+
+Begin adding a single new member to a running cluster
+
+**Usage:** `services add-cluster-member <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node-id <n>` | Target worker node ID | - | No |
+| `--role <value>` | Member role [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services remove-cluster-member`
+
+Remove a single member from a running cluster
+
+**Usage:** `services remove-cluster-member <id> <member-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-cluster-member`
+
+Get a single cluster member's current state
+
+**Usage:** `services get-cluster-member <id> <member-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services promote-cluster-member`
+
+Promote a replica to primary by triggering a pg_auto_failover failover
+
+**Usage:** `services promote-cluster-member <id> <member-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services migrate-s3`
+
+Copy every bucket of another managed S3 service into this one
+
+**Usage:** `services migrate-s3 <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--source-service-id <n>` | Managed S3 service to copy from (RustFS or Garage) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services reveal-parameter`
+
+Reveal one sensitive service parameter
+
+**Usage:** `services reveal-parameter <id> <param-name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-preview-environment-variables-masked`
+
+Get environment variables preview with masked sensitive values
+
+**Usage:** `services get-preview-environment-variables-masked <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-preview-environment-variable-names`
+
+Get environment variable names preview (safe - no sensitive values)
+
+**Usage:** `services get-preview-environment-variable-names <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services issue-runtime-credentials`
+
+Issue live connection credentials for a service in an environment
+
+**Usage:** `services issue-runtime-credentials <id> <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services update-resources`
+
+Update a service's resource limits (memory, CPU caps)
+
+**Usage:** `services update-resources <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--cpu-shares <n>` | Relative CPU weight (default 1024) | - | No |
+| `--memory-mb <n>` | Hard memory limit in MiB | - | No |
+| `--memory-swap-mb <n>` | Memory + swap limit in MiB | - | No |
+| `--nano-cpus <n>` | CPU quota in nano-cpus. 1_000_000_000 = 1 full CPU core | - | No |
+| `--shm-size-mb <n>` | Shared memory (/dev/shm) size in MiB | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services retry-cluster`
+
+Retry a failed cluster service initialization
+
+**Usage:** `services retry-cluster <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--members <json>` | Cluster member specifications (same format as create) (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-runtime`
+
+Inspect a service's container(s): status, restart count, OOM-killed flag, exit code, and the cgroup limits..
+
+**Usage:** `services get-runtime <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-stats`
+
+Sample current CPU/memory usage from each of a service's containers
+
+**Usage:** `services get-stats <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-tls`
+
+Get service tls
+
+**Usage:** `services get-tls <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services update-tls`
+
+Update service tls
+
+**Usage:** `services update-tls <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | The new mode. 'required' is rejected until it is supported (one of: off, available, required) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-managed-ca-certificate`
+
+Get managed ca certificate
+
+**Usage:** `services get-managed-ca-certificate <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services test-wal-archive-target`
+
+Test wal archive target
+
+**Usage:** `services test-wal-archive-target <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services get-workload-mode`
+
+Get a database's workload mode (internal, operator-only)
+
+**Usage:** `services get-workload-mode <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services update-workload-mode`
+
+Change a database's workload mode (internal, operator-only)
+
+**Usage:** `services update-workload-mode <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | Body field mode (one of: legacy, shadow, enforce) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services get-workload-pending-changes`
+
+List what a recreate from the workload spec would change (internal, operator-only)
+
+**Usage:** `services get-workload-pending-changes <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services recreate-from-workload-spec`
+
+Recreate a database's container from its workload spec (internal, operator-only)
+
+**Usage:** `services recreate-from-workload-spec <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--confirmed-fingerprint <value>` | The 'fingerprint' of the pending changes being confirmed | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services external-reset-pg-stat-statements`
+
+Reset all statistics accumulated by 'pg_stat_statements' for a Postgres service
+
+**Usage:** `services external-reset-pg-stat-statements <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--confirm` | Must be 'true' to acknowledge the global, irreversible reset [required] | - | No |
+| `--no-confirm` | Set confirm to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services query`
+
+Query commands
+
+**Subcommands:**
+
+- `data` - Query data from an entity with optional filters, pagination, and sorting
+- `download-object` - Download an object (S3 only) as a streaming response
+- `get-container-info` - Get information about a specific container
+
+#### `services query data`
+
+Query data from an entity with optional filters, pagination, and sorting
+
+**Usage:** `services query data <service-id> <path> <entity> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--filters <json>` | JSON filters (backend-specific format) (JSON) | - | No |
+| `--limit <n>` | Maximum number of rows to return | - | No |
+| `--offset <n>` | Number of rows to skip | - | No |
+| `--sort-by <value>` | Sort by field name | - | No |
+| `--sort-order <value>` | Sort order (asc/desc) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `services query download-object`
+
+Download an object (S3 only) as a streaming response
+
+**Usage:** `services query download-object <service-id> <path> <entity> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `services query get-container-info`
+
+Get information about a specific container
+
+**Usage:** `services query get-container-info <service-id> <path> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `services pg-upgrade`
+
+Pg upgrade commands
+
+**Subcommands:**
+
+- `list` - List recent upgrades for a single service (newest first, page size 50)
+- `start` - Start a new PostgreSQL major-version upgrade for a service
+- `get` - Get a single upgrade by id, scoped to a service
+- `cancel` - Cancel an in-flight upgrade
+- `get-logs` - Get the accumulated JSONL log content for an upgrade (for dashboard display)
+- `retry` - Retry a failed upgrade
+- `rollback` - Roll a completed upgrade back to its pre-upgrade PGDATA volume and old image
+
+#### `services pg-upgrade list`
+
+List recent upgrades for a single service (newest first, page size 50)
+
+**Usage:** `services pg-upgrade list <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `services pg-upgrade start`
+
+Start a new PostgreSQL major-version upgrade for a service
+
+**Usage:** `services pg-upgrade start <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from-image <value>` | Body field from_image [required] | - | No |
+| `--from-version <value>` | Body field from_version [required] | - | No |
+| `--to-image <value>` | Body field to_image [required] | - | No |
+| `--to-version <value>` | Body field to_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `services pg-upgrade get`
+
+Get a single upgrade by id, scoped to a service
+
+**Usage:** `services pg-upgrade get <service-id> <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `services pg-upgrade cancel`
+
+Cancel an in-flight upgrade
+
+**Usage:** `services pg-upgrade cancel <service-id> <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `services pg-upgrade get-logs`
+
+Get the accumulated JSONL log content for an upgrade (for dashboard display)
+
+**Usage:** `services pg-upgrade get-logs <service-id> <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `services pg-upgrade retry`
+
+Retry a failed upgrade
+
+**Usage:** `services pg-upgrade retry <service-id> <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `services pg-upgrade rollback`
+
+Roll a completed upgrade back to its pre-upgrade PGDATA volume and old image
+
+**Usage:** `services pg-upgrade rollback <service-id> <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `settings`
 
 Manage platform settings
@@ -3105,6 +6248,17 @@ Manage platform settings
 - `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
+- `fields` - List every instance setting, or print the value at a field path (e.g. shield, otel_ingest.max_spans_per_second)
+- `apply` - Change any instance setting by field path: field=value (JSON or text), field:=text, or a bare field with --value-stdin
+- `admin-gate` - Show, or change with flags, which hosts and source IPs may reach the console and API listener
+- `telemetry` - Show anonymous telemetry status, or turn it on/off with --enable/--disable
+- `ci-builder` - Configure the external CI builder that runs builds off the control plane
+- `disk-status` - Show the control plane's disk usage and alert threshold
+- `public-ingress` - Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
+- `refresh-routes` - Rebuild the proxy route table now instead of waiting for the next change
+- `weekly-digest` - Generate and send the weekly digest now
+- `onboarding` - Onboarding commands
+- `oidc` - Oidc commands
 
 ### `settings show` (alias: `get`)
 
@@ -3173,12 +6327,367 @@ Set the preview domain pattern
 |------|-------------|---------|----------|
 | `--domain <domain>` | Preview domain pattern | - | Yes |
 
+### `settings fields`
+
+List every instance setting, or print the value at a field path (e.g. shield, otel_ingest.max_spans_per_second)
+
+**Usage:** `settings fields [path] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings apply`
+
+Change any instance setting by field path: field=value (JSON or text), field:=text, or a bare field with --value-stdin
+
+**Usage:** `settings apply [assignments...] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from-file <path>` | Merge a JSON object of settings from a file (- for stdin) | - | No |
+| `--value-stdin` | Read the value of the one bare field from stdin (for secrets) | - | No |
+| `-y, --yes` | Do not ask before changing a setting that can lock you out | - | No |
+| `--json` | Print the saved settings response as JSON | - | No |
+
+### `settings admin-gate`
+
+Show, or change with flags, which hosts and source IPs may reach the console and API listener
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--allowed-host <host>` | Host header to allow (repeatable; replaces the list) | - | No |
+| `--allowed-ip <ip-or-cidr>` | Source IP or CIDR to allow (repeatable; replaces the list) | - | No |
+| `--clear-hosts` | Allow any Host header | - | No |
+| `--clear-ips` | Allow any source address | - | No |
+| `--trust-forwarded-for` | Trust X-Forwarded-For from loopback peers | - | No |
+| `--no-trust-forwarded-for` | Ignore X-Forwarded-For | - | No |
+| `-y, --yes` | Do not ask before saving a gate that may lock you out | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `settings telemetry`
+
+Show anonymous telemetry status, or turn it on/off with --enable/--disable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Send anonymous telemetry | - | No |
+| `--disable` | Stop sending anonymous telemetry | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `settings ci-builder`
+
+Configure the external CI builder that runs builds off the control plane
+
+**Subcommands:**
+
+- `show` - Show whether the CI builder is configured, and its settings (credentials are never returned)
+- `set` - Save CI builder settings from --from-file and/or field=value assignments (e.g. limits.concurrency=2)
+- `provision` - Create the builder repository and its pinned runner shim at the configured provider
+
+#### `settings ci-builder show`
+
+Show whether the CI builder is configured, and its settings (credentials are never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings ci-builder set`
+
+Save CI builder settings from --from-file and/or field=value assignments (e.g. limits.concurrency=2)
+
+**Usage:** `settings ci-builder set [assignments...] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from-file <path>` | JSON object of CI builder settings (- for stdin) | - | No |
+| `--dispatch-token-stdin` | Read the dispatch token from stdin | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings ci-builder provision`
+
+Create the builder repository and its pinned runner shim at the configured provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+
+### `settings disk-status`
+
+Show the control plane's disk usage and alert threshold
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings public-ingress`
+
+Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings refresh-routes`
+
+Rebuild the proxy route table now instead of waiting for the next change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings weekly-digest`
+
+Generate and send the weekly digest now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings onboarding`
+
+Onboarding commands
+
+**Subcommands:**
+
+- `get` - Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+- `update` - Change the install's first-run record
+
+#### `settings onboarding get`
+
+Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings onboarding update`
+
+Change the install's first-run record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--completed` | Mark the welcome flow finished (true) or reopen it (false) | - | No |
+| `--no-completed` | Set completed to false | - | No |
+| `--default-reach <json>` | How new apps are reached by default, e.g. {"audience":"public","way":"tunnel","naming":"wildcard","domain":"apps.example.com"} (JSON) | - | No |
+| `--done <value>` | Mark these steps done (one of: host, reach, agents, app) (repeatable) | - | No |
+| `--later <json>` | Leave steps for later with why, e.g. [{"step":"agents","reason":"no provider yet"}] (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `settings oidc`
+
+Oidc commands
+
+**Subcommands:**
+
+- `list-providers` - List oidc providers
+- `create-provider` - Create oidc provider
+- `get-provider` - Show one oidc provider
+- `delete-provider` - Delete oidc provider
+- `update-provider` - Update oidc provider
+- `list-role-mappings` - List oidc role mappings
+- `create-role-mapping` - Create oidc role mapping
+- `test-provider` - Test oidc provider
+- `list-provider-users` - List oidc provider users
+- `delete-role-mapping` - Delete oidc role mapping
+
+#### `settings oidc list-providers`
+
+List oidc providers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc create-provider`
+
+Create oidc provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--client-id <value>` | Body field client_id [required] | - | No |
+| `--client-secret-stdin` | A credential [required] (read from stdin) | - | No |
+| `--client-secret-file <path>` | A credential [required] (read from a file) | - | No |
+| `--default-role <value>` | Body field default_role | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--group-claim <value>` | Body field group_claim | - | No |
+| `--issuer-url <value>` | Body field issuer_url [required] | - | No |
+| `--jit-provisioning` | Body field jit_provisioning | - | No |
+| `--no-jit-provisioning` | Set jit_provisioning to false | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--role-claim <value>` | Body field role_claim | - | No |
+| `--scopes <value>` | Body field scopes | - | No |
+| `--template <value>` | Body field template | - | No |
+| `--trust-idp-email` | Defaults false | - | No |
+| `--no-trust-idp-email` | Set trust_idp_email to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc get-provider`
+
+Show one oidc provider
+
+**Usage:** `settings oidc get-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc delete-provider`
+
+Delete oidc provider
+
+**Usage:** `settings oidc delete-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc update-provider`
+
+Update oidc provider
+
+**Usage:** `settings oidc update-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--client-id <value>` | Body field client_id | - | No |
+| `--client-secret-stdin` | A credential (read from stdin) | - | No |
+| `--client-secret-file <path>` | A credential (read from a file) | - | No |
+| `--default-role <value>` | Body field default_role | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--group-claim <value>` | Body field group_claim | - | No |
+| `--issuer-url <value>` | Body field issuer_url | - | No |
+| `--jit-provisioning` | Body field jit_provisioning | - | No |
+| `--no-jit-provisioning` | Set jit_provisioning to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--role-claim <value>` | Body field role_claim | - | No |
+| `--scopes <value>` | Body field scopes | - | No |
+| `--template <value>` | Body field template | - | No |
+| `--trust-idp-email` | Body field trust_idp_email | - | No |
+| `--no-trust-idp-email` | Set trust_idp_email to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc list-role-mappings`
+
+List oidc role mappings
+
+**Usage:** `settings oidc list-role-mappings <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc create-role-mapping`
+
+Create oidc role mapping
+
+**Usage:** `settings oidc create-role-mapping <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--idp-group <value>` | Body field idp_group [required] | - | No |
+| `--priority <n>` | Body field priority [required] | - | No |
+| `--role <value>` | Body field role [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc test-provider`
+
+Test oidc provider
+
+**Usage:** `settings oidc test-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc list-provider-users`
+
+List oidc provider users
+
+**Usage:** `settings oidc list-provider-users <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings oidc delete-role-mapping`
+
+Delete oidc role mapping
+
+**Usage:** `settings oidc delete-role-mapping <mapping-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `users`
 
 Manage platform users
 
 **Subcommands:**
 
+- `get` - Show one platform user
 - `list` (`ls`) - List all users
 - `create` (`add`) - Create a new user
 - `me` - Show current user info
@@ -3187,6 +6696,24 @@ Manage platform users
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
 - `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 - `role` - Manage user roles
+- `update-self` - Update current user's information
+- `disable-mfa` - Disable mfa
+- `setup-mfa` - Setup mfa
+- `verify-and-enable-mfa` - Verify and enable mfa
+- `change-password-self` - Change password self
+- `update` - Update user information (admin only)
+
+### `users get`
+
+Show one platform user
+
+**Usage:** `users get <user-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `users list` (alias: `ls`)
 
@@ -3210,6 +6737,7 @@ Create a new user
 | `-e, --email <email>` | Email address | - | No |
 | `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | No |
 | `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | No |
+| `--must-change-password` | Make the user choose a new password at first sign-in | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 | `--password-file <path>` | Read the password from a file (- reads stdin) instead of --password | - | No |
 | `--password-stdin` | Read the password from stdin instead of --password | - | No |
@@ -3283,6 +6811,97 @@ Manage user roles
 | `--add <role>` | Add a role to user | - | No |
 | `--remove <role>` | Remove a role from user | - | No |
 
+### `users update-self`
+
+Update current user's information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--email <value>` | Body field email | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `users disable-mfa`
+
+Disable mfa
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--code <value>` | Body field code [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `users setup-mfa`
+
+Setup mfa
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--current-password-stdin` | Required to enroll MFA on an account that has a password set (read from stdin) | - | No |
+| `--current-password-file <path>` | Required to enroll MFA on an account that has a password set (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `users verify-and-enable-mfa`
+
+Verify and enable mfa
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--code <value>` | Body field code [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `users change-password-self`
+
+Change password self
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--current-password-stdin` | Body field current_password [required] (read from stdin) | - | No |
+| `--current-password-file <path>` | Body field current_password [required] (read from a file) | - | No |
+| `--mfa-code <value>` | TOTP code (or recovery code) | - | No |
+| `--new-password-stdin` | Body field new_password [required] (read from stdin) | - | No |
+| `--new-password-file <path>` | Body field new_password [required] (read from a file) | - | No |
+| `--revoke-other-sessions` | When true, every session OTHER than the one making this request is revoked | - | No |
+| `--no-revoke-other-sessions` | Set revoke_other_sessions to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `users update`
+
+Update user information (admin only)
+
+**Usage:** `users update <user-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--email <value>` | Body field email | - | No |
+| `--name <value>` | Deprecated: the old name of 'username', still accepted | - | No |
+| `--username <value>` | The new username, as in 'CreateUserRequest' | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `teams`
 
 Manage teams and project access
@@ -3304,6 +6923,7 @@ List all teams
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Page of 100 teams (default: 1) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `teams create` (alias: `add`)
@@ -3363,10 +6983,23 @@ Manage team membership
 
 **Subcommands:**
 
+- `get` - Show one member of a team
 - `list` (`ls`) - List a team's members
 - `add` - Add a user to a team
 - `set-role` - Change a member's role in the team
 - `remove` (`rm`) - Remove a user from a team
+
+#### `teams members get`
+
+Show one member of a team
+
+**Usage:** `teams members get <team-id> <user-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `teams members list` (alias: `ls`)
 
@@ -3629,6 +7262,8 @@ Scan the project's repository and add its apps as services that follow it
 | `-p, --path <dir...>` | Only these app directories (default: every app without a service) | - | No |
 | `--dry-run` | List what would be created without creating anything | - | No |
 | `--timeout <minutes>` | Stop waiting after this long (default 30); the import keeps running on the server | - | No |
+| `--fresh` | Scan a public repository again instead of using the cached scan | - | No |
+| `--base-url <url>` | HTTPS origin of the self-hosted GitLab a public repository lives on | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `project-groups follow`
@@ -3696,10 +7331,23 @@ Variables shared by every service in a project (group)
 
 **Subcommands:**
 
+- `get` - Show one shared variable (a secret value is never shown)
 - `list` (`ls`) - List shared variables (secret values are never shown)
 - `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 - `unset` - Remove a shared variable
+
+#### `project-groups vars get`
+
+Show one shared variable (a secret value is never shown)
+
+**Usage:** `project-groups vars get <group-id> <var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `project-groups vars list` (alias: `ls`)
 
@@ -3821,6 +7469,9 @@ Manage API keys for programmatic access
 - `activate` - Activate a deactivated API key
 - `deactivate` - Deactivate an API key
 - `permissions` - List available API key permissions
+- `get-ai-harness-status` - Whether the caller's external AI harness has connected
+- `update-api-key` - Update api key
+- `rotate-api-key` - Rotate api key
 
 ### `apikeys list` (alias: `ls`)
 
@@ -3831,6 +7482,8 @@ List all API keys
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Keys per page (max 100) | - | No |
 
 ### `apikeys create` (alias: `add`)
 
@@ -3901,6 +7554,48 @@ List available API key permissions
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
+### `apikeys get-ai-harness-status`
+
+Whether the caller's external AI harness has connected
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `apikeys update-api-key`
+
+Update api key
+
+**Usage:** `apikeys update-api-key <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expires-at <value>` | Body field expires_at | - | No |
+| `--is-active` | Body field is_active | - | No |
+| `--no-is-active` | Set is_active to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--permissions <value>` | Body field permissions (repeatable) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `apikeys rotate-api-key`
+
+Rotate api key
+
+**Usage:** `apikeys rotate-api-key <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `monitors` (alias: `monitoring`)
 
 Manage uptime monitors for status pages
@@ -3916,6 +7611,11 @@ Manage uptime monitors for status pages
 - `remove` (`rm`) - Delete a monitor
 - `status` - Get current status — all monitors for a project, or a single monitor by ID
 - `history` - Get monitor uptime history
+- `get-health` - Get monitor-based health summaries for multiple projects in a single query
+- `update` - Update a monitor's name, check interval or check path
+- `get-bucketed-status` - Get bucketed status data for a monitor using TimescaleDB
+- `crons` - Crons commands
+- `http-checks` - Http checks commands
 
 ### `monitors list` (alias: `ls`)
 
@@ -4058,6 +7758,370 @@ Get monitor uptime history
 | `--json` | Output in JSON format | - | No |
 | `--days <days>` | Number of days to show | `7` | No |
 
+### `monitors get-health`
+
+Get monitor-based health summaries for multiple projects in a single query
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-ids <value>` | Comma-separated list of project IDs [required] | - | No |
+| `--environment-id <n>` | Select one environment within the authorized projects; defaults to production | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors update`
+
+Update a monitor's name, check interval or check path
+
+**Usage:** `monitors update <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--check-interval-seconds <n>` | How often to probe, in seconds. **Clamped, not rejected**, exactly like on create: values below 30 are... | - | No |
+| `--check-path <value>` | Path probed on the monitored environment; must start with '/' | - | No |
+| `--name <value>` | Display name; 1 to 255 characters after trimming | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors get-bucketed-status`
+
+Get bucketed status data for a monitor using TimescaleDB
+
+**Usage:** `monitors get-bucketed-status <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--interval <value>` | Bucket interval: '5min', 'hourly', or 'daily' (default: hourly) | - | No |
+| `--start-time <value>` | Start time (ISO 8601) (default: 24 hours ago) | - | No |
+| `--end-time <value>` | End time (ISO 8601) (default: now) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors crons`
+
+Crons commands
+
+**Subcommands:**
+
+- `list` - List cron monitors
+- `create` - Create cron monitor
+- `delete` - Delete cron monitor
+- `get` - Get cron monitor
+- `update` - Update cron monitor
+- `list-runs` - List cron monitor runs
+
+#### `monitors crons list`
+
+List cron monitors
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons create`
+
+Create cron monitor
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--config <json>` | Body field config (JSON) [required] | - | No |
+| `--environment-id <n>` | Body field environment_id | - | No |
+| `--slug <value>` | Body field slug [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons delete`
+
+Delete cron monitor
+
+**Usage:** `monitors crons delete <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons get`
+
+Get cron monitor
+
+**Usage:** `monitors crons get <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons update`
+
+Update cron monitor
+
+**Usage:** `monitors crons update <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--config <json>` | Body field config (JSON) | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors crons list-runs`
+
+List cron monitor runs
+
+**Usage:** `monitors crons list-runs <monitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors http-checks`
+
+Http checks commands
+
+**Subcommands:**
+
+- `detect-env-credential` - Detect env credential
+- `list-variable-history` - List variable history
+- `list` - List http checks
+- `create` - Create http check
+- `get-capabilities` - Get http checks capabilities
+- `list-presets` - List http check presets
+- `get` - Show one http check
+- `delete` - Delete http check
+- `set-enabled` - Set http check enabled
+- `update` - Update http check
+- `run` - Run http check
+- `detect-secret-credential` - Detect secret credential
+- `list-secret-history` - List secret history
+
+#### `monitors http-checks detect-env-credential`
+
+Detect env credential
+
+**Usage:** `monitors http-checks detect-env-credential <env-var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list-variable-history`
+
+List variable history
+
+**Usage:** `monitors http-checks list-variable-history <env-var-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list`
+
+List http checks
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks create`
+
+Create http check
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--credential-stdin` | Body field credential (read from stdin) | - | No |
+| `--credential-file <path>` | Body field credential (read from a file) | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--env-var-id <n>` | Body field env_var_id | - | No |
+| `--interval-seconds <n>` | Body field interval_seconds | - | No |
+| `--kind <value>` | 'http' (default) calls an endpoint; 'local' reads expiring items (certificates, SSH certificates, OpenPGP... (one of: http, local) | - | No |
+| `--local <json>` | Body field local (JSON) | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--secret-id <n>` | Project secret to check | - | No |
+| `--spec <json>` | This is a declarative HTTP recipe, never executable code (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks get-capabilities`
+
+Get http checks capabilities
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list-presets`
+
+List http check presets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks get`
+
+Show one http check
+
+**Usage:** `monitors http-checks get <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks delete`
+
+Delete http check
+
+**Usage:** `monitors http-checks delete <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks set-enabled`
+
+Set http check enabled
+
+**Usage:** `monitors http-checks set-enabled <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks update`
+
+Update http check
+
+**Usage:** `monitors http-checks update <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--credential-stdin` | Body field credential (read from stdin) | - | No |
+| `--credential-file <path>` | Body field credential (read from a file) | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--env-var-id <n>` | Body field env_var_id | - | No |
+| `--interval-seconds <n>` | Body field interval_seconds | - | No |
+| `--kind <value>` | 'http' (default) calls an endpoint; 'local' reads expiring items (certificates, SSH certificates, OpenPGP... (one of: http, local) | - | No |
+| `--local <json>` | Body field local (JSON) | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--secret-id <n>` | Project secret to check | - | No |
+| `--spec <json>` | This is a declarative HTTP recipe, never executable code (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks run`
+
+Run http check
+
+**Usage:** `monitors http-checks run <check-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks detect-secret-credential`
+
+Detect secret credential
+
+**Usage:** `monitors http-checks detect-secret-credential <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `monitors http-checks list-secret-history`
+
+List secret history
+
+**Usage:** `monitors http-checks list-secret-history <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `webhooks` (alias: `hooks`)
 
 Manage webhooks for project events
@@ -4084,6 +8148,10 @@ List all webhooks for a project
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Webhooks per page (max 100) | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `webhooks create` (alias: `add`)
 
@@ -4237,6 +8305,9 @@ Manage project containers in environments
 - `restart` - Restart a container
 - `history` - List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 - `metrics` - Get container resource metrics (all containers if no container ID specified)
+- `get-environment-variable` - Get container environment variable
+- `metrics-get-history` - Fetch a time-series range for a single container resource metric (recorded by the container health monitor..
+- `stream-metrics` - Stream container metrics via Server-Sent Events (SSE)
 
 ### `containers list` (alias: `ls`)
 
@@ -4329,6 +8400,48 @@ Get container resource metrics (all containers if no container ID specified)
 | `-w, --watch` | Watch mode - continuously update metrics | - | No |
 | `-i, --interval <seconds>` | Refresh interval in seconds (default: 2) | `2` | No |
 
+### `containers get-environment-variable`
+
+Get container environment variable
+
+**Usage:** `containers get-environment-variable <environment-id> <container-id> <variable-name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `containers metrics-get-history`
+
+Fetch a time-series range for a single container resource metric (recorded by the container health monitor..
+
+**Usage:** `containers metrics-get-history <environment-id> <container-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--metric <value>` | Dotted metric name, e.g. 'container.cpu_percent' or 'container.memory_used_bytes' [required] | - | No |
+| `--range <value>` | Time window: '1h', '6h', '24h', or '7d' (defaults to '1h') | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `containers stream-metrics`
+
+Stream container metrics via Server-Sent Events (SSE)
+
+**Usage:** `containers stream-metrics <environment-id> <container-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--interval <n>` | Update interval in milliseconds (default: 1000) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `cluster`
 
 Cluster-wide multi-node operations
@@ -4336,6 +8449,10 @@ Cluster-wide multi-node operations
 **Subcommands:**
 
 - `dns` - Cluster DNS resolver (ADR-024) operations
+- `network` - The compute network workloads get their addresses from
+- `join-token` - The shared token worker nodes join with
+- `enrollment-tokens` - Short-lived, single-use tokens a new node enrolls with
+- `rotate-ca` - Replace a compromised cluster CA: every node re-enrolls and outstanding enrollment tokens are revoked
 
 ### `cluster dns`
 
@@ -4344,6 +8461,11 @@ Cluster DNS resolver (ADR-024) operations
 **Subcommands:**
 
 - `status` - Show whether cluster DNS is healthy across every node — resolver status, last sync, and errors — without SSHing into a node to read logs
+- `resolvers` - Each node's resolver: health, version, records served and last sync
+- `records` - The internal zone's records and who owns them, newest first
+- `queries` - Recent queries the internal resolvers answered, newest first
+- `traffic` - Queries per outcome over time for one node's resolver
+- `resolve` - Resolve a name from one node's resolver, optionally as a project or sandbox would see it
 
 #### `cluster dns status`
 
@@ -4353,6 +8475,220 @@ Show whether cluster DNS is healthy across every node — resolver status, last 
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns resolvers`
+
+Each node's resolver: health, version, records served and last sync
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns records`
+
+The internal zone's records and who owns them, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--search <text>` | Only records whose name contains this | - | No |
+| `--node <id>` | Only records served by this node | - | No |
+| `--owner-kind <kind>` | Only records owned by this kind (e.g. environment, service, sandbox) | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Records per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns queries`
+
+Recent queries the internal resolvers answered, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Only this node | - | No |
+| `--outcome <outcome>` | Only this outcome (e.g. answered, nxdomain, refused) | - | No |
+| `--zone <zone>` | Only this zone | - | No |
+| `--name <name>` | Only this queried name | - | No |
+| `--project <id>` | Only queries from this project ID | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Queries per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns traffic`
+
+Queries per outcome over time for one node's resolver
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node (default: the control plane) | - | No |
+| `--range <range>` | Time range, e.g. 1h, 24h, 7d | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster dns resolve`
+
+Resolve a name from one node's resolver, optionally as a project or sandbox would see it
+
+**Usage:** `cluster dns resolve <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node whose resolver answers | - | Yes |
+| `--type <type>` | Record type (A, AAAA, CNAME, SRV, TXT) | - | No |
+| `--project <id>` | Ask as this project ID | - | No |
+| `--sandbox <id>` | Ask as this sandbox | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cluster network`
+
+The compute network workloads get their addresses from
+
+**Subcommands:**
+
+- `show` - Show the compute pool, whether it can change, and each node's allocation
+- `set` - Change the compute pool (only while no allocation uses it)
+- `new-network-id` - Give this cluster its own VXLAN network ID, so it cannot collide with another cluster on the same network
+
+#### `cluster network show`
+
+Show the compute pool, whether it can change, and each node's allocation
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster network set`
+
+Change the compute pool (only while no allocation uses it)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--compute-pool <cidr>` | CIDR workloads get addresses from | - | Yes |
+| `--overlay-network <name>` | Docker overlay network name | - | No |
+| `--subnet-prefix <len>` | Per-node subnet prefix length | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster network new-network-id`
+
+Give this cluster its own VXLAN network ID, so it cannot collide with another cluster on the same network
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cluster join-token`
+
+The shared token worker nodes join with
+
+**Subcommands:**
+
+- `status` - Show whether a join token is configured
+- `generate` - Generate a new join token (replaces the current one; shown once)
+- `revoke` - Revoke the join token; no new node can join with it
+
+#### `cluster join-token status`
+
+Show whether a join token is configured
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster join-token generate`
+
+Generate a new join token (replaces the current one; shown once)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask before replacing an existing token | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster join-token revoke`
+
+Revoke the join token; no new node can join with it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cluster enrollment-tokens`
+
+Short-lived, single-use tokens a new node enrolls with
+
+**Subcommands:**
+
+- `list` (`ls`) - List valid enrollment tokens (the tokens themselves are never returned)
+- `create` (`mint`) - Mint an enrollment token (shown once)
+- `revoke` - Revoke an enrollment token
+
+#### `cluster enrollment-tokens list` (alias: `ls`)
+
+List valid enrollment tokens (the tokens themselves are never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster enrollment-tokens create` (alias: `mint`)
+
+Mint an enrollment token (shown once)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ttl <seconds>` | How long it is valid | - | No |
+| `--max-uses <n>` | How many nodes may enroll with it | - | No |
+| `--node <name>` | Only a node with this name may use it | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cluster enrollment-tokens revoke`
+
+Revoke an enrollment token
+
+**Usage:** `cluster enrollment-tokens revoke <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `cluster rotate-ca`
+
+Replace a compromised cluster CA: every node re-enrolls and outstanding enrollment tokens are revoked
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expected-fingerprint <sha256>` | Fingerprint of the current CA, read through a trusted channel just before | - | Yes |
+| `-y, --yes` | Do not ask; sends the confirmation "ROTATE CLUSTER CA" for you | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `nodes`
@@ -4367,6 +8703,14 @@ Worker nodes and workload placement
 - `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
 - `resources` - What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
 - `state-status` - Show the workload plane's desired-state stream: whether it runs here, its lag and counters
+- `show` - Show one node: status, addresses, labels and capacity
+- `containers` - List the containers running on a node
+- `drain` - Stop scheduling on a node and move its replicas elsewhere (redeploys the affected environments)
+- `undrain` - Let a drained node accept new deployments again
+- `remove` (`rm`) - Remove a drained node from the cluster and from every placement that targets it
+- `build-limits` - Show a worker node's build limits, or change them with flags
+- `public-ingress` - Show or change whether a node serves public HTTP(S) traffic itself, and on which ports and addresses
+- `workload-mode` - Show an environment's workload mode, or set it (legacy, shadow, enforce); operator-only
 
 ### `nodes capability`
 
@@ -4517,6 +8861,8 @@ Add servers over SSH: the control plane logs in, installs temps if needed, pairs
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--page <n>` | Page to show (default 1) | - | No |
+| `--per-page <n>` | Servers per page (default 20, max 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 **Subcommands:**
@@ -4604,6 +8950,7 @@ Change a node's resource policy or reservation. Giving only one of --reserve-cpu
 | `--policy <policy>` | best_effort (reservations not checked) or enforced (placements that do not fit are refused) | - | No |
 | `--reserve-cpu <millis>` | CPU kept for the OS and Temps, in millicores (1000 = one core) | - | No |
 | `--reserve-memory <mb>` | Memory kept for the OS and Temps, in MB | - | No |
+| `--reset-reserved` | Go back to the default reservation for the node's role | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `nodes state-status`
@@ -4614,6 +8961,119 @@ Show the workload plane's desired-state stream: whether it runs here, its lag an
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes show`
+
+Show one node: status, addresses, labels and capacity
+
+**Usage:** `nodes show <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes containers`
+
+List the containers running on a node
+
+**Usage:** `nodes containers <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes drain`
+
+Stop scheduling on a node and move its replicas elsewhere (redeploys the affected environments)
+
+**Usage:** `nodes drain <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status` | Only show drain progress | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes undrain`
+
+Let a drained node accept new deployments again
+
+**Usage:** `nodes undrain <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes remove` (alias: `rm`)
+
+Remove a drained node from the cluster and from every placement that targets it
+
+**Usage:** `nodes remove <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--force` | Remove even if the node is not drained (its containers are not moved first) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes build-limits`
+
+Show a worker node's build limits, or change them with flags
+
+**Usage:** `nodes build-limits <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--timeout <seconds>` | Longest a build may run | - | No |
+| `--concurrency <n>` | Builds that may run at once | - | No |
+| `--queue-wait <seconds>` | Longest a build may wait for a slot | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes public-ingress`
+
+Show or change whether a node serves public HTTP(S) traffic itself, and on which ports and addresses
+
+**Usage:** `nodes public-ingress <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Serve public traffic on this node | - | No |
+| `--disable` | Stop serving public traffic on this node | - | No |
+| `--http-port <port>` | HTTP port to listen on | - | No |
+| `--https-port <port>` | HTTPS port to listen on | - | No |
+| `--listen-address <addr>` | Local address to bind ("" for automatic) | - | No |
+| `--public-address <addr>` | Address DNS points at ("" for the listen address) | - | No |
+| `--toggle-only` | Only flip enabled with --enable/--disable, without saving ports or addresses | - | No |
+| `--check` | Check from the control plane that the node answers on its public address | - | No |
+| `-y, --yes` | Do not ask before disabling | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes workload-mode`
+
+Show an environment's workload mode, or set it (legacy, shadow, enforce); operator-only
+
+**Usage:** `nodes workload-mode <environment-id> [mode] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask before changing it | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `tunnels`
@@ -4668,6 +9128,8 @@ Create a tunnel for a managed zone and run it on workers. The zone must already 
 | `--domain <domain>` | Zone (or subdomain of one) whose apps it publishes | - | Yes |
 | `--node <ids...>` | Worker node ids to run it on | - | Yes |
 | `--provider <kind>` | Tunnel provider kind | `cloudflare_tunnel` | No |
+| `--host-suffix <suffix>` | Name environment hosts <label>-<suffix>.<domain>, one level under the zone | - | No |
+| `--secrets-file <path>` | JSON object of the provider's credential fields by key (- reads stdin) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `tunnels hostnames`
@@ -4761,6 +9223,7 @@ Manage deployment tokens for project API access (KV, Blob, etc.)
 - `show` (`get`) - Show deployment token details
 - `delete` (`rm`) - Delete a deployment token
 - `permissions` - List available deployment token permissions
+- `deployment` - Deployment commands
 
 ### `tokens list` (alias: `ls`)
 
@@ -4822,6 +9285,111 @@ List available deployment token permissions
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
+### `tokens deployment`
+
+Deployment commands
+
+**Subcommands:**
+
+- `list` - List all deployment tokens for a project
+- `create` - Create a new deployment token for a project
+- `delete` - Delete a deployment token
+- `get` - Get a specific deployment token
+- `update` - Update a deployment token
+- `rotate` - Rotate a deployment token, invalidating its old secret and issuing a new one
+
+#### `tokens deployment list`
+
+List all deployment tokens for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Page size (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `tokens deployment create`
+
+Create a new deployment token for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--deployment-id <n>` | Optional deployment ID - if set, token is scoped to a specific deployment | - | No |
+| `--environment-id <n>` | Optional environment ID - if not set, token applies to all environments | - | No |
+| `--expires-at <value>` | Body field expires_at | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--permissions <value>` | List of permissions (e.g., ["visitors:enrich", "emails:send"]) If not provided, defaults to full access (repeatable) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `tokens deployment delete`
+
+Delete a deployment token
+
+**Usage:** `tokens deployment delete <token-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `tokens deployment get`
+
+Get a specific deployment token
+
+**Usage:** `tokens deployment get <token-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `tokens deployment update`
+
+Update a deployment token
+
+**Usage:** `tokens deployment update <token-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expires-at <value>` | Body field expires_at | - | No |
+| `--is-active` | Body field is_active | - | No |
+| `--no-is-active` | Set is_active to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--permissions <value>` | Body field permissions (repeatable) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `tokens deployment rotate`
+
+Rotate a deployment token, invalidating its old secret and issuing a new one
+
+**Usage:** `tokens deployment rotate <token-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `errors` (alias: `error`)
 
 Manage error tracking and error groups
@@ -4855,6 +9423,15 @@ Manage error tracking and error groups
 - `dashboard` - Get error dashboard statistics
 - `sourcemaps` (`sm`) - Manage source maps for error symbolication
 - `source-files` (`sf`) - Manage raw source files for native (Go/Rust/…) symbolication
+- `list-global-groups` - List issues across every project visible to the caller
+- `autofix` - Autofix commands
+- `autofixer` - Autofixer commands
+- `ingestion` - Ingestion commands
+- `alert-rules` - Alert rules commands
+- `search-group-assignees` - Search users and teams to assign an error group to
+- `update-saved-search` - Rename, share or change the filters of your saved search
+- `feedback` - Feedback commands
+- `has-groups` - Check if project has any error groups
 
 ### `errors list` (alias: `ls`)
 
@@ -5007,10 +9584,24 @@ Drop noisy error events before they are stored (browser extensions, crawlers, lo
 
 **Subcommands:**
 
+- `get` - Show one of a project's inbound filters
 - `list` - List a project's inbound filters and how many events each dropped
 - `add` - Add an inbound filter
 - `update` - Change a filter's pattern, or switch it on or off
 - `remove` (`delete`) - Delete an inbound filter; matching events are stored again
+
+#### `errors filters get`
+
+Show one of a project's inbound filters
+
+**Usage:** `errors filters get <filter-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `errors filters list`
 
@@ -5166,6 +9757,25 @@ Show the health of each release: crash-free sessions and users, adoption and dep
 | `--environment <name>` | SDK environment (as the SDK sends it) | - | No |
 | `--days <n>` | Window in days, 1 to 14 | `7` | No |
 | `--page <n>` | Page | `1` | No |
+| `--json` | Output in JSON format | - | No |
+
+**Subcommands:**
+
+- `list-telemetry` - List telemetry releases
+
+#### `errors releases list-telemetry`
+
+List telemetry releases
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--release <value>` | Exact SDK release identity; absent lists observed releases | - | No |
+| `--days <n>` | Retained observation window, 1–31 days; default 7 | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors release`
@@ -5379,6 +9989,8 @@ List events in an error group
 | `--page <page>` | Page number | - | No |
 | `--page-size <size>` | Page size | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--tag-key <value>` | Only events with this tag (with --tag-value) | - | No |
+| `--tag-value <value>` | The value --tag-key must have | - | No |
 
 ### `errors event`
 
@@ -5550,6 +10162,513 @@ Delete all source files for a release
 | `--project-id <id>` | Project ID | - | Yes |
 | `--release <version>` | Release version | - | Yes |
 
+### `errors list-global-groups`
+
+List issues across every project visible to the caller
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--project-id <n>` | Query parameter project_id | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--search <value>` | Query parameter search | - | No |
+| `--start-date <value>` | Query parameter start_date | - | No |
+| `--end-date <value>` | Query parameter end_date | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors autofix`
+
+Autofix commands
+
+**Subcommands:**
+
+- `get-capability` - Whether autofix can run for the project, what a fix would become, and the project's autofix policy
+- `list-incidents` - The project's autofix incidents, newest first
+- `open-incident` - Ask autofix to reproduce and fix an error group
+- `get-incident` - One autofix incident
+- `close-incident` - Record the decision on a fix waiting for review
+- `list-incident-events` - The incident's timeline: every action the server, the agent and people took, oldest first
+- `download-patch` - The fix as a unified diff, for 'git apply'
+- `stop-incident` - Stop an incident: cancels the agent's turn, deletes the sandbox and keeps the transcript and timeline
+- `set-paused` - Pause or resume autofix for the project
+- `update-settings` - Change the project's autofix policy
+
+#### `errors autofix get-capability`
+
+Whether autofix can run for the project, what a fix would become, and the project's autofix policy
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix list-incidents`
+
+The project's autofix incidents, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number, from 1 | - | No |
+| `--page-size <n>` | Items per page | - | No |
+| `--status <value>` | 'open', 'closed', or one exact status | - | No |
+| `--error-group-id <n>` | Only incidents of this error group | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix open-incident`
+
+Ask autofix to reproduce and fix an error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--error-group-id <n>` | The error group to fix [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix get-incident`
+
+One autofix incident
+
+**Usage:** `errors autofix get-incident <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix close-incident`
+
+Record the decision on a fix waiting for review
+
+**Usage:** `errors autofix close-incident <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--decision <value>` | 'merged' (you merged the pull request), 'applied' (you applied the patch) or 'rejected' [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix list-incident-events`
+
+The incident's timeline: every action the server, the agent and people took, oldest first
+
+**Usage:** `errors autofix list-incident-events <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--after-id <n>` | Only events after this id; pass the last id seen to poll | - | No |
+| `--limit <n>` | Default 100, max 500 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix download-patch`
+
+The fix as a unified diff, for 'git apply'
+
+**Usage:** `errors autofix download-patch <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix stop-incident`
+
+Stop an incident: cancels the agent's turn, deletes the sandbox and keeps the transcript and timeline
+
+**Usage:** `errors autofix stop-incident <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix set-paused`
+
+Pause or resume autofix for the project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--paused` | Body field paused [required] | - | No |
+| `--no-paused` | Set paused to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofix update-settings`
+
+Change the project's autofix policy
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ai-model <value>` | Empty string clears it | - | No |
+| `--ai-provider <value>` | Empty string clears it (back to the assistant's default) | - | No |
+| `--min-confidence <n>` | Confidence level, 0-5, an 'auto_merge' fix must reach | - | No |
+| `--mode <value>` | 'off', 'propose' or 'auto_merge' | - | No |
+| `--protected-paths <value>` | Body field protected_paths (repeatable) | - | No |
+| `--test-command <value>` | Empty string clears it | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors autofixer`
+
+Autofixer commands
+
+**Subcommands:**
+
+- `start-analysis` - Start an autofixer analysis run for the given error group
+- `get-run` - Get a single autofixer run with its logs
+- `add-context` - Append a user message to the run's context field
+- `create-pr` - Push the fix branch and create a pull request
+- `start-fix` - Transition from analysis to fix phase
+- `re-analyze` - Continue the conversation with user feedback
+
+#### `errors autofixer start-analysis`
+
+Start an autofixer analysis run for the given error group
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--branch <value>` | Branch to clone instead of the project's main branch | - | No |
+| `--error-group-id <n>` | Body field error_group_id [required] | - | No |
+| `--max-turns <n>` | Per-run turn cap applied to every phase (1–200) | - | No |
+| `--model <value>` | Model id for the chosen provider. 'None' uses the provider's saved default model | - | No |
+| `--provider <value>` | AI provider id ("claude_cli", "codex_cli", "opencode"). 'None' uses the platform default provider | - | No |
+| `--user-context <value>` | Free-text notes for the model (extra context about the error, retry guidance, constraints) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer get-run`
+
+Get a single autofixer run with its logs
+
+**Usage:** `errors autofixer get-run <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer add-context`
+
+Append a user message to the run's context field
+
+**Usage:** `errors autofixer add-context <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--message <value>` | Body field message [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer create-pr`
+
+Push the fix branch and create a pull request
+
+**Usage:** `errors autofixer create-pr <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer start-fix`
+
+Transition from analysis to fix phase
+
+**Usage:** `errors autofixer start-fix <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors autofixer re-analyze`
+
+Continue the conversation with user feedback
+
+**Usage:** `errors autofixer re-analyze <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors ingestion`
+
+Ingestion commands
+
+**Subcommands:**
+
+- `list-client-outcomes` - List client outcomes
+
+#### `errors ingestion list-client-outcomes`
+
+List client outcomes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--days <n>` | Retained observation window, 1–31 days; default 7 | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors alert-rules`
+
+Alert rules commands
+
+**Subcommands:**
+
+- `list` - List all alert rules for a project
+- `create` - Create a new alert rule
+- `delete` - Delete an alert rule
+- `get` - Get a specific alert rule
+- `update` - Update an existing alert rule
+
+#### `errors alert-rules list`
+
+List all alert rules for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules create`
+
+Create a new alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--cooldown-minutes <n>` | Minimum minutes between notifications for same rule+group | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--environment-filter <n>` | Optional environment ID to filter alerts | - | No |
+| `--error-level-filter <value>` | Optional error type/level filter | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--notification-priority <value>` | Notification priority: Low, Normal, High, Critical | - | No |
+| `--trigger-config <json>` | Trigger-specific configuration (e.g., {"count": 100, "window_minutes": 60} for frequency) (JSON) | - | No |
+| `--trigger-type <value>` | Trigger type: new_issue, regression, frequency, new_user, user_count, status_change [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules delete`
+
+Delete an alert rule
+
+**Usage:** `errors alert-rules delete <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules get`
+
+Get a specific alert rule
+
+**Usage:** `errors alert-rules get <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors alert-rules update`
+
+Update an existing alert rule
+
+**Usage:** `errors alert-rules update <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--cooldown-minutes <n>` | Body field cooldown_minutes | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--environment-filter <n>` | Body field environment_filter | - | No |
+| `--error-level-filter <value>` | Body field error_level_filter | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--notification-priority <value>` | Body field notification_priority | - | No |
+| `--trigger-config <json>` | Body field trigger_config (JSON) | - | No |
+| `--trigger-type <value>` | Body field trigger_type | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors search-group-assignees`
+
+Search users and teams to assign an error group to
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--q <value>` | Text in the user's name or email, or the team's name | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors update-saved-search`
+
+Rename, share or change the filters of your saved search
+
+**Usage:** `errors update-saved-search <saved-search-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--filters <json>` | The list filters a saved search applies (JSON) | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--shared` | Body field shared | - | No |
+| `--no-shared` | Set shared to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors feedback`
+
+Feedback commands
+
+**Subcommands:**
+
+- `list` - List project feedback
+- `delete` - Delete project feedback
+- `get` - Get project feedback
+- `update` - Update project feedback
+
+#### `errors feedback list`
+
+List project feedback
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors feedback delete`
+
+Delete project feedback
+
+**Usage:** `errors feedback delete <feedback-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors feedback get`
+
+Get project feedback
+
+**Usage:** `errors feedback get <feedback-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `errors feedback update`
+
+Update project feedback
+
+**Usage:** `errors feedback update <feedback-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--status <value>` | Body field status [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `errors has-groups`
+
+Check if project has any error groups
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `metrics` (alias: `metric`)
 
 Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
@@ -5632,6 +10751,11 @@ Resource usage of the machine running the Temps control plane (what /monitoring/
 
 - `status` - Latest CPU, memory, disk, block I/O and network I/O sample for the control-plane host
 - `metrics` - Time series of one control-plane host metric, e.g. node.cpu_percent or node.network_rx_bytes_total
+- `cluster-metrics` - Time series of one metric combined across nodes (counters summed, ratios averaged)
+- `cluster-latest` - Latest value of every metric, combined across nodes
+- `reporting` - Whether each worker reports metrics, and why not
+- `disk-health` - Latest software RAID and drive SMART health for a node
+- `alert-rules` - CPU, memory and disk alerts on a node
 - `docker-disk-usage` (`df`) - Docker disk usage by images, containers, volumes and build cache (docker system df) on the control-plane host
 
 ### `server status`
@@ -5655,8 +10779,111 @@ Time series of one control-plane host metric, e.g. node.cpu_percent or node.netw
 |------|-------------|---------|----------|
 | `--metric <name>` | Metric name (node.cpu_percent, node.memory_used_bytes, node.disk_used_bytes, node.disk_read_bytes_total, node.network_tx_bytes_total, ...) | - | Yes |
 | `--range <range>` | Time window: 1h, 6h, 24h, 7d | `1h` | No |
+| `--start <time>` | Start of an explicit window (ISO 8601); with --end, instead of --range | - | No |
+| `--end <time>` | End of an explicit window (ISO 8601) | - | No |
+| `--percentile <p>` | Aggregate each bucket at this percentile (e.g. 0.95) instead of the mean | - | No |
 | `--node <id>` | Node ID (0 = control plane) | `0` | No |
 | `--json` | Output in JSON format | - | No |
+
+### `server cluster-metrics`
+
+Time series of one metric combined across nodes (counters summed, ratios averaged)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--metric <name>` | Metric name, e.g. node.cpu_percent | - | Yes |
+| `--nodes <ids>` | Comma-separated node IDs, e.g. 0,1,2 | - | Yes |
+| `--range <range>` | Time window, e.g. 1h, 24h, 7d | - | No |
+| `--start <time>` | Start of an explicit window (ISO 8601) | - | No |
+| `--end <time>` | End of an explicit window (ISO 8601) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `server cluster-latest`
+
+Latest value of every metric, combined across nodes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--nodes <ids>` | Comma-separated node IDs | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `server reporting`
+
+Whether each worker reports metrics, and why not
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `server disk-health`
+
+Latest software RAID and drive SMART health for a node
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `server alert-rules`
+
+CPU, memory and disk alerts on a node
+
+**Subcommands:**
+
+- `get` - Show one of a node's resource alerts
+- `create` - Alert when a node metric crosses a threshold
+- `delete` (`rm`) - Delete a node's resource alert
+
+#### `server alert-rules get`
+
+Show one of a node's resource alerts
+
+**Usage:** `server alert-rules get <id> <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `server alert-rules create`
+
+Alert when a node metric crosses a threshold
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `--name <name>` | Rule name | - | Yes |
+| `--metric <name>` | Metric, e.g. node.cpu_percent or node.disk_used_percent | - | Yes |
+| `--comparator <op>` | One of >, <, >=, <=, or gt, lt, gte, lte | - | Yes |
+| `--threshold <value>` | Threshold value | - | Yes |
+| `--severity <level>` | One of warning, critical | `warning` | No |
+| `--for <seconds>` | How long the condition must hold before it fires | - | No |
+| `--disabled` | Create it turned off | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `server alert-rules delete` (alias: `rm`)
+
+Delete a node's resource alert
+
+**Usage:** `server alert-rules delete <rule-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (0 = control plane) | `0` | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
 
 ### `server docker-disk-usage` (alias: `df`)
 
@@ -5681,6 +10908,12 @@ Inspect distributed traces and operation latency
 - `breakdown` - Show where the time inside one operation goes: queries, downstream calls, its own code
 - `page` - Compare a page's web vitals with the backend requests that served it
 - `show` (`get`) - Show every span of one trace: timing, service, status, attributes and events
+- `query-global` - Query global traces
+- `query-global-summaries` - Query global trace summaries
+- `get-unified` - Assemble a unified cross-project span waterfall (Phase 2)
+- `query-summaries` - Query trace summaries — one row per trace with span count, error count, root span info, and proper..
+- `query` - Query trace spans with optional filters
+- `get-cross-siblings` - Discover sibling projects that share the same 'trace_id' (Phase 1 banner)
 
 ### `traces span-stats` (alias: `operations`, `ops`)
 
@@ -5779,6 +11012,133 @@ Show every span of one trace: timing, service, status, attributes and events
 | `--start-time <iso>` | Look for the trace from this time (ISO 8601); pair with --end-time | - | No |
 | `--end-time <iso>` | Look for the trace up to this time (ISO 8601); pair with --start-time | - | No |
 | `--json` | Output the spans in JSON format | - | No |
+
+### `traces query-global`
+
+Query global traces
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Query parameter project_id | - | No |
+| `--trace-id <value>` | Query parameter trace_id | - | No |
+| `--service-name <value>` | Query parameter service_name | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--min-duration-ms <number>` | Query parameter min_duration_ms | - | No |
+| `--start-time <value>` | Query parameter start_time | - | No |
+| `--end-time <value>` | Query parameter end_time | - | No |
+| `--environment-id <n>` | Query parameter environment_id | - | No |
+| `--deployment-id <n>` | Query parameter deployment_id | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs. e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--sort-by <value>` | Sort field for the trace-summaries list: "start_time" (default) or "duration" | - | No |
+| `--sort-order <value>` | Sort direction: "asc" or "desc" (default) | - | No |
+| `--limit <n>` | Query parameter limit | - | No |
+| `--offset <n>` | Query parameter offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces query-global-summaries`
+
+Query global trace summaries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Query parameter project_id | - | No |
+| `--trace-id <value>` | Query parameter trace_id | - | No |
+| `--service-name <value>` | Query parameter service_name | - | No |
+| `--status <value>` | Query parameter status | - | No |
+| `--min-duration-ms <number>` | Query parameter min_duration_ms | - | No |
+| `--start-time <value>` | Query parameter start_time | - | No |
+| `--end-time <value>` | Query parameter end_time | - | No |
+| `--environment-id <n>` | Query parameter environment_id | - | No |
+| `--deployment-id <n>` | Query parameter deployment_id | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs. e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--sort-by <value>` | Sort field for the trace-summaries list: "start_time" (default) or "duration" | - | No |
+| `--sort-order <value>` | Sort direction: "asc" or "desc" (default) | - | No |
+| `--limit <n>` | Query parameter limit | - | No |
+| `--offset <n>` | Query parameter offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces get-unified`
+
+Assemble a unified cross-project span waterfall (Phase 2)
+
+**Usage:** `traces get-unified <trace-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339); pair with end_time, max 31 days | - | No |
+| `--end-time <value>` | Window end (RFC 3339); pair with start_time, max 31 days | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces query-summaries`
+
+Query trace summaries — one row per trace with span count, error count, root span info, and proper..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--trace-id <value>` | Filter by trace ID | - | No |
+| `--service-name <value>` | Filter by service name | - | No |
+| `--status <value>` | Filter by status (OK, ERROR) | - | No |
+| `--min-duration-ms <number>` | Minimum trace duration in ms | - | No |
+| `--start-time <value>` | Start time (RFC 3339) | - | No |
+| `--end-time <value>` | End time (RFC 3339) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--deployment-id <n>` | Filter by deployment ID | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs, e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--sort-by <value>` | Sort field: 'start_time' (default) or 'duration' | - | No |
+| `--sort-order <value>` | Sort direction: 'asc' or 'desc' (default) | - | No |
+| `--include-total` | Compute the 'total' count (default: true) | - | No |
+| `--no-include-total` | Set include_total to false | - | No |
+| `--limit <n>` | Max traces to return (default: 50, max: 100) | - | No |
+| `--offset <n>` | Offset for pagination | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces query`
+
+Query trace spans with optional filters
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--trace-id <value>` | Filter by trace ID | - | No |
+| `--service-name <value>` | Filter by service name | - | No |
+| `--status <value>` | Filter by status (OK, ERROR, UNSET) | - | No |
+| `--min-duration-ms <number>` | Minimum span duration in ms | - | No |
+| `--start-time <value>` | Start time (RFC 3339) | - | No |
+| `--end-time <value>` | End time (RFC 3339) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--deployment-id <n>` | Filter by deployment ID | - | No |
+| `--attributes <value>` | Filter by span attributes as comma-separated key=value pairs, e.g.... | - | No |
+| `--name-pattern <value>` | Filter by span name pattern (ILIKE) | - | No |
+| `--limit <n>` | Max spans to return (default: 100, max: 1000) | - | No |
+| `--offset <n>` | Offset for pagination | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces get-cross-siblings`
+
+Discover sibling projects that share the same 'trace_id' (Phase 1 banner)
+
+**Usage:** `traces get-cross-siblings <trace-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--exclude-project-id <n>` | Project ID to exclude (the caller's own project) so the UI does not render a self-link | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `facets`
 
@@ -6089,6 +11449,17 @@ Inspect the OTLP ingest pipeline itself — throughput, drops and failure reason
 
 - `ingest-errors` - Show why ingest batches were dropped, grouped by signal and failure reason
 - `pipeline-history` - Show pipeline counter trends over time (received/stored/dropped per signal)
+- `alerts` - Alerts commands
+- `get-cloud-backfill-status` - Status of the most recent Temps Cloud telemetry backfill for a project
+- `dashboards` - Dashboards commands
+- `genai` - Genai commands
+- `has-traces` - Whether a project has ever received at least one trace span
+- `get-health` - Get health summaries for a project
+- `insights` - Insights commands
+- `logs` - Logs commands
+- `get-pipeline-stats` - Get OTel pipeline statistics (admin/system view)
+- `get-quota` - Get storage quota for a project
+- `observe` - Observe commands
 
 ### `otel ingest-errors`
 
@@ -6114,6 +11485,594 @@ Show pipeline counter trends over time (received/stored/dropped per signal)
 | `--end-time <iso>` | Explicit window end (RFC 3339) — overrides --period | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `otel alerts`
+
+Alerts commands
+
+**Subcommands:**
+
+- `list` - List alert rules for a project (newest first, paginated)
+- `create` - Create a new alert rule for a project
+- `preview` - Backtest an anomaly detector over a time range without saving a rule
+- `delete` - Delete an alert rule
+- `get` - Fetch a single alert rule by id
+- `update` - Update an alert rule's fields
+
+#### `otel alerts list`
+
+List alert rules for a project (newest first, paginated)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Page size (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel alerts create`
+
+Create a new alert rule for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--aggregation <value>` | One of 'avg\|sum\|min\|max\|count\|rate\|p50\|p90\|p95\|p99' [required] | - | No |
+| `--detection-config <json>` | The detector: a discriminated union keyed by 'kind' (JSON) [required] | - | No |
+| `--dynamic-alerts` | When true (and 'group_by' is set) fire one independent alarm per breaching series | - | No |
+| `--no-dynamic-alerts` | Set dynamic_alerts to false | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--for-duration-secs <n>` | Body field for_duration_secs [required] | - | No |
+| `--group-by <value>` | Label keys to break the metric down by, e.g. '["endpoint","region"]' (repeatable) | - | No |
+| `--grouped-notification-threshold <n>` | When more than this many series transition to firing in the same tick, only the first gets the expensive... | - | No |
+| `--label-filters <json>` | AND-combined label equality filters: '[["key","value"],…]' (JSON) | - | No |
+| `--max-series <n>` | Cardinality cap for dynamic alerting: at most this many series (top by '\|value\|') | - | No |
+| `--metric-name <value>` | The OTel metric to watch | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--project-id <n>` | Body field project_id [required] | - | No |
+| `--severity <value>` | One of 'info\|warning\|critical' [required] | - | No |
+| `--source <json>` | What the rule watches: the metric above (the default), or the number of log lines matching a saved search... (JSON) | - | No |
+| `--window-secs <n>` | Body field window_secs [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel alerts preview`
+
+Backtest an anomaly detector over a time range without saving a rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--aggregation <value>` | One of 'avg\|sum\|min\|max\|count\|rate\|p50\|p90\|p95\|p99' [required] | - | No |
+| `--detection-config <json>` | The detector to backtest. 'static' and 'anomaly' are supported — the kinds the evaluator actually runs (JSON) [required] | - | No |
+| `--end-time <value>` | RFC 3339; defaults to now | - | No |
+| `--metric-name <value>` | Body field metric_name [required] | - | No |
+| `--project-id <n>` | Body field project_id [required] | - | No |
+| `--start-time <value>` | RFC 3339; defaults to 7 days before 'end_time' | - | No |
+| `--window-secs <n>` | Body field window_secs [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel alerts delete`
+
+Delete an alert rule
+
+**Usage:** `otel alerts delete <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Owning project ID (scopes the delete) [required] | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel alerts get`
+
+Fetch a single alert rule by id
+
+**Usage:** `otel alerts get <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Owning project ID (scopes the lookup) [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel alerts update`
+
+Update an alert rule's fields
+
+**Usage:** `otel alerts update <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Owning project ID (scopes the update) [required] | - | No |
+| `--aggregation <value>` | Body field aggregation | - | No |
+| `--detection-config <json>` | The typed detector definition stored (as jsonb) in 'metric_alert_rules.detection_config' (JSON) | - | No |
+| `--dynamic-alerts` | Toggles per-series ("dynamic") alerting (absent = leave unchanged) | - | No |
+| `--no-dynamic-alerts` | Set dynamic_alerts to false | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--for-duration-secs <n>` | Body field for_duration_secs | - | No |
+| `--group-by <value>` | Replaces the group_by keys wholesale when present (absent = leave unchanged) (repeatable) | - | No |
+| `--grouped-notification-threshold <n>` | Updates the notification-grouping threshold (absent = leave unchanged) | - | No |
+| `--label-filters <json>` | Replaces the label filters wholesale when present (absent = leave unchanged) (JSON) | - | No |
+| `--max-series <n>` | Updates the dynamic-alerting cardinality cap (absent = leave unchanged) | - | No |
+| `--metric-name <value>` | Body field metric_name | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--severity <value>` | Body field severity | - | No |
+| `--source <json>` | What series a rule is evaluated on (ADR 108 D1) (JSON) | - | No |
+| `--window-secs <n>` | Body field window_secs | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel get-cloud-backfill-status`
+
+Status of the most recent Temps Cloud telemetry backfill for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel dashboards`
+
+Dashboards commands
+
+**Subcommands:**
+
+- `list` - List dashboards for a project (newest first, paginated)
+- `create` - Create a new dashboard for a project
+- `delete` - Delete a dashboard
+- `get` - Fetch a single dashboard by id
+- `update` - Update a dashboard's name and/or layout
+
+#### `otel dashboards list`
+
+List dashboards for a project (newest first, paginated)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Page size (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel dashboards create`
+
+Create a new dashboard for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--layout <json>` | The typed layout persisted (as JSONB) in 'metric_dashboards.layout' (JSON) [required] | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--project-id <n>` | Body field project_id [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel dashboards delete`
+
+Delete a dashboard
+
+**Usage:** `otel dashboards delete <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Owning project ID (scopes the delete) [required] | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel dashboards get`
+
+Fetch a single dashboard by id
+
+**Usage:** `otel dashboards get <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Owning project ID (scopes the lookup) [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel dashboards update`
+
+Update a dashboard's name and/or layout
+
+**Usage:** `otel dashboards update <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Owning project ID (scopes the update) [required] | - | No |
+| `--layout <json>` | The typed layout persisted (as JSONB) in 'metric_dashboards.layout' (JSON) | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel genai`
+
+Genai commands
+
+**Subcommands:**
+
+- `query-traces` - Query GenAI trace summaries — traces containing spans with 'gen_ai.*' attributes
+- `get-trace` - Get GenAI span details for a specific trace
+
+#### `otel genai query-traces`
+
+Query GenAI trace summaries — traces containing spans with 'gen_ai.*' attributes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--service-name <value>` | Filter by service name | - | No |
+| `--gen-ai-system <value>` | Filter by AI system (openai, anthropic, etc.) | - | No |
+| `--gen-ai-model <value>` | Filter by model (gpt-6.2-sol, claude-sonnet-5-5, etc.) | - | No |
+| `--start-time <value>` | Start time (RFC 3339) | - | No |
+| `--end-time <value>` | End time (RFC 3339) | - | No |
+| `--limit <n>` | Max traces to return (default: 50, max: 100) | - | No |
+| `--offset <n>` | Offset for pagination | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel genai get-trace`
+
+Get GenAI span details for a specific trace
+
+**Usage:** `otel genai get-trace <trace-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--start-time <value>` | Window start (RFC 3339); pair with end_time, max 31 days | - | No |
+| `--end-time <value>` | Window end (RFC 3339); pair with start_time, max 31 days | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel has-traces`
+
+Whether a project has ever received at least one trace span
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel get-health`
+
+Get health summaries for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel insights`
+
+Insights commands
+
+**Subcommands:**
+
+- `list` - List anomaly insights for a project
+
+#### `otel insights list`
+
+List anomaly insights for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--status <value>` | Filter by status (active, resolved) | - | No |
+| `--limit <n>` | Max insights to return (default: 20, max: 100) | - | No |
+| `--offset <n>` | Offset for pagination | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel logs`
+
+Logs commands
+
+**Subcommands:**
+
+- `query` - Query log records with optional filters
+
+#### `otel logs query`
+
+Query log records with optional filters
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--severity <value>` | Filter by severity (TRACE, DEBUG, INFO, WARN, ERROR, FATAL) | - | No |
+| `--service-name <value>` | Filter by service name | - | No |
+| `--search <value>` | Full-text search in log body (ILIKE) | - | No |
+| `--attribute-key <value>` | Exact attribute key; pair with attribute_value | - | No |
+| `--attribute-value <value>` | Exact string or numeric text, preserving int64 precision | - | No |
+| `--attribute-type <value>` | Optional native declared type; older records without type metadata do not match (one of: string, boolean, integer, double, array, object, bytes) | - | No |
+| `--attribute-op <value>` | Default eq; numeric types also support lt/lte/gt/gte (one of: eq, ne, lt, lte, gt, gte) | - | No |
+| `--trace-id <value>` | Filter by correlated trace ID | - | No |
+| `--start-time <value>` | Start time (RFC 3339) | - | No |
+| `--end-time <value>` | End time (RFC 3339) | - | No |
+| `--limit <n>` | Max logs to return (default: 100, max: 1000) | - | No |
+| `--offset <n>` | Offset for pagination | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel get-pipeline-stats`
+
+Get OTel pipeline statistics (admin/system view)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `otel get-quota`
+
+Get storage quota for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `otel observe`
+
+Observe commands
+
+**Subcommands:**
+
+- `observability-list-events` - List a merged page of observability events for a project
+- `observability-full-event` - Fetch the un-truncated form of one event by '(kind, id)'
+
+#### `otel observe observability-list-events`
+
+List a merged page of observability events for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--kinds <value>` | Comma-separated kinds: 'request,span,error,revenue' | - | No |
+| `--from <value>` | Inclusive lower bound on event timestamp (ISO 8601, 'Z' suffix) | - | No |
+| `--to <value>` | Inclusive upper bound on event timestamp | - | No |
+| `--deployment-id <n>` | Query parameter deployment_id | - | No |
+| `--environment-id <n>` | Query parameter environment_id | - | No |
+| `--search <value>` | Free-text substring matched against per-kind summary fields (request path / error class / revenue event_type) | - | No |
+| `--limit <n>` | Page size (default 50, max 200) | - | No |
+| `--hide-bots` | When 'true', exclude bot/crawler request rows | - | No |
+| `--no-hide-bots` | Set hide_bots to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `otel observe observability-full-event`
+
+Fetch the un-truncated form of one event by '(kind, id)'
+
+**Usage:** `otel observe observability-full-event <kind> <event-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ts <value>` | The row's event timestamp as returned by the list endpoint | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `kv`
+
+Read and write a project's keys in the KV store, and manage the KV service
+
+**Subcommands:**
+
+- `get` - Get the value of a key
+- `set` - Set a key; the value is a string unless --json-value
+- `del` (`delete`) - Delete one or more keys
+- `keys` (`ls`) - List keys matching a pattern (* and ? wildcards; default *)
+- `ttl` - Show how long until a key expires
+- `expire` - Expire a key after a number of seconds
+- `incr` - Increment a numeric key (creating it at 0 first)
+- `status` - Show whether the KV service is enabled and healthy on this instance
+- `enable` - Enable the KV service on this instance (starts its Redis container)
+- `update` - Change the Docker image the KV service runs (recreates its container)
+- `disable` - Disable the KV service on this instance (stops its container; every project loses KV access)
+- `container-name` - Show, or set with --container-name/--reset, the Docker container name of the KV service
+
+### `kv get`
+
+Get the value of a key
+
+**Usage:** `kv get <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv set`
+
+Set a key; the value is a string unless --json-value
+
+**Usage:** `kv set <key> [value] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json-value` | Parse the value as JSON (a number, object, array, true/false or null) | - | No |
+| `--ex <seconds>` | Expire the key after this many seconds | - | No |
+| `--px <milliseconds>` | Expire the key after this many milliseconds | - | No |
+| `--nx` | Only set the key if it does not exist | - | No |
+| `--xx` | Only set the key if it already exists | - | No |
+| `--json` | Output in JSON format | - | No |
+| `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
+
+### `kv del` (alias: `delete`)
+
+Delete one or more keys
+
+**Usage:** `kv del <keys...> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv keys` (alias: `ls`)
+
+List keys matching a pattern (* and ? wildcards; default *)
+
+**Usage:** `kv keys [pattern] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv ttl`
+
+Show how long until a key expires
+
+**Usage:** `kv ttl <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv expire`
+
+Expire a key after a number of seconds
+
+**Usage:** `kv expire <key> <seconds> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv incr`
+
+Increment a numeric key (creating it at 0 first)
+
+**Usage:** `kv incr <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--by <amount>` | Amount to add, may be negative (default 1) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv status`
+
+Show whether the KV service is enabled and healthy on this instance
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `kv enable`
+
+Enable the KV service on this instance (starts its Redis container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run (default: the one this Temps release pins) | - | No |
+| `--max-memory <size>` | Memory limit, e.g. 256mb or 1gb | - | No |
+| `--persistence` | Persist data to disk | - | No |
+| `--no-persistence` | Keep data in memory only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv update`
+
+Change the Docker image the KV service runs (recreates its container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run | - | Yes |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv disable`
+
+Disable the KV service on this instance (stops its container; every project loses KV access)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `kv container-name`
+
+Show, or set with --container-name/--reset, the Docker container name of the KV service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--container-name <name>` | New container name (must keep the required prefix) | - | No |
+| `--reset` | Go back to the default container name | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `flags` (alias: `flag`)
 
 Manage feature flags (runtime config that changes without a redeploy)
@@ -6133,6 +12092,10 @@ Manage feature flags (runtime config that changes without a redeploy)
 - `enable` - Re-enable a flag in this environment after a kill switch
 - `restore` - Restore an archived flag
 - `archive` - Archive a flag (callers fall back to their own default)
+- `record-exposure` - Record which flags a running app actually evaluated
+- `get-snapshot` - Every flag for the caller's environment, collapsed to what the evaluator needs
+- `ofrep-server-bulk` - OFREP bulk evaluation for server-side OpenFeature SDKs
+- `ofrep-server-single` - OFREP single-flag evaluation for server-side OpenFeature SDKs
 
 ### `flags list` (alias: `ls`)
 
@@ -6355,6 +12318,58 @@ Archive a flag (callers fall back to their own default)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 
+### `flags record-exposure`
+
+Record which flags a running app actually evaluated
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--keys <value>` | Flag keys evaluated since the last report (repeatable) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags get-snapshot`
+
+Every flag for the caller's environment, collapsed to what the evaluator needs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--environment-id <n>` | Required only when the calling token is project-wide rather than scoped to a single environment | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags ofrep-server-bulk`
+
+OFREP bulk evaluation for server-side OpenFeature SDKs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--context <json>` | Body field context (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags ofrep-server-single`
+
+OFREP single-flag evaluation for server-side OpenFeature SDKs
+
+**Usage:** `flags ofrep-server-single <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--context <json>` | Body field context (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `surveys` (alias: `survey`)
 
 Manage in-app surveys (NPS, ratings, choices, open text) and read their answers
@@ -6564,6 +12579,7 @@ List tables, collections, keys or objects in a container
 |------|-------------|---------|----------|
 | `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
 | `--limit <n>` | Maximum entities to return (default: 100) | - | No |
+| `--next-token <token>` | Continue from the next_token of a previous page | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `data schema` (alias: `columns`)
@@ -6595,6 +12611,170 @@ Read rows from an entity
 | `--offset <n>` | Rows to skip (default: 0) | - | No |
 | `--sort-by <field>` | Field to sort by | - | No |
 | `--sort-order <order>` | asc or desc (default: asc) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `blob`
+
+Upload, download and list a project's files in Blob storage, and manage the Blob service
+
+**Subcommands:**
+
+- `list` (`ls`) - List blobs, optionally under a pathname prefix
+- `put` (`upload`) - Upload a local file
+- `get` (`download`) - Download a blob to a file, or to stdout with -o -
+- `head` (`stat`) - Show a blob's metadata (size, content type, last modified) without downloading it
+- `copy` (`cp`) - Copy a blob (by pathname or URL) to a new pathname
+- `del` (`delete`) - Delete one or more blobs
+- `status` - Show whether the Blob service is enabled and healthy on this instance
+- `enable` - Enable the Blob service on this instance (starts its S3-compatible container)
+- `update` - Change the Docker image the Blob service runs (recreates its container)
+- `disable` - Disable the Blob service on this instance (stops its container; every project loses Blob access)
+- `container-name` - Show, or set with --container-name/--reset, the Docker container name of the Blob service
+
+### `blob list` (alias: `ls`)
+
+List blobs, optionally under a pathname prefix
+
+**Usage:** `blob list [prefix] [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--limit <n>` | Blobs per page | - | No |
+| `--cursor <token>` | Continue from the cursor a previous page returned | - | No |
+| `--all` | Follow cursors to list everything (at most 100 pages) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob put` (alias: `upload`)
+
+Upload a local file
+
+**Usage:** `blob put <file> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--pathname <path>` | Where to store it (default: the file name) | - | No |
+| `--content-type <type>` | Content type (default: guessed from the extension) | - | No |
+| `--random-suffix` | Add a random suffix to the pathname so it never overwrites | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob get` (alias: `download`)
+
+Download a blob to a file, or to stdout with -o -
+
+**Usage:** `blob get <pathname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-o, --output <path>` | Where to write it (default: its file name in this directory; - for stdout) | - | No |
+
+### `blob head` (alias: `stat`)
+
+Show a blob's metadata (size, content type, last modified) without downloading it
+
+**Usage:** `blob head <pathname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob copy` (alias: `cp`)
+
+Copy a blob (by pathname or URL) to a new pathname
+
+**Usage:** `blob copy <from> <to> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob del` (alias: `delete`)
+
+Delete one or more blobs
+
+**Usage:** `blob del <pathnames...> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (defaults to the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob status`
+
+Show whether the Blob service is enabled and healthy on this instance
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `blob enable`
+
+Enable the Blob service on this instance (starts its S3-compatible container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run (default: the one this Temps release pins) | - | No |
+| `--root-user <user>` | Root user for S3 access (default: generated) | - | No |
+| `--root-password <password>` | Root password for S3 access (prefer --root-password-stdin) | - | No |
+| `--json` | Output in JSON format | - | No |
+| `--root-password-file <path>` | Read the root password from a file (- reads stdin) instead of --root-password | - | No |
+| `--root-password-stdin` | Read the root password from stdin instead of --root-password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
+
+### `blob update`
+
+Change the Docker image the Blob service runs (recreates its container)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Docker image to run | - | Yes |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob disable`
+
+Disable the Blob service on this instance (stops its container; every project loses Blob access)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `blob container-name`
+
+Show, or set with --container-name/--reset, the Docker container name of the Blob service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--container-name <name>` | New container name (must keep the required prefix) | - | No |
+| `--reset` | Go back to the default container name | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `dsn`
@@ -6796,6 +12976,8 @@ Manage project custom domains
 - `update` - Update a custom domain
 - `remove` (`rm`) - Remove a custom domain
 - `link-cert` - Link a custom domain to a certificate
+- `get-visible-by-hostname` - Find the project assignment for a certificate hostname
+- `reassign` - Move a domain between projects without deleting its route or certificate
 
 ### `custom-domains list` (alias: `ls`)
 
@@ -6822,6 +13004,7 @@ Create a custom domain for a project
 | `--branch <branch>` | Branch name | - | No |
 | `--redirect-to <url>` | Redirect target URL | - | No |
 | `--status-code <code>` | HTTP status code for redirects | - | No |
+| `--service <name>` | Docker Compose service the domain routes to (compose projects only) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `custom-domains show`
@@ -6851,6 +13034,7 @@ Update a custom domain
 | `--branch <branch>` | New branch name | - | No |
 | `--redirect-to <url>` | New redirect target URL | - | No |
 | `--status-code <code>` | New HTTP status code for redirects | - | No |
+| `--service <name>` | Docker Compose service the domain routes to ("" routes to the default service) | - | No |
 
 ### `custom-domains remove` (alias: `rm`)
 
@@ -6877,6 +13061,34 @@ Link a custom domain to a certificate
 | `--domain-id <id>` | Custom domain ID | - | Yes |
 | `--certificate-id <id>` | Certificate ID | - | Yes |
 
+### `custom-domains get-visible-by-hostname`
+
+Find the project assignment for a certificate hostname
+
+**Usage:** `custom-domains get-visible-by-hostname <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `custom-domains reassign`
+
+Move a domain between projects without deleting its route or certificate
+
+**Usage:** `custom-domains reassign <source-project-id> <domain-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--target-environment-id <n>` | Body field target_environment_id [required] | - | No |
+| `--target-project-id <n>` | Body field target_project_id [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `dns-provider` (alias: `dnsp`)
 
 Manage DNS providers and managed domains
@@ -6892,6 +13104,9 @@ Manage DNS providers and managed domains
 - `zones` - List DNS zones for a provider
 - `domains` - Manage domains associated with a DNS provider
 - `lookup` - Lookup DNS A records for a domain
+- `update-managed-domain` - Update a managed domain's settings (hostname mode, sync opt-in, auto-manage)
+- `apply-hostname-mode` - Apply a hostname mode to a managed domain (persist + optional DNS sync + route reload)
+- `preview-hostname-mode` - Preview the impact of switching a managed domain's hostname mode
 
 ### `dns-provider list` (alias: `ls`)
 
@@ -7032,6 +13247,11 @@ Add a managed domain to a provider
 | `--id <id>` | Provider ID | - | Yes |
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `--auto-manage` | Enable auto-management for DNS records | - | No |
+| `--generated-hostname-mode <value>` | Layout of generated hostnames (one of: standard, flat) | - | No |
+| `--proxied-by-default` | Create records proxied through the provider (Cloudflare) by default | - | No |
+| `--no-proxied-by-default` | Set proxied_by_default to false | - | No |
+| `--sync-generated-records` | Keep generated hostnames' DNS records in this zone in sync | - | No |
+| `--no-sync-generated-records` | Set sync_generated_records to false | - | No |
 
 #### `dns-provider domains remove` (alias: `rm`)
 
@@ -7066,6 +13286,61 @@ Lookup DNS A records for a domain
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name to lookup | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `dns-provider update-managed-domain`
+
+Update a managed domain's settings (hostname mode, sync opt-in, auto-manage)
+
+**Usage:** `dns-provider update-managed-domain <provider-id> <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--auto-manage` | Toggle automatic DNS management for this domain | - | No |
+| `--no-auto-manage` | Set auto_manage to false | - | No |
+| `--generated-hostname-mode <value>` | '"standard"' or '"flat"' | - | No |
+| `--proxied-by-default` | Default proxy mode for newly managed records; 'false' is an explicit override | - | No |
+| `--no-proxied-by-default` | Set proxied_by_default to false | - | No |
+| `--sync-generated-records` | Toggle DNS record sync for this domain | - | No |
+| `--no-sync-generated-records` | Set sync_generated_records to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `dns-provider apply-hostname-mode`
+
+Apply a hostname mode to a managed domain (persist + optional DNS sync + route reload)
+
+**Usage:** `dns-provider apply-hostname-mode <provider-id> <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--adopt-records <json>` | Conflicting records, from the preview's 'conflicts', that the user confirmed the sync may adopt — one... (JSON) | - | No |
+| `--mode <value>` | Target mode to apply: '"standard"' or '"flat"' [required] | - | No |
+| `--skip-records <json>` | Conflicting hostnames, from the preview's 'conflicts', that the user chose to leave untouched: the sync... (JSON) | - | No |
+| `--sync-dns` | Also reconcile the provider's DNS zone for the affected hostnames | - | No |
+| `--no-sync-dns` | Set sync_dns to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `dns-provider preview-hostname-mode`
+
+Preview the impact of switching a managed domain's hostname mode
+
+**Usage:** `dns-provider preview-hostname-mode <provider-id> <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | Target mode: standard\|flat [required] | - | No |
+| `--sync` | Include DNS record changes | - | No |
+| `--no-sync` | Set sync to false | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `delivery-profiles` (alias: `delivery-profile`)
@@ -7256,6 +13531,7 @@ Manage instance-wide IP access control rules, and per-project lists (ip-access p
 - `remove` (`rm`) - Delete an IP access control rule
 - `check` - Check if an IP address is blocked
 - `project` - Allow or deny IP ranges for one project or environment
+- `sessions` - Sessions commands
 
 ### `ip-access list` (alias: `ls`)
 
@@ -7394,6 +13670,182 @@ Check whether an address would be allowed
 | `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
 | `--ip <ip>` | Address to evaluate | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `ip-access sessions`
+
+Sessions commands
+
+**Subcommands:**
+
+- `list-providers` - The saved Cloudflare Access tokens
+- `create-provider` - Check a Cloudflare Access token, then save it sealed
+- `check-provider` - Check which Cloudflare Access permissions a pasted token has: Access: Apps and Policies Edit (probed with..
+- `delete-provider` - Delete a saved Cloudflare Access token
+- `sign-out-of-apps` - Sign out of every signed-in address
+- `sign-everyone-out-of-address` - Sign everyone out of a signed-in address
+
+#### `ip-access sessions list-providers`
+
+The saved Cloudflare Access tokens
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access sessions create-provider`
+
+Check a Cloudflare Access token, then save it sealed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--account-id <value>` | Body field account_id [required] | - | No |
+| `--name <value>` | A name to tell tokens apart [required] | - | No |
+| `--token-stdin` | Checked, then sealed; never returned [required] (read from stdin) | - | No |
+| `--token-file <path>` | Checked, then sealed; never returned [required] (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access sessions check-provider`
+
+Check which Cloudflare Access permissions a pasted token has: Access: Apps and Policies Edit (probed with..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--account-id <value>` | The Cloudflare account the Access applications live in (32 hex characters, from the dashboard URL or the... [required] | - | No |
+| `--token-stdin` | The token, as pasted [required] (read from stdin) | - | No |
+| `--token-file <path>` | The token, as pasted [required] (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access sessions delete-provider`
+
+Delete a saved Cloudflare Access token
+
+**Usage:** `ip-access sessions delete-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access sessions sign-out-of-apps`
+
+Sign out of every signed-in address
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access sessions sign-everyone-out-of-address`
+
+Sign everyone out of a signed-in address
+
+**Usage:** `ip-access sessions sign-everyone-out-of-address <address-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `preview-gateway` (alias: `pgw`)
+
+Manage the preview gateway that serves workspace preview URLs (status, settings, logs, restart, upgrade)
+
+**Subcommands:**
+
+- `status` - Show the gateway container's health, image and last setup error
+- `settings` (`show`) - Show the gateway settings: enabled, image, host port, auto-upgrade, container name, and their defaults
+- `configure` (`set`) - Change gateway settings; only the flags you pass are changed
+- `logs` - Print the latest gateway container log lines
+- `restart` - Restart the gateway container (previews are briefly unavailable)
+- `upgrade` - Pull an image and recreate the gateway with it (previews are briefly unavailable)
+
+### `preview-gateway status`
+
+Show the gateway container's health, image and last setup error
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `preview-gateway settings` (alias: `show`)
+
+Show the gateway settings: enabled, image, host port, auto-upgrade, container name, and their defaults
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `preview-gateway configure` (alias: `set`)
+
+Change gateway settings; only the flags you pass are changed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Run the gateway (creates its containers) | - | No |
+| `--disable` | Stop running the gateway (removes its containers; preview URLs stop being served) | - | No |
+| `--image <ref>` | Gateway image to run, ideally an immutable @sha256 reference | - | No |
+| `--reset-image` | Go back to the image pinned in this Temps build | - | No |
+| `--host-port <port>` | Host port the ingress relay's :8080 is published on | - | No |
+| `--auto-upgrade` | Apply the pinned image on every Temps startup (default) | - | No |
+| `--no-auto-upgrade` | Leave the running image alone on startup; upgrade by hand | - | No |
+| `--container-name <name>` | Docker container name; change only when several Temps instances share one Docker daemon | - | No |
+| `--reset-container-name` | Go back to the default container name | - | No |
+| `-y, --yes` | Do not ask before a change that interrupts previews (--disable, a new container name) | - | No |
+| `--json` | Print the saved settings as JSON | - | No |
+
+### `preview-gateway logs`
+
+Print the latest gateway container log lines
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--tail <lines>` | Lines to print, 1 to 2000 (default 200) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `preview-gateway restart`
+
+Restart the gateway container (previews are briefly unavailable)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+
+### `preview-gateway upgrade`
+
+Pull an image and recreate the gateway with it (previews are briefly unavailable)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <ref>` | Image to pull and run, ideally an immutable @sha256 reference | - | No |
+| `--default` | Use the image pinned in this Temps build | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
 
 ## `edge-rules` (alias: `edge-rule`)
 
@@ -7617,6 +14069,8 @@ Manage network policy for workloads: rules, egress/ingress profiles and the effe
 - `rules` - Manage network policy rules
 - `effective` - Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
 - `profile` - Manage a workload's egress and ingress profile
+- `list-node-modes` - List node modes
+- `set-node-mode` - Set node mode
 
 ### `network-policy rules`
 
@@ -7723,6 +14177,31 @@ Set a workload's profile. Each direction is open, restricted, none; a direction 
 | `--ingress <profile>` | Inbound profile (open, restricted, none). Omit for the kind's default | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `network-policy list-node-modes`
+
+List node modes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `network-policy set-node-mode`
+
+Set node mode
+
+**Usage:** `network-policy set-node-mode <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | Body field mode [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `audit`
 
 View audit logs
@@ -7745,6 +14224,7 @@ List audit logs
 | `--offset <n>` | Number of logs to skip | - | No |
 | `--operation-type <type>` | Filter by operation type | - | No |
 | `--user-id <id>` | Filter by user ID | - | No |
+| `--resource-id <id>` | Filter by the ID of the resource acted on | - | No |
 | `--from <timestamp>` | Start timestamp (ISO 8601 or epoch ms) | - | No |
 | `--to <timestamp>` | End timestamp (ISO 8601 or epoch ms) | - | No |
 
@@ -7770,6 +14250,12 @@ View proxy request logs and statistics
 - `by-request` - Get proxy log by request ID
 - `stats` - Get time bucket statistics (last 24 hours)
 - `today` - Get today's request statistics
+- `get-api-traffic-access` - Report whether the current principal may drill into a project's proxy logs
+- `list-known-ai-agents` - List every AI agent the detector knows how to classify
+- `get-ai-agent-pages` - Get the top pages accessed by a specific AI agent over a time window
+- `get-ai-agent-timeline` - Time-bucketed AI-agent request volume, split by provider or agent
+- `get-ai-status-breakdown` - HTTP status-class breakdown for AI-agent traffic — are bots being served (2xx) or hitting broken/blocked..
+- `get-health` - Get user-traffic health summaries for multiple projects (last 1 hour)
 
 ### `proxy-logs list` (alias: `ls`)
 
@@ -7794,6 +14280,23 @@ List proxy logs
 | `--sort-order <order>` | Sort order: asc or desc (default: desc) | - | No |
 | `--is-bot` | Filter for bot requests only | - | No |
 | `--has-error` | Filter for requests with errors only | - | No |
+| `--path-exact <value>` | Only this exact path (--path matches a prefix) | - | No |
+| `--session-id <n>` | Only requests of this analytics session | - | No |
+| `--visitor-id <n>` | Only requests of this visitor | - | No |
+| `--exclude-bots` | Leave out requests from bots | - | No |
+| `--no-exclude-bots` | Set exclude_bots to false | - | No |
+| `--exclude-synthetic` | Leave out synthetic traffic (uptime checks, Temps itself) | - | No |
+| `--no-exclude-synthetic` | Set exclude_synthetic to false | - | No |
+| `--is-ai-agent` | Only (or, with --no-is-ai-agent, never) AI agent requests | - | No |
+| `--no-is-ai-agent` | Set is_ai_agent to false | - | No |
+| `--ai-agent <value>` | Only this AI agent (e.g. GPTBot) | - | No |
+| `--ai-provider <value>` | Only AI agents of this provider (e.g. OpenAI) | - | No |
+| `--request-size-min <n>` | Smallest request body, in bytes | - | No |
+| `--request-size-max <n>` | Largest request body, in bytes | - | No |
+| `--response-size-min <n>` | Smallest response body, in bytes | - | No |
+| `--response-size-max <n>` | Largest response body, in bytes | - | No |
+| `--response-time-min <n>` | Fastest response, in milliseconds | - | No |
+| `--response-time-max <n>` | Slowest response, in milliseconds | - | No |
 
 ### `proxy-logs show`
 
@@ -7828,6 +14331,9 @@ Get time bucket statistics (last 24 hours)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--has-project` | Only requests routed to a project (or, with --no-has-project, to none) | - | No |
+| `--no-has-project` | Set has_project to false | - | No |
+| `--status-code-class <value>` | Only this status class (one of: 2xx, 3xx, 4xx, 5xx) | - | No |
 
 ### `proxy-logs today`
 
@@ -7837,6 +14343,91 @@ Get today's request statistics
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+| `--status-code-class <value>` | Only this status class (one of: 2xx, 3xx, 4xx, 5xx) | - | No |
+
+### `proxy-logs get-api-traffic-access`
+
+Report whether the current principal may drill into a project's proxy logs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `proxy-logs list-known-ai-agents`
+
+List every AI agent the detector knows how to classify
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `proxy-logs get-ai-agent-pages`
+
+Get the top pages accessed by a specific AI agent over a time window
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--agent <value>` | Canonical agent name to filter by (e.g. 'ChatGPT-User', 'ClaudeBot') [required] | - | No |
+| `--project-id <n>` | Filter by project ID | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--start-time <value>` | Start time (ISO 8601) | - | No |
+| `--end-time <value>` | End time (ISO 8601) | - | No |
+| `--limit <n>` | Maximum rows to return | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `proxy-logs get-ai-agent-timeline`
+
+Time-bucketed AI-agent request volume, split by provider or agent
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Filter by project ID | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--start-time <value>` | Start time (ISO 8601) | - | No |
+| `--end-time <value>` | End time (ISO 8601) | - | No |
+| `--group-by <value>` | Grouping dimension: 'provider' (default) or 'agent' | - | No |
+| `--bucket <value>` | Bucket interval override (e.g. '1 hour', '1 day') | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `proxy-logs get-ai-status-breakdown`
+
+HTTP status-class breakdown for AI-agent traffic — are bots being served (2xx) or hitting broken/blocked..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Filter by project ID (recommended for per-project analytics) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--start-time <value>` | Start time (ISO 8601) | - | No |
+| `--end-time <value>` | End time (ISO 8601) | - | No |
+| `--limit <n>` | Maximum rows to return | - | No |
+| `--path <value>` | Optional exact path filter | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `proxy-logs get-health`
+
+Get user-traffic health summaries for multiple projects (last 1 hour)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-ids <value>` | Comma-separated list of project IDs [required] | - | No |
+| `--start-time <value>` | Optional start time (ISO 8601) | - | No |
+| `--end-time <value>` | Optional end time (ISO 8601) | - | No |
+| `--is-bot` | Filter by bot detection | - | No |
+| `--no-is-bot` | Set is_bot to false | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `logs` (alias: `glogs`)
@@ -7853,6 +14444,19 @@ Search collected logs across every project and database you can access
 - `capabilities` - Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available
 - `saved` - Saved log searches: named filters you can reopen, chart on a dashboard and alert on
 - `keys` - Ingest keys for POST /api/logs/ingest (newline-delimited JSON from Vector, Fluent Bit or any HTTP client)
+- `get-context` - Get context lines surrounding a specific log line
+- `global-aggregate` - Global log aggregate
+- `global-attribute-keys` - Global log attribute keys
+- `global-capabilities` - Global log capabilities
+- `global-facets-attrs` - Global log facets attrs
+- `global-histogram` - Global log histogram
+- `ingest` - Ingest newline-delimited JSON log lines with a log ingest key
+- `ingest-budget` - The ingestion budget and the containers dropping lines over it, for the warnings on the log views
+- `tail` - Live tail logs via Server-Sent Events
+- `purge` - Purge all logs for a project before a given timestamp
+- `project-search` - Search one project's (or one database's) log lines, newest first, with a cursor for the next page
+- `get-saved-search` - Read one saved log search
+- `update-saved-search` - Change a saved log search
 
 ### `logs search`
 
@@ -8124,6 +14728,241 @@ Revoke an ingest key; collectors using it are refused
 |------|-------------|---------|----------|
 | `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 
+### `logs get-context`
+
+Get context lines surrounding a specific log line
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--timestamp <value>` | Target line timestamp (RFC 3339) [required] | - | No |
+| `--container-id <value>` | Target line container ID [required] | - | No |
+| `--line-id <value>` | Target line_id, as a decimal string [required] | - | No |
+| `--lines <n>` | Context lines before and after (default: 25, max 50) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-aggregate`
+
+Global log aggregate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--group-by <value>` | Comma-separated label names and/or attr:<name> [required] | - | No |
+| `--metric <value>` | count \| count_distinct:<k> \| avg:<k> \| p50:<k> \| p95:<k> \| p99:<k> \| max:<k> \| sum:<k> [required] | - | No |
+| `--limit <n>` | Max rows returned (default 50, cap 1000) | - | No |
+| `--attr <value>` | Repeatable attribute predicate: <key><op><value> or <key>? (repeatable) [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-attribute-keys`
+
+Global log attribute keys
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--limit <n>` | Max keys returned (default/cap 1000) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-capabilities`
+
+Global log capabilities
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-facets-attrs`
+
+Global log facets attrs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--keys <value>` | Comma-separated label names or attr:<name> [required] | - | No |
+| `--attr <value>` | Repeatable attribute predicate: <key><op><value> or <key>? (repeatable) [required] | - | No |
+| `--limit <n>` | Max values per key (default/cap 1000) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-histogram`
+
+Global log histogram
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--bucket-secs <n>` | Bucket width in seconds (default 60) | - | No |
+| `--group-by <value>` | One label name or attr:<name> to split series by | - | No |
+| `--max-groups <n>` | Max series before folding the rest into "other" (default 8) | - | No |
+| `--attr <value>` | Repeatable attribute predicate: <key><op><value> or <key>? (repeatable) [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs ingest`
+
+Ingest newline-delimited JSON log lines with a log ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--input <path>` | The file to upload (- for stdin) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `logs ingest-budget`
+
+The ingestion budget and the containers dropping lines over it, for the warnings on the log views
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `logs tail`
+
+Live tail logs via Server-Sent Events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <value>` | Project ID [required] | - | No |
+| `--service <value>` | Service name [required] | - | No |
+| `--env <value>` | Environment [required] | - | No |
+| `--levels <value>` | Optional level filters (repeatable) [required] | - | No |
+| `--text <value>` | Optional text filter | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs purge`
+
+Purge all logs for a project before a given timestamp
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--before <value>` | Delete all logs before this timestamp (ISO 8601) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs project-search`
+
+Search one project's (or one database's) log lines, newest first, with a cursor for the next page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID (0 with --external-service-id searches a database's logs) [required] | - | No |
+| `--external-service-id <n>` | Search this external service's (database's) logs instead | - | No |
+| `--start-time <value>` | Window start (RFC 3339; default: 24 hours ago) | - | No |
+| `--end-time <value>` | Window end (RFC 3339; default: now) | - | No |
+| `--text <value>` | Only lines containing this text | - | No |
+| `--levels <value>` | Only these levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Only these environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Only these services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Only these containers (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Only lines from these nodes (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Only lines from this deployment | - | No |
+| `--context-lines <n>` | Lines of context around each match | - | No |
+| `--page-size <n>` | Lines per page | - | No |
+| `--cursor <value>` | Resume from a previous next_cursor | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs get-saved-search`
+
+Read one saved log search
+
+**Usage:** `logs get-saved-search <saved-search-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs update-saved-search`
+
+Change a saved log search
+
+**Usage:** `logs update-saved-search <saved-search-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--description <value>` | Absent leaves the description unchanged; an empty string clears it | - | No |
+| `--name <value>` | Absent leaves the name unchanged | - | No |
+| `--pinned` | Body field pinned | - | No |
+| `--no-pinned` | Set pinned to false | - | No |
+| `--query <json>` | The stored filter set of a saved search (JSON) | - | No |
+| `--time-range <value>` | Body field time_range | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `email-domains` (alias: `edom`)
 
 Manage email domains for transactional email
@@ -8198,6 +15037,7 @@ Remove an email domain
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Email domain ID | - | Yes |
+| `--delete-from-provider` | Also delete the domain at the email provider (SES, etc.) | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
@@ -8291,6 +15131,9 @@ Manage email providers (SES, Scaleway) for transactional email
 - `remove` (`rm`) - Remove an email provider
 - `test` - Test an email provider by sending a test email
 - `discoverable-domains` (`discover-domains`) - List domain identities already registered on the provider's side, for importing
+- `update` - Update an email provider
+- `setup-tracking` - One-click AWS-side setup of SES event tracking (SNS topic + webhook subscription + SESv2 event..
+- `get-tracking-status` - Live status of SES event tracking for a provider
 
 ### `email-providers list` (alias: `ls`)
 
@@ -8311,17 +15154,26 @@ Create a new email provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Provider name | - | No |
-| `-t, --type <type>` | Provider type (ses, scaleway) | - | No |
+| `-t, --type <type>` | Provider type (ses, scaleway, smtp) | - | No |
 | `-r, --region <region>` | Cloud region | - | No |
 | `--access-key-id <key>` | AWS access key ID (for SES) | - | No |
 | `--secret-access-key <secret>` | AWS secret access key (for SES) | - | No |
 | `--api-key <key>` | Scaleway API key | - | No |
 | `--project-id <id>` | Scaleway project ID | - | No |
+| `--sns-topic-arn <arn>` | SES: the only SNS topic allowed to deliver bounce and complaint events | - | No |
+| `--smtp-host <host>` | SMTP server host name | - | No |
+| `--smtp-port <port>` | SMTP port (default: 587, or 465 with --smtp-encryption tls) | - | No |
+| `--smtp-encryption <mode>` | starttls (default), tls or none | - | No |
+| `--smtp-username <user>` | SMTP user name, when the server requires a sign-in | - | No |
+| `--smtp-password <password>` | SMTP password | - | No |
+| `--smtp-accept-invalid-certs` | Accept a self-signed or otherwise invalid server certificate | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 | `--secret-access-key-file <path>` | Read the AWS secret access key from a file (- reads stdin) instead of --secret-access-key | - | No |
 | `--secret-access-key-stdin` | Read the AWS secret access key from stdin instead of --secret-access-key | - | No |
 | `--api-key-file <path>` | Read the Scaleway API key from a file (- reads stdin) instead of --api-key | - | No |
 | `--api-key-stdin` | Read the Scaleway API key from stdin instead of --api-key | - | No |
+| `--smtp-password-file <path>` | Read the SMTP password from a file (- reads stdin) instead of --smtp-password | - | No |
+| `--smtp-password-stdin` | Read the SMTP password from stdin instead of --smtp-password | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `email-providers show`
@@ -8370,6 +15222,52 @@ List domain identities already registered on the provider's side, for importing
 | `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
+### `email-providers update`
+
+Update an email provider
+
+**Usage:** `email-providers update <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--is-active` | Body field is_active | - | No |
+| `--no-is-active` | Set is_active to false | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--region <value>` | Body field region | - | No |
+| `--scaleway-credentials <json>` | Body field scaleway_credentials (JSON) | - | No |
+| `--ses-credentials <json>` | Body field ses_credentials (JSON) | - | No |
+| `--smtp-credentials <json>` | Generic SMTP credentials request body (JSON) | - | No |
+| `--sns-topic-arn <value>` | Rotate or clear the exact SNS topic allowed for this SES provider | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `email-providers setup-tracking`
+
+One-click AWS-side setup of SES event tracking (SNS topic + webhook subscription + SESv2 event..
+
+**Usage:** `email-providers setup-tracking <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `email-providers get-tracking-status`
+
+Live status of SES event tracking for a provider
+
+**Usage:** `email-providers get-tracking-status <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `incidents` (alias: `incident`)
 
 Manage incidents for status pages and monitoring
@@ -8383,6 +15281,7 @@ Manage incidents for status pages and monitoring
 - `set-visibility` - Show or hide an incident update on published status pages
 - `updates` - List status updates for an incident
 - `bucketed` - Get bucketed incident data for a project
+- `update` - Set or clear the heading an incident shows on published status pages
 
 ### `incidents list` (alias: `ls`)
 
@@ -8482,6 +15381,21 @@ Get bucketed incident data for a project
 | `--environment-id <id>` | Filter by environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `incidents update`
+
+Set or clear the heading an incident shows on published status pages
+
+**Usage:** `incidents update <incident-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--public-title <value>` | New public heading [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `status-pages` (alias: `status-page`)
 
 Publish public status pages showing monitors from any of your projects
@@ -8502,6 +15416,11 @@ Publish public status pages showing monitors from any of your projects
 - `maintenance` - Schedule maintenance windows: shown on the page, no outage alerts, no downtime counted
 - `webhooks` - Post every public update of a status page to signed HTTPS webhooks
 - `password` - Protect a status page with a password
+- `get-overview` - Get status page overview
+- `get-maintenance` - A maintenance window
+- `preview` - Preview what a status page shows visitors, published or not
+- `get-public-feed` - Public status page (Atom feed)
+- `get-public-json` - Public status page (JSON)
 
 ### `status-pages list` (alias: `ls`)
 
@@ -8527,6 +15446,14 @@ Create a draft status page; monitors may come from any project
 | `-g, --group <name=ids>` | Show monitors together under a group, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `-d, --description <text>` | Public description | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--theme <value>` | Color scheme of the public page (one of: auto, light, dark) | - | No |
+| `--accent-color <value>` | Accent color, e.g. #2563eb | - | No |
+| `--logo-url <value>` | HTTPS URL of the logo shown in the header | - | No |
+| `--website-url <value>` | Where the logo links to | - | No |
+| `--show-response-times` | Show monitor response times | - | No |
+| `--no-show-response-times` | Set show_response_times to false | - | No |
+| `--show-uptime-percentage` | Show uptime percentages | - | No |
+| `--no-show-uptime-percentage` | Set show_uptime_percentage to false | - | No |
 
 ### `status-pages show`
 
@@ -8553,6 +15480,14 @@ Change the title, description or monitor selection
 | `-m, --monitor <id=name>` | Replace the selection; repeat for each monitor | - | No |
 | `-g, --group <name=ids>` | With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--theme <value>` | Color scheme of the public page (one of: auto, light, dark) | - | No |
+| `--accent-color <value>` | Accent color, e.g. #2563eb | - | No |
+| `--logo-url <value>` | HTTPS URL of the logo shown in the header | - | No |
+| `--website-url <value>` | Where the logo links to | - | No |
+| `--show-response-times` | Show monitor response times | - | No |
+| `--no-show-response-times` | Set show_response_times to false | - | No |
+| `--show-uptime-percentage` | Show uptime percentages | - | No |
+| `--no-show-uptime-percentage` | Set show_uptime_percentage to false | - | No |
 
 ### `status-pages publish`
 
@@ -8827,10 +15762,23 @@ Post every public update of a status page to signed HTTPS webhooks
 
 **Subcommands:**
 
+- `get` - Show one webhook of a status page
 - `list` (`ls`) - List the webhooks of a status page and how deliveries are going
 - `add` - Add a webhook; its signing secret is printed once
 - `update` - Change the URL, or pause and resume deliveries
 - `remove` (`rm`) - Delete a webhook; events waiting for it are dropped
+
+#### `status-pages webhooks get`
+
+Show one webhook of a status page
+
+**Usage:** `status-pages webhooks get <status-page-id> <webhook-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 #### `status-pages webhooks list` (alias: `ls`)
 
@@ -8915,6 +15863,67 @@ Set or change the password (prompted, or read from stdin); signs every visitor o
 | `--remove` | Remove the password and open the page again | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `status-pages get-overview`
+
+Get status page overview
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages get-maintenance`
+
+A maintenance window
+
+**Usage:** `status-pages get-maintenance <status-page-id> <maintenance-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages preview`
+
+Preview what a status page shows visitors, published or not
+
+**Usage:** `status-pages preview <status-page-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages get-public-feed`
+
+Public status page (Atom feed)
+
+**Usage:** `status-pages get-public-feed <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `status-pages get-public-json`
+
+Public status page (JSON)
+
+**Usage:** `status-pages get-public-json <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `alarms` (alias: `alarm`)
 
 List, acknowledge, and resolve alarms (container crashes, uptime, metrics, databases)
@@ -8925,6 +15934,11 @@ List, acknowledge, and resolve alarms (container crashes, uptime, metrics, datab
 - `summary` - Show active alarm counts by status, severity, and type
 - `ack` (`acknowledge`) - Acknowledge alarms by ID, or every alarm matching the filters with --all
 - `resolve` - Resolve alarms by ID, or every alarm matching the filters with --all
+- `acknowledge-alarm` - Acknowledge a firing alarm (marks it as seen but not resolved)
+- `resolve-alarm` - Resolve an alarm
+- `unsilence` - Lift an alarm's silence before it expires, so the next breach of the same alert notifies again
+- `silence` - Silence an alarm (and future re-fires of the same type/scope) for a chosen duration, without permanently..
+- `system` - System commands
 
 ### `alarms list` (alias: `ls`)
 
@@ -8942,6 +15956,7 @@ List alarms, newest first
 | `--type <type>` | Filter by alarm type (e.g. container_crash) | - | No |
 | `--environment-id <id>` | Filter by environment ID | - | No |
 | `--deployment-id <id>` | Filter by deployment ID | - | No |
+| `--service-id <id>` | Only alarms of this external service | - | No |
 | `--page <n>` | Page number (default: 1) | - | No |
 | `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -9001,6 +16016,125 @@ Resolve alarms by ID, or every alarm matching the filters with --all
 | `--all` | Target every alarm matching the filters instead of explicit IDs | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `alarms acknowledge-alarm`
+
+Acknowledge a firing alarm (marks it as seen but not resolved)
+
+**Usage:** `alarms acknowledge-alarm <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `alarms resolve-alarm`
+
+Resolve an alarm
+
+**Usage:** `alarms resolve-alarm <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `alarms unsilence`
+
+Lift an alarm's silence before it expires, so the next breach of the same alert notifies again
+
+**Usage:** `alarms unsilence <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `alarms silence`
+
+Silence an alarm (and future re-fires of the same type/scope) for a chosen duration, without permanently..
+
+**Usage:** `alarms silence <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--duration-hours <n>` | How long to mute this alarm (and future re-fires of the same type/scope) for, in hours [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `alarms system`
+
+System commands
+
+**Subcommands:**
+
+- `acknowledge` - Acknowledge a firing system alarm
+- `resolve` - Resolve a system alarm
+- `unsilence` - Lift a system alarm's silence before it expires
+- `silence` - Silence a system alarm (and future re-fires of the same type/scope) for a chosen duration, without..
+
+#### `alarms system acknowledge`
+
+Acknowledge a firing system alarm
+
+**Usage:** `alarms system acknowledge <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `alarms system resolve`
+
+Resolve a system alarm
+
+**Usage:** `alarms system resolve <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `alarms system unsilence`
+
+Lift a system alarm's silence before it expires
+
+**Usage:** `alarms system unsilence <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `alarms system silence`
+
+Silence a system alarm (and future re-fires of the same type/scope) for a chosen duration, without..
+
+**Usage:** `alarms system silence <alarm-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--duration-hours <n>` | How long to mute this alarm (and future re-fires of the same type/scope) for, in hours [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `emails` (alias: `email`)
 
 Manage and send emails
@@ -9012,6 +16146,8 @@ Manage and send emails
 - `show` - Show email details
 - `stats` - Get email statistics
 - `validate` - Validate an email address
+- `tracking` - Tracking commands
+- `resend` - Resend a captured email
 
 ### `emails list` (alias: `ls`)
 
@@ -9042,6 +16178,11 @@ Send an email
 | `--body <body>` | Email body | - | No |
 | `--from <email>` | Sender email address | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--cc <value>` | CC recipient (repeatable) (repeatable) | - | No |
+| `--bcc <value>` | BCC recipient (repeatable) (repeatable) | - | No |
+| `--reply-to <value>` | Reply-to address | - | No |
+| `--html <value>` | HTML body, sent alongside the text body | - | No |
+| `--headers <json>` | Extra headers as a JSON object, e.g. {"X-Campaign":"spring"} (JSON) | - | No |
 
 ### `emails show`
 
@@ -9073,6 +16214,90 @@ Validate an email address
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--email <email>` | Email address to validate | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `emails tracking`
+
+Tracking commands
+
+**Subcommands:**
+
+- `get-global-events` - GET /emails/events
+- `get-global-event-stats` - GET /emails/events/stats
+- `get` - Get email tracking summary
+- `get-events` - Get email tracking events
+- `get-links` - Get tracked links for an email
+
+#### `emails tracking get-global-events`
+
+GET /emails/events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--event-type <value>` | Filter by event type (open, click) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Page size (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get-global-event-stats`
+
+GET /emails/events/stats
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get`
+
+Get email tracking summary
+
+**Usage:** `emails tracking get <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get-events`
+
+Get email tracking events
+
+**Usage:** `emails tracking get-events <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--event-type <value>` | Filter by event type (open, click) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `emails tracking get-links`
+
+Get tracked links for an email
+
+**Usage:** `emails tracking get-links <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `emails resend`
+
+Resend a captured email
+
+**Usage:** `emails resend <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 ## `load-balancer` (alias: `lb`)
@@ -9107,6 +16332,7 @@ Create a load balancer route
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain for the route | - | No |
 | `-t, --target <target>` | Target upstream URL | - | No |
+| `--type <type>` | http (default: match the Host header) or tls (match the SNI name, pass TCP through) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `load-balancer show`
@@ -9130,6 +16356,7 @@ Update a load balancer route
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain of the route | - | Yes |
 | `-t, --target <target>` | New target upstream URL | - | No |
+| `--type <type>` | http (match the Host header) or tls (match the SNI name, pass TCP through) | - | No |
 
 ### `load-balancer remove` (alias: `rm`)
 
@@ -9181,6 +16408,11 @@ Discover workloads from a source
 | `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
 | `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--name-pattern <value>` | Only workloads whose name matches this glob or pattern | - | No |
+| `--status-filter <value>` | Only workloads in this state, e.g. running (repeatable) (repeatable) | - | No |
+| `--workload-type-filter <value>` | Only workloads of this type, e.g. container or static-site (repeatable) (repeatable) | - | No |
+| `--label-filter <json>` | Only workloads with these labels, as a JSON object, e.g. {"env":"prod"} (JSON) | - | No |
+| `--limit <n>` | Return at most this many workloads | - | No |
 | `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -9200,6 +16432,12 @@ Discover a source, pick a workload, and show the import plan
 | `--username <name>` | Admin username (portainer source, defaults to "admin") | - | No |
 | `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
 | `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
+| `--name-pattern <value>` | Only workloads whose name matches this glob or pattern | - | No |
+| `--status-filter <value>` | Only workloads in this state, e.g. running (repeatable) (repeatable) | - | No |
+| `--workload-type-filter <value>` | Only workloads of this type, e.g. container or static-site (repeatable) (repeatable) | - | No |
+| `--label-filter <json>` | Only workloads with these labels, as a JSON object, e.g. {"env":"prod"} (JSON) | - | No |
+| `--limit <n>` | Return at most this many workloads | - | No |
+| `--repository-id <n>` | Connected repository to detect the build preset from | - | No |
 | `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -9225,6 +16463,12 @@ Guided end-to-end migration: discover, plan, review, and execute
 | `--branch <branch>` | Branch to deploy | `main` | No |
 | `--dry-run` | Plan only — do not create or deploy anything | - | No |
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--name-pattern <value>` | Only workloads whose name matches this glob or pattern | - | No |
+| `--status-filter <value>` | Only workloads in this state, e.g. running (repeatable) (repeatable) | - | No |
+| `--workload-type-filter <value>` | Only workloads of this type, e.g. container or static-site (repeatable) (repeatable) | - | No |
+| `--label-filter <json>` | Only workloads with these labels, as a JSON object, e.g. {"env":"prod"} (JSON) | - | No |
+| `--limit <n>` | Return at most this many workloads | - | No |
+| `--repository-id <n>` | Connected repository to detect the build preset from | - | No |
 | `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -9265,6 +16509,7 @@ Browse templates and create them
 - `list` (`ls`) - List available templates
 - `create` - Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 - `validate` - Validate a Temps-native template YAML file or directory offline
+- `list-tags` - List all available template tags
 
 ### `templates list` (alias: `ls`)
 
@@ -9276,6 +16521,8 @@ List available templates
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 | `--kind <kind>` | Filter by kind: starter or app | - | No |
+| `--featured` | Only featured templates | - | No |
+| `--tag <tag>` | Only templates with this tag (see: templates list-tags) | - | No |
 
 ### `templates create`
 
@@ -9302,6 +16549,7 @@ Create a template: every service (an app, what `projects` manages), the database
 | `--public-repo` | Make the new repository public (private by default) | - | No |
 | `--no-auto-deploy` | Do not deploy on push to the new repository | - | No |
 | `--idempotency-key <key>` | Reuse a key to get the same result instead of creating twice | - | No |
+| `--runtime-overrides <json>` | Image, command, port, health check or limits per image service, e.g. {"api":{"exposed_port":8080}} | - | No |
 | `--no-wait` | Return right away instead of waiting until it finishes | - | No |
 | `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -9318,12 +16566,27 @@ Validate a Temps-native template YAML file or directory offline
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
+### `templates list-tags`
+
+List all available template tags
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `platform` (alias: `plat`)
 
 View platform and server information
 
 **Subcommands:**
 
+- `host-facts` - What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
+- `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+- `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
+- `geo` - Look up the location of an IP address in the server's geolocation database
+- `file` - Print a file from the server's static directory (or save it with -o)
 - `info` - Get platform information
 - `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
@@ -9331,6 +16594,65 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform host-facts`
+
+What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform operations` (alias: `ops`)
+
+List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <status>` | Which ones: running, waiting, finished, all (default: the server's) | - | No |
+| `--kind <kind>` | Only one kind: deployment, rollback, promotion, restore, backup, autofix | - | No |
+| `--project <id>` | Only this project ID | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Operations per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `platform maturity`
+
+Show the compatibility promise (stable, beta, experimental) for every feature
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform geo`
+
+Look up the location of an IP address in the server's geolocation database
+
+**Usage:** `platform geo <ip> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform file`
+
+Print a file from the server's static directory (or save it with -o)
+
+**Usage:** `platform file <path> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <file>` | Write it to a file instead of stdout | - | No |
 
 ### `platform info`
 
@@ -9524,6 +16846,40 @@ View project analytics
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 - `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
 - `identify` - Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
+- `get-active-visitors` - Get detailed active visitors
+- `get-event-detail` - Get detailed analytics for a specific event
+- `get-event-entries` - Get paginated list of raw occurrences of a specific event, including custom JSON properties
+- `get-event-visitors` - Get paginated list of visitors who triggered a specific event
+- `get-events-count` - Get analytics events count
+- `get-stats` - Get general statistics across all projects for a time frame
+- `get-global` - Get global analytics
+- `get` - Get analytics projects
+- `check-has-events` - Check analytics has events
+- `get-live-visitors-list` - Get list of currently live visitors from visitor table
+- `get-page-flow` - Get page flow analytics: entry pages, exit pages, drop-off points, and page transitions
+- `get-page-hourly-sessions` - Get page hourly sessions
+- `get-page-path-detail` - Get detailed analytics for a specific page path Returns visitors, page views, activity over time,..
+- `get-page-path-visitors` - Get individual visitor sessions for a specific page path
+- `get-page-paths-sparklines` - Get page paths sparklines
+- `get-recent-activity` - Get recent activity events for real-time activity feed
+- `get-session-details` - Get detailed information about a specific session including events and request logs
+- `get-session-events` - Get analytics session events
+- `get-session-logs` - Get session logs
+- `get-visitor-facets` - Get filter dropdown contents for the visitors page
+- `get-visitors` - Get list of visitors with summary information
+- `get-visitor-by-guid` - Get visitor by GUID with geolocation data
+- `get-visitor-by-id` - Get visitor by numeric ID with geolocation data
+- `get-visitor-details` - Get detailed information about a specific visitor by numeric ID
+- `identify-visitor-for-token` - Identify a visitor of the token's own project (ADR 109 D4)
+- `get-visitor-info` - Get visitor record from database
+- `get-visitor-journey` - Get the complete visitor journey: all events across all sessions, grouped by session
+- `get-visitor-sessions` - Get all sessions for a specific visitor by numeric ID
+- `get-visitor-stats` - Get visitor statistics
+- `events` - Events commands
+- `visitors` - Visitors commands
+- `settings` - Settings commands
+- `get-api-callers` - Return the top callers (by client IP, ranked by request count) in a project's API traffic window
+- `get-api-routes` - Return the top routes (by request count) in a project's API traffic, grouped by raw '(method, path)'
 
 ### `analytics keys`
 
@@ -9531,11 +16887,26 @@ Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 
 **Subcommands:**
 
+- `get` - Show one analytics ingest key
 - `list` (`ls`) - List analytics ingest keys for a project
 - `create` (`add`) - Mint a new analytics ingest key
 - `update` - Update an ingest key's label, origin allowlist, or rate limit
 - `rotate` - Replace an ingest key value, keeping the same row and scope
 - `revoke` - Revoke (deactivate) an analytics ingest key
+- `get-ingest-endpoint` - The public address an app Temps does not deploy should send analytics to
+
+#### `analytics keys get`
+
+Show one analytics ingest key
+
+**Usage:** `analytics keys get <key-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `analytics keys list` (alias: `ls`)
 
@@ -9610,6 +16981,17 @@ Revoke (deactivate) an analytics ingest key
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
+#### `analytics keys get-ingest-endpoint`
+
+The public address an app Temps does not deploy should send analytics to
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `analytics conversions` (alias: `goals`)
 
 Conversion goals: events or pages that count as success
@@ -9621,6 +17003,7 @@ Conversion goals: events or pages that count as success
 - `update` - Replace a conversion's definition
 - `delete` - Delete a conversion (recorded events are kept)
 - `breakdown` - Where the visitors who converted came from
+- `get-goal` - Get one conversion goal
 
 #### `analytics conversions list`
 
@@ -9633,6 +17016,7 @@ List conversions with visitors, rate and revenue in a period
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 #### `analytics conversions create`
 
@@ -9696,6 +17080,20 @@ Where the visitors who converted came from
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
 | `--limit <n>` | Rows (default: 10, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
+
+#### `analytics conversions get-goal`
+
+Get one conversion goal
+
+**Usage:** `analytics conversions get-goal <goal-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `analytics identity`
 
@@ -9742,6 +17140,8 @@ Show analytics dashboard overview
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
+| `--deployment-id <n>` | Only this deployment (an ID) | - | No |
 
 ### `analytics top`
 
@@ -9757,6 +17157,16 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
+| `--deployment-id <n>` | Only this deployment (an ID) | - | No |
+| `--filter-browser <value>` | Only visitors on this browser | - | No |
+| `--filter-channel <value>` | Only visitors from this channel (e.g. Organic Search) | - | No |
+| `--filter-country <value>` | Only visitors from this country | - | No |
+| `--filter-os <value>` | Only visitors on this operating system | - | No |
+| `--filter-referrer <value>` | Only visitors from this referrer | - | No |
+| `--filter-region <value>` | Only visitors from this region | - | No |
+| `--include-crawlers` | Count crawler traffic too | - | No |
+| `--no-include-crawlers` | Set include_crawlers to false | - | No |
 
 ### `analytics outbound`
 
@@ -9770,6 +17180,7 @@ Show the outbound links visitors clicked (outbound_click events)
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics downloads`
 
@@ -9783,6 +17194,7 @@ Show the files visitors downloaded (file_download events)
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics not-found`
 
@@ -9796,6 +17208,7 @@ Show pages visitors could not find: 404s Temps answered and not_found events
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics funnels`
 
@@ -9808,6 +17221,8 @@ Show funnel conversion metrics for all funnels
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
+| `--country-code <value>` | Only visitors from this country (ISO code, e.g. DE) | - | No |
 
 ### `analytics performance` (alias: `speed`)
 
@@ -9834,6 +17249,21 @@ Show real-user Web Vitals and optional dimension breakdowns
 | `--os <operating-system>` | Restrict samples to one operating system | - | No |
 | `--json` | Output in JSON format | - | No |
 
+**Subcommands:**
+
+- `has-metrics` - Check if performance metrics exist for a project
+
+#### `analytics performance has-metrics`
+
+Check if performance metrics exist for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `analytics ai-agents`
 
 Show AI crawler / provider breakdown (web /analytics/ai-agents)
@@ -9848,6 +17278,7 @@ Show AI crawler / provider breakdown (web /analytics/ai-agents)
 | `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | No |
 | `--path <path>` | Restrict to one URL path (e.g. /docs) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics ai-pages`
 
@@ -9863,6 +17294,7 @@ Show pages crawled by AI agents, with distinct-agent counts
 | `--path <path>` | Restrict to one URL path (returns just that row) | - | No |
 | `--with-agents` | Also fetch and render the per-agent split for each page (slower) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics ai-page`
 
@@ -9879,6 +17311,7 @@ Show which agents/providers crawled a single page (e.g. /docs)
 | `--limit <n>` | Number of rows to fetch (default: 50, max: 100) | - | No |
 | `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics api-overview`
 
@@ -10001,6 +17434,7 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--refresh` | Generate a fresh summary instead of the cached one | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics enrich`
@@ -10036,6 +17470,856 @@ Label a visitor with your app's user id, as your backend would (browser identify
 | `--unset <key>` | Remove one trait (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |
 
+### `analytics get-active-visitors`
+
+Get detailed active visitors
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--deployment-id <n>` | Deployment ID (optional) | - | No |
+| `--window-minutes <n>` | Time window in minutes for active visitors (default: 5) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-event-detail`
+
+Get detailed analytics for a specific event
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--event-name <value>` | Event name to get details for [required] | - | No |
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date (ISO 8601) [required] | - | No |
+| `--end-date <value>` | End date (ISO 8601) [required] | - | No |
+| `--bucket-interval <value>` | Bucket interval: hour, day, week, month (default: auto) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-event-entries`
+
+Get paginated list of raw occurrences of a specific event, including custom JSON properties
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--event-name <value>` | Event name to list occurrences for [required] | - | No |
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date (ISO 8601) [required] | - | No |
+| `--end-date <value>` | End date (ISO 8601) [required] | - | No |
+| `--page <n>` | Page number (1-based, default: 1) | - | No |
+| `--per-page <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-event-visitors`
+
+Get paginated list of visitors who triggered a specific event
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--event-name <value>` | Event name to list visitors for [required] | - | No |
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date (ISO 8601) [required] | - | No |
+| `--end-date <value>` | End date (ISO 8601) [required] | - | No |
+| `--page <n>` | Page number (1-based, default: 1) | - | No |
+| `--per-page <n>` | Items per page (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-events-count`
+
+Get analytics events count
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-date <value>` | Start date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--end-date <value>` | End date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--limit <n>` | Maximum number of results to return | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--custom-events-only` | Only return custom events, excluding system events like page_view, page_leave, heartbeat (default: true) | - | No |
+| `--no-custom-events-only` | Set custom_events_only to false | - | No |
+| `--breakdown <value>` | Breakdown by geography: 'country', 'region', or 'city' (optional) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-stats`
+
+Get general statistics across all projects for a time frame
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-date <value>` | Start date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--end-date <value>` | End date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--project-ids <n>` | Optional: Filter by specific project IDs (comma-separated) (repeatable) | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--include-project-breakdown` | Whether to include per-project breakdown (default: false) | - | No |
+| `--no-include-project-breakdown` | Set include_project_breakdown to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-global`
+
+Get global analytics
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--facet <value>` | Query parameter facet (one of: summary, traffic, pages, events, breakdown, speed) | - | No |
+| `--project-id <n>` | Query parameter project_id | - | No |
+| `--environment-id <n>` | Query parameter environment_id | - | No |
+| `--start-date <value>` | Query parameter start_date [required] | - | No |
+| `--end-date <value>` | Query parameter end_date [required] | - | No |
+| `--search <value>` | Query parameter search | - | No |
+| `--dimension <value>` | Query parameter dimension | - | No |
+| `--device <value>` | Query parameter device | - | No |
+| `--sort-by <value>` | Query parameter sort_by | - | No |
+| `--sort-order <value>` | Query parameter sort_order | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--per-page <n>` | Query parameter per_page | - | No |
+| `--min-views <n>` | Query parameter min_views | - | No |
+| `--min-sessions <n>` | Query parameter min_sessions | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get`
+
+Get analytics projects
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `analytics check-has-events`
+
+Check analytics has events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-live-visitors-list`
+
+Get list of currently live visitors from visitor table
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--window-minutes <n>` | Time window in minutes for live visitors (default: 5) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-page-flow`
+
+Get page flow analytics: entry pages, exit pages, drop-off points, and page transitions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date in ISO 8601 format [required] | - | No |
+| `--end-date <value>` | End date in ISO 8601 format [required] | - | No |
+| `--limit <n>` | Max entry/exit pages to return (default: 20, max: 100) | - | No |
+| `--transitions-limit <n>` | Max page transitions to return (default: 50, max: 200) | - | No |
+| `--min-views-for-dropoff <n>` | Minimum views for drop-off analysis (default: 5) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-page-hourly-sessions`
+
+Get page hourly sessions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page-path <value>` | The page path to get sessions for [required] | - | No |
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-time <value>` | Start time in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--end-time <value>` | End time in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--bucket-interval <value>` | Bucket interval: 'hour', 'day', 'week', or 'month' (default: auto-determined based on range) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-page-path-detail`
+
+Get detailed analytics for a specific page path Returns visitors, page views, activity over time,..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page-path <value>` | The page path to get details for (URL-encoded) [required] | - | No |
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date in ISO 8601 format [required] | - | No |
+| `--end-date <value>` | End date in ISO 8601 format [required] | - | No |
+| `--bucket-interval <value>` | Bucket interval for time series: 'hour', 'day', 'week', 'month' (default: auto based on date range) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-page-path-visitors`
+
+Get individual visitor sessions for a specific page path
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page-path <value>` | The page path to get visitors for (URL-encoded) [required] | - | No |
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date in ISO 8601 format [required] | - | No |
+| `--end-date <value>` | End date in ISO 8601 format [required] | - | No |
+| `--page <n>` | Page number (1-based, default: 1) | - | No |
+| `--per-page <n>` | Items per page (default: 50, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-page-paths-sparklines`
+
+Get page paths sparklines
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-time <value>` | Start time in ISO 8601 format [required] | - | No |
+| `--end-time <value>` | End time in ISO 8601 format [required] | - | No |
+| `--page-paths <value>` | Comma-separated list of page paths [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-recent-activity`
+
+Get recent activity events for real-time activity feed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--since-id <n>` | Return events with ID greater than this (cursor-based polling) | - | No |
+| `--limit <n>` | Max events to return (default: 50, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-session-details`
+
+Get detailed information about a specific session including events and request logs
+
+**Usage:** `analytics get-session-details <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-session-events`
+
+Get analytics session events
+
+**Usage:** `analytics get-session-events <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date in format YYYY-MM-DD HH:MM:SS | - | No |
+| `--end-date <value>` | End date in format YYYY-MM-DD HH:MM:SS | - | No |
+| `--limit <n>` | Number of results to return (default: 100) | - | No |
+| `--offset <n>` | Number of results to skip (default: 0) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-session-logs`
+
+Get session logs
+
+**Usage:** `analytics get-session-logs <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Start date in format YYYY-MM-DD HH:MM:SS | - | No |
+| `--end-date <value>` | End date in format YYYY-MM-DD HH:MM:SS | - | No |
+| `--limit <n>` | Number of results to return (default: 100) | - | No |
+| `--offset <n>` | Number of results to skip (default: 0) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-facets`
+
+Get filter dropdown contents for the visitors page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-date <value>` | Start date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--end-date <value>` | End date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--include-crawlers` | Include crawlers (default: false) | - | No |
+| `--no-include-crawlers` | Set include_crawlers to false | - | No |
+| `--has-activity-only` | Hide ghost visitors (default: true) | - | No |
+| `--no-has-activity-only` | Set has_activity_only to false | - | No |
+| `--per-facet-limit <n>` | Top N values per dimension (default: 50, max: 200) | - | No |
+| `--filter-country <value>` | Geolocation country | - | No |
+| `--filter-region <value>` | Geolocation region | - | No |
+| `--filter-city <value>` | Geolocation city | - | No |
+| `--filter-channel <value>` | First-touch channel | - | No |
+| `--filter-referrer <value>` | First-touch referrer hostname (use 'Direct' for null) | - | No |
+| `--filter-user-id <value>` | User id set by identify(): the same user on every device | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitors`
+
+Get list of visitors with summary information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-date <value>` | Start date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--end-date <value>` | End date in format YYYY-MM-DD HH:MM:SS [required] | - | No |
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--include-crawlers` | Include crawlers (default: false) | - | No |
+| `--no-include-crawlers` | Set include_crawlers to false | - | No |
+| `--limit <n>` | Maximum number of visitors to return (default: 50) | - | No |
+| `--offset <n>` | Number of visitors to skip (default: 0) | - | No |
+| `--has-activity-only` | Filter to only include visitors with recorded activity (events/sessions) | - | No |
+| `--no-has-activity-only` | Set has_activity_only to false | - | No |
+| `--filter-country <value>` | Geolocation country | - | No |
+| `--filter-region <value>` | Geolocation region | - | No |
+| `--filter-city <value>` | Geolocation city | - | No |
+| `--filter-channel <value>` | First-touch channel | - | No |
+| `--filter-referrer <value>` | First-touch referrer hostname (use 'Direct' for null) | - | No |
+| `--filter-user-id <value>` | User id set by identify(): the same user on every device | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-by-guid`
+
+Get visitor by GUID with geolocation data
+
+**Usage:** `analytics get-visitor-by-guid <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-by-id`
+
+Get visitor by numeric ID with geolocation data
+
+**Usage:** `analytics get-visitor-by-id <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-details`
+
+Get detailed information about a specific visitor by numeric ID
+
+**Usage:** `analytics get-visitor-details <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identify-visitor-for-token`
+
+Identify a visitor of the token's own project (ADR 109 D4)
+
+**Usage:** `analytics identify-visitor-for-token <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--traits <json>` | Traits merged into the visitor's 'custom_data' at the top level; a key set to 'null' is removed (JSON) | - | No |
+| `--user-id <value>` | The app's own id for the person (database id, UUID, email) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-info`
+
+Get visitor record from database
+
+**Usage:** `analytics get-visitor-info <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-journey`
+
+Get the complete visitor journey: all events across all sessions, grouped by session
+
+**Usage:** `analytics get-visitor-journey <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID [required] | - | No |
+| `--limit-sessions <n>` | Maximum number of sessions to return (default: 50) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-sessions`
+
+Get all sessions for a specific visitor by numeric ID
+
+**Usage:** `analytics get-visitor-sessions <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--limit <n>` | Maximum number of sessions to return (default: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-visitor-stats`
+
+Get visitor statistics
+
+**Usage:** `analytics get-visitor-stats <visitor-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID or slug [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics events`
+
+Events commands
+
+**Subcommands:**
+
+- `get-dashboard` - Get dashboard analytics for multiple projects in a single batch request
+- `get-active-visitors` - Get active visitors count
+- `get-type-breakdown` - Get event type breakdown
+- `record-console` - Record an analytics event via the console API with explicit project ID
+- `get-property-timeline` - Get property timeline by grouping events by a column over time
+- `get-timeline` - Get events timeline
+- `has` - Check if project has any analytics events
+- `get-hourly-visits` - Get hourly visits
+- `get-session` - Get events for a specific session
+
+#### `analytics events get-dashboard`
+
+Get dashboard analytics for multiple projects in a single batch request
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-ids <value>` | Comma-separated list of project IDs [required] | - | No |
+| `--start-date <value>` | Start date for filtering [required] | - | No |
+| `--end-date <value>` | End date for filtering [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events get-active-visitors`
+
+Get active visitors count
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--deployment-id <n>` | Filter by deployment ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events get-type-breakdown`
+
+Get event type breakdown
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--start-date <value>` | Start date for filtering events [required] | - | No |
+| `--end-date <value>` | End date for filtering events [required] | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--aggregation-level <value>` | Aggregation level: events, sessions, or visitors (default: events) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events record-console`
+
+Record an analytics event via the console API with explicit project ID
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--deployment-id <n>` | Deployment ID to attribute the event to [required] | - | No |
+| `--environment-id <n>` | Environment ID to attribute the event to [required] | - | No |
+| `--event-data <json>` | Arbitrary JSON event data (JSON) | - | No |
+| `--event-name <value>` | Event name (e.g. "purchase", "signup", custom event names) [required] | - | No |
+| `--request-path <value>` | Page path context (defaults to "/") | - | No |
+| `--request-query <value>` | Query string context | - | No |
+| `--session-id <value>` | Encrypted '_temps_sid' cookie value from the user's browser | - | No |
+| `--visitor-id <value>` | Encrypted '_temps_visitor_id' cookie value from the user's browser | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events get-property-timeline`
+
+Get property timeline by grouping events by a column over time
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--start-date <value>` | Start date in '%Y-%m-%d %H:%M:%S' format [required] | - | No |
+| `--end-date <value>` | End date in '%Y-%m-%d %H:%M:%S' format [required] | - | No |
+| `--group-by <value>` | Column to group by (channel, device_type, browser, etc.) [required] | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--deployment-id <n>` | Filter by deployment ID | - | No |
+| `--event-name <value>` | Filter by event name | - | No |
+| `--aggregation-level <value>` | Aggregation level: events, sessions, or visitors - default: events | - | No |
+| `--bucket-size <value>` | Time bucket: hour, day, week, month (default: auto-detect) | - | No |
+| `--include-crawlers` | Include crawler/bot traffic (default: false) | - | No |
+| `--no-include-crawlers` | Set include_crawlers to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events get-timeline`
+
+Get events timeline
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--start-date <value>` | Start date for filtering events [required] | - | No |
+| `--end-date <value>` | End date for filtering events [required] | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--event-name <value>` | Filter by specific event name | - | No |
+| `--bucket-size <value>` | Bucket size: hour, day, or week (auto-detected if not specified) | - | No |
+| `--aggregation-level <value>` | Aggregation level: events, sessions, or visitors (default: events) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events has`
+
+Check if project has any analytics events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events get-hourly-visits`
+
+Get hourly visits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--start-date <value>` | Start date for filtering visits [required] | - | No |
+| `--end-date <value>` | End date for filtering visits [required] | - | No |
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--aggregation-level <value>` | Aggregation level: events (page views), sessions (unique sessions), or visitors (unique visitors) -... | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics events get-session`
+
+Get events for a specific session
+
+**Usage:** `analytics events get-session <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--environment-id <n>` | Filter by environment ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics visitors`
+
+Visitors commands
+
+**Subcommands:**
+
+- `get-activity-status` - Get activity status
+- `save-activity-settings` - Save activity settings
+- `suggest-activity-goals` - Suggest activity goals
+- `preview-activity-report` - Preview activity report
+- `run-activity-report` - Run activity report
+
+#### `analytics visitors get-activity-status`
+
+Get activity status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Query parameter environment_id | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics visitors save-activity-settings`
+
+Save activity settings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--application-context <value>` | Body field application_context [required] | - | No |
+| `--categories <json>` | Body field categories (JSON) [required] | - | No |
+| `--daily-enabled` | Body field daily_enabled [required] | - | No |
+| `--no-daily-enabled` | Set daily_enabled to false | - | No |
+| `--environment-id <n>` | Body field environment_id | - | No |
+| `--goal-title <value>` | Short operator-facing label for the selected analysis goal | - | No |
+| `--min-page-paths <n>` | Body field min_page_paths | - | No |
+| `--min-sessions <n>` | Body field min_sessions | - | No |
+| `--property-keys <value>` | Only these event-property keys may be sent to the provider (repeatable) [required] | - | No |
+| `--share-activity-with-ai` | Explicit permission to send the selected analytics fields to the configured AI provider [required] | - | No |
+| `--no-share-activity-with-ai` | Set share_activity_with_ai to false | - | No |
+| `--source-domain <value>` | Body field source_domain | - | No |
+| `--source-url <value>` | Body field source_url | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics visitors suggest-activity-goals`
+
+Suggest activity goals
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Body field environment_id | - | No |
+| `--share-with-ai` | Body field share_with_ai [required] | - | No |
+| `--no-share-with-ai` | Set share_with_ai to false | - | No |
+| `--url <value>` | Body field url [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics visitors preview-activity-report`
+
+Preview activity report
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Body field environment_id | - | No |
+| `--goal <value>` | Body field goal [required] | - | No |
+| `--min-page-paths <n>` | Body field min_page_paths | - | No |
+| `--min-sessions <n>` | Body field min_sessions | - | No |
+| `--property-keys <value>` | Body field property_keys (repeatable) | - | No |
+| `--share-activity-with-ai` | Body field share_activity_with_ai [required] | - | No |
+| `--no-share-activity-with-ai` | Set share_activity_with_ai to false | - | No |
+| `--source-domain <value>` | Body field source_domain | - | No |
+| `--source-url <value>` | Body field source_url | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics visitors run-activity-report`
+
+Run activity report
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics settings`
+
+Settings commands
+
+**Subcommands:**
+
+- `get-filtered-traffic` - How many events were counted and how many were kept out of the project's analytics, by reason, over the..
+- `get` - Get a project's analytics traffic settings and whether datacenter detection is available on this instance
+- `update` - Change a project's analytics traffic settings
+- `list-traffic-filters` - List a project's traffic filters, newest first
+- `create-traffic-filter` - Add a traffic filter
+- `delete-traffic-filter` - Remove a traffic filter
+
+#### `analytics settings get-filtered-traffic`
+
+How many events were counted and how many were kept out of the project's analytics, by reason, over the..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--days <n>` | Window in days, ending now (default 7, max 30) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics settings get`
+
+Get a project's analytics traffic settings and whether datacenter detection is available on this instance
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics settings update`
+
+Change a project's analytics traffic settings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--exclude-datacenter-traffic` | Body field exclude_datacenter_traffic | - | No |
+| `--no-exclude-datacenter-traffic` | Set exclude_datacenter_traffic to false | - | No |
+| `--exclude-spam-referrers` | Body field exclude_spam_referrers | - | No |
+| `--no-exclude-spam-referrers` | Set exclude_spam_referrers to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics settings list-traffic-filters`
+
+List a project's traffic filters, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--kind <value>` | Only filters of this kind (one of: referrer, ip, asn, country) | - | No |
+| `--page <n>` | Page number, starting at 1 (default 1) | - | No |
+| `--page-size <n>` | Page size (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics settings create-traffic-filter`
+
+Add a traffic filter
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--kind <value>` | What a traffic filter matches on (one of: referrer, ip, asn, country) [required] | - | No |
+| `--note <value>` | Why the filter exists, for whoever reviews it later | - | No |
+| `--value <value>` | A domain or URL ('referrer'), an IP address or CIDR range ('ip'), a network number with or without the... [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics settings delete-traffic-filter`
+
+Remove a traffic filter
+
+**Usage:** `analytics settings delete-traffic-filter <filter-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-api-callers`
+
+Return the top callers (by client IP, ranked by request count) in a project's API traffic window
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Window start (ISO 8601) [required] | - | No |
+| `--end-date <value>` | Window end (ISO 8601) [required] | - | No |
+| `--limit <n>` | Max callers to return (default: 20, max: 100) | - | No |
+| `--offset <n>` | Ranked callers to skip (default: 0) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics get-api-routes`
+
+Return the top routes (by request count) in a project's API traffic, grouped by raw '(method, path)'
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Environment ID (optional) | - | No |
+| `--start-date <value>` | Window start (ISO 8601) [required] | - | No |
+| `--end-date <value>` | Window end (ISO 8601) [required] | - | No |
+| `--limit <n>` | Max routes to return (default: 20, max: 100) | - | No |
+| `--offset <n>` | Ranked routes to skip (default: 0) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `funnels` (alias: `funnel`)
 
 Manage analytics funnels for projects
@@ -10048,6 +18332,7 @@ Manage analytics funnels for projects
 - `remove` (`rm`) - Delete a funnel
 - `metrics` - Get funnel metrics
 - `preview` - Preview funnel metrics without saving
+- `get-unique-events` - Get all unique/distinct event types for a project (paginated)
 
 ### `funnels list` (alias: `ls`)
 
@@ -10112,6 +18397,10 @@ Get funnel metrics
 | `--project-id <id>` | Project ID | - | Yes |
 | `--funnel-id <id>` | Funnel ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+| `--start-date <value>` | Window start (RFC 3339) | - | No |
+| `--end-date <value>` | Window end (RFC 3339) | - | No |
+| `--environment-id <n>` | Only this environment (an ID) | - | No |
+| `--country-code <value>` | Only visitors from this country (ISO code, e.g. DE) | - | No |
 
 ### `funnels preview`
 
@@ -10123,6 +18412,19 @@ Preview funnel metrics without saving
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `-s, --steps <json>` | Funnel steps as JSON array | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `funnels get-unique-events`
+
+Get all unique/distinct event types for a project (paginated)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 50, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `notification-preferences` (alias: `notif-prefs`)
@@ -10438,6 +18740,7 @@ Create or update a secret (upsert by name). Prefer --value-file or --value-stdin
 | `-t, --type <type>` | Secret type: "env" (default) or "file" | `env` | No |
 | `-m, --mount-path <path>` | Absolute path inside sandbox where file-type secret is written (required for --type file) | - | No |
 | `-d, --description <description>` | Human-readable description | - | No |
+| `-p, --project <slug-or-id>` | Scope the secret to one project (default: instance-wide) | - | No |
 | `--value-file <path>` | Read the secret value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the secret value from stdin, e.g. piped from a secret manager | - | No |
 | `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
@@ -10456,6 +18759,7 @@ Update an existing secret (alias for create — upserts). The value must be re-s
 | `-t, --type <type>` | Secret type: "env" or "file" | - | No |
 | `-m, --mount-path <path>` | New mount path (file type only) | - | No |
 | `-d, --description <description>` | New description | - | No |
+| `-p, --project <slug-or-id>` | The project the secret is scoped to (default: instance-wide) | - | No |
 | `--value-file <path>` | Read the new secret value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the new secret value from stdin, e.g. piped from a secret manager | - | No |
 | `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
@@ -10471,6 +18775,7 @@ Delete a secret
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Delete the secret of this project (default: the instance-wide one) | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
@@ -10500,6 +18805,29 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `fs` - Filesystem operations inside a sandbox
 - `snapshots` - Manage sandbox snapshots (ADR-037)
 - `snapshot` - Take a snapshot of a sandbox
+- `service-access` - Service access commands
+- `internal-access` - Internal access commands
+- `services` - Services commands
+- `get-creation` - Read a create's steps by the 'creation_id' its 'POST /v1/sandboxes' sent
+- `get-image-preparation` - Every host that can run sandboxes, with whether its default sandbox image is pulled (with download..
+- `prepare-images` - Pull the default sandbox image on every eligible host (or one), so the first sandbox there starts without..
+- `update-host-image-preparation` - Turn keeping one host's sandbox image prepared on or off
+- `get-resource-defaults` - Effective resource defaults and input ceilings for the requested placement
+- `rootfs-report` - Inspect rootfs storage: the Firecracker digest-keyed cache (with which sandboxes reference each entry) and..
+- `rootfs-gc` - Reclaim rootfs cache entries not backing any live sandbox
+- `get-cmd` - Get cmd
+- `cmd-logs` - Stream a command's stdout/stderr as 'application/x-ndjson' ('@vercel/sandbox'-compatible)
+- `cmd` - Run a command the '@vercel/sandbox' way: without --wait it returns the started command's id at once (read its output with cmd-logs); with --wait it prints the running and finished envelopes as JSON lines. For an interactive run use `temps sandbox exec`
+- `get-creation-by` - Read the steps of the create that made a sandbox, while this server still tracks it (it is running, or..
+- `list-dir` - List dir
+- `write-files` - Batch-write multiple files in a single request
+- `list-jobs` - List jobs
+- `job-status` - Job status
+- `kill-job` - Terminate a detached job
+- `create-preview-link` - Mint a shareable link to a sandbox preview
+- `resize` - Grow a Firecracker sandbox's root disk
+- `issue-runtime-environment` - Issue the same scoped service variables used by a deployment runtime for the project attached to this sandbox
+- `cmd-kill` - Kill a running command ('@vercel/sandbox'-compatible)
 
 ### `sandbox create`
 
@@ -10515,6 +18843,8 @@ Create a new sandbox
 | `-e, --env <KEY=VAL>` | Env var baked into the container (repeatable) | - | No |
 | `--cpu-limit <cpu>` | CPU limit (e.g., 0.5 for half a core) | - | No |
 | `--memory-mb <mb>` | Memory limit in megabytes | - | No |
+| `--pids-limit <n>` | Maximum number of processes (default 512) | - | No |
+| `--creation-id <id>` | Your own id for this create (8-64 letters, digits, - or _), to follow its steps with `sandbox get-creation` | - | No |
 | `--git-url <url>` | Git repo URL to clone into the work dir | - | No |
 | `--git-rev <revision>` | Git revision to check out (requires --git-url) | - | No |
 | `--git-depth <n>` | Shallow clone depth (requires --git-url) | - | No |
@@ -10722,6 +19052,7 @@ Clone a git repo or extract a tarball into a running sandbox
 | `--git-username <user>` | HTTP Basic username (pairs with --git-password) | - | No |
 | `--git-password <token>` | HTTP Basic password/token (injected via GIT_ASKPASS) | - | No |
 | `--tarball-url <url>` | Tarball URL to download and extract | - | No |
+| `--strip-git-metadata` | Remove the .git directory after cloning | - | No |
 | `--git-password-file <path>` | Read the Git HTTP password or token from a file (- reads stdin) instead of --git-password | - | No |
 | `--git-password-stdin` | Read the Git HTTP password or token from stdin instead of --git-password | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -10964,6 +19295,647 @@ Take a snapshot of a sandbox
 | `--wait` | Wait until the snapshot reaches ready or failed status | - | No |
 | `--json` | Output as JSON | - | No |
 
+### `sandbox service-access`
+
+Service access commands
+
+**Subcommands:**
+
+- `list` - List access services
+- `create` - Create access service
+- `get` - Get access service
+- `update` - Update access service
+- `list-grants` - List service grants
+- `request-grant` - Request service grant
+- `approve-grant` - Approve service grant
+- `revoke-grant` - Revoke service grant
+- `capability` - Access capability
+
+#### `sandbox service-access list`
+
+List access services
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access create`
+
+Create access service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--clear-credential` | Body field clear_credential | - | No |
+| `--no-clear-credential` | Set clear_credential to false | - | No |
+| `--credential-stdin` | A credential (read from stdin) | - | No |
+| `--credential-file <path>` | A credential (read from a file) | - | No |
+| `--enabled` | Allows requests to be saved; does not enable a network connection [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--expected-version <n>` | Required for updates; omit for creation | - | No |
+| `--max-ttl-seconds <n>` | Maximum lifetime of a request, between 60 and 86400 seconds [required] | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--policy <json>` | Exact destination and request scope (JSON) [required] | - | No |
+| `--vault-id <value>` | Add a newly created service to this vault in the same transaction | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access get`
+
+Get access service
+
+**Usage:** `sandbox service-access get <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access update`
+
+Update access service
+
+**Usage:** `sandbox service-access update <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--clear-credential` | Body field clear_credential | - | No |
+| `--no-clear-credential` | Set clear_credential to false | - | No |
+| `--credential-stdin` | A credential (read from stdin) | - | No |
+| `--credential-file <path>` | A credential (read from a file) | - | No |
+| `--enabled` | Allows requests to be saved; does not enable a network connection [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--expected-version <n>` | Required for updates; omit for creation | - | No |
+| `--max-ttl-seconds <n>` | Maximum lifetime of a request, between 60 and 86400 seconds [required] | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--policy <json>` | Exact destination and request scope (JSON) [required] | - | No |
+| `--vault-id <value>` | Add a newly created service to this vault in the same transaction | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access list-grants`
+
+List service grants
+
+**Usage:** `sandbox service-access list-grants <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access request-grant`
+
+Request service grant
+
+**Usage:** `sandbox service-access request-grant <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--service-id <value>` | Body field service_id [required] | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--ttl-seconds <n>` | Absolute expiry is calculated at creation, even if the broker is unavailable [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access approve-grant`
+
+Approve service grant
+
+**Usage:** `sandbox service-access approve-grant <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--request-id <value>` | Body field request_id [required] | - | No |
+| `--service-id <value>` | Body field service_id [required] | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access revoke-grant`
+
+Revoke service grant
+
+**Usage:** `sandbox service-access revoke-grant <sandbox-id> <grant-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox service-access capability`
+
+Access capability
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox internal-access`
+
+Internal access commands
+
+**Subcommands:**
+
+- `list-grants` - List the projects allowed to call this project's internal addresses
+- `create-grant` - Allow another project to call this project's internal addresses
+- `list-internal-access-sandbox-grants` - List the sandboxes allowed to call this project's internal addresses
+- `create-internal-access-sandbox-grant` - Allow one of your sandboxes to call this project's internal addresses
+- `delete-grant` - Stop a sandbox from calling this project's internal addresses
+- `delete-internal-access-grant` - Stop another project from calling this project's internal addresses
+- `list-addresses` - List the internal addresses one of your sandboxes may call
+
+#### `sandbox internal-access list-grants`
+
+List the projects allowed to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Only grants that cover this environment of the project: its own and the project-wide ones | - | No |
+| `--page <n>` | 1-based page, default 1 | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access create-grant`
+
+Allow another project to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--caller-environment-id <n>` | Only this environment of the calling project; omit for every environment, present and future | - | No |
+| `--caller-project-id <n>` | The project whose workloads may call [required] | - | No |
+| `--description <value>` | Why the grant exists, up to 200 characters | - | No |
+| `--target-environment-id <n>` | The environment of this project that may be called; omit for every environment, present and future | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access list-internal-access-sandbox-grants`
+
+List the sandboxes allowed to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Only grants that cover this environment of the project: its own and the project-wide ones | - | No |
+| `--page <n>` | 1-based page, default 1 | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access create-internal-access-sandbox-grant`
+
+Allow one of your sandboxes to call this project's internal addresses
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--description <value>` | Why the grant exists, up to 200 characters | - | No |
+| `--sandbox-id <value>` | Public id of one of your sandboxes [required] | - | No |
+| `--target-environment-id <n>` | The environment of this project that may be called; omit for every environment, present and future | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access delete-grant`
+
+Stop a sandbox from calling this project's internal addresses
+
+**Usage:** `sandbox internal-access delete-grant <grant-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access delete-internal-access-grant`
+
+Stop another project from calling this project's internal addresses
+
+**Usage:** `sandbox internal-access delete-internal-access-grant <grant-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox internal-access list-addresses`
+
+List the internal addresses one of your sandboxes may call
+
+**Usage:** `sandbox internal-access list-addresses <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | 1-based page, default 1 | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox services`
+
+Services commands
+
+**Subcommands:**
+
+- `list` - List sandbox services
+- `request` - Request sandbox service
+- `approve` - Approve sandbox service
+- `revoke` - Revoke sandbox service
+
+#### `sandbox services list`
+
+List sandbox services
+
+**Usage:** `sandbox services list <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox services request`
+
+Request sandbox service
+
+**Usage:** `sandbox services request <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--service-id <value>` | Body field service_id [required] | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox services approve`
+
+Approve sandbox service
+
+**Usage:** `sandbox services approve <sandbox-id> <access-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version [required] | - | No |
+| `--expires-at <value>` | Omit for the sandbox lifetime | - | No |
+| `--service-version <n>` | Body field service_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `sandbox services revoke`
+
+Revoke sandbox service
+
+**Usage:** `sandbox services revoke <sandbox-id> <access-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-creation`
+
+Read a create's steps by the 'creation_id' its 'POST /v1/sandboxes' sent
+
+**Usage:** `sandbox get-creation <creation-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-image-preparation`
+
+Every host that can run sandboxes, with whether its default sandbox image is pulled (with download..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox prepare-images`
+
+Pull the default sandbox image on every eligible host (or one), so the first sandbox there starts without..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node-id <n>` | The host to prepare: a node id, or '0' for the control plane | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox update-host-image-preparation`
+
+Turn keeping one host's sandbox image prepared on or off
+
+**Usage:** `sandbox update-host-image-preparation <node-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--keep-prepared` | Keep this host's default sandbox image pulled, re-pulling it when an upgrade changes the default. 'false'... [required] | - | No |
+| `--no-keep-prepared` | Set keep_prepared to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-resource-defaults`
+
+Effective resource defaults and input ceilings for the requested placement
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <value>` | Query parameter node | - | No |
+| `--backend <value>` | Which isolation backend a sandbox runs on (ADR-029, ADR-050) (one of: docker, firecracker, microsandbox, local) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox rootfs-report`
+
+Inspect rootfs storage: the Firecracker digest-keyed cache (with which sandboxes reference each entry) and..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox rootfs-gc`
+
+Reclaim rootfs cache entries not backing any live sandbox
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-cmd`
+
+Get cmd
+
+**Usage:** `sandbox get-cmd <id> <cmd-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox cmd-logs`
+
+Stream a command's stdout/stderr as 'application/x-ndjson' ('@vercel/sandbox'-compatible)
+
+**Usage:** `sandbox cmd-logs <id> <cmd-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox cmd`
+
+Run a command the '@vercel/sandbox' way: without --wait it returns the started command's id at once (read its output with cmd-logs); with --wait it prints the running and finished envelopes as JSON lines. For an interactive run use `temps sandbox exec`
+
+**Usage:** `sandbox cmd <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--command <value>` | Program to run [required] | - | No |
+| `--args <value>` | Argument (repeatable, in order) (repeatable) | - | No |
+| `--cwd <value>` | Working directory inside the sandbox | - | No |
+| `--env <json>` | Environment variables as a JSON object, e.g. {"NODE_ENV":"test"} (JSON) | - | No |
+| `--sudo` | Run the command privileged | - | No |
+| `--no-sudo` | Set sudo to false | - | No |
+| `--wait` | Wait for the command to finish | - | No |
+| `--no-wait` | Set wait to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox get-creation-by`
+
+Read the steps of the create that made a sandbox, while this server still tracks it (it is running, or..
+
+**Usage:** `sandbox get-creation-by <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox list-dir`
+
+List dir
+
+**Usage:** `sandbox list-dir <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Absolute path of a directory inside the sandbox [required] | - | No |
+| `--page <n>` | 1-based page (default 1) | - | No |
+| `--page-size <n>` | Entries per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox write-files`
+
+Batch-write multiple files in a single request
+
+**Usage:** `sandbox write-files <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--files <json>` | List of files to write (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox list-jobs`
+
+List jobs
+
+**Usage:** `sandbox list-jobs <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox job-status`
+
+Job status
+
+**Usage:** `sandbox job-status <id> <job-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox kill-job`
+
+Terminate a detached job
+
+**Usage:** `sandbox kill-job <id> <job-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--force` | When true, sends SIGKILL immediately | - | No |
+| `--no-force` | Set force to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox create-preview-link`
+
+Mint a shareable link to a sandbox preview
+
+**Usage:** `sandbox create-preview-link <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Path the recipient lands on | - | No |
+| `--port <n>` | Port inside the sandbox the preview serves on [required] | - | No |
+| `--ttl-seconds <n>` | How long the link stays usable, in seconds | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox resize`
+
+Grow a Firecracker sandbox's root disk
+
+**Usage:** `sandbox resize <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--disk-size-mb <n>` | New root disk size in MB [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox issue-runtime-environment`
+
+Issue the same scoped service variables used by a deployment runtime for the project attached to this sandbox
+
+**Usage:** `sandbox issue-runtime-environment <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `sandbox cmd-kill`
+
+Kill a running command ('@vercel/sandbox'-compatible)
+
+**Usage:** `sandbox cmd-kill <id> <cmd-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--force` | Optional: when true, SIGKILL instead of SIGTERM | - | No |
+| `--no-force` | Set force to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `workflow` (alias: `wf`)
 
 Trigger and inspect agent/workflow runs
@@ -11022,6 +19994,21 @@ Durable application workflows
 - `watch` - Poll until terminal or the bounded deadline
 - `init` - Create a Node workflow worker in a new directory
 - `dev` - Forward preview-environment invocations to a local SDK server
+- `revoke-credential` - Revoke workflow credential
+- `get-credential` - Get workflow credential
+- `issue-credential` - Issue workflow credential
+- `list-grants` - List workflow grants
+- `create-grant` - Create workflow grant
+- `revoke-grant` - Revoke workflow grant
+- `diagnose-run` - Diagnose workflow run
+- `list-steps` - List workflow steps
+- `get-settings` - Get workflow settings
+- `update-settings` - Update workflow settings
+- `list-keys` - List workflow project keys
+- `shred-key` - Shred workflow project key
+- `list-definitions` - List workflow definitions
+- `list-all-runs` - List all workflow runs
+- `app` - App commands
 
 ### `workflows list`
 
@@ -11214,6 +20201,307 @@ Forward preview-environment invocations to a local SDK server
 | `--port <port>` | Local SDK server port | `3000` | No |
 | `--json` | Output tunnel readiness as JSON | - | No |
 
+### `workflows revoke-credential`
+
+Revoke workflow credential
+
+**Usage:** `workflows revoke-credential <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows get-credential`
+
+Get workflow credential
+
+**Usage:** `workflows get-credential <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows issue-credential`
+
+Issue workflow credential
+
+**Usage:** `workflows issue-credential <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows list-grants`
+
+List workflow grants
+
+**Usage:** `workflows list-grants <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | 1-indexed page number | - | No |
+| `--page-size <n>` | Items per page | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows create-grant`
+
+Create workflow grant
+
+**Usage:** `workflows create-grant <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--action <value>` | Body field action (one of: start, event) [required] | - | No |
+| `--resource <value>` | Body field resource [required] | - | No |
+| `--source-environment-id <n>` | Body field source_environment_id [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows revoke-grant`
+
+Revoke workflow grant
+
+**Usage:** `workflows revoke-grant <environment-id> <grant-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows diagnose-run`
+
+Diagnose workflow run
+
+**Usage:** `workflows diagnose-run <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows list-steps`
+
+List workflow steps
+
+**Usage:** `workflows list-steps <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | 1-indexed page number | - | No |
+| `--page-size <n>` | Items per page | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows get-settings`
+
+Get workflow settings
+
+**Usage:** `workflows get-settings <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows update-settings`
+
+Update workflow settings
+
+**Usage:** `workflows update-settings <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--drain-timeout-secs <n>` | Opt-in deploy drain: pause new invocations and wait for running attempts | - | No |
+| `--host-service <value>` | Compose service hosting the workflow handler; 'None': the main service | - | No |
+| `--inline-payload-limit-bytes <n>` | Body field inline_payload_limit_bytes [required] | - | No |
+| `--invocation-deadline-secs <n>` | Body field invocation_deadline_secs [required] | - | No |
+| `--lease-secs <n>` | Body field lease_secs [required] | - | No |
+| `--managed-store-service-id <n>` | Managed PostgreSQL journal for new runs; existing runs keep their store | - | No |
+| `--max-active-runs <n>` | Body field max_active_runs [required] | - | No |
+| `--max-concurrent-runs <n>` | Body field max_concurrent_runs [required] | - | No |
+| `--max-journal-bytes-per-run <n>` | Body field max_journal_bytes_per_run [required] | - | No |
+| `--max-payload-bytes <n>` | Body field max_payload_bytes [required] | - | No |
+| `--max-steps-per-run <n>` | Body field max_steps_per_run [required] | - | No |
+| `--retention-days <n>` | Body field retention_days [required] | - | No |
+| `--stuck-after-failures <n>` | Body field stuck_after_failures [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows list-keys`
+
+List workflow project keys
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | 1-indexed page number | - | No |
+| `--page-size <n>` | Items per page | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows shred-key`
+
+Shred workflow project key
+
+**Usage:** `workflows shred-key <key-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--confirm-key-id <value>` | Exact key UUID, confirming that its retained payloads become unreadable [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows list-definitions`
+
+List workflow definitions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | 1-based page; default 1 | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows list-all-runs`
+
+List all workflow runs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <value>` | Where a run is in its lifecycle (ADR-106 §3) (one of: queued, running, sleeping, waiting, retrying, completed, failed, cancelled, stuck) | - | No |
+| `--workflow <value>` | Query parameter workflow | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--cursor <value>` | Query parameter cursor | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `workflows app`
+
+App commands
+
+**Subcommands:**
+
+- `send-event` - App send workflow event
+- `send-granted-event` - App send granted event
+- `start-granted` - App start granted workflow
+- `start-run` - App start workflow run
+- `get-run` - App get workflow run
+
+#### `workflows app send-event`
+
+App send workflow event
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--key <value>` | Narrows delivery to runs waiting on this key | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--payload <json>` | Body field payload (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `workflows app send-granted-event`
+
+App send granted event
+
+**Usage:** `workflows app send-granted-event <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--key <value>` | Narrows delivery to runs waiting on this key | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--payload <json>` | Body field payload (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `workflows app start-granted`
+
+App start granted workflow
+
+**Usage:** `workflows app start-granted <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--idempotency-key <value>` | A second start with the same key returns the first run | - | No |
+| `--body-input <json>` | Body field input (JSON) | - | No |
+| `--workflow <value>` | Body field workflow [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `workflows app start-run`
+
+App start workflow run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--idempotency-key <value>` | A second start with the same key returns the first run | - | No |
+| `--body-input <json>` | Body field input (JSON) | - | No |
+| `--workflow <value>` | Body field workflow [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `workflows app get-run`
+
+App get workflow run
+
+**Usage:** `workflows app get-run <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `revenue`
 
 Manage revenue integrations and import historical data
@@ -11221,6 +20509,22 @@ Manage revenue integrations and import historical data
 **Subcommands:**
 
 - `import` - Import historical revenue data from a CSV export
+- `recent-events` - Recent ingested events for the activity feed
+- `list-integrations` - List revenue integrations for a project
+- `create-integration` - Create a new revenue integration
+- `delete-integration` - Delete a revenue integration (permanent — use rotate_token to refresh credentials without breaking history)
+- `update-config` - Replace the typed provider config on an integration
+- `import-invoices-csv` - Import a Stripe invoices CSV export
+- `import-subscriptions-csv` - Import a Stripe subscriptions CSV export
+- `rotate-token` - Rotate the webhook path token
+- `update-secret` - Replace the stored signing secret without rotating the webhook URL
+- `metrics-customers` - New + churned customers per bucket
+- `metrics-mrr` - Bucketed MRR timeseries for the revenue chart
+- `metrics-summary` - Current MRR / ARR / churn / ARPU for a project, in one currency
+- `global-events` - Org-wide revenue events across every project
+- `metrics-global-mrr` - Org-wide MRR total, summed across every project in the install
+- `metrics-global-summary` - Org-wide revenue summary: MRR, paid cash (30d + all-time), refunds, active subscriptions/customers, and..
+- `list-providers` - List registered providers (what the UI needs to render the "Connect" dropdown + its wizard instructions)
 
 ### `revenue import`
 
@@ -11260,6 +20564,209 @@ Import paid invoices CSV to backfill the revenue chart
 | `--integration-id <id>` | Target integration ID (auto-detected if only one exists) | - | No |
 | `--provider <name>` | Target provider name (e.g., stripe) | - | No |
 | `--json` | Output the import outcome as JSON (suppresses spinners) | - | No |
+
+### `revenue recent-events`
+
+Recent ingested events for the activity feed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue list-integrations`
+
+List revenue integrations for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue create-integration`
+
+Create a new revenue integration
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--provider <value>` | Registered provider name, e.g. "stripe" [required] | - | No |
+| `--signing-secret-stdin` | Signing secret from the provider's dashboard [required] (read from stdin) | - | No |
+| `--signing-secret-file <path>` | Signing secret from the provider's dashboard [required] (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue delete-integration`
+
+Delete a revenue integration (permanent — use rotate_token to refresh credentials without breaking history)
+
+**Usage:** `revenue delete-integration <integration-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue update-config`
+
+Replace the typed provider config on an integration
+
+**Usage:** `revenue update-config <integration-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--config <json>` | Provider-specific integration settings persisted in 'revenue_integrations.config' (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue import-invoices-csv`
+
+Import a Stripe invoices CSV export
+
+**Usage:** `revenue import-invoices-csv <integration-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue import-subscriptions-csv`
+
+Import a Stripe subscriptions CSV export
+
+**Usage:** `revenue import-subscriptions-csv <integration-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue rotate-token`
+
+Rotate the webhook path token
+
+**Usage:** `revenue rotate-token <integration-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue update-secret`
+
+Replace the stored signing secret without rotating the webhook URL
+
+**Usage:** `revenue update-secret <integration-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--signing-secret-stdin` | New signing secret from the provider's dashboard [required] (read from stdin) | - | No |
+| `--signing-secret-file <path>` | New signing secret from the provider's dashboard [required] (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue metrics-customers`
+
+New + churned customers per bucket
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue metrics-mrr`
+
+Bucketed MRR timeseries for the revenue chart
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue metrics-summary`
+
+Current MRR / ARR / churn / ARPU for a project, in one currency
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue global-events`
+
+Org-wide revenue events across every project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Filter to a single project | - | No |
+| `--from <value>` | Lower bound (inclusive), ISO-8601 | - | No |
+| `--to <value>` | Upper bound (inclusive), ISO-8601 | - | No |
+| `--event-types <value>` | Comma-separated event types (e.g. 'invoice.paid,charge.succeeded') | - | No |
+| `--limit <n>` | Max rows, default 100, max 500 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue metrics-global-mrr`
+
+Org-wide MRR total, summed across every project in the install
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `revenue metrics-global-summary`
+
+Org-wide revenue summary: MRR, paid cash (30d + all-time), refunds, active subscriptions/customers, and..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--currency <value>` | ISO-4217 currency code, default USD | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `revenue list-providers`
+
+List registered providers (what the UI needs to render the "Connect" dropdown + its wizard instructions)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ## `session-replay` (alias: `sessions`, `replay`)
 
@@ -11525,8 +21032,1040 @@ AI assistant status for a project
 
 **Subcommands:**
 
+- `chat` - AI chat conversations: messages, attachments, sandboxes and workspaces
 - `provider` - Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
 - `readiness` - Show which AI prerequisites this project meets, and how to fix the rest
+- `apps` - Apps commands
+- `coding-agents` - Coding agents commands
+- `gateway` - Gateway commands
+- `provider-status` - Provider status commands
+- `workspace` - Workspace commands
+
+### `ai chat`
+
+AI chat conversations: messages, attachments, sandboxes and workspaces
+
+**Subcommands:**
+
+- `upload` - Attach a file to a conversation in chunks; resumable with --resume
+- `create-assistant-conversation` - Start a chat with the Temps assistant
+- `list-all-conversations` - List the current user's active conversations across all projects, most-recently-active first, annotated..
+- `create-global-conversation` - Create a private user-owned operator thread without binding its lifetime or authority to a project
+- `get-user-conversation` - Load one bounded history page for a private conversation by its owner-facing id
+- `rename-user-conversation` - Rename user conversation
+- `archive-user-conversation` - Archive user conversation
+- `start-attachment-upload` - Start uploading a file in chunks, for clients behind a small request-size limit
+- `cancel-attachment-upload` - Abandon an upload and free what it reserved
+- `append-attachment-chunk` - Append the next chunk of an upload
+- `complete-attachment-upload` - Finish an upload once every byte has arrived
+- `upload-user-conversation-attachment` - Upload user conversation attachment
+- `get-user-conversation-attachment` - Get user conversation attachment
+- `compact-conversation` - Summarize the chat's older messages now
+- `get-user-conversation-diagnostics` - Export the bounded, server-redacted diagnostic state Temps currently owns
+- `list-goals` - List the goals a chat is watching or has finished with, newest first
+- `cancel-goal` - Stop watching a goal
+- `retry-goal` - Give a failed or waiting goal a fresh attempt budget and check it again now
+- `send-user-message` - Submit a turn to a user-owned conversation
+- `list-operations` - The deployments, backups and restores this chat started, newest first, with their current state
+- `list-user-pending-actions` - List user pending actions
+- `update-user-permission-mode` - Update user permission mode
+- `resolve-user-permission` - Resolve user permission
+- `list-resources` - The projects, databases and services, repositories and sandbox this chat made, with their current state
+- `restore-user-conversation` - Restore a user-owned archived conversation
+- `unlink-sandbox` - Unlink the chat's sandbox
+- `get-sandbox` - Whether the chat can use a sandbox, and which one it is linked to
+- `link-sandbox` - Link a sandbox to the chat, or create one for it
+- `get-sandbox-changes` - The uncommitted Git changes of every repository under the sandbox work directory
+- `get-sandbox-diff` - Both sides of one changed file: as last committed, and as it is now
+- `track-sandbox-changes` - Put a folder of the sandbox under Git, so its changes show from now on: a '.gitignore' for dependencies,..
+- `read-sandbox-file` - One file of the chat's sandbox, for the viewer
+- `list-sandbox-files` - List one directory of the chat's sandbox: folders first, then files
+- `connect-sandbox` - Let the chat's sandbox use a project's database
+- `disconnect-sandbox` - Stop the chat's sandbox using a project's database
+- `connect-sandbox-service` - Let the chat's sandbox use one service, whether or not it belongs to a project
+- `disconnect-sandbox-service` - Stop the chat's sandbox using one service
+- `wake-sandbox` - Start the chat's sandbox if it went to sleep, so the preview and the assistant's next command find it up
+- `list-secret-requests` - List the credentials this chat has asked for and not yet used up or lost
+- `provide-secret` - Provide the credential the assistant asked for
+- `discard-secret` - Discard a credential request and anything already typed into it
+- `stop-user-turn` - Stop user turn
+- `get-suggestion-mode` - A chat's next-step suggestion setting, with the default it falls back to
+- `update-suggestion-mode` - Set a chat's own next-step suggestion mode, or clear it to follow the user's default
+- `suggest-next-steps` - Suggest a few next steps after the chat's latest answer
+- `get-user-conversation-usage` - What this conversation has cost so far
+- `leave-workspace` - Take this chat out of its workspace
+- `get-workspace` - The workspace this chat is in, with its other chats
+- `set-workspace` - Put this chat in a workspace, creating it when asked
+- `get-user-pending-action` - Get user pending action
+- `confirm-user-pending-action` - Confirm user pending action
+- `reject-user-pending-action` - Reject user pending action
+- `get-suggestion-default` - The user's default for next-step suggestions
+- `update-suggestion-default` - Set the user's default for every chat that does not set its own mode
+- `find-conversation` - Find the current user's existing chat for a context (returns 'null' if none yet)
+- `create-conversation` - Get-or-create the current user's private chat for a context
+- `list-conversations` - List the current user's active conversations for a project, most-recently-active first
+- `get-conversation` - One bounded conversation-history page (excluding internal context rows)
+- `rename-conversation` - Rename a conversation (set its human-facing title)
+- `archive-conversation` - Archive (soft-delete) a conversation
+- `send-message` - Submit a user message and start a server-owned turn
+- `list-pending-actions` - List all pending actions for a conversation (most-recently-proposed first)
+- `update-permission-mode` - Update permission mode
+- `resolve-permission` - Resolve permission
+- `stop-turn` - Explicitly cancel the server-owned active turn
+- `get-pending-action` - Get a single pending action by its public id (scoped to the project)
+- `confirm-pending-action` - Confirm a proposed AI action: validate permission, atomically claim, execute, persist outcome
+- `reject-pending-action` - Reject a proposed AI action (no execution)
+
+#### `ai chat upload`
+
+Attach a file to a conversation in chunks; resumable with --resume
+
+**Usage:** `ai chat upload <conversation-id> <file> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | File name to show (default: the file name) | - | No |
+| `--mime-type <type>` | Content type (default: guessed from the extension) | - | No |
+| `--resume <upload-id>` | Continue an interrupted upload instead of starting a new one | - | No |
+| `--chunk-bytes <n>` | Bytes per chunk (default 32768, the server's limit) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat create-assistant-conversation`
+
+Start a chat with the Temps assistant
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ai-model <value>` | Model id to start with; defaults to the provider's default model | - | No |
+| `--ai-provider <value>` | An AI-gateway provider id ('gateway_key:<id>') | - | No |
+| `--project-id <n>` | A project the chat is about | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-all-conversations`
+
+List the current user's active conversations across all projects, most-recently-active first, annotated..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <value>` | Conversation lifecycle state (defaults to active) (one of: active, archived) | - | No |
+| `--scope <value>` | Limit results to the global workspace, or return every readable context (one of: all, global) | - | No |
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Number of conversations per page (clamped to 1..=100) | - | No |
+| `--search <value>` | Keep only chats whose title, or whose project's name or slug, contains this text (case-insensitive,... | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat create-global-conversation`
+
+Create a private user-owned operator thread without binding its lifetime or authority to a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ai-model <value>` | Body field ai_model | - | No |
+| `--ai-permission-mode <value>` | Body field ai_permission_mode | - | No |
+| `--ai-provider <value>` | A registered development harness | - | No |
+| `--ai-thinking-level <value>` | Body field ai_thinking_level | - | No |
+| `--kind <value>` | 'ai' (default) or 'terminal' | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-user-conversation`
+
+Load one bounded history page for a private conversation by its owner-facing id
+
+**Usage:** `ai chat get-user-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--before <value>` | Opaque next_before cursor returned by the previous page | - | No |
+| `--limit <n>` | Messages per page (default 50, maximum 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat rename-user-conversation`
+
+Rename user conversation
+
+**Usage:** `ai chat rename-user-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--title <value>` | New human-facing title [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat archive-user-conversation`
+
+Archive user conversation
+
+**Usage:** `ai chat archive-user-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat start-attachment-upload`
+
+Start uploading a file in chunks, for clients behind a small request-size limit
+
+**Usage:** `ai chat start-attachment-upload <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mime-type <value>` | Content type the browser reported, if any | - | No |
+| `--name <value>` | File name as the user knows it; unsafe characters are replaced [required] | - | No |
+| `--size-bytes <n>` | Size of the whole file in bytes [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat cancel-attachment-upload`
+
+Abandon an upload and free what it reserved
+
+**Usage:** `ai chat cancel-attachment-upload <public-id> <upload-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat append-attachment-chunk`
+
+Append the next chunk of an upload
+
+**Usage:** `ai chat append-attachment-chunk <public-id> <upload-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--offset <n>` | Where this chunk starts in the file: the bytes received so far [required] | - | No |
+| `--chunk <path>` | Body field chunk [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat complete-attachment-upload`
+
+Finish an upload once every byte has arrived
+
+**Usage:** `ai chat complete-attachment-upload <public-id> <upload-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat upload-user-conversation-attachment`
+
+Upload user conversation attachment
+
+**Usage:** `ai chat upload-user-conversation-attachment <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--file <path>` | Body field file [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-user-conversation-attachment`
+
+Get user conversation attachment
+
+**Usage:** `ai chat get-user-conversation-attachment <public-id> <attachment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <value>` | Query parameter name [required] | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat compact-conversation`
+
+Summarize the chat's older messages now
+
+**Usage:** `ai chat compact-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-user-conversation-diagnostics`
+
+Export the bounded, server-redacted diagnostic state Temps currently owns
+
+**Usage:** `ai chat get-user-conversation-diagnostics <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--limit <n>` | Persisted rows to include, newest window first (default/max 25) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-goals`
+
+List the goals a chat is watching or has finished with, newest first
+
+**Usage:** `ai chat list-goals <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat cancel-goal`
+
+Stop watching a goal
+
+**Usage:** `ai chat cancel-goal <public-id> <goal-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat retry-goal`
+
+Give a failed or waiting goal a fresh attempt budget and check it again now
+
+**Usage:** `ai chat retry-goal <public-id> <goal-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat send-user-message`
+
+Submit a turn to a user-owned conversation
+
+**Usage:** `ai chat send-user-message <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ai-model <value>` | Optional next-turn model, one advertised by the conversation's provider (or by 'ai_provider' when that is set) | - | No |
+| `--ai-permission-mode <value>` | Optional next-turn permission mode for the pinned provider harness | - | No |
+| `--ai-provider <value>` | Optional AI gateway provider ('gateway_key:<id>') for this and later turns | - | No |
+| `--ai-thinking-level <value>` | Optional next-turn thinking level | - | No |
+| `--attachments <json>` | Opaque references returned by the conversation attachment endpoint (JSON) | - | No |
+| `--content <value>` | Body field content [required] | - | No |
+| `--page-context <value>` | Optional, client-supplied description of the page/entity the user is currently viewing (e.g. a trace in a... | - | No |
+| `--turn-id <value>` | Client-generated opaque idempotency key for this turn | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-operations`
+
+The deployments, backups and restores this chat started, newest first, with their current state
+
+**Usage:** `ai chat list-operations <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-user-pending-actions`
+
+List user pending actions
+
+**Usage:** `ai chat list-user-pending-actions <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat update-user-permission-mode`
+
+Update user permission mode
+
+**Usage:** `ai chat update-user-permission-mode <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--permission-mode <value>` | Provider permission mode to persist [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat resolve-user-permission`
+
+Resolve user permission
+
+**Usage:** `ai chat resolve-user-permission <public-id> <permission-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--decision <json>` | The user's decision for a pending permission request (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-resources`
+
+The projects, databases and services, repositories and sandbox this chat made, with their current state
+
+**Usage:** `ai chat list-resources <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat restore-user-conversation`
+
+Restore a user-owned archived conversation
+
+**Usage:** `ai chat restore-user-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat unlink-sandbox`
+
+Unlink the chat's sandbox
+
+**Usage:** `ai chat unlink-sandbox <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-sandbox`
+
+Whether the chat can use a sandbox, and which one it is linked to
+
+**Usage:** `ai chat get-sandbox <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat link-sandbox`
+
+Link a sandbox to the chat, or create one for it
+
+**Usage:** `ai chat link-sandbox <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--create` | Create a fresh sandbox for this chat instead | - | No |
+| `--no-create` | Set create to false | - | No |
+| `--sandbox-id <value>` | Public id of one of the caller's own sandboxes | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-sandbox-changes`
+
+The uncommitted Git changes of every repository under the sandbox work directory
+
+**Usage:** `ai chat get-sandbox-changes <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-sandbox-diff`
+
+Both sides of one changed file: as last committed, and as it is now
+
+**Usage:** `ai chat get-sandbox-diff <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--repo <value>` | The repository root, absolute or relative to the work directory [required] | - | No |
+| `--path <value>` | The file, relative to the repository root [required] | - | No |
+| `--old-path <value>` | The path before a rename, relative to the repository root | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat track-sandbox-changes`
+
+Put a folder of the sandbox under Git, so its changes show from now on: a '.gitignore' for dependencies,..
+
+**Usage:** `ai chat track-sandbox-changes <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Absolute, or relative to the work directory; the work directory when omitted | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat read-sandbox-file`
+
+One file of the chat's sandbox, for the viewer
+
+**Usage:** `ai chat read-sandbox-file <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Absolute, or relative to the sandbox work directory [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-sandbox-files`
+
+List one directory of the chat's sandbox: folders first, then files
+
+**Usage:** `ai chat list-sandbox-files <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Absolute, or relative to the sandbox work directory | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat connect-sandbox`
+
+Let the chat's sandbox use a project's database
+
+**Usage:** `ai chat connect-sandbox <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | The project whose services the sandbox may use [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat disconnect-sandbox`
+
+Stop the chat's sandbox using a project's database
+
+**Usage:** `ai chat disconnect-sandbox <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat connect-sandbox-service`
+
+Let the chat's sandbox use one service, whether or not it belongs to a project
+
+**Usage:** `ai chat connect-sandbox-service <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | A project the service is linked to | - | No |
+| `--service-id <n>` | The service the sandbox may use [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat disconnect-sandbox-service`
+
+Stop the chat's sandbox using one service
+
+**Usage:** `ai chat disconnect-sandbox-service <public-id> <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat wake-sandbox`
+
+Start the chat's sandbox if it went to sleep, so the preview and the assistant's next command find it up
+
+**Usage:** `ai chat wake-sandbox <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-secret-requests`
+
+List the credentials this chat has asked for and not yet used up or lost
+
+**Usage:** `ai chat list-secret-requests <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat provide-secret`
+
+Provide the credential the assistant asked for
+
+**Usage:** `ai chat provide-secret <public-id> <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--value-stdin` | The credential [required] (read from stdin) | - | No |
+| `--value-file <path>` | The credential [required] (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat discard-secret`
+
+Discard a credential request and anything already typed into it
+
+**Usage:** `ai chat discard-secret <public-id> <secret-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat stop-user-turn`
+
+Stop user turn
+
+**Usage:** `ai chat stop-user-turn <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-suggestion-mode`
+
+A chat's next-step suggestion setting, with the default it falls back to
+
+**Usage:** `ai chat get-suggestion-mode <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat update-suggestion-mode`
+
+Set a chat's own next-step suggestion mode, or clear it to follow the user's default
+
+**Usage:** `ai chat update-suggestion-mode <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | What happens after each answer (one of: off, ask, always) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat suggest-next-steps`
+
+Suggest a few next steps after the chat's latest answer
+
+**Usage:** `ai chat suggest-next-steps <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--answer <value>` | Cursor of the answer the user is looking at, from the message list | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-user-conversation-usage`
+
+What this conversation has cost so far
+
+**Usage:** `ai chat get-user-conversation-usage <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat leave-workspace`
+
+Take this chat out of its workspace
+
+**Usage:** `ai chat leave-workspace <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-workspace`
+
+The workspace this chat is in, with its other chats
+
+**Usage:** `ai chat get-workspace <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat set-workspace`
+
+Put this chat in a workspace, creating it when asked
+
+**Usage:** `ai chat set-workspace <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--application-id <value>` | Body field application_id | - | No |
+| `--create <json>` | A new workspace to create for the chat (JSON) | - | No |
+| `--keep-sandbox <value>` | Which sandbox the chats keep when both the chat and the workspace have one (one of: workspace, chat) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-user-pending-action`
+
+Get user pending action
+
+**Usage:** `ai chat get-user-pending-action <action-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat confirm-user-pending-action`
+
+Confirm user pending action
+
+**Usage:** `ai chat confirm-user-pending-action <action-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat reject-user-pending-action`
+
+Reject user pending action
+
+**Usage:** `ai chat reject-user-pending-action <action-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-suggestion-default`
+
+The user's default for next-step suggestions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat update-suggestion-default`
+
+Set the user's default for every chat that does not set its own mode
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--mode <value>` | What happens after each answer (one of: off, ask, always) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat find-conversation`
+
+Find the current user's existing chat for a context (returns 'null' if none yet)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--context-type <value>` | Query parameter context_type [required] | - | No |
+| `--context-id <value>` | Query parameter context_id [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat create-conversation`
+
+Get-or-create the current user's private chat for a context
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ai-model <value>` | Body field ai_model | - | No |
+| `--ai-permission-mode <value>` | Body field ai_permission_mode | - | No |
+| `--ai-provider <value>` | Provider pinned to this conversation | - | No |
+| `--ai-thinking-level <value>` | Body field ai_thinking_level | - | No |
+| `--context-id <value>` | The entity id (ints stringified) [required] | - | No |
+| `--context-type <value>` | e.g. '"deployment"' [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-conversations`
+
+List the current user's active conversations for a project, most-recently-active first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-conversation`
+
+One bounded conversation-history page (excluding internal context rows)
+
+**Usage:** `ai chat get-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--before <value>` | Opaque next_before cursor returned by the previous page | - | No |
+| `--limit <n>` | Messages per page (default 50, maximum 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat rename-conversation`
+
+Rename a conversation (set its human-facing title)
+
+**Usage:** `ai chat rename-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--title <value>` | New human-facing title [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat archive-conversation`
+
+Archive (soft-delete) a conversation
+
+**Usage:** `ai chat archive-conversation <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat send-message`
+
+Submit a user message and start a server-owned turn
+
+**Usage:** `ai chat send-message <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ai-model <value>` | Optional next-turn model, one advertised by the conversation's provider (or by 'ai_provider' when that is set) | - | No |
+| `--ai-permission-mode <value>` | Optional next-turn permission mode for the pinned provider harness | - | No |
+| `--ai-provider <value>` | Optional AI gateway provider ('gateway_key:<id>') for this and later turns | - | No |
+| `--ai-thinking-level <value>` | Optional next-turn thinking level | - | No |
+| `--attachments <json>` | Opaque references returned by the conversation attachment endpoint (JSON) | - | No |
+| `--content <value>` | Body field content [required] | - | No |
+| `--page-context <value>` | Optional, client-supplied description of the page/entity the user is currently viewing (e.g. a trace in a... | - | No |
+| `--turn-id <value>` | Client-generated opaque idempotency key for this turn | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat list-pending-actions`
+
+List all pending actions for a conversation (most-recently-proposed first)
+
+**Usage:** `ai chat list-pending-actions <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat update-permission-mode`
+
+Update permission mode
+
+**Usage:** `ai chat update-permission-mode <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--permission-mode <value>` | Provider permission mode to persist [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat resolve-permission`
+
+Resolve permission
+
+**Usage:** `ai chat resolve-permission <public-id> <permission-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--decision <json>` | The user's decision for a pending permission request (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat stop-turn`
+
+Explicitly cancel the server-owned active turn
+
+**Usage:** `ai chat stop-turn <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat get-pending-action`
+
+Get a single pending action by its public id (scoped to the project)
+
+**Usage:** `ai chat get-pending-action <action-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat confirm-pending-action`
+
+Confirm a proposed AI action: validate permission, atomically claim, execute, persist outcome
+
+**Usage:** `ai chat confirm-pending-action <action-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai chat reject-pending-action`
+
+Reject a proposed AI action (no execution)
+
+**Usage:** `ai chat reject-pending-action <action-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `ai provider`
 
@@ -11559,6 +22098,1588 @@ Show which AI prerequisites this project meets, and how to fix the rest
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `ai apps`
+
+Apps commands
+
+**Subcommands:**
+
+- `list-applications` - List applications
+- `create-application` - Create application
+- `archive-application` - Archive an AI application
+- `get-application` - Get application
+- `rename-application` - Rename an AI application
+- `list-application-conversations` - List application conversations
+- `create-application-conversation` - Create application conversation
+- `list-thread-artifacts` - List thread artifacts
+- `create-thread-artifact` - Create thread artifact
+- `list-application-git-connections` - List application git connections
+- `bind-application-git-connection` - Bind application git connection
+- `disconnect-application-git-connection` - Disconnect application git connection
+- `create-application-preview-link` - Mint a short-lived URL for a port running in the application harness sandbox
+- `create-application-project` - Create and link an application project
+- `link-application` - Link an existing project to an application
+- `unlink-application` - Unlink an application project
+- `deploy-application-workspace` - Deploy an application workspace project with Drop
+- `set-application-primary` - Choose the application's primary project
+- `write-application-workspace-files` - Write a bounded batch of local files into an application project
+- `import-application-workspace-git` - Import a Git repository into an application project
+- `restore-application` - Restore an archived AI application
+- `get-application-workspace` - Get application workspace
+- `update-application-workspace` - Update desired application workspace resources
+- `control-application-workspace` - Control an application workspace
+- `get-application-workspace-changes` - Get application workspace changes
+- `get-application-workspace-diff` - Get application workspace diff
+- `get-application-workspace-directory` - Get application workspace directory
+- `get-application-workspace-file` - Get application workspace file
+- `download-application-workspace-file` - Download one application workspace file
+- `upload-application-workspace-files` - Upload files into an application workspace
+- `attach-application-workspace-terminal` - Attach an interactive terminal to an application workspace
+- `blueprint` - Blueprint commands
+
+#### `ai apps list-applications`
+
+List applications
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <value>` | Resource lifecycle state (defaults to active) (one of: active, archived) | - | No |
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Number of applications or conversations per page (clamped to 1..=100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps create-application`
+
+Create application
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--description <value>` | Body field description | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--project-ids <n>` | Body field project_ids (repeatable) | - | No |
+| `--starter-project <json>` | Body field starter_project (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps archive-application`
+
+Archive an AI application
+
+**Usage:** `ai apps archive-application <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps get-application`
+
+Get application
+
+**Usage:** `ai apps get-application <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <value>` | Resource lifecycle state (defaults to active) (one of: active, archived) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps rename-application`
+
+Rename an AI application
+
+**Usage:** `ai apps rename-application <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <value>` | New name shown for the application [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps list-application-conversations`
+
+List application conversations
+
+**Usage:** `ai apps list-application-conversations <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <value>` | Resource lifecycle state (defaults to active) (one of: active, archived) | - | No |
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Number of applications or conversations per page (clamped to 1..=100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps create-application-conversation`
+
+Create application conversation
+
+**Usage:** `ai apps create-application-conversation <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--ai-provider <value>` | A registered development harness (for example 'claude_cli') | - | No |
+| `--kind <value>` | 'ai' (default) or 'terminal' | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps list-thread-artifacts`
+
+List thread artifacts
+
+**Usage:** `ai apps list-thread-artifacts <application-public-id> <conversation-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps create-thread-artifact`
+
+Create thread artifact
+
+**Usage:** `ai apps create-thread-artifact <application-public-id> <conversation-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--kind <value>` | Body field kind [required] | - | No |
+| `--payload <json>` | Body field payload (JSON) [required] | - | No |
+| `--title <value>` | Body field title | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps list-application-git-connections`
+
+List application git connections
+
+**Usage:** `ai apps list-application-git-connections <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps bind-application-git-connection`
+
+Bind application git connection
+
+**Usage:** `ai apps bind-application-git-connection <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--connection-id <n>` | Body field connectionId [required] | - | No |
+| `--project-id <n>` | Body field projectId [required] | - | No |
+| `--remote-name <value>` | Body field remoteName [required] | - | No |
+| `--repository-id <n>` | Body field repositoryId [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps disconnect-application-git-connection`
+
+Disconnect application git connection
+
+**Usage:** `ai apps disconnect-application-git-connection <application-public-id> <binding-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps create-application-preview-link`
+
+Mint a short-lived URL for a port running in the application harness sandbox
+
+**Usage:** `ai apps create-application-preview-link <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Optional same-origin path to open after the preview grant is exchanged | - | No |
+| `--port <n>` | The development server port detected or selected in the sandbox [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps create-application-project`
+
+Create and link an application project
+
+**Usage:** `ai apps create-application-project <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--exposed-port <n>` | Body field exposed_port | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--preset <value>` | Deployment preset for the project | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps link-application`
+
+Link an existing project to an application
+
+**Usage:** `ai apps link-application <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Body field project_id [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps unlink-application`
+
+Unlink an application project
+
+**Usage:** `ai apps unlink-application <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps deploy-application-workspace`
+
+Deploy an application workspace project with Drop
+
+**Usage:** `ai apps deploy-application-workspace <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--environment-id <n>` | Target environment | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps set-application-primary`
+
+Choose the application's primary project
+
+**Usage:** `ai apps set-application-primary <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps write-application-workspace-files`
+
+Write a bounded batch of local files into an application project
+
+**Usage:** `ai apps write-application-workspace-files <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--files <json>` | Body field files (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps import-application-workspace-git`
+
+Import a Git repository into an application project
+
+**Usage:** `ai apps import-application-workspace-git <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--depth <n>` | Body field depth | - | No |
+| `--git-connection-id <n>` | Opaque user-owned connection reference | - | No |
+| `--revision <value>` | Body field revision | - | No |
+| `--url <value>` | Body field url [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps restore-application`
+
+Restore an archived AI application
+
+**Usage:** `ai apps restore-application <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps get-application-workspace`
+
+Get application workspace
+
+**Usage:** `ai apps get-application-workspace <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps update-application-workspace`
+
+Update desired application workspace resources
+
+**Usage:** `ai apps update-application-workspace <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--cpu-limit <number>` | Body field cpu_limit | - | No |
+| `--disk-limit-mb <n>` | Body field disk_limit_mb | - | No |
+| `--idle-timeout-secs <n>` | Body field idle_timeout_secs | - | No |
+| `--image <value>` | Pinned Temps-managed daemon image | - | No |
+| `--memory-limit-mb <n>` | Body field memory_limit_mb | - | No |
+| `--pids-limit <n>` | Body field pids_limit | - | No |
+| `--runtime <value>` | Body field runtime | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps control-application-workspace`
+
+Control an application workspace
+
+**Usage:** `ai apps control-application-workspace <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--action <value>` | restart, pause, resume, rebuild, snapshot, restore, or update_runtime [required] | - | No |
+| `--confirm` | Must be true for update_runtime because compute is replaced | - | No |
+| `--no-confirm` | Set confirm to false | - | No |
+| `--label <value>` | Body field label | - | No |
+| `--runtime <value>` | Optional built-in flavor to select during update_runtime | - | No |
+| `--snapshot-id <value>` | Body field snapshot_id | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps get-application-workspace-changes`
+
+Get application workspace changes
+
+**Usage:** `ai apps get-application-workspace-changes <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--cursor <n>` | Position returned by the previous page | - | No |
+| `--limit <n>` | Files per page (1-200, default 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps get-application-workspace-diff`
+
+Get application workspace diff
+
+**Usage:** `ai apps get-application-workspace-diff <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Query parameter path [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps get-application-workspace-directory`
+
+Get application workspace directory
+
+**Usage:** `ai apps get-application-workspace-directory <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Workspace-relative directory; omit for the root | - | No |
+| `--cursor <n>` | Position returned by the previous page | - | No |
+| `--limit <n>` | Entries per page (1-100, default 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps get-application-workspace-file`
+
+Get application workspace file
+
+**Usage:** `ai apps get-application-workspace-file <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Query parameter path [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps download-application-workspace-file`
+
+Download one application workspace file
+
+**Usage:** `ai apps download-application-workspace-file <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Query parameter path [required] | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps upload-application-workspace-files`
+
+Upload files into an application workspace
+
+**Usage:** `ai apps upload-application-workspace-files <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--files <json>` | Body field files (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps attach-application-workspace-terminal`
+
+Attach an interactive terminal to an application workspace
+
+**Usage:** `ai apps attach-application-workspace-terminal <application-public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--thread <value>` | Public id of the terminal thread to attach to [required] | - | No |
+| `--cols <n>` | Initial terminal width in columns (default 80) | - | No |
+| `--rows <n>` | Initial terminal height in rows (default 24) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai apps blueprint`
+
+Blueprint commands
+
+**Subcommands:**
+
+- `get` - The workspace's architecture blueprint with the live state of its parts
+- `unbind-component` - Remove a part's binding
+- `bind-component` - Bind a part of the accepted blueprint to the project or service that realises it
+- `list-versions` - Every version of the workspace's blueprint, newest first
+- `save-version` - Save a version the user wrote
+- `accept-version` - Accept a proposed version: every chat of the workspace builds against it
+- `reject-version` - Reject a proposed version
+
+##### `ai apps blueprint get`
+
+The workspace's architecture blueprint with the live state of its parts
+
+**Usage:** `ai apps blueprint get <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+##### `ai apps blueprint unbind-component`
+
+Remove a part's binding
+
+**Usage:** `ai apps blueprint unbind-component <public-id> <component-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai apps blueprint bind-component`
+
+Bind a part of the accepted blueprint to the project or service that realises it
+
+**Usage:** `ai apps blueprint bind-component <public-id> <component-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Body field project_id | - | No |
+| `--service-id <n>` | Body field service_id | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai apps blueprint list-versions`
+
+Every version of the workspace's blueprint, newest first
+
+**Usage:** `ai apps blueprint list-versions <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | 1-based page | - | No |
+| `--page-size <n>` | Default 20, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai apps blueprint save-version`
+
+Save a version the user wrote
+
+**Usage:** `ai apps blueprint save-version <public-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--change-summary <value>` | Body field change_summary [required] | - | No |
+| `--document <json>` | The design of an application: what it is for, its parts and its flows (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai apps blueprint accept-version`
+
+Accept a proposed version: every chat of the workspace builds against it
+
+**Usage:** `ai apps blueprint accept-version <public-id> <version> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+##### `ai apps blueprint reject-version`
+
+Reject a proposed version
+
+**Usage:** `ai apps blueprint reject-version <public-id> <version> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `ai coding-agents`
+
+Coding agents commands
+
+**Subcommands:**
+
+- `list` - Every coding-agent CLI Temps manages, its latest published release, and whether newer releases are..
+- `update-settings` - Turn automatic coding-agent updates on or off
+
+#### `ai coding-agents list`
+
+Every coding-agent CLI Temps manages, its latest published release, and whether newer releases are..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--refresh` | Ask the npm registry again instead of using the six-hour cache (at most once a minute) | - | No |
+| `--no-refresh` | Set refresh to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai coding-agents update-settings`
+
+Turn automatic coding-agent updates on or off
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--auto-update` | Body field auto_update | - | No |
+| `--no-auto-update` | Set auto_update to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `ai gateway`
+
+Gateway commands
+
+**Subcommands:**
+
+- `limits` - Limits commands
+- `catalog` - Catalog commands
+- `pricing` - Pricing commands
+- `providers` - Providers commands
+- `usage` - Usage commands
+- `create-batch` - Create batch
+- `retrieve-batch` - Retrieve batch
+- `cancel-batch` - Cancel batch
+- `chat-completions` - Chat completions
+- `embeddings` - Embeddings
+- `upload-file` - Upload file
+- `delete-file` - Delete file
+- `retrieve-file` - Retrieve file
+- `file-content` - File content
+- `list-models` - List models
+- `create-response-json` - Explicit JSON contract for generated clients; the standard OpenAI route remains polymorphic
+- `create-response-stream` - Explicit SSE contract for generated clients; never buffers a successful event stream
+- `stream-structured-output` - Stream structured output
+
+#### `ai gateway limits`
+
+Limits commands
+
+**Subcommands:**
+
+- `get-overview` - Get limits overview
+- `update-instance` - Update instance limits
+- `reset` - Reset project limits
+- `get` - Get project limits
+- `update` - Update project limits
+
+##### `ai gateway limits get-overview`
+
+Get limits overview
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page of project overrides (default 1) | - | No |
+| `--page-size <n>` | Page size (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway limits update-instance`
+
+Update instance limits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--max-cost-per-month-microcents <n>` | Operator-funded spend per UTC calendar month, in microcents (1/10000 of a cent; 1 USD = 1,000,000 microcents) | - | No |
+| `--max-requests-per-minute <n>` | Requests per rolling minute | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway limits reset`
+
+Reset project limits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway limits get`
+
+Get project limits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway limits update`
+
+Update project limits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--max-cost-per-month-microcents <n>` | Operator-funded spend per UTC calendar month, in microcents (1/10000 of a cent; 1 USD = 1,000,000 microcents) | - | No |
+| `--max-requests-per-minute <n>` | Requests per rolling minute | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway catalog`
+
+Catalog commands
+
+**Subcommands:**
+
+- `get-model` - The runtime model catalog's settings and the outcome of its last refresh
+- `list-model-entries` - The stored catalog's models, newest release first
+- `refresh-model` - Fetch the catalog now, store it and apply its prices
+- `update-model-settings` - Change where the catalog comes from and how it is refreshed
+- `list-unpriced-models` - Models enabled on a provider key that no price covers
+
+##### `ai gateway catalog get-model`
+
+The runtime model catalog's settings and the outcome of its last refresh
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway catalog list-model-entries`
+
+The stored catalog's models, newest release first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--provider <value>` | Temps provider id ('openai', 'anthropic', 'gemini', 'xai', 'openrouter') | - | No |
+| `--search <value>` | Case-insensitive part of the model id or name | - | No |
+| `--page <n>` | Page number, from 1 (default 1) | - | No |
+| `--page-size <n>` | Page size (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway catalog refresh-model`
+
+Fetch the catalog now, store it and apply its prices
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway catalog update-model-settings`
+
+Change where the catalog comes from and how it is refreshed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--auto-refresh` | Body field auto_refresh | - | No |
+| `--no-auto-refresh` | Set auto_refresh to false | - | No |
+| `--discover-provider-models` | Body field discover_provider_models | - | No |
+| `--no-discover-provider-models` | Set discover_provider_models to false | - | No |
+| `--refresh-interval-hours <n>` | Body field refresh_interval_hours | - | No |
+| `--source-url <value>` | A custom 'https://' catalog URL, or an empty string to go back to the catalog published in the Temps... | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway catalog list-unpriced-models`
+
+Models enabled on a provider key that no price covers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway pricing`
+
+Pricing commands
+
+**Subcommands:**
+
+- `get` - Get pricing
+
+##### `ai gateway pricing get`
+
+Get pricing
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway providers`
+
+Providers commands
+
+**Subcommands:**
+
+- `list-keys` - List provider keys
+- `create-key` - Create provider key
+- `discover-models` - Discover provider models
+- `test-key-inline` - Test provider key inline
+- `delete-key` - Delete provider key
+- `get-key` - Get provider key
+- `update-key` - Update provider key
+- `add-model` - Add provider model
+- `refresh-models` - Refresh provider models
+- `delete-model` - Delete provider model
+- `update-model` - Update provider model
+- `test-key-by-id` - Test provider key by id
+
+##### `ai gateway providers list-keys`
+
+List provider keys
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers create-key`
+
+Create provider key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--api-key-stdin` | Provider API key (read from stdin) | - | No |
+| `--api-key-file <path>` | Provider API key (read from a file) | - | No |
+| `--base-url <value>` | Required for "openai_compatible", e.g. "http://10.0.0.5:8000/v1" | - | No |
+| `--capabilities <json>` | Capabilities an administrator declared for a self-hosted key (JSON) | - | No |
+| `--default-model <value>` | Model id to pin for this provider (e.g. "gpt-6.2-sol") | - | No |
+| `--display-name <value>` | Body field display_name [required] | - | No |
+| `--provider <value>` | "openai", "anthropic", "xai", "gemini", "openrouter", or "openai_compatible" for a self-hosted... [required] | - | No |
+| `--trust-private-address` | Trust the exact private 'ip:port' of 'base_url' for this key only, without adding it to the instance-wide... | - | No |
+| `--no-trust-private-address` | Set trust_private_address to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers discover-models`
+
+Discover provider models
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--api-key-stdin` | API key, if the server requires one (read from stdin) | - | No |
+| `--api-key-file <path>` | API key, if the server requires one (read from a file) | - | No |
+| `--base-url <value>` | Base URL of the server (required for "openai_compatible") | - | No |
+| `--provider <value>` | Provider ID, e.g. "openai_compatible" [required] | - | No |
+| `--trust-private-address` | Discover as if the base URL's exact private address were trusted on the key | - | No |
+| `--no-trust-private-address` | Set trust_private_address to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers test-key-inline`
+
+Test provider key inline
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--api-key-stdin` | The raw API key to test (may be empty for a self-hosted provider) (read from stdin) | - | No |
+| `--api-key-file <path>` | The raw API key to test (may be empty for a self-hosted provider) (read from a file) | - | No |
+| `--base-url <value>` | Optional custom base URL (required for "openai_compatible") | - | No |
+| `--default-model <value>` | Model to send the test completion to | - | No |
+| `--provider <value>` | Provider ID: "openai", "anthropic", "xai", "gemini", "openrouter", "openai_compatible" [required] | - | No |
+| `--trust-private-address` | Test as if the base URL's exact private address were trusted on the key | - | No |
+| `--no-trust-private-address` | Set trust_private_address to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers delete-key`
+
+Delete provider key
+
+**Usage:** `ai gateway providers delete-key <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers get-key`
+
+Get provider key
+
+**Usage:** `ai gateway providers get-key <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers update-key`
+
+Update provider key
+
+**Usage:** `ai gateway providers update-key <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--api-key-stdin` | A credential (read from stdin) | - | No |
+| `--api-key-file <path>` | A credential (read from a file) | - | No |
+| `--base-url <value>` | Double-Option: absent = leave unchanged, present-null = clear (revert to the provider's default endpoint),... | - | No |
+| `--capabilities <json>` | Capabilities an administrator declared for a self-hosted key (JSON) | - | No |
+| `--default-model <value>` | Double-Option: absent = leave unchanged, present-null = clear the pinned model (revert to the per-provider... | - | No |
+| `--display-name <value>` | Body field display_name | - | No |
+| `--is-active` | Body field is_active | - | No |
+| `--no-is-active` | Set is_active to false | - | No |
+| `--trust-private-address` | 'true' trusts the exact private 'ip:port' of the (new) base URL for this key only (requires... | - | No |
+| `--no-trust-private-address` | Set trust_private_address to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers add-model`
+
+Add provider model
+
+**Usage:** `ai gateway providers add-model <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--display-name <value>` | Body field display_name | - | No |
+| `--model-id <value>` | Body field model_id [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers refresh-models`
+
+Refresh provider models
+
+**Usage:** `ai gateway providers refresh-models <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers delete-model`
+
+Delete provider model
+
+**Usage:** `ai gateway providers delete-model <id> <model-row-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers update-model`
+
+Update provider model
+
+**Usage:** `ai gateway providers update-model <id> <model-row-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--is-enabled` | Body field is_enabled [required] | - | No |
+| `--no-is-enabled` | Set is_enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway providers test-key-by-id`
+
+Test provider key by id
+
+**Usage:** `ai gateway providers test-key-by-id <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway usage`
+
+Usage commands
+
+**Subcommands:**
+
+- `get-by` - Get usage by project
+- `get-by-provider` - Get usage by provider
+- `get-conversations` - Get conversations
+- `get-conversation-detail` - Get conversation detail
+- `get-recent` - Get usage recent
+- `get-summary` - Get usage summary
+- `get-timeseries` - Get usage timeseries
+- `get-top-models` - Get usage top models
+
+##### `ai gateway usage get-by`
+
+Get usage by project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from <value>` | ISO 8601 start time (defaults to 24h ago) | - | No |
+| `--to <value>` | ISO 8601 end time (defaults to now) | - | No |
+| `--limit <n>` | Max projects (defaults to 50, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway usage get-by-provider`
+
+Get usage by provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from <value>` | ISO 8601 start time (defaults to 24h ago) | - | No |
+| `--to <value>` | ISO 8601 end time (defaults to now) | - | No |
+| `--project-id <n>` | Filter by project ID (deployment-token usage; instance administrators only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway usage get-conversations`
+
+Get conversations
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Filter by project ID (deployment-token usage; instance administrators only) | - | No |
+| `--from <value>` | ISO 8601 start time (defaults to 24h ago) | - | No |
+| `--to <value>` | ISO 8601 end time (defaults to now) | - | No |
+| `--limit <n>` | Max results (defaults to 50, max 100) | - | No |
+| `--user-id <n>` | Filter by user ID | - | No |
+| `--tags <value>` | Filter by tags (comma-separated) | - | No |
+| `--model <value>` | Filter by model name | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway usage get-conversation-detail`
+
+Get conversation detail
+
+**Usage:** `ai gateway usage get-conversation-detail <conversation-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--limit <n>` | Max results (defaults to 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway usage get-recent`
+
+Get usage recent
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--limit <n>` | Page size (defaults to 20, max 50) | - | No |
+| `--offset <n>` | Number of results to skip for pagination (defaults to 0) | - | No |
+| `--provider <value>` | Filter by provider name | - | No |
+| `--model <value>` | Filter by model name | - | No |
+| `--project-id <n>` | Filter by project ID (deployment-token usage; instance administrators only) | - | No |
+| `--status <n>` | Filter by HTTP status code (exact match) | - | No |
+| `--cost-gte <n>` | Cost greater-than-or-equal, in microcents | - | No |
+| `--cost-gt <n>` | Cost strictly greater-than, in microcents | - | No |
+| `--cost-lte <n>` | Cost less-than-or-equal, in microcents | - | No |
+| `--cost-lt <n>` | Cost strictly less-than, in microcents | - | No |
+| `--tokens-gte <n>` | Total tokens greater-than-or-equal | - | No |
+| `--tokens-gt <n>` | Total tokens strictly greater-than | - | No |
+| `--tokens-lte <n>` | Total tokens less-than-or-equal | - | No |
+| `--tokens-lt <n>` | Total tokens strictly less-than | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway usage get-summary`
+
+Get usage summary
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from <value>` | ISO 8601 start time (defaults to 24h ago) | - | No |
+| `--to <value>` | ISO 8601 end time (defaults to now) | - | No |
+| `--project-id <n>` | Filter by project ID (deployment-token usage; instance administrators only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway usage get-timeseries`
+
+Get usage timeseries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from <value>` | ISO 8601 start time (defaults to 24h ago) | - | No |
+| `--to <value>` | ISO 8601 end time (defaults to now) | - | No |
+| `--bucket <value>` | Bucket size: hour, day, week (defaults to day) | - | No |
+| `--project-id <n>` | Filter by project ID (deployment-token usage; instance administrators only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `ai gateway usage get-top-models`
+
+Get usage top models
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from <value>` | ISO 8601 start time (defaults to 24h ago) | - | No |
+| `--to <value>` | ISO 8601 end time (defaults to now) | - | No |
+| `--limit <n>` | Max results (defaults to 10) | - | No |
+| `--project-id <n>` | Filter by project ID (deployment-token usage; instance administrators only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway create-batch`
+
+Create batch
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--completion-window <value>` | Currently only '24h' [required] | - | No |
+| `--endpoint <value>` | Endpoint every request in the input file targets: '/v1/responses', '/v1/chat/completions' or '/v1/embeddings' [required] | - | No |
+| `--input-file-id <value>` | A file uploaded through 'POST /ai/v1/files' by the same caller [required] | - | No |
+| `--metadata <json>` | Body field metadata (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway retrieve-batch`
+
+Retrieve batch
+
+**Usage:** `ai gateway retrieve-batch <batch-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway cancel-batch`
+
+Cancel batch
+
+**Usage:** `ai gateway cancel-batch <batch-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway chat-completions`
+
+Chat completions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--frequency-penalty <number>` | Body field frequency_penalty | - | No |
+| `--max-tokens <n>` | Body field max_tokens | - | No |
+| `--messages <json>` | Body field messages (JSON) [required] | - | No |
+| `--model <value>` | Body field model [required] | - | No |
+| `--n <n>` | Body field n | - | No |
+| `--presence-penalty <number>` | Body field presence_penalty | - | No |
+| `--response-format <json>` | Body field response_format (JSON) | - | No |
+| `--seed <n>` | Body field seed | - | No |
+| `--stop <json>` | Body field stop (JSON) | - | No |
+| `--stream` | Body field stream | - | No |
+| `--no-stream` | Set stream to false | - | No |
+| `--temperature <number>` | Body field temperature | - | No |
+| `--tool-choice <json>` | Body field tool_choice (JSON) | - | No |
+| `--tools <json>` | Body field tools (JSON) | - | No |
+| `--top-p <number>` | Body field top_p | - | No |
+| `--user <value>` | Body field user | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway embeddings`
+
+Embeddings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--dimensions <n>` | Body field dimensions | - | No |
+| `--encoding-format <value>` | Body field encoding_format | - | No |
+| `--body-input <json>` | Body field input (JSON) [required] | - | No |
+| `--model <value>` | Body field model [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway upload-file`
+
+Upload file
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--file <path>` | A JSONL batch input file: one request per line, every line targeting the same model and endpoint [required] | - | No |
+| `--purpose <value>` | Must be 'batch' [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway delete-file`
+
+Delete file
+
+**Usage:** `ai gateway delete-file <file-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway retrieve-file`
+
+Retrieve file
+
+**Usage:** `ai gateway retrieve-file <file-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway file-content`
+
+File content
+
+**Usage:** `ai gateway file-content <file-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway list-models`
+
+List models
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway create-response-json`
+
+Explicit JSON contract for generated clients; the standard OpenAI route remains polymorphic
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--background` | Run asynchronously and poll for the result | - | No |
+| `--no-background` | Set background to false | - | No |
+| `--conversation <json>` | Attach the response to a stored conversation (JSON) | - | No |
+| `--model <value>` | Model to run, e.g. 'gpt-6-luna' [required] | - | No |
+| `--previous-response-id <value>` | Continue from a stored response | - | No |
+| `--stream` | Stream the reply as server-sent events | - | No |
+| `--no-stream` | Set stream to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai gateway create-response-stream`
+
+Explicit SSE contract for generated clients; never buffers a successful event stream
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--background` | Run asynchronously and poll for the result | - | No |
+| `--no-background` | Set background to false | - | No |
+| `--conversation <json>` | Attach the response to a stored conversation (JSON) | - | No |
+| `--model <value>` | Model to run, e.g. 'gpt-6-luna' [required] | - | No |
+| `--previous-response-id <value>` | Continue from a stored response | - | No |
+| `--stream` | Stream the reply as server-sent events | - | No |
+| `--no-stream` | Set stream to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Accepted for symmetry: events are always JSON lines | - | No |
+
+#### `ai gateway stream-structured-output`
+
+Stream structured output
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--cache-key <value>` | Optional screen-owned cache identity | - | No |
+| `--cache-ttl-seconds <n>` | Backend cache lifetime in seconds (default 60, clamped to 1-300) | - | No |
+| `--model <value>` | Optional enabled model id for the selected key | - | No |
+| `--prompt <value>` | The complete, already-authorized context and instructions for the model [required] | - | No |
+| `--provider-key-id <n>` | Optional configured gateway key | - | No |
+| `--purpose <value>` | Stable product use-case identifier, for example 'api_traffic.summary' [required] | - | No |
+| `--refresh` | Bypass any matching backend cache entry and replace it with this result | - | No |
+| `--no-refresh` | Set refresh to false | - | No |
+| `--schema <json>` | JSON Schema describing the required response object (JSON) [required] | - | No |
+| `--thinking-level <value>` | Optional normalized reasoning depth advertised for the selected model | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Accepted for symmetry: events are always JSON lines | - | No |
+
+### `ai provider-status`
+
+Provider status commands
+
+**Subcommands:**
+
+- `get` - Get ai provider status
+- `refresh` - Refresh ai provider status
+- `update-summary-preference` - Update ai summary preference
+
+#### `ai provider-status get`
+
+Get ai provider status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai provider-status refresh`
+
+Refresh ai provider status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai provider-status update-summary-preference`
+
+Update ai summary preference
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--model <value>` | Body field model | - | No |
+| `--provider-id <value>` | Body field provider_id | - | No |
+| `--thinking-level <value>` | Body field thinking_level | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `ai workspace`
+
+Workspace commands
+
+**Subcommands:**
+
+- `get-global` - Get global ai workspace
+- `get-activity` - Aggregate all active threads for the caller's global workspace and up to 100 requested, visible..
+- `get-global-changes` - Get global workspace changes
+- `get-global-diff` - Get global workspace diff
+- `get-global-directory` - Get global workspace directory
+- `get-global-file` - Get global workspace file
+- `get-file-limits` - Get effective AI workspace file limits
+- `download-global-file` - Download one global AI workspace file
+- `upload-global-files` - Upload files into the global AI workspace
+- `create-global-preview-link` - Mint a short-lived preview URL for a port in the user's shared global AI workspace
+- `attach-global-terminal` - Attach an interactive terminal to the user's global workspace
+
+#### `ai workspace get-global`
+
+Get global ai workspace
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace get-activity`
+
+Aggregate all active threads for the caller's global workspace and up to 100 requested, visible..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--application-public-ids <value>` | Comma-separated application public IDs (maximum 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace get-global-changes`
+
+Get global workspace changes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--cursor <n>` | Position returned by the previous page | - | No |
+| `--limit <n>` | Files per page (1-200, default 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace get-global-diff`
+
+Get global workspace diff
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Query parameter path [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace get-global-directory`
+
+Get global workspace directory
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Workspace-relative directory; omit for the root | - | No |
+| `--cursor <n>` | Position returned by the previous page | - | No |
+| `--limit <n>` | Entries per page (1-100, default 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace get-global-file`
+
+Get global workspace file
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Query parameter path [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace get-file-limits`
+
+Get effective AI workspace file limits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace download-global-file`
+
+Download one global AI workspace file
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Query parameter path [required] | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace upload-global-files`
+
+Upload files into the global AI workspace
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--files <json>` | Body field files (JSON) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace create-global-preview-link`
+
+Mint a short-lived preview URL for a port in the user's shared global AI workspace
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <value>` | Optional same-origin path to open after the preview grant is exchanged | - | No |
+| `--port <n>` | The development server port detected or selected in the sandbox [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ai workspace attach-global-terminal`
+
+Attach an interactive terminal to the user's global workspace
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--thread <value>` | Public id of the terminal thread to attach to [required] | - | No |
+| `--cols <n>` | Initial terminal width in columns (default 80) | - | No |
+| `--rows <n>` | Initial terminal height in rows (default 24) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `instances` (alias: `instance`)
@@ -11691,6 +23812,10 @@ Temps Cloud
 - `billing` - Manage Temps Cloud billing and subscription
 - `console-access` - Console access through Temps Cloud (ADR-045) -- Cloud members with the owner/admin role can open this console with no inbound port
 - `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
+- `get-ai-capability` - Get cloud ai capability
+- `reconcile-backup-source` - Reconcile cloud backup source
+- `features` - Turn the Temps Cloud features this instance uses on or off; omitted ones keep their setting
+- `get-capability` - Get cloud capability
 
 ### `cloud login`
 
@@ -11984,6 +24109,7 @@ Set the write mode to "local" (stored on this instance) or "cloud" (written to T
 |------|-------------|---------|----------|
 | `-p, --project <slug>` | Project slug | - | No |
 | `--fidelity <tier>` | Also set Cloud telemetry fidelity: metered or queryable. "cloud" requires "queryable". | - | No |
+| `--analytics <mode>` | Also set where analytics and metrics are written: local or cloud | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -12040,6 +24166,56 @@ Stop a Temps Cloud activation at its next chunk boundary
 | `-y, --yes` | Skip confirmation | - | No |
 | `--json` | Output in JSON format | - | No |
 
+### `cloud get-ai-capability`
+
+Get cloud ai capability
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `cloud reconcile-backup-source`
+
+Reconcile cloud backup source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `cloud features`
+
+Turn the Temps Cloud features this instance uses on or off; omitted ones keep their setting
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--backups-enabled` | Off-site backups through Temps Cloud | - | No |
+| `--no-backups-enabled` | Set backups_enabled to false | - | No |
+| `--console-access-enabled` | Let Temps Cloud open this console (see `temps cloud console-access`) | - | No |
+| `--no-console-access-enabled` | Set console_access_enabled to false | - | No |
+| `--notifications-enabled` | Notifications delivered through Temps Cloud | - | No |
+| `--no-notifications-enabled` | Set notifications_enabled to false | - | No |
+| `--telemetry-enabled` | Cloud telemetry for spans, analytics and metrics | - | No |
+| `--no-telemetry-enabled` | Set telemetry_enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `cloud get-capability`
+
+Get cloud capability
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `plugin`
 
 Create and build TypeScript plugins, or install and manage external plugins
@@ -12054,6 +24230,7 @@ Create and build TypeScript plugins, or install and manage external plugins
 - `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
 - `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
+- `api` - Api commands
 
 ### `plugin install`
 
@@ -12257,6 +24434,81 @@ Build, publish native npm packages, verify ownership and submit for review; resu
 |------|-------------|---------|----------|
 | `-y, --yes` | Confirm public npm publication non-interactively | - | No |
 
+### `plugin api`
+
+Api commands
+
+**Subcommands:**
+
+- `list-chat-watches` - List chat plugin watches
+- `change-chat-watch` - Change chat plugin watch
+- `get-ai-tools` - Get plugin ai tools
+- `put-ai-tools` - Put plugin ai tools
+
+#### `plugin api list-chat-watches`
+
+List chat plugin watches
+
+**Usage:** `plugin api list-chat-watches <chat> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `plugin api change-chat-watch`
+
+Change chat plugin watch
+
+**Usage:** `plugin api change-chat-watch <chat> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--action <value>` | Body field action (one of: create, pause, resume, remove) [required] | - | No |
+| `--digest <value>` | Body field digest | - | No |
+| `--mode <value>` | Body field mode (one of: notify, wake) | - | No |
+| `--plugin <value>` | Body field plugin | - | No |
+| `--source <value>` | Body field source | - | No |
+| `--subject <value>` | Body field subject | - | No |
+| `--where <json>` | Body field where (JSON) | - | No |
+| `--id <value>` | Body field id | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `plugin api get-ai-tools`
+
+Get plugin ai tools
+
+**Usage:** `plugin api get-ai-tools <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `plugin api put-ai-tools`
+
+Put plugin ai tools
+
+**Usage:** `plugin api put-ai-tools <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--actor-id <value>` | Current actor_id returned by GET; replacing the installation requires fresh consent [required] | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--installation-revision <value>` | Binary revision returned by GET; a changed binary requires fresh consent [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ## `setup`
 
 PoC: install Temps on an existing Linux VPS over SSH and save a client context
@@ -12303,6 +24555,1642 @@ Stop the Temps server and database started by `temps start`
 |------|-------------|---------|----------|
 | `--delete-data` | Also delete everything in your local Temps: its apps, services, sandboxes, database and admin password (asks first) | - | No |
 | `-y, --yes` | Do not ask before deleting data | - | No |
+
+## `agents`
+
+Project agents, their MCP servers, skills and AI providers
+
+**Subcommands:**
+
+- `create` - Create agent
+- `get-cli-status` - Get cli status
+- `list-all-runs` - List all runs
+- `latest-run-for-source` - Latest run for source
+- `cancel-run` - Cancel run
+- `retry-run` - Retry a completed, failed, cancelled, or no_fix run with the same trigger context
+- `get-sandbox-status` - Get sandbox status
+- `smoke-test` - Run a smoke test to verify the selected AI CLI works in the environment where agents will actually execute..
+- `delete` - Delete agent
+- `get` - Get agent
+- `update` - Update agent
+- `list-runs` - List agent runs
+- `stream-events` - SSE endpoint: streams run log events in real-time
+- `list-mcps` - List mcps
+- `create-mcp` - Create mcp
+- `delete-mcp` - Delete mcp
+- `get-mcp` - Get mcp
+- `update-mcp` - Update mcp
+- `reveal-mcp-config` - Reveal mcp config
+- `get-skill` - Get skill
+- `download-skill-archive` - Download a skill's archive (tar.gz) — project-scoped
+- `save-token` - Save an encrypted AI provider token for use in sandbox containers
+- `list-ai-providers` - List the AI provider catalog
+- `update-ai-provider` - Update provider-scoped settings without touching the saved credential
+- `activate-ai-provider` - Activate a provider as the platform-wide default
+- `save-ai-provider-credential` - Save (or replace) a provider's credential
+- `import-local-ai-provider-credential` - Import the credential already used by this provider's CLI on the Temps host
+- `verify-saved-ai-provider-credential` - Verify a previously imported OpenCode credential against a user-selected model without asking the browser..
+- `get-ai-provider-harness-update` - Installed and latest version of the provider's harness CLI in your persistent workspace, and whether an..
+- `update-ai-provider-harness` - Install the latest release of the provider's harness CLI in your persistent workspace so newly released..
+- `refresh-ai-provider-models` - Refresh exactly one provider's account-aware model inventory
+- `run-ai-provider-preflight` - Run ai provider preflight
+- `run-ai-provider-smoke` - Run ai provider smoke
+- `list-global-mcps` - List global mcps
+- `create-global-mcp` - Create global mcp
+- `delete-global-mcp` - Delete global mcp
+- `get-global-mcp` - Get global mcp
+- `update-global-mcp` - Update global mcp
+- `reveal-global-mcp-config` - Reveal global mcp config
+- `rebuild-sandbox-image` - Rebuild sandbox image
+- `get-global-sandbox-status` - Get global sandbox status
+- `get-global-skill` - Get global skill
+- `download-global-skill-archive` - Download a skill's archive (tar.gz) — global
+
+### `agents create`
+
+Create agent
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ai-model <value>` | Preferred model identifier for the CLI. 'Some("")' clears the stored value | - | No |
+| `--ai-provider <value>` | Body field ai_provider | - | No |
+| `--ai-provider-key-id <n>` | Body field ai_provider_key_id | - | No |
+| `--api-key-stdin` | Plain-text API key — will be encrypted before storage (read from stdin) | - | No |
+| `--api-key-file <path>` | Plain-text API key — will be encrypted before storage (read from a file) | - | No |
+| `--branch-prefix <value>` | Body field branch_prefix | - | No |
+| `--config-repo-branch <value>` | Branch of the config repo to use (default: "main") | - | No |
+| `--config-repo-url <value>` | Private config repo containing .claude/ directory (skills, MCP, plugins) | - | No |
+| `--cooldown-minutes <n>` | Body field cooldown_minutes | - | No |
+| `--daily-budget-cents <n>` | Body field daily_budget_cents | - | No |
+| `--deliverable <value>` | Body field deliverable | - | No |
+| `--description <value>` | Body field description | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--max-turns <n>` | Body field max_turns | - | No |
+| `--mcp-servers-config <json>` | MCP servers config (Claude Code settings.json mcpServers format) (JSON) | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--prompt <value>` | Body field prompt | - | No |
+| `--sandbox-enabled` | Body field sandbox_enabled | - | No |
+| `--no-sandbox-enabled` | Set sandbox_enabled to false | - | No |
+| `--skills-config <json>` | Skills config as JSON array (JSON) | - | No |
+| `--slug <value>` | Body field slug | - | No |
+| `--timeout-seconds <n>` | Body field timeout_seconds | - | No |
+| `--tools-config <json>` | Tools config as JSON array (JSON) | - | No |
+| `--trigger-config <json>` | Trigger configuration JSON: { "error": { "new_issue": true, "regression": true }, "manual": true } (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents get-cli-status`
+
+Get cli status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--provider <value>` | AI provider: claude_cli or codex_cli | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents list-all-runs`
+
+List all runs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (1-based) | - | No |
+| `--page-size <n>` | Page size (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents latest-run-for-source`
+
+Latest run for source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--trigger-source-type <value>` | Trigger source type, e.g. 'error_group' [required] | - | No |
+| `--trigger-source-id <n>` | Trigger source ID [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents cancel-run`
+
+Cancel run
+
+**Usage:** `agents cancel-run <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents retry-run`
+
+Retry a completed, failed, cancelled, or no_fix run with the same trigger context
+
+**Usage:** `agents retry-run <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents get-sandbox-status`
+
+Get sandbox status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents smoke-test`
+
+Run a smoke test to verify the selected AI CLI works in the environment where agents will actually execute..
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--provider-id <value>` | Provider id to test; defaults to the globally active provider | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents delete`
+
+Delete agent
+
+**Usage:** `agents delete <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents get`
+
+Get agent
+
+**Usage:** `agents get <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents update`
+
+Update agent
+
+**Usage:** `agents update <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ai-model <value>` | Preferred model identifier for the CLI. 'Some("")' clears the stored value | - | No |
+| `--ai-provider <value>` | Body field ai_provider | - | No |
+| `--ai-provider-key-id <n>` | Body field ai_provider_key_id | - | No |
+| `--api-key-stdin` | Plain-text API key — will be encrypted before storage (read from stdin) | - | No |
+| `--api-key-file <path>` | Plain-text API key — will be encrypted before storage (read from a file) | - | No |
+| `--branch-prefix <value>` | Body field branch_prefix | - | No |
+| `--config-repo-branch <value>` | Branch of the config repo to use (default: "main") | - | No |
+| `--config-repo-url <value>` | Private config repo containing .claude/ directory (skills, MCP, plugins) | - | No |
+| `--cooldown-minutes <n>` | Body field cooldown_minutes | - | No |
+| `--daily-budget-cents <n>` | Body field daily_budget_cents | - | No |
+| `--deliverable <value>` | Body field deliverable | - | No |
+| `--description <value>` | Body field description | - | No |
+| `--enabled` | Body field enabled | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--max-turns <n>` | Body field max_turns | - | No |
+| `--mcp-servers-config <json>` | MCP servers config (Claude Code settings.json mcpServers format) (JSON) | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--prompt <value>` | Body field prompt | - | No |
+| `--sandbox-enabled` | Body field sandbox_enabled | - | No |
+| `--no-sandbox-enabled` | Set sandbox_enabled to false | - | No |
+| `--skills-config <json>` | Skills config as JSON array (JSON) | - | No |
+| `--slug <value>` | Body field slug | - | No |
+| `--timeout-seconds <n>` | Body field timeout_seconds | - | No |
+| `--tools-config <json>` | Tools config as JSON array (JSON) | - | No |
+| `--trigger-config <json>` | Trigger configuration JSON: { "error": { "new_issue": true, "regression": true }, "manual": true } (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents list-runs`
+
+List agent runs
+
+**Usage:** `agents list-runs <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (1-based) | - | No |
+| `--page-size <n>` | Page size (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents stream-events`
+
+SSE endpoint: streams run log events in real-time
+
+**Usage:** `agents stream-events <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Accepted for symmetry: events are always JSON lines | - | No |
+
+### `agents list-mcps`
+
+List mcps
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents create-mcp`
+
+Create mcp
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--config <json>` | Body field config (JSON) [required] | - | No |
+| `--description <value>` | Body field description | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--slug <value>` | Body field slug [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents delete-mcp`
+
+Delete mcp
+
+**Usage:** `agents delete-mcp <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents get-mcp`
+
+Get mcp
+
+**Usage:** `agents get-mcp <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents update-mcp`
+
+Update mcp
+
+**Usage:** `agents update-mcp <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--config <json>` | Body field config (JSON) [required] | - | No |
+| `--description <value>` | Body field description | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents reveal-mcp-config`
+
+Reveal mcp config
+
+**Usage:** `agents reveal-mcp-config <slug> <field> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents get-skill`
+
+Get skill
+
+**Usage:** `agents get-skill <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents download-skill-archive`
+
+Download a skill's archive (tar.gz) — project-scoped
+
+**Usage:** `agents download-skill-archive <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents save-token`
+
+Save an encrypted AI provider token for use in sandbox containers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--token-stdin` | The OAuth token from 'claude setup-token' or an API key [required] (read from stdin) | - | No |
+| `--token-file <path>` | The OAuth token from 'claude setup-token' or an API key [required] (read from a file) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents list-ai-providers`
+
+List the AI provider catalog
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--catalog-only` | Return only static/cached catalog metadata | - | No |
+| `--no-catalog-only` | Set catalog_only to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents update-ai-provider`
+
+Update provider-scoped settings without touching the saved credential
+
+**Usage:** `agents update-ai-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--default-model <value>` | New default model id. 'None' or an empty string clears the stored value so the CLI falls back to its own... | - | No |
+| `--max-turns-analysis <n>` | Default max turns for the autofixer analysis phase (1–200). '0' clears the stored value (built-in default... | - | No |
+| `--max-turns-feedback <n>` | Default max turns for autofixer feedback rounds (1–200). '0' clears; omitted leaves unchanged | - | No |
+| `--max-turns-fix <n>` | Default max turns for the autofixer fix phase (1–200). '0' clears; omitted leaves unchanged | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents activate-ai-provider`
+
+Activate a provider as the platform-wide default
+
+**Usage:** `agents activate-ai-provider <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents save-ai-provider-credential`
+
+Save (or replace) a provider's credential
+
+**Usage:** `agents save-ai-provider-credential <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--auth-type <value>` | Auth flavor id (must match one of the provider's catalog entries) [required] | - | No |
+| `--credential-stdin` | Plaintext credential body (API key, OAuth token, or full config file contents) [required] (read from stdin) | - | No |
+| `--credential-file <path>` | Plaintext credential body (API key, OAuth token, or full config file contents) [required] (read from a file) | - | No |
+| `--verification-model <value>` | OpenCode model to test, in 'provider/model' form | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents import-local-ai-provider-credential`
+
+Import the credential already used by this provider's CLI on the Temps host
+
+**Usage:** `agents import-local-ai-provider-credential <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--verification-model <value>` | OpenCode model to use for the verification request, in 'provider/model' form | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents verify-saved-ai-provider-credential`
+
+Verify a previously imported OpenCode credential against a user-selected model without asking the browser..
+
+**Usage:** `agents verify-saved-ai-provider-credential <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--verification-model <value>` | OpenCode model in 'provider/model' form, used to verify the saved secret [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents get-ai-provider-harness-update`
+
+Installed and latest version of the provider's harness CLI in your persistent workspace, and whether an..
+
+**Usage:** `agents get-ai-provider-harness-update <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--refresh` | Look inside the workspace again instead of returning the cached check | - | No |
+| `--no-refresh` | Set refresh to false | - | No |
+| `--cached-only` | Return only what was last read, never looking inside the workspace (which could create or wake it) | - | No |
+| `--no-cached-only` | Set cached_only to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents update-ai-provider-harness`
+
+Install the latest release of the provider's harness CLI in your persistent workspace so newly released..
+
+**Usage:** `agents update-ai-provider-harness <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents refresh-ai-provider-models`
+
+Refresh exactly one provider's account-aware model inventory
+
+**Usage:** `agents refresh-ai-provider-models <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents run-ai-provider-preflight`
+
+Run ai provider preflight
+
+**Usage:** `agents run-ai-provider-preflight <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents run-ai-provider-smoke`
+
+Run ai provider smoke
+
+**Usage:** `agents run-ai-provider-smoke <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--consent` | Explicit acknowledgement that this check makes a billable model request [required] | - | No |
+| `--no-consent` | Set consent to false | - | No |
+| `--model <value>` | Optional catalog model identifier | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents list-global-mcps`
+
+List global mcps
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents create-global-mcp`
+
+Create global mcp
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Body field config (JSON) [required] | - | No |
+| `--description <value>` | Body field description | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--slug <value>` | Body field slug [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents delete-global-mcp`
+
+Delete global mcp
+
+**Usage:** `agents delete-global-mcp <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents get-global-mcp`
+
+Get global mcp
+
+**Usage:** `agents get-global-mcp <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents update-global-mcp`
+
+Update global mcp
+
+**Usage:** `agents update-global-mcp <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--config <json>` | Body field config (JSON) [required] | - | No |
+| `--description <value>` | Body field description | - | No |
+| `--name <value>` | Body field name | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `agents reveal-global-mcp-config`
+
+Reveal global mcp config
+
+**Usage:** `agents reveal-global-mcp-config <slug> <field> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents rebuild-sandbox-image`
+
+Rebuild sandbox image
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Accepted for symmetry: events are always JSON lines | - | No |
+
+### `agents get-global-sandbox-status`
+
+Get global sandbox status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents get-global-skill`
+
+Get global skill
+
+**Usage:** `agents get-global-skill <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `agents download-global-skill-archive`
+
+Download a skill's archive (tar.gz) — global
+
+**Usage:** `agents download-global-skill-archive <slug> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
+| `--json` | Output in JSON format | - | No |
+
+## `shield`
+
+Shield: bot and abuse protection rules, entries and proposals
+
+**Subcommands:**
+
+- `list-events` - Recent Shield events for an environment
+- `lookup-client` - Look up what Shield says about a client
+- `get-summary` - Shield summary for an environment
+- `list-tokens` - List bypass tokens for an environment
+- `create-token` - Create a bypass token
+- `revoke-token` - Revoke a bypass token
+- `list-entries` - List a project's Shield entries
+- `create-entry` - Add a Shield entry to a project
+- `get-entry` - Show one of a project's Shield entries
+- `delete-entry` - Remove a project's Shield entry
+- `update-entry` - Change a project's Shield entry
+- `get-settings` - Get the platform Shield settings
+- `update-settings` - Change the platform Shield settings
+- `list-platform-entries` - List platform Shield entries
+- `create-platform-entry` - Add a platform Shield entry
+- `get-platform-entry` - Show one platform-wide Shield entry
+- `delete-platform-entry` - Remove a platform Shield entry
+- `update-platform-entry` - Change a platform Shield entry
+- `list-proposals` - List fleet learning's proposals
+- `approve-proposal` - Approve a proposal
+- `reject-proposal` - Reject a proposal
+
+### `shield list-events`
+
+Recent Shield events for an environment
+
+**Usage:** `shield list-events <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--limit <n>` | Events to return, 1 to 100; 20 by default | - | No |
+| `--kind <value>` | Only this kind: 'verdict', 'challenge_issued', 'challenge_solved' or 'challenge_failed' | - | No |
+| `--verdict <value>` | Only this verdict: 'block', 'challenge' or 'log' | - | No |
+| `--ip <value>` | Only this client address, IPv4 or IPv6 | - | No |
+| `--before <value>` | Only events before this instant (the 'next_before' of the previous page) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield lookup-client`
+
+Look up what Shield says about a client
+
+**Usage:** `shield lookup-client <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--ip <value>` | A client address | - | No |
+| `--ja4 <value>` | A JA4 TLS fingerprint | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield get-summary`
+
+Shield summary for an environment
+
+**Usage:** `shield get-summary <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--window <value>` | '1h', '24h' (the default) or '7d' (one of: 1h, 24h, 7d) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield list-tokens`
+
+List bypass tokens for an environment
+
+**Usage:** `shield list-tokens <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield create-token`
+
+Create a bypass token
+
+**Usage:** `shield create-token <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--name <value>` | What uses it: 'uptime monitor', 'CI' [required] | - | No |
+| `--project-wide` | Valid for every environment of the project, not only this one | - | No |
+| `--no-project-wide` | Set project_wide to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield revoke-token`
+
+Revoke a bypass token
+
+**Usage:** `shield revoke-token <environment-id> <token-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield list-entries`
+
+List a project's Shield entries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield create-entry`
+
+Add a Shield entry to a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expires-at <value>` | When the entry stops applying; omit for never | - | No |
+| `--ja4 <value>` | A JA4 fingerprint; exactly one of 'network' and 'ja4' | - | No |
+| `--network <value>` | An address or CIDR range; exactly one of 'network' and 'ja4' | - | No |
+| `--note <value>` | Body field note | - | No |
+| `--verdict <value>` | The verdict an operator entry gives what it matches (one of: allow, log, challenge, block) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield get-entry`
+
+Show one of a project's Shield entries
+
+**Usage:** `shield get-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield delete-entry`
+
+Remove a project's Shield entry
+
+**Usage:** `shield delete-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield update-entry`
+
+Change a project's Shield entry
+
+**Usage:** `shield update-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expires-at <value>` | Body field expires_at | - | No |
+| `--note <value>` | Body field note | - | No |
+| `--verdict <value>` | The verdict an operator entry gives what it matches (one of: allow, log, challenge, block) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield get-settings`
+
+Get the platform Shield settings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `shield update-settings`
+
+Change the platform Shield settings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--share-observations` | Whether what one environment's visitors did counts for every environment (D9): addresses and fingerprints... | - | No |
+| `--no-share-observations` | Set share_observations to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield list-platform-entries`
+
+List platform Shield entries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `shield create-platform-entry`
+
+Add a platform Shield entry
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expires-at <value>` | When the entry stops applying; omit for never | - | No |
+| `--ja4 <value>` | A JA4 fingerprint; exactly one of 'network' and 'ja4' | - | No |
+| `--network <value>` | An address or CIDR range; exactly one of 'network' and 'ja4' | - | No |
+| `--note <value>` | Body field note | - | No |
+| `--verdict <value>` | The verdict an operator entry gives what it matches (one of: allow, log, challenge, block) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield get-platform-entry`
+
+Show one platform-wide Shield entry
+
+**Usage:** `shield get-platform-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `shield delete-platform-entry`
+
+Remove a platform Shield entry
+
+**Usage:** `shield delete-platform-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield update-platform-entry`
+
+Change a platform Shield entry
+
+**Usage:** `shield update-platform-entry <entry-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expires-at <value>` | Body field expires_at | - | No |
+| `--note <value>` | Body field note | - | No |
+| `--verdict <value>` | The verdict an operator entry gives what it matches (one of: allow, log, challenge, block) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield list-proposals`
+
+List fleet learning's proposals
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <value>` | Only proposals in this state; all of them when omitted (one of: pending, approved, rejected) | - | No |
+| `--q <value>` | Only proposals whose address or fingerprint contains this text, ignoring case | - | No |
+| `--page <n>` | Page number, from 1 (the default) | - | No |
+| `--page-size <n>` | Proposals per page: 25 by default, at most 100 | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `shield approve-proposal`
+
+Approve a proposal
+
+**Usage:** `shield approve-proposal <proposal-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `shield reject-proposal`
+
+Reject a proposal
+
+**Usage:** `shield reject-proposal <proposal-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+## `vault`
+
+Access vaults, the services they hold and their sessions
+
+**Subcommands:**
+
+- `list-services` - List access services general
+- `create-service` - Create access service general
+- `delete-service` - Delete access service general
+- `get-service` - Get access service general
+- `update-service` - Update access service general
+- `sessions` - Sessions commands
+- `list` - List access vaults general
+- `create` - Create access vault general
+- `delete` - Delete access vault general
+- `get` - Get access vault general
+- `update` - Update access vault general
+- `list-bundles` - List access bundles general
+- `create-bundle` - Create access bundle general
+- `delete-bundle` - Delete access bundle general
+- `update-bundle` - Update access bundle general
+- `get-eligibility` - Get vault eligibility
+- `list-links` - List vault links
+- `create-link` - Create vault link
+- `delete-link` - Delete vault link
+- `project` - Project commands
+- `sandbox` - Sandbox access vaults
+- `capability` - General access capability
+- `service-catalog` - Service catalog
+
+### `vault list-services`
+
+List access services general
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault create-service`
+
+Create access service general
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--source-project-id <n>` | Query parameter source_project_id | - | No |
+| `--clear-credential` | Body field clear_credential | - | No |
+| `--no-clear-credential` | Set clear_credential to false | - | No |
+| `--credential-stdin` | A credential (read from stdin) | - | No |
+| `--credential-file <path>` | A credential (read from a file) | - | No |
+| `--enabled` | Allows requests to be saved; does not enable a network connection [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--expected-version <n>` | Required for updates; omit for creation | - | No |
+| `--max-ttl-seconds <n>` | Maximum lifetime of a request, between 60 and 86400 seconds [required] | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--policy <json>` | Exact destination and request scope (JSON) [required] | - | No |
+| `--vault-id <value>` | Add a newly created service to this vault in the same transaction | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault delete-service`
+
+Delete access service general
+
+**Usage:** `vault delete-service <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault get-service`
+
+Get access service general
+
+**Usage:** `vault get-service <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `vault update-service`
+
+Update access service general
+
+**Usage:** `vault update-service <service-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--clear-credential` | Body field clear_credential | - | No |
+| `--no-clear-credential` | Set clear_credential to false | - | No |
+| `--credential-stdin` | A credential (read from stdin) | - | No |
+| `--credential-file <path>` | A credential (read from a file) | - | No |
+| `--enabled` | Allows requests to be saved; does not enable a network connection [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--expected-version <n>` | Required for updates; omit for creation | - | No |
+| `--max-ttl-seconds <n>` | Maximum lifetime of a request, between 60 and 86400 seconds [required] | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--policy <json>` | Exact destination and request scope (JSON) [required] | - | No |
+| `--vault-id <value>` | Add a newly created service to this vault in the same transaction | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault sessions`
+
+Sessions commands
+
+**Subcommands:**
+
+- `list` - List access sessions general
+- `get` - Get access session general
+- `revoke` - Revoke access session general
+- `create` - Create access session general
+
+#### `vault sessions list`
+
+List access sessions general
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--vault-id <value>` | Query parameter vault_id | - | No |
+| `--sandbox-id <value>` | Filter by the sandbox's public ID; ownership still applies | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault sessions get`
+
+Get access session general
+
+**Usage:** `vault sessions get <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `vault sessions revoke`
+
+Revoke access session general
+
+**Usage:** `vault sessions revoke <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault sessions create`
+
+Create access session general
+
+**Usage:** `vault sessions create <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--bundle-id <value>` | Body field bundle_id [required] | - | No |
+| `--bundle-version <n>` | Body field bundle_version [required] | - | No |
+| `--consumer <json>` | Body field consumer (JSON) [required] | - | No |
+| `--request-id <value>` | Stable for retries of this approval [required] | - | No |
+| `--services <json>` | Exact policies the operator reviewed, one per bundle service (maximum 16) (JSON) [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault list`
+
+List access vaults general
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault create`
+
+Create access vault general
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | Existing services in this project (repeatable) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault delete`
+
+Delete access vault general
+
+**Usage:** `vault delete <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault get`
+
+Get access vault general
+
+**Usage:** `vault get <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--sandbox-id <value>` | Query parameter sandbox_id | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault update`
+
+Update access vault general
+
+**Usage:** `vault update <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | Existing services in this project (repeatable) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault list-bundles`
+
+List access bundles general
+
+**Usage:** `vault list-bundles <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--sandbox-id <value>` | Query parameter sandbox_id | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault create-bundle`
+
+Create access bundle general
+
+**Usage:** `vault create-bundle <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | A selection of this vault's services, not an authorization grant (repeatable) [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault delete-bundle`
+
+Delete access bundle general
+
+**Usage:** `vault delete-bundle <vault-id> <bundle-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault update-bundle`
+
+Update access bundle general
+
+**Usage:** `vault update-bundle <vault-id> <bundle-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | A selection of this vault's services, not an authorization grant (repeatable) [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault get-eligibility`
+
+Get vault eligibility
+
+**Usage:** `vault get-eligibility <vault-id> <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `vault list-links`
+
+List vault links
+
+**Usage:** `vault list-links <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--project-ids <value>` | Query parameter project_ids | - | No |
+| `--sandbox-ids <value>` | Query parameter sandbox_ids | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault create-link`
+
+Create vault link
+
+**Usage:** `vault create-link <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Body field project_id | - | No |
+| `--sandbox-id <value>` | Body field sandbox_id | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault delete-link`
+
+Delete vault link
+
+**Usage:** `vault delete-link <vault-id> <link-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault project`
+
+Project commands
+
+**Subcommands:**
+
+- `sessions` - Sessions commands
+- `list` - List access vaults
+- `create` - Create access vault
+- `get` - Get access vault
+- `update` - Update access vault
+- `list-bundles` - List access bundles
+- `create-bundle` - Create access bundle
+- `update-bundle` - Update access bundle
+- `create-session` - Create access session
+- `project` - Project access vaults
+
+#### `vault project sessions`
+
+Sessions commands
+
+**Subcommands:**
+
+- `list` - List access sessions
+- `get` - Get access session
+- `revoke` - Revoke access session
+
+##### `vault project sessions list`
+
+List access sessions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--vault-id <value>` | Query parameter vault_id | - | No |
+| `--sandbox-id <value>` | Filter by the sandbox's public ID; ownership still applies | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `vault project sessions get`
+
+Get access session
+
+**Usage:** `vault project sessions get <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `vault project sessions revoke`
+
+Revoke access session
+
+**Usage:** `vault project sessions revoke <session-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project list`
+
+List access vaults
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project create`
+
+Create access vault
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | Existing services in this project (repeatable) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project get`
+
+Get access vault
+
+**Usage:** `vault project get <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project update`
+
+Update access vault
+
+**Usage:** `vault project update <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | Existing services in this project (repeatable) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project list-bundles`
+
+List access bundles
+
+**Usage:** `vault project list-bundles <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project create-bundle`
+
+Create access bundle
+
+**Usage:** `vault project create-bundle <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | A selection of this vault's services, not an authorization grant (repeatable) [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project update-bundle`
+
+Update access bundle
+
+**Usage:** `vault project update-bundle <vault-id> <bundle-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--expected-version <n>` | Body field expected_version | - | No |
+| `--name <value>` | Body field name [required] | - | No |
+| `--service-ids <value>` | A selection of this vault's services, not an authorization grant (repeatable) [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project create-session`
+
+Create access session
+
+**Usage:** `vault project create-session <vault-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--bundle-id <value>` | Body field bundle_id [required] | - | No |
+| `--bundle-version <n>` | Body field bundle_version [required] | - | No |
+| `--consumer <json>` | Body field consumer (JSON) [required] | - | No |
+| `--request-id <value>` | Stable for retries of this approval [required] | - | No |
+| `--services <json>` | Exact policies the operator reviewed, one per bundle service (maximum 16) (JSON) [required] | - | No |
+| `--ttl-seconds <n>` | Body field ttl_seconds [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `vault project project`
+
+Project access vaults
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault sandbox`
+
+Sandbox access vaults
+
+**Usage:** `vault sandbox <sandbox-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `vault capability`
+
+General access capability
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `vault service-catalog`
+
+Service catalog
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Query parameter page_size | - | No |
+| `--search <value>` | Query parameter search | - | No |
+| `--id <value>` | Query parameter id | - | No |
+| `--json` | Output in JSON format | - | No |
 
 
 ---

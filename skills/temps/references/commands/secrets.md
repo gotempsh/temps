@@ -38,6 +38,7 @@ Create or update a secret (upsert by name). Prefer --value-file or --value-stdin
 | `-t, --type <type>` | Secret type: "env" (default) or "file" | `env` | No |
 | `-m, --mount-path <path>` | Absolute path inside sandbox where file-type secret is written (required for --type file) | - | No |
 | `-d, --description <description>` | Human-readable description | - | No |
+| `-p, --project <slug-or-id>` | Scope the secret to one project (default: instance-wide) | - | No |
 | `--value-file <path>` | Read the secret value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the secret value from stdin, e.g. piped from a secret manager | - | No |
 | `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
@@ -56,6 +57,7 @@ Update an existing secret (alias for create — upserts). The value must be re-s
 | `-t, --type <type>` | Secret type: "env" or "file" | - | No |
 | `-m, --mount-path <path>` | New mount path (file type only) | - | No |
 | `-d, --description <description>` | New description | - | No |
+| `-p, --project <slug-or-id>` | The project the secret is scoped to (default: instance-wide) | - | No |
 | `--value-file <path>` | Read the new secret value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the new secret value from stdin, e.g. piped from a secret manager | - | No |
 | `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
@@ -71,5 +73,6 @@ Delete a secret
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Delete the secret of this project (default: the instance-wide one) | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |

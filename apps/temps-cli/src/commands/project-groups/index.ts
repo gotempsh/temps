@@ -12,7 +12,6 @@
 import type { Command } from 'commander'
 import {
   addProjectToGroup,
-  getInheritedEnvVars,
   clearGroupRepository,
   createGroupEnvVar,
   createGroupRoute,
@@ -20,14 +19,16 @@ import {
   deleteGroupEnvVar,
   deleteGroupRoute,
   deleteProjectGroup,
+  detectPublicPresets,
+  getGroupEnvVar,
   getGroupRepository,
+  getInheritedEnvVars,
   getProjectBySlug,
   getProjectGroup,
   getProjectGroupBySlug,
   getProjects,
   getRepositoryPresetLive,
   importProjectServices,
-  detectPublicPresets,
   listGroupEnvVars,
   listGroupRoutes,
   listProjectGroups,
@@ -35,8 +36,9 @@ import {
   setGroupRepository,
   setRepositoryInheritance,
   updateGroupEnvVar,
-  updateProjectGroup
+  updateProjectGroup,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type {
   ImportedApp,
   InheritedEnvVarResponse,
@@ -450,6 +452,8 @@ export function registerProjectGroupsCommands(program: Command): void {
     .option('-p, --path <dir...>', 'Only these app directories (default: every app without a service)')
     .option('--dry-run', 'List what would be created without creating anything')
     .option('--timeout <minutes>', 'Stop waiting after this long (default 30); the import keeps running on the server')
+    .option('--fresh', 'Scan a public repository again instead of using the cached scan')
+    .option('--base-url <url>', 'HTTPS origin of the self-hosted GitLab a public repository lives on')
     .option('--json', 'Output in JSON format')
     .action(importAction)
 
@@ -493,6 +497,12 @@ export function registerProjectGroupsCommands(program: Command): void {
   const vars = groups
     .command('vars')
     .description('Variables shared by every service in a project (group)')
+
+  endpoint(vars, getGroupEnvVar, {
+    name: 'get',
+    description: 'Show one shared variable (a secret value is never shown)',
+    path: { group_id: 'int', var_id: 'int' },
+  })
 
   vars
     .command('list <group>')
@@ -1155,7 +1165,7 @@ async function followAction(ref: string, serviceRef: string, inherit: boolean): 
 
 async function importAction(
   ref: string,
-  options: { path?: string[]; dryRun?: boolean; timeout?: string } & JsonOption
+  options: { path?: string[]; dryRun?: boolean; timeout?: string; fresh?: boolean; baseUrl?: string } & JsonOption
 ): Promise<void> {
   if (options.json) setQuietMode(true)
   const timeoutMs = waitTimeoutMs(options.timeout)
@@ -1179,7 +1189,11 @@ async function importAction(
             owner: repository.repo_owner,
             repo: repository.repo_name,
           },
-          query: { branch: repository.main_branch },
+          query: {
+            branch: repository.main_branch,
+            ...(options.fresh && { fresh: true }),
+            ...(options.baseUrl && { base_url: options.baseUrl }),
+          },
         })
       )
       apps = scan.presets.map(fromPublicPreset)

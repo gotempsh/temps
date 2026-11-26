@@ -30,6 +30,8 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm, promptText, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, formatRelativeTime } from '../../ui/output.js'
 import { addCredentialSources } from '../../lib/value-source.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { CreateBackupScheduleRequest, CreateS3SourceRequest, ListSourceBackupsData, UpdateS3SourceRequest } from '../../api/types.gen.js'
 
 interface CreateScheduleOptions {
   name?: string
@@ -188,17 +190,18 @@ export function registerBackupsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listSchedules)
 
-  schedules
-    .command('create')
-    .description('Create a backup schedule')
-    .option('-n, --name <name>', 'Schedule name')
-    .option('-t, --type <type>', 'Backup type (full, incremental)')
-    .option('-s, --schedule <cron>', 'Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *"')
-    .option('-r, --retention <days>', 'Retention period in days')
-    .option('-d, --description <desc>', 'Description')
-    .option('--s3-source-id <id>', 'S3 Source ID')
-    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
-    .action(createSchedule)
+  SCHEDULE_EXTRA.addTo(
+    schedules
+      .command('create')
+      .description('Create a backup schedule')
+      .option('-n, --name <name>', 'Schedule name')
+      .option('-t, --type <type>', 'Backup type (full, incremental)')
+      .option('-s, --schedule <cron>', 'Schedule expression: six-field cron with seconds first, e.g. "0 0 2 * * *"')
+      .option('-r, --retention <days>', 'Retention period in days')
+      .option('-d, --description <desc>', 'Description')
+      .option('--s3-source-id <id>', 'S3 Source ID')
+      .option('-y, --yes', 'Skip confirmation prompts (for automation)'),
+  ).action(createSchedule)
 
   schedules
     .command('show')
@@ -253,6 +256,7 @@ export function registerBackupsCommands(program: Command): void {
     .option('--prefix <prefix>', 'Bucket path/prefix')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createSource)
+  SOURCE_EXTRA.addTo(createSourceCommand)
   addCredentialSources(createSourceCommand, [{ flag: 'secret-key', what: 'the S3 secret access key' }])
 
   sources
@@ -274,6 +278,7 @@ export function registerBackupsCommands(program: Command): void {
     .option('--secret-key <key>', 'New secret access key')
     .option('--prefix <prefix>', 'New bucket path/prefix')
     .action(updateSource)
+  SOURCE_UPDATE_EXTRA.addTo(updateSourceCommand)
   addCredentialSources(updateSourceCommand, [{ flag: 'secret-key', what: 'the S3 secret access key' }])
 
   sources
@@ -285,12 +290,13 @@ export function registerBackupsCommands(program: Command): void {
     .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(deleteSource)
 
-  sources
-    .command('backups')
-    .description('List backups for an S3 source')
-    .requiredOption('--id <id>', 'S3 source ID')
-    .option('--json', 'Output in JSON format')
-    .action(listSourceBackupsFn)
+  SOURCE_BACKUPS_QUERY.addTo(
+    sources
+      .command('backups')
+      .description('List backups for an S3 source')
+      .requiredOption('--id <id>', 'S3 source ID')
+      .option('--json', 'Output in JSON format'),
+  ).action(listSourceBackupsFn)
 
   sources
     .command('run')
@@ -388,7 +394,15 @@ async function listSchedules(options: { json?: boolean }): Promise<void> {
   newline()
 }
 
+const SCHEDULE_EXTRA = fieldFlags<CreateBackupScheduleRequest>({
+  target_all_services: { kind: 'bool', help: 'Back up every external service (the default when no --service-ids)' },
+  service_ids: { kind: 'ints', help: 'Back up only these external services (repeatable)' },
+  include_control_plane: { kind: 'bool', help: "Also back up Temps' own database" },
+  max_runtime_secs: { kind: 'int', help: 'Cancel a run that takes longer than this' },
+})
+
 async function createSchedule(options: CreateScheduleOptions): Promise<void> {
+  const extra = await SCHEDULE_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -470,6 +484,7 @@ async function createSchedule(options: CreateScheduleOptions): Promise<void> {
         s3_source_id: s3SourceId,
         enabled: true,
         tags: [],
+        ...extra,
       },
     })
     if (error) {
@@ -652,7 +667,21 @@ async function listSources(options: { json?: boolean }): Promise<void> {
   newline()
 }
 
+const S3_SOURCE_FIELDS = {
+  use_tls: { kind: 'bool', help: 'Connect to the endpoint over TLS (default true)' },
+  worker_credentials: { kind: 'json', help: 'Separate credentials the backup workers use, as JSON' },
+} as const
+
+const SOURCE_EXTRA = fieldFlags<CreateS3SourceRequest>({
+  ...S3_SOURCE_FIELDS,
+  backing_service_id: { kind: 'int', help: 'The external service (S3/MinIO) that hosts this bucket' },
+  is_default: { kind: 'bool', help: 'Make this the default backup destination' },
+})
+
+const SOURCE_UPDATE_EXTRA = fieldFlags<UpdateS3SourceRequest>(S3_SOURCE_FIELDS)
+
 async function createSource(options: CreateSourceOptions): Promise<void> {
+  const extra = await SOURCE_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -723,6 +752,7 @@ async function createSource(options: CreateSourceOptions): Promise<void> {
         access_key_id: accessKeyId,
         secret_key: secretKey,
         bucket_path: bucketPath,
+        ...extra,
       },
     })
     if (error) {
@@ -780,6 +810,7 @@ async function showSource(options: ShowSourceOptions): Promise<void> {
 }
 
 async function updateSource(options: UpdateSourceOptions): Promise<void> {
+  const extra = await SOURCE_UPDATE_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -807,6 +838,7 @@ async function updateSource(options: UpdateSourceOptions): Promise<void> {
         access_key_id: options.accessKey || null,
         secret_key: options.secretKey || null,
         bucket_path: options.prefix || null,
+        ...extra,
       },
     })
     if (error) {
@@ -854,6 +886,11 @@ async function deleteSource(options: DeleteSourceOptions): Promise<void> {
   success(`S3 source #${options.id} deleted`)
 }
 
+const SOURCE_BACKUPS_QUERY = fieldFlags<NonNullable<ListSourceBackupsData['query']>>(
+  { include_s3_scan: { kind: 'bool', help: 'Also list backups found in the bucket that this server has no record of' } },
+  'query',
+)
+
 async function listSourceBackupsFn(options: SourceBackupsOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -868,6 +905,7 @@ async function listSourceBackupsFn(options: SourceBackupsOptions): Promise<void>
     const { data, error } = await listSourceBackups({
       client,
       path: { id },
+      query: await SOURCE_BACKUPS_QUERY.read(options),
     })
     if (error) {
       throw new Error(getErrorMessage(error))

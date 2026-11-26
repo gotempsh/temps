@@ -23,7 +23,7 @@ export interface MockRun {
   stderr: string
   /** `METHOD /path?query` of every request, in order (without the `/api` prefix). */
   requests: string[]
-  /** JSON bodies sent, keyed like `requests`. */
+  /** Bodies sent, keyed like `requests`: parsed JSON, or the text of a non-JSON body. */
   bodies: Array<{ request: string; body: unknown }>
   error?: Error
 }
@@ -35,6 +35,8 @@ export interface MockRunOptions {
    * runner's own stdin in place.
    */
   stdin?: string | Uint8Array | 'tty'
+  /** The API base URL the command sees (default: an address nothing listens on). */
+  apiUrl?: string
 }
 
 /** A stand-in for `process.stdin`: a pipe yielding `input`, or an empty terminal. */
@@ -61,7 +63,7 @@ export async function runWithApi(
     Object.defineProperty(process, 'stdin', { value: fakeStdin(options.stdin), configurable: true, writable: true })
   }
   const saved = { url: process.env.TEMPS_API_URL, token: process.env.TEMPS_TOKEN, exitCode: process.exitCode }
-  process.env.TEMPS_API_URL = 'http://127.0.0.1:9'
+  process.env.TEMPS_API_URL = options.apiUrl ?? 'http://127.0.0.1:9'
   process.env.TEMPS_TOKEN = 'test-token-never-sent'
   // Bun ignores `process.exitCode = undefined`, so 0 marks "not set".
   process.exitCode = 0
@@ -85,14 +87,21 @@ export async function runWithApi(
   const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
     throw new Error(`process.exit(${code}) called`)
   }) as typeof process.exit)
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: Request | string | URL) => {
-    const request = input instanceof Request ? input : new Request(String(input))
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: Request | string | URL, init?: RequestInit) => {
+    // `init` carries the method, headers and body of a raw `fetch(url, { ... })` call.
+    const request = input instanceof Request && !init ? input : new Request(input instanceof Request ? input : String(input), init)
     const url = new URL(request.url)
     const path = url.pathname.replace(/^\/api/, '')
     const key = `${request.method} ${path}`
     requests.push(`${key}${url.search}`)
     const text = request.body ? await request.text() : ''
-    const body = text ? JSON.parse(text) : undefined
+    // A binary upload is recorded as its text; anything else as parsed JSON.
+    let body: unknown
+    try {
+      body = text ? JSON.parse(text) : undefined
+    } catch {
+      body = text
+    }
     if (body !== undefined) bodies.push({ request: key, body })
     const route = routes[key]
     if (route === undefined) {

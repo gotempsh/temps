@@ -40,6 +40,7 @@ export interface ResourceFlags {
   policy?: string
   reserveCpu?: string
   reserveMemory?: string
+  resetReserved?: boolean
 }
 
 /** What `resources set` changes, validated; reservations still unmerged. */
@@ -47,6 +48,8 @@ export interface ResourceUpdate {
   policy?: NodeResourcePolicy
   reserveCpuMillis?: number
   reserveMemoryMb?: number
+  /** Go back to the default reservation for the node's role. */
+  resetReserved?: boolean
 }
 
 function parseNonNegative(value: string): number | null {
@@ -76,8 +79,19 @@ export function parseResourceFlags(flags: ResourceFlags): { update: ResourceUpda
     if (memory === null) return { error: `--reserve-memory must be a whole number of MB (got "${flags.reserveMemory}")` }
     update.reserveMemoryMb = memory
   }
-  if (update.policy === undefined && update.reserveCpuMillis === undefined && update.reserveMemoryMb === undefined) {
-    return { error: 'Pass at least one of --policy, --reserve-cpu or --reserve-memory' }
+  if (flags.resetReserved) {
+    if (update.reserveCpuMillis !== undefined || update.reserveMemoryMb !== undefined) {
+      return { error: 'Pass --reset-reserved or --reserve-cpu/--reserve-memory, not both' }
+    }
+    update.resetReserved = true
+  }
+  if (
+    update.policy === undefined &&
+    update.reserveCpuMillis === undefined &&
+    update.reserveMemoryMb === undefined &&
+    !update.resetReserved
+  ) {
+    return { error: 'Pass at least one of --policy, --reserve-cpu, --reserve-memory or --reset-reserved' }
   }
   return { update }
 }
@@ -93,6 +107,7 @@ export function buildNodeResourcesRequest(
 ): SetNodeResourcesRequest {
   const body: SetNodeResourcesRequest = {}
   if (update.policy !== undefined) body.resource_policy = update.policy
+  if (update.resetReserved) body.reset_system_reserved = true
   if (update.reserveCpuMillis !== undefined || update.reserveMemoryMb !== undefined) {
     body.system_reserved = {
       cpu_millis: update.reserveCpuMillis ?? current?.system_reserved.cpu_millis ?? 0,
@@ -138,6 +153,7 @@ export function registerNodesResourcesCommands(nodes: Command): void {
     .option('--policy <policy>', 'best_effort (reservations not checked) or enforced (placements that do not fit are refused)')
     .option('--reserve-cpu <millis>', 'CPU kept for the OS and Temps, in millicores (1000 = one core)')
     .option('--reserve-memory <mb>', 'Memory kept for the OS and Temps, in MB')
+    .option('--reset-reserved', "Go back to the default reservation for the node's role")
     .option('--json', 'Output in JSON format')
     .action(resourcesSetAction)
 

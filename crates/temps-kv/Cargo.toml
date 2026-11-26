@@ -48,6 +48,10 @@ schemars.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# Docker-backed Redis test of conditional SET (skips without Docker).
+bollard.workspace = true
+futures.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

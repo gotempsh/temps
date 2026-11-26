@@ -41,6 +41,9 @@ import {
   keyValue,
   formatRelativeTime,
 } from '../../ui/output.js'
+import { parseIntegerFlag } from '../../lib/command-kit.js'
+import { ValidationError } from '../../utils/errors.js'
+import type { StartRestoreRequest } from '../../api/types.gen.js'
 
 // ---- Action option types -------------------------------------------------
 
@@ -55,6 +58,9 @@ interface ListBackupsOptions {
 }
 
 interface RestoreOptions {
+  backupLocation?: string
+  backupEngine?: string
+  s3Source?: string
   id: string // source service id
   backupId?: string
   newService?: string // if set, clone-to-new-service mode
@@ -185,7 +191,32 @@ async function listBackupsAction(options: ListBackupsOptions): Promise<void> {
   newline()
 }
 
+const BACKUP_ENGINES = ['postgres', 'redis', 'mongodb', 's3']
+
+/** `--backup-location` with its engine and S3 source, or `undefined` when restoring by `--backup-id`. */
+export function restoreLocation(
+  options: Pick<RestoreOptions, 'backupId' | 'backupLocation' | 'backupEngine' | 's3Source'>,
+): { backup_location: string; backup_engine: string; s3_source_id: number } | undefined {
+  if (options.backupLocation === undefined) {
+    if (options.backupEngine !== undefined || options.s3Source !== undefined) {
+      throw new ValidationError('--backup-engine and --s3-source go with --backup-location')
+    }
+    return undefined
+  }
+  if (options.backupId !== undefined) throw new ValidationError('Pass --backup-id or --backup-location, not both')
+  if (!options.backupEngine || !BACKUP_ENGINES.includes(options.backupEngine)) {
+    throw new ValidationError(`--backup-location needs --backup-engine (${BACKUP_ENGINES.join(', ')})`)
+  }
+  if (options.s3Source === undefined) throw new ValidationError('--backup-location needs --s3-source <id>')
+  return {
+    backup_location: options.backupLocation,
+    backup_engine: options.backupEngine,
+    s3_source_id: parseIntegerFlag(options.s3Source, '--s3-source', 1),
+  }
+}
+
 async function restoreAction(options: RestoreOptions): Promise<void> {
+  const location = restoreLocation(options)
   await requireAuth()
   await setupClient()
 
@@ -216,9 +247,9 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
     },
   )
 
-  // Step 2: resolve the backup to restore from.
-  const backupId = options.backupId ? parseInt(options.backupId, 10) : await askForBackupId()
-  if (!Number.isFinite(backupId)) {
+  // Step 2: resolve the backup to restore from: a recorded backup, or a raw S3 location.
+  const backupId = location ? undefined : options.backupId ? parseInt(options.backupId, 10) : await askForBackupId()
+  if (backupId !== undefined && !Number.isFinite(backupId)) {
     errorOutput('Backup id is required.')
     process.exit(1)
   }
@@ -277,7 +308,7 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
     newline()
     header(`${icons.arrow} ${modeLabel}`)
     keyValue('Source service', `${serviceName} (id ${serviceId}, ${serviceType})`)
-    keyValue('Backup ID', String(backupId))
+    keyValue('Backup', backupId !== undefined ? `ID ${backupId}` : `${location?.backup_location} (S3 source ${location?.s3_source_id})`)
     if (mode.mode === 'pitr') {
       keyValue('Target time', mode.target.kind === 'time' ? mode.target.time : '')
     }
@@ -297,13 +328,10 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
     const { data, error } = await startRestore({
       path: { id: serviceId },
       body: {
-        backup_id: backupId,
+        ...(backupId !== undefined ? { backup_id: backupId } : location),
         confirm_cross_service: options.confirmCrossService === true,
         ...mode,
-      } as unknown as RestoreRequestMode & {
-        backup_id: number
-        confirm_cross_service: boolean
-      },
+      } as unknown as StartRestoreRequest,
     })
     if (error) throw new Error(getErrorMessage(error))
     return data as RestoreRunView
@@ -584,7 +612,13 @@ export function registerRestoreCommands(services: Command): void {
     .command('restore')
     .description('Restore a service from a backup (in-place, new service, or PITR)')
     .requiredOption('--id <id>', 'Source service ID (the service the backup came from)')
-    .requiredOption('--backup-id <id>', 'Backup ID to restore from (see `list-backups`)')
+    .option('--backup-id <id>', 'Backup ID to restore from (see `list-backups`)')
+    .option(
+      '--backup-location <s3-key>',
+      'Instead of --backup-id: the S3 key of a backup this instance did not record (one found by an S3 scan, made by another Temps instance)',
+    )
+    .option('--backup-engine <engine>', 'With --backup-location: postgres, redis, mongodb or s3')
+    .option('--s3-source <id>', 'With --backup-location: the S3 source the backup is in')
     .option(
       '--new-service [name]',
       'Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name.',

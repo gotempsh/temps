@@ -16,6 +16,8 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptText } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, info, warning, keyValue, formatRelativeTime } from '../../ui/output.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { GetProxyLogsData, GetTimeBucketStatsData, GetTodayStatsData } from '../../api/types.gen.js'
 
 interface ListOptions {
   json?: boolean
@@ -61,26 +63,27 @@ export function registerProxyLogsCommands(program: Command): void {
     .alias('plogs')
     .description('View proxy request logs and statistics')
 
-  proxyLogs
-    .command('list')
-    .alias('ls')
-    .description('List proxy logs')
-    .option('--json', 'Output in JSON format')
-    .option('--limit <n>', 'Items per page (default: 20, max: 100)')
-    .option('--page <n>', 'Page number')
-    .option('--project-id <id>', 'Filter by project ID')
-    .option('--environment-id <id>', 'Filter by environment ID')
-    .option('--method <method>', 'Filter by HTTP method (GET, POST, etc.)')
-    .option('--status-code <code>', 'Filter by HTTP status code')
-    .option('--host <host>', 'Filter by host')
-    .option('--path <path>', 'Filter by path (partial match)')
-    .option('--start-date <date>', 'Start date (ISO 8601)')
-    .option('--end-date <date>', 'End date (ISO 8601)')
-    .option('--sort-by <field>', 'Sort by field (default: timestamp)')
-    .option('--sort-order <order>', 'Sort order: asc or desc (default: desc)')
-    .option('--is-bot', 'Filter for bot requests only')
-    .option('--has-error', 'Filter for requests with errors only')
-    .action(listProxyLogsAction)
+  LIST_EXTRA.addTo(
+    proxyLogs
+      .command('list')
+      .alias('ls')
+      .description('List proxy logs')
+      .option('--json', 'Output in JSON format')
+      .option('--limit <n>', 'Items per page (default: 20, max: 100)')
+      .option('--page <n>', 'Page number')
+      .option('--project-id <id>', 'Filter by project ID')
+      .option('--environment-id <id>', 'Filter by environment ID')
+      .option('--method <method>', 'Filter by HTTP method (GET, POST, etc.)')
+      .option('--status-code <code>', 'Filter by HTTP status code')
+      .option('--host <host>', 'Filter by host')
+      .option('--path <path>', 'Filter by path (partial match)')
+      .option('--start-date <date>', 'Start date (ISO 8601)')
+      .option('--end-date <date>', 'End date (ISO 8601)')
+      .option('--sort-by <field>', 'Sort by field (default: timestamp)')
+      .option('--sort-order <order>', 'Sort order: asc or desc (default: desc)')
+      .option('--is-bot', 'Filter for bot requests only')
+      .option('--has-error', 'Filter for requests with errors only'),
+  ).action(listProxyLogsAction)
 
   proxyLogs
     .command('show')
@@ -98,17 +101,19 @@ export function registerProxyLogsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(byRequestAction)
 
-  proxyLogs
-    .command('stats')
-    .description('Get time bucket statistics (last 24 hours)')
-    .option('--json', 'Output in JSON format')
-    .action(statsAction)
+  STATS_EXTRA.addTo(
+    proxyLogs
+      .command('stats')
+      .description('Get time bucket statistics (last 24 hours)')
+      .option('--json', 'Output in JSON format'),
+  ).action(statsAction)
 
-  proxyLogs
-    .command('today')
-    .description("Get today's request statistics")
-    .option('--json', 'Output in JSON format')
-    .action(todayAction)
+  TODAY_EXTRA.addTo(
+    proxyLogs
+      .command('today')
+      .description("Get today's request statistics")
+      .option('--json', 'Output in JSON format'),
+  ).action(todayAction)
 }
 
 /** Sums and averages a page of time-bucket stats into the printed summary line. */
@@ -139,7 +144,28 @@ export function parseOptionalProjectId(value: string | undefined): number | unde
   return projectId
 }
 
+const LIST_EXTRA = fieldFlags<NonNullable<GetProxyLogsData['query']>>(
+  {
+    path_exact: { kind: 'string', help: 'Only this exact path (--path matches a prefix)' },
+    session_id: { kind: 'int', help: 'Only requests of this analytics session' },
+    visitor_id: { kind: 'int', help: 'Only requests of this visitor' },
+    exclude_bots: { kind: 'bool', help: 'Leave out requests from bots' },
+    exclude_synthetic: { kind: 'bool', help: 'Leave out synthetic traffic (uptime checks, Temps itself)' },
+    is_ai_agent: { kind: 'bool', help: 'Only (or, with --no-is-ai-agent, never) AI agent requests' },
+    ai_agent: { kind: 'string', help: 'Only this AI agent (e.g. GPTBot)' },
+    ai_provider: { kind: 'string', help: 'Only AI agents of this provider (e.g. OpenAI)' },
+    request_size_min: { kind: 'int', help: 'Smallest request body, in bytes' },
+    request_size_max: { kind: 'int', help: 'Largest request body, in bytes' },
+    response_size_min: { kind: 'int', help: 'Smallest response body, in bytes' },
+    response_size_max: { kind: 'int', help: 'Largest response body, in bytes' },
+    response_time_min: { kind: 'int', help: 'Fastest response, in milliseconds' },
+    response_time_max: { kind: 'int', help: 'Slowest response, in milliseconds' },
+  },
+  'query',
+)
+
 async function listProxyLogsAction(options: ListOptions): Promise<void> {
+  const extra = await LIST_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -167,6 +193,7 @@ async function listProxyLogsAction(options: ListOptions): Promise<void> {
         ...(options.sortOrder && { sort_order: options.sortOrder }),
         ...(options.isBot !== undefined && { is_bot: options.isBot }),
         ...(options.hasError !== undefined && { has_error: options.hasError }),
+        ...extra,
       },
     })
     if (error) {
@@ -279,7 +306,15 @@ async function byRequestAction(options: ByRequestOptions): Promise<void> {
   printProxyLogDetail(log)
 }
 
+const STATUS_CLASS = { kind: 'string', help: 'Only this status class', values: ['2xx', '3xx', '4xx', '5xx'] } as const
+
+const STATS_EXTRA = fieldFlags<NonNullable<GetTimeBucketStatsData['query']>>(
+  { has_project: { kind: 'bool', help: 'Only requests routed to a project (or, with --no-has-project, to none)' }, status_code_class: STATUS_CLASS },
+  'query',
+)
+
 async function statsAction(options: StatsOptions): Promise<void> {
+  const extra = await STATS_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -294,6 +329,7 @@ async function statsAction(options: StatsOptions): Promise<void> {
         start_time: startTime.toISOString(),
         end_time: endTime.toISOString(),
         bucket_interval: '1 hour',
+        ...extra,
       },
     })
     if (error || !data) {
@@ -345,13 +381,17 @@ async function statsAction(options: StatsOptions): Promise<void> {
   newline()
 }
 
+const TODAY_EXTRA = fieldFlags<NonNullable<GetTodayStatsData['query']>>({ status_code_class: STATUS_CLASS }, 'query')
+
 async function todayAction(options: TodayOptions): Promise<void> {
+  const extra = await TODAY_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
   const result = await withSpinner("Fetching today's statistics...", async () => {
     const { data, error } = await getTodayStats({
       client,
+      query: extra,
     })
     if (error || !data) {
       throw new Error(getErrorMessage(error) ?? "Failed to fetch today's statistics")

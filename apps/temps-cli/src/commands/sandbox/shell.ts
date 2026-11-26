@@ -47,6 +47,7 @@ export function terminalWsUrl(
   id: string,
   params: Record<string, string | undefined>,
 ): string {
+  // api-coverage: GET /v1/sandboxes/{id}/terminal (a WebSocket upgrade)
   const http = sandboxUrl(baseUrl, `/${encodeURIComponent(id)}/terminal`)
   const ws = http.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
   const query = Object.entries(params)
@@ -121,7 +122,7 @@ export function describeUpgradeRejection(
  *
  * Node's HTTP client strips the framing before the body reaches us; Bun's
  * `ws` compatibility layer hands it through verbatim, which made a perfectly
- * valid chunked problem document unparseable. Working on bytes, not text,
+ * valid chunked problem document unparsable. Working on bytes, not text,
  * because chunk sizes count bytes and a multi-byte character would otherwise
  * shift every later boundary.
  *
@@ -197,13 +198,13 @@ export function readBoundedBody(
 }
 
 /** Read a rejected upgrade's response body for error reporting. */
-async function readRejectionBody(res: IncomingMessage): Promise<string> {
+export async function readRejectionBody(res: IncomingMessage): Promise<string> {
   const raw = await readBoundedBody(res)
   return decodeChunkedBody(raw).toString('utf8')
 }
 
 /** Current terminal size, falling back to a sane default when not a TTY. */
-function terminalSize(): { cols: number; rows: number } {
+export function terminalSize(): { cols: number; rows: number } {
   return {
     cols: process.stdout.columns || 80,
     rows: process.stdout.rows || 24,
@@ -247,10 +248,17 @@ export async function shellAction(
   await runSession(socket, id, options)
 }
 
-function runSession(
+/**
+ * Drive an attached terminal socket until it closes. Shared by every PTY
+ * WebSocket with this protocol (sandbox shells, AI workspace terminals):
+ * binary frames are terminal bytes, text frames JSON control events.
+ * `hint` replaces the sandbox-specific advice when the attach fails.
+ */
+export function runSession(
   socket: WebSocket,
   id: string,
   options: ShellOptions,
+  hint: string = 'Check the sandbox exists and is reachable with: temps sandbox show ' + id,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     let rawModeEngaged = false
@@ -397,9 +405,7 @@ function runSession(
     socket.on('error', (err: Error) => {
       finish(
         new Error(
-          `Could not open a terminal in ${id}: ${err.message}. ` +
-            'Check the sandbox exists and is reachable with: temps sandbox show ' +
-            id,
+          `Could not open a terminal in ${id}: ${err.message}. ${hint}`,
         ),
       )
     })
