@@ -163,8 +163,21 @@ const MEMBER_INSPECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often, and for how long, a cluster whose data nodes were still being
 /// created (or failed) is converged again in the background after creation,
 /// a new member or a start: a standby's first base backup can take minutes.
+///
+/// The delay doubles from [`FOLLOW_UP_INTERVAL`] up to
+/// [`FOLLOW_UP_MAX_INTERVAL`] (see [`follow_up_delay`]), about twelve minutes
+/// in all. A data node that stays unavailable that long (a former primary
+/// whose PostgreSQL is still coming back after its node rebooted) is not
+/// exec'd into every few seconds for the whole window.
 const FOLLOW_UP_INTERVAL: Duration = Duration::from_secs(15);
-const FOLLOW_UP_ATTEMPTS: u32 = 40;
+const FOLLOW_UP_MAX_INTERVAL: Duration = Duration::from_secs(120);
+const FOLLOW_UP_ATTEMPTS: u32 = 8;
+
+/// The wait before follow-up `attempt` (1-based).
+fn follow_up_delay(attempt: u32) -> Duration {
+    let doubled = FOLLOW_UP_INTERVAL.saturating_mul(1u32 << attempt.saturating_sub(1).min(16));
+    doubled.min(FOLLOW_UP_MAX_INTERVAL)
+}
 
 /// Why `service` cannot use managed server TLS yet, or `None` when it can.
 ///
@@ -619,7 +632,8 @@ impl ExternalServiceManager {
     /// Converge a cluster's data nodes on its TLS setting after `trigger`
     /// (start, creation, a new member). Never fails the caller: when a data
     /// node is still being created or applying failed, a background
-    /// follow-up retries every [`FOLLOW_UP_INTERVAL`] for a bounded time.
+    /// follow-up retries, backing off from [`FOLLOW_UP_INTERVAL`], for a
+    /// bounded time.
     /// What still does not converge is logged, shown as pending in the TLS
     /// status, and retried on the next start.
     pub(super) async fn reconcile_cluster_server_tls(
@@ -672,7 +686,7 @@ impl ExternalServiceManager {
         let manager = self.clone();
         tokio::spawn(async move {
             for attempt in 1..=FOLLOW_UP_ATTEMPTS {
-                tokio::time::sleep(FOLLOW_UP_INTERVAL).await;
+                tokio::time::sleep(follow_up_delay(attempt)).await;
                 if manager
                     .converge_cluster_server_tls(service_id, trigger)
                     .await
@@ -1426,6 +1440,20 @@ mod tests {
             !log.is_empty(),
             "the dropped request's change never ran: it was cancelled with the request"
         );
+    }
+
+    /// The follow-up backs off instead of re-running every 15 s for ten
+    /// minutes, and still covers the minutes a standby's first base backup
+    /// can take.
+    #[test]
+    fn the_cluster_tls_follow_up_backs_off_over_a_bounded_window() {
+        let delays: Vec<u64> = (1..=FOLLOW_UP_ATTEMPTS)
+            .map(|attempt| follow_up_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(delays, vec![15, 30, 60, 120, 120, 120, 120, 120]);
+        let window: u64 = delays.iter().sum();
+        assert!((600..=900).contains(&window), "{window}s");
+        assert_eq!(follow_up_delay(u32::MAX), FOLLOW_UP_MAX_INTERVAL);
     }
 
     /// A pass whose caller is dropped still schedules its bounded retry when
