@@ -28,6 +28,8 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm, promptNumber, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 import { addCredentialSources } from '../../lib/value-source.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { ListNotificationProvidersData, ListNotificationRoutesData } from '../../api/types.gen.js'
 
 const SEVERITIES = ['debug', 'info', 'warning', 'error', 'critical', 'emergency'] as const
 
@@ -401,12 +403,13 @@ export function registerNotificationsCommands(program: Command): void {
     .alias('notify')
     .description('Manage notification providers (Slack, Email, Webhook, Telegram, etc.)')
 
-  notifications
-    .command('list')
-    .alias('ls')
-    .description('List configured notification providers')
-    .option('--json', 'Output in JSON format')
-    .action(listProviders)
+  PROVIDER_LIST_QUERY.addTo(
+    notifications
+      .command('list')
+      .alias('ls')
+      .description('List configured notification providers')
+      .option('--json', 'Output in JSON format'),
+  ).action(listProviders)
 
   const addCommand = notifications
     .command('add')
@@ -506,12 +509,13 @@ export function registerNotificationsCommands(program: Command): void {
     .command('routes')
     .description('Manage severity-based notification routes (which providers receive which severities)')
 
-  routes
-    .command('list')
-    .alias('ls')
-    .description('List notification routes')
-    .option('--json', 'Output in JSON format')
-    .action(listRoutes)
+  ROUTE_LIST_QUERY.addTo(
+    routes
+      .command('list')
+      .alias('ls')
+      .description('List notification routes')
+      .option('--json', 'Output in JSON format'),
+  ).action(listRoutes)
 
   routes
     .command('show')
@@ -554,12 +558,21 @@ export function registerNotificationsCommands(program: Command): void {
     .action(removeRoute)
 }
 
+const PROVIDER_LIST_QUERY = fieldFlags<NonNullable<ListNotificationProvidersData['query']>>(
+  {
+    sort_by: { kind: 'string', help: 'Sort column (default created_at)' },
+    sort_order: { kind: 'string', help: 'Sort direction', values: ['asc', 'desc'] },
+  },
+  'query',
+)
+
 async function listProviders(options: { json?: boolean }): Promise<void> {
+  const query = await PROVIDER_LIST_QUERY.read(options)
   await requireAuth()
   await setupClient()
 
   const providers = await withSpinner('Fetching notification providers...', async () => {
-    const { data, error } = await listNotificationProviders({ client })
+    const { data, error } = await listNotificationProviders({ client, query })
     if (error) {
       throw new Error(getErrorMessage(error))
     }
@@ -1310,12 +1323,21 @@ function routeColumns(): TableColumn<NotificationRoute>[] {
   ]
 }
 
+const ROUTE_LIST_QUERY = fieldFlags<NonNullable<ListNotificationRoutesData['query']>>(
+  {
+    sort_by: { kind: 'string', help: 'Sort column (default created_at)' },
+    sort_order: { kind: 'string', help: 'Sort direction', values: ['asc', 'desc'] },
+  },
+  'query',
+)
+
 async function listRoutes(options: RouteListOptions): Promise<void> {
+  const query = await ROUTE_LIST_QUERY.read(options)
   await requireAuth()
   await setupClient()
 
   const routesPage = await withSpinner('Fetching notification routes...', async () => {
-    const { data, error } = await listNotificationRoutes({ client, query: { page: 1, page_size: 100 } })
+    const { data, error } = await listNotificationRoutes({ client, query: { page: 1, page_size: 100, ...query } })
     if (error) {
       throw new Error(getErrorMessage(error))
     }

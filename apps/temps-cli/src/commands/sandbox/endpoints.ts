@@ -12,6 +12,7 @@ import {
   approveSandboxService,
   approveServiceGrant,
   cmdKill,
+  cmd,
   cmdLogs,
   createAccessService,
   createInternalAccessGrant,
@@ -317,6 +318,22 @@ export function registerSandboxEndpoints(program: Command): void {
     name: "cmd-logs",
     description: "Stream a command's stdout/stderr as 'application/x-ndjson' ('@vercel/sandbox'-compatible)",
     path: { id: 'string', cmd_id: 'string' },
+    output: 'bytes',
+  })
+
+  endpoint(group, cmd, {
+    name: "cmd",
+    description: "Run a command the '@vercel/sandbox' way: without --wait it returns the started command's id at once (read its output with cmd-logs); with --wait it prints the running and finished envelopes as JSON lines. For an interactive run use `temps sandbox exec`",
+    path: { id: 'string' },
+    body: {
+      command: { kind: 'string!', help: "Program to run" },
+      args: { kind: 'strings', help: "Argument (repeatable, in order)" },
+      cwd: { kind: 'string', help: "Working directory inside the sandbox" },
+      env: { kind: 'json', help: 'Environment variables as a JSON object, e.g. {"NODE_ENV":"test"}' },
+      sudo: { kind: 'bool', help: "Run the command privileged" },
+      wait: { kind: 'bool', help: "Wait for the command to finish" },
+    },
+    output: 'bytes',
   })
 
   endpoint(group, getSandboxCreationBySandbox, {

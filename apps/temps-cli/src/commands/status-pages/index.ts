@@ -35,6 +35,8 @@ import {
 import { registerSubscriberCommands } from './subscribers.js'
 import { registerMaintenanceCommands } from './maintenance.js'
 import { registerWebhookCommands } from './webhooks.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { StatusPageAppearanceInput } from '../../api/types.gen.js'
 
 interface ListOptions {
   projectId?: string
@@ -71,6 +73,16 @@ function collect(value: string, previous: string[] = []): string[] {
  * error message. The public name is what visitors see; it is required so an
  * internal monitor name is never published by default.
  */
+/** How the public page looks; on update, omitted settings keep their value. */
+const APPEARANCE = fieldFlags<StatusPageAppearanceInput>({
+  theme: { kind: 'string', help: 'Color scheme of the public page', values: ['auto', 'light', 'dark'] },
+  accent_color: { kind: 'string', help: 'Accent color, e.g. #2563eb' },
+  logo_url: { kind: 'string', help: 'HTTPS URL of the logo shown in the header' },
+  website_url: { kind: 'string', help: 'Where the logo links to' },
+  show_response_times: { kind: 'bool', help: 'Show monitor response times' },
+  show_uptime_percentage: { kind: 'bool', help: 'Show uptime percentages' },
+})
+
 export function parseMonitorSpec(spec: string): StatusPageMonitorInput | string {
   const separator = spec.indexOf('=')
   if (separator <= 0) {
@@ -515,15 +527,17 @@ export function registerStatusPagesCommands(program: Command): void {
       newline()
     })
 
-  pages
-    .command('create')
-    .description('Create a draft status page; monitors may come from any project')
-    .requiredOption('-t, --title <title>', 'Public page title')
-    .requiredOption('-m, --monitor <id=name>', 'Monitor to show and its public name (repeatable)', collect)
-    .option('-g, --group <name=ids>', 'Show monitors together under a group, e.g. "Cloud=12,13" (repeatable)', collect)
-    .option('-d, --description <text>', 'Public description')
-    .option('--json', 'Output in JSON format')
-    .action(async (options: CreateOptions) => {
+  APPEARANCE.addTo(
+    pages
+      .command('create')
+      .description('Create a draft status page; monitors may come from any project')
+      .requiredOption('-t, --title <title>', 'Public page title')
+      .requiredOption('-m, --monitor <id=name>', 'Monitor to show and its public name (repeatable)', collect)
+      .option('-g, --group <name=ids>', 'Show monitors together under a group, e.g. "Cloud=12,13" (repeatable)', collect)
+      .option('-d, --description <text>', 'Public description')
+      .option('--json', 'Output in JSON format'),
+  ).action(async (options: CreateOptions) => {
+      const appearance = await APPEARANCE.read(options)
       await requireAuth()
       await setupClient()
       const monitors = parseSelection(options.monitor, options.group)
@@ -531,7 +545,12 @@ export function registerStatusPagesCommands(program: Command): void {
       const page = await run('Creating status page...', () =>
         createStatusPage({
           client,
-          body: { title: options.title, description: options.description ?? null, monitors },
+          body: {
+            title: options.title,
+            description: options.description ?? null,
+            monitors,
+            ...(Object.keys(appearance).length > 0 && { appearance }),
+          },
         }))
       if (options.json) {
         json(page)
@@ -560,16 +579,18 @@ export function registerStatusPagesCommands(program: Command): void {
       printPage(page)
     })
 
-  pages
-    .command('update')
-    .description('Change the title, description or monitor selection')
-    .requiredOption('--id <id>', 'Status page ID')
-    .option('-t, --title <title>', 'Public page title')
-    .option('-d, --description <text>', 'Public description ("" clears it)')
-    .option('-m, --monitor <id=name>', 'Replace the selection; repeat for each monitor', collect)
-    .option('-g, --group <name=ids>', 'With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable)', collect)
-    .option('--json', 'Output in JSON format')
-    .action(async (options: UpdateOptions) => {
+  APPEARANCE.addTo(
+    pages
+      .command('update')
+      .description('Change the title, description or monitor selection')
+      .requiredOption('--id <id>', 'Status page ID')
+      .option('-t, --title <title>', 'Public page title')
+      .option('-d, --description <text>', 'Public description ("" clears it)')
+      .option('-m, --monitor <id=name>', 'Replace the selection; repeat for each monitor', collect)
+      .option('-g, --group <name=ids>', 'With --monitor: group monitors, e.g. "Cloud=12,13" (repeatable)', collect)
+      .option('--json', 'Output in JSON format'),
+  ).action(async (options: UpdateOptions) => {
+      const appearance = await APPEARANCE.read(options)
       await requireAuth()
       await setupClient()
       const id = parseId(options.id, 'status page ID')
@@ -591,6 +612,7 @@ export function registerStatusPagesCommands(program: Command): void {
             ...(options.title !== undefined && { title: options.title }),
             ...(options.description !== undefined && { description: options.description }),
             ...(monitors !== undefined && { monitors }),
+            ...(Object.keys(appearance).length > 0 && { appearance }),
           },
         }))
       if (options.json) {

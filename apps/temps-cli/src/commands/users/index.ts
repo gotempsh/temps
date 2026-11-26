@@ -34,6 +34,7 @@ interface CreateOptions {
   email?: string
   password?: string
   roles?: string
+  mustChangePassword?: boolean
   yes?: boolean
 }
 
@@ -118,6 +119,7 @@ export function registerUsersCommands(program: Command): void {
     .option('-e, --email <email>', 'Email address')
     .option('-p, --password <password>', 'Password (if not provided, invite email will be sent)')
     .option('-r, --roles <roles>', 'Comma-separated roles (admin, user)')
+    .option('--must-change-password', 'Make the user choose a new password at first sign-in')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createUserAction)
   addCredentialSources(createCommand, [{ flag: 'password', what: 'the password' }])
@@ -286,6 +288,7 @@ async function createUserAction(options: CreateOptions): Promise<void> {
         email,
         password,
         roles: selectedRoles,
+        ...(options.mustChangePassword && { must_change_password: true }),
       },
     })
     if (error) {

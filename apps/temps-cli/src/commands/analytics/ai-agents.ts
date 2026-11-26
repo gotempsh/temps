@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import chalk from 'chalk'
+import { ENVIRONMENT_FILTER } from './scope.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -97,6 +98,7 @@ export function buildAiAgentRows(
 }
 
 export async function aiAgents(options: AiAgentsOptions): Promise<void> {
+  const environment = await ENVIRONMENT_FILTER.read(options)
   const groupBy = options.groupBy ?? 'agent'
   if (groupBy !== 'agent' && groupBy !== 'provider') {
     throw new Error(`Invalid --group-by "${groupBy}". Use: agent, provider`)
@@ -132,6 +134,7 @@ export async function aiAgents(options: AiAgentsOptions): Promise<void> {
         project_id: projectId,
         start_time: startDate,
         end_time: endDate,
+        ...environment,
         limit,
         path: options.path,
       },

@@ -13,6 +13,7 @@
  */
 
 import chalk from 'chalk'
+import { ENVIRONMENT_FILTER } from './scope.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { resolveAnalyticsProject } from './project.js'
@@ -123,6 +124,7 @@ async function eventPropertyTop(
   empty: string,
   options: AutoEventOptions,
 ): Promise<void> {
+  const environment = await ENVIRONMENT_FILTER.read(options)
   const limit = parseLimit(options.limit)
   await requireAuth()
   await setupClient()
@@ -140,6 +142,7 @@ async function eventPropertyTop(
         start_date: startDate,
         end_date: endDate,
         limit,
+        ...environment,
       },
     })
     if (error || !data) {
@@ -187,6 +190,7 @@ export function fileDownloads(options: AutoEventOptions): Promise<void> {
 }
 
 export async function notFound(options: AutoEventOptions): Promise<void> {
+  const environment = await ENVIRONMENT_FILTER.read(options)
   const limit = parseLimit(options.limit)
   await requireAuth()
   await setupClient()
@@ -216,6 +220,7 @@ export async function notFound(options: AutoEventOptions): Promise<void> {
         event_name: NOT_FOUND_EVENT,
         aggregation_level: 'events',
         limit,
+        ...environment,
       },
     })
     if (reported.error || !reported.data) {

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { GetFunnelMetricsData } from '../../api/types.gen.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -99,13 +101,14 @@ export function registerFunnelsCommands(program: Command): void {
     .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(removeFunnelAction)
 
-  funnels
-    .command('metrics')
-    .description('Get funnel metrics')
-    .requiredOption('--project-id <id>', 'Project ID')
-    .requiredOption('--funnel-id <id>', 'Funnel ID')
-    .option('--json', 'Output in JSON format')
-    .action(getFunnelMetricsAction)
+  METRICS_QUERY.addTo(
+    funnels
+      .command('metrics')
+      .description('Get funnel metrics')
+      .requiredOption('--project-id <id>', 'Project ID')
+      .requiredOption('--funnel-id <id>', 'Funnel ID')
+      .option('--json', 'Output in JSON format'),
+  ).action(getFunnelMetricsAction)
 
   funnels
     .command('preview')
@@ -348,7 +351,18 @@ async function removeFunnelAction(options: RemoveOptions): Promise<void> {
   success('Funnel deleted')
 }
 
+const METRICS_QUERY = fieldFlags<NonNullable<GetFunnelMetricsData['query']>>(
+  {
+    start_date: { kind: 'string', help: 'Window start (RFC 3339)' },
+    end_date: { kind: 'string', help: 'Window end (RFC 3339)' },
+    environment_id: { kind: 'int', help: 'Only this environment (an ID)' },
+    country_code: { kind: 'string', help: 'Only visitors from this country (ISO code, e.g. DE)' },
+  },
+  'query',
+)
+
 async function getFunnelMetricsAction(options: MetricsOptions): Promise<void> {
+  const query = await METRICS_QUERY.read(options)
   await requireAuth()
   await setupClient()
 
@@ -363,6 +377,7 @@ async function getFunnelMetricsAction(options: MetricsOptions): Promise<void> {
     const { data, error } = await getFunnelMetrics({
       client,
       path: { project_id: projectId, funnel_id: funnelId },
+      query,
     })
     if (error || !data) {
       throw new Error(getErrorMessage(error) ?? 'Failed to get funnel metrics')

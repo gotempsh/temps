@@ -87,8 +87,9 @@ export async function runWithApi(
   const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
     throw new Error(`process.exit(${code}) called`)
   }) as typeof process.exit)
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: Request | string | URL) => {
-    const request = input instanceof Request ? input : new Request(String(input))
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: Request | string | URL, init?: RequestInit) => {
+    // `init` carries the method, headers and body of a raw `fetch(url, { ... })` call.
+    const request = input instanceof Request && !init ? input : new Request(input instanceof Request ? input : String(input), init)
     const url = new URL(request.url)
     const path = url.pathname.replace(/^\/api/, '')
     const key = `${request.method} ${path}`

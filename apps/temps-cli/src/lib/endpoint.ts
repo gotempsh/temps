@@ -203,10 +203,19 @@ function describeField(field: NormalizedField, where: 'body' | 'query'): string 
   return parts.join(' ')
 }
 
-function addFieldOptions(cmd: Command, fields: NormalizedField[], where: 'body' | 'query', taken: Set<string>): void {
+function addFieldOptions(
+  cmd: Command,
+  fields: NormalizedField[],
+  where: 'body' | 'query',
+  taken: Set<string>,
+  onConflict: 'prefix' | 'throw' = 'prefix',
+): void {
   for (const field of fields) {
     let flag = flagName(field.name)
-    if (RESERVED_FLAGS.has(flag) || taken.has(flag)) flag = `${where}-${flag}`
+    if (RESERVED_FLAGS.has(flag) || taken.has(flag)) {
+      if (onConflict === 'throw') throw new Error(`"${cmd.name()}" already has --${flag}; it cannot also set ${where} field ${field.name}`)
+      flag = `${where}-${flag}`
+    }
     if (taken.has(flag)) throw new Error(`Two inputs of "${cmd.name()}" map to the flag --${flag}`)
     taken.add(flag)
     const description = describeField(field, where)
@@ -316,6 +325,43 @@ async function fieldValue(field: NormalizedField, options: Record<string, unknow
     }
   }
   return value
+}
+
+export interface FieldFlags<T> {
+  /** Add the flags to a command (throws if it already has one of them). */
+  addTo<C extends Command>(cmd: C): C
+  /** The fields passed on the command line, to merge into the request. */
+  read(options: object): Promise<Partial<T>>
+}
+
+/**
+ * Flags for request fields a hand-written command does not set itself, typed
+ * like an endpoint table (`Partial`: name only the fields it lacks):
+ *
+ * ```ts
+ * const CREATE_EXTRA = fieldFlags<CreateUserRequest>({ must_change_password: 'bool' })
+ * CREATE_EXTRA.addTo(users.command('create'))
+ * // in the action
+ * body = { ...body, ...(await CREATE_EXTRA.read(options)) }
+ * ```
+ */
+export function fieldFlags<T>(fields: Partial<Fields<T>>, where: 'body' | 'query' = 'body'): FieldFlags<T> {
+  const normalized = normalizeFields(fields as Record<string, unknown>)
+  return {
+    addTo(cmd) {
+      const taken = new Set(cmd.options.flatMap((o) => (o.long ? [o.long.replace(/^--(no-)?/, '')] : [])))
+      addFieldOptions(cmd, normalized, where, taken, 'throw')
+      return cmd
+    },
+    async read(options) {
+      const values: Record<string, unknown> = {}
+      for (const field of normalized) {
+        const value = await fieldValue(field, options as Record<string, unknown>)
+        if (value !== undefined) values[field.name] = value
+      }
+      return values as Partial<T>
+    },
+  }
 }
 
 /** Find the subcommand `name` of `parent`, or create it as a group. */

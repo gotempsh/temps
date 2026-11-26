@@ -22,6 +22,8 @@ import {
   colors,
   box,
 } from '../../ui/output.js'
+import { parseIntegerFlag } from '../../lib/command-kit.js'
+import { ValidationError } from '../../utils/errors.js'
 
 interface DeployImageOptions {
   image: string
@@ -33,6 +35,8 @@ interface DeployImageOptions {
   metadata?: string
   healthCheckPath?: string
   timeout?: string
+  externalImageId?: string
+  claimLocal?: boolean
 }
 
 /**
@@ -74,12 +78,21 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
+  const externalImageId =
+    options.externalImageId === undefined ? undefined : parseIntegerFlag(options.externalImageId, '--external-image-id', 1)
+  if (externalImageId !== undefined && options.image) {
+    throw new ValidationError('--image and --external-image-id name the image twice; pass one')
+  }
+  if (options.claimLocal && externalImageId !== undefined) {
+    throw new ValidationError('--claim-local takes an image on the host by --image, not a registered --external-image-id')
+  }
+
   newline()
 
   // Get image reference
   let imageRef = options.image
 
-  if (!imageRef && !options.yes) {
+  if (!imageRef && externalImageId === undefined && !options.yes) {
     imageRef = await promptText({
       message: 'Docker image reference',
       default: '',
@@ -92,9 +105,9 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
     })
   }
 
-  if (!imageRef) {
+  if (!imageRef && externalImageId === undefined) {
     warning('No image specified')
-    info('Use: temps deploy image --image <image-ref>')
+    info('Use: temps deploy image --image <image-ref> (or --external-image-id <id>)')
     return
   }
 
@@ -241,7 +254,7 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
   box(
     `Project: ${colors.bold(projectName)}\n` +
       `Environment: ${colors.bold(environmentName)}\n` +
-      `Image: ${colors.bold(imageRef)}`,
+      `Image: ${colors.bold(imageRef ?? `registered image ${externalImageId}`)}`,
     `${icons.rocket} Docker Image Deployment`
   )
   newline()
@@ -257,7 +270,9 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
     const deployUrl = `${apiUrl}/projects/${projectData.id}/environments/${environmentId}/deploy/image`
 
     const deployBody: Record<string, unknown> = {
-      image_ref: imageRef,
+      ...(imageRef && { image_ref: imageRef }),
+      ...(externalImageId !== undefined && { external_image_id: externalImageId }),
+      ...(options.claimLocal && { claim_local: true }),
     }
 
     if (options.metadata) {

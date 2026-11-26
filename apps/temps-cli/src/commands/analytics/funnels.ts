@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import chalk from 'chalk'
+import { FUNNEL_FILTERS } from './scope.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -43,6 +44,7 @@ export function renderConversionBar(rate: number, width = 20): string {
 }
 
 export async function funnelsOverview(options: FunnelsOptions): Promise<void> {
+  const filters = await FUNNEL_FILTERS.read(options)
   await requireAuth()
   await setupClient()
 
@@ -95,7 +97,7 @@ export async function funnelsOverview(options: FunnelsOptions): Promise<void> {
             const { data, error } = await getFunnelMetrics({
               client,
               path: { project_id: projectId, funnel_id: funnel.id },
-              query: { start_date: startDate, end_date: endDate },
+              query: { start_date: startDate, end_date: endDate, ...filters },
             })
             if (error || !data) return { funnel, metrics: null }
             return { funnel, metrics: data }

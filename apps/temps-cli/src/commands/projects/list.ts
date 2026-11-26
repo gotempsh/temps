@@ -8,11 +8,15 @@ import { newline, header, icons, json, colors, formatRelativeTime } from '../../
 import { setupClient, client, getErrorMessage, requireApiShape } from '../../lib/api-client.js'
 import { getProjects } from '../../api/sdk.gen.js'
 import type { ProjectResponse } from '../../api/types.gen.js'
+import { parseIntegerFlag } from '../../lib/command-kit.js'
+import { ValidationError } from '../../utils/errors.js'
 
 interface ListOptions {
   json?: boolean
   page?: string
   perPage?: string
+  group?: string
+  ungrouped?: boolean
 }
 
 export async function list(options: ListOptions): Promise<void> {
@@ -21,6 +25,10 @@ export async function list(options: ListOptions): Promise<void> {
 
   const page = options.page ? parseInt(options.page, 10) : undefined
   const perPage = options.perPage ? parseInt(options.perPage, 10) : undefined
+  if (options.group !== undefined && options.ungrouped) {
+    throw new ValidationError('--group and --ungrouped cannot be combined')
+  }
+  const groupId = options.group === undefined ? undefined : parseIntegerFlag(options.group, '--group', 1)
 
   const projects = await withSpinner('Fetching projects...', async () => {
     const { data, error } = await getProjects({
@@ -28,6 +36,8 @@ export async function list(options: ListOptions): Promise<void> {
       query: {
         ...(page && { page }),
         ...(perPage && { per_page: perPage }),
+        ...(groupId !== undefined && { project_group_id: groupId }),
+        ...(options.ungrouped && { ungrouped: true }),
       },
     })
 

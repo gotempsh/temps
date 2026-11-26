@@ -450,6 +450,8 @@ export function registerProjectGroupsCommands(program: Command): void {
     .option('-p, --path <dir...>', 'Only these app directories (default: every app without a service)')
     .option('--dry-run', 'List what would be created without creating anything')
     .option('--timeout <minutes>', 'Stop waiting after this long (default 30); the import keeps running on the server')
+    .option('--fresh', 'Scan a public repository again instead of using the cached scan')
+    .option('--base-url <url>', 'HTTPS origin of the self-hosted GitLab a public repository lives on')
     .option('--json', 'Output in JSON format')
     .action(importAction)
 
@@ -1155,7 +1157,7 @@ async function followAction(ref: string, serviceRef: string, inherit: boolean): 
 
 async function importAction(
   ref: string,
-  options: { path?: string[]; dryRun?: boolean; timeout?: string } & JsonOption
+  options: { path?: string[]; dryRun?: boolean; timeout?: string; fresh?: boolean; baseUrl?: string } & JsonOption
 ): Promise<void> {
   if (options.json) setQuietMode(true)
   const timeoutMs = waitTimeoutMs(options.timeout)
@@ -1179,7 +1181,11 @@ async function importAction(
             owner: repository.repo_owner,
             repo: repository.repo_name,
           },
-          query: { branch: repository.main_branch },
+          query: {
+            branch: repository.main_branch,
+            ...(options.fresh && { fresh: true }),
+            ...(options.baseUrl && { base_url: options.baseUrl }),
+          },
         })
       )
       apps = scan.presets.map(fromPublicPreset)

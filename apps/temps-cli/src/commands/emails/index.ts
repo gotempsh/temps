@@ -16,6 +16,8 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue, formatDate } from '../../ui/output.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { SendEmailRequestBody } from '../../api/types.gen.js'
 
 interface ListOptions {
   json?: boolean
@@ -98,15 +100,16 @@ export function registerEmailsCommands(program: Command): void {
     .option('--from-address <email>', 'Filter by sender address')
     .action(listEmailsAction)
 
-  emails
-    .command('send')
-    .description('Send an email')
-    .option('--to <email>', 'Recipient email address')
-    .option('--subject <subject>', 'Email subject')
-    .option('--body <body>', 'Email body')
-    .option('--from <email>', 'Sender email address')
-    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
-    .action(sendEmailAction)
+  SEND_EXTRA.addTo(
+    emails
+      .command('send')
+      .description('Send an email')
+      .option('--to <email>', 'Recipient email address')
+      .option('--subject <subject>', 'Email subject')
+      .option('--body <body>', 'Email body')
+      .option('--from <email>', 'Sender email address')
+      .option('-y, --yes', 'Skip confirmation prompts (for automation)'),
+  ).action(sendEmailAction)
 
   emails
     .command('show')
@@ -173,7 +176,17 @@ async function listEmailsAction(options: ListOptions): Promise<void> {
   newline()
 }
 
+/** Everything `send` can set beyond the recipient, subject, text body and sender. */
+export const SEND_EXTRA = fieldFlags<SendEmailRequestBody>({
+  cc: { kind: 'strings', help: 'CC recipient (repeatable)' },
+  bcc: { kind: 'strings', help: 'BCC recipient (repeatable)' },
+  reply_to: { kind: 'string', help: 'Reply-to address' },
+  html: { kind: 'string', help: 'HTML body, sent alongside the text body' },
+  headers: { kind: 'json', help: 'Extra headers as a JSON object, e.g. {"X-Campaign":"spring"}' },
+})
+
 async function sendEmailAction(options: SendOptions): Promise<void> {
+  const extra = await SEND_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -236,6 +249,7 @@ async function sendEmailAction(options: SendOptions): Promise<void> {
         subject,
         text: body,
         from: from ?? to,
+        ...extra,
       },
     })
     if (error) {

@@ -51,6 +51,8 @@ import type {
   UpdateSandboxPlacementBody,
 } from '../../api/types.gen.js'
 import { addCredentialSources } from '../../lib/value-source.js'
+import { parseIntegerFlag } from '../../lib/command-kit.js'
+import { ValidationError } from '../../utils/errors.js'
 
 // ── Types mirroring /v1/sandbox/* responses ─────────────────────────────────
 
@@ -383,6 +385,11 @@ export function registerSandboxCommands(program: Command): void {
     )
     .option('--cpu-limit <cpu>', 'CPU limit (e.g., 0.5 for half a core)')
     .option('--memory-mb <mb>', 'Memory limit in megabytes')
+    .option('--pids-limit <n>', 'Maximum number of processes (default 512)')
+    .option(
+      '--creation-id <id>',
+      'Your own id for this create (8-64 letters, digits, - or _), to follow its steps with `sandbox get-creation`',
+    )
     .option('--git-url <url>', 'Git repo URL to clone into the work dir')
     .option('--git-rev <revision>', 'Git revision to check out (requires --git-url)')
     .option('--git-depth <n>', 'Shallow clone depth (requires --git-url)')
@@ -563,6 +570,7 @@ export function registerSandboxCommands(program: Command): void {
     .option('--git-username <user>', 'HTTP Basic username (pairs with --git-password)')
     .option('--git-password <token>', 'HTTP Basic password/token (injected via GIT_ASKPASS)')
     .option('--tarball-url <url>', 'Tarball URL to download and extract')
+    .option('--strip-git-metadata', 'Remove the .git directory after cloning')
     .action(cloneAction)
   addCredentialSources(cloneCommand, [{ flag: 'git-password', what: 'the Git HTTP password or token' }])
 
@@ -734,6 +742,8 @@ export function registerSandboxCommands(program: Command): void {
 
 interface CreateOptions {
   image?: string
+  pidsLimit?: string
+  creationId?: string
   name?: string
   timeout?: string
   env?: string[]
@@ -874,6 +884,13 @@ async function createAction(options: CreateOptions): Promise<void> {
   if (Object.keys(env).length > 0) body.env = env
   if (options.cpuLimit !== undefined) body.cpu_limit = Number(options.cpuLimit)
   if (options.memoryMb !== undefined) body.memory_limit_mb = Number(options.memoryMb)
+  if (options.pidsLimit !== undefined) body.pids_limit = parseIntegerFlag(options.pidsLimit, '--pids-limit', 1)
+  if (options.creationId !== undefined) {
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(options.creationId)) {
+      throw new ValidationError('--creation-id must be 8 to 64 letters, digits, - or _')
+    }
+    body.creation_id = options.creationId
+  }
   if (options.workspace) body.lifecycle = 'workspace'
   const egress: EgressFlags = { allow: options.egressAllow, denyAll: options.egressDenyAll }
   if (wantsEgressChange(egress)) body.egress_policy = buildEgressPolicy(egress)
@@ -1856,6 +1873,7 @@ interface CloneOptions {
   gitUsername?: string
   gitPassword?: string
   tarballUrl?: string
+  stripGitMetadata?: boolean
 }
 
 async function cloneAction(id: string, options: CloneOptions): Promise<void> {
@@ -1868,7 +1886,7 @@ async function cloneAction(id: string, options: CloneOptions): Promise<void> {
     // api-coverage: POST /v1/sandboxes/{id}/source
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/source`, {
       method: 'POST',
-      body: JSON.stringify(source),
+      body: JSON.stringify(options.stripGitMetadata ? { ...source, strip_git_metadata: true } : source),
     }),
   )
   const view = toSandboxView(sbx.sandbox)

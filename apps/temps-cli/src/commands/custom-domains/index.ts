@@ -30,6 +30,7 @@ interface CreateOptions {
   branch?: string
   redirectTo?: string
   statusCode?: string
+  service?: string
   yes?: boolean
 }
 
@@ -47,6 +48,7 @@ interface UpdateOptions {
   branch?: string
   redirectTo?: string
   statusCode?: string
+  service?: string
 }
 
 interface RemoveOptions {
@@ -91,6 +93,7 @@ export function registerCustomDomainsCommands(program: Command): void {
     .option('--branch <branch>', 'Branch name')
     .option('--redirect-to <url>', 'Redirect target URL')
     .option('--status-code <code>', 'HTTP status code for redirects')
+    .option('--service <name>', 'Docker Compose service the domain routes to (compose projects only)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createCustomDomainAction)
 
@@ -112,6 +115,7 @@ export function registerCustomDomainsCommands(program: Command): void {
     .option('--branch <branch>', 'New branch name')
     .option('--redirect-to <url>', 'New redirect target URL')
     .option('--status-code <code>', 'New HTTP status code for redirects')
+    .option('--service <name>', 'Docker Compose service the domain routes to ("" routes to the default service)')
     .action(updateCustomDomainAction)
 
   customDomains
@@ -230,6 +234,7 @@ async function createCustomDomainAction(options: CreateOptions): Promise<void> {
         ...(options.branch && { branch: options.branch }),
         ...(options.redirectTo && { redirect_to: options.redirectTo }),
         ...(options.statusCode && { status_code: parseInt(options.statusCode, 10) }),
+        ...(options.service && { service_name: options.service }),
       },
     })
     if (error) {
@@ -323,6 +328,7 @@ export function buildCustomDomainUpdateBody(options: {
   branch?: string
   redirectTo?: string
   statusCode?: string
+  service?: string
 }): Record<string, unknown> {
   const body: Record<string, unknown> = {}
   if (options.domain) {
@@ -339,6 +345,9 @@ export function buildCustomDomainUpdateBody(options: {
   }
   if (options.statusCode) {
     body.status_code = parseInt(options.statusCode, 10)
+  }
+  if (options.service !== undefined) {
+    body.service_name = options.service || null
   }
   return body
 }
@@ -363,7 +372,7 @@ async function updateCustomDomainAction(options: UpdateOptions): Promise<void> {
 
   if (Object.keys(body).length === 0) {
     warning('No update options provided')
-    info('Use --domain, --environment-id, --branch, --redirect-to, or --status-code to update fields')
+    info('Use --domain, --environment-id, --branch, --redirect-to, --status-code or --service to update fields')
     return
   }
 

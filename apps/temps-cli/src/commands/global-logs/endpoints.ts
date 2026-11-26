@@ -18,6 +18,7 @@ import {
   ingestLogs,
   logIngestBudget,
   purgeProjectLogs,
+  searchLogs,
   tailLogs,
   updateSavedSearch,
 } from '../../api/sdk.gen.js'
@@ -161,6 +162,27 @@ export function registerGlobalLogsEndpoints(program: Command): void {
       before: { kind: 'string!', help: "Delete all logs before this timestamp (ISO 8601)" },
     },
     confirm: "This will purge all logs for a project before a given timestamp.",
+  })
+
+  endpoint(group, searchLogs, {
+    name: "project-search",
+    description: "Search one project's (or one database's) log lines, newest first, with a cursor for the next page",
+    body: {
+      project_id: { kind: 'int!', help: "Project ID (0 with --external-service-id searches a database's logs)" },
+      external_service_id: { kind: 'int', help: "Search this external service's (database's) logs instead" },
+      start_time: { kind: 'string', help: "Window start (RFC 3339; default: 24 hours ago)" },
+      end_time: { kind: 'string', help: "Window end (RFC 3339; default: now)" },
+      text: { kind: 'string', help: "Only lines containing this text" },
+      levels: { kind: 'strings', help: "Only these levels (repeatable)", values: ["TRACE","DEBUG","INFO","WARN","ERROR"] },
+      envs: { kind: 'strings', help: "Only these environments (repeatable)" },
+      services: { kind: 'strings', help: "Only these services (repeatable)" },
+      container_ids: { kind: 'strings', help: "Only these containers (repeatable)" },
+      node_ids: { kind: 'ints', help: "Only lines from these nodes (repeatable)" },
+      deploy_id: { kind: 'int', help: "Only lines from this deployment" },
+      context_lines: { kind: 'int', help: "Lines of context around each match" },
+      page_size: { kind: 'int', help: "Lines per page" },
+      cursor: { kind: 'string', help: "Resume from a previous next_cursor" },
+    },
   })
 
   endpoint(group, getSavedSearch, {

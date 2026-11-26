@@ -18,6 +18,8 @@ import type {
   ProviderDomainIdentityResponse,
   ScalewayCredentialsRequest,
   SesCredentialsRequest,
+  SmtpCredentialsRequest,
+  SmtpEncryptionRoute,
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
@@ -31,7 +33,10 @@ import { addCredentialSources } from '../../lib/value-source.js'
 const PROVIDER_TYPES: { name: string; value: EmailProviderTypeRoute }[] = [
   { name: 'Amazon SES', value: 'ses' },
   { name: 'Scaleway', value: 'scaleway' },
+  { name: 'SMTP server', value: 'smtp' },
 ]
+
+const SMTP_ENCRYPTION: SmtpEncryptionRoute[] = ['starttls', 'tls', 'none']
 
 interface CreateOptions {
   name?: string
@@ -41,6 +46,13 @@ interface CreateOptions {
   secretAccessKey?: string
   apiKey?: string
   projectId?: string
+  smtpHost?: string
+  smtpPort?: string
+  smtpUsername?: string
+  smtpPassword?: string
+  smtpEncryption?: string
+  smtpAcceptInvalidCerts?: boolean
+  snsTopicArn?: string
   yes?: boolean
 }
 
@@ -82,7 +94,13 @@ export function requireNonEmpty(value: string): true | string {
 export function resolveEmailProviderCredentials(
   providerType: EmailProviderTypeRoute,
   options: CreateOptions,
-): { ses_credentials: SesCredentialsRequest | null; scaleway_credentials: ScalewayCredentialsRequest | null } | undefined {
+):
+  | {
+      ses_credentials: SesCredentialsRequest | null
+      scaleway_credentials: ScalewayCredentialsRequest | null
+      smtp_credentials?: SmtpCredentialsRequest | null
+    }
+  | undefined {
   switch (providerType) {
     case 'ses': {
       if (options.accessKeyId && options.secretAccessKey) {
@@ -116,8 +134,32 @@ export function resolveEmailProviderCredentials(
       return undefined
     }
 
+    case 'smtp':
+      return { ses_credentials: null, scaleway_credentials: null, smtp_credentials: smtpCredentials(options) }
+
     default:
       return undefined
+  }
+}
+
+/** SMTP settings from the flags; the host is required, the port defaults to the encryption's usual one. */
+export function smtpCredentials(options: CreateOptions): SmtpCredentialsRequest {
+  if (!options.smtpHost) throw new Error('--smtp-host is required for an SMTP provider')
+  const encryption = (options.smtpEncryption ?? 'starttls') as SmtpEncryptionRoute
+  if (!SMTP_ENCRYPTION.includes(encryption)) {
+    throw new Error(`--smtp-encryption must be one of ${SMTP_ENCRYPTION.join(', ')}, got "${options.smtpEncryption}"`)
+  }
+  const port = options.smtpPort === undefined ? (encryption === 'tls' ? 465 : 587) : Number(options.smtpPort)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`--smtp-port must be a port number (1-65535), got "${options.smtpPort}"`)
+  }
+  return {
+    host: options.smtpHost,
+    port,
+    encryption,
+    ...(options.smtpUsername && { username: options.smtpUsername }),
+    ...(options.smtpPassword && { password: options.smtpPassword }),
+    ...(options.smtpAcceptInvalidCerts && { accept_invalid_certs: true }),
   }
 }
 
@@ -139,7 +181,7 @@ export function registerEmailProvidersCommands(program: Command): void {
     .alias('add')
     .description('Create a new email provider')
     .option('-n, --name <name>', 'Provider name')
-    .option('-t, --type <type>', 'Provider type (ses, scaleway)')
+    .option('-t, --type <type>', 'Provider type (ses, scaleway, smtp)')
     .option('-r, --region <region>', 'Cloud region')
     // SES options
     .option('--access-key-id <key>', 'AWS access key ID (for SES)')
@@ -147,11 +189,20 @@ export function registerEmailProvidersCommands(program: Command): void {
     // Scaleway options
     .option('--api-key <key>', 'Scaleway API key')
     .option('--project-id <id>', 'Scaleway project ID')
+    .option('--sns-topic-arn <arn>', 'SES: the only SNS topic allowed to deliver bounce and complaint events')
+    // SMTP options
+    .option('--smtp-host <host>', 'SMTP server host name')
+    .option('--smtp-port <port>', 'SMTP port (default: 587, or 465 with --smtp-encryption tls)')
+    .option('--smtp-encryption <mode>', 'starttls (default), tls or none')
+    .option('--smtp-username <user>', 'SMTP user name, when the server requires a sign-in')
+    .option('--smtp-password <password>', 'SMTP password')
+    .option('--smtp-accept-invalid-certs', 'Accept a self-signed or otherwise invalid server certificate')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createProviderAction)
   addCredentialSources(createCommand, [
     { flag: 'secret-access-key', what: 'the AWS secret access key' },
     { flag: 'api-key', what: 'the Scaleway API key' },
+    { flag: 'smtp-password', what: 'the SMTP password' },
   ])
 
   emailProviders
@@ -236,15 +287,17 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
   let region: string
 
   // Check if automation mode
-  const isAutomation = options.yes && options.type && options.name && options.region
+  // An SMTP provider's region is informational only: the host and port route the mail.
+  const regionFlag = options.region ?? (options.type === 'smtp' ? 'smtp' : undefined)
+  const isAutomation = options.yes && options.type && options.name && regionFlag
 
   if (isAutomation) {
     providerType = options.type as EmailProviderTypeRoute
     name = options.name!
-    region = options.region!
+    region = regionFlag!
 
-    if (providerType !== 'ses' && providerType !== 'scaleway') {
-      warning(`Invalid provider type: ${providerType}. Supported: ses, scaleway`)
+    if (!PROVIDER_TYPES.some((t) => t.value === providerType)) {
+      warning(`Invalid provider type: ${providerType}. Supported: ses, scaleway, smtp`)
       return
     }
   } else {
@@ -256,8 +309,8 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
           choices: PROVIDER_TYPES,
         }) as EmailProviderTypeRoute
 
-    if (providerType !== 'ses' && providerType !== 'scaleway') {
-      warning(`Invalid provider type: ${providerType}. Supported: ses, scaleway`)
+    if (!PROVIDER_TYPES.some((t) => t.value === providerType)) {
+      warning(`Invalid provider type: ${providerType}. Supported: ses, scaleway, smtp`)
       return
     }
 
@@ -267,9 +320,9 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
       required: true,
     })
 
-    region = options.region || await promptText({
-      message: 'Cloud region',
-      default: providerType === 'ses' ? 'us-east-1' : 'fr-par',
+    region = regionFlag || await promptText({
+      message: providerType === 'smtp' ? 'Label for this server (informational)' : 'Cloud region',
+      default: providerType === 'ses' ? 'us-east-1' : providerType === 'smtp' ? 'smtp' : 'fr-par',
       required: true,
     })
   }
@@ -277,12 +330,14 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
   // Build credentials based on type
   let sesCredentials: SesCredentialsRequest | null = null
   let scalewayCredentials: ScalewayCredentialsRequest | null = null
+  let smtpCredentialsBody: SmtpCredentialsRequest | null = null
 
   const resolved = resolveEmailProviderCredentials(providerType, options)
 
   if (resolved) {
     sesCredentials = resolved.ses_credentials
     scalewayCredentials = resolved.scaleway_credentials
+    smtpCredentialsBody = resolved.smtp_credentials ?? null
   } else {
     switch (providerType) {
       case 'ses': {
@@ -343,6 +398,8 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
         region,
         ses_credentials: sesCredentials,
         scaleway_credentials: scalewayCredentials,
+        smtp_credentials: smtpCredentialsBody,
+        ...(options.snsTopicArn && { sns_topic_arn: options.snsTopicArn }),
       },
     })
     if (error) {
