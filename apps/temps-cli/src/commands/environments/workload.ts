@@ -287,14 +287,17 @@ export function registerEnvironmentWorkloadCommands(environments: Command): void
 // Resolution
 // ============================================================================
 
-interface Target {
+export interface Target {
   projectSlug: string
   projectId: number
   environmentId: number
   environmentSlug: string
 }
 
-async function resolveTarget(projectOption: string | undefined, environment: string): Promise<Target> {
+export async function resolveTarget(
+  projectOption: string | undefined,
+  environment: string
+): Promise<Target> {
   const resolved = await requireProjectSlug(projectOption)
   if (resolved.source !== 'flag') {
     info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
@@ -324,7 +327,7 @@ async function resolveTarget(projectOption: string | undefined, environment: str
   })
 }
 
-async function connect(): Promise<void> {
+export async function connect(): Promise<void> {
   await requireAuth()
   await setupClient()
 }

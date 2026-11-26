@@ -31,6 +31,7 @@ import { promptText, promptPassword, promptConfirm, promptSelect, promptCheckbox
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
 import { formatMicrocores, parseMillicores } from '../../lib/cpu.js'
 import { registerEnvironmentWorkloadCommands } from './workload.js'
+import { registerEnvironmentRecordingCommands } from './recording.js'
 import { addValueSourceOptions, resolveValueSource, valueSourceInput, type ValueSourceIO } from '../../lib/value-source.js'
 
 const SET_VAR_EXAMPLES = `
@@ -206,6 +207,7 @@ export function registerEnvironmentsCommands(program: Command): void {
 
   // Placement, isolation, volumes and ingress login (ADR-055)
   registerEnvironmentWorkloadCommands(environments)
+  registerEnvironmentRecordingCommands(environments)
 
   // Cron jobs subcommand
   const crons = environments
