@@ -24,6 +24,8 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 import { readSecretFromStdin } from '../delivery-profiles/index.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { AddManagedDomainApiRequest } from '../../api/types.gen.js'
 
 const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'Cloudflare', value: 'cloudflare' },
@@ -432,13 +434,14 @@ export function registerDnsProvidersCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(domainsListAction)
 
-  domains
-    .command('add')
-    .description('Add a managed domain to a provider')
-    .requiredOption('--id <id>', 'Provider ID')
-    .requiredOption('-d, --domain <domain>', 'Domain name')
-    .option('--auto-manage', 'Enable auto-management for DNS records')
-    .action(domainsAddAction)
+  MANAGED_DOMAIN_EXTRA.addTo(
+    domains
+      .command('add')
+      .description('Add a managed domain to a provider')
+      .requiredOption('--id <id>', 'Provider ID')
+      .requiredOption('-d, --domain <domain>', 'Domain name')
+      .option('--auto-manage', 'Enable auto-management for DNS records'),
+  ).action(domainsAddAction)
 
   domains
     .command('remove')
@@ -1073,7 +1076,14 @@ async function domainsListAction(options: DomainsListOptions): Promise<void> {
   newline()
 }
 
+const MANAGED_DOMAIN_EXTRA = fieldFlags<AddManagedDomainApiRequest>({
+  generated_hostname_mode: { kind: 'string', help: 'Layout of generated hostnames', values: ['standard', 'flat'] },
+  proxied_by_default: { kind: 'bool', help: 'Create records proxied through the provider (Cloudflare) by default' },
+  sync_generated_records: { kind: 'bool', help: "Keep generated hostnames' DNS records in this zone in sync" },
+})
+
 async function domainsAddAction(options: DomainsAddOptions): Promise<void> {
+  const extra = await MANAGED_DOMAIN_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -1090,6 +1100,7 @@ async function domainsAddAction(options: DomainsAddOptions): Promise<void> {
       body: {
         domain: options.domain,
         ...(options.autoManage !== undefined && { auto_manage: options.autoManage }),
+        ...extra,
       },
     })
     if (error) {

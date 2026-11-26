@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-25
+> Generated on: 2026-11-26
 
 ## Installation
 
@@ -252,10 +252,22 @@ Manage project secrets — mounted into the deployed container as files at /run/
 
 **Subcommands:**
 
+- `get` - Show one project secret's metadata (the value is never returned)
 - `list` (`ls`) - List secrets for a project (values are never returned)
 - `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
+
+#### `projects secrets get <secret-id>`
+
+Show one project secret's metadata (the value is never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `projects secrets list` (alias: `ls`)
 
@@ -334,6 +346,8 @@ List all services
 | `--json` | Output in JSON format | - | No |
 | `--page <n>` | Page number | - | No |
 | `--per-page <n>` | Items per page | - | No |
+| `--group <id>` | Only services in this project group (its numeric ID) | - | No |
+| `--ungrouped` | Only services in no project group | - | No |
 
 ### `projects create` (alias: `new`)
 
@@ -357,6 +371,20 @@ Create a new service (git-based or manual deployment); add it to a project with 
 | `--external` | The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes) | - | No |
 | `--delivery-provider <provider>` | Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`) | - | No |
 | `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
+| `--cloudflare-enabled` | Serve through Cloudflare (overrides the instance default) | - | No |
+| `--no-cloudflare-enabled` | Set cloudflare_enabled to false | - | No |
+| `--custom-domain <value>` | Custom domain to attach to the production environment | - | No |
+| `--expected-slug <value>` | Fail unless the project gets exactly this URL slug | - | No |
+| `--is-on-demand` | Start containers on the first request and stop them when idle | - | No |
+| `--no-is-on-demand` | Set is_on_demand to false | - | No |
+| `--is-public-repo` | The repository is public (cloned without a git connection) | - | No |
+| `--no-is-public-repo` | Set is_public_repo to false | - | No |
+| `--is-web-app` | The app serves HTTP (false for a worker with no port) | - | No |
+| `--no-is-web-app` | Set is_web_app to false | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
+| `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
 ### `projects cloudflare-capability` (alias: `delivery-capability`)
 
@@ -403,6 +431,24 @@ Update service name and description
 | `-d, --description <description>` | New project description | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided values (for automation) | - | No |
+| `--build-command <value>` | Build command (overrides the preset) | - | No |
+| `--install-command <value>` | Install command (overrides the preset) | - | No |
+| `--output-dir <value>` | Build output directory (static sites) | - | No |
+| `--cloudflare-enabled` | Serve through Cloudflare | - | No |
+| `--no-cloudflare-enabled` | Set cloudflare_enabled to false | - | No |
+| `--custom-domain <value>` | Custom domain of the production environment | - | No |
+| `--expected-slug <value>` | Fail unless the project keeps exactly this URL slug | - | No |
+| `--is-on-demand` | Start containers on the first request and stop them when idle | - | No |
+| `--no-is-on-demand` | Set is_on_demand to false | - | No |
+| `--is-public-repo` | The repository is public (cloned without a git connection) | - | No |
+| `--no-is-public-repo` | Set is_public_repo to false | - | No |
+| `--is-web-app` | The app serves HTTP (false for a worker with no port) | - | No |
+| `--no-is-web-app` | Set is_web_app to false | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--preset-config <json>` | Preset-specific build settings as JSON, e.g. {"buildCommand":"bun run build"} (JSON) | - | No |
+| `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
+| `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
 ### `projects settings`
 
@@ -425,6 +471,24 @@ Update service settings (name, slug, attack mode, preview environments, vulnerab
 | `--reset-image-retention` | Clear the per-project image retention override and use the system default | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
+| `--ai-alert-summaries-enabled` | Summarize metric alert notifications with AI | - | No |
+| `--no-ai-alert-summaries-enabled` | Set ai_alert_summaries_enabled to false | - | No |
+| `--ai-api-traffic-summary-enabled` | Summarize API traffic analytics with AI | - | No |
+| `--no-ai-api-traffic-summary-enabled` | Set ai_api_traffic_summary_enabled to false | - | No |
+| `--cross-project-trace-sharing` | Show this project's spans in other projects' traces | - | No |
+| `--no-cross-project-trace-sharing` | Set cross_project_trace_sharing to false | - | No |
+| `--error-source-context-enabled` | Show source code in error stack traces (uploads source files) | - | No |
+| `--no-error-source-context-enabled` | Set error_source_context_enabled to false | - | No |
+| `--error-source-root <value>` | Source root for error source context, relative to the checkout | - | No |
+| `--log-ingest-lines-per-sec <n>` | Log ingestion budget for the project's containers, lines per second (0 lifts it) | - | No |
+| `--log-ingest-kib-per-sec <n>` | Log ingestion budget in KiB per second (0 lifts it) | - | No |
+| `--preview-envs-on-demand` | New preview environments start on demand and stop when idle | - | No |
+| `--no-preview-envs-on-demand` | Set preview_envs_on_demand to false | - | No |
+| `--preview-envs-idle-timeout-seconds <n>` | Idle seconds (60-86400) before an on-demand preview stops | - | No |
+| `--preview-envs-wake-timeout-seconds <n>` | Seconds (5-120) to wait for an on-demand preview to wake | - | No |
+| `--serves-own-temps-api` | Send /api/_temps* and /api/otel* on the project's domains to the app instead of Temps | - | No |
+| `--no-serves-own-temps-api` | Set serves_own_temps_api to false | - | No |
+| `--shield-mode <value>` | How Shield acts on its verdicts (one of: off, log, selective, attack) | - | No |
 
 ### `projects git`
 
@@ -443,6 +507,12 @@ Update git repository settings
 | `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided/existing values (for automation) | - | No |
+| `--is-public-repo` | The repository is public: clone it without a git connection | - | No |
+| `--no-is-public-repo` | Set is_public_repo to false | - | No |
+| `--git-url <value>` | Clone URL of a public repository | - | No |
+| `--preset-config <json>` | Preset-specific build settings as JSON, e.g. {"buildCommand":"bun run build"} (JSON) | - | No |
+| `--pull-only-root-directory` | Clone only --directory instead of the whole repository | - | No |
+| `--no-pull-only-root-directory` | Set pull_only_root_directory to false | - | No |
 
 ### `projects source`
 
@@ -515,6 +585,21 @@ Update deployment configuration (resources, replicas)
 | `--websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
+| `--build-location <value>` | Where a source deployment's image is built (one of: control_plane, node, ci) | - | No |
+| `--cross-architecture-builds` | Build one image per architecture the eligible nodes run | - | No |
+| `--no-cross-architecture-builds` | Set crossArchitectureBuilds to false | - | No |
+| `--cpu-request <n>` | CPU reserved per container, in microcores | - | No |
+| `--memory-request <n>` | Memory reserved per container, in MB | - | No |
+| `--exposed-port <n>` | Port the container listens on | - | No |
+| `--health <json>` | Health check settings as JSON, e.g. {"path":"/healthz"} (JSON) | - | No |
+| `--health-check-timeout-seconds <n>` | Seconds (30-3600) a new deployment's containers get to become ready | - | No |
+| `--stop-timeout-seconds <n>` | Seconds (1-3600) the previous deployment gets to finish in-flight requests | - | No |
+| `--load-balancing <json>` | Load balancing settings as JSON (JSON) | - | No |
+| `--max-concurrent-connections <n>` | Default cap on concurrent requests to an environment's upstream (0 = unlimited) | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performanceMetricsEnabled to false | - | No |
+| `--session-recording-enabled` | Record visitor sessions | - | No |
+| `--no-session-recording-enabled` | Set sessionRecordingEnabled to false | - | No |
 
 ### `projects delete` (alias: `rm`)
 
@@ -586,7 +671,9 @@ Deploy a pre-built Docker image
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | Yes |
+| `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | No |
+| `--external-image-id <id>` | Deploy an image already registered with Temps instead of --image | - | No |
+| `--claim-local` | --image is on the platform host's Docker daemon, not in a registry: claim it | - | No |
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Target environment name | `production` | No |
 | `--environment-id <id>` | Target environment ID | - | No |
@@ -608,6 +695,9 @@ Build and deploy a local Docker image (or deploy existing image with --image)
 | `-f, --dockerfile <path>` | Path to Dockerfile | `Dockerfile` | No |
 | `-c, --context <path>` | Build context directory | `.` | No |
 | `--build-arg <arg...>` | Build arguments (can be specified multiple times) | - | No |
+| `--build-command <cmd>` | With no Dockerfile: the build command in the one generated from the project's preset | - | No |
+| `--install-command <cmd>` | With no Dockerfile: the install command in the generated one | - | No |
+| `--output-dir <dir>` | With no Dockerfile: the static output directory in the generated one | - | No |
 | `--no-build` | Skip building, requires --image | - | No |
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Target environment name | `production` | No |
@@ -813,6 +903,9 @@ List domains
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--search <value>` | Only domains whose name contains this | - | No |
+| `--sort-by <value>` | Sort column (default created_at) (one of: created_at, domain, status, expiration) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `domains add`
 
@@ -904,6 +997,8 @@ List all ACME orders
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 #### `domains orders show`
 
@@ -1574,6 +1669,9 @@ List available repositories
 | `--direction <dir>` | Sort direction: asc or desc | - | No |
 | `--language <lang>` | Filter by programming language | - | No |
 | `--owner <owner>` | Filter by repository owner | - | No |
+| `--updated-after <value>` | Only repositories updated on or after this time (RFC 3339) | - | No |
+| `--preset <value>` | Only repositories detected as this preset (e.g. nextjs); not with --id | - | No |
+| `--git-provider-connection-id <n>` | Only repositories of this connection; not with --id | - | No |
 
 ### `providers connections` (alias: `conn`)
 
@@ -1679,8 +1777,11 @@ Update access token for a Git connection
 |------|-------------|---------|----------|
 | `--id <id>` | Connection ID | - | Yes |
 | `-t, --token <token>` | New access token (prefer --token-file or --token-stdin, which keep it out of shell history) | - | No |
+| `--refresh-token <token>` | New refresh token, for providers whose access tokens expire (prefer --refresh-token-file or --refresh-token-stdin) | - | No |
 | `--token-file <path>` | Read the new access token from a file (- reads stdin) instead of --token | - | No |
 | `--token-stdin` | Read the new access token from stdin instead of --token | - | No |
+| `--refresh-token-file <path>` | Read the new refresh token from a file (- reads stdin) instead of --refresh-token | - | No |
+| `--refresh-token-stdin` | Read the new refresh token from stdin instead of --refresh-token | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `providers connections validate`
@@ -1746,6 +1847,12 @@ Create a backup schedule
 | `-d, --description <desc>` | Description | - | No |
 | `--s3-source-id <id>` | S3 Source ID | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--target-all-services` | Back up every external service (the default when no --service-ids) | - | No |
+| `--no-target-all-services` | Set target_all_services to false | - | No |
+| `--service-ids <n>` | Back up only these external services (repeatable) (repeatable) | - | No |
+| `--include-control-plane` | Also back up Temps' own database | - | No |
+| `--no-include-control-plane` | Set include_control_plane to false | - | No |
+| `--max-runtime-secs <n>` | Cancel a run that takes longer than this | - | No |
 
 #### `backups schedules show`
 
@@ -1830,6 +1937,12 @@ Create an S3 source
 | `--secret-key <key>` | Secret access key | - | No |
 | `--prefix <prefix>` | Bucket path/prefix | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--use-tls` | Connect to the endpoint over TLS (default true) | - | No |
+| `--no-use-tls` | Set use_tls to false | - | No |
+| `--worker-credentials <json>` | Separate credentials the backup workers use, as JSON (JSON) | - | No |
+| `--backing-service-id <n>` | The external service (S3/MinIO) that hosts this bucket | - | No |
+| `--is-default` | Make this the default backup destination | - | No |
+| `--no-is-default` | Set is_default to false | - | No |
 | `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
 | `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -1861,6 +1974,9 @@ Update an S3 source
 | `--access-key <key>` | New access key ID | - | No |
 | `--secret-key <key>` | New secret access key | - | No |
 | `--prefix <prefix>` | New bucket path/prefix | - | No |
+| `--use-tls` | Connect to the endpoint over TLS (default true) | - | No |
+| `--no-use-tls` | Set use_tls to false | - | No |
+| `--worker-credentials <json>` | Separate credentials the backup workers use, as JSON (JSON) | - | No |
 | `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
 | `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -1887,6 +2003,8 @@ List backups for an S3 source
 |------|-------------|---------|----------|
 | `--id <id>` | S3 source ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+| `--include-s3-scan` | Also list backups found in the bucket that this server has no record of | - | No |
+| `--no-include-s3-scan` | Set include_s3_scan to false | - | No |
 
 #### `backups sources run`
 
@@ -2001,6 +2119,8 @@ List configured notification providers
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `notifications add`
 
@@ -2148,6 +2268,8 @@ List notification routes
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 #### `notifications routes show`
 
@@ -2443,6 +2565,9 @@ Create a new external service
 | `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
 | `--backend <backend>` | S3 storage engine: rustfs (default) or garage (s3/blob only) | - | No |
 | `--bucket <name>` | Bucket to create (repeatable, s3/blob only; the first is S3_BUCKET) | `` | No |
+| `--node <id>` | Worker node to run the service on (default: the control plane) | - | No |
+| `--topology <topology>` | standalone (default) or cluster (highly available, several members) | - | No |
+| `--member <role[@node]>` | With --topology cluster: a member, monitor, primary or replica, optionally on a node id (repeatable; exactly one monitor) | `` | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services show`
@@ -2582,6 +2707,8 @@ Link a service to a project
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
 | `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
+| `--database-mode <mode>` | Which database deployments get: project (one per project), project_environment (one per environment) or custom | - | No |
+| `--database-name <name>` | With --database-mode custom: the exact database name | - | No |
 
 ### `services unlink`
 
@@ -2858,7 +2985,10 @@ Restore a service from a backup (in-place, new service, or PITR)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
-| `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
+| `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | No |
+| `--backup-location <s3-key>` | Instead of --backup-id: the S3 key of a backup this instance did not record (one found by an S3 scan, made by another Temps instance) | - | No |
+| `--backup-engine <engine>` | With --backup-location: postgres, redis, mongodb or s3 | - | No |
+| `--s3-source <id>` | With --backup-location: the S3 source the backup is in | - | No |
 | `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
 | `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service. | - | No |
 | `--confirm-cross-service` | Confirm an in-place (or PITR in-place) restore of a backup produced by a different service. Required by the server for such restores; recorded in the audit log. | - | No |
@@ -2988,6 +3118,15 @@ Manage platform settings
 - `geo-status` - Show the freshness of the geolocation (GeoLite2) database
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
+- `fields` - List every instance setting, or print the value at a field path (e.g. shield, otel_ingest.max_spans_per_second)
+- `apply` - Change any instance setting by field path: field=value (JSON or text), field:=text, or a bare field with --value-stdin
+- `admin-gate` - Show, or change with flags, which hosts and source IPs may reach the console and API listener
+- `telemetry` - Show anonymous telemetry status, or turn it on/off with --enable/--disable
+- `ci-builder` - Configure the external CI builder that runs builds off the control plane
+- `disk-status` - Show the control plane's disk usage and alert threshold
+- `public-ingress` - Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
+- `refresh-routes` - Rebuild the proxy route table now instead of waiting for the next change
+- `weekly-digest` - Generate and send the weekly digest now
 
 ### `settings show` (alias: `get`)
 
@@ -3056,12 +3195,150 @@ Set the preview domain pattern
 |------|-------------|---------|----------|
 | `--domain <domain>` | Preview domain pattern | - | Yes |
 
+### `settings fields [path]`
+
+List every instance setting, or print the value at a field path (e.g. shield, otel_ingest.max_spans_per_second)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings apply [assignments...]`
+
+Change any instance setting by field path: field=value (JSON or text), field:=text, or a bare field with --value-stdin
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from-file <path>` | Merge a JSON object of settings from a file (- for stdin) | - | No |
+| `--value-stdin` | Read the value of the one bare field from stdin (for secrets) | - | No |
+| `-y, --yes` | Do not ask before changing a setting that can lock you out | - | No |
+| `--json` | Print the saved settings response as JSON | - | No |
+
+### `settings admin-gate`
+
+Show, or change with flags, which hosts and source IPs may reach the console and API listener
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--allowed-host <host>` | Host header to allow (repeatable; replaces the list) | - | No |
+| `--allowed-ip <ip-or-cidr>` | Source IP or CIDR to allow (repeatable; replaces the list) | - | No |
+| `--clear-hosts` | Allow any Host header | - | No |
+| `--clear-ips` | Allow any source address | - | No |
+| `--trust-forwarded-for` | Trust X-Forwarded-For from loopback peers | - | No |
+| `--no-trust-forwarded-for` | Ignore X-Forwarded-For | - | No |
+| `-y, --yes` | Do not ask before saving a gate that may lock you out | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `settings telemetry`
+
+Show anonymous telemetry status, or turn it on/off with --enable/--disable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Send anonymous telemetry | - | No |
+| `--disable` | Stop sending anonymous telemetry | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `settings ci-builder`
+
+Configure the external CI builder that runs builds off the control plane
+
+**Subcommands:**
+
+- `show` - Show whether the CI builder is configured, and its settings (credentials are never returned)
+- `set` - Save CI builder settings from --from-file and/or field=value assignments (e.g. limits.concurrency=2)
+- `provision` - Create the builder repository and its pinned runner shim at the configured provider
+
+#### `settings ci-builder show`
+
+Show whether the CI builder is configured, and its settings (credentials are never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings ci-builder set [assignments...]`
+
+Save CI builder settings from --from-file and/or field=value assignments (e.g. limits.concurrency=2)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--from-file <path>` | JSON object of CI builder settings (- for stdin) | - | No |
+| `--dispatch-token-stdin` | Read the dispatch token from stdin | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `settings ci-builder provision`
+
+Create the builder repository and its pinned runner shim at the configured provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+
+### `settings disk-status`
+
+Show the control plane's disk usage and alert threshold
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings public-ingress`
+
+Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings refresh-routes`
+
+Rebuild the proxy route table now instead of waiting for the next change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings weekly-digest`
+
+Generate and send the weekly digest now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `platform` (alias: `plat`)
 
 View platform and server information
 
 **Subcommands:**
 
+- `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+- `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
+- `geo` - Look up the location of an IP address in the server's geolocation database
+- `file` - Print a file from the server's static directory (or save it with -o)
 - `info` - Get platform information
 - `features` - Show which capabilities the server process actually provides
 - `access` - Get access and networking information
@@ -3069,6 +3346,51 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform operations` (alias: `ops`)
+
+List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--status <status>` | Which ones: running, waiting, finished, all (default: the server's) | - | No |
+| `--kind <kind>` | Only one kind: deployment, rollback, promotion, restore, backup, autofix | - | No |
+| `--project <id>` | Only this project ID | - | No |
+| `--page <n>` | Page (default 1) | - | No |
+| `--page-size <n>` | Operations per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `platform maturity`
+
+Show the compatibility promise (stable, beta, experimental) for every feature
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform geo <ip>`
+
+Look up the location of an IP address in the server's geolocation database
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform file <path>`
+
+Print a file from the server's static directory (or save it with -o)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <file>` | Write it to a file instead of stdout | - | No |
 
 ### `platform info`
 
@@ -3204,6 +3526,7 @@ Manage platform users
 
 **Subcommands:**
 
+- `get` - Show one platform user
 - `list` (`ls`) - List all users
 - `create` (`add`) - Create a new user
 - `me` - Show current user info
@@ -3212,6 +3535,16 @@ Manage platform users
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
 - `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again
 - `role` - Manage user roles
+
+### `users get <user-id>`
+
+Show one platform user
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `users list` (alias: `ls`)
 
@@ -3235,6 +3568,7 @@ Create a new user
 | `-e, --email <email>` | Email address | - | No |
 | `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | No |
 | `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | No |
+| `--must-change-password` | Make the user choose a new password at first sign-in | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 | `--password-file <path>` | Read the password from a file (- reads stdin) instead of --password | - | No |
 | `--password-stdin` | Read the password from stdin instead of --password | - | No |
@@ -3331,6 +3665,8 @@ List all API keys
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Keys per page (max 100) | - | No |
 
 ### `apikeys create` (alias: `add`)
 
@@ -3584,6 +3920,10 @@ List all webhooks for a project
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+| `--page <n>` | Query parameter page | - | No |
+| `--page-size <n>` | Webhooks per page (max 100) | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `webhooks create` (alias: `add`)
 
@@ -4085,6 +4425,7 @@ List tables, collections, keys or objects in a container
 |------|-------------|---------|----------|
 | `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
 | `--limit <n>` | Maximum entities to return (default: 100) | - | No |
+| `--next-token <token>` | Continue from the next_token of a previous page | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `data schema <service> <entity>` (alias: `columns`)
@@ -4149,11 +4490,23 @@ Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 
 **Subcommands:**
 
+- `get` - Show one analytics ingest key
 - `list` (`ls`) - List analytics ingest keys for a project
 - `create` (`add`) - Mint a new analytics ingest key
 - `update` - Update an ingest key's label, origin allowlist, or rate limit
 - `rotate` - Replace an ingest key value, keeping the same row and scope
 - `revoke` - Revoke (deactivate) an analytics ingest key
+
+#### `analytics keys get <key-id>`
+
+Show one analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 #### `analytics keys list` (alias: `ls`)
 
@@ -4251,6 +4604,7 @@ List conversions with visitors, rate and revenue in a period
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 #### `analytics conversions create`
 
@@ -4314,6 +4668,7 @@ Where the visitors who converted came from
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
 | `--limit <n>` | Rows (default: 10, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics identity`
 
@@ -4360,6 +4715,8 @@ Show analytics dashboard overview
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
+| `--deployment-id <n>` | Only this deployment (an ID) | - | No |
 
 ### `analytics top <dimension>`
 
@@ -4373,6 +4730,16 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
+| `--deployment-id <n>` | Only this deployment (an ID) | - | No |
+| `--filter-browser <value>` | Only visitors on this browser | - | No |
+| `--filter-channel <value>` | Only visitors from this channel (e.g. Organic Search) | - | No |
+| `--filter-country <value>` | Only visitors from this country | - | No |
+| `--filter-os <value>` | Only visitors on this operating system | - | No |
+| `--filter-referrer <value>` | Only visitors from this referrer | - | No |
+| `--filter-region <value>` | Only visitors from this region | - | No |
+| `--include-crawlers` | Count crawler traffic too | - | No |
+| `--no-include-crawlers` | Set include_crawlers to false | - | No |
 
 ### `analytics outbound`
 
@@ -4386,6 +4753,7 @@ Show the outbound links visitors clicked (outbound_click events)
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics downloads`
 
@@ -4399,6 +4767,7 @@ Show the files visitors downloaded (file_download events)
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics not-found`
 
@@ -4412,6 +4781,7 @@ Show pages visitors could not find: 404s Temps answered and not_found events
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics funnels`
 
@@ -4424,6 +4794,8 @@ Show funnel conversion metrics for all funnels
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
+| `--country-code <value>` | Only visitors from this country (ISO code, e.g. DE) | - | No |
 
 ### `analytics performance` (alias: `speed`)
 
@@ -4464,6 +4836,7 @@ Show AI crawler / provider breakdown (web /analytics/ai-agents)
 | `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | No |
 | `--path <path>` | Restrict to one URL path (e.g. /docs) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics ai-pages`
 
@@ -4479,6 +4852,7 @@ Show pages crawled by AI agents, with distinct-agent counts
 | `--path <path>` | Restrict to one URL path (returns just that row) | - | No |
 | `--with-agents` | Also fetch and render the per-agent split for each page (slower) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics ai-page <path>`
 
@@ -4493,6 +4867,7 @@ Show which agents/providers crawled a single page (e.g. /docs)
 | `--limit <n>` | Number of rows to fetch (default: 50, max: 100) | - | No |
 | `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | No |
 | `--json` | Output in JSON format | - | No |
+| `--environment-id <n>` | Only this environment of the project (an ID) | - | No |
 
 ### `analytics api-overview`
 
@@ -4611,6 +4986,7 @@ Show an AI-generated summary of API traffic from /api-analytics/summary (require
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--refresh` | Generate a fresh summary instead of the cached one | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics enrich <visitor-id>`

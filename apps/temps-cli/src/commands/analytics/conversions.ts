@@ -13,6 +13,7 @@ import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { resolveAnalyticsProject } from './project.js'
+import { ENVIRONMENT_FILTER, GOAL_BREAKDOWN_FILTERS } from './scope.js'
 import {
   createAnalyticsGoal,
   deleteAnalyticsGoal,
@@ -147,6 +148,7 @@ export function formatRevenue(revenue: AnalyticsGoalRevenue | null | undefined):
 }
 
 async function listConversions(options: ProjectOptions & { period: string }): Promise<void> {
+  const environment = await ENVIRONMENT_FILTER.read(options)
   await requireAuth()
   await setupClient()
   const projectId = (await resolveAnalyticsProject(options.project)).id
@@ -162,7 +164,7 @@ async function listConversions(options: ProjectOptions & { period: string }): Pr
     const stats = await getAnalyticsGoalStats({
       client,
       path: { project_id: projectId },
-      query: { start_date: startDate, end_date: endDate },
+      query: { start_date: startDate, end_date: endDate, ...environment },
     })
     if (stats.error || !stats.data) throw new Error(getErrorMessage(stats.error))
     return [goals.data, stats.data] as const
@@ -262,6 +264,7 @@ async function deleteConversion(
 async function breakdownConversion(
   options: ProjectOptions & { goalId?: string; by: string; period: string; limit?: string },
 ): Promise<void> {
+  const environment = await GOAL_BREAKDOWN_FILTERS.read(options)
   const goalId = parseGoalId(options.goalId)
   const dimension = parseDimension(options.by)
   const limit = options.limit === undefined ? 10 : Number(options.limit)
@@ -277,7 +280,7 @@ async function breakdownConversion(
     const { data, error } = await getAnalyticsGoalBreakdown({
       client,
       path: { project_id: projectId, goal_id: goalId },
-      query: { dimension, start_date: startDate, end_date: endDate, limit },
+      query: { dimension, start_date: startDate, end_date: endDate, limit, ...environment },
     })
     if (error || !data) throw new Error(getErrorMessage(error))
     return data
@@ -315,13 +318,13 @@ export function registerAnalyticsConversionsCommands(analytics: Command): void {
     .alias('goals')
     .description('Conversion goals: events or pages that count as success')
 
-  conversions
+  const list = conversions
     .command('list')
     .description('List conversions with visitors, rate and revenue in a period')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--period <period>', PERIOD_HELP, '30d')
     .option('--json', 'Output in JSON format')
-    .action(listConversions)
+  ENVIRONMENT_FILTER.addTo(list).action(listConversions)
 
   goalDefinitionOptions(
     conversions
@@ -347,7 +350,7 @@ export function registerAnalyticsConversionsCommands(analytics: Command): void {
     .option('-y, --yes', 'Skip confirmation (alias for --force)')
     .action(deleteConversion)
 
-  conversions
+  const goalBreakdown = conversions
     .command('breakdown')
     .description('Where the visitors who converted came from')
     .option('-p, --project <project>', 'Project slug or ID')
@@ -356,5 +359,5 @@ export function registerAnalyticsConversionsCommands(analytics: Command): void {
     .option('--period <period>', PERIOD_HELP, '30d')
     .option('--limit <n>', 'Rows (default: 10, max: 100)')
     .option('--json', 'Output in JSON format')
-    .action(breakdownConversion)
+  GOAL_BREAKDOWN_FILTERS.addTo(goalBreakdown).action(breakdownConversion)
 }

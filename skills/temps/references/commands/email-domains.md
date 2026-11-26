@@ -78,6 +78,7 @@ Remove an email domain
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Email domain ID | - | Yes |
+| `--delete-from-provider` | Also delete the domain at the email provider (SES, etc.) | - | No |
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 

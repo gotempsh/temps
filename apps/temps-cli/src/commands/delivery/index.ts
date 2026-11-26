@@ -679,10 +679,11 @@ async function bindingsListAction(options: BindingsListOptions): Promise<void> {
   const result = await withSpinner(
     'Fetching delivery bindings...',
     async () => {
+      const { page, page_size, sort_by, sort_order } = paging.value
       const { data, error: apiError } = await listDomainDeliveryBindings({
         client,
         path: { project_id: project.id },
-        query: paging.value,
+        query: { page, page_size, sort_by, sort_order },
       })
       if (apiError || !data) {
         throw new Error(

@@ -13,6 +13,7 @@ Browse templates and create them
 - `list` (`ls`) - List available templates
 - `create` - Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 - `validate` - Validate a Temps-native template YAML file or directory offline
+- `list-tags` - List all available template tags
 
 ### `templates list` (alias: `ls`)
 
@@ -24,6 +25,8 @@ List available templates
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 | `--kind <kind>` | Filter by kind: starter or app | - | No |
+| `--featured` | Only featured templates | - | No |
+| `--tag <tag>` | Only templates with this tag (see: templates list-tags) | - | No |
 
 ### `templates create`
 
@@ -50,6 +53,7 @@ Create a template: every service (an app, what `projects` manages), the database
 | `--public-repo` | Make the new repository public (private by default) | - | No |
 | `--no-auto-deploy` | Do not deploy on push to the new repository | - | No |
 | `--idempotency-key <key>` | Reuse a key to get the same result instead of creating twice | - | No |
+| `--runtime-overrides <json>` | Image, command, port, health check or limits per image service, e.g. {"api":{"exposed_port":8080}} | - | No |
 | `--no-wait` | Return right away instead of waiting until it finishes | - | No |
 | `--timeout <minutes>` | Stop waiting after this long (default 30); it keeps running on the server | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -59,6 +63,16 @@ Create a template: every service (an app, what `projects` manages), the database
 Validate a Temps-native template YAML file or directory offline
 
 **Usage:** `templates validate <path> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `templates list-tags`
+
+List all available template tags
 
 **Options:**
 

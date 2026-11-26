@@ -12,7 +12,9 @@ Deploy a pre-built Docker image
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | Yes |
+| `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | No |
+| `--external-image-id <id>` | Deploy an image already registered with Temps instead of --image | - | No |
+| `--claim-local` | --image is on the platform host's Docker daemon, not in a registry: claim it | - | No |
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Target environment name | `production` | No |
 | `--environment-id <id>` | Target environment ID | - | No |

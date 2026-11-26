@@ -6,9 +6,9 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## Contents
 
-- [`environments list`](#environments-list)
+- [`environments list`](#environments-list-alias-ls)
 - [`environments create`](#environments-create)
-- [`environments delete`](#environments-delete)
+- [`environments delete`](#environments-delete-alias-rm)
 - [`environments vars`](#environments-vars)
 - [`environments resources`](#environments-resources)
 - [`environments timeouts`](#environments-timeouts)
@@ -19,6 +19,12 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`environments volumes`](#environments-volumes)
 - [`environments ingress`](#environments-ingress)
 - [`environments crons`](#environments-crons)
+- [`environments reachability`](#environments-reachability)
+- [`environments create-ingress-login-grant`](#environments-create-ingress-login-grant)
+- [`environments sleep`](#environments-sleep)
+- [`environments wake`](#environments-wake)
+- [`environments health`](#environments-health)
+- [`environments settings`](#environments-settings)
 
 ## `environments` (alias: `envs`, `env`)
 
@@ -39,6 +45,12 @@ Manage environments and environment variables
 - `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
 - `ingress` - Whether visitors must sign in to Temps to open an environment
 - `crons` - Manage cron jobs
+- `reachability` - Reachability commands
+- `create-ingress-login-grant` - Create ingress login grant
+- `sleep` - Sleep an on-demand environment
+- `wake` - Wake a sleeping on-demand environment
+- `health` - Health commands
+- `settings` - Change any setting of one environment (by its numeric ID); flags left out keep their value. `resources`, `timeouts` and `force-https` cover the common ones by name
 
 ### `environments list` (alias: `ls`)
 
@@ -419,6 +431,10 @@ Whether visitors must sign in to Temps to open an environment
 
 - `show` - Show the login requirement and whether the proxy enforces it now
 - `set` - Require visitors to sign in to Temps, or stop requiring it
+- `delete-connector` - Delete a tunnel at the provider and unpublish every hostname it carries
+- `get-connector` - Get one tunnel
+- `retry-hostname-dns` - Retry DNS setup for a failed hostname publication on its current tunnel
+- `list-providers` - List the tunnel providers this control plane offers
 
 #### `environments ingress show`
 
@@ -446,6 +462,53 @@ Require visitors to sign in to Temps, or stop requiring it
 | `-p, --project <project>` | Project slug | - | No |
 | `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
 | `--no-require-login` | Visitors do not need to sign in | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress delete-connector`
+
+Delete a tunnel at the provider and unpublish every hostname it carries
+
+**Usage:** `environments ingress delete-connector <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress get-connector`
+
+Get one tunnel
+
+**Usage:** `environments ingress get-connector <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress retry-hostname-dns`
+
+Retry DNS setup for a failed hostname publication on its current tunnel
+
+**Usage:** `environments ingress retry-hostname-dns <id> <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress list-providers`
+
+List the tunnel providers this control plane offers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
@@ -497,4 +560,386 @@ Show cron job execution history
 | `--id <id>` | Cron job ID | - | Yes |
 | `--page <page>` | Page number | `1` | No |
 | `--per-page <count>` | Items per page | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments reachability`
+
+Reachability commands
+
+**Subcommands:**
+
+- `get-certificate-methods` - Which ways to give a domain HTTPS work here
+- `check-cloudflare-token` - Check which permissions a pasted Cloudflare API token has
+- `get-connector-hosts` - What a tunnel publishes for environments, or would once turned on
+- `set-connector-hosts` - Turn a tunnel's environment hosts on or off
+- `get` - Whether visitors can reach each address of an environment
+- `apply` - Carry out one option of a stored plan
+- `get-choices` - Which audiences, and which ways in, can work for an environment
+- `plan` - What *Make it reachable* would do for an address
+- `list-runs` - The newest runs of an environment
+- `get-run` - One run, with the progress of each step and what it created
+- `decide-conflict` - Answer a conflict: a DNS record someone else changed while the run was setting it, or after it did (ADR..
+- `resume-run` - Carry on a waiting or interrupted run from its first step not done
+- `undo-run` - Remove exactly what a run created, newest first
+- `get-preview-domain-status` - Whether the preview domain can be reached
+
+#### `environments reachability get-certificate-methods`
+
+Which ways to give a domain HTTPS work here
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain <value>` | The domain to judge, such as 'my-app.example.com' or '*.example.com' | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability check-cloudflare-token`
+
+Check which permissions a pasted Cloudflare API token has
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--hostname <value>` | A hostname the token is meant to serve, when the zone is not known: the longest zone the token reaches... | - | No |
+| `--token-stdin` | The token, as pasted [required] (read from stdin) | - | No |
+| `--token-file <path>` | The token, as pasted [required] (read from a file) | - | No |
+| `--zone <value>` | The zone the token is meant for | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-connector-hosts`
+
+What a tunnel publishes for environments, or would once turned on
+
+**Usage:** `environments reachability get-connector-hosts <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability set-connector-hosts`
+
+Turn a tunnel's environment hosts on or off
+
+**Usage:** `environments reachability set-connector-hosts <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--confirm <value>` | The 'confirm_token' of the list that was shown and accepted: turning on publishes every host in it,... | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get`
+
+Whether visitors can reach each address of an environment
+
+**Usage:** `environments reachability get <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability apply`
+
+Carry out one option of a stored plan
+
+**Usage:** `environments reachability apply <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--answers <json>` | Answers to the option's fields by key. 'address', when given, must be the plan's; 'dns_provider_id' takes... (JSON) | - | No |
+| `--confirmed` | The user saw and accepted the option's 'confirmation' | - | No |
+| `--no-confirmed` | Set confirmed to false | - | No |
+| `--option <value>` | Which option of the plan to carry out (one of: existing_tunnel, direct_managed_dns, new_tunnel, new_tunnel_with_token, direct_manual_dns, private_worker, tailscale_serve, tailscale_service, tailscale_service_with_credential, tunnel_environment_hosts) [required] | - | No |
+| `--plan-id <value>` | The plan this acts on, from 'POST …/reachability/plan' [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-choices`
+
+Which audiences, and which ways in, can work for an environment
+
+**Usage:** `environments reachability get-choices <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability plan`
+
+What *Make it reachable* would do for an address
+
+**Usage:** `environments reachability plan <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--address <value>` | The hostname to make reachable; Temps suggests one without it | - | No |
+| `--audience <value>` | Who an address is for (one of: public, private, signed_in, tailnet_users, unsupported) | - | No |
+| `--gate <value>` | Which gate an address has (D7) (one of: temps, cloudflare_access, unsupported) | - | No |
+| `--principals <json>` | For 'tailnet_users': the tailnet logins and tags it admits (ADR 065 D6) (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability list-runs`
+
+The newest runs of an environment
+
+**Usage:** `environments reachability list-runs <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-run`
+
+One run, with the progress of each step and what it created
+
+**Usage:** `environments reachability get-run <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability decide-conflict`
+
+Answer a conflict: a DNS record someone else changed while the run was setting it, or after it did (ADR..
+
+**Usage:** `environments reachability decide-conflict <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--decision <value>` | A user's answer to a conflict (ADR 064 D4), journaled with the entry (one of: keep, overwrite) [required] | - | No |
+| `--key <value>` | The journal entry in conflict [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability resume-run`
+
+Carry on a waiting or interrupted run from its first step not done
+
+**Usage:** `environments reachability resume-run <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--answers <json>` | 'cloudflare_api_token', when the run had not saved the account yet (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability undo-run`
+
+Remove exactly what a run created, newest first
+
+**Usage:** `environments reachability undo-run <environment-id> <run-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments reachability get-preview-domain-status`
+
+Whether the preview domain can be reached
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `environments create-ingress-login-grant`
+
+Create ingress login grant
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--host <value>` | The hostname, without a port [required] | - | No |
+| `--next <value>` | Path on the host to return to | - | No |
+| `--owner-id <n>` | Body field owner_id [required] | - | No |
+| `--owner-kind <value>` | 'environment' or 'sandbox' (a sandbox preview host) [required] | - | No |
+| `--port <n>` | The port the visitor reached the host on, when the proxy's request carries one (it leaves out the scheme's... | - | No |
+| `--scheme <value>` | 'http' or 'https': how the visitor reached the host [required] | - | No |
+| `--sig <value>` | Body field sig [required] | - | No |
+| `--ts <n>` | Unix seconds the proxy signed the request at [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments sleep`
+
+Sleep an on-demand environment
+
+**Usage:** `environments sleep <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments wake`
+
+Wake a sleeping on-demand environment
+
+**Usage:** `environments wake <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments health`
+
+Health commands
+
+**Subcommands:**
+
+- `get-runtime` - Get runtime health
+- `update-runtime` - Update runtime health
+- `get-project-runtime-health` - Get project runtime health
+
+#### `environments health get-runtime`
+
+Get runtime health
+
+**Usage:** `environments health get-runtime <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments health update-runtime`
+
+Update runtime health
+
+**Usage:** `environments health update-runtime <environment-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--paused` | Body field paused [required] | - | No |
+| `--no-paused` | Set paused to false | - | No |
+| `--required-healthy <n>` | Body field required_healthy | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments health get-project-runtime-health`
+
+Get project runtime health
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments settings`
+
+Change any setting of one environment (by its numeric ID); flags left out keep their value. `resources`, `timeouts` and `force-https` cover the common ones by name
+
+**Usage:** `environments settings <env-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--branch <value>` | Branch this environment deploys | - | No |
+| `--automatic-deploy` | Deploy automatically on push | - | No |
+| `--no-automatic-deploy` | Set automatic_deploy to false | - | No |
+| `--protected` | Never deploy this environment automatically from a push | - | No |
+| `--no-protected` | Set protected to false | - | No |
+| `--replicas <n>` | Container replicas | - | No |
+| `--cpu-limit <n>` | CPU limit per container, in microcores | - | No |
+| `--cpu-request <n>` | CPU reserved per container, in microcores | - | No |
+| `--memory-limit <n>` | Memory limit per container, in MB | - | No |
+| `--memory-request <n>` | Memory reserved per container, in MB | - | No |
+| `--exposed-port <n>` | Port the container listens on (overrides the project's) | - | No |
+| `--anti-affinity` | Spread replicas across different nodes | - | No |
+| `--no-anti-affinity` | Set anti_affinity to false | - | No |
+| `--target-nodes <n>` | Only deploy to this node ID (repeatable) (repeatable) | - | No |
+| `--target-labels <json>` | Only deploy to nodes with these labels, as JSON, e.g. {"region":"eu"} (JSON) | - | No |
+| `--build-location <value>` | Where a source deployment's image is built (one of: control_plane, node, ci) | - | No |
+| `--cross-architecture-builds` | Build one image per architecture the eligible nodes run | - | No |
+| `--no-cross-architecture-builds` | Set cross_architecture_builds to false | - | No |
+| `--on-demand` | Start containers on the first request and stop them when idle | - | No |
+| `--no-on-demand` | Set on_demand to false | - | No |
+| `--idle-timeout-seconds <n>` | Idle seconds (60-86400) before an on-demand environment stops | - | No |
+| `--wake-timeout-seconds <n>` | Seconds (5-120) to wait for an on-demand environment to wake | - | No |
+| `--health <json>` | Health check settings as JSON, e.g. {"path":"/healthz"} (JSON) | - | No |
+| `--health-check-timeout-seconds <n>` | Seconds (30-3600) a new deployment's containers get to become ready | - | No |
+| `--stop-timeout-seconds <n>` | Seconds (1-3600) the previous deployment gets to finish in-flight requests | - | No |
+| `--load-balancing <json>` | Load balancing settings as JSON (JSON) | - | No |
+| `--max-concurrent-connections <n>` | Cap on concurrent requests to this environment's upstream (0 = unlimited) | - | No |
+| `--request-timeout-seconds <n>` | HTTP request timeout, in seconds | - | No |
+| `--sse-idle-timeout-seconds <n>` | Idle timeout of SSE streams, in seconds | - | No |
+| `--websocket-idle-timeout-seconds <n>` | Idle timeout of WebSocket connections, in seconds | - | No |
+| `--force-https` | Redirect HTTP to HTTPS | - | No |
+| `--no-force-https` | Set force_https to false | - | No |
+| `--password-stdin` | Password visitors must enter to open the environment (read from stdin) | - | No |
+| `--password-file <path>` | Password visitors must enter to open the environment (read from a file) | - | No |
+| `--security <json>` | Security settings (headers, rate limits) as JSON (JSON) | - | No |
+| `--attack-mode` | Ask visitors to solve a CAPTCHA | - | No |
+| `--no-attack-mode` | Set attack_mode to false | - | No |
+| `--shield-mode <value>` | How Shield acts on its verdicts (one of: off, log, selective, attack) | - | No |
+| `--shield-exempt-paths <value>` | Path Shield never challenges, e.g. /api/* (repeatable; replaces the list) (repeatable) | - | No |
+| `--performance-metrics-enabled` | Collect web performance metrics | - | No |
+| `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--session-recording-enabled` | Record visitor sessions | - | No |
+| `--no-session-recording-enabled` | Set session_recording_enabled to false | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |

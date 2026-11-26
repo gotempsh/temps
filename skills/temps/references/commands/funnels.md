@@ -16,6 +16,7 @@ Manage analytics funnels for projects
 - `remove` (`rm`) - Delete a funnel
 - `metrics` - Get funnel metrics
 - `preview` - Preview funnel metrics without saving
+- `get-unique-events` - Get all unique/distinct event types for a project (paginated)
 
 ### `funnels list` (alias: `ls`)
 
@@ -80,6 +81,10 @@ Get funnel metrics
 | `--project-id <id>` | Project ID | - | Yes |
 | `--funnel-id <id>` | Funnel ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+| `--start-date <value>` | Window start (RFC 3339) | - | No |
+| `--end-date <value>` | Window end (RFC 3339) | - | No |
+| `--environment-id <n>` | Only this environment (an ID) | - | No |
+| `--country-code <value>` | Only visitors from this country (ISO code, e.g. DE) | - | No |
 
 ### `funnels preview`
 
@@ -91,4 +96,17 @@ Preview funnel metrics without saving
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
 | `-s, --steps <json>` | Funnel steps as JSON array | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `funnels get-unique-events`
+
+Get all unique/distinct event types for a project (paginated)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 50, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |

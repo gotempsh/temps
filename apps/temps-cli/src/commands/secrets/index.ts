@@ -6,6 +6,7 @@ import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
+import { resolveProjectFlag } from '../../lib/project-id.js'
 import {
   newline,
   header,
@@ -94,15 +95,18 @@ interface CreateOptions extends ValueSourceOptions {
   type?: string
   mountPath?: string
   description?: string
+  project?: string
 }
 
 type UpdateOptions = ValueSourceOptions & {
   type?: string
   mountPath?: string
   description?: string
+  project?: string
 }
 
 interface DeleteOptions {
+  project?: string
   force?: boolean
   yes?: boolean
 }
@@ -152,6 +156,7 @@ export function registerSecretsCommands(program: Command): void {
       'Absolute path inside sandbox where file-type secret is written (required for --type file)',
     )
     .option('-d, --description <description>', 'Human-readable description')
+    .option('-p, --project <slug-or-id>', 'Scope the secret to one project (default: instance-wide)')
   addValueSourceOptions(create, { what: 'the secret value', legacyAtPath: true })
   create.addHelpText('after', CREATE_EXAMPLES).action(createAction)
 
@@ -166,6 +171,7 @@ export function registerSecretsCommands(program: Command): void {
     .option('-t, --type <type>', 'Secret type: "env" or "file"')
     .option('-m, --mount-path <path>', 'New mount path (file type only)')
     .option('-d, --description <description>', 'New description')
+    .option('-p, --project <slug-or-id>', 'The project the secret is scoped to (default: instance-wide)')
   addValueSourceOptions(update, { what: 'the new secret value', legacyAtPath: true })
   update.action(updateAction)
 
@@ -174,6 +180,7 @@ export function registerSecretsCommands(program: Command): void {
     .alias('rm')
     .description('Delete a secret')
     .argument('<name>', 'Name of the secret to delete')
+    .option('-p, --project <slug-or-id>', 'Delete the secret of this project (default: the instance-wide one)')
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation (alias for --force)')
     .action(deleteAction)
@@ -321,6 +328,8 @@ async function createAction(options: CreateOptions): Promise<void> {
 
   await requireAuth()
   await setupClient()
+  const projectId = await secretProjectId(options.project)
+  if (projectId !== undefined) body.project_id = projectId
 
   const secret = await withSpinner('Saving secret...', async () => {
     const { data, error } = await client.post({
@@ -382,6 +391,8 @@ async function updateAction(options: UpdateOptions & { name: string }): Promise<
 
   const value = await resolveSecretValue(options.name, updateSecretType(options, current), options)
   const body = buildUpdateSecretBody({ ...options, value }, current)
+  const projectId = await secretProjectId(options.project)
+  if (projectId !== undefined) body.project_id = projectId
 
   const secret = await withSpinner('Updating secret...', async () => {
     const { data, error } = await client.post({
@@ -398,6 +409,11 @@ async function updateAction(options: UpdateOptions & { name: string }): Promise<
       `Re-written to ${secret.mount_path} on next workflow run (mode 0o600)`,
     )
   }
+}
+
+/** The project a secret is scoped to: only from an explicit `--project` (secrets default to instance-wide). */
+async function secretProjectId(project: string | undefined): Promise<number | undefined> {
+  return project === undefined ? undefined : (await resolveProjectFlag(project)).id
 }
 
 async function deleteAction(
@@ -420,10 +436,12 @@ async function deleteAction(
     }
   }
 
+  const projectId = await secretProjectId(options.project)
   await withSpinner('Deleting secret...', async () => {
     const { error } = await client.delete({
       url: '/settings/secrets/{name}',
       path: { name },
+      query: projectId === undefined ? undefined : { project_id: projectId },
     })
     if (error) throw new Error(getErrorMessage(error))
   })

@@ -15,6 +15,8 @@ import { displayImportPlan } from './plan-display.js'
 import { displayExecuteResult } from './execute-display.js'
 import { runVercelMigrationWizard } from '../migrate/index.js'
 import { addCredentialSources } from '../../lib/value-source.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { CreatePlanRequest, ImportSelector } from '../../api/types.gen.js'
 
 const VERCEL_SOURCE: ImportSourceInfo = {
   source: 'vercel',
@@ -65,6 +67,19 @@ interface StatusOptions {
   json?: boolean
 }
 
+/** Narrow what discovery returns. */
+const SELECTOR = fieldFlags<ImportSelector>({
+  name_pattern: { kind: 'string', help: 'Only workloads whose name matches this glob or pattern' },
+  status_filter: { kind: 'strings', help: 'Only workloads in this state, e.g. running (repeatable)' },
+  workload_type_filter: { kind: 'strings', help: 'Only workloads of this type, e.g. container or static-site (repeatable)' },
+  label_filter: { kind: 'json', help: 'Only workloads with these labels, as a JSON object, e.g. {"env":"prod"}' },
+  limit: { kind: 'int', help: 'Return at most this many workloads' },
+})
+
+const PLAN_EXTRA = fieldFlags<CreatePlanRequest>({
+  repository_id: { kind: 'int', help: 'Connected repository to detect the build preset from' },
+})
+
 export function registerImportsCommands(program: Command): void {
   const imports = program
     .command('migrate')
@@ -90,6 +105,7 @@ export function registerImportsCommands(program: Command): void {
     .option('--deploy-yml <path>', 'Path to config/deploy.yml (kamal source)')
     .option('--json', 'Output in JSON format')
     .action(discoverAction)
+  SELECTOR.addTo(discoverCommand)
   addCredentialSources(discoverCommand, [{ flag: 'token', what: 'the source API token or admin password' }])
 
   const planCommand = imports
@@ -103,6 +119,8 @@ export function registerImportsCommands(program: Command): void {
     .option('--kubeconfig <path>', 'Path to a kubeconfig file (kubernetes source)')
     .option('--deploy-yml <path>', 'Path to config/deploy.yml (kamal source)')
     .action(planAction)
+  SELECTOR.addTo(planCommand)
+  PLAN_EXTRA.addTo(planCommand)
   addCredentialSources(planCommand, [{ flag: 'token', what: 'the source API token or admin password' }])
 
   const runCommand = imports
@@ -122,6 +140,8 @@ export function registerImportsCommands(program: Command): void {
     .option('--dry-run', 'Plan only — do not create or deploy anything')
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .action(runAction)
+  SELECTOR.addTo(runCommand)
+  PLAN_EXTRA.addTo(runCommand)
   addCredentialSources(runCommand, [{ flag: 'token', what: 'the source API token or admin password' }])
 
   imports
@@ -200,9 +220,16 @@ async function pickSourceForMigration(preselected: string | undefined): Promise<
   return allSources.find((s) => s.source === source) as ImportSourceInfo
 }
 
-async function discover(source: ImportSource, credentials: ImportCredentials): Promise<WorkloadDescriptor[]> {
+async function discover(
+  source: ImportSource,
+  credentials: ImportCredentials,
+  selector: ImportSelector,
+): Promise<WorkloadDescriptor[]> {
   const { data, error } = await withSpinner(`Discovering workloads from ${source}...`, () =>
-    discoverWorkloads({ client, body: { source, credentials } }),
+    discoverWorkloads({
+      client,
+      body: { source, credentials, ...(Object.keys(selector).length > 0 && { selector }) },
+    }),
   )
   if (error) throw new Error(getErrorMessage(error))
   return data?.workloads ?? []
@@ -274,12 +301,13 @@ async function listSourcesAction(options: SourcesOptions): Promise<void> {
 }
 
 async function discoverAction(options: DiscoverOptions): Promise<void> {
+  const selector = await SELECTOR.read(options)
   await requireAuth()
   await setupClient()
 
   const sourceInfo = await pickSource(options.source)
   const credentials = await resolveCredentials(sourceInfo.source, options)
-  const workloads = await discover(sourceInfo.source, credentials)
+  const workloads = await discover(sourceInfo.source, credentials, selector)
 
   if (options.json) {
     json({ workloads })
@@ -290,12 +318,14 @@ async function discoverAction(options: DiscoverOptions): Promise<void> {
 }
 
 async function planAction(options: PlanOptions): Promise<void> {
+  const selector = await SELECTOR.read(options)
+  const planExtra = await PLAN_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
   const sourceInfo = await pickSource(options.source)
   const credentials = await resolveCredentials(sourceInfo.source, options)
-  const workloads = await discover(sourceInfo.source, credentials)
+  const workloads = await discover(sourceInfo.source, credentials, selector)
   if (workloads.length === 0) {
     warning('No workloads discovered from this source')
     return
@@ -305,7 +335,7 @@ async function planAction(options: PlanOptions): Promise<void> {
   const planResult = await withSpinner(`Creating import plan for ${workload.name ?? workload.id}...`, async () => {
     const { data, error } = await createPlan({
       client,
-      body: { source: sourceInfo.source, workload_id: workload.id, credentials },
+      body: { source: sourceInfo.source, workload_id: workload.id, credentials, ...planExtra },
     })
     if (error) throw new Error(getErrorMessage(error))
     return data
@@ -323,6 +353,8 @@ async function planAction(options: PlanOptions): Promise<void> {
 }
 
 async function runAction(options: RunOptions): Promise<void> {
+  const selector = await SELECTOR.read(options)
+  const planExtra = await PLAN_EXTRA.read(options)
   await requireAuth()
   await setupClient()
 
@@ -342,7 +374,7 @@ async function runAction(options: RunOptions): Promise<void> {
     info(`Connecting to ${credDescription}`)
   }
 
-  const workloads = await discover(sourceInfo.source, credentials)
+  const workloads = await discover(sourceInfo.source, credentials, selector)
   if (workloads.length === 0) {
     warning('No workloads discovered from this source')
     return
@@ -353,7 +385,7 @@ async function runAction(options: RunOptions): Promise<void> {
   const planResult = await withSpinner(`Creating import plan for ${workload.name ?? workload.id}...`, async () => {
     const { data, error } = await createPlan({
       client,
-      body: { source: sourceInfo.source, workload_id: workload.id, credentials },
+      body: { source: sourceInfo.source, workload_id: workload.id, credentials, ...planExtra },
     })
     if (error) throw new Error(getErrorMessage(error))
     return data

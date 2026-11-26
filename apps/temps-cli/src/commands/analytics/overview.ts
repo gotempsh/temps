@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import chalk from 'chalk'
+import { SCOPE_FILTERS } from './scope.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -70,6 +71,7 @@ export function renderSparkline(data: { count: number }[]): string {
 }
 
 export async function overview(options: OverviewOptions): Promise<void> {
+  const scope = await SCOPE_FILTERS.read(options)
   await requireAuth()
   await setupClient()
 
@@ -95,6 +97,7 @@ export async function overview(options: OverviewOptions): Promise<void> {
   const projectId = projectData.id
 
   const bucketSize = bucketSizeForRange(startDate, endDate)
+  const environment = scope.environment_id === undefined ? {} : { environment_id: scope.environment_id }
 
   // Fetch all data concurrently
   const data = await withSpinner('Fetching analytics...', async () => {
@@ -103,21 +106,21 @@ export async function overview(options: OverviewOptions): Promise<void> {
         getUniqueCounts({
           client,
           path: { project_id: projectId },
-          query: { start_date: startDate, end_date: endDate, metric: 'visitors' },
+          query: { start_date: startDate, end_date: endDate, metric: 'visitors', ...scope },
         }),
         getUniqueCounts({
           client,
           path: { project_id: projectId },
-          query: { start_date: startDate, end_date: endDate, metric: 'sessions' },
+          query: { start_date: startDate, end_date: endDate, metric: 'sessions', ...scope },
         }),
         getUniqueCounts({
           client,
           path: { project_id: projectId },
-          query: { start_date: startDate, end_date: endDate, metric: 'page_views' },
+          query: { start_date: startDate, end_date: endDate, metric: 'page_views', ...scope },
         }),
         getPagePaths({
           client,
-          query: { project_id: projectId, start_date: startDate, end_date: endDate, limit: 10 },
+          query: { project_id: projectId, start_date: startDate, end_date: endDate, limit: 10, ...environment },
         }),
         getEventsCount({
           client,
@@ -127,6 +130,7 @@ export async function overview(options: OverviewOptions): Promise<void> {
             end_date: endDate,
             limit: 10,
             custom_events_only: true,
+            ...environment,
           },
         }),
         // Locations must come from the server-side country aggregate. The
@@ -144,6 +148,7 @@ export async function overview(options: OverviewOptions): Promise<void> {
             group_by: 'country',
             aggregation_level: 'visitors',
             limit: 10,
+            ...scope,
           },
         }),
         getAggregatedBuckets({
@@ -154,6 +159,7 @@ export async function overview(options: OverviewOptions): Promise<void> {
             end_date: endDate,
             aggregation_level: 'visitors',
             bucket_size: bucketSize,
+            ...scope,
           },
         }),
       ])

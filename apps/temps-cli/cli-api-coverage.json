@@ -1,0 +1,197 @@
+{
+  "excluded": [
+    {
+      "reason": "Browser SDK endpoints on the app's own origin (`/_temps/*`): called from a visitor's browser by the Temps web SDKs (analytics, flags, surveys, session replay, speed, Sentry tunnel), keyed by the visitor, not an operator action.",
+      "entries": [
+        "POST /_temps/event",
+        "POST /_temps/flags",
+        "POST /_temps/identify",
+        "POST /_temps/ofrep/v1/evaluate/flags",
+        "POST /_temps/ofrep/v1/evaluate/flags/{key}",
+        "POST /_temps/reset",
+        "POST /_temps/sentry/envelope",
+        "POST /_temps/session-replay/events",
+        "POST /_temps/session-replay/init",
+        "POST /_temps/speed",
+        "POST /_temps/speed/update",
+        "POST /_temps/surveys"
+      ]
+    },
+    {
+      "reason": "Session-replay recorder ingest: the browser recorder appends events and duration to a visitor's replay as it records; operators read replays through `temps session-replay`.",
+      "entries": [
+        "POST /visitors/{visitor_id}/session-replays/{session_id}/events",
+        "PUT /visitors/{visitor_id}/session-replays/{session_id}/duration"
+      ]
+    },
+    {
+      "reason": "Sentry SDK ingest (envelope, store, NEL and CSP reports), authenticated by the project DSN and sent by instrumented applications and browsers, not by an operator.",
+      "entries": [
+        "POST /{project_id}/envelope/",
+        "POST /{project_id}/nel/",
+        "POST /{project_id}/security/",
+        "POST /{project_id}/store/"
+      ]
+    },
+    {
+      "reason": "sentry-cli compatibility layer: exists so an unmodified `sentry-cli` can create releases and upload artifact bundles; the Temps CLI uploads source maps through `temps errors source-files`.",
+      "entries": [
+        "GET /0/organizations/{org_slug}/chunk-upload/",
+        "GET /0/projects/{org_slug}/{project_slug}/releases/{version}/files/",
+        "POST /0/organizations/{org_slug}/artifactbundle/assemble/",
+        "POST /0/organizations/{org_slug}/chunk-upload/",
+        "POST /0/organizations/{org_slug}/releases/",
+        "POST /0/projects/{org_slug}/{project_slug}/releases/",
+        "POST /0/projects/{org_slug}/{project_slug}/releases/{version}/files/",
+        "PUT /0/projects/{org_slug}/{project_slug}/releases/{version}/"
+      ]
+    },
+    {
+      "reason": "OTLP/HTTP protobuf ingest, sent by OpenTelemetry exporters in instrumented workloads; the CLI configures exporters and reads the data, it is not an exporter.",
+      "entries": [
+        "POST /otel/v1/logs",
+        "POST /otel/v1/metrics",
+        "POST /otel/v1/traces",
+        "POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/logs",
+        "POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/metrics",
+        "POST /otel/v1/{project_id}/{environment_id}/{deployment_id}/traces"
+      ]
+    },
+    {
+      "reason": "Worker-node agent protocol (join, registration, heartbeat, desired-state long-poll and ack, WireGuard and DNS sync, instance environment), called by `temps agent` on a worker with its node credentials, not by an operator.",
+      "entries": [
+        "GET /internal/nodes/plane-identity",
+        "GET /internal/nodes/{node_id}/dns/changes",
+        "GET /internal/nodes/{node_id}/instances/{instance_id}/env",
+        "GET /internal/nodes/{node_id}/network/peers",
+        "GET /internal/nodes/{node_id}/state",
+        "POST /internal/nodes/mesh-enroll",
+        "POST /internal/nodes/register",
+        "POST /internal/nodes/{node_id}/dns/ack",
+        "POST /internal/nodes/{node_id}/heartbeat",
+        "POST /internal/nodes/{node_id}/state/ack",
+        "PUT /internal/nodes/{node_id}/network/wireguard",
+        "PUT /internal/nodes/{node_id}/network/wireguard/handshakes"
+      ]
+    },
+    {
+      "reason": "CI runner protocol: the build runner claims a build and reports logs, failure and result with that build's lease; operators follow builds through the deployment commands.",
+      "entries": [
+        "GET /internal/ci-builds/{build_id}/context",
+        "GET /internal/ci-builds/{build_id}/lease",
+        "POST /internal/ci-builds/{build_id}/claim",
+        "POST /internal/ci-builds/{build_id}/failure",
+        "POST /internal/ci-builds/{build_id}/logs",
+        "POST /internal/ci-builds/{build_id}/result"
+      ]
+    },
+    {
+      "reason": "Workflow runtime protocol: the workflow SDK inside a running workflow reads its journal and records steps, heartbeats and the outcome with the run's invocation key.",
+      "entries": [
+        "GET /workflow-runs/{run_id}/journal",
+        "GET /workflows/v1/invocation-key",
+        "POST /workflow-runs/{run_id}/heartbeat",
+        "POST /workflow-runs/{run_id}/outcome",
+        "POST /workflow-runs/{run_id}/steps"
+      ]
+    },
+    {
+      "reason": "Email tracking pixel and link redirect, fetched by a recipient's mail client from inside a sent email; unauthenticated by design. Tracking data is read with the authenticated email tracking endpoints.",
+      "entries": [
+        "GET /emails/{email_id}/track/click/{link_index}",
+        "GET /emails/{email_id}/track/open"
+      ]
+    },
+    {
+      "reason": "Browser sign-in redirects (OIDC login start, cloud login and callback, email verification link): each answers with a redirect that only a browser following it can complete.",
+      "entries": [
+        "GET /auth/oidc/callback",
+        "GET /auth/oidc/cloud/login",
+        "GET /auth/oidc/login/{slug}",
+        "GET /auth/verify-email"
+      ]
+    },
+    {
+      "reason": "Console login-page steps that complete a browser cookie session (sign-in options and email status for the login page, MFA challenge, forced password change, password reset, step-up re-authentication); the CLI authenticates with an API key or the device flow and holds no session cookie.",
+      "entries": [
+        "GET /auth/email-status",
+        "GET /auth/oidc/providers",
+        "POST /auth/password-change-required",
+        "POST /auth/password-reset/request",
+        "POST /auth/password-reset/verify",
+        "POST /auth/step-up",
+        "POST /auth/verify-mfa"
+      ]
+    },
+    {
+      "reason": "The console side of `temps login`: the signed-in browser looks up, approves or denies the code the CLI shows; the CLI is the device being approved and drives `start`/`poll`.",
+      "entries": [
+        "GET /auth/cli/device/lookup",
+        "POST /auth/cli/device/approve",
+        "POST /auth/cli/device/deny"
+      ]
+    },
+    {
+      "reason": "Signs the console's own browser in to a preview by setting a cookie on the preview origin; it has no meaning outside a browser. The CLI mints shareable preview links instead.",
+      "entries": [
+        "POST /ai/preview/authorize",
+        "POST /ingress/sandbox-preview-sessions"
+      ]
+    },
+    {
+      "reason": "Inbound webhook receiver called by the external system that a workflow subscribes to, authenticated by its webhook secret.",
+      "entries": [
+        "POST /agents/webhook/{webhook_id}"
+      ]
+    },
+    {
+      "reason": "Not generated into the CLI client (`openapi-ts.config.ts` excludes it): the route answers JSON or a stream by `Accept`, and the CLI calls its `/json` and `/stream` forms.",
+      "entries": [
+        "POST /ai/v1/responses"
+      ]
+    },
+    {
+      "reason": "Git provider OAuth redirects: `authorize` answers with a redirect to the provider's consent page and the provider calls `callback` back with the grant; only a browser follows either. The CLI connects git providers with tokens (`temps providers add`, `temps providers git connect`) and reads them back.",
+      "entries": [
+        "GET /git-providers/{provider_id}/callback",
+        "GET /git-providers/{provider_id}/oauth/authorize"
+      ]
+    },
+    {
+      "reason": "Public status page for visitors and its subscriber flow: the HTML page, the email subscribe form, the confirm and unsubscribe links mailed to a subscriber (each a page asking for a click, then a form post), and the unlock form that sets a cookie on a password-protected page. They serve a visitor's browser; operators manage pages and subscribers with `temps status-pages` (`subscribers`, `subscriptions`), and the page's JSON and Atom feed are readable from the CLI.",
+      "entries": [
+        "GET /status/{slug}",
+        "GET /status/{slug}/confirm/{token}",
+        "GET /status/{slug}/unsubscribe/{token}",
+        "POST /status/{slug}/confirm/{token}",
+        "POST /status/{slug}/subscribe",
+        "POST /status/{slug}/unlock",
+        "POST /status/{slug}/unsubscribe/{token}"
+      ]
+    },
+    {
+      "reason": "`@vercel/sandbox` compatibility fields: on sandbox create the server accepts `_runtime` and `networkPolicy` so that SDK's requests do not fail, and ignores them; `resources` is the SDK's spelling of `cpu_limit`/`memory_limit_mb`, which `temps sandbox create` sets with --cpu-limit and --memory-mb; on extend-timeout, `duration` is the SDK's milliseconds spelling of `extra_secs`, which `temps sandbox extend --secs` sets.",
+      "entries": [
+        "POST /v1/sandboxes body._runtime",
+        "POST /v1/sandboxes body.networkPolicy",
+        "POST /v1/sandboxes body.resources",
+        "POST /v1/sandboxes/{id}/extend-timeout body.duration"
+      ]
+    },
+    {
+      "reason": "Workflow dev-session protocol field: the version of the manifest the local workflow runtime reports; `temps workflows dev` forwards the runtime's manifest unchanged, so a flag could only make it disagree with the runtime it describes.",
+      "entries": [
+        "PUT /projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id} body.protocol_version"
+      ]
+    },
+    {
+      "reason": "Deprecated PUT aliases of the PATCH partial updates for skills and MCP servers (the spec marks them `deprecated`); `skills update` and `agents update-mcp`/`update-global-mcp` call the PATCH operations.",
+      "entries": [
+        "PUT /projects/{project_id}/mcp-servers/{slug}",
+        "PUT /projects/{project_id}/skills/{slug}",
+        "PUT /settings/mcp-servers/{slug}",
+        "PUT /settings/skills/{slug}"
+      ]
+    }
+  ]
+}

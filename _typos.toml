@@ -83,3 +83,15 @@ DELETEs = "DELETEs"
 iif = "iif"
 # The `wrk` HTTP benchmarking tool.
 wrk = "wrk"
+# "catch-alls" (plural of catch-all) in AGENTS.md and docs/plans; typos
+# splits on the hyphen and reads "alls" as "all"/"falls".
+alls = "alls"
+# A deliberate partial search term (the prefix of "cache") in
+# web/src/lib/database-links.test.ts.
+cach = "cach"
+# A fragment of "secret-" asserted absent from serialized output in
+# apps/temps-cli/src/commands/notifications/index.test.ts.
+ecret = "ecret"
+# IIFE = immediately invoked function expression (web/AGENTS.md); typos
+# "corrects" the plural to "IFEs".
+IIFEs = "IIFEs"

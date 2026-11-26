@@ -49,6 +49,9 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { parseIntegerFlag } from '../../lib/command-kit.js'
+import { ValidationError } from '../../utils/errors.js'
+import type { ClusterMemberRequest, DatabaseProvisioningMode } from '../../api/types.gen.js'
 
 const SERVICE_TYPE_LABELS: Record<ServiceTypeRoute, string> = {
   postgres: 'PostgreSQL',
@@ -152,6 +155,9 @@ interface CreateOptions {
   set?: string[]
   backend?: string
   bucket?: string[]
+  node?: string
+  topology?: string
+  member?: string[]
   yes?: boolean
 }
 
@@ -237,6 +243,8 @@ interface ImportOptions {
 interface LinkOptions {
   id: string
   project?: string
+  databaseMode?: string
+  databaseName?: string
 }
 
 interface UnlinkOptions {
@@ -297,6 +305,14 @@ export function registerServicesCommands(program: Command): void {
     .option('-s, --set <key=value>', 'Set a parameter (repeatable)', collectSet, [])
     .option('--backend <backend>', 'S3 storage engine: rustfs (default) or garage (s3/blob only)')
     .option('--bucket <name>', 'Bucket to create (repeatable, s3/blob only; the first is S3_BUCKET)', collectSet, [])
+    .option('--node <id>', 'Worker node to run the service on (default: the control plane)')
+    .option('--topology <topology>', 'standalone (default) or cluster (highly available, several members)')
+    .option(
+      '--member <role[@node]>',
+      'With --topology cluster: a member, monitor, primary or replica, optionally on a node id (repeatable; exactly one monitor)',
+      collectSet,
+      [],
+    )
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createServiceAction)
 
@@ -390,6 +406,11 @@ export function registerServicesCommands(program: Command): void {
     .description('Link a service to a project')
     .requiredOption('--id <id>', 'Service ID')
     .option('-p, --project <slug>', 'Project slug (auto-detected from .temps/config.json)')
+    .option(
+      '--database-mode <mode>',
+      'Which database deployments get: project (one per project), project_environment (one per environment) or custom',
+    )
+    .option('--database-name <name>', 'With --database-mode custom: the exact database name')
     .action(linkServiceAction)
 
   services
@@ -620,7 +641,38 @@ async function listServicesAction(options: { json?: boolean }): Promise<void> {
   newline()
 }
 
+const CLUSTER_ROLES = ['monitor', 'primary', 'replica']
+
+/** `--node`, `--topology` and `--member` as request fields, checked before anything is sent. */
+export function servicePlacement(options: Pick<CreateOptions, 'node' | 'topology' | 'member'>): {
+  node_id?: number
+  topology?: string
+  members?: ClusterMemberRequest[]
+} {
+  const placement: { node_id?: number; topology?: string; members?: ClusterMemberRequest[] } = {}
+  if (options.node !== undefined) placement.node_id = parseIntegerFlag(options.node, '--node', 1)
+  if (options.topology !== undefined) {
+    if (options.topology !== 'standalone' && options.topology !== 'cluster') {
+      throw new ValidationError(`--topology must be standalone or cluster, got "${options.topology}"`)
+    }
+    placement.topology = options.topology
+  }
+  const members = options.member ?? []
+  if (members.length > 0) {
+    if (placement.topology !== 'cluster') throw new ValidationError('--member needs --topology cluster')
+    placement.members = members.map((value) => {
+      const [role, node] = value.split('@')
+      if (!role || !CLUSTER_ROLES.includes(role)) {
+        throw new ValidationError(`--member ${value}: the role must be one of ${CLUSTER_ROLES.join(', ')}`)
+      }
+      return node === undefined ? { role } : { role, node_id: parseIntegerFlag(node, `--member ${value}`, 1) }
+    })
+  }
+  return placement
+}
+
 async function createServiceAction(options: CreateOptions): Promise<void> {
+  const placement = servicePlacement(options)
   await requireAuth()
   await setupClient()
 
@@ -780,6 +832,7 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
         name,
         service_type: serviceType,
         parameters,
+        ...placement,
       },
     })
     if (error) {
@@ -1294,7 +1347,28 @@ async function importServiceAction(options: ImportOptions): Promise<void> {
   info('Run: temps services list to see all services')
 }
 
+const DATABASE_MODES: DatabaseProvisioningMode[] = ['project', 'project_environment', 'custom']
+
+/** `--database-mode` and `--database-name` as link fields. */
+export function linkDatabaseFields(options: Pick<LinkOptions, 'databaseMode' | 'databaseName'>): {
+  database_provisioning_mode?: DatabaseProvisioningMode
+  custom_database_name?: string
+} {
+  const mode = options.databaseMode as DatabaseProvisioningMode | undefined
+  if (mode !== undefined && !DATABASE_MODES.includes(mode)) {
+    throw new ValidationError(`--database-mode must be one of ${DATABASE_MODES.join(', ')}, got "${options.databaseMode}"`)
+  }
+  if ((mode === 'custom') !== (options.databaseName !== undefined)) {
+    throw new ValidationError('--database-name goes with --database-mode custom, and custom needs --database-name')
+  }
+  return {
+    ...(mode && { database_provisioning_mode: mode }),
+    ...(options.databaseName !== undefined && { custom_database_name: options.databaseName }),
+  }
+}
+
 async function linkServiceAction(options: LinkOptions): Promise<void> {
+  const database = linkDatabaseFields(options)
   await requireAuth()
   await setupClient()
 
@@ -1312,6 +1386,7 @@ async function linkServiceAction(options: LinkOptions): Promise<void> {
       path: { id },
       body: {
         project_id: project.id,
+        ...database,
       },
     })
     if (error) {
