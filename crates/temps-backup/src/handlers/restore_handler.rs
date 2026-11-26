@@ -29,8 +29,10 @@ use utoipa::{OpenApi, ToSchema};
 use crate::handlers::audit::{AuditContext, RestoreRunAudit, RestoreRunCancelledAudit};
 use crate::handlers::types::BackupAppState;
 use crate::services::{
-    PlanSourceBackup, PlanTarget, RestoreError, RestorePlan, RestoreRequestMode,
-    RestoreRunSourceBackup, RestoreRunView, RestoreService,
+    MissingLinkedDatabase, PlanSourceBackup, PlanTarget, RestoreError, RestorePlan,
+    RestoreRequestMode, RestoreRunSourceBackup, RestoreRunView, RestoreService, RestoredDatabase,
+    RestoredDatabaseKind, RestoredDatabaseUse, RestoredDatabasesReport, RestoredDatabasesResponse,
+    RestoredRole,
 };
 use temps_providers::externalsvc::{RecoveryTarget, RestoreCapabilities};
 
@@ -165,6 +167,7 @@ fn restore_internal_problem(title: &'static str, error: &RestoreError) -> Proble
     paths(
         get_restore_capabilities,
         list_restore_runs_for_service,
+        get_restored_databases,
         start_restore,
         get_restore_run,
         cancel_restore_run,
@@ -182,6 +185,14 @@ fn restore_internal_problem(title: &'static str, error: &RestoreError) -> Proble
             RestorePlan,
             PlanTarget,
             PlanSourceBackup,
+            RestoredDatabasesResponse,
+            RestoredDatabasesReport,
+            RestoredDatabase,
+            RestoredDatabaseKind,
+            RestoredDatabaseUse,
+            RestoredRole,
+            MissingLinkedDatabase,
+            temps_providers::DatabaseProvisioningMode,
         )
     ),
     info(
@@ -325,6 +336,57 @@ async fn list_restore_runs_for_service(
     Ok(Json(runs))
 }
 
+/// What the latest restore of a PostgreSQL service brought back
+///
+/// The databases and login roles the restore recorded, each restored database
+/// with the linked projects that read it, and each linked database the backup
+/// does not have while restored data sits unused, with a restored database the
+/// link could read instead.
+#[utoipa::path(
+    tag = "Restore",
+    get,
+    path = "/external-services/{id}/restored-databases",
+    params(("id" = i32, Path, description = "External service id")),
+    responses(
+        (status = 200, description = "What the latest restore brought back; `report` is null when it recorded nothing", body = RestoredDatabasesResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Service not found", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_restored_databases(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BackupsRead);
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "external service",
+        "restored database lookup",
+    )
+    .await?;
+    let visible = visible_linked_projects(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "restored database lookup",
+    )
+    .await?;
+
+    let report = app_state
+        .restore_service
+        .restored_databases(id, visible.as_ref())
+        .await
+        .map_err(Problem::from)?;
+    Ok(Json(RestoredDatabasesResponse { report }))
+}
+
 /// Filter restore history without disclosing runs whose backup producer or
 /// completed clone target is outside the caller's project permission scope.
 /// Database/checker failures abort the full request rather than returning a
@@ -427,6 +489,7 @@ fn restore_source_visible(
 // `service_id`, no project scoping" gap.
 use crate::handlers::authz::{
     accessible_service_ids, require_service_access, require_services_access,
+    visible_linked_projects,
 };
 
 #[utoipa::path(
@@ -984,6 +1047,10 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
             get(list_restore_runs_for_service),
         )
         .route("/external-services/{id}/restore-plan", post(plan_restore))
+        .route(
+            "/external-services/{id}/restored-databases",
+            get(get_restored_databases),
+        )
         .route("/external-services/{id}/restore", post(start_restore))
         .route("/restore-runs/{id}", get(get_restore_run))
         .route("/restore-runs/{id}/cancel", post(cancel_restore_run))
@@ -1045,6 +1112,208 @@ mod tests {
     #[test]
     fn deployment_token_denied_for_unlinked_service() {
         assert!(!deployment_token_may_access(7, &[]));
+    }
+
+    mod restored_databases {
+        use super::super::*;
+        use crate::handlers::test_support::test_state;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::{external_services, project_services, projects, restore_runs};
+        use tower::ServiceExt;
+
+        #[derive(Default)]
+        struct NoAudit;
+
+        #[async_trait::async_trait]
+        impl temps_core::AuditLogger for NoAudit {
+            async fn create_audit_log(
+                &self,
+                _operation: &dyn temps_core::AuditOperation,
+            ) -> temps_core::AuditResult<()> {
+                Ok(())
+            }
+        }
+
+        fn admin() -> temps_auth::AuthContext {
+            let now = chrono::Utc::now();
+            temps_auth::AuthContext::new_session(
+                temps_entities::users::Model {
+                    id: 1,
+                    name: "Restore Admin".to_string(),
+                    email: "restore-admin@example.test".to_string(),
+                    password_hash: None,
+                    email_verified: true,
+                    email_verification_token: None,
+                    email_verification_expires: None,
+                    password_reset_token: None,
+                    password_reset_expires: None,
+                    must_change_password: false,
+                    deleted_at: None,
+                    mfa_secret: None,
+                    mfa_enabled: false,
+                    mfa_recovery_codes: None,
+                    oidc_subject: None,
+                    oidc_provider_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                temps_auth::Role::Admin,
+            )
+        }
+
+        fn service(service_type: &str) -> external_services::Model {
+            let config =
+                temps_core::EncryptionService::new_from_password("pg-upgrade-handler-tests")
+                    .encrypt_string(r#"{"database":"app","username":"app","password":"pw"}"#)
+                    .expect("encrypt");
+            external_services::Model {
+                id: 5,
+                name: "orders".to_string(),
+                service_type: service_type.to_string(),
+                topology: "standalone".to_string(),
+                status: "running".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                node_id: None,
+                version: None,
+                slug: None,
+                config: Some(config),
+                error_message: None,
+                health_status: None,
+                last_health_check_at: None,
+                last_health_error: None,
+                consecutive_health_failures: 0,
+                health_metadata: None,
+                metrics_enabled: false,
+                default_backup_provisioned: false,
+                container_name: None,
+                created_by_user_id: None,
+                continuous_archive_s3_source_id: None,
+                continuous_archive_pinned_at: None,
+                workload_mode: Default::default(),
+                log_ingest_lines_per_sec: None,
+                log_ingest_kib_per_sec: None,
+                healthcheck_interval_secs: None,
+                healthcheck_start_interval_secs: None,
+                healthcheck_start_period_secs: None,
+                healthcheck_timeout_secs: None,
+                healthcheck_retries: None,
+            }
+        }
+
+        fn completed_run() -> restore_runs::Model {
+            restore_runs::Model {
+                id: 21,
+                source_backup_id: None,
+                source_service_id: 5,
+                target_service_id: None,
+                target_service_name: None,
+                mode: "in_place".into(),
+                status: "completed".into(),
+                phase: "completed".into(),
+                recovery_target: None,
+                parameter_overrides: serde_json::json!({}),
+                resume_token: None,
+                log_id: "log".into(),
+                error_message: None,
+                attempt: 1,
+                started_at: None,
+                finished_at: Some(chrono::Utc::now()),
+                created_by: 1,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                cancel_requested_at: None,
+                cancel_requested_by: None,
+                restored_login_encrypted: None,
+                restored_inventory: Some(serde_json::json!({
+                    "databases": ["app", "postgres", "shop_prod"],
+                    "roles": [{"name": "origin-admin", "superuser": true}],
+                })),
+            }
+        }
+
+        fn get(auth: Option<temps_auth::AuthContext>) -> Request<Body> {
+            let mut request = Request::builder()
+                .uri("/external-services/5/restored-databases")
+                .body(Body::empty())
+                .expect("request");
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            request
+        }
+
+        async fn send(db: MockDatabase, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+            let state = test_state(
+                std::sync::Arc::new(db.into_connection()),
+                std::sync::Arc::new(NoAudit),
+                None,
+            );
+            let response = configure_routes()
+                .with_state(state)
+                .oneshot(request)
+                .await
+                .expect("response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("body");
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        #[tokio::test]
+        async fn without_a_token_it_is_401() {
+            let (status, _) = send(MockDatabase::new(DatabaseBackend::Postgres), get(None)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn the_latest_restore_lists_its_databases_and_users() {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![service("postgres")]])
+                .append_query_results([vec![completed_run()]])
+                .append_query_results([vec![service("postgres")]])
+                .append_query_results([
+                    Vec::<(project_services::Model, Option<projects::Model>)>::new(),
+                ]);
+            let (status, body) = send(db, get(Some(admin()))).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let report = &body["report"];
+            assert_eq!(report["restore_run_id"], 21);
+            let kinds: Vec<_> = report["databases"]
+                .as_array()
+                .expect("databases")
+                .iter()
+                .map(|d| {
+                    (
+                        d["name"].as_str().unwrap_or_default(),
+                        d["kind"].as_str().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    ("app", "service"),
+                    ("postgres", "system"),
+                    ("shop_prod", "unused")
+                ]
+            );
+            assert_eq!(report["roles"][0]["name"], "origin-admin");
+            assert_eq!(report["roles"][0]["superuser"], true);
+            assert_eq!(report["missing"], serde_json::json!([]));
+        }
+
+        #[tokio::test]
+        async fn another_engine_has_no_report() {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![service("redis")]]);
+            let (status, body) = send(db, get(Some(admin()))).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body, serde_json::json!({ "report": null }));
+        }
     }
 
     fn status_for(err: RestoreError) -> StatusCode {

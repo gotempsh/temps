@@ -27,6 +27,7 @@ mod persistence;
 mod project_links;
 mod readiness;
 mod remote;
+mod restored_databases;
 mod runtime_limits;
 mod server_tls;
 mod stats_poll;
@@ -36,6 +37,10 @@ pub use archive_target::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
 pub use healthcheck::{
     service_overrides, HealthcheckApplied, HealthcheckCapability, ServiceHealthcheck,
     ServiceHealthcheckUpdate,
+};
+pub use restored_databases::{
+    InventoryError, InventoryRole, LinkedDatabase, LinkedEnvironment, PostgresInventory,
+    ServiceLinkedDatabases, MAX_INVENTORY_ENTRIES,
 };
 pub(super) use server_tls::ServiceTlsLocks;
 pub use stats_poll::{

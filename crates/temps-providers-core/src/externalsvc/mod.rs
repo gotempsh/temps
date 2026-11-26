@@ -799,6 +799,27 @@ pub enum RestoreMode {
     },
 }
 
+/// How a physical restore makes the restored data accept the service's
+/// configured login.
+///
+/// A physical backup (a WAL-G base backup) carries its origin server's roles
+/// and their passwords. When the orchestrator holds the origin's login it
+/// merges it into the restore's config, and the restored data accepts it as
+/// is. A backup from a server this one does not know (one found in S3, or one
+/// whose origin service is gone) answers only to passwords Temps does not
+/// have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RestoredLogin {
+    /// The restored roles accept the configured login: the backup is the
+    /// target's own, or the origin's login was merged into the config.
+    #[default]
+    AsConfigured,
+    /// Before verifying the restored server, set the configured user's
+    /// password inside the restored data (creating the user when the backup
+    /// has none by that name). Every other role keeps the password it had.
+    SetConfiguredPassword,
+}
+
 /// Context passed to restore methods: database handle, S3 clients, and
 /// supporting services the orchestrator needs.
 ///
@@ -846,6 +867,9 @@ pub struct RestoreContext<'a> {
     /// the target's live data. Callers that cannot cancel pass
     /// [`NoopRestoreGate`].
     pub gate: &'a dyn RestoreGate,
+    /// Whether the restore sets the configured login inside the restored
+    /// data. Only physical PostgreSQL restores act on it.
+    pub restored_login: RestoredLogin,
 }
 
 /// Returned by [`RestoreGate::begin_target_writes`] when a cancellation won

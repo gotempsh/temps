@@ -10,6 +10,7 @@ import {
   deleteServiceMutation,
   getClusterHealthQueryKey,
   getProjectsOptions,
+  getRestoredDatabasesQueryKey,
   getServiceOptions,
   getServiceQueryKey,
   getServicePreviewEnvironmentVariablesMaskedOptions,
@@ -33,6 +34,7 @@ import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
+import { RestoredDatabasesPanel } from '@/components/storage/RestoredDatabasesPanel'
 import { ServiceHealthcheckCard } from '@/components/storage/ServiceHealthcheckCard'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
@@ -420,6 +422,11 @@ export function ServiceDetail() {
     onSuccess: (_data, variables) => {
       toast.success('Service linked successfully')
       refetchLinkedProjects()
+      void queryClient.invalidateQueries({
+        queryKey: getRestoredDatabasesQueryKey({
+          path: { id: variables.path.id },
+        }),
+      })
       setIsLinkPopoverOpen(false)
       const project = allProjectsData?.projects?.find(
         (candidate) => candidate.id === variables.body.project_id
@@ -1055,6 +1062,13 @@ export function ServiceDetail() {
             ) : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
+
+            {/* What the last restore brought back, and links missing its data. */}
+            <RestoredDatabasesPanel
+              key={service.service.id}
+              serviceId={service.service.id}
+              serviceType={service.service.service_type}
+            />
 
             {/* This service's containers over the log ingestion budget. */}
             <LogIngestBudgetWarning

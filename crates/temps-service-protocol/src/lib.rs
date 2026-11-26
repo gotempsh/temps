@@ -767,6 +767,13 @@ pub struct PostgresWalgRestoreRequest {
     /// started the restored data or put the original back.
     #[serde(default)]
     pub operation_id: Option<String>,
+    /// Set `service_config`'s user and password inside the restored data
+    /// before verifying it: the backup came from a server whose login the
+    /// control plane does not hold, so the restored roles would reject it.
+    /// Every other role keeps its password. Absent from an older control
+    /// plane, which never asks for it.
+    #[serde(default)]
+    pub set_configured_login: bool,
 }
 
 /// What a [`PostgresWalgRestoreRequest`] did.

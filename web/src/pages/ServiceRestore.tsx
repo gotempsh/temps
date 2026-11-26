@@ -138,24 +138,10 @@ import {
   type RestoreSelectionPatch,
 } from './service-restore/restore-selection'
 import { FoundInS3Badge } from './service-restore/FoundInS3Badge'
+import { enginesCompatible } from '@/lib/create-from-backup'
 import { cancelRefusal } from './service-restore/run-context'
 
 type Mode = 'in_place' | 'new_service' | 'pitr'
-
-// Engine-family check — mirror of the backend `engines_compatible` helper in
-// crates/temps-backup/src/services/restore.rs. S3-compatible object stores
-// all share the mc-mirror restore path and are mutually restorable.
-const OBJECT_STORE_FAMILY = new Set(['s3', 'rustfs', 'minio', 'blob'])
-function enginesCompatible(
-  backupEngine: string | null | undefined,
-  targetEngine: string
-): boolean {
-  const a = (backupEngine ?? '').toLowerCase()
-  const b = targetEngine.toLowerCase()
-  if (!a) return false
-  if (a === b) return true
-  return OBJECT_STORE_FAMILY.has(a) && OBJECT_STORE_FAMILY.has(b)
-}
 
 export function ServiceRestore() {
   const { id } = useParams<{ id: string }>()
