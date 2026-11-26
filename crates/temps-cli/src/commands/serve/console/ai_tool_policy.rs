@@ -201,6 +201,14 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "serving private addresses from this machine changes which network the proxy answers on; the operator decides it in the console or CLI",
+        &["delete_private_ingress", "put_private_ingress"],
+    ),
+    (
+        "the first-run record is the operator's own progress through the welcome flow, which the console writes",
+        &["update_onboarding"],
+    ),
+    (
         "takes a credential: the status page password",
         &["set_status_page_password"],
     ),

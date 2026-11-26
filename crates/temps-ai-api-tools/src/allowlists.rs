@@ -647,6 +647,17 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_platform_features",
     // Server's externally-reachable public IP as detected at startup.
     "get_public_ip",
+    // The control plane's machine for the welcome flow: processor, memory,
+    // disk, Docker, who holds ports 80/443, its addresses and Tailscale
+    // status. Hardware and network facts only, no secrets.
+    "get_host_facts",
+    // The first-run record: which welcome steps are done or left for later
+    // and the default way projects are reached. No secrets.
+    "get_onboarding",
+    // Whether this machine serves private addresses: the consented listen
+    // address, the admitted ranges and what the control plane last made of
+    // it. Addresses and status only, no secrets.
+    "get_private_ingress",
     // Whether an in-place binary update is possible and what version is available.
     "get_update_capability",
     "get_update_status",
