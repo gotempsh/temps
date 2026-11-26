@@ -5,6 +5,7 @@ import { createAndLinkDescription } from '@/lib/service-link-copy'
 import {
   adminListNodesOptions,
   createServiceMutation,
+  startRestoreMutation,
   listS3SourcesOptions,
   getProjectOptions,
   getProviderMetadataOptions,
@@ -16,6 +17,7 @@ import {
   CreatableServiceTypeRoute,
   NodeInfoResponse,
   ServiceTypeRoute,
+  SourceBackupEntry,
 } from '@/api/client/types.gen'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -48,20 +50,36 @@ import {
   serviceProjectId,
   serviceProjectLink,
 } from '@/lib/service-project-link'
-import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
 import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import {
+  ArchiveRestore,
   ArrowLeft,
   CheckCircle2,
+  Database,
   Link2,
   Plus,
   Server,
   Trash2,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { creationBackupHref } from '@/lib/creation-backup-schedule'
 import { CreationBackupSetup } from '@/components/storage/CreationBackupSetup'
+import { CreationBackupSource } from '@/components/storage/CreationBackupSource'
+import {
+  createFromBackupRestore,
+  restoreRunHref,
+  restoreSelectionHref,
+} from '@/lib/create-from-backup'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { restoreRunQuery } from '@/pages/service-restore/restore-queries'
+import { restoreRequestFailure } from '@/pages/service-restore/restore-state'
 
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
@@ -85,6 +103,19 @@ const CREATABLE_SERVICE_TYPES: CreatableServiceTypeRoute[] = [
  * node is a `replica` at config time, and the live primary comes from
  * the monitor's FSM state (`live_state` on `ServiceMemberInfo`).
  */
+/** Service types a new service can be restored into from a backup. */
+const RESTORABLE_SERVICE_TYPES: CreatableServiceTypeRoute[] = [
+  'mariadb',
+  'mongodb',
+  'postgres',
+  'redis',
+  's3',
+  'blob',
+  'rustfs',
+]
+
+type StartFrom = 'empty' | 'backup'
+
 const DEFAULT_CLUSTER_ROLES: Record<string, string[]> = {
   postgres: ['monitor', 'replica'],
 }
@@ -300,6 +331,7 @@ export function CreateService() {
   const [backupDestination, setBackupDestination] = useState('later')
   const destinations = useQuery({ ...listS3SourcesOptions(), retry: false })
   const [searchParams] = useSearchParams()
+  const queryClient = useQueryClient()
   const requestedServiceType = searchParams.get('type')
   const projectId = serviceProjectId(searchParams.get('project_id'))
   const serviceType = CREATABLE_SERVICE_TYPES.includes(
@@ -337,6 +369,43 @@ export function CreateService() {
   )
 
   const preset = useServiceTypePreset(serviceType)
+
+  // Starting from a backup: the service is created, then the backup is
+  // restored into it (see lib/create-from-backup.ts). `?from=backup` opens
+  // the page with it chosen.
+  const supportsRestore =
+    serviceType !== null && RESTORABLE_SERVICE_TYPES.includes(serviceType)
+  const [chosenStartFrom, setStartFrom] = useState<StartFrom>(
+    searchParams.get('from') === 'backup' ? 'backup' : 'empty'
+  )
+  const startFrom: StartFrom = supportsRestore ? chosenStartFrom : 'empty'
+  const [chosenRestoreSourceId, setRestoreSourceId] = useState<number>()
+  const restoreSourceId =
+    chosenRestoreSourceId ??
+    (
+      destinations.data?.find((source) => source.is_default) ??
+      destinations.data?.[0]
+    )?.id
+  // The pick is kept with its engine and source, so switching either drops it.
+  const [restorePick, setRestorePick] = useState<{
+    engine: string
+    sourceId: number
+    backup: SourceBackupEntry
+  } | null>(null)
+  const restoreBackup =
+    restorePick &&
+    restorePick.engine === serviceType &&
+    restorePick.sourceId === restoreSourceId
+      ? restorePick.backup
+      : null
+  // A service created for a restore that has not started yet (verification
+  // dismissed): the restore is retried for it, never a second service.
+  const [createdForRestore, setCreatedForRestore] = useState<{
+    id: number
+    name: string
+  } | null>(null)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   // Standalone services can be placed on any active worker. PostgreSQL also
   // uses this list to configure its optional HA topology.
@@ -431,6 +500,51 @@ export function CreateService() {
   )
   const serviceName = serviceNameOverride ?? creationDefaults?.name ?? ''
 
+  const startRestoreMut = useMutation({
+    ...startRestoreMutation(),
+    retry: false,
+    onSuccess: (run, variables) => {
+      const serviceId = variables.path.id
+      queryClient.setQueryData(restoreRunQuery(run.id).queryKey, run)
+      setCreatedForRestore(null)
+      toast.success('Restoring the backup into the new service')
+      navigate(restoreRunHref(serviceId, run.id))
+    },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          startRestoreMut.mutate(variables)
+        )
+      ) {
+        return
+      }
+      const serviceId = variables.path.id
+      const orphan = !!variables.body.backup_location
+      toast.error('The service was created, but the restore did not start', {
+        description: restoreRequestFailure(error, 'start', orphan),
+      })
+      setCreatedForRestore(null)
+      if (restoreBackup && restoreSourceId !== undefined) {
+        navigate(
+          restoreSelectionHref(serviceId, restoreSourceId, restoreBackup)
+        )
+      } else {
+        navigate(`/storage/${serviceId}/restore`)
+      }
+    },
+  })
+
+  const startRestoreInto = (serviceId: number) => {
+    if (!restoreBackup || restoreSourceId === undefined) {
+      navigate(`/storage/${serviceId}/restore`)
+      return
+    }
+    startRestoreMut.mutate({
+      path: { id: serviceId },
+      body: createFromBackupRestore(restoreBackup, restoreSourceId),
+    })
+  }
+
   const createServiceMut = useMutation({
     ...createServiceMutation(),
     meta: {
@@ -442,6 +556,11 @@ export function CreateService() {
         nameInput.current?.focus()
       }),
     onSuccess: (data) => {
+      if (startFrom === 'backup') {
+        setCreatedForRestore({ id: data.id, name: data.name })
+        startRestoreInto(data.id)
+        return
+      }
       if (data.status === 'creating') {
         toast.success('Cluster creation started — tracking progress...')
       } else {
@@ -460,6 +579,14 @@ export function CreateService() {
     }
     if (!serviceType) {
       toast.error('Select a supported service type')
+      return
+    }
+    if (createdForRestore) {
+      startRestoreInto(createdForRestore.id)
+      return
+    }
+    if (startFrom === 'backup' && !restoreBackup) {
+      toast.error('Choose the backup to restore')
       return
     }
     if (topology === 'standalone' && standaloneNodeId === null) {
@@ -649,7 +776,6 @@ export function CreateService() {
           </Alert>
         )}
 
-        {/* Service Name Field */}
         <div className="space-y-2">
           <Label htmlFor="serviceName">
             Service name
@@ -664,6 +790,7 @@ export function CreateService() {
               setNameError(null)
             }}
             placeholder={`my-${serviceType}`}
+            disabled={createdForRestore !== null}
             aria-invalid={!!nameError || !serviceName.trim()}
             aria-describedby="serviceName-description"
           />
@@ -675,168 +802,100 @@ export function CreateService() {
             >
               {nameError}
             </p>
-          ) : serviceName.trim() ? (
-            <p
-              id="serviceName-description"
-              className="text-sm text-muted-foreground"
-            >
-              A unique name to identify this service
-            </p>
-          ) : (
+          ) : !serviceName.trim() ? (
             <p
               id="serviceName-description"
               className="text-sm text-destructive"
             >
               Service name is required
             </p>
-          )}
+          ) : null}
         </div>
 
-        {/* Topology Selector (only for service types that support clustering AND when worker nodes exist) */}
-        {supportsCluster && hasWorkerNodes && (
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <Label>Topology</Label>
-              <p className="text-sm text-muted-foreground">
-                Choose standalone for a single instance, or cluster for
-                high-availability with automatic failover
-              </p>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={() => selectTopology('standalone')}
-                className={`flex flex-col gap-1.5 rounded-lg border-2 p-4 text-left transition-colors ${
-                  topology === 'standalone'
-                    ? 'border-primary bg-primary/5'
-                    : 'border-border hover:border-muted-foreground/50'
-                }`}
-              >
-                <span className="font-medium text-sm">Standalone</span>
-                <span className="text-xs text-muted-foreground">
-                  Single container. Simple, fast. No failover.
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={() => selectTopology('cluster')}
-                className={`flex flex-col gap-1.5 rounded-lg border-2 p-4 text-left transition-colors ${
-                  topology === 'cluster'
-                    ? 'border-primary bg-primary/5'
-                    : 'border-border hover:border-muted-foreground/50'
-                }`}
-              >
-                <span className="font-medium text-sm">Cluster (HA)</span>
-                <span className="text-xs text-muted-foreground">
-                  Multi-node with pg_auto_failover. Requires 3+ nodes.
-                </span>
-              </button>
-            </div>
-
-            {topology === 'cluster' && (
-              <>
-                <p className="text-sm text-muted-foreground">
-                  Docker image will be set to{' '}
-                  <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">
-                    gotempsh/postgres-ha:18-bookworm-walg
-                  </code>{' '}
-                  automatically (includes pg_auto_failover and WAL-G for
-                  backups).
-                </p>
-                <ClusterMemberConfig
-                  members={clusterMembers}
-                  onMembersChange={setClusterMembers}
-                  nodes={nodes}
-                  serviceType={serviceType}
-                />
-              </>
-            )}
-          </div>
+        {supportsRestore && (
+          <StartFromChoice
+            value={startFrom}
+            disabled={createdForRestore !== null}
+            onChange={(next) => {
+              setStartFrom(next)
+              if (next === 'backup') {
+                // A restore lands on one server; the backup schedule is
+                // set up from the service page once its data is back.
+                selectTopology('standalone')
+                setBackupDestination('later')
+              }
+            }}
+          />
         )}
 
-        {topology === 'standalone' && (
-          <div className="space-y-2">
-            <Label>Deployment node</Label>
-            <p className="text-sm text-muted-foreground">
-              Choose the machine whose Docker daemon will run this service.
-            </p>
-            <Select
-              value={standaloneNodeId ?? undefined}
-              onValueChange={setChosenNodeId}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Select node..." />
-              </SelectTrigger>
-              <SelectContent>
-                {placement.offerControlPlane && (
-                  <SelectItem value={CONTROL_PLANE_PLACEMENT}>
-                    <div className="flex items-center gap-2">
-                      <Server className="h-3 w-3" />
-                      Control plane
-                    </div>
-                  </SelectItem>
-                )}
-                {nodes.map((node) => (
-                  <SelectItem key={node.id} value={String(node.id)}>
-                    <div className="flex items-center gap-2">
-                      <Server className="h-3 w-3" />
-                      {node.name}
-                      <span className="text-muted-foreground text-xs">
-                        ({node.private_address})
-                      </span>
-                    </div>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {placement.chosenUnavailable && !placement.noTarget && (
-              <Alert variant="destructive">
-                <AlertTitle>
-                  The machine you chose is no longer available
-                </AlertTitle>
-                <AlertDescription>
-                  It went offline, started draining or can no longer run
-                  services. Choose another deployment node; the service is not
-                  moved to another machine without your choice.
-                </AlertDescription>
-              </Alert>
-            )}
-            {placement.noTarget && (
-              <Alert variant="destructive">
-                <AlertTitle>No machine can run this service</AlertTitle>
-                <AlertDescription>
-                  This control plane runs no services itself, and no worker node
-                  is active.{' '}
-                  <Link to="/settings/nodes" className="underline">
-                    Join a worker node
-                  </Link>{' '}
-                  to create one.
-                </AlertDescription>
-              </Alert>
-            )}
-          </div>
+        {startFrom === 'backup' && (
+          <CreationBackupSource
+            engine={serviceType}
+            engineName={providerMetadata?.display_name ?? serviceType}
+            sources={destinations}
+            sourceId={restoreSourceId}
+            onSourceChange={setRestoreSourceId}
+            selected={restoreBackup}
+            onSelect={(backup) =>
+              restoreSourceId !== undefined &&
+              setRestorePick({
+                engine: serviceType,
+                sourceId: restoreSourceId,
+                backup,
+              })
+            }
+          />
         )}
 
-        {hasWorkerNodes &&
-          placementNeedsClusterDns(
-            topology === 'cluster'
-              ? {
-                  topology: 'cluster',
-                  memberNodeIds: clusterMembers.map((m) => m.node_id),
-                }
-              : {
-                  topology: 'standalone',
-                  nodeId: placementNodeId(standaloneNodeId),
-                }
-          ) && (
-            <ClusterDnsOffNotice title="Apps on other nodes won't reach it">
-              {topology === 'cluster'
-                ? 'Members on different machines are reached through *.temps.local names, which resolve only with Cluster DNS on.'
-                : 'Apps on other nodes reach a service on a worker through its *.temps.local name, which resolves only with Cluster DNS on. Apps on the same node are unaffected.'}
-            </ClusterDnsOffNotice>
+        {createdForRestore && (
+          <Alert>
+            <AlertTitle>
+              {createdForRestore.name} was created; its restore has not started
+            </AlertTitle>
+            <AlertDescription>
+              Confirm your identity to restore the backup into it, or{' '}
+              <Link
+                to={`/storage/${createdForRestore.id}/restore`}
+                className="underline"
+              >
+                open its restore page
+              </Link>
+              .
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {/* Type-specific preset (version/engine pills) */}
+        {topology === 'standalone' && preset.ui}
+
+        {topology === 'standalone' &&
+          placement.chosenUnavailable &&
+          !placement.noTarget && (
+            <Alert variant="destructive">
+              <AlertTitle>
+                The machine you chose is no longer available
+              </AlertTitle>
+              <AlertDescription>
+                It went offline, started draining or can no longer run services.
+                Choose another deployment node under Advanced settings; the
+                service is not moved to another machine without your choice.
+              </AlertDescription>
+            </Alert>
           )}
+        {topology === 'standalone' && placement.noTarget && (
+          <Alert variant="destructive">
+            <AlertTitle>No machine can run this service</AlertTitle>
+            <AlertDescription>
+              This control plane runs no services itself, and no worker node is
+              active.{' '}
+              <Link to="/settings/nodes" className="underline">
+                Join a worker node
+              </Link>{' '}
+              to create one.
+            </AlertDescription>
+          </Alert>
+        )}
 
-        {/* Preview summary */}
         <ServicePreviewCard
           serviceName={serviceName}
           serviceType={serviceType}
@@ -844,26 +903,29 @@ export function CreateService() {
           schema={jsonSchema as any}
           dockerImageOverride={preset.overrides.docker_image}
           presetOwnsImage={preset.ownedFields.includes('docker_image')}
+          nodeLabel={
+            topology === 'cluster'
+              ? null
+              : standaloneNodeId === CONTROL_PLANE_PLACEMENT
+                ? 'Control plane'
+                : (nodes.find((node) => String(node.id) === standaloneNodeId)
+                    ?.name ?? null)
+          }
+          backup={startFrom === 'backup' ? restoreBackup : undefined}
         />
 
-        {/* Type-specific preset (version/engine pills) */}
-        {topology === 'standalone' && preset.ui}
-
-        <CreationBackupSetup
-          query={destinations}
-          destination={backupDestination}
-          onDestinationChange={setBackupDestination}
-        />
-
-        {/* JSON Schema Form for Parameters */}
         <JsonSchemaForm
           schema={jsonSchema as any}
           onSubmit={handleSubmit}
           onCancel={() => navigate('/storage')}
           submitText={
-            serviceName.trim()
-              ? `Create ${serviceName.trim()}`
-              : 'Create database'
+            createdForRestore
+              ? 'Restore the backup'
+              : startFrom === 'backup'
+                ? 'Create and restore'
+                : serviceName.trim()
+                  ? `Create ${serviceName.trim()}`
+                  : 'Create database'
           }
           submitDisabled={
             (backupDestination !== 'later' &&
@@ -872,11 +934,53 @@ export function CreateService() {
               )) ||
             !serviceName.trim() ||
             !!preset.error ||
+            (startFrom === 'backup' && !restoreBackup) ||
             (topology === 'standalone' && standaloneNodeId === null)
           }
-          isSubmitting={createServiceMut.isPending}
+          isSubmitting={createServiceMut.isPending || startRestoreMut.isPending}
           serviceType={serviceType}
           managedByTemps
+          allFieldsAdvanced
+          advancedLabel="Advanced settings"
+          advancedContent={
+            <AdvancedPlacement
+              showTopology={
+                supportsCluster && hasWorkerNodes && startFrom === 'empty'
+              }
+              topology={topology}
+              onTopologyChange={selectTopology}
+              clusterMembers={clusterMembers}
+              onClusterMembersChange={setClusterMembers}
+              nodes={nodes}
+              serviceType={serviceType}
+              standaloneNodeId={standaloneNodeId}
+              onNodeChange={setChosenNodeId}
+              offerControlPlane={placement.offerControlPlane}
+              showClusterDnsNotice={
+                hasWorkerNodes &&
+                placementNeedsClusterDns(
+                  topology === 'cluster'
+                    ? {
+                        topology: 'cluster',
+                        memberNodeIds: clusterMembers.map((m) => m.node_id),
+                      }
+                    : {
+                        topology: 'standalone',
+                        nodeId: placementNodeId(standaloneNodeId),
+                      }
+                )
+              }
+              backups={
+                startFrom === 'empty' ? (
+                  <CreationBackupSetup
+                    query={destinations}
+                    destination={backupDestination}
+                    onDestinationChange={setBackupDestination}
+                  />
+                ) : null
+              }
+            />
+          }
           fieldOverrides={
             topology === 'standalone' ? preset.overrides : undefined
           }
@@ -887,8 +991,203 @@ export function CreateService() {
             topology === 'cluster' ? ['host', 'port', 'docker_image'] : []
           }
         />
+        {verificationDialog}
       </div>
     </div>
+  )
+}
+
+const START_FROM_OPTIONS: {
+  value: StartFrom
+  label: string
+  detail: string
+  icon: typeof Database
+}[] = [
+  {
+    value: 'empty',
+    label: 'Empty database',
+    detail: 'A new, empty service',
+    icon: Database,
+  },
+  {
+    value: 'backup',
+    label: 'From a backup',
+    detail:
+      'Restore a backup from your storage, including one another server made',
+    icon: ArchiveRestore,
+  },
+]
+
+function StartFromChoice({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: StartFrom
+  disabled: boolean
+  onChange: (value: StartFrom) => void
+}) {
+  return (
+    <div className="space-y-2">
+      <Label id="start-from-label">Start from</Label>
+      <div
+        role="radiogroup"
+        aria-labelledby="start-from-label"
+        className="grid grid-cols-1 gap-3 sm:grid-cols-2"
+      >
+        {START_FROM_OPTIONS.map((option) => {
+          const Icon = option.icon
+          const selected = option.value === value
+          return (
+            <button
+              key={option.value}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              disabled={disabled}
+              onClick={() => onChange(option.value)}
+              className={`flex items-start gap-3 rounded-lg border-2 p-4 text-left transition-colors disabled:opacity-60 ${
+                selected
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border hover:border-muted-foreground/50'
+              }`}
+            >
+              <Icon className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+              <span className="space-y-1">
+                <span className="block text-sm font-medium">
+                  {option.label}
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  {option.detail}
+                </span>
+              </span>
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+/** Where the service runs, and its backups: the advanced settings that are not parameters. */
+function AdvancedPlacement({
+  showTopology,
+  topology,
+  onTopologyChange,
+  clusterMembers,
+  onClusterMembersChange,
+  nodes,
+  serviceType,
+  standaloneNodeId,
+  onNodeChange,
+  offerControlPlane,
+  showClusterDnsNotice,
+  backups,
+}: {
+  showTopology: boolean
+  topology: 'standalone' | 'cluster'
+  onTopologyChange: (topology: 'standalone' | 'cluster') => void
+  clusterMembers: ClusterMemberRequest[]
+  onClusterMembersChange: (members: ClusterMemberRequest[]) => void
+  nodes: NodeInfoResponse[]
+  serviceType: ServiceTypeRoute
+  standaloneNodeId: string | null
+  onNodeChange: (nodeId: string) => void
+  offerControlPlane: boolean
+  showClusterDnsNotice: boolean
+  backups: ReactNode
+}) {
+  return (
+    <>
+      {showTopology && (
+        <div className="space-y-3">
+          <Label>Topology</Label>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <button
+              type="button"
+              onClick={() => onTopologyChange('standalone')}
+              className={`flex flex-col gap-1.5 rounded-lg border-2 p-4 text-left transition-colors ${
+                topology === 'standalone'
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border hover:border-muted-foreground/50'
+              }`}
+            >
+              <span className="text-sm font-medium">Standalone</span>
+              <span className="text-xs text-muted-foreground">
+                Single container. Simple, fast. No failover.
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onTopologyChange('cluster')}
+              className={`flex flex-col gap-1.5 rounded-lg border-2 p-4 text-left transition-colors ${
+                topology === 'cluster'
+                  ? 'border-primary bg-primary/5'
+                  : 'border-border hover:border-muted-foreground/50'
+              }`}
+            >
+              <span className="text-sm font-medium">Cluster (HA)</span>
+              <span className="text-xs text-muted-foreground">
+                Multi-node with pg_auto_failover. Requires 3+ nodes.
+              </span>
+            </button>
+          </div>
+          {topology === 'cluster' && (
+            <ClusterMemberConfig
+              members={clusterMembers}
+              onMembersChange={onClusterMembersChange}
+              nodes={nodes}
+              serviceType={serviceType}
+            />
+          )}
+        </div>
+      )}
+
+      {topology === 'standalone' && (
+        <div className="space-y-2">
+          <Label htmlFor="deployment-node">Deployment node</Label>
+          <Select
+            value={standaloneNodeId ?? undefined}
+            onValueChange={onNodeChange}
+          >
+            <SelectTrigger id="deployment-node">
+              <SelectValue placeholder="Select node..." />
+            </SelectTrigger>
+            <SelectContent>
+              {offerControlPlane && (
+                <SelectItem value={CONTROL_PLANE_PLACEMENT}>
+                  <div className="flex items-center gap-2">
+                    <Server className="h-3 w-3" />
+                    Control plane
+                  </div>
+                </SelectItem>
+              )}
+              {nodes.map((node) => (
+                <SelectItem key={node.id} value={String(node.id)}>
+                  <div className="flex items-center gap-2">
+                    <Server className="h-3 w-3" />
+                    {node.name}
+                    <span className="text-muted-foreground text-xs">
+                      ({node.private_address})
+                    </span>
+                  </div>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {showClusterDnsNotice && (
+        <ClusterDnsOffNotice title="Apps on other nodes won't reach it">
+          {topology === 'cluster'
+            ? 'Members on different machines are reached through *.temps.local names, which resolve only with Cluster DNS on.'
+            : 'Apps on other nodes reach a service on a worker through its *.temps.local name, which resolves only with Cluster DNS on. Apps on the same node are unaffected.'}
+        </ClusterDnsOffNotice>
+      )}
+
+      {backups}
+    </>
   )
 }
 
@@ -901,6 +1200,10 @@ interface ServicePreviewCardProps {
   } | null
   dockerImageOverride?: string
   presetOwnsImage?: boolean
+  /** The machine it runs on; `null` when not decided or a cluster. */
+  nodeLabel: string | null
+  /** Starting from a backup: the one chosen, `null` while none is. */
+  backup?: SourceBackupEntry | null
 }
 
 function ServicePreviewCard({
@@ -910,6 +1213,8 @@ function ServicePreviewCard({
   schema,
   dockerImageOverride,
   presetOwnsImage,
+  nodeLabel,
+  backup,
 }: ServicePreviewCardProps) {
   const displayName = serviceName.trim() || `<unnamed>`
   let dockerImage: string | null
@@ -927,6 +1232,19 @@ function ServicePreviewCard({
   }
 
   const highlights: { label: string; value: string }[] = []
+  if (backup !== undefined) {
+    highlights.push({
+      label: 'Data',
+      value: backup
+        ? `Backup of ${backup.origin_service_name || backup.name}, ${new Date(
+            backup.created_at
+          ).toLocaleString()}`
+        : 'Choose a backup',
+    })
+  }
+  if (nodeLabel) {
+    highlights.push({ label: 'Runs on', value: nodeLabel })
+  }
   if (topology === 'cluster') {
     highlights.push({ label: 'Topology', value: 'Cluster (HA)' })
   }
@@ -947,7 +1265,7 @@ function ServicePreviewCard({
               <span className="font-mono font-medium">{displayName}</span>
             </p>
             <p className="text-xs text-muted-foreground">
-              Defaults are filled in — click Create to provision.
+              Change any of these under Advanced settings.
             </p>
           </div>
           <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs">
