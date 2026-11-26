@@ -4,7 +4,7 @@
 //! Runtime state is shared by every hostname for a replica and retained on reload.
 use crate::BackendEntry;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     Arc, OnceLock,
 };
 use std::time::{Duration, Instant};
@@ -25,6 +25,28 @@ fn now_ms() -> u64 {
     u64::try_from(elapsed).unwrap_or(u64::MAX).saturating_add(1)
 }
 
+/// The low bits of [`ReplicaState::connect`]: consecutive failed connects,
+/// saturating.
+const CONNECT_FAILURES_MASK: u64 = (1 << 31) - 1;
+/// Set in [`ReplicaState::connect`] while a request is out as the probe of an
+/// ejection that ran out.
+const PROBE_BIT: u64 = 1 << 31;
+/// Above it, [`ReplicaState::connect`] holds a generation a successful
+/// connect advances.
+const GENERATION_SHIFT: u32 = 32;
+
+/// A failed connect as it was counted, before it was decided whether it
+/// takes the replica out of rotation.
+#[derive(Debug, Clone, Copy)]
+struct CountedFailure {
+    /// The generation the failure was counted in.
+    generation: u64,
+    /// Consecutive failures, this one included.
+    failures: u64,
+    /// The request was the probe of an ejection that ran out.
+    was_probe: bool,
+}
+
 /// What a recorded connect failure did to the replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectFailureOutcome {
@@ -41,16 +63,18 @@ pub struct ReplicaState {
     pub health: AtomicU8,
     successes: AtomicUsize,
     failures: AtomicUsize,
-    /// Consecutive failed connects seen on the request path.
-    connect_failures: AtomicU32,
+    /// Consecutive failed connects seen on the request path (the low 31
+    /// bits), whether a probe is out ([`PROBE_BIT`]) and, above
+    /// [`GENERATION_SHIFT`], a generation each successful connect advances.
+    /// One word, so a failure is counted and a success resets the count
+    /// atomically, and a failure can tell that a success came in between
+    /// counting it and taking the replica out of rotation.
+    connect: AtomicU64,
     /// Ejections since the replica last accepted a connection.
     ejections: AtomicU32,
     /// [`now_ms`] until which the replica is out of rotation; 0 when it is
     /// in rotation.
     ejected_until_ms: AtomicU64,
-    /// A request was sent as the probe of an ejection that ran out; its
-    /// failed connect re-ejects the replica without waiting for the threshold.
-    probing: AtomicBool,
 }
 
 impl ReplicaState {
@@ -96,9 +120,15 @@ impl ReplicaState {
             )
             .is_ok();
         if claimed {
-            self.probing.store(true, Ordering::Relaxed);
+            self.mark_probe();
         }
         claimed
+    }
+
+    /// The request this replica was given is the probe of its ejection: its
+    /// failed connect re-ejects the replica without waiting for the threshold.
+    fn mark_probe(&self) {
+        self.connect.fetch_or(PROBE_BIT, Ordering::SeqCst);
     }
 
     /// A new connection to the replica could not be made (refused, timed
@@ -110,14 +140,42 @@ impl ReplicaState {
     }
 
     fn record_connect_failure_at(&self, now: u64) -> ConnectFailureOutcome {
-        let failures = self
-            .connect_failures
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let was_probe = self.probing.swap(false, Ordering::Relaxed);
-        let until = self.ejected_until_ms.load(Ordering::Relaxed);
+        let counted = self.count_connect_failure();
+        self.decide_after_failure(counted, now)
+    }
+
+    /// Count a failed connect and take the probe flag, in one step.
+    fn count_connect_failure(&self) -> CountedFailure {
+        let (Ok(previous) | Err(previous)) =
+            self.connect
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                    let failures = ((word & CONNECT_FAILURES_MASK) + 1).min(CONNECT_FAILURES_MASK);
+                    Some((word & !(CONNECT_FAILURES_MASK | PROBE_BIT)) | failures)
+                });
+        CountedFailure {
+            generation: previous >> GENERATION_SHIFT,
+            failures: ((previous & CONNECT_FAILURES_MASK) + 1).min(CONNECT_FAILURES_MASK),
+            was_probe: previous & PROBE_BIT != 0,
+        }
+    }
+
+    /// Take the replica out of rotation if `counted` is the failure that
+    /// reaches the threshold, or the failed probe of an ejection.
+    ///
+    /// A successful connect may run between counting the failure and the
+    /// ejection: it resets the count, and finds no ejection yet to clear.
+    /// Publishing the ejection anyway would leave a replica that just
+    /// accepted a connection out of rotation, which neither order of the two
+    /// produces. So the ejection is published, and then the generation
+    /// re-read: either the success saw the ejection and cleared it, or this
+    /// sees the generation it advanced and withdraws the ejection (both
+    /// sides are `SeqCst`, so at least one of them sees the other).
+    fn decide_after_failure(&self, counted: CountedFailure, now: u64) -> ConnectFailureOutcome {
+        let until = self.ejected_until_ms.load(Ordering::SeqCst);
         let ejected_now = until != 0 && until > now;
-        if !was_probe && (failures < OUTLIER_CONSECUTIVE_CONNECT_FAILURES || ejected_now) {
+        if !counted.was_probe
+            && (counted.failures < u64::from(OUTLIER_CONSECUTIVE_CONNECT_FAILURES) || ejected_now)
+        {
             return ConnectFailureOutcome::Counted;
         }
         let previous = self.ejections.fetch_add(1, Ordering::Relaxed);
@@ -125,24 +183,59 @@ impl ReplicaState {
             .saturating_mul(1u32 << previous.min(16))
             .min(OUTLIER_MAX_EJECTION);
         let millis = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
-        self.ejected_until_ms
-            .store(now.saturating_add(millis), Ordering::Relaxed);
+        let ejected_until = now.saturating_add(millis);
+        self.ejected_until_ms.store(ejected_until, Ordering::SeqCst);
+        if self.connect.load(Ordering::SeqCst) >> GENERATION_SHIFT != counted.generation {
+            // A connection was made since this failure was counted.
+            if self
+                .ejected_until_ms
+                .compare_exchange(ejected_until, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let _ = self
+                    .ejections
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                        Some(n.saturating_sub(1))
+                    });
+            }
+            return ConnectFailureOutcome::Counted;
+        }
         ConnectFailureOutcome::Ejected(backoff)
     }
 
     /// A new connection to the replica was made: it is back in rotation and
     /// its failures are forgotten. Loads only, while nothing is recorded.
     pub fn record_connect_success(&self) {
-        if self.connect_failures.load(Ordering::Relaxed) != 0 {
-            self.connect_failures.store(0, Ordering::Relaxed);
-        }
-        if self.ejected_until_ms.load(Ordering::Relaxed) != 0
-            || self.ejections.load(Ordering::Relaxed) != 0
+        let word = self.connect.load(Ordering::SeqCst);
+        if word & (CONNECT_FAILURES_MASK | PROBE_BIT) == 0
+            && self.ejected_until_ms.load(Ordering::SeqCst) == 0
+            && self.ejections.load(Ordering::Relaxed) == 0
         {
-            self.ejected_until_ms.store(0, Ordering::Relaxed);
-            self.ejections.store(0, Ordering::Relaxed);
-            self.probing.store(false, Ordering::Relaxed);
+            return;
         }
+        // A new generation, so a failure counted before this connection
+        // withdraws an ejection it publishes after it (see
+        // `decide_after_failure`).
+        let _ = self
+            .connect
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                Some(
+                    word.wrapping_add(1 << GENERATION_SHIFT) & !(CONNECT_FAILURES_MASK | PROBE_BIT),
+                )
+            });
+        let until = self.ejected_until_ms.load(Ordering::SeqCst);
+        if until != 0 {
+            // Not a store: an ejection published since the load above is
+            // one this success did not see, and the failure that published
+            // it withdraws it itself if it was counted before this success.
+            let _ = self.ejected_until_ms.compare_exchange(
+                until,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+        self.ejections.store(0, Ordering::Relaxed);
     }
 
     pub fn record_probe(&self, passed: bool, config: &LoadBalancingConfig) {
@@ -720,12 +813,65 @@ mod tests {
     }
 
     #[test]
+    fn a_success_while_the_third_failure_is_recorded_keeps_the_replica_in_rotation() {
+        let state = ReplicaState::default();
+        let now = now_ms();
+        for _ in 0..2 {
+            assert_eq!(
+                state.record_connect_failure_at(now),
+                ConnectFailureOutcome::Counted
+            );
+        }
+        // The third failure is counted, then a connection is made before it
+        // decides to eject.
+        let third = state.count_connect_failure();
+        state.record_connect_success();
+        assert_eq!(
+            state.decide_after_failure(third, now),
+            ConnectFailureOutcome::Counted
+        );
+        assert!(!state.out_of_rotation());
+        assert_eq!(state.ejections.load(Ordering::Relaxed), 0);
+
+        // Three failures in a row with no connection between still eject.
+        for _ in 0..2 {
+            assert_eq!(
+                state.record_connect_failure_at(now),
+                ConnectFailureOutcome::Counted
+            );
+        }
+        assert_eq!(
+            state.record_connect_failure_at(now),
+            ConnectFailureOutcome::Ejected(OUTLIER_BASE_EJECTION)
+        );
+        assert!(state.out_of_rotation());
+    }
+
+    #[test]
+    fn a_success_while_a_failed_probe_is_recorded_keeps_the_replica_in_rotation() {
+        let state = ReplicaState::default();
+        let now = now_ms();
+        eject(&state, now);
+        // The ejection ran out and a request became its probe.
+        state.ejected_until_ms.store(1, Ordering::Relaxed);
+        assert!(state.claim_probe_if_due(now_ms));
+        let probe = state.count_connect_failure();
+        // Another request (every replica ejected) connected meanwhile.
+        state.record_connect_success();
+        assert_eq!(
+            state.decide_after_failure(probe, now),
+            ConnectFailureOutcome::Counted
+        );
+        assert!(!state.out_of_rotation());
+    }
+
+    #[test]
     fn the_ejection_backoff_is_capped_and_reset_by_a_successful_connect() {
         let state = ReplicaState::default();
         let now = now_ms();
         let mut last = Duration::ZERO;
         for _ in 0..10 {
-            state.probing.store(true, Ordering::Relaxed);
+            state.mark_probe();
             if let ConnectFailureOutcome::Ejected(backoff) = state.record_connect_failure_at(now) {
                 last = backoff;
             }
