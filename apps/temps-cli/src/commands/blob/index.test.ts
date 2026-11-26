@@ -39,8 +39,9 @@ describe('blob helpers', () => {
   test('continuationCommand repeats the project, prefix and page size, shell-quoted', () => {
     expect(shellQuote('abc-1_2/x.y')).toBe('abc-1_2/x.y')
     expect(shellQuote("it's here")).toBe(`'it'\\''s here'`)
-    expect(continuationCommand(7, 'my docs/', 50, 'c1')).toBe("temps blob list 'my docs/' -p 7 --limit 50 --cursor c1")
+    expect(continuationCommand(7, 'my docs/', 50, 'c1')).toBe("temps blob list -p 7 --limit 50 --cursor c1 -- 'my docs/'")
     expect(continuationCommand(7, undefined, undefined, 'a b')).toBe("temps blob list -p 7 --cursor 'a b'")
+    expect(continuationCommand(7, '--all', 1, 'next')).toBe('temps blob list -p 7 --limit 1 --cursor next -- --all')
   })
 
   test('buildEnableRequest needs the root user and password together', () => {
@@ -96,7 +97,21 @@ describe('temps blob', () => {
       'GET /blob': { blobs: [stored], hasMore: true, cursor: 'next' },
     })
     expect(run.error).toBeUndefined()
-    expect(run.stdout).toContain("temps blob list 'my docs/' -p 7 --limit 1 --cursor next")
+    expect(run.stdout).toContain("temps blob list -p 7 --limit 1 --cursor next -- 'my docs/'")
+  })
+
+  test('a prefix starting with a hyphen survives the printed hint and is read back as the prefix', async () => {
+    const routes = { 'GET /blob': { blobs: [stored], hasMore: true, cursor: 'next' } }
+    const first = await runWithApi(registerBlobCommands, ['blob', 'list', '-p', '7', '--limit', '1', '--', '--all'], routes)
+    expect(first.error).toBeUndefined()
+    expect(first.requests).toEqual(['GET /blob?project_id=7&prefix=--all&limit=1'])
+    const hint = first.stdout.match(/temps blob list .*/)?.[0] as string
+    expect(hint).toBe('temps blob list -p 7 --limit 1 --cursor next -- --all')
+    // Run the printed command: commander must take `--all` after `--` as the prefix, not as --all.
+    const argv = hint.replace(/^temps /, '').split(' ')
+    const second = await runWithApi(registerBlobCommands, argv, routes)
+    expect(second.error).toBeUndefined()
+    expect(second.requests).toEqual(['GET /blob?project_id=7&prefix=--all&limit=1&cursor=next'])
   })
 
   test('put uploads the file to its pathname', async () => {

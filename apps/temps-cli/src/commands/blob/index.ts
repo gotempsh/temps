@@ -277,13 +277,16 @@ export function shellQuote(value: string): string {
   return /^[A-Za-z0-9_\-./:=@%+,]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`
 }
 
-/** The `blob list` command that fetches the next page with the same project, prefix and page size. */
+/**
+ * The `blob list` command that fetches the next page with the same project,
+ * prefix and page size. The prefix goes last, after `--`, so one that starts
+ * with a hyphen (`--all`) is read as the prefix, not as a flag.
+ */
 export function continuationCommand(projectId: number, prefix: string | undefined, limit: number | undefined, cursor: string): string {
-  const parts = ['temps blob list']
-  if (prefix !== undefined) parts.push(shellQuote(prefix))
-  parts.push('-p', String(projectId))
+  const parts = ['temps blob list', '-p', String(projectId)]
   if (limit !== undefined) parts.push('--limit', String(limit))
   parts.push('--cursor', shellQuote(cursor))
+  if (prefix !== undefined) parts.push('--', shellQuote(prefix))
   return parts.join(' ')
 }
 
