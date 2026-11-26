@@ -65,7 +65,7 @@ export function AgentHandoffButton() {
       </PopoverTrigger>
       <PopoverContent
         align="end"
-        className="w-[34rem] max-w-[calc(100vw-1rem)] space-y-4"
+        className="max-h-[var(--radix-popover-content-available-height)] w-[34rem] max-w-[calc(100vw-1rem)] space-y-4 overflow-y-auto"
       >
         <AgentHandoffPanel
           request={request}

@@ -183,6 +183,23 @@ describe('AgentHandoffButton', () => {
     ).toBeTruthy()
   })
 
+  test('the panel never grows past the room the window has, and scrolls instead', async () => {
+    const { store } = setup({
+      settings: { external_url: 'https://temps.example.com' },
+    })
+    act(() => store.set('page', TRACE))
+    fireEvent.click(trigger())
+    await settle()
+
+    const panel = document.querySelector(
+      '[data-radix-popper-content-wrapper] > *'
+    )
+    expect(panel?.className).toContain(
+      'max-h-[var(--radix-popover-content-available-height)]'
+    )
+    expect(panel?.className).toContain('overflow-y-auto')
+  })
+
   test('says what the sign-in grants, for how long, and that the rules are not enforced', async () => {
     const { store } = setup({ settings: {}, role: 'admin' })
     act(() => store.set('page', TRACE))

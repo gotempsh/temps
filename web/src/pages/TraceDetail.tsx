@@ -802,6 +802,17 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   // the built-in assistant both describe it from this. Only once the trace
   // has loaded, so neither points at a trace this page could not show.
   const rootSpanName = tree[0]?.span?.name ?? '(root span)'
+  // Across projects, the other projects whose spans are on screen come too:
+  // a read covers one project, so the prompt reads each of them.
+  const otherProjects = usingUnified
+    ? (unifiedData?.projects ?? [])
+        .filter((p) => p.project_id !== project.id)
+        .map((p) => ({
+          id: p.project_id,
+          slug: p.project_slug,
+          name: p.project_name,
+        }))
+    : []
   usePageSubject(
     traceId && spans.length > 0
       ? {
@@ -810,6 +821,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           traceId,
           startTime: timeBounds.start_time,
           endTime: timeBounds.end_time,
+          ...(otherProjects.length > 0 ? { otherProjects } : {}),
         }
       : null,
     {

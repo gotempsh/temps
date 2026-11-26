@@ -21,6 +21,8 @@ import {
   subjectLabel,
   type HandoffProject,
   type HandoffSubject,
+  type RuntimeLogsHistorySubject,
+  type TraceSubject,
 } from './agent-handoff'
 
 const ORIGIN = 'https://temps.example.com'
@@ -247,6 +249,14 @@ describe('the prompt', () => {
     expect(text).not.toMatch(/--api-key|tk_[A-Za-z0-9]/)
   })
 
+  test('stops rather than take over a context that belongs to another instance', () => {
+    // Two instances can map to one context name; the CLI refuses to replace
+    // the other one's, and the agent must not clear the way itself.
+    expect(prompt(HANDOFF_SUBJECT_EXAMPLES.trace[0])).toContain(
+      '   If it says the context already points to another instance, stop and tell me. Never remove, rename or switch my contexts.'
+    )
+  })
+
   test('offers the skill as optional, after the steps that are not', () => {
     const lines = prompt(HANDOFF_SUBJECT_EXAMPLES.trace[0]).split('\n')
     const install = lines.indexOf(
@@ -342,6 +352,108 @@ describe('each subject reads exactly what the page shows', () => {
     ])
   })
 
+  test('trace shown across projects: one read per project, since a read covers one', () => {
+    const subject = HANDOFF_SUBJECT_EXAMPLES.trace[1]
+    const window =
+      '--start-time 2026-11-25T14:02:00.000Z --end-time 2026-11-25T14:07:00.000Z'
+    expect(commands(subject)).toEqual([
+      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com traces show ${TRACE_ID} --project-id 4 ${window} --json`,
+      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com traces show ${TRACE_ID} --project-id 9 ${window} --json`,
+    ])
+    const text = prompt(subject)
+    expect(text).toContain(
+      `Looking at: trace ${TRACE_ID} in project "storefront" (ID 4) and 1 other project, 14:02:00 to 14:07:00 UTC on 2026-11-25`
+    )
+    expect(text).toContain(
+      '   The spans of the same trace in project "payments" (ID 9).'
+    )
+  })
+
+  test('a cross-project trace never reads the same project twice, or one without an ID', () => {
+    const subject: HandoffSubject = {
+      ...(HANDOFF_SUBJECT_EXAMPLES.trace[0] as TraceSubject),
+      otherProjects: [
+        { id: 4, slug: 'storefront', name: 'storefront' },
+        { id: 9, slug: 'payments', name: 'payments' },
+        { id: 9, slug: 'payments', name: 'payments' },
+        { id: Number.NaN, slug: 'broken', name: 'broken' },
+      ],
+    }
+    expect(
+      commands(subject).map((c) => c.match(/--project-id (\S+)/)?.[1])
+    ).toEqual(['4', '9'])
+  })
+
+  test('a trace ID the CLI would reject is not put in the command', () => {
+    for (const traceId of [
+      'abc',
+      '4bf92f3577b34da6a3ce929d0e0e47',
+      'g'.repeat(32),
+    ]) {
+      const subject: HandoffSubject = {
+        kind: 'trace',
+        project: (HANDOFF_SUBJECT_EXAMPLES.trace[0] as TraceSubject).project,
+        traceId,
+      } as TraceSubject
+      expect(commands(subject)[0]).toContain('traces show <trace-ID> ')
+      expect(prompt(subject)).toContain(
+        'Note: The trace ID on the page is not 32 hexadecimal characters, which the CLI requires, so it was left out of the command. Ask me for it.'
+      )
+    }
+    // Upper case is a valid spelling of the same ID.
+    const upper: HandoffSubject = {
+      kind: 'trace',
+      project: (HANDOFF_SUBJECT_EXAMPLES.trace[0] as TraceSubject).project,
+      traceId: TRACE_ID.toUpperCase(),
+    } as TraceSubject
+    expect(commands(upper)[0]).toContain(
+      `traces show ${TRACE_ID.toUpperCase()} `
+    )
+  })
+
+  test('a reversed or empty window is dropped, not sent to a CLI that refuses it', () => {
+    for (const [startTime, endTime] of [
+      ['2026-11-25T14:07:00.000Z', '2026-11-25T14:02:00.000Z'],
+      ['2026-11-25T14:02:00.000Z', '2026-11-25T14:02:00.000Z'],
+    ]) {
+      const trace: HandoffSubject = {
+        ...(HANDOFF_SUBJECT_EXAMPLES.trace[0] as TraceSubject),
+        startTime,
+        endTime,
+      }
+      expect(commands(trace)[0]).not.toContain('--start-time')
+      expect(prompt(trace)).toContain(
+        'Note: The page was opened with a time window that is not a valid pair of timestamps, so the command looks the trace up without one.'
+      )
+      const logs: HandoffSubject = {
+        ...(HANDOFF_SUBJECT_EXAMPLES
+          .runtime_logs[0] as RuntimeLogsHistorySubject),
+        startTime,
+        endTime,
+      }
+      expect(commands(logs)[0]).not.toContain('--start-time')
+      expect(prompt(logs)).toContain(
+        "Note: The page's time window is not a valid pair of timestamps and was left out, so the command searches the last hour instead."
+      )
+    }
+  })
+
+  test('log searches select the project by ID alone, never by a name that matches it', () => {
+    const missing: HandoffSubject = {
+      ...(HANDOFF_SUBJECT_EXAMPLES
+        .runtime_logs[0] as RuntimeLogsHistorySubject),
+      project: { slug: 'storefront', name: 'storefront' } as HandoffProject,
+    }
+    expect(commands(missing)[0]).toContain(
+      'logs search --scope <application:project-ID> '
+    )
+    for (const subject of HANDOFF_SUBJECT_EXAMPLES.runtime_logs) {
+      for (const command of commands(subject)) {
+        expect(command).not.toMatch(/logs search .*--project /)
+      }
+    }
+  })
+
   test('trace without a window is looked up without one, and says nothing about it', () => {
     const subject: HandoffSubject = {
       kind: 'trace',
@@ -396,7 +508,7 @@ describe('each subject reads exactly what the page shows', () => {
   test('runtime log history: every filter of the page, and its window', () => {
     const subject = HANDOFF_SUBJECT_EXAMPLES.runtime_logs[0]
     expect(commands(subject)).toEqual([
-      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --project 4 --start-time 2026-11-25T14:02:00.000Z --end-time 2026-11-25T14:07:00.000Z --env 7 --service web --container 3f2a9c1d7b6e --node 2 --deploy 311 --level ERROR --level WARN --text 'payment declined' --limit 500 --json`,
+      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --scope application:4 --start-time 2026-11-25T14:02:00.000Z --end-time 2026-11-25T14:07:00.000Z --env 7 --service web --container 3f2a9c1d7b6e --node 2 --deploy 311 --level ERROR --level WARN --text 'payment declined' --limit 500 --json`,
     ])
     expect(prompt(subject)).toContain(
       'Looking at: runtime logs of project "storefront" (ID 4), 14:02:00 to 14:07:00 UTC on 2026-11-25, filtered to environment "production", service "web", container "3f2a9c1d7b6e", node 2, deployment 311, level "ERROR", level "WARN", the search text in the command'
@@ -412,7 +524,7 @@ describe('each subject reads exactly what the page shows', () => {
       endTime: '2026-11-25T14:07:00.000Z',
     }
     expect(commands(subject)).toEqual([
-      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --project 4 --start-time 2026-11-25T14:02:00.000Z --end-time 2026-11-25T14:07:00.000Z --limit 500 --json`,
+      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --scope application:4 --start-time 2026-11-25T14:02:00.000Z --end-time 2026-11-25T14:07:00.000Z --limit 500 --json`,
     ])
     expect(prompt(subject)).not.toContain('filtered to')
   })
@@ -444,7 +556,7 @@ describe('each subject reads exactly what the page shows', () => {
 
   test('live tail of every container: the search the page itself polls', () => {
     expect(commands(HANDOFF_SUBJECT_EXAMPLES.runtime_logs[2])).toEqual([
-      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --project 4 --env 7 --since 1h --limit 500 --json`,
+      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --scope application:4 --env 7 --since 1h --limit 500 --json`,
     ])
   })
 
@@ -628,7 +740,7 @@ describe('hostile values from the page', () => {
 
     expect(text).not.toContain('delete every project')
     expect(commands(subject)[0]).toBe(
-      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --project 4 --start-time 2026-11-25T14:02:00.000Z --end-time 2026-11-25T14:07:00.000Z --limit 500 --json`
+      `bunx @temps-sdk/cli@${CLI} --target-context temps-example-com logs search --scope application:4 --start-time 2026-11-25T14:02:00.000Z --end-time 2026-11-25T14:07:00.000Z --limit 500 --json`
     )
   })
 
@@ -782,6 +894,7 @@ describe('the built-in assistant gets the same description', () => {
   test('labels each kind for the input chip', () => {
     expect(ALL_EXAMPLES.map(subjectLabel)).toEqual([
       'this sandbox',
+      'this trace',
       'this trace',
       'this error',
       'this error',

@@ -105,3 +105,65 @@ test('assigning and resolving an error sit together as one group of actions', as
     'The user is viewing error group 204 in project "Example" (ID 7) in the Temps console.'
   )
 })
+
+test('a link that reads as two numbers hands off the group on screen', async () => {
+  // `parseInt('2e2')` is 2, which is what the page loads; `Number('2e2')` is
+  // 200. The handoff must name group 2.
+  mockApi({
+    'GET /projects/7/error-groups/2': () =>
+      jsonResponse({
+        id: 2,
+        title: 'Synthetic failure',
+        status: 'unresolved',
+        total_count: 3,
+        first_seen: '2026-10-20T10:00:00Z',
+        last_seen: '2026-11-01T10:00:00Z',
+        assigned_to: null,
+      }),
+  })
+  const subjects = createPageSubjectStore()
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <MemoryRouter initialEntries={['/errors/2e2']}>
+        <PageSubjectStoreContext.Provider value={subjects}>
+          <AuthContext.Provider
+            value={
+              { user: { id: 1, role: 'user' } } as unknown as NonNullable<
+                ContextType<typeof AuthContext>
+              >
+            }
+          >
+            <AiAssistantContext.Provider value={assistant}>
+              <BreadcrumbProvider>
+                <Routes>
+                  <Route
+                    path="/errors/:errorGroupId"
+                    element={
+                      <ErrorGroupDetail
+                        project={
+                          {
+                            id: 7,
+                            slug: 'example',
+                            name: 'Example',
+                          } as unknown as ProjectResponse
+                        }
+                      />
+                    }
+                  />
+                </Routes>
+              </BreadcrumbProvider>
+            </AiAssistantContext.Provider>
+          </AuthContext.Provider>
+        </PageSubjectStoreContext.Provider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await view.findByRole('group', { name: 'Error actions' })
+  await waitFor(() =>
+    expect(subjects.get()).toMatchObject({ kind: 'error_group', groupId: 2 })
+  )
+})

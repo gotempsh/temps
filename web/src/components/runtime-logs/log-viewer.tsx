@@ -418,6 +418,10 @@ export default function LogViewer({
   const [mode, setMode] = useState<LogMode>(() =>
     loadPersistedMode(project.slug)
   )
+  // Whether Pause froze an Interval snapshot (the whole environment) rather
+  // than a Live tail (the picked container): the handoff describes what the
+  // pane holds.
+  const [pausedFromInterval, setPausedFromInterval] = useState(false)
   // Last interval the user picked, so toggling "Interval" remembers their
   // previous duration instead of resetting to 5s every time.
   const [lastIntervalMs, setLastIntervalMs] = useState<IntervalMs>(() => {
@@ -555,7 +559,11 @@ export default function LogViewer({
 
   // What this tail is showing, for the header's "Hand off to agent" and the
   // built-in assistant. Declared once the environment and container are
-  // chosen: before that nothing is on screen to hand over.
+  // chosen: before that nothing is on screen to hand over. Interval mode
+  // polls the last hour of the whole environment whatever container is
+  // picked, so it is handed over as every container.
+  const environmentWide =
+    mode.kind === 'interval' || (mode.kind === 'pause' && pausedFromInterval)
   usePageSubject(
     currentEnv && selectedContainer
       ? {
@@ -565,7 +573,9 @@ export default function LogViewer({
           environmentId: currentEnv.id,
           environmentName: currentEnv.name,
           containerId:
-            selectedContainer === ALL_CONTAINERS ? null : selectedContainer,
+            environmentWide || selectedContainer === ALL_CONTAINERS
+              ? null
+              : selectedContainer,
           tail,
           dateRestricted: !!startDate || !!endDate,
         }
@@ -1757,7 +1767,12 @@ export default function LogViewer({
                 variant={mode.kind === 'pause' ? 'secondary' : 'ghost'}
                 size="sm"
                 className="h-7 gap-1.5 px-2"
-                onClick={() => setMode({ kind: 'pause' })}
+                onClick={() => {
+                  if (mode.kind !== 'pause') {
+                    setPausedFromInterval(mode.kind === 'interval')
+                  }
+                  setMode({ kind: 'pause' })
+                }}
                 aria-pressed={mode.kind === 'pause'}
               >
                 <Pause className="h-3.5 w-3.5" />

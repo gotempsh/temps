@@ -162,14 +162,14 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   }, [setBreadcrumbs, errorGroup, projectSlug])
 
   // Declare what is on the page once, for "Hand off to agent" and the
-  // built-in assistant alike.
-  const groupId = Number(errorGroupId)
+  // built-in assistant alike. The ID is the loaded group's, not the
+  // address's: `parseInt` and `Number` read a link like `2e2` differently.
   usePageSubject(
-    errorGroup && Number.isSafeInteger(groupId) && groupId > 0
+    errorGroup && Number.isSafeInteger(errorGroup.id) && errorGroup.id > 0
       ? {
           kind: 'error_group',
           project: { id: project.id, slug: project.slug, name: project.name },
-          groupId,
+          groupId: errorGroup.id,
         }
       : null,
     {

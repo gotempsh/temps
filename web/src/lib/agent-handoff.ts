@@ -44,6 +44,11 @@ export interface TraceSubject {
   /** The lookup window the page was opened with (both or neither). */
   startTime?: string
   endTime?: string
+  /**
+   * The other projects whose spans the page shows, when it shows the trace
+   * across projects. `traces show` reads one project per call.
+   */
+  otherProjects?: HandoffProject[]
 }
 
 export interface ErrorGroupSubject {
@@ -177,6 +182,8 @@ export const MAX_LABEL_LENGTH = 60
 export const MAX_REQUEST_LENGTH = 500
 /** Lines the history view asks for per page. */
 export const RUNTIME_LOGS_PAGE_SIZE = 500
+/** Other projects of a cross-project trace the prompt reads, at most. */
+export const MAX_TRACE_PROJECTS = 20
 /** Lines of each job's build log a deployment prompt asks for. */
 export const DEPLOYMENT_LOG_LINES = 1000
 /** The window the live view's "all containers" poll looks back over. */
@@ -380,6 +387,41 @@ function isIsoInstant(value: unknown): value is string {
   )
 }
 
+/**
+ * Two instants that make a window the CLI accepts: both valid and the end
+ * strictly after the start (`traces show` and `logs search` refuse anything
+ * else, so a reversed pair would only produce a failing command).
+ */
+function isWindow(start: unknown, end: unknown): start is string {
+  return (
+    isIsoInstant(start) &&
+    isIsoInstant(end) &&
+    Date.parse(end) > Date.parse(start)
+  )
+}
+
+/** A W3C trace ID, which is all `traces show` accepts. */
+const TRACE_ID = /^[0-9a-f]{32}$/i
+
+function carryTraceId(value: unknown): CarriedId {
+  const carried = carryId(value, 'trace ID')
+  if (typeof carried.arg !== 'string' || TRACE_ID.test(carried.arg)) {
+    return carried
+  }
+  return {
+    arg: { placeholder: 'trace-ID' },
+    shown: quoteLabel(carried.arg),
+    note: 'The trace ID on the page is not 32 hexadecimal characters, which the CLI requires, so it was left out of the command. Ask me for it.',
+  }
+}
+
+/** `--scope application:<id>`: the project by ID alone, never by a name that happens to match. */
+function applicationScope(projectId: HandoffArg): HandoffArg {
+  return typeof projectId === 'string'
+    ? `application:${projectId}`
+    : { placeholder: 'application:project-ID' }
+}
+
 /** "14:02:00 to 14:07:00 UTC on 2026-11-25", or both instants in full. */
 export function describeWindow(startTime: string, endTime: string): string {
   const start = new Date(startTime).toISOString()
@@ -445,40 +487,76 @@ function planSandbox(subject: SandboxSubject): SubjectPlan {
 }
 
 function planTrace(subject: TraceSubject): SubjectPlan {
-  const carried = carryId(subject.traceId, 'trace ID')
+  const carried = carryTraceId(subject.traceId)
   const project = carryProject(subject.project)
-  const args: HandoffArg[] = [
-    'traces',
-    'show',
-    carried.arg,
-    '--project-id',
-    project.id.arg,
-  ]
   const notes = notesOf(carried, project.id)
   let when = ''
+  const window: HandoffArg[] = []
   const hasStart = subject.startTime != null
   const hasEnd = subject.endTime != null
-  if (isIsoInstant(subject.startTime) && isIsoInstant(subject.endTime)) {
-    args.push('--start-time', new Date(subject.startTime).toISOString())
-    args.push('--end-time', new Date(subject.endTime).toISOString())
-    when = `, ${describeWindow(subject.startTime, subject.endTime)}`
+  if (isWindow(subject.startTime, subject.endTime)) {
+    const end = subject.endTime as string
+    window.push('--start-time', new Date(subject.startTime).toISOString())
+    window.push('--end-time', new Date(end).toISOString())
+    when = `, ${describeWindow(subject.startTime, end)}`
   } else if (hasStart || hasEnd) {
     notes.push(
       'The page was opened with a time window that is not a valid pair of timestamps, so the command looks the trace up without one.'
     )
   }
-  args.push('--json')
+  const show = (projectId: HandoffArg): HandoffArg[] => [
+    'traces',
+    'show',
+    carried.arg,
+    '--project-id',
+    projectId,
+    ...window,
+    '--json',
+  ]
+  const read = [
+    cli(
+      show(project.id.arg),
+      'Every span of the trace: timing, service, status, attributes and events.'
+    ),
+  ]
+
+  // The page can show the trace across projects. One command reads one
+  // project, so each other project gets its own; the same project twice, or
+  // one whose ID did not come through, adds nothing that could be read.
+  const others = Array.isArray(subject.otherProjects)
+    ? subject.otherProjects
+    : []
+  const seen = new Set([project.id.shown])
+  const otherReads: HandoffCommand[] = []
+  for (const other of others) {
+    const carriedOther = carryProject(other)
+    if (typeof carriedOther.id.arg !== 'string') continue
+    if (seen.has(carriedOther.id.arg)) continue
+    seen.add(carriedOther.id.arg)
+    if (otherReads.length === MAX_TRACE_PROJECTS) {
+      notes.push(
+        `The page shows spans from more than ${MAX_TRACE_PROJECTS} other projects; the commands above read the first ${MAX_TRACE_PROJECTS}.`
+      )
+      break
+    }
+    otherReads.push(
+      cli(
+        show(carriedOther.id.arg),
+        `The spans of the same trace in ${carriedOther.described}.`
+      )
+    )
+  }
+  read.push(...otherReads)
+  const across =
+    otherReads.length > 0
+      ? ` and ${otherReads.length} other project${otherReads.length === 1 ? '' : 's'}`
+      : ''
   notes.push(
     'The page also lists the log records emitted inside this trace. The CLI has no command for those yet, so they are not included.'
   )
   return {
-    lookingAt: `trace ${carried.shown} in ${project.described}${when}`,
-    read: [
-      cli(
-        args,
-        'Every span of the trace: timing, service, status, attributes and events.'
-      ),
-    ],
+    lookingAt: `trace ${carried.shown} in ${project.described}${across}${when}`,
+    read,
     notes,
     rules: [READ_ONLY_RULE],
   }
@@ -545,9 +623,14 @@ function planRuntimeLogsHistory(
 ): SubjectPlan {
   const project = carryProject(subject.project)
   const notes = notesOf(project.id)
-  const args: HandoffArg[] = ['logs', 'search', '--project', project.id.arg]
+  const args: HandoffArg[] = [
+    'logs',
+    'search',
+    '--scope',
+    applicationScope(project.id.arg),
+  ]
   let when = 'the last hour'
-  if (isIsoInstant(subject.startTime) && isIsoInstant(subject.endTime)) {
+  if (isWindow(subject.startTime, subject.endTime)) {
     args.push('--start-time', new Date(subject.startTime).toISOString())
     args.push('--end-time', new Date(subject.endTime).toISOString())
     when = describeWindow(subject.startTime, subject.endTime)
@@ -664,8 +747,8 @@ function planRuntimeLogsLive(subject: RuntimeLogsLiveSubject): SubjectPlan {
           [
             'logs',
             'search',
-            '--project',
-            project.id.arg,
+            '--scope',
+            applicationScope(project.id.arg),
             '--env',
             environmentId.arg,
             '--since',
@@ -925,6 +1008,7 @@ export function renderAgentHandoffPrompt(
     `${INDENT}Otherwise sign in:`,
     run(plan.connect.startLogin),
     `${INDENT}This prints a link and exits. Show me the link, then go on: I approve it in my browser. Never ask me for a password or a key.`,
+    `${INDENT}If it says the context already points to another instance, stop and tell me. Never remove, rename or switch my contexts.`,
     run(plan.connect.finishLogin),
     `${INDENT}This waits up to 90 seconds for my approval. If it says it is still waiting, run it again.`,
     `${INDENT}Optional: the Temps skill has the command reference. The commands below work without it.`,
@@ -1026,6 +1110,14 @@ export const HANDOFF_SUBJECT_EXAMPLES: Record<
       traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
       startTime: '2026-11-25T14:02:00.000Z',
       endTime: '2026-11-25T14:07:00.000Z',
+    },
+    {
+      kind: 'trace',
+      project: EXAMPLE_PROJECT,
+      traceId: '4bf92f3577b34da6a3ce929d0e0e4736',
+      startTime: '2026-11-25T14:02:00.000Z',
+      endTime: '2026-11-25T14:07:00.000Z',
+      otherProjects: [{ id: 9, slug: 'payments', name: 'payments' }],
     },
   ],
   error_group: [

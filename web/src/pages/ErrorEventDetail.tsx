@@ -71,20 +71,20 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
     : undefined
 
   // Declare what is on the page once, for "Hand off to agent" and the
-  // built-in assistant alike.
-  const groupId = Number(errorGroupId)
-  const occurrenceId = Number(eventId)
+  // built-in assistant alike. The IDs come from the occurrence that loaded,
+  // not from the address: `parseInt` and `Number` read a link like `1e2`
+  // differently, and the handoff must name the record on screen.
   usePageSubject(
     event &&
-      Number.isSafeInteger(groupId) &&
-      groupId > 0 &&
-      Number.isSafeInteger(occurrenceId) &&
-      occurrenceId > 0
+      Number.isSafeInteger(event.error_group_id) &&
+      event.error_group_id > 0 &&
+      Number.isSafeInteger(event.id) &&
+      event.id > 0
       ? {
           kind: 'error_group',
           project: { id: project.id, slug: project.slug, name: project.name },
-          groupId,
-          eventId: occurrenceId,
+          groupId: event.error_group_id,
+          eventId: event.id,
         }
       : null
   )
