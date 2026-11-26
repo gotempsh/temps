@@ -212,3 +212,26 @@ test('the branch is looked up by its exact name, non-breaking space included', a
   await waitFor(() => expect(view.getByText('missing:none')).toBeTruthy())
   expect(asked).toEqual(['release '])
 })
+
+test('a name of only Unicode whitespace is a branch, so it is looked up', async () => {
+  const asked: (string | null)[] = []
+  const { view } = renderProbe(
+    {
+      'GET /repositories/temps/example/branch': (request) => {
+        asked.push(new URL(request.url).searchParams.get('name'))
+        return jsonResponse({ title: 'Branch Not Found' }, 404)
+      },
+    },
+    { branch: '\u00a0' }
+  )
+
+  await waitFor(() => expect(view.getByText('missing:none')).toBeTruthy())
+  expect(asked).toEqual(['\u00a0'])
+})
+
+test('a name of only ASCII spaces cannot be a branch, so nothing is asked', () => {
+  const { api, view } = renderProbe({}, { branch: '  ' })
+
+  expect(view.getByText('not-needed:none')).toBeTruthy()
+  expect(api.called('GET', '/repositories/temps/example/branch')).toBe(false)
+})

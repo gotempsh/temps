@@ -72,6 +72,15 @@ export interface BranchVerificationInput {
  * whole point: the console must not read "absent from a capped list" as "does
  * not exist".
  */
+/** Empty, or only ASCII spaces and control characters: no ref can be named so. */
+function isImpossibleBranchName(name: string): boolean {
+  for (let index = 0; index < name.length; index++) {
+    const code = name.charCodeAt(index)
+    if (code > 0x20 && code !== 0x7f) return false
+  }
+  return true
+}
+
 export function useBranchVerification({
   repoOwner,
   repoName,
@@ -81,11 +90,13 @@ export function useBranchVerification({
   branch,
   enabled,
 }: BranchVerificationInput): BranchVerification {
-  // Ask for exactly this name. Git allows U+00A0 in a ref, and `trim()`
-  // would strip it and verify a different branch; only an all-whitespace
-  // name is treated as no name.
+  // Ask for exactly this name. Git allows Unicode whitespace such as U+00A0
+  // in a ref, and `trim()` would strip it and verify a different branch.
+  // Only a name no ref can have (empty, or only ASCII spaces and control
+  // characters) is treated as no name.
   const name = branch ?? ''
-  const canAsk = enabled && !!repoOwner && !!repoName && name.trim() !== ''
+  const canAsk =
+    enabled && !!repoOwner && !!repoName && !isImpossibleBranchName(name)
 
   const connectionQuery = useQuery({
     ...getRepositoryBranchOptions({

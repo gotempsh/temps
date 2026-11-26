@@ -73,6 +73,18 @@ async fn an_empty_branch_name_is_rejected_before_any_provider_request() {
 }
 
 #[tokio::test]
+async fn a_name_of_only_unicode_whitespace_passes_the_name_check() {
+    // U+00A0 on its own is a valid ref. With a custom origin and no caller,
+    // the request stops at the origin guard, which runs after the name check,
+    // so a 401 (not a 400) shows the name was accepted, with no request sent.
+    let uri = format!("/git/public/gitlab/temps/example/branch?name=%C2%A0&{CUSTOM_ORIGIN}");
+    let (status, body) = problem(send(&uri, None).await).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["title"], "Authentication Required");
+}
+
+#[tokio::test]
 async fn a_custom_gitlab_origin_needs_a_signed_in_caller() {
     let uri = format!("/git/public/gitlab/temps/example/branch?name=main&{CUSTOM_ORIGIN}");
     let (status, body) = problem(send(&uri, None).await).await;

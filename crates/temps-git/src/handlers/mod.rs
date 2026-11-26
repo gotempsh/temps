@@ -29,6 +29,15 @@ pub use public::PublicRepositoriesApiDoc;
 /// so no delivery that worked is refused; the other providers set their own.
 pub(crate) const PROVIDER_EVENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+/// Whether `name` cannot name any branch, so a lookup for it is rejected
+/// before the provider is asked: it is empty, or holds nothing but ASCII
+/// spaces and control characters, which `git check-ref-format` forbids in
+/// every ref. Unicode whitespace such as U+00A0 or U+2003 is allowed in a
+/// ref, so a name made only of it is a real, if unusual, branch.
+pub(crate) fn is_impossible_branch_name(name: &str) -> bool {
+    name.bytes().all(|byte| byte <= b' ' || byte == 0x7f)
+}
+
 /// Extract a branch without changing occurrences of the prefix inside its name.
 fn branch_from_ref(git_ref: &str, allow_bare: bool) -> Option<String> {
     git_ref
@@ -325,6 +334,32 @@ pub(crate) mod public_route_tests {
                 status(configure_public_routes(), post(path, oversized.clone())).await,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "{path} must bound its request body"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod branch_name_tests {
+    use super::is_impossible_branch_name;
+
+    #[test]
+    fn only_names_no_ref_can_have_are_impossible() {
+        for impossible in ["", " ", "  ", "\t", "\n", " \u{7f} "] {
+            assert!(
+                is_impossible_branch_name(impossible),
+                "{impossible:?} cannot be a branch"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_whitespace_is_a_branch_name_git_accepts() {
+        // `git check-ref-format refs/heads/<name>` accepts each of these.
+        for possible in ["\u{a0}", "\u{2003}", "\u{a0}\u{2003}", "main", " main"] {
+            assert!(
+                !is_impossible_branch_name(possible),
+                "{possible:?} can name a branch"
             );
         }
     }

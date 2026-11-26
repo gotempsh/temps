@@ -515,4 +515,35 @@ mod branch_lookup_handler_tests {
         exact.assert_async().await;
         trimmed.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn a_name_of_only_unicode_whitespace_is_asked_of_the_provider() {
+        // U+00A0 on its own is a valid ref, so it is looked up, not refused.
+        let mut server = mockito::Server::new_async().await;
+        let token = mock_valid_token(&mut server).await;
+        let exact = server
+            .mock("GET", "/repos/temps/example/branches/%C2%A0")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Branch not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let response = router()
+            .with_state(state_over(database(&server.url())))
+            .oneshot(
+                Request::builder()
+                    .uri("/repositories/temps/example/branch?connection_id=7&name=%C2%A0")
+                    .extension(AuthContext::new_session(test_user(), Role::Admin))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        token.assert_async().await;
+        exact.assert_async().await;
+    }
 }
