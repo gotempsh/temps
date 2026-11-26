@@ -99,6 +99,9 @@ pub struct PublicIngressSettings {
     pub behind_nat: bool,
     pub last_check: Option<PublicIngressCheck>,
     pub checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Revision of the settings above that a save writes. Send it back as
+    /// `expected_revision`, so a save made since this read is not reverted.
+    pub revision: String,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -110,6 +113,11 @@ pub struct UpdatePublicIngressSettingsRequest {
     pub https_port: Option<u16>,
     /// What DNS points at, or `None` for the listen address.
     pub public_address: Option<String>,
+    /// The `revision` the settings were read with. When set and they have
+    /// changed since, the save is refused with 409 and nothing changes.
+    /// When omitted the save is unconditional (older clients).
+    #[serde(default)]
+    pub expected_revision: Option<String>,
 }
 
 fn bad_request(detail: impl Into<String>) -> Problem {
@@ -243,6 +251,7 @@ fn view(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> Public
             .and_then(|r| r.last_check.clone())
             .and_then(|v| serde_json::from_value(v).ok()),
         checked_at: row.and_then(|r| r.checked_at),
+        revision: crate::services::node_public_ingress::settings_revision(node, row),
     }
 }
 
@@ -250,6 +259,9 @@ impl From<NodePublicIngressError> for Problem {
     fn from(error: NodePublicIngressError) -> Self {
         match error {
             NodePublicIngressError::Node(error) => Problem::from(error),
+            NodePublicIngressError::StaleRevision(stale) => {
+                temps_core::revision::stale_revision_problem(&stale)
+            }
             error @ (NodePublicIngressError::Load { .. } | NodePublicIngressError::Save { .. }) => {
                 internal(error.to_string())
             }
@@ -288,7 +300,8 @@ pub async fn get_public_ingress_settings(
     request_body = UpdatePublicIngressSettingsRequest,
     responses((status = 200, body = PublicIngressSettings),
         (status = 400, description = "Invalid address or ports, or not a worker"),
-        (status = 404, description = "Node not found")),
+        (status = 404, description = "Node not found"),
+        (status = 409, description = "The worker does not allow this change, or `expected_revision` is stale: the settings changed since they were read; nothing was saved")),
     security(("bearer_auth" = []))
 )]
 pub async fn update_public_ingress_settings(
@@ -390,7 +403,7 @@ pub async fn update_public_ingress_settings(
     };
     state
         .node_public_ingress_service
-        .save(node_id, &change)
+        .save(node_id, &change, request.expected_revision.as_deref())
         .await?;
 
     let audit = NodePublicIngressSettingsChangedAudit {

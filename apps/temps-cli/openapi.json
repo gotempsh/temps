@@ -6293,6 +6293,10 @@
             "description": "When enabled, Admin-role accounts without MFA enrolled are rejected\nat password login (bherila/temps#32). SSO/OIDC logins are unaffected.",
             "type": "boolean"
           },
+          "revision": {
+            "description": "Revision of these settings. Send it back as `expected_revision` when\nsaving, so a save made by someone else since this read is not\nsilently reverted.",
+            "type": "string"
+          },
           "screenshots": {
             "$ref": "#/components/schemas/ScreenshotSettings"
           },
@@ -6376,7 +6380,8 @@
           "tenant_resource_ceilings",
           "self_update",
           "image_retention",
-          "mcp_server"
+          "mcp_server",
+          "revision"
         ],
         "type": "object"
       },
@@ -50270,14 +50275,6 @@
             "description": "Metric name, e.g. `\"pg.connections_active\"`.",
             "type": "string"
           },
-          "percentile": {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
           "range": {
             "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "type": "string"
@@ -52454,6 +52451,10 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "revision": {
+            "description": "Revision of the stored limits. Send it back as `expected_revision`\nwhen saving, so a save made by someone else since this read is not\nsilently reverted.",
+            "type": "string"
           }
         },
         "required": [
@@ -52461,7 +52462,8 @@
           "concurrency",
           "queue_wait_seconds",
           "build_timeout_seconds",
-          "is_default"
+          "is_default",
+          "revision"
         ],
         "type": "object"
       },
@@ -52971,6 +52973,10 @@
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimits"
           },
+          "build_limits_revision": {
+            "description": "Revision of `build_limits`, to send as `expected_revision` when\nsaving them (`PUT /internal/nodes/{node_id}/build-limits`).",
+            "type": "string"
+          },
           "capacity": {
             "description": "Resource capacity/usage metrics from the latest heartbeat"
           },
@@ -53099,6 +53105,7 @@
           "labels",
           "capacity",
           "build_limits",
+          "build_limits_revision",
           "created_at",
           "public_ingress_enabled",
           "public_ingress_unsupported_reasons"
@@ -64557,6 +64564,10 @@
               "null"
             ]
           },
+          "revision": {
+            "description": "Revision of the settings above that a save writes. Send it back as\n`expected_revision`, so a save made since this read is not reverted.",
+            "type": "string"
+          },
           "running": {
             "type": [
               "boolean",
@@ -64572,7 +64583,8 @@
           "agent_reports",
           "interfaces",
           "private_on_tailscale",
-          "behind_nat"
+          "behind_nat",
+          "revision"
         ],
         "type": "object"
       },
@@ -76984,6 +76996,26 @@
         ],
         "type": "object"
       },
+      "SetNodeBuildLimitsRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BuildLimits"
+          },
+          {
+            "properties": {
+              "expected_revision": {
+                "description": "The `revision` the limits were read with. When set and the stored\nlimits have changed since, the save is refused with 409 and nothing\nchanges. When omitted the save is unconditional (older clients).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "A worker's new build limits."
+      },
       "SetNodeNetworkPolicyModeRequest": {
         "properties": {
           "mode": {
@@ -77269,6 +77301,13 @@
         "properties": {
           "message": {
             "type": "string"
+          },
+          "revision": {
+            "description": "`PUT /settings`: revision of the saved settings, to send as\n`expected_revision` with the next save.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -89220,6 +89259,13 @@
           "enabled": {
             "type": "boolean"
           },
+          "expected_revision": {
+            "description": "The `revision` the settings were read with. When set and they have\nchanged since, the save is refused with 409 and nothing changes.\nWhen omitted the save is unconditional (older clients).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "http_port": {
             "format": "int32",
             "minimum": 0,
@@ -89578,6 +89624,26 @@
           "message"
         ],
         "type": "object"
+      },
+      "UpdateSettingsRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AppSettings"
+          },
+          {
+            "properties": {
+              "expected_revision": {
+                "description": "The `revision` from `GET /settings`. When set and the settings have\nchanged since, the save is refused with 409 and nothing changes.\nWhen omitted the save is unconditional (older clients).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "`PUT /settings` body: the settings document (partial documents keep the\nomitted fields), plus the revision it was read with.\n\nSchema only: the handler reads the raw body, because which fields were\nsent is information deserialization destroys."
       },
       "UpdateShieldEntryRequest": {
         "description": "Replaces an entry's verdict, note and expiry; what it matches stays.",
@@ -119108,19 +119174,6 @@
             }
           },
           {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "in": "query",
-            "name": "percentile",
-            "required": false,
-            "schema": {
-              "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
-            }
-          },
-          {
             "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
             "example": "2026-08-13T00:00:00Z",
             "in": "query",
@@ -125604,7 +125657,7 @@
             "description": "Service or member not found"
           },
           "409": {
-            "description": "This process has no local Docker daemon to run the promotion on"
+            "description": "This process has no local Docker daemon to run the promotion on, or the member's node stayed busy (another operation owned its container) and ran nothing: retry"
           },
           "500": {
             "description": "pg_autoctl perform promotion failed"
@@ -125623,7 +125676,6 @@
     },
     "/external-services/{id}/metrics": {
       "get": {
-        "description": "Pass `percentile` to compute a histogram quantile instead of a plain\ngauge/counter average.",
         "operationId": "ExternalServiceMetricsGetRange",
         "parameters": [
           {
@@ -125652,19 +125704,6 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "in": "query",
-            "name": "percentile",
-            "required": false,
-            "schema": {
-              "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
             }
           },
           {
@@ -135835,7 +135874,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/BuildLimits"
+                "$ref": "#/components/schemas/SetNodeBuildLimitsRequest"
               }
             }
           },
@@ -135846,10 +135885,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BuildLimits"
+                  "$ref": "#/components/schemas/NodeBuildLimitsResponse"
                 }
               }
-            }
+            },
+            "description": "The saved limits and their new revision"
           },
           "400": {
             "description": "Invalid limits, node role, or the control plane (node 0)"
@@ -135862,6 +135902,9 @@
           },
           "404": {
             "description": "Node not found"
+          },
+          "409": {
+            "description": "`expected_revision` is stale: the limits changed since they were read; nothing was saved"
           },
           "500": {
             "description": "Storage failed"
@@ -136596,6 +136639,9 @@
           },
           "404": {
             "description": "Node not found"
+          },
+          "409": {
+            "description": "The worker does not allow this change, or `expected_revision` is stale: the settings changed since they were read; nothing was saved"
           }
         },
         "security": [
@@ -141558,19 +141604,6 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "in": "query",
-            "name": "percentile",
-            "required": false,
-            "schema": {
-              "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
             }
           },
           {
@@ -191590,7 +191623,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AppSettings"
+                "$ref": "#/components/schemas/UpdateSettingsRequest"
               }
             }
           },
@@ -191612,6 +191645,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "409": {
+            "description": "`expected_revision` is stale (the settings changed since they were read), or the public ingress hostname is in use; nothing was saved"
           },
           "500": {
             "description": "Internal server error"

@@ -73,6 +73,23 @@ pub struct SettingsUpdateResult {
     pub trusted_proxy_cidrs: Vec<String>,
     pub previous_trusted_private_networks: Vec<String>,
     pub trusted_private_networks: Vec<String>,
+    /// Revision of the saved settings, when the write carried a
+    /// [`SettingsRevisionCheck`].
+    pub revision: Option<String>,
+}
+
+/// An optimistic-concurrency precondition on a settings write.
+///
+/// The revision is computed by the caller's `revision_of` (the handler's,
+/// over the masked view a reader sees), so this crate never decides what a
+/// revision covers. It is compared with the row the write locks, so no save
+/// can land between the check and the write.
+#[derive(Debug, Clone)]
+pub struct SettingsRevisionCheck {
+    /// The revision the client read. `None` writes unconditionally; the
+    /// saved revision is still returned.
+    pub expected: Option<String>,
+    pub revision_of: fn(&AppSettings) -> String,
 }
 
 /// Rebase credential-owned fields onto the row locked by the settings writer.
@@ -146,6 +163,9 @@ pub(crate) fn preserve_geo_recorded_state(
 pub enum ConfigServiceError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error(transparent)]
+    StaleRevision(temps_core::revision::StaleRevision),
 
     #[error("Failed to read external TLS policy from settings row 1: {source}")]
     ExternalTlsSettingDatabase {
@@ -1792,10 +1812,31 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// write cannot restore a range revoked by a concurrent administrator.
     pub async fn update_settings_with_proxy_intent(
         &self,
+        settings: AppSettings,
+        geo_license_key_intent: GeoLicenseKeyIntent,
+        trusted_private_networks_intent: TrustedPrivateNetworksIntent,
+        proxy_intent: TrustedProxyRangesIntent,
+    ) -> Result<SettingsUpdateResult, ConfigServiceError> {
+        self.update_settings_checked(
+            settings,
+            geo_license_key_intent,
+            trusted_private_networks_intent,
+            proxy_intent,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::update_settings_with_proxy_intent`] with an optional
+    /// [`SettingsRevisionCheck`]: a stale `expected` revision is refused with
+    /// [`ConfigServiceError::StaleRevision`] and nothing is written.
+    pub async fn update_settings_checked(
+        &self,
         mut settings: AppSettings,
         geo_license_key_intent: GeoLicenseKeyIntent,
         trusted_private_networks_intent: TrustedPrivateNetworksIntent,
         proxy_intent: TrustedProxyRangesIntent,
+        revision_check: Option<SettingsRevisionCheck>,
     ) -> Result<SettingsUpdateResult, ConfigServiceError> {
         let proxy_ranges = match proxy_intent {
             TrustedProxyRangesIntent::Unchanged => None,
@@ -1861,6 +1902,18 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             })?,
             None => AppSettings::default(),
         };
+        if let Some(check) = &revision_check {
+            if let Err(stale) = temps_core::revision::check_expected_revision(
+                || "Platform settings".to_string(),
+                check.expected.as_deref(),
+                &(check.revision_of)(&locked_settings),
+            ) {
+                if let Err(rollback) = txn.rollback().await {
+                    warn!(%rollback, "Failed to roll back a refused stale settings update");
+                }
+                return Err(ConfigServiceError::StaleRevision(stale));
+            }
+        }
         settings.trusted_private_networks = match trusted_private_networks_intent {
             TrustedPrivateNetworksIntent::Unchanged => {
                 locked_settings.trusted_private_networks.clone()
@@ -1869,11 +1922,12 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         };
         settings.trusted_proxy_cidrs =
             proxy_ranges.unwrap_or_else(|| locked_settings.trusted_proxy_cidrs.clone());
-        let result = SettingsUpdateResult {
+        let mut result = SettingsUpdateResult {
             previous_trusted_proxy_cidrs: locked_settings.trusted_proxy_cidrs.clone(),
             trusted_proxy_cidrs: settings.trusted_proxy_cidrs.clone(),
             previous_trusted_private_networks: locked_settings.trusted_private_networks.clone(),
             trusted_private_networks: settings.trusted_private_networks.clone(),
+            revision: None,
         };
         // Consent belongs to the SystemAdmin-only plugin endpoint. A generic
         // settings save must not undo a consent update committed before this lock.
@@ -2104,6 +2158,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             };
             new_settings.insert(&txn).await?;
         }
+        // Of exactly what is written, which is also what the next read sees.
+        result.revision = revision_check
+            .as_ref()
+            .map(|check| (check.revision_of)(&settings));
 
         txn.commit().await?;
 

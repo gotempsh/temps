@@ -28,6 +28,16 @@ describe('node admin helpers', () => {
     expect(() => ingressSettingsRequest(current, { enable: true, disable: true })).toThrow(/not both/)
     expect(() => ingressSettingsRequest(current, { httpPort: '70000' })).toThrow(/--http-port/)
   })
+
+  test('a change sends back the revision it read, so a save made since is refused (#2081)', () => {
+    expect(buildLimitsRequest({ ...limits, revision: '3' }, { concurrency: '2' })).toEqual({
+      ...limits,
+      concurrency: 2,
+      expected_revision: '3',
+    })
+    const ingress = { enabled: true, http_port: 80, https_port: 443, revision: 'abc' }
+    expect(ingressSettingsRequest(ingress, { httpsPort: '8443' })?.expected_revision).toBe('abc')
+  })
 })
 
 describe('temps nodes (admin)', () => {

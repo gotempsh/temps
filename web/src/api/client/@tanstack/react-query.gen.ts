@@ -9429,9 +9429,6 @@ export const externalServiceMetricsGetRangeQueryKey = (options: Options<External
 
 /**
  * Fetch a time-series range for a single metric on an external service.
- *
- * Pass `percentile` to compute a histogram quantile instead of a plain
- * gauge/counter average.
  */
 export const externalServiceMetricsGetRangeOptions = (options: Options<ExternalServiceMetricsGetRangeData>) => queryOptions<ExternalServiceMetricsGetRangeResponse, DefaultError, ExternalServiceMetricsGetRangeResponse, ReturnType<typeof externalServiceMetricsGetRangeQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {

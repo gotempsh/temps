@@ -8,6 +8,7 @@ import type { ReactNode } from 'react'
 import { getSandboxResourceDefaultsQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { isStaleRevision } from '@/lib/stale-revision'
 import { useUpdateSettings } from './useSettings'
 
 installBrowserWindow()
@@ -50,4 +51,71 @@ test('saving sandbox settings invalidates cached limits for every placement', as
   expect(api.called('PUT', '/settings')).toBe(true)
   for (const key of keys)
     expect(client.getQueryState(key)?.isInvalidated).toBe(true)
+})
+
+test('a save sends the revision the page loaded with, and a stale one is refused', async () => {
+  let sent: { expected_revision?: unknown; preview_domain?: unknown } = {}
+  mockApi({
+    // Someone else saved after this page loaded: the server is at "r2".
+    'GET /settings': () =>
+      jsonResponse({ preview_domain: 'other.example.com', revision: 'r2' }),
+    'PUT /settings': async (request) => {
+      sent = await request.json()
+      return jsonResponse(
+        {
+          title: 'Settings Changed Since They Were Read',
+          detail: 'Platform settings changed since it was read',
+          expected_revision: 'r1',
+          current_revision: 'r2',
+        },
+        409
+      )
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  client.setQueryData(['platform-settings'], {
+    preview_domain: 'example.com',
+    revision: 'r1',
+  })
+  const { result } = renderHook(() => useUpdateSettings(), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  })
+  act(() => {
+    result.current.mutate({ preview_domain: 'mine.example.com' })
+  })
+  await waitFor(() => expect(result.current.isError).toBe(true))
+  expect(sent.expected_revision).toBe('r1')
+  expect(sent.preview_domain).toBe('mine.example.com')
+  expect(isStaleRevision(result.current.error)).toBe(true)
+  expect(
+    (client.getQueryData(['platform-settings']) as { preview_domain: string })
+      .preview_domain
+  ).toBe('example.com')
+})
+
+test('a successful save keeps the new revision for the next save', async () => {
+  mockApi({
+    'GET /settings': () =>
+      jsonResponse({ preview_domain: 'example.com', revision: 'r1' }),
+    'PUT /settings': () => jsonResponse({ message: 'Updated', revision: 'r2' }),
+  })
+  const client = new QueryClient()
+  client.setQueryData(['platform-settings'], {
+    preview_domain: 'example.com',
+    revision: 'r1',
+  })
+  const { result } = renderHook(() => useUpdateSettings(), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  })
+  act(() => {
+    result.current.mutate({ preview_domain: 'mine.example.com' })
+  })
+  await waitFor(() => expect(result.current.isSuccess).toBe(true))
+  expect(result.current.data?.revision).toBe('r2')
 })

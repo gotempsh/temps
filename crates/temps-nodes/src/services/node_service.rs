@@ -284,11 +284,24 @@ fn orphaned_container_note(node_name: &str, node_id: i32) -> String {
 }
 
 /// A worker's effective build limits ([`NodeService::get_build_limits`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeBuildLimits {
     pub limits: temps_deployer::build_protocol::BuildLimits,
     /// True when nothing is stored for the node, so the defaults apply.
     pub is_default: bool,
+    /// Revision of the stored limits, for an optimistic-concurrency save
+    /// ([`NodeService::set_build_limits`]): the `_version` every save
+    /// increments, `"0"` before the first.
+    pub revision: String,
+}
+
+/// The revision of a node's stored build limits (see [`NodeBuildLimits`]).
+pub(crate) fn build_limits_revision(stored: Option<&serde_json::Value>) -> String {
+    match stored.and_then(|value| value.get("_version")) {
+        Some(serde_json::Value::Number(version)) => version.to_string(),
+        Some(serde_json::Value::String(version)) => version.clone(),
+        _ => "0".to_string(),
+    }
 }
 
 #[derive(Error, Debug)]
@@ -323,6 +336,9 @@ pub enum NodeError {
 
     #[error("Node {node_id} has invalid stored build limits: {reason}")]
     InvalidStoredBuildLimits { node_id: i32, reason: String },
+
+    #[error(transparent)]
+    StaleRevision(#[from] temps_core::revision::StaleRevision),
 
     #[error("Node '{name}' already exists")]
     AlreadyExists { name: String },
@@ -2057,10 +2073,12 @@ impl NodeService {
                 ),
             });
         }
+        let revision = build_limits_revision(node.build_limits.as_ref());
         match node.build_limits {
             None => Ok(NodeBuildLimits {
                 limits: temps_deployer::build_protocol::BuildLimits::default(),
                 is_default: true,
+                revision,
             }),
             Some(value) => {
                 // The stored object also carries `_version`, which the
@@ -2075,16 +2093,25 @@ impl NodeService {
                 Ok(NodeBuildLimits {
                     limits,
                     is_default: false,
+                    revision,
                 })
             }
         }
     }
 
+    /// Save a worker's build limits and return their new revision.
+    ///
+    /// With `expected_revision`, the save happens only while the stored
+    /// limits still have that revision (what the caller read), checked in the
+    /// same statement that writes; otherwise it is refused with
+    /// [`NodeError::StaleRevision`] and nothing changes. Without one the save
+    /// is unconditional, as it was before revisions existed.
     pub async fn set_build_limits(
         &self,
         node_id: i32,
         limits: temps_deployer::build_protocol::BuildLimits,
-    ) -> Result<(), NodeError> {
+        expected_revision: Option<&str>,
+    ) -> Result<String, NodeError> {
         if node_id == temps_core::CONTROL_PLANE_NODE_ID {
             return Err(NodeError::ControlPlaneHasNoBuildLimits { node_id });
         }
@@ -2102,15 +2129,38 @@ impl NodeService {
         })?;
         // Increment under the same row lock as the settings write: concurrent
         // saves must never publish the same revision for different limits.
-        let changed = self.db.execute(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "UPDATE nodes SET build_limits = jsonb_set($2::jsonb, '{_version}', to_jsonb(COALESCE((build_limits->>'_version')::bigint, 0) + 1)) WHERE id = $1 AND role = 'worker'",
-            vec![node_id.into(), value.into()],
-        )).await?.rows_affected();
-        if changed != 1 {
-            return Err(NodeError::NotFoundById { node_id });
+        // The precondition is in the same statement, so no save can land
+        // between the check and the write.
+        let saved = self
+            .db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "UPDATE nodes SET build_limits = jsonb_set($2::jsonb, '{_version}', to_jsonb(COALESCE((build_limits->>'_version')::bigint, 0) + 1)) \
+                 WHERE id = $1 AND role = 'worker' \
+                   AND ($3::text IS NULL OR COALESCE(build_limits->>'_version', '0') = $3::text) \
+                 RETURNING build_limits->>'_version' AS revision",
+                vec![
+                    node_id.into(),
+                    value.into(),
+                    expected_revision.map(str::to_string).into(),
+                ],
+            ))
+            .await?;
+        if let Some(row) = saved {
+            return Ok(row.try_get::<String>("", "revision")?);
         }
-        Ok(())
+        // Nothing was written: the node is gone, or the precondition failed.
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(NodeError::NotFoundById { node_id })?;
+        let current = build_limits_revision(node.build_limits.as_ref());
+        temps_core::revision::check_expected_revision(
+            || format!("Build limits of node {node_id}"),
+            expected_revision,
+            &current,
+        )?;
+        Err(NodeError::NotFoundById { node_id })
     }
 
     pub async fn set_public_ingress_enabled(
@@ -7976,14 +8026,17 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![node]])
-                .append_exec_results([sea_orm::MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 1,
-                }])
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "revision".to_string(),
+                    sea_orm::Value::from("1"),
+                )])]])
                 .into_connection(),
         );
         let service = NodeService::new(db.clone());
-        service.set_build_limits(1, limits).await.unwrap();
+        assert_eq!(
+            service.set_build_limits(1, limits, None).await.unwrap(),
+            "1"
+        );
         drop(service);
         let db = Arc::try_unwrap(db).unwrap();
         let log = format!("{:?}", db.into_transaction_log());
@@ -8020,17 +8073,92 @@ mod tests {
             ..Default::default()
         };
         let (a, b) = tokio::join!(
-            service.set_build_limits(1, first),
-            service.set_build_limits(1, last)
+            service.set_build_limits(1, first, None),
+            service.set_build_limits(1, last, None)
         );
         a.unwrap();
         b.unwrap();
         let value = service.get_by_id(1).await.unwrap().build_limits.unwrap();
         assert_eq!(value["_version"], 2);
-        service.set_build_limits(1, last).await.unwrap();
+        assert_eq!(service.set_build_limits(1, last, None).await.unwrap(), "3");
         let value = service.get_by_id(1).await.unwrap().build_limits.unwrap();
         assert_eq!(value["_version"], 3);
         assert_eq!(value["concurrency"], 1);
+    }
+
+    /// #2081: admin A reads the limits, admin B saves, then A saves what it
+    /// read with one field changed. A's save must be refused, not revert B's.
+    #[tokio::test]
+    async fn a_build_limits_save_from_a_stale_read_is_refused() {
+        let db = match temps_test_utils::TestDatabase::new().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Database unavailable; skipping stale build limits test: {error}");
+                return;
+            }
+        };
+        let conn = db.db.clone();
+        let schema = sea_orm::Schema::new(sea_orm::DatabaseBackend::Postgres);
+        conn.execute(
+            conn.get_database_backend()
+                .build(&schema.create_table_from_entity(nodes::Entity)),
+        )
+        .await
+        .unwrap();
+        let active: nodes::ActiveModel = sample_node().into();
+        active.insert(conn.as_ref()).await.unwrap();
+        let service = NodeService::new(conn.clone());
+
+        let read_by_a = service.get_build_limits(1).await.unwrap();
+        assert!(read_by_a.is_default);
+        assert_eq!(read_by_a.revision, "0");
+        let read_by_b = service.get_build_limits(1).await.unwrap();
+        let saved_by_b = temps_deployer::build_protocol::BuildLimits {
+            concurrency: 4,
+            ..read_by_b.limits
+        };
+        let b_revision = service
+            .set_build_limits(1, saved_by_b, Some(&read_by_b.revision))
+            .await
+            .unwrap();
+        assert_eq!(b_revision, "1");
+
+        let saved_by_a = temps_deployer::build_protocol::BuildLimits {
+            build_timeout_seconds: 900,
+            ..read_by_a.limits
+        };
+        match service
+            .set_build_limits(1, saved_by_a, Some(&read_by_a.revision))
+            .await
+        {
+            Err(NodeError::StaleRevision(stale)) => {
+                assert_eq!(stale.expected, "0");
+                assert_eq!(stale.current, "1");
+                assert!(stale.resource.contains("node 1"), "{stale}");
+            }
+            other => panic!("expected a stale revision, got {other:?}"),
+        }
+        let stored = service.get_build_limits(1).await.unwrap();
+        assert_eq!(stored.limits, saved_by_b, "B's save is kept");
+        assert_eq!(stored.revision, "1");
+
+        // Re-read and saved again, A's change applies on top of B's.
+        let saved_by_a = temps_deployer::build_protocol::BuildLimits {
+            build_timeout_seconds: 900,
+            ..stored.limits
+        };
+        assert_eq!(
+            service
+                .set_build_limits(1, saved_by_a, Some(&stored.revision))
+                .await
+                .unwrap(),
+            "2"
+        );
+        // A client that sends no revision still saves (older CLIs).
+        assert_eq!(
+            service.set_build_limits(1, saved_by_b, None).await.unwrap(),
+            "3"
+        );
     }
     #[tokio::test]
     async fn builder_limits_reject_missing_node_and_non_worker() {
@@ -8039,7 +8167,7 @@ mod tests {
             .into_connection();
         let service = NodeService::new(Arc::new(db));
         assert!(matches!(
-            service.set_build_limits(99, Default::default()).await,
+            service.set_build_limits(99, Default::default(), None).await,
             Err(NodeError::NotFoundById { node_id: 99 })
         ));
         let mut node = sample_node();
@@ -8049,7 +8177,7 @@ mod tests {
             .into_connection();
         let service = NodeService::new(Arc::new(db));
         assert!(matches!(
-            service.set_build_limits(1, Default::default()).await,
+            service.set_build_limits(1, Default::default(), None).await,
             Err(NodeError::Validation { .. })
         ));
     }
@@ -8065,7 +8193,8 @@ mod tests {
                     temps_deployer::build_protocol::BuildLimits {
                         concurrency: 0,
                         ..Default::default()
-                    }
+                    },
+                    None,
                 )
                 .await,
             Err(NodeError::Validation { .. })
@@ -8075,14 +8204,14 @@ mod tests {
     async fn builder_limits_report_node_removed_during_save() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![sample_node()]])
-            .append_exec_results([sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }])
+            .append_query_results([
+                Vec::<std::collections::BTreeMap<String, sea_orm::Value>>::new(),
+            ])
+            .append_query_results([Vec::<nodes::Model>::new()])
             .into_connection();
         let service = NodeService::new(Arc::new(db));
         assert!(matches!(
-            service.set_build_limits(1, Default::default()).await,
+            service.set_build_limits(1, Default::default(), None).await,
             Err(NodeError::NotFoundById { node_id: 1 })
         ));
     }
@@ -8093,7 +8222,7 @@ mod tests {
             .into_connection();
         let service = NodeService::new(Arc::new(db));
         assert!(matches!(
-            service.set_build_limits(1, Default::default()).await,
+            service.set_build_limits(1, Default::default(), None).await,
             Err(NodeError::Database(_))
         ));
     }

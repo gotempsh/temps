@@ -10,6 +10,7 @@ import {
   type PlatformSettings,
 } from '@/api/platformSettings'
 import { shouldRetryQuery } from '@/lib/query-retry'
+import { isStaleRevision, STALE_REVISION_MESSAGE } from '@/lib/stale-revision'
 import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 
 // Re-export types for backward compatibility
@@ -70,7 +71,14 @@ export function useUpdateSettings() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: updateSettingsApi,
+    // The revision the page was rendered from, not a fresh read: a save made
+    // by someone else since this page loaded is refused instead of reverted.
+    mutationFn: (changes: Partial<PlatformSettings>) =>
+      updateSettingsApi(changes, {
+        expectedRevision: queryClient.getQueryData<PlatformSettings>([
+          'platform-settings',
+        ])?.revision,
+      }),
     onSuccess: (data, changes) => {
       if (changes.agent_sandbox) {
         void queryClient.invalidateQueries({
@@ -81,6 +89,15 @@ export function useUpdateSettings() {
       queryClient.invalidateQueries({ queryKey: ['platform-settings'] })
     },
     onError: (error) => {
+      if (isStaleRevision(error)) {
+        // A reload resets the page's form to the stored values; refetching
+        // alone would leave the stale form able to save over them.
+        toast.error('Settings were changed by someone else', {
+          description: STALE_REVISION_MESSAGE,
+          action: { label: 'Reload', onClick: () => window.location.reload() },
+        })
+        return
+      }
       toast.error('Failed to update settings', {
         description: error instanceof Error ? error.message : 'Unknown error',
       })

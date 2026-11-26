@@ -64,6 +64,8 @@ import { WorkerTunnels } from '@/components/nodes/WorkerTunnels'
 import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
+import { isStaleRevision, STALE_REVISION_MESSAGE } from '@/lib/stale-revision'
+import { AUTOMATIC_LISTEN, ingressSaveBody } from './worker-ingress-save'
 import {
   ALLOW_INGRESS_COMMANDS,
   PRIVATE_INGRESS_COMMAND,
@@ -74,7 +76,7 @@ import {
   workerIngressStatus,
 } from '@/lib/worker-ingress'
 
-const AUTOMATIC = '__automatic__'
+const AUTOMATIC = AUTOMATIC_LISTEN
 
 const port = z
   .string()
@@ -199,6 +201,15 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
     onError: (error, variables) => {
       if (handleSensitiveActionError(error, () => update.mutate(variables)))
         return
+      if (isStaleRevision(error)) {
+        // Re-read: the form keeps the operator's edited fields and shows the
+        // other save for the rest, so saving again applies on top of it.
+        void refresh()
+        toast.error('Public ingress was changed by someone else', {
+          description: STALE_REVISION_MESSAGE,
+        })
+        return
+      }
       toast.error('Could not save public ingress', {
         description: problemDetail(
           error,
@@ -223,13 +234,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   const save = (next: Draft) =>
     update.mutate({
       path: { node_id: node.id },
-      body: {
-        enabled: next.enabled,
-        listen_address: next.listen === AUTOMATIC ? null : next.listen,
-        public_address: next.publicAddress.trim() || null,
-        http_port: Number(next.httpPort) || 80,
-        https_port: Number(next.httpsPort) || 443,
-      },
+      body: ingressSaveBody(next, settings?.revision),
     })
 
   const state = workerIngressStatus(node)
