@@ -385,8 +385,10 @@ async function importAction(source: string, options: ImportOptions): Promise<voi
         let uploadUrl: string
         if (isProject) {
           const pid = await resolveProjectId(options.project!)
+          // api-coverage: POST /projects/{x}/skills/upload
           uploadUrl = `/projects/${pid}/skills/upload`
         } else {
+          // api-coverage: POST /settings/skills/upload
           uploadUrl = '/settings/skills/upload'
         }
 
@@ -547,9 +549,11 @@ async function listAction(options: ListOptions): Promise<void> {
 
     if (isProject) {
       const pid = await resolveProjectId(options.project!)
+      // api-coverage: GET /projects/{project_id}/skills
       url = '/projects/{project_id}/skills'
       pathParams = { project_id: pid }
     } else {
+      // api-coverage: GET /settings/skills
       url = '/settings/skills'
     }
 
@@ -639,8 +643,10 @@ async function createAction(options: CreateOptions): Promise<void> {
       let uploadUrl: string
       if (isProject) {
         const pid = await resolveProjectId(options.project!)
+        // api-coverage: POST /projects/{x}/skills/upload
         uploadUrl = `/projects/${pid}/skills/upload`
       } else {
+        // api-coverage: POST /settings/skills/upload
         uploadUrl = '/settings/skills/upload'
       }
 
@@ -671,9 +677,11 @@ async function createAction(options: CreateOptions): Promise<void> {
 
     if (isProject) {
       const pid = await resolveProjectId(options.project!)
+      // api-coverage: POST /projects/{project_id}/skills
       url = '/projects/{project_id}/skills'
       pathParams = { project_id: pid }
     } else {
+      // api-coverage: POST /settings/skills
       url = '/settings/skills'
     }
 
@@ -724,9 +732,11 @@ async function updateAction(
 
     if (isProject) {
       const pid = await resolveProjectId(options.project!)
+      // api-coverage: PUT /projects/{project_id}/skills/{slug}
       url = '/projects/{project_id}/skills/{slug}'
       pathParams = { project_id: pid, slug }
     } else {
+      // api-coverage: PUT /settings/skills/{slug}
       url = '/settings/skills/{slug}'
       pathParams = { slug }
     }
@@ -767,9 +777,11 @@ async function deleteAction(
 
     if (isProject) {
       const pid = await resolveProjectId(options.project!)
+      // api-coverage: DELETE /projects/{project_id}/skills/{slug}
       url = '/projects/{project_id}/skills/{slug}'
       pathParams = { project_id: pid, slug }
     } else {
+      // api-coverage: DELETE /settings/skills/{slug}
       url = '/settings/skills/{slug}'
       pathParams = { slug }
     }

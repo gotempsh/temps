@@ -17,6 +17,7 @@
     "build:bin": "bun build src/index.ts --compile --outfile bin/temps",
     "spec:update": "bun run scripts/update-openapi.ts",
     "spec:check": "bun run scripts/check-openapi.ts",
+    "coverage:api": "bun run scripts/api-coverage.ts",
     "generate:api": "bun openapi-ts && python3 ../../scripts/source_attribution.py annotate apps/temps-cli/src/api",
     "generate:docs": "bun run scripts/generate-docs.ts",
     "generate:docs:mdx": "bun run scripts/generate-docs.ts --format mdx",

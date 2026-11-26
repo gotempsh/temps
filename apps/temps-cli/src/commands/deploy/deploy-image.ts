@@ -253,6 +253,7 @@ export async function deployImage(options: DeployImageOptions): Promise<void> {
   const apiKey = await credentials.getApiKey()
 
   try {
+    // api-coverage: POST /projects/{project_id}/environments/{environment_id}/deploy/image
     const deployUrl = `${apiUrl}/projects/${projectData.id}/environments/${environmentId}/deploy/image`
 
     const deployBody: Record<string, unknown> = {

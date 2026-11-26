@@ -918,6 +918,7 @@ async function createAction(options: CreateOptions): Promise<void> {
   const envelope = await withSpinner(
     options.workspace ? 'Creating workspace...' : 'Creating sandbox...',
     () =>
+      // api-coverage: POST /v1/sandboxes
       apiRequest<SandboxResponse>(api, '', {
         method: 'POST',
         body: JSON.stringify(body),
@@ -932,6 +933,7 @@ async function createAction(options: CreateOptions): Promise<void> {
   let newBranchError: string | undefined
   if (options.newBranch) {
     try {
+      // api-coverage: POST /v1/sandboxes/{id}/exec
       const res = await apiRequest<ExecResponse>(
         api,
         `/${encodeURIComponent(sbx.id)}/exec`,
@@ -1041,6 +1043,7 @@ async function passwordAction(
 
   if (options.clear) {
     await withSpinner('Clearing preview password...', () =>
+      // api-coverage: DELETE /v1/sandboxes/{id}/preview-password
       apiRequest<void>(
         api,
         `/${encodeURIComponent(id)}/preview-password`,
@@ -1061,6 +1064,7 @@ async function passwordAction(
   const password = generatePassword(len)
 
   const res = await withSpinner('Setting preview password...', () =>
+    // api-coverage: PUT /v1/sandboxes/{id}/preview-password
     apiRequest<SetPreviewPasswordResponse>(
       api,
       `/${encodeURIComponent(id)}/preview-password`,
@@ -1086,6 +1090,7 @@ interface PreviewAccessOptions extends PreviewAccessFlags {
 async function previewAccessAction(id: string, options: PreviewAccessOptions): Promise<void> {
   const api = await auth()
   const envelope = await withSpinner('Fetching sandbox...', () =>
+    // api-coverage: GET /v1/sandboxes/{id}
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}`),
   )
   const inner = envelope.sandbox
@@ -1121,6 +1126,7 @@ async function previewAccessAction(id: string, options: PreviewAccessOptions): P
     )
   }
   const res = await withSpinner('Updating preview access...', () =>
+    // api-coverage: PUT /v1/sandboxes/{id}/preview-access
     apiRequest<PreviewAccessResponse>(api, `/${encodeURIComponent(id)}/preview-access`, {
       method: 'PUT',
       body: JSON.stringify(body),
@@ -1177,6 +1183,7 @@ async function egressAction(id: string, options: EgressOptions): Promise<void> {
   // Validate before any request, so a typo never reaches the server.
   const policy = buildEgressPolicy(options)
   const envelope = await withSpinner('Updating egress policy...', () =>
+    // api-coverage: PUT /v1/sandboxes/{id}/egress-policy
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/egress-policy`, {
       method: 'PUT',
       body: JSON.stringify(policy),
@@ -1232,6 +1239,7 @@ async function listAction(options: ListOptions): Promise<void> {
   const path = qs.length ? `?${qs.join('&')}` : ''
 
   const data = await withSpinner('Fetching sandboxes...', () =>
+    // api-coverage: GET /v1/sandboxes
     apiRequest<ListSandboxesResponse>(api, path),
   )
 
@@ -1328,6 +1336,7 @@ function printPlacement(data: SandboxPlacementResponse): void {
 async function nodesListAction(options: { json?: boolean }): Promise<void> {
   const api = await auth()
   const data = await withSpinner('Fetching sandbox nodes...', () =>
+    // api-coverage: GET /v1/sandboxes/placement
     apiRequest<SandboxPlacementResponse>(api, '/placement'),
   )
   if (options.json) {
@@ -1407,6 +1416,7 @@ async function applyPlacement(
   if (warn) warning(warn)
   const body: UpdateSandboxPlacementBody = { allowed_node_ids: allowed }
   const data = await withSpinner('Updating sandbox placement...', () =>
+    // api-coverage: PUT /v1/sandboxes/placement
     apiRequest<SandboxPlacementResponse>(api, '/placement', {
       method: 'PUT',
       body: JSON.stringify(body),
@@ -1517,6 +1527,7 @@ async function nodesEvictAction(
   let data: NodeEvictionResponse
   try {
     data = await withSpinner(`Destroying sandboxes on ${node}...`, () =>
+      // api-coverage: POST /v1/sandboxes/placement/nodes/{node}/evict
       apiRequest<NodeEvictionResponse>(api, `/placement/nodes/${encodeURIComponent(node)}/evict`, {
         method: 'POST',
       }),
@@ -1667,6 +1678,7 @@ async function nodesShowAction(
   if (pageSize) query.set('page_size', String(pageSize))
   const qs = query.toString() ? `?${query}` : ''
   const data = await withSpinner('Fetching node sandboxes...', () =>
+    // api-coverage: GET /v1/sandboxes/placement/nodes/{node}
     apiRequest<NodeSandboxesResponse>(api, `/placement/nodes/${encodeURIComponent(node)}${qs}`),
   )
   if (options.json) {
@@ -1797,6 +1809,7 @@ async function rmAction(id: string, options: { force?: boolean }): Promise<void>
   }
 
   await withSpinner('Removing sandbox...', () =>
+    // api-coverage: POST /v1/sandboxes/{id}/stop
     apiRequest<void>(api, `/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
   )
   success(`Sandbox ${colors.primary(id)} removed`)
@@ -1805,6 +1818,7 @@ async function rmAction(id: string, options: { force?: boolean }): Promise<void>
 async function pauseAction(id: string): Promise<void> {
   const api = await auth()
   const envelope = await withSpinner('Pausing sandbox...', () =>
+    // api-coverage: POST /v1/sandboxes/{id}/pause
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
   )
   const sbx = toSandboxView(envelope.sandbox)
@@ -1815,6 +1829,7 @@ async function pauseAction(id: string): Promise<void> {
 async function resumeAction(id: string): Promise<void> {
   const api = await auth()
   const envelope = await withSpinner('Resuming sandbox...', () =>
+    // api-coverage: POST /v1/sandboxes/{id}/resume
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
   )
   const sbx = toSandboxView(envelope.sandbox)
@@ -1824,6 +1839,7 @@ async function resumeAction(id: string): Promise<void> {
 async function restartAction(id: string): Promise<void> {
   const api = await auth()
   const envelope = await withSpinner('Restarting sandbox...', () =>
+    // api-coverage: POST /v1/sandboxes/{id}/restart
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/restart`, { method: 'POST' }),
   )
   const sbx = toSandboxView(envelope.sandbox)
@@ -1847,6 +1863,7 @@ async function cloneAction(id: string, options: CloneOptions): Promise<void> {
   }
   const api = await auth()
   const sbx = await withSpinner('Seeding source...', () =>
+    // api-coverage: POST /v1/sandboxes/{id}/source
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/source`, {
       method: 'POST',
       body: JSON.stringify(source),
@@ -1865,6 +1882,7 @@ async function extendAction(id: string, options: { secs: string }): Promise<void
   }
 
   const sbx = await withSpinner('Extending timeout...', () =>
+    // api-coverage: POST /v1/sandboxes/{id}/extend-timeout
     apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/extend-timeout`, {
       method: 'POST',
       body: JSON.stringify({ extra_secs: extra }),
@@ -1903,6 +1921,7 @@ async function execAction(
 
   if (options.detach) {
     const res = await withSpinner('Starting detached job...', () =>
+      // api-coverage: POST /v1/sandboxes/{id}/exec-detached
       apiRequest<ExecDetachedResponse>(api, path, {
         method: 'POST',
         body: JSON.stringify(body),
@@ -1913,6 +1932,7 @@ async function execAction(
     return
   }
 
+  // api-coverage: POST /v1/sandboxes/{id}/exec
   const res = await apiRequest<ExecResponse>(api, path, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -1936,6 +1956,7 @@ async function logsAction(id: string, jobId: string): Promise<void> {
   const api = await auth()
 
   const response = await fetch(
+    // api-coverage: GET /v1/sandboxes/{id}/jobs/{job_id}/logs
     sandboxUrl(api.baseUrl, `/${encodeURIComponent(id)}/jobs/${encodeURIComponent(jobId)}/logs`),
     {
       headers: {
@@ -2013,6 +2034,7 @@ async function domainAction(id: string, options: { port: string }): Promise<void
     throw new Error('--port must be an integer in 1..=65535')
   }
 
+  // api-coverage: GET /v1/sandboxes/{id}/domain
   const res = await apiRequest<DomainResponse>(
     api,
     `/${encodeURIComponent(id)}/domain?port=${port}`,
@@ -2026,6 +2048,7 @@ async function fsReadAction(
 ): Promise<void> {
   const api = await auth()
   const res = await withSpinner('Reading file...', () =>
+    // api-coverage: GET /v1/sandboxes/{id}/fs/read
     apiRequest<ReadFileResponse>(
       api,
       `/${encodeURIComponent(id)}/fs/read?path=${encodeURIComponent(options.path)}`,
@@ -2078,6 +2101,7 @@ async function fsWriteAction(
 
   const api = await auth()
   await withSpinner(`Writing ${bytes.length} bytes to ${options.path}...`, () =>
+    // api-coverage: POST /v1/sandboxes/{id}/fs/write
     apiRequest<void>(api, `/${encodeURIComponent(id)}/fs/write`, {
       method: 'POST',
       body: JSON.stringify(body),
@@ -2091,6 +2115,7 @@ async function fsStatAction(
   options: { path: string; json?: boolean },
 ): Promise<void> {
   const api = await auth()
+  // api-coverage: GET /v1/sandboxes/{id}/fs/stat
   const res = await apiRequest<StatResponse>(
     api,
     `/${encodeURIComponent(id)}/fs/stat?path=${encodeURIComponent(options.path)}`,
@@ -2115,6 +2140,7 @@ async function fsStatAction(
 async function fsMkdirAction(id: string, options: { path: string }): Promise<void> {
   const api = await auth()
   await withSpinner(`Creating ${options.path}...`, () =>
+    // api-coverage: POST /v1/sandboxes/{id}/fs/mkdir
     apiRequest<void>(api, `/${encodeURIComponent(id)}/fs/mkdir`, {
       method: 'POST',
       body: JSON.stringify({ path: options.path }),
@@ -2213,6 +2239,7 @@ async function snapshotCreateAction(
   if (options.label) body.label = options.label
 
   const snap = await withSpinner('Creating snapshot…', () =>
+    // api-coverage: POST /v1/sandboxes/{id}/snapshots
     apiRequest<SnapshotResponse>(
       api,
       `/${encodeURIComponent(sandboxId)}/snapshots`,
@@ -2229,6 +2256,7 @@ async function snapshotCreateAction(
       const maxAttempts = 120 // 120 × 5s = 10 min
       while (current.status === 'creating' && attempts < maxAttempts) {
         await new Promise((r) => setTimeout(r, 5000))
+        // api-coverage: GET /v1/sandbox-snapshots/{snap_id}
         current = await snapshotApiRequest<SnapshotResponse>(api, `/${encodeURIComponent(current.id)}`)
         attempts++
       }
@@ -2275,6 +2303,7 @@ async function snapshotListAction(options: {
   const qs = params.toString() ? `?${params.toString()}` : ''
 
   const res = await withSpinner('Fetching snapshots…', () =>
+    // api-coverage: GET /v1/sandbox-snapshots
     snapshotApiRequest<ListSnapshotsResponse>(api, `${qs}`),
   )
 
@@ -2344,6 +2373,7 @@ async function snapshotDeleteAction(snapId: string, options: { force?: boolean }
 
   const api = await auth()
   await withSpinner('Deleting snapshot…', () =>
+    // api-coverage: DELETE /v1/sandbox-snapshots/{snap_id}
     snapshotApiRequest<void>(api, `/${encodeURIComponent(snapId)}`, { method: 'DELETE' }),
   )
   success(`Snapshot ${colors.primary(snapId)} deleted`)
@@ -2352,6 +2382,7 @@ async function snapshotDeleteAction(snapId: string, options: { force?: boolean }
 async function snapshotStorageAction(options: { json?: boolean }): Promise<void> {
   const api = await auth()
   const summary = await withSpinner('Fetching storage summary…', () =>
+    // api-coverage: GET /v1/sandbox-snapshots/storage-summary
     snapshotApiRequest<StorageSummaryResponse>(api, '/storage-summary'),
   )
 

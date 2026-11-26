@@ -56,6 +56,7 @@ syntax may have changed.
 - [`delivery-profiles`](delivery-profiles.md)
 - [`delivery`](delivery.md)
 - [`ip-access`](ip-access.md)
+- [`preview-gateway`](preview-gateway.md)
 - [`edge-rules`](edge-rules.md)
 - [`network-policy`](network-policy.md)
 - [`audit`](audit.md)

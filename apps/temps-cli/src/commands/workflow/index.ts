@@ -232,6 +232,7 @@ async function listAction(options: ListOptions): Promise<void> {
 
   const api = await authClient()
   const data = await withSpinner('Fetching workflows...', () =>
+    // api-coverage: GET /projects/{project_id}/agents
     apiRequest<ListAgentsResponse>(api, `/projects/${project.id}/agents`),
   )
 
@@ -424,6 +425,7 @@ async function runAction(slug: string | undefined, options: RunOptions): Promise
         ? `workflow "${slug}" for error group ${errorGroupId}`
         : `workflow "${slug}"`
     run = await withSpinner(`Triggering ${runLabel}...`, () =>
+      // api-coverage: POST /projects/{project_id}/agents/{slug}/trigger
       apiRequest<AgentRunResponse>(
         api,
         `/projects/${project.id}/agents/${encodeSlug(slug as string)}/trigger`,
@@ -447,6 +449,7 @@ async function runAction(slug: string | undefined, options: RunOptions): Promise
   await streamLogs(api, project.id, run.id)
 
   // Fetch final run state to surface PR URL, error, and exit code.
+  // api-coverage: GET /projects/{project_id}/agents/runs/{run_id}
   const final = await apiRequest<{ run: AgentRunResponse }>(
     api,
     `/projects/${project.id}/agents/runs/${run.id}`,
@@ -494,6 +497,7 @@ async function streamLogs(
   projectId: number,
   runId: number,
 ): Promise<void> {
+  // api-coverage: GET /projects/{project_id}/agents/runs/{run_id}/stream
   const url = `${api.baseUrl}/projects/${projectId}/agents/runs/${runId}/stream`
   const response = await fetch(url, {
     headers: {

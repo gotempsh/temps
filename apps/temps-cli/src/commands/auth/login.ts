@@ -274,6 +274,7 @@ export async function loginWithDevice(
 
   // 4. Poll for approval. The server is the authority on the polling
   // interval — it returns `slow_down` if we're too eager.
+  // api-coverage: POST /auth/cli/device/poll
   const pollUrl = `${apiBaseUrl}/auth/cli/device/poll`
   const success = await withSpinner(
     `Waiting for browser approval (code ${colors.bold(start.user_code)})...`,

@@ -905,6 +905,13 @@ jobs:
       - name: Check openapi.json is canonical
         run: bun apps/temps-cli/scripts/check-openapi.ts
 
+      # Every operation and input in the committed spec has a CLI command or
+      # flag, or is listed in apps/temps-cli/cli-api-coverage.json: excluded
+      # with a reason, or pending (a list that may only shrink). Reads only
+      # committed files, like the step above, so it needs no install.
+      - name: Check the CLI covers the API
+        run: bun test apps/temps-cli/scripts/api-coverage.test.ts
+
   clippy:
     name: Clippy
     needs: changes
