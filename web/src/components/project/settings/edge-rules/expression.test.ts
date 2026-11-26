@@ -8,9 +8,11 @@ import {
   emptyDraft,
   newCondition,
   newGroup,
+  NO_CONDITIONS,
   removeNode,
   ruleWarnings,
   updateNode,
+  updatePatch,
   validateRule,
   withAutoName,
 } from './expression'
@@ -99,13 +101,71 @@ describe('validateRule', () => {
     ).toContain('Patterns may use at most 8 * wildcards.')
   })
 
-  test('rejects empty nested groups but allows an empty root', () => {
+  test('rejects a rule without conditions, whatever its combinator', () => {
+    for (const combinator of ['all', 'any', 'none'] as const) {
+      const draft = draftWith([])
+      draft.expression.combinator = combinator
+      expect(validateRule(draft)).toEqual([
+        { target: draft.expression.id, message: NO_CONDITIONS },
+      ])
+    }
+  })
+
+  test('a disabled rule stored without conditions can keep them while renamed', () => {
+    const stored = draftWith([]).expression
     const draft = draftWith([])
-    expect(validateRule(draft)).toEqual([])
+    draft.expression = structuredClone(stored)
+    draft.enabled = false
+    draft.name = 'Old catch-all'
+    expect(validateRule(draft, stored)).toEqual([])
+
+    // Turning it on needs a condition...
+    expect(validateRule({ ...draft, enabled: true }, stored)).toEqual([
+      { target: stored.id, message: NO_CONDITIONS },
+    ])
+    // ...and so does a different expression, or a new rule.
+    const changed = structuredClone(stored)
+    changed.combinator = 'any'
+    expect(validateRule({ ...draft, expression: changed }, stored)).toEqual([
+      { target: stored.id, message: NO_CONDITIONS },
+    ])
+    expect(validateRule(draft)).toEqual([
+      { target: stored.id, message: NO_CONDITIONS },
+    ])
+  })
+
+  test('an update leaves out an unchanged expression and sends a changed one', () => {
+    const stored = draftWith([]).expression
+    const draft = { ...draftWith([]), expression: structuredClone(stored) }
+    const unchanged = updatePatch(draft, stored)
+    expect('expression' in unchanged).toBe(false)
+    expect(unchanged.name).toBe(draft.name)
+    expect(unchanged.action).toEqual(draft.action)
+
+    const edited = {
+      ...draft,
+      expression: draftWith([{ field: 'path', op: 'starts_with', value: '/' }])
+        .expression,
+    }
+    expect(updatePatch(edited, stored).expression).toEqual(edited.expression)
+    // Without a stored expression (a new rule) the whole draft is sent.
+    expect(updatePatch(draft, undefined)).toEqual(draft)
+  })
+
+  test('accepts an explicit condition on every path', () => {
+    expect(
+      validateRule(
+        draftWith([{ field: 'path', op: 'starts_with', value: '/' }])
+      )
+    ).toEqual([])
+  })
+
+  test('rejects empty nested groups', () => {
+    const draft = draftWith([{ field: 'path', op: 'starts_with', value: '/' }])
     draft.expression.children.push(newGroup('any', []))
-    expect(messages(draft)).toContain(
-      'Add a condition to this group or remove it.'
-    )
+    expect(messages(draft)).toEqual([
+      'Add a condition to this group or remove it.',
+    ])
   })
 
   test('limits nesting depth to four levels', () => {
@@ -129,7 +189,13 @@ describe('validateRule', () => {
 
   describe('redirect targets cannot become open redirects', () => {
     const redirect = (target: string) =>
-      messages(draftWith([], { type: 'redirect', target, status: 302 }))
+      messages(
+        draftWith([{ field: 'path', op: 'starts_with', value: '/old' }], {
+          type: 'redirect',
+          target,
+          status: 302,
+        })
+      )
 
     test('accepts fixed-host URLs and paths with placeholders', () => {
       expect(redirect('https://docs.example.com{path}')).toEqual([])
@@ -172,8 +238,8 @@ describe('ruleWarnings', () => {
     expect(warnings.some((w) => w.includes('can be forged'))).toBe(true)
   })
 
-  test('warns that a rule without conditions matches everything', () => {
-    expect(ruleWarnings(draftWith([]))[0]).toContain('matches every request')
+  test('a rule without conditions is an error, not a warning', () => {
+    expect(ruleWarnings(draftWith([]))).toEqual([])
   })
 
   test('warns when an allow rule ignores path case', () => {

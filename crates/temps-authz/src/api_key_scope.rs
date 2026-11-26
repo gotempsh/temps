@@ -19,11 +19,22 @@ pub struct InvalidApiKeyScope {
 
 impl std::fmt::Display for InvalidApiKeyScope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Invalid API key resource scope: project {:?}, environment {:?}",
-            self.project_id, self.environment_id
-        )
+        match (self.project_id, self.environment_id) {
+            (None, Some(environment_id)) => write!(
+                formatter,
+                "environment_id {environment_id} needs project_id: an API key scoped to an \
+                 environment must also name its project"
+            ),
+            (Some(project_id), Some(environment_id)) => write!(
+                formatter,
+                "project_id {project_id} and environment_id {environment_id} must both be \
+                 positive IDs"
+            ),
+            (Some(project_id), None) => {
+                write!(formatter, "project_id {project_id} must be a positive ID")
+            }
+            (None, None) => write!(formatter, "an API key scope needs a project_id"),
+        }
     }
 }
 impl std::error::Error for InvalidApiKeyScope {}
@@ -152,6 +163,32 @@ pub fn enforce_api_key_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_errors_say_what_is_wrong_in_plain_words() {
+        let message = |project_id, environment_id| {
+            ApiKeyScope::from_ids(project_id, environment_id)
+                .expect_err("invalid scope")
+                .to_string()
+        };
+        assert_eq!(
+            message(None, Some(1)),
+            "environment_id 1 needs project_id: an API key scoped to an environment must also \
+             name its project"
+        );
+        assert_eq!(message(Some(0), None), "project_id 0 must be a positive ID");
+        assert_eq!(
+            message(Some(1), Some(-1)),
+            "project_id 1 and environment_id -1 must both be positive IDs"
+        );
+        for text in [
+            message(None, Some(1)),
+            message(Some(0), None),
+            message(Some(1), Some(-1)),
+        ] {
+            assert!(!text.contains("Some(") && !text.contains("None"), "{text}");
+        }
+    }
 
     #[test]
     fn malformed_scope_fails_closed() {

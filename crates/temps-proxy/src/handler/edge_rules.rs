@@ -59,6 +59,12 @@ impl From<EdgeRuleServiceError> for Problem {
                     .with_detail(error.to_string())
                     .with_value("issues", issues)
             }
+            EdgeRuleServiceError::InvalidPosition { max, .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Edge Rule Position")
+                    .with_detail(error.to_string())
+                    .with_value("max_position", max)
+            }
             EdgeRuleServiceError::TooManyRules { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Edge Rule Limit Reached")
                 .with_detail(error.to_string()),
@@ -256,7 +262,7 @@ pub async fn get_edge_rule(
     request_body = CreateEdgeRuleRequest,
     responses(
         (status = 201, description = "Rule created", body = EdgeRuleResponse),
-        (status = 400, description = "Invalid rule; `issues` lists each problem", body = ProblemDetails),
+        (status = 400, description = "Invalid rule (`issues` lists each problem; a rule needs at least one condition), or a position outside the project's rules (`max_position` is the last valid one)", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Project or environment not found", body = ProblemDetails),
@@ -768,6 +774,60 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
         assert!(audit.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rule_without_conditions_or_a_bad_position_is_a_400_problem() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project_id, _) = project(&test_db, "edge-routes-refusals").await;
+        let audit = Arc::new(RecordingAudit::default());
+        let admin = AuthContext::new_session(user(), Role::Admin);
+        let uri = format!("/projects/{project_id}/edge-rules");
+
+        let (status, body) = send(
+            app(db.clone(), Some(admin.clone()), audit.clone()),
+            request(
+                Method::POST,
+                &uri,
+                Some(serde_json::json!({
+                    "mode": "enforce",
+                    "expression": {"combinator": "all", "children": []},
+                    "action": {"type": "block", "status": 403}
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["title"], "Invalid Edge Rule", "body: {body}");
+        assert_eq!(
+            body["issues"][0]["message"],
+            temps_edge_rules::NO_CONDITIONS,
+            "body: {body}"
+        );
+
+        let mut at = block_admin();
+        at["position"] = serde_json::json!(999);
+        let (status, body) = send(
+            app(db.clone(), Some(admin), audit.clone()),
+            request(Method::POST, &uri, Some(at)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(body["title"], "Invalid Edge Rule Position", "body: {body}");
+        assert_eq!(body["max_position"], 0, "body: {body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("Position 999")),
+            "body: {body}"
+        );
+        assert!(
+            audit.recorded().is_empty(),
+            "refused writes are not audited"
+        );
     }
 
     #[tokio::test]

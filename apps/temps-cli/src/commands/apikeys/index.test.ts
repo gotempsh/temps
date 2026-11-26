@@ -2,8 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Command } from 'commander'
-import { test, expect, describe } from 'bun:test'
-import { registerApiKeysCommands, computeExpiryIso, groupPermissionsByCategory, parseApiKeyScope } from './index.js'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import {
+  registerApiKeysCommands,
+  computeExpiryIso,
+  groupPermissionsByCategory,
+  parseApiKeyScope,
+  roleTypeForPermissions,
+} from './index.js'
 
 describe('computeExpiryIso', () => {
   test('advances by the given number of days from the reference date', () => {
@@ -18,6 +24,17 @@ describe('computeExpiryIso', () => {
   test('rejects zero and negative day counts', () => {
     expect(computeExpiryIso('0')).toBeNull()
     expect(computeExpiryIso('-5')).toBeNull()
+  })
+})
+
+describe('roleTypeForPermissions', () => {
+  test('a chosen permission list makes the key custom', () => {
+    expect(roleTypeForPermissions('user', ['projects:read'])).toBe('custom')
+  })
+
+  test('no chosen permissions keep the picked role', () => {
+    expect(roleTypeForPermissions('user', null)).toBe('user')
+    expect(roleTypeForPermissions('reader', [])).toBe('reader')
   })
 })
 
@@ -65,4 +82,88 @@ test('invalid scope fails before authentication', async () => {
     await program.parseAsync(['apikeys', 'create', '--environment-id', '9'], { from: 'user' })
     expect(process.exitCode).toBe(1)
   } finally { process.exitCode = previous }
+})
+
+describe('apikeys create --yes', () => {
+  const realFetch = globalThis.fetch
+  const savedEnv = { token: process.env.TEMPS_TOKEN, url: process.env.TEMPS_API_URL }
+  const spies: { mockRestore: () => void }[] = []
+  let bodies: Record<string, unknown>[] = []
+  let printed: string[] = []
+
+  beforeEach(() => {
+    bodies = []
+    printed = []
+    process.env.TEMPS_TOKEN = 'tk_test'
+    process.env.TEMPS_API_URL = 'http://temps.test'
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const request = new Request(input, init)
+      if (request.method !== 'POST' || !new URL(request.url).pathname.endsWith('/api-keys')) {
+        return new Response('no route', { status: 599 })
+      }
+      const body = (await request.json()) as Record<string, unknown>
+      bodies.push(body)
+      return new Response(
+        JSON.stringify({
+          id: 1,
+          name: body.name,
+          api_key: 'tk_created',
+          key_prefix: 'tk_crea',
+          role_type: body.role_type,
+          permissions: body.permissions,
+          created_at: '2026-01-01T00:00:00Z',
+          expires_at: '2027-01-01T00:00:00Z',
+        }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      )
+    }) as typeof fetch
+    const capture = (...args: unknown[]) => { printed.push(args.map(String).join(' ')) }
+    spies.push(spyOn(console, 'log').mockImplementation(capture))
+    spies.push(spyOn(console, 'warn').mockImplementation(capture))
+    spies.push(spyOn(console, 'error').mockImplementation(capture))
+  })
+
+  afterEach(() => {
+    globalThis.fetch = realFetch
+    for (const s of spies.splice(0)) s.mockRestore()
+    if (savedEnv.token === undefined) delete process.env.TEMPS_TOKEN
+    else process.env.TEMPS_TOKEN = savedEnv.token
+    if (savedEnv.url === undefined) delete process.env.TEMPS_API_URL
+    else process.env.TEMPS_API_URL = savedEnv.url
+  })
+
+  async function create(...argv: string[]) {
+    const program = new Command()
+    program.exitOverride()
+    registerApiKeysCommands(program)
+    await program.parseAsync(['apikeys', 'create', '--yes', ...argv], { from: 'user' })
+  }
+
+  test('--permissions with a predefined role creates a custom key with exactly those permissions', async () => {
+    await create('--name', 'ci', '--role', 'user', '--permissions', 'projects:read, deployments:read')
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0]!.role_type).toBe('custom')
+    expect(bodies[0]!.permissions).toEqual(['projects:read', 'deployments:read'])
+    expect(printed.join('\n')).toContain('Using the custom role')
+  })
+
+  test('a --permissions list with an empty entry creates nothing', async () => {
+    const previous = process.exitCode
+    try {
+      await create('--name', 'ci', '--role', 'user', '--permissions', 'projects:read,,')
+      expect(bodies).toEqual([])
+      expect(process.exitCode).toBe(1)
+      expect(printed.join('\n')).toContain('--permissions has an empty entry')
+    } finally {
+      process.exitCode = previous
+    }
+  })
+
+  test('a predefined role without --permissions is sent as chosen', async () => {
+    await create('--name', 'ci', '--role', 'reader')
+    expect(bodies).toHaveLength(1)
+    expect(bodies[0]!.role_type).toBe('reader')
+    expect(bodies[0]!.permissions ?? null).toBeNull()
+    expect(printed.join('\n')).not.toContain('Using the custom role')
+  })
 })
