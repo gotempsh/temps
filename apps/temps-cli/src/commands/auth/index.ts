@@ -24,9 +24,12 @@ export function resolveLoginUrl(
 export function registerAuthCommands(program: Command): void {
   const loginCommand = program
     .command('login [url]')
-    .description('Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.')
+    .description('Authenticate with a Temps server. Opens the browser for interactive logins; use --no-wait then --resume when a person approves but the caller cannot keep a command open, and --api-key for headless / CI.')
     .option('-k, --api-key <key>', 'Use a pre-minted API key (Settings → API Keys) instead of opening the browser. Required for headless / CI.')
     .option('--context <name>', 'Save the credentials under this context name (defaults to URL host)')
+    .option('--no-wait', 'Print the browser approval link and exit instead of waiting for it. For agents and scripts whose shell returns output only when a command exits; finish with --resume.')
+    .option('--resume', 'Finish a sign-in started with --no-wait: wait for the browser approval, then save the credentials. Exits with code 2 if it is not approved yet; run it again.')
+    .option('--wait-secs <seconds>', 'With --resume: how long to wait for the approval before exiting with code 2 (default: 90)')
     .option('--debug', 'Print every request/response (URL, status, headers, raw body) to stderr. Also enabled via TEMPS_DEBUG=1.')
     .action(async (url: string | undefined, opts: Record<string, unknown>) => {
       await login({

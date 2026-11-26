@@ -4,13 +4,13 @@
 import { Button } from '@/components/ui/button'
 import { Sparkles } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router'
-
-const ASSISTANT_PATH = '/chat'
+import { ASSISTANT_URL, assistantHref } from '@/lib/assistant-entry'
 
 /**
- * Global top-bar entry point to the Temps assistant, which takes the whole
- * screen (`/chat`): onboarding when no AI provider is set up, then a chat with
- * Temps. Pressing it again returns to where the user was.
+ * The top bar's one button: "Ask", the same entry the sidebar has, for when
+ * the sidebar is folded or off screen. It opens the assistant (`/chat`):
+ * onboarding when no AI provider is set up, then the last chat or a new one.
+ * Pressing it again returns to where the user was.
  *
  * Always shown: gateway keys are only one possible runtime, and hiding this
  * button also hid managed Cloud and host-authenticated Claude/Codex/OpenCode.
@@ -23,11 +23,11 @@ const ASSISTANT_PATH = '/chat'
 export function AiAssistantButton() {
   const navigate = useNavigate()
   const { pathname } = useLocation()
-  const active = pathname === ASSISTANT_PATH
+  const active = pathname === ASSISTANT_URL
 
   const toggle = () => {
     if (!active) {
-      navigate(ASSISTANT_PATH)
+      navigate(assistantHref())
       return
     }
     // `idx` is react-router's position in this tab's history; 0 means there is
@@ -40,13 +40,12 @@ export function AiAssistantButton() {
   return (
     <Button
       variant={active ? 'secondary' : 'outline'}
-      size="icon"
       onClick={toggle}
-      title="AI assistant"
       aria-pressed={active}
+      className="h-9 gap-1.5 px-2.5 sm:px-3"
     >
-      <Sparkles className="h-4 w-4" />
-      <span className="sr-only">AI assistant</span>
+      <Sparkles className="size-4" />
+      Ask
     </Button>
   )
 }

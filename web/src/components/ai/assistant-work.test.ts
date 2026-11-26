@@ -4,7 +4,6 @@
 import { describe, expect, it } from 'bun:test'
 import {
   failedToolCount,
-  standaloneResultId,
   groupAssistantParts,
   liveWorkSegmentKey,
   liveWorkStatus,
@@ -119,46 +118,6 @@ describe('groupAssistantParts', () => {
       call(tool('b', 'Bash', { command: 'pwd' })),
     ]
     expect(shape(groupAssistantParts(parts, everyTool))).toEqual(['work[a,b]'])
-  })
-})
-
-describe('standaloneResultId', () => {
-  const isLookup = (value: ToolCall) => value.name === 'temps'
-  const hasOwnView = (value: ToolCall) => value.id.startsWith('list')
-  const standalone = (parts: ChatPart[]) =>
-    standaloneResultId(parts, isLookup, hasOwnView)
-
-  it('is the last viewable result of an answer that only looked things up', () => {
-    expect(
-      standalone([
-        call(tool('help', 'temps')),
-        call(tool('list-page-1', 'temps')),
-        text('Fetching the rest.'),
-        call(tool('list-all', 'temps')),
-        call(tool('environments', 'temps')),
-        text('You have 15 projects.'),
-      ])
-    ).toBe('list-all')
-  })
-
-  it('is none once the answer does other work, wherever the lookup sits', () => {
-    expect(
-      standalone([
-        call(tool('playbook', 'temps_playbook')),
-        call(tool('list-projects', 'temps')),
-      ])
-    ).toBeNull()
-    expect(
-      standalone([
-        call(tool('list-projects', 'temps')),
-        call(tool('exec', 'sandbox_exec')),
-      ])
-    ).toBeNull()
-  })
-
-  it('is none when no lookup has a view of its own', () => {
-    expect(standalone([call(tool('help', 'temps'))])).toBeNull()
-    expect(standalone([text('Hello')])).toBeNull()
   })
 })
 

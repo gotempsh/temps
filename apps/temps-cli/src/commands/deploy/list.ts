@@ -98,7 +98,7 @@ export async function list(options: ListOptions): Promise<void> {
     },
     {
       header: 'Created',
-      accessor: (d) => formatRelativeTime(new Date(d.created_at * 1000).toISOString()),
+      accessor: (d) => formatRelativeTime(d.created_at),
       color: (v) => colors.muted(v),
     },
   ]

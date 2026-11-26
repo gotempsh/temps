@@ -12,6 +12,7 @@ import {
 } from '@/components/onboarding/SetupGuide'
 import { Button } from '@/components/ui/button'
 import { CodeBlock } from '@/components/ui/code-block'
+import { CopySetupPromptButton } from '@/components/project/setup/PlainHttpSetup'
 import {
   analyticsSnippets,
   errorSnippets,
@@ -40,10 +41,14 @@ export function ObservabilitySetupGuide({
     enabled: projectId !== undefined,
   })
   const service = project.data
+  // Short labels; the service they open is in the tooltip.
   const setupLink = (label: string) => (
     <Button asChild variant="outline">
-      <Link to={serviceSetupHref(kind, service?.slug)}>
-        {service ? `${label} for ${service.name}` : 'Choose a service'}
+      <Link
+        to={serviceSetupHref(kind, service?.slug)}
+        title={service ? `${label} for ${service.name}` : undefined}
+      >
+        {service ? label : 'Choose service'}
       </Link>
     </Button>
   )
@@ -52,6 +57,13 @@ export function ObservabilitySetupGuide({
     <SetupGuide
       title={guide.title}
       description={guide.description}
+      // A prompt for a coding agent to do the setup in the user's own app,
+      // with this server's endpoints filled in; it needs a service in scope.
+      action={
+        service ? (
+          <CopySetupPromptButton project={service} signal={kind} />
+        ) : undefined
+      }
       steps={guide.steps}
     />
   )
@@ -71,7 +83,7 @@ const guides: Record<
         title: 'Open the service’s analytics setup',
         caption:
           'It has the base path and ingest key for the service, already filled into the snippets.',
-        content: setupLink('Open analytics setup'),
+        content: setupLink('Open setup'),
       },
       {
         title: 'Add the analytics script to your site',
@@ -100,7 +112,7 @@ const guides: Record<
         title: 'Set the DSN',
         caption:
           'Apps deployed on Temps get SENTRY_DSN automatically. Anywhere else, copy it from the service’s error tracking setup.',
-        content: setupLink('Open error tracking setup'),
+        content: setupLink('Open setup'),
       },
       {
         title: 'Send a test error',
@@ -130,7 +142,7 @@ const guides: Record<
               defaultWrap
               disableWrapToggle
             />
-            {setupLink('Open trace setup')}
+            {setupLink('Open setup')}
           </>
         ),
       },

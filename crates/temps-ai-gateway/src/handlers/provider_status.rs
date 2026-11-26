@@ -320,12 +320,12 @@ impl AuditOperation for AiSummaryPreferenceUpdatedAudit {
 
 /// Shown when no active provider key exists. The wording is user-facing: the
 /// console renders it verbatim in the assistant's onboarding state.
+/// It names no vendor: any supported provider's key is enough.
 const NO_PROVIDER_REASON: &str =
-    "No AI provider is configured. Add an OpenRouter API key to start managing Temps by chat.";
+    "No AI provider is configured. Add a provider key to start managing Temps by chat.";
 
-/// Opens the provider-key dialog on the OpenRouter row, so a single key is the
-/// only thing the operator has to supply.
-const NO_PROVIDER_SETUP_PATH: &str = "/ai-gateway?add=openrouter";
+/// The AI providers page, where a key for any supported provider is added.
+const NO_PROVIDER_SETUP_PATH: &str = "/ai-gateway";
 
 /// `(configured, reason, setup_path)` for the capability response. When
 /// unconfigured, both `reason` and `setup_path` are always present so the UI
@@ -656,7 +656,11 @@ mod tests {
         assert!(reason
             .as_deref()
             .is_some_and(|reason| reason.starts_with("No AI provider is configured")));
-        assert_eq!(setup_path.as_deref(), Some("/ai-gateway?add=openrouter"));
+        // Any supported provider will do, so neither names one.
+        assert!(reason
+            .as_deref()
+            .is_some_and(|reason| !reason.contains("OpenRouter")));
+        assert_eq!(setup_path.as_deref(), Some("/ai-gateway"));
     }
 
     #[test]

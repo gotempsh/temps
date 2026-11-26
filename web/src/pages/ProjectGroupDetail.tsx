@@ -51,11 +51,12 @@ import {
 } from '@/components/ui/dropdown-menu'
 import {
   GroupBackupsPage,
-  GroupDatabasesPage,
   GroupDeploymentsPage,
   GroupDomainsPage,
   GroupObservePage,
 } from '@/components/project-groups/GroupScopedPages'
+import { GroupDatabasesPage } from '@/components/project-groups/GroupDatabasesPage'
+import { GroupAreaChrome } from '@/components/navigation/GroupAreaChrome'
 import { legacyGroupTabRedirect } from '@/lib/console-scope'
 
 /**
@@ -63,7 +64,7 @@ import { legacyGroupTabRedirect } from '@/lib/console-scope'
  * project sidebar's entries) live below it.
  */
 export function ProjectGroupDetail() {
-  const { slug = '' } = useParams()
+  const { slug = '', '*': route = '' } = useParams()
   const { search, hash } = useLocation()
   const legacyTab = legacyGroupTabRedirect(slug, search, hash)
   const {
@@ -140,38 +141,46 @@ export function ProjectGroupDetail() {
   }
 
   return (
-    <Routes>
-      <Route index element={<GroupOverview group={group} />} />
-      <Route
-        path="deployments"
-        element={<GroupDeploymentsPage group={group} />}
-      />
-      <Route
-        path="logs"
-        element={<GroupObservePage group={group} kind="logs" />}
-      />
-      <Route
-        path="errors"
-        element={<GroupObservePage group={group} kind="errors" />}
-      />
-      <Route
-        path="traces"
-        element={<GroupObservePage group={group} kind="traces" />}
-      />
-      <Route
-        path="analytics"
-        element={<GroupObservePage group={group} kind="analytics" />}
-      />
-      <Route path="domains" element={<GroupDomainsPage group={group} />} />
-      <Route path="databases" element={<GroupDatabasesPage group={group} />} />
-      <Route path="backups" element={<GroupBackupsPage group={group} />} />
-      <Route path="variables" element={<GroupVariablesPage group={group} />} />
-      <Route path="settings" element={<GroupSettingsPage group={group} />} />
-      <Route
-        path="*"
-        element={<Navigate to={groupHref(group.slug)} replace />}
-      />
-    </Routes>
+    <GroupAreaChrome group={group} route={route}>
+      <Routes>
+        <Route index element={<GroupOverview group={group} />} />
+        <Route
+          path="deployments"
+          element={<GroupDeploymentsPage group={group} />}
+        />
+        <Route
+          path="logs"
+          element={<GroupObservePage group={group} kind="logs" />}
+        />
+        <Route
+          path="errors"
+          element={<GroupObservePage group={group} kind="errors" />}
+        />
+        <Route
+          path="traces"
+          element={<GroupObservePage group={group} kind="traces" />}
+        />
+        <Route
+          path="analytics"
+          element={<GroupObservePage group={group} kind="analytics" />}
+        />
+        <Route path="domains" element={<GroupDomainsPage group={group} />} />
+        <Route
+          path="databases"
+          element={<GroupDatabasesPage group={group} />}
+        />
+        <Route path="backups" element={<GroupBackupsPage group={group} />} />
+        <Route
+          path="variables"
+          element={<GroupVariablesPage group={group} />}
+        />
+        <Route path="settings" element={<GroupSettingsPage group={group} />} />
+        <Route
+          path="*"
+          element={<Navigate to={groupHref(group.slug)} replace />}
+        />
+      </Routes>
+    </GroupAreaChrome>
   )
 }
 

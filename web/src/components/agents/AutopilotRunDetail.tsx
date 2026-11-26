@@ -19,6 +19,7 @@ import {
   untrustedMarkdownImage,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
+import { markdownTable } from '@/components/markdown/table'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -140,6 +141,7 @@ function Markdown({ children }: { children: string }) {
           pre: MarkdownCodeBlock,
           ...untrustedMarkdownImage,
           ...untrustedMarkdownLink,
+          ...markdownTable,
         }}
       >
         {children}

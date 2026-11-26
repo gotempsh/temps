@@ -24,11 +24,14 @@ export interface SetupGuideStep {
 export function SetupGuide({
   title,
   description,
+  action,
   steps,
 }: {
   title: string
   /** One line on why the page is empty, shown under the title. */
   description?: ReactNode
+  /** One action for the whole guide, beside the title (a "Copy prompt"). */
+  action?: ReactNode
   steps: SetupGuideStep[]
 }) {
   const titleId = useId()
@@ -37,13 +40,16 @@ export function SetupGuide({
       aria-labelledby={titleId}
       className="rounded-lg border bg-card text-card-foreground"
     >
-      <div className="space-y-0.5 border-b px-4 py-3">
-        <h2 id={titleId} className="text-base font-medium">
-          {title}
-        </h2>
-        {description && (
-          <p className="text-sm text-muted-foreground">{description}</p>
-        )}
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b px-4 py-3">
+        <div className="min-w-0 space-y-0.5">
+          <h2 id={titleId} className="text-base font-medium">
+            {title}
+          </h2>
+          {description && (
+            <p className="text-sm text-muted-foreground">{description}</p>
+          )}
+        </div>
+        {action}
       </div>
       <ol className="divide-y">
         {steps.map((step, index) => (

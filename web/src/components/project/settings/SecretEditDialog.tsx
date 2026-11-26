@@ -8,6 +8,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import type { ProjectResponse, ProjectSecretResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
+  getProjectSecretOptions,
   listProjectSecretsOptions,
   updateProjectSecretMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -99,7 +100,11 @@ export function SecretEditDialog({
       void queryClient.invalidateQueries({
         queryKey: listProjectSecretsOptions({
           path: { project_id: project.id },
-          query: {},
+        }).queryKey,
+      })
+      void queryClient.invalidateQueries({
+        queryKey: getProjectSecretOptions({
+          path: { project_id: project.id, secret_id: secret.id },
         }).queryKey,
       })
       void queryClient.invalidateQueries({

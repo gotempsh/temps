@@ -6,14 +6,11 @@ import { isInternalConsolePath } from '@/lib/cloud-telemetry-activation'
 /** `context_type` of conversations started from the Temps assistant. */
 export const ASSISTANT_CONTEXT_TYPE = 'assistant'
 
-/**
- * Where an operator pastes the one key the assistant needs. The query opens the
- * add-key dialog on the AI Gateway page with OpenRouter preselected.
- */
-export const OPENROUTER_SETUP_PATH = '/ai-gateway?add=openrouter'
+/** The AI providers page, where every supported provider can be added. */
+export const PROVIDER_SETUP_PATH = '/ai-gateway'
 
 export const NO_PROVIDER_REASON =
-  'No AI provider is configured. Add an OpenRouter API key to start managing Temps by chat.'
+  'No AI provider is configured. Add a provider key to start managing Temps by chat.'
 
 /** Gateway permission mode that has every change wait for the user's approval. */
 export const ASK_BEFORE_CHANGES_MODE = 'confirm-actions'
@@ -24,13 +21,15 @@ export const ASK_BEFORE_CHANGES_MODE = 'confirm-actions'
  */
 export const RUN_CHANGES_AUTOMATICALLY_MODE = 'auto'
 
+/** The two permission modes the assistant offers, in the order they are listed. */
+export const ASSISTANT_PERMISSION_CHOICES = [
+  { id: ASK_BEFORE_CHANGES_MODE, label: 'Ask' },
+  { id: RUN_CHANGES_AUTOMATICALLY_MODE, label: 'Full permission' },
+] as const
+
 /** Whether a conversation's permission mode makes changes wait for approval. */
 export function asksBeforeChanges(permissionModeId: string | null): boolean {
   return permissionModeId === ASK_BEFORE_CHANGES_MODE
-}
-
-export function permissionModeForAsk(ask: boolean): string {
-  return ask ? ASK_BEFORE_CHANGES_MODE : RUN_CHANGES_AUTOMATICALLY_MODE
 }
 
 /**
@@ -187,7 +186,7 @@ export function unconfiguredAssistant(
     reason: status?.reason?.trim() || NO_PROVIDER_REASON,
     setupPath: isInternalConsolePath(status?.setup_path)
       ? status.setup_path
-      : OPENROUTER_SETUP_PATH,
+      : PROVIDER_SETUP_PATH,
   }
 }
 

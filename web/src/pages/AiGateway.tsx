@@ -4148,8 +4148,8 @@ export function AiGatewayPage() {
       shouldValidate: providerKeyForm.formState.isSubmitted,
     })
 
-  // `/ai-gateway?add=openrouter` is where the assistant's onboarding sends
-  // operators. Handled in an effect below, once the existing keys are known.
+  // `/ai-gateway?add=<provider>` is where the assistant's onboarding sends
+  // operators for a provider it does not set up inline. Handled in an effect below, once the existing keys are known.
   const [addSearchParams, setAddSearchParams] = useSearchParams()
   const addProvider = addSearchParams.get('add')
 

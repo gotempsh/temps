@@ -2027,9 +2027,16 @@ mod tests {
             .state
             .status_page_service
             .incident_service()
-            .get_incident_updates(fx.selected_incident)
+            .get_incident_updates(
+                fx.selected_incident,
+                temps_core::PageQuery {
+                    page: None,
+                    page_size: Some(100),
+                },
+            )
             .await
-            .expect("updates");
+            .expect("updates")
+            .0;
         let private = updates
             .iter()
             .find(|u| u.message == "PRIVATE-UPDATE-TEXT")

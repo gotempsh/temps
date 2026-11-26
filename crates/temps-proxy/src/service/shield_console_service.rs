@@ -1113,6 +1113,34 @@ impl ShieldConsoleService {
             .collect()
     }
 
+    /// One entry of `owner`, or [`ShieldConsoleError::EntryNotFound`].
+    pub async fn get_entry(
+        &self,
+        owner: EntryOwner,
+        entry_id: i64,
+    ) -> Result<ShieldEntryResponse, ShieldConsoleError> {
+        let row = shield_operator_entries::Entity::find()
+            .from_raw_sql(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT {ENTRY_COLUMNS} FROM shield_operator_entries \
+                     WHERE id = $1 AND scope = $2 AND project_id IS NOT DISTINCT FROM $3"
+                ),
+                [
+                    entry_id.into(),
+                    owner.scope().into(),
+                    owner.project_id().into(),
+                ],
+            ))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ShieldConsoleError::EntryNotFound {
+                scope: owner.describe(),
+                entry_id,
+            })?;
+        ShieldEntryResponse::from_model(row)
+    }
+
     pub async fn create_entry(
         &self,
         owner: EntryOwner,

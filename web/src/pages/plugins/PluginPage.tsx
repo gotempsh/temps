@@ -243,8 +243,8 @@ export function PluginPage() {
                 <RefreshCw className="mr-2 size-4" />
                 Manage plugins
               </Button>
-              <Button variant="outline" onClick={() => navigate('/tools')}>
-                Back to tools
+              <Button variant="outline" onClick={() => navigate('/projects')}>
+                All projects
               </Button>
             </div>
           </CardContent>

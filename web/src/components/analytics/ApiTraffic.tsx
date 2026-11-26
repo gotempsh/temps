@@ -874,12 +874,11 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       return []
     const fromMs = startDate.getTime()
     const toMs = endDate.getTime()
-    const toMs10 = (n: number) => (n < 1e12 ? n * 1000 : n)
     const bucketMs = points.map((p) => new Date(p.timestamp).getTime())
     const markers: ThresholdMarker[] = []
     for (const d of deploys) {
       const at = d.finished_at ?? d.started_at ?? d.created_at
-      const ts = toMs10(at)
+      const ts = Date.parse(at)
       if (ts < fromMs || ts > toMs) continue
       let best = 0
       let bestDiff = Infinity

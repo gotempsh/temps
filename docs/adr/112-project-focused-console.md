@@ -53,7 +53,7 @@ Project pages show only that project's resources, with one exception: the
 database source of project Logs has no project filter yet, so it shows
 database logs from the whole server and says so ("Showing all on this
 server"; see the table below). Each project page has a single explicit link
-to the server-wide list ("All databases on this server").
+to the server-wide list ("All databases", with "Every database on this server" as its tooltip).
 Nothing became unreachable. Every server-wide list is still in the global
 sidebar. Every project page is a ⌘K destination ("Storefront · Databases").
 Old URLs redirect.
@@ -178,8 +178,8 @@ Risks:
 - **Large projects.** The fan-out shows the first 25 services and says so,
   until the backend filters land.
 - **Muscle memory.** Operators used to the global Databases or Domains list
-  while inside a project now get the project's list. "All … on this server" is
-  one click away.
+  while inside a project now get the project's list. The "All databases" (or domains,
+  backups) button is one click away.
 - **Standalone services** keep their own menu. If most installs never group
   services, step 2's value depends on nudging grouping, which the overview
   already offers.

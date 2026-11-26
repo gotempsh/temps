@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ASSISTANT_URL } from '@/lib/assistant-entry'
 import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { RetiredAiWorkspaceRedirect } from '@/components/routing/RetiredAiWorkspaceRedirect'
 import { CommandPalette } from '@/components/command/CommandPalette'
@@ -27,7 +28,7 @@ import {
   QueryClientProvider,
 } from '@tanstack/react-query'
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
-import { lazy, Suspense, useEffect } from 'react'
+import { lazy, Suspense, useEffect, type ReactNode } from 'react'
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
@@ -68,6 +69,7 @@ import { AcmeContactEmailBanner } from './components/alerts/AcmeContactEmailBann
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import SandboxPreviewAccess from './pages/SandboxPreviewAccess'
 import { SettingsLayout } from './components/settings/SettingsLayout'
+import { ServerAreaChrome } from './components/navigation/ServerAreaChrome'
 import { SidebarInset, SidebarProvider } from './components/ui/sidebar'
 import { AiAssistantProvider } from './components/ai/AiAssistantContext'
 import { AutofixOnboardingProvider } from './components/autofixer/AutofixOnboardingContext'
@@ -100,8 +102,10 @@ const Welcome = lazy(() =>
 const AiOnboarding = lazy(() =>
   import('./pages/AiOnboarding').then((m) => ({ default: m.AiOnboarding }))
 )
-const PlatformTools = lazy(() =>
-  import('./pages/PlatformTools').then((m) => ({ default: m.PlatformTools }))
+const SettingsOverviewPage = lazy(() =>
+  import('./components/settings/SettingsOverviewPage').then((m) => ({
+    default: m.SettingsOverviewPage,
+  }))
 )
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
@@ -585,13 +589,26 @@ const TraefikDiscoveryPage = lazy(() =>
 )
 
 // Full app routes with sidebar
+/**
+ * The page a route renders: lazily loaded, and under its area's tab strip
+ * when the area has several pages.
+ */
+function RoutedPage({ children }: { children: ReactNode }) {
+  return (
+    <Suspense fallback={<PageSkeleton />}>
+      <ServerAreaChrome>{children}</ServerAreaChrome>
+    </Suspense>
+  )
+}
+
 const FullAppRoutes = () => {
   const { routes: extraRoutes } = useConsoleExtensions()
-  // The assistant is a focus mode: no console sidebar, header or banners, just
-  // the conversation. Its own header carries the way back to the console.
-  const focusMode = useLocation().pathname === '/chat'
+  // The assistant is a page like any other: same sidebar, header and
+  // banners. Only its content box differs: the conversation fills what is
+  // left exactly and scrolls inside itself, so the composer stays in view.
+  const chatPage = useLocation().pathname === ASSISTANT_URL
   // On a phone the keyboard must not push the header off screen.
-  useVisualViewportFit(focusMode)
+  useVisualViewportFit(chatPage)
   // A link to a setting lands on that setting, on every page.
   useScrollToLinkedSection()
 
@@ -625,32 +642,27 @@ const FullAppRoutes = () => {
         <AutofixOnboardingProvider>
           <SidebarProvider>
             {/* Wrap sidebar with independent error boundary */}
-            {!focusMode && (
-              <ErrorBoundary
-                fallback={(error, _errorInfo, resetError) => (
-                  <CompactErrorFallback
-                    error={error}
-                    resetError={resetError}
-                    componentName="Sidebar"
-                  />
-                )}
-                onError={(error, errorInfo) => {
-                  console.error(
-                    '[App] Sidebar error caught by boundary:',
-                    error
-                  )
-                  console.error(
-                    '[App] Component stack:',
-                    errorInfo.componentStack
-                  )
-                }}
-              >
-                <AppSidebar />
-              </ErrorBoundary>
-            )}
+            <ErrorBoundary
+              fallback={(error, _errorInfo, resetError) => (
+                <CompactErrorFallback
+                  error={error}
+                  resetError={resetError}
+                  componentName="Sidebar"
+                />
+              )}
+              onError={(error, errorInfo) => {
+                console.error('[App] Sidebar error caught by boundary:', error)
+                console.error(
+                  '[App] Component stack:',
+                  errorInfo.componentStack
+                )
+              }}
+            >
+              <AppSidebar />
+            </ErrorBoundary>
             <SidebarInset
               className={
-                focusMode
+                chatPage
                   ? 'max-md:fixed max-md:inset-x-0 max-md:top-[var(--app-top,0px)] max-md:h-[var(--app-height,100dvh)]'
                   : undefined
               }
@@ -658,41 +670,36 @@ const FullAppRoutes = () => {
               {/* App-wide disk-space banner — sits above the header inside the
               content column (to the right of the fixed sidebar, so it's never
               clipped by it), full content width, on every page. */}
-              {!focusMode && <DiskSpaceAlert />}
+              <DiskSpaceAlert />
               {/* App-wide "newer release published" banner — informational, per-
               version dismissible, links the upgrade docs. */}
-              {!focusMode && <UpdateAvailableBanner />}
-              {!focusMode && <AiHarnessPendingBanner />}
+              <UpdateAvailableBanner />
+              <AiHarnessPendingBanner />
               {/* Docker Compose CLI too old/missing for Compose deployments. */}
-              {!focusMode && <ComposeVersionAlert />}
+              <ComposeVersionAlert />
               {/* HTTPS for environment URLs needs a Let's Encrypt contact; asks
               for it inline while on-demand TLS is on and nothing else blocks. */}
-              {!focusMode && <AcmeContactEmailBanner />}
+              <AcmeContactEmailBanner />
               {/* Wrap header with independent error boundary */}
-              {!focusMode && (
-                <ErrorBoundary
-                  fallback={(error, _errorInfo, resetError) => (
-                    <CompactErrorFallback
-                      error={error}
-                      resetError={resetError}
-                      componentName="Header"
-                      minimal
-                    />
-                  )}
-                  onError={(error, errorInfo) => {
-                    console.error(
-                      '[App] Header error caught by boundary:',
-                      error
-                    )
-                    console.error(
-                      '[App] Component stack:',
-                      errorInfo.componentStack
-                    )
-                  }}
-                >
-                  <Header />
-                </ErrorBoundary>
-              )}
+              <ErrorBoundary
+                fallback={(error, _errorInfo, resetError) => (
+                  <CompactErrorFallback
+                    error={error}
+                    resetError={resetError}
+                    componentName="Header"
+                    minimal
+                  />
+                )}
+                onError={(error, errorInfo) => {
+                  console.error('[App] Header error caught by boundary:', error)
+                  console.error(
+                    '[App] Component stack:',
+                    errorInfo.componentStack
+                  )
+                }}
+              >
+                <Header />
+              </ErrorBoundary>
               {/* Wrap page content with error boundary */}
               <ErrorBoundary
                 fallback={(error, errorInfo, resetError) => (
@@ -720,23 +727,23 @@ const FullAppRoutes = () => {
                 <div
                   data-console-scroll
                   className={
-                    focusMode
+                    chatPage
                       ? 'flex-1 min-h-0 overflow-hidden flex flex-col'
                       : 'flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4'
                   }
                 >
-                  {/* The full-screen chat fills this box exactly, so a banner
+                  {/* The chat fills this box exactly, so a banner
                       gets its own row and the page the rest: stacked in a
                       plain block, the banner pushed the chat's input off the
                       bottom of the screen. Elsewhere the wrapper is
                       `contents`, leaving the scrolling pages as they were. */}
                   <RouteQueryFailureBanner
                     className={
-                      focusMode ? 'shrink-0 px-2 pt-2 pb-0 sm:px-2' : undefined
+                      chatPage ? 'shrink-0 px-2 pt-2 pb-0 sm:px-2' : undefined
                     }
                   />
-                  <div className={focusMode ? 'min-h-0 flex-1' : 'contents'}>
-                    <Suspense fallback={<PageSkeleton />}>
+                  <div className={chatPage ? 'min-h-0 flex-1' : 'contents'}>
+                    <RoutedPage>
                       <Routes>
                         {extraRoutes?.map((r) => (
                           <Route
@@ -758,7 +765,12 @@ const FullAppRoutes = () => {
                         <Route path="/get-started" element={<GetStarted />} />
                         <Route path="/welcome" element={<Welcome />} />
                         <Route path="/setup/ai" element={<AiOnboarding />} />
-                        <Route path="/tools" element={<PlatformTools />} />
+                        {/* The former catch-all index: each of its pages
+                    now has a home under a parent of the sidebar. */}
+                        <Route
+                          path="/tools"
+                          element={<RedirectWithQuery to="/projects" />}
+                        />
                         <Route path="/projects" element={<Projects />} />
                         <Route
                           path="/p/:slug/*"
@@ -876,7 +888,7 @@ const FullAppRoutes = () => {
                         <Route path="/monitoring" element={<Monitoring />}>
                           <Route
                             index
-                            element={<RedirectWithQuery to="alerts" />}
+                            element={<RedirectWithQuery to="alarms" />}
                           />
                           <Route
                             path="resources"
@@ -949,6 +961,10 @@ const FullAppRoutes = () => {
                     settings sidebar swap. */}
                         <Route path="/settings" element={<SettingsLayout />}>
                           <Route index element={<Settings />} />
+                          <Route
+                            path="overview"
+                            element={<SettingsOverviewPage />}
+                          />
                           <Route
                             path="notifications"
                             element={<Notifications />}
@@ -1386,7 +1402,7 @@ const FullAppRoutes = () => {
                         />
                         <Route path="*" element={<NotFound />} />
                       </Routes>
-                    </Suspense>
+                    </RoutedPage>
                   </div>
                 </div>
               </ErrorBoundary>

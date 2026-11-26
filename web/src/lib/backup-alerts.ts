@@ -88,6 +88,14 @@ export function listBackupAlertsOptions() {
  * instance-wide and served to instance administrators only, so the poll is
  * disabled for every other role: it would be refused every minute.
  */
+/**
+ * Whether the top bar shows the backup alert bell: only while an alert is
+ * open (or its list is). With every backup healthy there is nothing to say.
+ */
+export function backupAlertsShown(count: number, open: boolean): boolean {
+  return count > 0 || open
+}
+
 export function backupAlertsQueryOptions(isInstanceAdmin: boolean) {
   return {
     ...listBackupAlertsOptions(),

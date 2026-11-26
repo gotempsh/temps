@@ -126,6 +126,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "listErrorGroupFingerprints",
     "list_error_group_activity",
     "listErrorInboundFilters",
+    "getErrorInboundFilter",
     "list_error_saved_searches",
     "get_error_saved_search",
     "search_error_group_assignees",
@@ -222,6 +223,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_public_compose_services",
     // ── Monitoring the user already configured ──
     "listHttpChecks",
+    "getHttpCheck",
     "getHttpChecksCapabilities",
     "listHttpCheckPresets",
     "listSystemAlarms",
@@ -319,6 +321,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "has_performance_metrics",
     "get_funnel_metrics",
     "list_funnels",
+    "get_funnel",
     "get_unique_events",
     // Conversion goals (ADR 109 D2): definitions the user wrote and
     // aggregate counts per goal or per dimension value.
@@ -373,6 +376,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_ai_harness_status",
     "list_public_providers",
     "list_oidc_providers",
+    "get_oidc_provider",
     "list_oidc_provider_users",
     "list_oidc_role_mappings",
     "get_current_user",
@@ -596,7 +600,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "lookup_shield_client",
     "list_shield_tokens",
     "list_project_shield_entries",
+    "get_project_shield_entry",
     "list_platform_shield_entries",
+    "get_platform_shield_entry",
     "get_shield_settings",
     // Geolocation lookup for an IP — country/city, no PII beyond what the
     // caller already knows (the IP itself). Gated by AnalyticsRead.
@@ -720,6 +726,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_teams",
     "get_team",
     "list_team_members",
+    "get_team_member",
     "list_team_projects",
     "list_project_access",
     // ── Agent secrets + AI provider status ──
@@ -728,6 +735,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // Project secrets — metadata only (key names + environment scoping).
     // Values are never returned by this endpoint; see its doc comment.
     "listProjectSecrets",
+    "getProjectSecret",
     // AI provider list — reports installed/authenticated booleans and
     // available models; actual credentials are never included.
     "list_ai_providers",
@@ -898,6 +906,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "log_ingest_budget",
     "list_facets",
     "NodeMetricsGetAlertRules",
+    "NodeMetricsGetAlertRule",
     "get_cloud_backfill_status",
     "get_current_bulk_activation_job",
     "get_bulk_activation_job",
@@ -1497,9 +1506,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "delete_agent",
     "create_skill",
     "update_skill",
+    "update_skill_put",
     "delete_skill",
     "create_global_skill",
     "update_global_skill",
+    "update_global_skill_put",
     "delete_global_skill",
     "delete_mcp",
     "delete_global_mcp",

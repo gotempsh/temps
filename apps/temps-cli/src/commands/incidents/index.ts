@@ -4,6 +4,7 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { nextPageHint, pageQuery, type PageFlags } from '../../lib/page-options.js'
 import {
   listIncidents,
   createIncident,
@@ -76,7 +77,7 @@ interface VisibilityOptions {
   private?: boolean
 }
 
-interface UpdatesOptions {
+interface UpdatesOptions extends PageFlags {
   id: string
   json?: boolean
 }
@@ -152,6 +153,8 @@ export function registerIncidentsCommands(program: Command): void {
     .command('updates')
     .description('List status updates for an incident')
     .requiredOption('--id <id>', 'Incident ID')
+    .option('--page <n>', 'Page number (default: 1)')
+    .option('--page-size <n>', 'Items per page (default: 20, max: 100)')
     .option('--json', 'Output in JSON format')
     .action(listUpdatesAction)
 
@@ -580,24 +583,28 @@ async function listUpdatesAction(options: UpdatesOptions): Promise<void> {
     return
   }
 
-  const updates = await withSpinner('Fetching incident updates...', async () => {
+  const query = pageQuery(options)
+  const result = await withSpinner('Fetching incident updates...', async () => {
     const { data, error } = await getIncidentUpdates({
       client,
       path: { incident_id: id },
+      query,
     })
     if (error) {
       throw new Error(getErrorMessage(error))
     }
-    return data ?? []
+    if (!data) throw new Error(`Failed to list updates of incident ${id}: empty response`)
+    return data
   })
 
   if (options.json) {
-    json(updates)
+    json(result)
     return
   }
 
+  const updates = result.items
   newline()
-  header(`${icons.info} Incident Updates (${updates.length})`)
+  header(`${icons.info} Incident Updates (${updates.length} of ${result.total}, newest first)`)
 
   if (updates.length === 0) {
     info('No status updates for this incident')
@@ -614,6 +621,8 @@ async function listUpdatesAction(options: UpdatesOptions): Promise<void> {
   ]
 
   printTable(updates, columns, { style: 'minimal' })
+  const more = nextPageHint(result)
+  if (more) info(more)
   newline()
 }
 

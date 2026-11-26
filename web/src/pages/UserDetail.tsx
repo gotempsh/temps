@@ -157,8 +157,9 @@ export function UserDetail() {
   const failedLogins30d = useMemo(() => {
     if (!failedLoginsQuery.data) return undefined
     const cutoff = failedLoginsQuery.dataUpdatedAt - STATS_WINDOW_MS
-    return failedLoginsQuery.data.filter((log) => log.audit_date >= cutoff)
-      .length
+    return failedLoginsQuery.data.filter(
+      (log) => Date.parse(log.audit_date) >= cutoff
+    ).length
   }, [failedLoginsQuery.data, failedLoginsQuery.dataUpdatedAt])
 
   const userDisplayName = target?.user.name || target?.user.username || 'User'

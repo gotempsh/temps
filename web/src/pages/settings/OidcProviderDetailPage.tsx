@@ -44,7 +44,12 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import {
   AlertCircle,
   ArrowLeft,
@@ -58,6 +63,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { ScrollRegion } from '@/components/ui/scroll-region'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 
 /**
  * ADR-045 §4: tooltip shown on the disabled delete control for the provider
@@ -92,9 +98,14 @@ export function OidcProviderDetailPage() {
   const provider: OidcProviderResponse | undefined =
     providersQuery.data?.find((p) => p.id === providerId) ?? undefined
 
+  const [usersPage, setUsersPage] = useState(1)
   const usersQuery = useQuery({
-    ...listOidcProviderUsersOptions({ path: { provider_id: providerId } }),
+    ...listOidcProviderUsersOptions({
+      path: { provider_id: providerId },
+      query: { page: usersPage, page_size: PROVIDER_USERS_PER_PAGE },
+    }),
     enabled: Number.isFinite(providerId) && providerId > 0,
+    placeholderData: keepPreviousData,
   })
 
   const redirectUri = useMemo(() => getOidcRedirectUri(), [])
@@ -289,7 +300,10 @@ export function OidcProviderDetailPage() {
             ? problemMessage(usersQuery.error, 'Failed to load users')
             : null
         }
-        users={usersQuery.data ?? []}
+        users={usersQuery.data?.items ?? []}
+        page={usersPage}
+        total={usersQuery.data?.total ?? 0}
+        onPageChange={setUsersPage}
       />
 
       <ConfirmDeleteDialog
@@ -447,14 +461,23 @@ function ProviderEditor({
   )
 }
 
+/** Users listed per page on a provider, newest first. */
+const PROVIDER_USERS_PER_PAGE = 20
+
 function UsersForProviderCard({
   loading,
   error,
   users,
+  page,
+  total,
+  onPageChange,
 }: {
   loading: boolean
   error: string | null
   users: OidcProviderUserResponse[]
+  page: number
+  total: number
+  onPageChange: (page: number) => void
 }) {
   return (
     <Card>
@@ -490,56 +513,68 @@ function UsersForProviderCard({
             </p>
           </div>
         ) : (
-          <ScrollRegion regionLabel="Users who signed in through this provider, scrollable">
-            <table className="w-full min-w-[640px] text-sm">
-              <thead>
-                <tr className="text-left text-xs uppercase text-muted-foreground">
-                  <th className="px-2 py-2 font-medium">User</th>
-                  <th className="px-2 py-2 font-medium">IdP subject</th>
-                  <th className="hidden px-2 py-2 font-medium md:table-cell">
-                    First seen
-                  </th>
-                  <th className="px-2 py-2 text-right font-medium">Status</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {users.map((user) => (
-                  <tr key={user.id}>
-                    <td className="px-2 py-2">
-                      <Link
-                        to={`/settings/users/${user.id}`}
-                        className="hover:underline"
-                      >
-                        <div className="font-medium">{user.name}</div>
-                        <div className="text-xs text-muted-foreground">
-                          {user.email}
-                        </div>
-                      </Link>
-                    </td>
-                    <td className="px-2 py-2 font-mono text-xs text-muted-foreground">
-                      {user.oidc_subject ?? '—'}
-                    </td>
-                    <td className="hidden px-2 py-2 text-xs text-muted-foreground md:table-cell">
-                      {formatDate(user.created_at)}
-                    </td>
-                    <td className="px-2 py-2 text-right">
-                      <div className="inline-flex items-center gap-1">
-                        {user.mfa_enabled && (
-                          <Badge variant="outline" className="gap-1">
-                            <ShieldCheck className="h-3 w-3" />
-                            MFA
-                          </Badge>
-                        )}
-                        {!user.email_verified && (
-                          <Badge variant="secondary">Unverified</Badge>
-                        )}
-                      </div>
-                    </td>
+          <>
+            <ScrollRegion regionLabel="Users who signed in through this provider, scrollable">
+              <table className="w-full min-w-[640px] text-sm">
+                <thead>
+                  <tr className="text-left text-xs uppercase text-muted-foreground">
+                    <th className="px-2 py-2 font-medium">User</th>
+                    <th className="px-2 py-2 font-medium">IdP subject</th>
+                    <th className="hidden px-2 py-2 font-medium md:table-cell">
+                      First seen
+                    </th>
+                    <th className="px-2 py-2 text-right font-medium">Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </ScrollRegion>
+                </thead>
+                <tbody className="divide-y">
+                  {users.map((user) => (
+                    <tr key={user.id}>
+                      <td className="px-2 py-2">
+                        <Link
+                          to={`/settings/users/${user.id}`}
+                          className="hover:underline"
+                        >
+                          <div className="font-medium">{user.name}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {user.email}
+                          </div>
+                        </Link>
+                      </td>
+                      <td className="px-2 py-2 font-mono text-xs text-muted-foreground">
+                        {user.oidc_subject ?? '—'}
+                      </td>
+                      <td className="hidden px-2 py-2 text-xs text-muted-foreground md:table-cell">
+                        {formatDate(user.created_at)}
+                      </td>
+                      <td className="px-2 py-2 text-right">
+                        <div className="inline-flex items-center gap-1">
+                          {user.mfa_enabled && (
+                            <Badge variant="outline" className="gap-1">
+                              <ShieldCheck className="h-3 w-3" />
+                              MFA
+                            </Badge>
+                          )}
+                          {!user.email_verified && (
+                            <Badge variant="secondary">Unverified</Badge>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </ScrollRegion>
+            {total > PROVIDER_USERS_PER_PAGE && (
+              <ResponsivePagination
+                page={page}
+                pageSize={PROVIDER_USERS_PER_PAGE}
+                total={total}
+                totalPages={Math.ceil(total / PROVIDER_USERS_PER_PAGE)}
+                onPageChange={onPageChange}
+                ariaLabel="Provider user pagination"
+              />
+            )}
+          </>
         )}
       </CardContent>
     </Card>

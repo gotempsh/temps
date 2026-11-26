@@ -6,7 +6,6 @@ import {
   ASSISTANT_ATTACHMENT_LIMITS,
   assistantAttachTitle,
   assistantImageError,
-  attachHint,
   attachmentSelectionError,
   createPendingAttachment,
 } from './attachment-previews'
@@ -118,8 +117,9 @@ describe('createPendingAttachment', () => {
 describe('attach copy for assistant chats', () => {
   const limits = ASSISTANT_ATTACHMENT_LIMITS
   it('says images are unavailable when the model is text-only', () => {
-    expect(attachHint(true, 'no', limits)).toContain('PDFs and files')
-    expect(attachHint(true, 'no', limits)).toContain('can\u2019t read images')
+    expect(assistantAttachTitle('no', limits, true)).toContain(
+      'can\u2019t read images'
+    )
     expect(assistantAttachTitle('no', limits, true)).toContain(
       'Attach PDFs and files'
     )
@@ -128,7 +128,9 @@ describe('attach copy for assistant chats', () => {
     )
   })
   it('offers images when the model reads them', () => {
-    expect(attachHint(true, 'yes', limits)).toContain('images, PDFs, and files')
+    expect(assistantAttachTitle('yes', limits, true)).toContain(
+      'Attach images, PDFs and files'
+    )
     expect(assistantAttachTitle('yes', limits, true)).toContain('10 MB')
   })
   it('warns that images depend on the model when the catalogue is silent', () => {
@@ -140,10 +142,5 @@ describe('attach copy for assistant chats', () => {
     expect(assistantAttachTitle('yes', limits, false)).toContain(
       'first message'
     )
-  })
-  it('keeps the workspace wording for non-assistant chats', () => {
-    expect(
-      attachHint(false, 'unknown', { maxFiles: 8, maxBytes: 20 * 1024 * 1024 })
-    ).toContain('up to 8 files, 20 MB each')
   })
 })

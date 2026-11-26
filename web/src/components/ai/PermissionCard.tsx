@@ -43,6 +43,7 @@ import {
   untrustedMarkdownImage,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
+import { markdownTable } from '@/components/markdown/table'
 import {
   describeParameters,
   summaryTitle,
@@ -115,6 +116,7 @@ const markdownComponents: Components = {
   pre: MarkdownCodeBlock,
   ...untrustedMarkdownImage,
   ...untrustedMarkdownLink,
+  ...markdownTable,
 }
 
 // ─── Sub-renderers ────────────────────────────────────────────────────────────

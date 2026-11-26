@@ -106,8 +106,8 @@ test('cached S3 sources stay visible when a refresh fails', () => {
       worker_credentials: 'scoped',
       effective_force_path_style: true,
       path_style_reason: 'configured',
-      created_at: Date.parse('2026-01-01T00:00:00Z'),
-      updated_at: Date.parse('2026-01-01T00:00:00Z'),
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
     },
   ]
   client.setQueryData(listKey, cached)

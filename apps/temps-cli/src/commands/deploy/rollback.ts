@@ -56,7 +56,7 @@ export function formatRollbackChoice(d: DeploymentResponse): {
   const commit =
     d.commit_hash?.substring(0, 7) ?? (isRollback ? `from #${d.metadata?.rolledBackFromId ?? '?'}` : '-')
   const currentTag = d.is_current ? ' (current)' : ''
-  const date = new Date(d.created_at * 1000).toLocaleString()
+  const date = new Date(d.created_at).toLocaleString()
 
   return {
     name: `#${d.id} - ${branch} (${commit})${currentTag}`,

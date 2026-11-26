@@ -80,22 +80,22 @@ pub struct DomainResponse {
     pub id: i32,
     pub domain: String,
     pub status: String,
-    pub expiration_time: Option<i64>,
-    pub last_renewed: Option<i64>,
+    pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_renewed: Option<chrono::DateTime<chrono::Utc>>,
     pub dns_challenge_token: Option<String>,
     pub dns_challenge_value: Option<String>,
     pub last_error: Option<String>,
     pub last_error_type: Option<String>,
     pub is_wildcard: bool,
     pub verification_method: String,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     /// The PEM-encoded certificate chain (can be displayed in browser or downloaded)
     pub certificate: Option<String>,
-    /// On-demand TLS negative-cache deadline (epoch millis), when this hostname's
+    /// On-demand TLS negative-cache deadline (ISO 8601, UTC), when this hostname's
     /// on-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).
     /// `None` means no active backoff.
-    pub on_demand_backoff_until: Option<i64>,
+    pub on_demand_backoff_until: Option<chrono::DateTime<chrono::Utc>>,
     /// Why the last certificate attempt failed, when it did: the CA could not
     /// reach the host (`unreachable`), DNS has no usable record
     /// (`dns_lookup`), something other than this server answered
@@ -150,20 +150,18 @@ impl From<temps_entities::domains::Model> for DomainResponse {
             id: domain.id,
             domain: domain.domain,
             status: domain.status,
-            expiration_time: domain.expiration_time.map(|dt| dt.timestamp_millis()),
-            last_renewed: domain.last_renewed.map(|dt| dt.timestamp_millis()),
+            expiration_time: domain.expiration_time,
+            last_renewed: domain.last_renewed,
             dns_challenge_token: domain.dns_challenge_token,
             dns_challenge_value: domain.dns_challenge_value,
             last_error: domain.last_error,
             last_error_type: domain.last_error_type,
             is_wildcard: domain.is_wildcard,
             verification_method: domain.verification_method,
-            created_at: domain.created_at.timestamp_millis(),
-            updated_at: domain.updated_at.timestamp_millis(),
+            created_at: domain.created_at,
+            updated_at: domain.updated_at,
             certificate: domain.certificate,
-            on_demand_backoff_until: domain
-                .on_demand_backoff_until
-                .map(|dt| dt.timestamp_millis()),
+            on_demand_backoff_until: domain.on_demand_backoff_until,
             failure_cause: domain
                 .failure_cause
                 .as_deref()
@@ -197,16 +195,16 @@ impl From<crate::tls::models::Certificate> for DomainResponse {
             id: 0, // Certificate model doesn't have ID, will need to get from database
             domain: cert.domain.clone(),
             status,
-            expiration_time: Some(cert.expiration_time.timestamp_millis()),
-            last_renewed: cert.last_renewed.map(|dt| dt.timestamp_millis()),
+            expiration_time: Some(cert.expiration_time),
+            last_renewed: cert.last_renewed,
             dns_challenge_token: None, // Will be populated by challenge methods
             dns_challenge_value: None, // Will be populated by challenge methods
             last_error,
             last_error_type,
             is_wildcard: cert.is_wildcard,
             verification_method: cert.verification_method,
-            created_at: chrono::Utc::now().timestamp_millis(),
-            updated_at: chrono::Utc::now().timestamp_millis(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
             certificate: Some(cert.certificate_pem),
             // The `Certificate` model carries no on-demand backoff state; that
             // lives on the `domains` row, surfaced via the other `From` impl.
@@ -237,9 +235,9 @@ pub struct AcmeOrderResponse {
     pub certificate_url: Option<String>,
     pub error: Option<String>,
     pub error_type: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub expires_at: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Live challenge validation status fetched from Let's Encrypt
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge_validation: Option<ChallengeValidationStatus>,
@@ -368,9 +366,9 @@ impl From<crate::tls::models::AcmeOrder> for AcmeOrderResponse {
             certificate_url: order.certificate_url,
             error: order.error,
             error_type: order.error_type,
-            created_at: order.created_at.timestamp_millis(),
-            updated_at: order.updated_at.timestamp_millis(),
-            expires_at: order.expires_at.map(|dt| dt.timestamp_millis()),
+            created_at: order.created_at,
+            updated_at: order.updated_at,
+            expires_at: order.expires_at,
             challenge_validation: None, // Will be populated by fetching from Let's Encrypt
         }
     }
@@ -450,8 +448,8 @@ pub struct OnDemandCertAttemptResponse {
     pub error_category: Option<String>,
     /// End-to-end issuance duration in milliseconds (0/None for skipped).
     pub duration_ms: Option<i32>,
-    /// When the attempt was recorded (epoch millis).
-    pub created_at: i64,
+    /// When the attempt was recorded (ISO 8601, UTC).
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<temps_entities::on_demand_cert_attempts::Model> for OnDemandCertAttemptResponse {
@@ -467,7 +465,7 @@ impl From<temps_entities::on_demand_cert_attempts::Model> for OnDemandCertAttemp
             error_chain: m.error_chain,
             error_category: m.error_category,
             duration_ms: m.duration_ms,
-            created_at: m.created_at.timestamp_millis(),
+            created_at: m.created_at,
         }
     }
 }
@@ -482,10 +480,10 @@ pub struct OnDemandCertRow {
     /// `on_demand_pending`, `on_demand_issuing`, `active`, `on_demand_failed`,
     /// etc. `None` when no `domains` row exists yet for this hostname.
     pub status: Option<String>,
-    /// Certificate expiration (epoch millis), when an active cert exists.
-    pub expiration_time: Option<i64>,
-    /// On-demand negative-cache deadline (epoch millis), when in backoff.
-    pub backoff_until: Option<i64>,
+    /// Certificate expiration (ISO 8601, UTC), when an active cert exists.
+    pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// On-demand negative-cache deadline (ISO 8601, UTC), when in backoff.
+    pub backoff_until: Option<chrono::DateTime<chrono::Utc>>,
     /// The audit record for the attempt this row represents (newest first in
     /// the list).
     pub attempt: OnDemandCertAttemptResponse,
@@ -509,8 +507,8 @@ pub struct CertStatusResponse {
     pub hostname: String,
     /// Current cert lifecycle status from the `domains` row, when one exists.
     pub status: Option<String>,
-    /// On-demand negative-cache deadline (epoch millis), when in backoff.
-    pub backoff_until: Option<i64>,
+    /// On-demand negative-cache deadline (ISO 8601, UTC), when in backoff.
+    pub backoff_until: Option<chrono::DateTime<chrono::Utc>>,
     /// The most recent on-demand issuance attempt for this hostname, if any.
     pub last_attempt: Option<OnDemandCertAttemptResponse>,
 }
@@ -528,8 +526,8 @@ pub struct RenewalAttemptResponse {
     pub outcome: String,
     pub error: Option<String>,
     pub error_type: Option<String>,
-    /// When the attempt was recorded (epoch millis).
-    pub created_at: i64,
+    /// When the attempt was recorded (ISO 8601, UTC).
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl From<temps_entities::renewal_attempts::Model> for RenewalAttemptResponse {
@@ -541,7 +539,7 @@ impl From<temps_entities::renewal_attempts::Model> for RenewalAttemptResponse {
             outcome: m.outcome,
             error: m.error,
             error_type: m.error_type,
-            created_at: m.created_at.timestamp_millis(),
+            created_at: m.created_at,
         }
     }
 }

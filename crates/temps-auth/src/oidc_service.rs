@@ -594,17 +594,25 @@ impl OidcService {
 
     /// Users that have logged in via this provider (matched by
     /// `users.oidc_provider_id`). Returns soft-deleted users filtered out.
+    /// One page of the active users who sign in through a provider, newest
+    /// first, with the total.
     pub async fn list_users_for_provider(
         &self,
         provider_id: i32,
-    ) -> Result<Vec<users::Model>, OidcError> {
+        page: temps_core::PageQuery,
+    ) -> Result<(Vec<users::Model>, u64), OidcError> {
+        use sea_orm::PaginatorTrait;
+
         self.get_provider(provider_id).await?;
-        Ok(users::Entity::find()
+        let (_, page_size) = page.normalize();
+        let paginator = users::Entity::find()
             .filter(users::Column::OidcProviderId.eq(provider_id))
             .filter(users::Column::DeletedAt.is_null())
-            .order_by_asc(users::Column::Email)
-            .all(self.db.as_ref())
-            .await?)
+            .order_by_desc(users::Column::CreatedAt)
+            .order_by_desc(users::Column::Id)
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await?;
+        Ok((paginator.fetch_page(page.page_index()).await?, total))
     }
 
     pub async fn delete_provider(&self, provider_id: i32) -> Result<(), OidcError> {

@@ -75,17 +75,18 @@ export function previewLinkBlockedReason(options: {
 
 /**
  * When a link stops working, as a wall-clock time. `expires_at` from the API
- * is Unix seconds. An absolute time never goes stale on screen the way a
+ * is an ISO 8601 timestamp. An absolute time never goes stale on screen the way a
  * "in 1 h" label computed once would.
  */
 export function previewLinkExpiry(
-  expiresAt: number,
+  /** ISO 8601, as the API returns it. */
+  expiresAt: string,
   options: { locale?: string; timeZone?: string } = {}
 ): string {
   // Date and time are formatted separately and joined here: a combined
   // `toLocaleString` uses a locale-data-version-dependent connector
   // ("Jan 1, 12:30 PM" in one ICU release, "Jan 1 at 12:30 PM" in another).
-  const at = new Date(expiresAt * 1000)
+  const at = new Date(expiresAt)
   const day = at.toLocaleDateString(options.locale, {
     month: 'short',
     day: 'numeric',

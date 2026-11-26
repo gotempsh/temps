@@ -19,7 +19,7 @@ temps-authz = { path = "../temps-authz" }
 
 # Web framework
 axum = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 
 # Database
 sea-orm = { workspace = true }
@@ -43,6 +43,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true }
+tower = { workspace = true }
 
 [lints]
 workspace = true

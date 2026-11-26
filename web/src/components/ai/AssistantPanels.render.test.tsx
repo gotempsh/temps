@@ -6,13 +6,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 
-import { AskBeforeChangesToggle } from './AskBeforeChangesToggle'
 import { AssistantOnboarding, AssistantStart } from './AssistantPanels'
-import {
-  ASSISTANT_EXAMPLE_PROMPTS,
-  NO_PROVIDER_REASON,
-  OPENROUTER_SETUP_PATH,
-} from './assistant-state'
+import { NO_PROVIDER_REASON, PROVIDER_SETUP_PATH } from './assistant-state'
 
 function render(node: React.ReactNode) {
   const client = new QueryClient({
@@ -29,7 +24,7 @@ describe('AssistantOnboarding', () => {
   const markup = render(
     <AssistantOnboarding
       reason={NO_PROVIDER_REASON}
-      setupPath={OPENROUTER_SETUP_PATH}
+      setupPath={PROVIDER_SETUP_PATH}
       cloudPath="/settings/cloud"
     />
   )
@@ -38,9 +33,30 @@ describe('AssistantOnboarding', () => {
     expect(markup).toContain('No AI provider is configured')
   })
 
-  test('shows a concrete example of what it would do', () => {
-    expect(markup).toContain(ASSISTANT_EXAMPLE_PROMPTS[0])
-    expect(markup).toContain('Deletions always wait for your approval')
+  test('is setup and nothing else: no things to ask before a key exists', () => {
+    const heading = markup.indexOf('Connect an AI provider</h2>')
+    const reason = markup.indexOf('No AI provider is configured')
+    const providers = markup.indexOf('aria-label="AI provider"')
+    expect(heading).toBeGreaterThan(-1)
+    expect(reason).toBeGreaterThan(heading)
+    expect(providers).toBeGreaterThan(reason)
+    expect(markup).not.toContain('Things to ask')
+    expect(markup).not.toContain('<ul')
+    expect(markup.match(/<h2/g)).toHaveLength(1)
+  })
+
+  test('offers every supported provider, not one vendor', () => {
+    for (const name of [
+      'OpenRouter',
+      'OpenAI',
+      'Anthropic',
+      'Google Gemini',
+      'xAI',
+      'OpenAI API',
+    ])
+      expect(markup).toContain(`>${name}</span>`)
+    // One is chosen to start with, so the key field is there at once.
+    expect(markup.match(/aria-pressed="true"/g)).toHaveLength(1)
   })
 
   test('takes the key inline, as a masked field that is never prefilled', () => {
@@ -48,13 +64,14 @@ describe('AssistantOnboarding', () => {
     expect(markup).toContain('type="password"')
     expect(markup).toContain('autoComplete="off"')
     expect(markup).not.toContain('value="')
-    expect(markup).toContain('Save key')
+    // Tried or connected here: both are buttons, neither a link away.
+    expect(markup).toContain('>Connect</button>')
+    expect(markup).toContain('>Test</button>')
+    expect(markup).not.toContain('Add endpoint')
   })
 
   test('deep-links to the setup page, not documentation', () => {
-    expect(markup).toContain(
-      `href="${OPENROUTER_SETUP_PATH.replace('?', '?')}"`
-    )
+    expect(markup).toContain(`href="${PROVIDER_SETUP_PATH.replace('?', '?')}"`)
     expect(markup).toContain('Open AI provider settings')
   })
 
@@ -63,7 +80,7 @@ describe('AssistantOnboarding', () => {
     const without = render(
       <AssistantOnboarding
         reason={NO_PROVIDER_REASON}
-        setupPath={OPENROUTER_SETUP_PATH}
+        setupPath={PROVIDER_SETUP_PATH}
       />
     )
     expect(without).not.toContain('Temps Cloud')
@@ -73,7 +90,7 @@ describe('AssistantOnboarding', () => {
 describe('AssistantOnboarding sizing', () => {
   const props = {
     reason: NO_PROVIDER_REASON,
-    setupPath: OPENROUTER_SETUP_PATH,
+    setupPath: PROVIDER_SETUP_PATH,
   }
 
   test('is compact in the dock', () => {
@@ -96,43 +113,5 @@ describe('AssistantStart', () => {
     expect(markup).toContain('role="status"')
     expect(markup).toContain('animate-pulse')
     expect(markup).not.toContain('animate-spin')
-  })
-})
-
-describe('AskBeforeChangesToggle', () => {
-  test('is off when changes run automatically', () => {
-    const markup = render(
-      <AskBeforeChangesToggle permissionModeId="auto" onChange={() => {}} />
-    )
-    expect(markup).toContain('Ask before changes')
-    expect(markup).toContain('aria-checked="false"')
-  })
-
-  test('is on when every change asks first', () => {
-    const markup = render(
-      <AskBeforeChangesToggle
-        permissionModeId="confirm-actions"
-        onChange={() => {}}
-      />
-    )
-    expect(markup).toContain('aria-checked="true"')
-  })
-
-  test('says deletions always ask, so the off state is not read as "no safety"', () => {
-    const markup = render(
-      <AskBeforeChangesToggle permissionModeId="auto" onChange={() => {}} />
-    )
-    expect(markup).toContain('Deletions always ask')
-  })
-
-  test('can be disabled while a turn is running', () => {
-    const markup = render(
-      <AskBeforeChangesToggle
-        permissionModeId="auto"
-        disabled
-        onChange={() => {}}
-      />
-    )
-    expect(markup).toContain('disabled=""')
   })
 })

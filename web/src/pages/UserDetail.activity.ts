@@ -12,9 +12,9 @@ export function summarizeActivity(
   let lastActivity: number | undefined
   const calls = new Set<string>()
   for (const log of logs) {
-    if (lastActivity === undefined || log.audit_date > lastActivity)
-      lastActivity = log.audit_date
-    if (log.audit_date < cutoff) continue
+    const at = Date.parse(log.audit_date)
+    if (lastActivity === undefined || at > lastActivity) lastActivity = at
+    if (at < cutoff) continue
     const data = log.data
     const callId =
       log.operation_type === 'EXTERNAL_PLUGIN_AI_WRITE' &&
@@ -33,6 +33,7 @@ export function summarizeActivity(
   // A full newest-first batch cannot establish the total when every row is
   // inside the window, regardless of how many calls deduplication removes.
   const actionsIncomplete =
-    logs.length >= batchSize && logs.every((log) => log.audit_date >= cutoff)
+    logs.length >= batchSize &&
+    logs.every((log) => Date.parse(log.audit_date) >= cutoff)
   return { actions30d, lastActivity, actionsIncomplete }
 }

@@ -94,6 +94,13 @@ pub struct UpdateMcpDefinitionRequest {
     pub config: Option<serde_json::Value>,
 }
 
+/// Normalise a definition description for storage: an empty or
+/// whitespace-only string means "no description" and is stored as `NULL`, so
+/// clients can clear the field by sending `""` and read it back as `null`.
+pub(crate) fn normalize_description(description: Option<String>) -> Option<String> {
+    description.filter(|d| !d.trim().is_empty())
+}
+
 pub struct DefinitionService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<temps_core::EncryptionService>,
@@ -358,7 +365,7 @@ impl DefinitionService {
             project_id: Set(Some(project_id)),
             slug: Set(request.slug.clone()),
             name: Set(request.name),
-            description: Set(request.description),
+            description: Set(normalize_description(request.description)),
             content: Set(request.content),
             archive: Set(request.archive),
             ..Default::default()
@@ -383,7 +390,7 @@ impl DefinitionService {
             active.name = Set(name);
         }
         if let Some(description) = request.description {
-            active.description = Set(Some(description));
+            active.description = Set(normalize_description(Some(description)));
         }
         if let Some(content) = request.content {
             active.content = Set(content);
@@ -459,7 +466,7 @@ impl DefinitionService {
             project_id: Set(None),
             slug: Set(request.slug.clone()),
             name: Set(request.name),
-            description: Set(request.description),
+            description: Set(normalize_description(request.description)),
             content: Set(request.content),
             archive: Set(request.archive),
             ..Default::default()
@@ -483,7 +490,7 @@ impl DefinitionService {
             active.name = Set(name);
         }
         if let Some(description) = request.description {
-            active.description = Set(Some(description));
+            active.description = Set(normalize_description(Some(description)));
         }
         if let Some(content) = request.content {
             active.content = Set(content);
@@ -602,7 +609,7 @@ impl DefinitionService {
             project_id: Set(Some(project_id)),
             slug: Set(request.slug.clone()),
             name: Set(request.name),
-            description: Set(request.description),
+            description: Set(normalize_description(request.description)),
             config: Set(protected_config),
             ..Default::default()
         };
@@ -627,7 +634,7 @@ impl DefinitionService {
             active.name = Set(name);
         }
         if let Some(description) = request.description {
-            active.description = Set(Some(description));
+            active.description = Set(normalize_description(Some(description)));
         }
         if let Some(mut config) = request.config {
             Self::merge_masked_config(&existing_config, &mut config, "")?;
@@ -701,7 +708,7 @@ impl DefinitionService {
             project_id: Set(None),
             slug: Set(request.slug.clone()),
             name: Set(request.name),
-            description: Set(request.description),
+            description: Set(normalize_description(request.description)),
             config: Set(protected_config),
             ..Default::default()
         };
@@ -725,7 +732,7 @@ impl DefinitionService {
             active.name = Set(name);
         }
         if let Some(description) = request.description {
-            active.description = Set(Some(description));
+            active.description = Set(normalize_description(Some(description)));
         }
         if let Some(mut config) = request.config {
             Self::merge_masked_config(&existing_config, &mut config, "")?;
@@ -889,6 +896,136 @@ mod tests {
                 "mcp-definition-test",
             )),
         )
+    }
+
+    fn skill_model(description: Option<&str>) -> project_skill_definitions::Model {
+        project_skill_definitions::Model {
+            id: 3,
+            project_id: None,
+            slug: "notes".to_string(),
+            name: "Notes".to_string(),
+            description: description.map(str::to_string),
+            content: "# Notes".to_string(),
+            archive: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// `SET "description" = $n` in the debug form of a recorded statement.
+    const DESCRIPTION_SET: &str = r#"\"description\" = $"#;
+
+    /// The UPDATE statement a mock connection recorded, as its debug form.
+    fn recorded_update(db: Arc<DatabaseConnection>) -> String {
+        let db = Arc::try_unwrap(db).expect("service dropped, so the test owns the connection");
+        db.into_transaction_log()
+            .into_iter()
+            .map(|txn| format!("{txn:?}"))
+            .find(|txn| txn.contains("UPDATE"))
+            .expect("the update should have issued an UPDATE statement")
+    }
+
+    #[test]
+    fn empty_description_normalizes_to_none() {
+        assert_eq!(normalize_description(Some(String::new())), None);
+        assert_eq!(normalize_description(Some("   ".to_string())), None);
+        assert_eq!(normalize_description(None), None);
+        assert_eq!(
+            normalize_description(Some("Team notes".to_string())),
+            Some("Team notes".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_description_on_skill_update_clears_it() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![skill_model(Some("old text"))]])
+                .append_query_results([vec![skill_model(None)]])
+                .into_connection(),
+        );
+        let service = DefinitionService::new(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "skill-description-test",
+            )),
+        );
+
+        let updated = service
+            .update_global_skill(
+                "notes",
+                UpdateSkillDefinitionRequest {
+                    name: None,
+                    description: Some(String::new()),
+                    content: None,
+                    archive: None,
+                },
+            )
+            .await
+            .expect("clearing the description should succeed");
+        drop(service);
+
+        assert_eq!(updated.description, None);
+        let update = recorded_update(db);
+        assert!(
+            update.contains(DESCRIPTION_SET),
+            "the UPDATE must write the description column: {update}"
+        );
+        assert!(
+            update.contains("String(None)"),
+            "an empty description must be stored as NULL, not \"\": {update}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_description_on_mcp_update_keeps_it() {
+        let existing = project_mcp_definitions::Model {
+            id: 9,
+            project_id: Some(4),
+            slug: "docs".to_string(),
+            name: "Docs".to_string(),
+            description: Some("Search the docs".to_string()),
+            config: json!({"command": "docs-mcp"}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let renamed = project_mcp_definitions::Model {
+            name: "Docs search".to_string(),
+            ..existing.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![existing]])
+                .append_query_results([vec![renamed]])
+                .into_connection(),
+        );
+        let service = DefinitionService::new(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "mcp-description-test",
+            )),
+        );
+
+        let updated = service
+            .update_mcp(
+                4,
+                "docs",
+                UpdateMcpDefinitionRequest {
+                    name: Some("Docs search".to_string()),
+                    description: None,
+                    config: None,
+                },
+            )
+            .await
+            .expect("renaming should succeed");
+        drop(service);
+
+        assert_eq!(updated.description.as_deref(), Some("Search the docs"));
+        let update = recorded_update(db);
+        assert!(
+            !update.contains(DESCRIPTION_SET),
+            "an omitted description must not be written: {update}"
+        );
     }
 
     #[test]

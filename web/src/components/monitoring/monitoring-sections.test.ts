@@ -3,17 +3,28 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  DEFAULT_MONITORING_SECTION,
   MONITORING_SECTIONS,
   monitoringSectionLabel,
 } from './monitoring-sections'
 
 describe('monitoring sections', () => {
-  test('keeps project alert rules separate from global alert settings', () => {
+  test('opens on what is firing, then the rules, then what raises alerts', () => {
     expect(MONITORING_SECTIONS.map((section) => section.id)).toEqual([
-      'alerts',
-      'rules',
       'alarms',
+      'rules',
+      'alerts',
       'notifications',
+    ])
+    expect(DEFAULT_MONITORING_SECTION).toBe('alarms')
+  })
+
+  test('names each section as its tab does', () => {
+    expect(MONITORING_SECTIONS.map((section) => section.label)).toEqual([
+      'Alarms',
+      'Rules',
+      'Events',
+      'Preferences',
     ])
   })
 
@@ -21,11 +32,12 @@ describe('monitoring sections', () => {
     expect(monitoringSectionLabel('server')).toBe('Server')
   })
 
-  test('does not reuse the Settings "Notifications" name', () => {
-    expect(monitoringSectionLabel('notifications')).toBe('Delivery preferences')
+  test('does not call delivery preferences "Notifications" or "Channels"', () => {
+    // Channels is the tab for where notifications go; this one is how.
+    expect(monitoringSectionLabel('notifications')).toBe('Preferences')
   })
 
-  test('provides the user-facing alert rules label', () => {
-    expect(monitoringSectionLabel('rules')).toBe('Alert rules')
+  test('has no label for a section that does not exist', () => {
+    expect(monitoringSectionLabel('nope')).toBeUndefined()
   })
 })

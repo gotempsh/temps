@@ -119,7 +119,7 @@ export function matchingDeployment(
     }
     if (
       reference.createdAfterSeconds &&
-      deployment.created_at < reference.createdAfterSeconds
+      Date.parse(deployment.created_at) < reference.createdAfterSeconds * 1000
     ) {
       return false
     }
@@ -141,7 +141,11 @@ export function matchingDeployment(
     return true
   })
 
-  return matches.sort((a, b) => b.created_at - a.created_at)[0] ?? null
+  return (
+    matches.sort(
+      (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)
+    )[0] ?? null
+  )
 }
 
 export function isActiveDeploymentStatus(status: string): boolean {

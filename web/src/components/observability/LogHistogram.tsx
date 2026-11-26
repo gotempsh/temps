@@ -205,7 +205,7 @@ export function LogHistogram({
         )}
       </div>
       {capabilityLoading ? (
-        <Skeleton className="h-20 w-full" />
+        <Skeleton className="h-24 w-full" />
       ) : !configured ? (
         <AnalyticsOnboarding
           compact
@@ -224,17 +224,17 @@ export function LogHistogram({
           }
         />
       ) : histogram.isPending ? (
-        <Skeleton className="h-20 w-full" />
+        <Skeleton className="h-24 w-full" />
       ) : histogram.isError ? (
-        <div className="flex h-20 items-center justify-center text-xs text-muted-foreground">
+        <div className="flex h-24 items-center justify-center text-xs text-muted-foreground">
           Histogram could not be loaded.
         </div>
       ) : rows.length === 0 ? (
-        <div className="flex h-20 items-center justify-center text-xs text-muted-foreground">
+        <div className="flex h-24 items-center justify-center text-xs text-muted-foreground">
           No lines in this window.
         </div>
       ) : (
-        <div className="h-20">
+        <div className="h-24">
           <ResponsiveContainer width="100%" height="100%">
             <BarChart
               data={rows}
@@ -248,8 +248,12 @@ export function LogHistogram({
               <XAxis
                 dataKey="ts"
                 type="number"
-                height={16}
+                height={22}
+                tickMargin={6}
                 domain={['dataMin', 'dataMax']}
+                // A bar is centred on its bucket: without this the first
+                // and last ones hang over the edges, onto the axis numbers.
+                padding={{ left: 12, right: 12 }}
                 tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
                 tickLine={false}
                 axisLine={false}
@@ -266,6 +270,7 @@ export function LogHistogram({
                 tickLine={false}
                 axisLine={false}
                 width={40}
+                tickMargin={6}
                 tickCount={3}
                 allowDecimals={false}
               />

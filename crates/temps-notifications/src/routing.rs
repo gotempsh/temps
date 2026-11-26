@@ -21,8 +21,8 @@ pub struct NotificationRoute {
     pub min_severity: String,
     pub max_severity: String,
     pub provider_ids: Vec<i32>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -361,8 +361,8 @@ impl NotificationRoutingService {
             min_severity: route.min_severity,
             max_severity: route.max_severity,
             provider_ids: provider_ids.remove(&route.id).unwrap_or_default(),
-            created_at: route.created_at.timestamp_millis(),
-            updated_at: route.updated_at.timestamp_millis(),
+            created_at: route.created_at,
+            updated_at: route.updated_at,
         }
     }
 
@@ -495,8 +495,8 @@ impl NotificationRoutingService {
             min_severity: route.min_severity,
             max_severity: route.max_severity,
             provider_ids,
-            created_at: route.created_at.timestamp_millis(),
-            updated_at: route.updated_at.timestamp_millis(),
+            created_at: route.created_at,
+            updated_at: route.updated_at,
         })
     }
 
@@ -619,8 +619,8 @@ impl NotificationRoutingService {
             min_severity: route.min_severity,
             max_severity: route.max_severity,
             provider_ids,
-            created_at: route.created_at.timestamp_millis(),
-            updated_at: route.updated_at.timestamp_millis(),
+            created_at: route.created_at,
+            updated_at: route.updated_at,
         })
     }
 

@@ -25,8 +25,8 @@ const domain = {
   status: 'pending',
   verification_method: 'dns-01',
   is_wildcard: false,
-  created_at: Date.parse('2026-01-01T00:00:00Z'),
-  updated_at: Date.parse('2026-01-01T00:00:00Z'),
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
 }
 function createClient() {
   return new QueryClient({
@@ -379,7 +379,7 @@ test('active certificate still exposes a DNS renewal order after switching from 
     status: 'active',
     verification_method: 'http-01',
     certificate: 'certificate',
-    expiration_time: Date.now() + 86400000 * 30,
+    expiration_time: new Date(Date.now() + 86400000 * 30).toISOString(),
   })
   client.setQueryData(orderKey, {
     order: {
@@ -389,8 +389,8 @@ test('active certificate still exposes a DNS renewal order after switching from 
       order_url: 'https://acme.example.test/order/1',
       status: 'pending',
       email: 'ops@example.test',
-      created_at: Date.now(),
-      updated_at: Date.now(),
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
       authorizations: {
         challenge_type: 'dns-01',
         dns_txt_records: [

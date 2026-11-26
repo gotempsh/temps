@@ -585,24 +585,30 @@ impl BackupService {
         Ok(schedules)
     }
 
-    /// List raw backup rows after the bounded history summary has been
-    /// authorized by the handler.
+    /// One page of a schedule's backups, newest first, with the total. The
+    /// handler authorizes the bounded history summary first.
     pub async fn list_backups_for_schedule(
         &self,
         schedule_id: i32,
-    ) -> Result<Vec<Backup>, BackupError> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+        page: temps_core::PageQuery,
+    ) -> Result<(Vec<Backup>, u64), BackupError> {
+        use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 
         self.get_backup_schedule(schedule_id).await?;
 
-        let backups = temps_entities::backups::Entity::find()
+        let (_, page_size) = page.normalize();
+        let paginator = temps_entities::backups::Entity::find()
             .filter(temps_entities::backups::Column::ScheduleId.eq(schedule_id))
             .order_by_desc(temps_entities::backups::Column::StartedAt)
-            .all(self.db.as_ref())
+            .order_by_desc(temps_entities::backups::Column::Id)
+            .paginate(self.db.as_ref(), page_size);
+        let total = paginator.num_items().await.map_err(BackupError::Database)?;
+        let backups = paginator
+            .fetch_page(page.page_index())
             .await
             .map_err(BackupError::Database)?;
 
-        Ok(backups)
+        Ok((backups, total))
     }
 
     // Add this new validation function

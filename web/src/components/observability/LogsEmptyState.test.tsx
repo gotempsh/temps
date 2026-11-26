@@ -35,7 +35,7 @@ test('offers telemetry setup from the first-use logs state', () => {
   expect(markup).toContain('OpenTelemetry or a Sentry SDK')
   // The framework-agnostic option and its prompt sit beside the SDK choices.
   expect(markup).toContain('Any language or framework')
-  expect(markup).toContain('Copy AI prompt')
+  expect(markup).toContain('Hand off to agent')
 })
 
 test('closing the any-framework setup keeps its state for reopening', () => {
