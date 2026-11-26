@@ -708,6 +708,12 @@ impl ApiKeyService {
                         .add(Column::Name.starts_with(crate::ai_harness::MCP_CLIENT_KEY_PREFIX)),
                 )
                 .filter(Column::LastUsedAt.is_not_null())
+                // An expired key is rejected; an older one still valid counts.
+                .filter(
+                    Condition::any()
+                        .add(Column::ExpiresAt.is_null())
+                        .add(Column::ExpiresAt.gt(Utc::now())),
+                )
                 .order_by_desc(Column::LastUsedAt)
         };
         let agent_key = match &harness_key {

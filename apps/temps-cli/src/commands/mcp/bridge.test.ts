@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { bridgePackageSpec, checkBridgeAddress, resolveFolder } from './bridge.js'
+import { bridgeApiKey, bridgePackageSpec, checkBridgeAddress, resolveFolder } from './bridge.js'
 
 const CLI_ENTRY = fileURLToPath(new URL('../../index.ts', import.meta.url))
 const KEY = 'tk_test_secret_value_0123456789'
@@ -29,6 +29,22 @@ describe('bridge settings', () => {
     expect(() => checkBridgeAddress('https://temps.example.test')).not.toThrow()
     expect(() => checkBridgeAddress('http://localhost:3014')).not.toThrow()
     expect(() => checkBridgeAddress('http://192.168.1.10:8080')).toThrow('plain HTTP')
+  })
+
+  test('the key comes from TEMPS_API_KEY, or else from the file TEMPS_API_KEY_FILE names', () => {
+    const file = join(SCRATCH, 'bridge.key')
+    writeFileSync(file, `${KEY}\n`, { mode: 0o600 })
+    expect(bridgeApiKey({ TEMPS_API_KEY_FILE: file })).toBe(KEY)
+    expect(bridgeApiKey({ TEMPS_API_KEY: 'direct', TEMPS_API_KEY_FILE: file })).toBe('direct')
+    expect(bridgeApiKey({})).toBe('')
+  })
+
+  test('a key file that is missing or too large is an error naming the file, not a read into memory', () => {
+    const missing = join(SCRATCH, 'missing.key')
+    expect(() => bridgeApiKey({ TEMPS_API_KEY_FILE: missing })).toThrow(missing)
+    const large = join(SCRATCH, 'large.key')
+    writeFileSync(large, 'x'.repeat(5000))
+    expect(() => bridgeApiKey({ TEMPS_API_KEY_FILE: large })).toThrow('not an API key file')
   })
 })
 

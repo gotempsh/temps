@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { bridgeKeyFilePath } from './base.js'
 import { codexAddArgs, parseCodexMcpGetOutput, TOKEN_ENV_VAR } from './codex.js'
 
 describe('parseCodexMcpGetOutput', () => {
@@ -41,19 +42,20 @@ describe('codexAddArgs', () => {
     expect(args).toEqual(['mcp', 'add', 'temps', '--url', 'https://temps.example.com/mcp', '--bearer-token-env-var', TOKEN_ENV_VAR])
   })
 
-  test('with deploy folders, the bridge over stdio with the key in its environment', () => {
-    expect(
-      codexAddArgs({
-        url: 'https://temps.example.com/mcp?write=1',
-        apiKey: 'k',
-        bridge: { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
-      }),
-    ).toEqual([
+  test('with deploy folders, the bridge over stdio, naming the private key file and never holding the key', () => {
+    const args = codexAddArgs({
+      url: 'https://temps.example.com/mcp?write=1',
+      apiKey: 'tk_secret-bridge-key',
+      bridge: { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
+    })
+    // These are codex's arguments, readable by other users in the process list.
+    expect(args.join(' ')).not.toContain('tk_secret-bridge-key')
+    expect(args).toEqual([
       'mcp',
       'add',
       'temps',
       '--env',
-      'TEMPS_API_KEY=k',
+      `TEMPS_API_KEY_FILE=${bridgeKeyFilePath('codex')}`,
       '--',
       'npx',
       '-y',

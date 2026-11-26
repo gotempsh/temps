@@ -7,10 +7,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as jsonc from 'jsonc-parser'
 import {
+  bridgeKeyFilePath,
   bridgeUrlFromArgs,
   bridgeUrlFromText,
   JsonConfigMcpClientAdapter,
   localBridgeCommand,
+  removeBridgeKeyFile,
+  writeBridgeKeyFile,
   type McpServerEntry,
 } from './base.js'
 
@@ -190,6 +193,29 @@ describe('the local bridge entry', () => {
       env: { TEMPS_API_KEY: 'secret-key' },
     })
     expect(command.args.join(' ')).not.toContain('secret-key')
+  })
+
+  test('with a key file, the environment names the file and holds no key', () => {
+    const command = localBridgeCommand(entry, entry.bridge!, '/home/me/.temps/mcp/codex.key')
+    expect(command.env).toEqual({ TEMPS_API_KEY_FILE: '/home/me/.temps/mcp/codex.key' })
+    expect(JSON.stringify(command)).not.toContain('secret-key')
+  })
+
+  test('the key file is written for this user only, replaced in place, and removed', async () => {
+    const file = await writeBridgeKeyFile('codex', 'secret-key', dir)
+    expect(file).toBe(bridgeKeyFilePath('codex', dir))
+    expect(file).toBe(join(dir, '.temps', 'mcp', 'codex.key'))
+    expect(readFileSync(file, 'utf8').trim()).toBe('secret-key')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expect(statSync(join(dir, '.temps', 'mcp')).mode & 0o777).toBe(0o700)
+    // A file a looser earlier version left behind is replaced at 0600.
+    chmodSync(file, 0o644)
+    await writeBridgeKeyFile('codex', 'second-key', dir)
+    expect(readFileSync(file, 'utf8').trim()).toBe('second-key')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    await removeBridgeKeyFile('codex', dir)
+    await removeBridgeKeyFile('codex', dir)
+    expect(() => statSync(file)).toThrow()
   })
 
   test('a JSON-config app gets a stdio entry, and status reads it back as read/write', async () => {

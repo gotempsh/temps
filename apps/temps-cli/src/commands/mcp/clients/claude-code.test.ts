@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { bridgeKeyFilePath } from './base.js'
 import { claudeCodeAddArgs, parseClaudeCodeMcpGetOutput } from './claude-code.js'
 
 describe('parseClaudeCodeMcpGetOutput', () => {
@@ -60,7 +61,7 @@ describe('claudeCodeAddArgs', () => {
     expect(
       claudeCodeAddArgs({
         url: 'https://temps.example.com/mcp?write=1',
-        apiKey: 'k',
+        apiKey: 'tk_secret-bridge-key',
         bridge: { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
       }),
     ).toEqual([
@@ -70,7 +71,7 @@ describe('claudeCodeAddArgs', () => {
       'user',
       'temps',
       '-e',
-      'TEMPS_API_KEY=k',
+      `TEMPS_API_KEY_FILE=${bridgeKeyFilePath('claude-code')}`,
       '--',
       'npx',
       '-y',
@@ -82,6 +83,13 @@ describe('claudeCodeAddArgs', () => {
       '--folder',
       '/srv/apps',
     ])
+    expect(
+      claudeCodeAddArgs({
+        url: 'https://temps.example.com/mcp?write=1',
+        apiKey: 'tk_secret-bridge-key',
+        bridge: { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
+      }).join(' '),
+    ).not.toContain('tk_secret-bridge-key')
   })
 
   test('status reads a bridge entry back as read/write', () => {

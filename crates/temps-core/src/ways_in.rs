@@ -119,6 +119,21 @@ pub fn cidr_is_private(cidr: &str) -> Option<bool> {
     })
 }
 
+/// [`cidr_is_private`] for a comma-separated list of ranges, the form a
+/// private address stores (`100.64.0.0/10,fd7a:115c:a1e0::/48`): `Some(true)`
+/// only when every range in it is private. `None` when the list is empty or
+/// any part does not parse.
+pub fn ranges_are_private(ranges: &str) -> Option<bool> {
+    let mut any = false;
+    for part in ranges.split(',') {
+        any = true;
+        if !cidr_is_private(part)? {
+            return Some(false);
+        }
+    }
+    any.then_some(true)
+}
+
 /// An IP access allow list that admits only private ranges, and whose it
 /// is, for messages that name the rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +181,20 @@ pub trait EnvironmentWaysIn: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_of_ranges_is_private_only_when_every_range_is() {
+        assert_eq!(
+            ranges_are_private("100.64.0.0/10,fd7a:115c:a1e0::/48"),
+            Some(true)
+        );
+        assert_eq!(ranges_are_private("10.8.0.0/24"), Some(true));
+        assert_eq!(ranges_are_private("10.8.0.0/24, 8.8.8.0/24"), Some(false));
+        assert_eq!(ranges_are_private("10.8.0.0/24,not-a-range"), None);
+        assert_eq!(ranges_are_private(""), None);
+        // One CIDR's parser is not fooled by the list either.
+        assert_eq!(cidr_is_private("100.64.0.0/10,fd7a:115c:a1e0::/48"), None);
+    }
 
     #[test]
     fn private_ranges_are_told_from_public_ones() {

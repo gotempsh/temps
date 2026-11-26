@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 // jsonc-parser's package.json `main` points at a UMD build whose dynamic
 // require() of sibling files (e.g. `./impl/format`) doesn't survive Bun's
@@ -28,14 +29,20 @@ export interface LocalBridge {
   packageSpec: string
 }
 
-/** How an app starts the bridge. The key is in `env`, never in `args`, so it stays out of the process list. */
+/**
+ * How an app starts the bridge. The key is in `env`, never in `args`, so it
+ * stays out of the process list of the running bridge. With `keyFile`, `env`
+ * names that file instead of holding the key: for apps whose installer is a
+ * CLI that takes the environment as arguments (`codex mcp add --env`), so the
+ * key never appears on the installer's command line either.
+ */
 export interface LocalBridgeCommand {
   command: string
   args: string[]
   env: Record<string, string>
 }
 
-export function localBridgeCommand(entry: McpServerEntry, bridge: LocalBridge): LocalBridgeCommand {
+export function localBridgeCommand(entry: McpServerEntry, bridge: LocalBridge, keyFile?: string): LocalBridgeCommand {
   return {
     command: 'npx',
     args: [
@@ -47,8 +54,44 @@ export function localBridgeCommand(entry: McpServerEntry, bridge: LocalBridge): 
       new URL(entry.url).origin,
       ...bridge.folders.flatMap((folder) => ['--folder', folder]),
     ],
-    env: { TEMPS_API_KEY: entry.apiKey },
+    env: keyFile ? { TEMPS_API_KEY_FILE: keyFile } : { TEMPS_API_KEY: entry.apiKey },
   }
+}
+
+/** Where the bridge key for an app installed through its own CLI is kept: readable by this user only. */
+export function bridgeKeyFilePath(clientId: string, home: string = os.homedir()): string {
+  return path.join(home, '.temps', 'mcp', `${clientId}.key`)
+}
+
+/**
+ * Write the bridge key to `bridgeKeyFilePath(clientId)`, created at 0600 in a
+ * 0700 directory and moved into place, so it is never readable by another
+ * user, even for an instant. Returns the path.
+ */
+export async function writeBridgeKeyFile(
+  clientId: string,
+  apiKey: string,
+  home: string = os.homedir(),
+): Promise<string> {
+  const file = bridgeKeyFilePath(clientId, home)
+  const dir = path.dirname(file)
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
+  await fs.promises.chmod(dir, 0o700)
+  const temporary = `${file}.${process.pid}.tmp`
+  await fs.promises.rm(temporary, { force: true })
+  await fs.promises.writeFile(temporary, `${apiKey}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+  try {
+    await fs.promises.rename(temporary, file)
+  } catch (error) {
+    await fs.promises.rm(temporary, { force: true })
+    throw error
+  }
+  return file
+}
+
+/** Delete an app's bridge key file; a missing file is not an error. */
+export async function removeBridgeKeyFile(clientId: string, home: string = os.homedir()): Promise<void> {
+  await fs.promises.rm(bridgeKeyFilePath(clientId, home), { force: true })
 }
 
 /**

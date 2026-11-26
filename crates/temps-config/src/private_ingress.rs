@@ -357,6 +357,11 @@ impl PrivateIngressService {
         }
         txn.commit().await?;
         if let Some(runtime) = &self.runtime {
+            // A withdrawn consent stops serving now, not when the loop next
+            // gets to it (it may be in the middle of inside checks).
+            if consent.is_none() {
+                runtime.set_serving(None);
+            }
             runtime.notify_changed();
         }
         Ok(before)
@@ -565,6 +570,42 @@ mod tests {
         assert_eq!(after.admit, ["100.64.0.0/10"]);
         assert!(after.tailscale_serve);
         // The wake-up is stored until the loop waits for it.
+        tokio::time::timeout(std::time::Duration::from_secs(1), runtime.changed())
+            .await
+            .expect("the loop is woken");
+    }
+
+    /// Withdrawing consent stops serving as soon as it commits: the loop may
+    /// be inside checks that take a DNS timeout per host, and the old
+    /// networks must not stay admitted until they finish.
+    #[tokio::test]
+    async fn withdrawing_consent_stops_serving_at_once_and_wakes_the_loop() {
+        let stored = settings_row(serde_json::json!({
+            "external_url": "https://temps.example.com",
+            "private_ingress": {"listen": "10.8.0.1", "updated_at": "2026-11-24T10:00:00Z"},
+        }));
+        let mut updated = stored.clone();
+        updated.data = serde_json::json!({"external_url": "https://temps.example.com"});
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stored]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .append_query_results([vec![updated]])
+            .into_connection();
+        let runtime = temps_core::private_ingress::ControlPlanePrivateIngress::new();
+        runtime.set_serving(Some(
+            temps_core::private_ingress::PrivateIngressServing::new(
+                "10.8.0.1".parse().unwrap(),
+                vec!["10.8.0.0/24".parse().unwrap()],
+            )
+            .unwrap(),
+        ));
+        let service = PrivateIngressService::new(Arc::new(db), Some(runtime.clone()));
+        let before = service.delete().await.unwrap();
+        assert_eq!(before.map(|c| c.listen), Some("10.8.0.1".to_string()));
+        assert_eq!(runtime.serving(), None);
         tokio::time::timeout(std::time::Duration::from_secs(1), runtime.changed())
             .await
             .expect("the loop is woken");

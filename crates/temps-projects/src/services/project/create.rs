@@ -1035,29 +1035,28 @@ impl ProjectService {
                         .collect::<BTreeMap<_, _>>()
                 })
                 .unwrap_or_default();
+            // Aliases are stored with the links, in the transaction that
+            // consumes the creator claims (an invalid alias consumes none),
+            // and before the first deployment is queued, so it already sees
+            // DATABASE_URL for POSTGRES_URL.
+            let aliases = storage_service_env_aliases
+                .iter()
+                .filter(|(_, aliases)| !aliases.is_empty())
+                .map(|(service_id, aliases)| (*service_id, aliases.clone()))
+                .collect::<BTreeMap<_, _>>();
             self.external_service_manager
-                .link_services_to_project_with_claims(&storage_service_ids, project.id, &claims)
+                .link_services_to_project_with_claims(
+                    &storage_service_ids,
+                    project.id,
+                    &claims,
+                    &aliases,
+                )
                 .await
                 .map_err(|e| ProjectError::StorageLinksFailed {
                     project_id: project.id,
                     service_ids: storage_service_ids,
                     reason: e.to_string(),
                 })?;
-            // Aliases are stored before the first deployment is queued, so it
-            // already sees DATABASE_URL for POSTGRES_URL.
-            for (service_id, aliases) in &storage_service_env_aliases {
-                if aliases.is_empty() {
-                    continue;
-                }
-                self.external_service_manager
-                    .set_link_env_aliases(*service_id, project.id, aliases)
-                    .await
-                    .map_err(|e| ProjectError::StorageLinksFailed {
-                        project_id: project.id,
-                        service_ids: vec![*service_id],
-                        reason: format!("storing variable aliases: {e}"),
-                    })?;
-            }
         }
 
         if let Some(profile_id) = delivery_profile_id {

@@ -98,6 +98,57 @@ describe('mcp add wizard', () => {
   })
 })
 
+describe('mcp add -y', () => {
+  test.each([
+    [false, 'reader'],
+    [true, null],
+  ] as const)('read-only installs a new reader key, never the login (write=%s)', async (write, minted) => {
+    const { Command } = await import('commander')
+    const contexts = await import('../../config/contexts.js')
+    const api = await import('../../lib/api-client.js')
+    const sdk = await import('../../api/sdk.gen.js')
+    const probe = await import('./probe.js')
+    const { getClientAdapter } = await import('./clients/index.js')
+    const adapter = getClientAdapter('cursor')!
+    const created: unknown[] = []
+    const spies = [
+      spyOn(contexts, 'listContexts').mockResolvedValue([
+        { name: 'test', url: 'https://temps.example.test', apiKey: 'login-key', email: 'test@example.test' },
+      ]),
+      spyOn(api, 'setupClient').mockResolvedValue(undefined),
+      spyOn(probe, 'probeMcpEndpoint').mockResolvedValue({ supported: true }),
+      spyOn(adapter, 'isClientSupported').mockResolvedValue(true),
+      spyOn(adapter, 'describeTarget').mockResolvedValue('test configuration'),
+      spyOn(console, 'log').mockImplementation(() => {}),
+      spyOn(sdk, 'createApiKey').mockImplementation((async (options: { body: unknown }) => {
+        created.push(options.body)
+        return { data: { api_key: 'tk_reader', name: 'mcp-cursor', key_prefix: 'tk_r' }, error: undefined }
+      }) as never),
+    ]
+    const add = spyOn(adapter, 'addServer').mockResolvedValue({ success: true })
+    try {
+      const program = new Command().exitOverride()
+      registerMcpCommands(program)
+      await program.parseAsync(
+        ['mcp', 'add', 'cursor', '--url', 'https://temps.example.test', ...(write ? ['--write'] : []), '-y'],
+        { from: 'user' },
+      )
+      const installed = (add.mock.calls[0]?.[0] as { apiKey: string }).apiKey
+      if (minted) {
+        expect(created).toHaveLength(1)
+        expect((created[0] as { role_type: string }).role_type).toBe(minted)
+        expect(installed).toBe('tk_reader')
+      } else {
+        expect(created).toEqual([])
+        expect(installed).toBe('login-key')
+      }
+    } finally {
+      add.mockRestore()
+      spies.forEach((spy) => spy.mockRestore())
+    }
+  })
+})
+
 describe('mcp add --deploy-folder', () => {
   test('the app runs the bridge with the folders, pinned to this CLI, with write tools and no write prompt', async () => {
     const { Command } = await import('commander')

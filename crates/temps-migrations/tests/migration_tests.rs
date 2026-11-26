@@ -11084,3 +11084,81 @@ async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyh
     }
     Ok(())
 }
+
+/// `private_range` holds every range a private address admits; six `/24`
+/// subnets are 89 characters, past the `VARCHAR(64)` it started as. After the
+/// migration both tables take such a list, and `down` narrows the column only
+/// when no stored list is longer.
+#[tokio::test]
+async fn test_private_range_holds_a_long_admission_list_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261126_000001_widen_private_range";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping private range migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+
+    let column_type = |table: &'static str| {
+        let db = &db;
+        async move {
+            db.query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT data_type, character_maximum_length::int AS width \
+                 FROM information_schema.columns \
+                 WHERE table_name = $1 AND column_name = 'private_range'",
+                [table.into()],
+            ))
+            .await
+            .map(|row| {
+                let row = row.expect("private_range column");
+                (
+                    row.try_get::<String>("", "data_type").expect("type"),
+                    row.try_get::<Option<i32>>("", "width").expect("width"),
+                )
+            })
+        }
+    };
+    for table in ["project_custom_domains", "environment_domains"] {
+        // Unbounded: six admitted /24 subnets (89 characters) fit.
+        assert_eq!(column_type(table).await?, ("text".to_string(), None));
+    }
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    for table in ["project_custom_domains", "environment_domains"] {
+        assert_eq!(
+            column_type(table).await?,
+            ("character varying".to_string(), Some(64)),
+            "{table} after down"
+        );
+    }
+    Ok(())
+}

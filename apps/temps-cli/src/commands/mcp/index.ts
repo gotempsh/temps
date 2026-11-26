@@ -256,7 +256,7 @@ export function registerMcpCommands(program: Command): void {
     .option('-w, --write', 'Enable write tools (deploy, delete, restart, etc). Default: read-only')
     .option('-k, --api-key <key>', 'Use this API key instead of creating or prompting for one')
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
-    .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login)')
+    .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; without --write, creates a read-only key)')
     .option(
       '-d, --deploy-folder <dir>',
       'Let the agent deploy project folders from this computer, from inside this folder (repeatable). The app then runs the Temps bridge locally (temps mcp bridge) instead of connecting over HTTP. Implies --write',
@@ -409,8 +409,11 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   // Whether this command minted the key: only then may it be shown, once.
   let mintedKey = false
   if (!apiKey) {
+    // Read-only must not install this login's credential, which may be able
+    // to write: without --write, -y mints a reader key. With --write, -y
+    // reuses the login, which already has whatever the operator can do.
     const wantsNewKey = options.yes
-      ? false
+      ? !write
       : await promptConfirm({
           message: 'Create a new dedicated API key scoped for MCP access? (recommended over reusing an existing key)',
           default: true,

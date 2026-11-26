@@ -3,10 +3,12 @@
 
 import { afterAll, describe, expect, test } from 'bun:test'
 import {
+  appendFileSync,
   chmodSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -36,9 +38,12 @@ interface Deploy {
   HOSTS: { extension: Host; cli: Host }
   collectFiles(
     root: string,
-    limits?: { files: number; bytes: number }
+    limits?: { files?: number; bytes?: number; ignoreBytes?: number }
   ): Promise<Collected>
-  packZip(collected: Collected): Promise<{
+  packZip(
+    collected: Collected,
+    limits?: { files?: number; bytes?: number }
+  ): Promise<{
     zip: Buffer
     packed: string[]
     bytes: number
@@ -294,5 +299,103 @@ describe('packing a folder', () => {
     await expect(
       deploy.collectFiles(root, { files: 100, bytes: 100 })
     ).rejects.toThrow('.gitignore')
+  })
+})
+
+describe('a folder that changes while it is packed', () => {
+  test('a folder swapped for a symlink after listing does not lead the read outside', async () => {
+    const root = join(SCRATCH, 'swapped')
+    tree(root, { 'package.json': '{}', 'config/app.json': '{"mine":true}' })
+    tree(join(SCRATCH, 'outside-swap'), { 'app.json': 'NOT YOURS' })
+    const collected = await deploy.collectFiles(root)
+    expect(collected.files.map((f) => f.name).sort()).toEqual([
+      'config/app.json',
+      'package.json',
+    ])
+    // Between listing and packing, config/ becomes a symlink to a folder
+    // outside with a file of the same name.
+    renameSync(join(root, 'config'), join(root, 'config-old'))
+    symlinkSync(join(SCRATCH, 'outside-swap'), join(root, 'config'))
+    await expect(deploy.packZip(collected)).rejects.toThrow(
+      'config/app.json changed while the folder was packed'
+    )
+  })
+
+  test('a folder reached through a symlink above it while listing is not read', async () => {
+    const root = join(SCRATCH, 'listed-through-link')
+    tree(root, { 'package.json': '{}' })
+    tree(join(SCRATCH, 'outside-list'), { 'sub/secret.txt': 'NOT YOURS' })
+    symlinkSync(join(SCRATCH, 'outside-list'), join(root, 'linked'))
+    // What the walk sees when a folder above the one it lists was swapped for
+    // a symlink: a directory whose real path is not where it was listed.
+    await expect(
+      deploy.collectFiles(join(root, 'linked', 'sub'))
+    ).rejects.toThrow('changed while it was read')
+  })
+
+  test('a file that grew after listing is not read past the limit', async () => {
+    const root = join(SCRATCH, 'growing')
+    tree(root, { 'big.txt': 'x'.repeat(100), 'small.txt': 'ok' })
+    const collected = await deploy.collectFiles(root)
+    appendFileSync(join(root, 'big.txt'), 'y'.repeat(1000))
+    await expect(deploy.packZip(collected, { bytes: 500 })).rejects.toThrow(
+      'grew past'
+    )
+    // Growth within the limit is packed whole, as the file is now.
+    const again = await deploy.collectFiles(root)
+    appendFileSync(join(root, 'small.txt'), '!')
+    const files = readDeflatedZip((await deploy.packZip(again)).zip)
+    expect(files.get('small.txt')?.text).toBe('ok!')
+  })
+
+  test('a .gitignore past its limit is refused before it is read', async () => {
+    const root = join(SCRATCH, 'huge-ignore')
+    tree(root, { 'package.json': '{}', '.gitignore': `${'#'.repeat(5000)}\n` })
+    await expect(
+      deploy.collectFiles(root, { ignoreBytes: 1024 })
+    ).rejects.toThrow('a .gitignore may be here')
+  })
+})
+
+describe('a folder inside a repository', () => {
+  const repo = join(SCRATCH, 'monorepo')
+  tree(repo, {
+    '.git/HEAD': 'ref: refs/heads/main\n',
+    '.gitignore': 'apps/site/private-config.json\n*.secret\napps/hidden/\n',
+    'apps/.gitignore': 'site/generated/\n',
+    'apps/site/package.json': '{}',
+    'apps/site/private-config.json': '{"token":"PRIVATE"}',
+    'apps/site/notes.secret': 'PRIVATE',
+    'apps/site/generated/out.js': 'built',
+    'apps/site/src/index.js': 'ok',
+    'apps/hidden/package.json': '{}',
+    'apps/nested/.git/HEAD': 'ref: refs/heads/main\n',
+    'apps/nested/notes.secret': 'its own repository',
+  })
+
+  test('the .gitignore files above it, up to the repository top, still apply', async () => {
+    const collected = await deploy.collectFiles(join(repo, 'apps', 'site'))
+    expect(collected.files.map((f) => f.name).sort()).toEqual([
+      'package.json',
+      'src/index.js',
+    ])
+    expect(collected.leftOut.sort()).toEqual([
+      'generated/',
+      'notes.secret',
+      'private-config.json',
+    ])
+    const { zip } = await deploy.packZip(collected)
+    expect(Buffer.from(zip).toString('latin1')).not.toContain('PRIVATE')
+  })
+
+  test('a folder the repository leaves out uploads nothing', async () => {
+    const collected = await deploy.collectFiles(join(repo, 'apps', 'hidden'))
+    expect(collected.files).toEqual([])
+    expect(collected.leftOut[0]).toContain('apps/hidden/')
+  })
+
+  test('a folder that is its own repository follows only its own rules', async () => {
+    const collected = await deploy.collectFiles(join(repo, 'apps', 'nested'))
+    expect(collected.files.map((f) => f.name)).toEqual(['notes.secret'])
   })
 })

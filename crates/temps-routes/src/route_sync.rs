@@ -957,8 +957,10 @@ pub fn worker_private_routes(
             .range
             .clone()
             // A range that does not parse, or reaches past one private
-            // block, admits nobody rather than everybody.
-            .filter(|range| temps_core::ways_in::cidr_is_private(range) == Some(true));
+            // block, admits nobody rather than everybody. A worker on
+            // Tailscale admits two (`100.64.0.0/10,fd7a:115c:a1e0::/48`):
+            // each must be private.
+            .filter(|range| temps_core::ways_in::ranges_are_private(range) == Some(true));
         let listener = private.address.listener.clone();
         let entry = entry_from_route(host.clone(), &private.route).filter(|entry| {
             entry.backends.iter().all(|backend| {

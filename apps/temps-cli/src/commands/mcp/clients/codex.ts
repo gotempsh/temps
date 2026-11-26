@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { execFileSync } from 'node:child_process'
-import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
+  bridgeKeyFilePath,
   bridgeUrlFromText,
   localBridgeCommand,
   MCP_SERVER_NAME,
   redactSecrets,
+  removeBridgeKeyFile,
+  writeBridgeKeyFile,
   type InstallResult,
   type McpClientAdapter,
   type McpServerEntry,
@@ -40,16 +42,19 @@ export function parseCodexMcpGetOutput(output: string): string | null {
   return match?.[1] ?? bridgeUrlFromText(output)
 }
 
+const CODEX_ID = 'codex'
+
 /**
  * The `codex mcp add` arguments for an entry. Over HTTP, config.toml names
  * the environment variable that holds the token (see TOKEN_ENV_VAR). The
  * bridge runs over stdio, and Codex starts it with only the variables its
- * entry sets, so the key is stored in config.toml; `addServer` then makes
- * that file readable by this user only.
+ * entry sets; `--env` takes them as arguments, visible in the process list
+ * while `codex mcp add` runs, so the entry names the private key file
+ * (`bridgeKeyFilePath`) that `addServer` writes, never the key itself.
  */
 export function codexAddArgs(entry: McpServerEntry): string[] {
   if (entry.bridge) {
-    const command = localBridgeCommand(entry, entry.bridge)
+    const command = localBridgeCommand(entry, entry.bridge, bridgeKeyFilePath(CODEX_ID))
     return [
       'mcp',
       'add',
@@ -63,7 +68,7 @@ export function codexAddArgs(entry: McpServerEntry): string[] {
   return ['mcp', 'add', MCP_SERVER_NAME, '--url', entry.url, '--bearer-token-env-var', TOKEN_ENV_VAR]
 }
 
-/** Codex's settings file, which holds the key of a bridge entry. */
+/** Codex's settings file. */
 export function codexConfigPath(): string {
   return path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml')
 }
@@ -71,7 +76,7 @@ export function codexConfigPath(): string {
 // Same rationale as Claude Code: shell out to the official `codex` CLI so
 // Codex's own config format (config.toml) is never hand-written here.
 export class CodexAdapter implements McpClientAdapter {
-  readonly id = 'codex'
+  readonly id = CODEX_ID
   readonly label = 'Codex'
   private binary: string | null | undefined
 
@@ -114,22 +119,21 @@ export class CodexAdapter implements McpClientAdapter {
   async addServer(entry: McpServerEntry): Promise<InstallResult> {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The codex CLI was not found on PATH.' }
+    if (entry.bridge) {
+      try {
+        await writeBridgeKeyFile(CODEX_ID, entry.apiKey)
+      } catch (error) {
+        return {
+          success: false,
+          reason: `Could not save the API key to ${bridgeKeyFilePath(CODEX_ID)} (${redactSecrets(execErrorMessage(error))}).`,
+        }
+      }
+    }
     try {
       execFileSync(binary, codexAddArgs(entry), {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, [TOKEN_ENV_VAR]: `Bearer ${entry.apiKey}` },
       })
-      if (entry.bridge) {
-        const configPath = codexConfigPath()
-        try {
-          await fs.promises.chmod(configPath, 0o600)
-        } catch (error) {
-          return {
-            success: false,
-            reason: `Codex saved the server, but ${configPath}, which now holds the API key, could not be made private (${execErrorMessage(error)}). Run: chmod 600 ${configPath}`,
-          }
-        }
-      }
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
@@ -145,10 +149,14 @@ export class CodexAdapter implements McpClientAdapter {
     if (!binary) return { success: false, reason: 'The codex CLI was not found on PATH.' }
     try {
       execFileSync(binary, ['mcp', 'remove', MCP_SERVER_NAME], { stdio: ['ignore', 'pipe', 'pipe'] })
+      await removeBridgeKeyFile(CODEX_ID)
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
-      if (/not found|no such/i.test(reason)) return { success: true, alreadyInstalled: true }
+      if (/not found|no such/i.test(reason)) {
+        await removeBridgeKeyFile(CODEX_ID).catch(() => undefined)
+        return { success: true, alreadyInstalled: true }
+      }
       return { success: false, reason }
     }
   }

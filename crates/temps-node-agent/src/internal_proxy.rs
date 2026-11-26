@@ -482,6 +482,19 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 /// (ADR 064 D7) tells the listener's own refusal from the app's answer.
 pub(crate) const PRIVATE_REFUSAL_HEADER: &str = "x-temps-private-ingress";
 
+/// Whether a private address answers `peer`: inside the address's range, and
+/// admitted by this worker's consent as it is now, so a peer the operator has
+/// since stopped admitting is refused on routes applied before the change too.
+fn private_peer_allowed(
+    store: &crate::route_store::RouteStore,
+    peer: Option<std::net::IpAddr>,
+    range: &str,
+) -> bool {
+    peer.is_some_and(|ip| {
+        temps_core::worker_ingress::ip_in_range(ip, range) && store.private_admits(ip)
+    })
+}
+
 fn private_refusal(status: StatusCode, reason: &'static str, message: &str) -> Response {
     let mut response = error_body(status, message);
     response.headers_mut().insert(
@@ -537,7 +550,7 @@ async fn handle_private(state: &ProxyState, mut req: Request) -> Response {
         );
     };
     let peer = req.extensions().get::<PublicPeer>().map(|peer| peer.0.ip());
-    if !peer.is_some_and(|ip| temps_core::worker_ingress::ip_in_range(ip, &private.range)) {
+    if !private_peer_allowed(&state.store, peer, &private.range) {
         return private_refusal(
             StatusCode::FORBIDDEN,
             "outside-range",
@@ -2378,6 +2391,37 @@ fn error_body(status: StatusCode, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Narrowing the worker's consent from 10.0.0.0/8 to 10.8.0.0/24 refuses a
+    /// peer outside the new range on an address applied with the old one;
+    /// an admit list the worker could not compute (empty) refuses everyone.
+    #[test]
+    fn a_private_route_follows_the_consent_as_it_is_now() {
+        let store = crate::route_store::RouteStore::new(
+            std::env::temp_dir().join(format!("temps-private-admit-{}.json", std::process::id())),
+        );
+        let old_range = "10.0.0.0/8";
+        let peer = |ip: &str| Some(ip.parse::<std::net::IpAddr>().unwrap());
+        store.set_private_admit(vec!["10.0.0.0/8".parse().unwrap()]);
+        assert!(private_peer_allowed(&store, peer("10.9.0.1"), old_range));
+        store.set_private_admit(vec!["10.8.0.0/24".parse().unwrap()]);
+        assert!(!private_peer_allowed(&store, peer("10.9.0.1"), old_range));
+        assert!(private_peer_allowed(&store, peer("10.8.0.9"), old_range));
+        assert!(private_peer_allowed(
+            &store,
+            peer("::ffff:10.8.0.9"),
+            old_range
+        ));
+        // Still inside consent, but outside the address's own range.
+        assert!(!private_peer_allowed(
+            &store,
+            peer("10.8.0.9"),
+            "10.9.0.0/16"
+        ));
+        store.set_private_admit(Vec::new());
+        assert!(!private_peer_allowed(&store, peer("10.8.0.9"), old_range));
+        assert!(!private_peer_allowed(&store, None, old_range));
+    }
     use crate::route_store::{RouteBackend, RouteEntry, RouteStore};
     use std::path::PathBuf;
 

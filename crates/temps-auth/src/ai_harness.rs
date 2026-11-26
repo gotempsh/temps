@@ -77,18 +77,26 @@ pub fn agent_credential_kind(name: &str) -> Option<AiHarnessCredentialKind> {
 }
 
 /// The kind and last use of `candidate` when it is an agent credential that
-/// has authenticated a request: active, account-wide (an agent operating
-/// Temps is not confined to one project), minted by an agent flow, and used.
+/// has authenticated a request and still can: active, not expired (an
+/// expired key is rejected, so an agent holding it gets 401), account-wide
+/// (an agent operating Temps is not confined to one project), minted by an
+/// agent flow, and used.
 fn used_agent_credential(
     candidate: &api_keys::Model,
 ) -> Option<(AiHarnessCredentialKind, UtcDateTime)> {
-    if !candidate.is_active || candidate.project_id.is_some() {
+    if !candidate.is_active || candidate.project_id.is_some() || expired(candidate) {
         return None;
     }
     Some((
         agent_credential_kind(&candidate.name)?,
         candidate.last_used_at?,
     ))
+}
+
+/// Whether `key` is past its expiry, after which authentication rejects it.
+fn expired(key: &api_keys::Model) -> bool {
+    key.expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
 }
 
 /// The credential that authenticated the harness. Never carries the secret,
@@ -197,13 +205,16 @@ pub fn derive_ai_harness_status(
     };
 
     if let Some(last_used_at) = key.last_used_at {
+        if expired(key) {
+            return missing(format!(
+                "The '{AI_HARNESS_KEY_NAME}' API key (id {}) has expired, so the agent using it is rejected; create a new one",
+                key.id
+            ));
+        }
         return connected(key, AiHarnessCredentialKind::DedicatedKey, last_used_at);
     }
 
-    if key
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= Utc::now())
-    {
+    if expired(key) {
         return missing(format!(
             "The '{AI_HARNESS_KEY_NAME}' API key (id {}) expired before it was used; delete it and create a new one",
             key.id
@@ -302,6 +313,36 @@ mod tests {
             assert_eq!(status.key_id, None);
             assert_eq!(status.reason, None);
         }
+    }
+
+    /// `temps mcp add` keys default to a year; once one expires the agent
+    /// holding it gets 401, so it no longer proves a connection.
+    #[test]
+    fn an_expired_agent_credential_or_dedicated_key_is_not_connected() {
+        let mut mcp = key(3, "mcp-claude-app-2026-11-25T10-00-00Z");
+        mcp.last_used_at = Some(mcp.created_at);
+        mcp.expires_at = Some(Utc::now() - Duration::minutes(1));
+        let status = derive_ai_harness_status(None, Some(&mcp));
+        assert_eq!(status.status, AiHarnessState::Missing);
+        assert_eq!(status.connected_via, None);
+
+        let harness = harness();
+        let mut login = cli_login_after(&harness);
+        login.expires_at = Some(Utc::now() - Duration::seconds(1));
+        let status = derive_ai_harness_status(Some(&harness), Some(&login));
+        assert_eq!(status.status, AiHarnessState::Waiting);
+
+        let mut used = harness.clone();
+        used.last_used_at = Some(used.created_at);
+        used.expires_at = Some(Utc::now() - Duration::seconds(1));
+        let status = derive_ai_harness_status(Some(&used), None);
+        assert_eq!(status.status, AiHarnessState::Missing);
+        assert!(status.reason.as_deref().unwrap_or("").contains("expired"));
+
+        // Not yet expired still counts.
+        mcp.expires_at = Some(Utc::now() + Duration::days(30));
+        let status = derive_ai_harness_status(None, Some(&mcp));
+        assert_eq!(status.status, AiHarnessState::Connected);
     }
 
     #[test]

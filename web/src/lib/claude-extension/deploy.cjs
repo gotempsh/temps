@@ -12,10 +12,15 @@
  *   `temps mcp add --deploy-folder`), after
  *   resolving symlinks; never the home folder or a filesystem root itself.
  * - Symlinks inside the folder are left out, and each file is opened without
- *   following one, so nothing outside the folder is read.
+ *   following one and must be the very file listed (same device and inode),
+ *   so a folder swapped for a symlink meanwhile does not redirect a read
+ *   outside the folder.
  * - Version control, dependencies, build caches, `.env` files, keys and
- *   credentials are always left out, as is anything a `.gitignore` lists.
- * - At most LIMITS.files files and LIMITS.bytes bytes.
+ *   credentials are always left out, as is anything a `.gitignore` lists,
+ *   including those above the folder up to its repository's root.
+ * - At most LIMITS.files files and LIMITS.bytes bytes, and nothing is read
+ *   into memory past those bytes (a `.gitignore` past LIMITS.ignoreBytes is
+ *   refused unread).
  * Then it uploads a ZIP to the endpoint `temps deploy` uses. The server checks
  * the key there: it must be allowed to deploy that project. Claude asks the
  * user before running the tool (it is marked as making changes).
@@ -34,7 +39,11 @@ const fsp = fs.promises
 const deflateRaw = promisify(zlib.deflateRaw)
 
 const DEPLOY_TOOL_NAME = 'temps_deploy_folder'
-const LIMITS = { files: 10000, bytes: 100 * 1024 * 1024 }
+const LIMITS = {
+  files: 10000,
+  bytes: 100 * 1024 * 1024,
+  ignoreBytes: 1024 * 1024,
+}
 
 const DEPLOY_TOOL = {
   name: DEPLOY_TOOL_NAME,
@@ -318,25 +327,164 @@ async function allowedRoot(input, folders, host = HOSTS.extension) {
 }
 
 /**
+ * Read at most `max` bytes of the regular file at `file`, without following a
+ * symlink in its place. Throws `tooLarge(size)` for a larger file, before
+ * reading it, or when it grew past `max` while it was read.
+ */
+async function readBounded(file, max, tooLarge) {
+  const noFollow = fs.constants.O_NOFOLLOW || 0
+  const handle = await fsp.open(file, fs.constants.O_RDONLY | noFollow)
+  try {
+    const stat = await handle.stat()
+    if (!stat.isFile()) return null
+    if (stat.size > max) throw tooLarge(stat.size)
+    return await readHandle(handle, stat.size, max, tooLarge, file)
+  } finally {
+    await handle.close()
+  }
+}
+
+/**
+ * The bytes of an open file expected to hold `size` bytes, reading at most
+ * one byte more to notice growth. Throws `tooLarge(read)` past `max`, and an
+ * Error saying the file changed when it holds more than `size`.
+ */
+async function readHandle(handle, size, max, tooLarge, file) {
+  const capacity = Math.min(size, max) + 1
+  const buffer = Buffer.alloc(capacity)
+  let read = 0
+  while (read < capacity) {
+    const { bytesRead } = await handle.read(buffer, read, capacity - read, read)
+    if (bytesRead === 0) break
+    read += bytesRead
+  }
+  if (read > max) throw tooLarge(read)
+  if (read > size) {
+    throw new Error(
+      `${file} changed while it was read. Try again once the folder has stopped changing.`
+    )
+  }
+  return buffer.subarray(0, read)
+}
+
+/** The rules of the `.gitignore` in `directory`, read within the limit. */
+async function readIgnore(directory, base, limits) {
+  const file = path.join(directory, '.gitignore')
+  const text = await readBounded(
+    file,
+    limits.ignoreBytes,
+    (size) =>
+      new Error(
+        `${file} is ${megabytes(size)}, more than the ${megabytes(limits.ignoreBytes)} a .gitignore may be here. Shorten it, then try again.`
+      )
+  )
+  return text ? parseIgnore(text.toString('utf8'), base) : []
+}
+
+/**
+ * The repository `root` is in, when it is below one: the nearest folder above
+ * it with a `.git`. Null when there is none, or `root` is the repository's top.
+ */
+async function repositoryAbove(root) {
+  const isRepository = async (directory) => {
+    try {
+      await fsp.lstat(path.join(directory, '.git'))
+      return true
+    } catch {
+      return false
+    }
+  }
+  if (await isRepository(root)) return null
+  let directory = path.dirname(root)
+  for (;;) {
+    if (await isRepository(directory)) return directory
+    const parent = path.dirname(directory)
+    if (parent === directory) return null
+    directory = parent
+  }
+}
+
+/**
+ * The `.gitignore` rules that apply to `root` from the folders above it, up to
+ * its repository's top (git applies those too), with the path of `root` in
+ * that repository ('apps/site/'). `ignored` names the first folder on the way
+ * that one of them leaves out, in which case nothing under `root` is uploaded.
+ */
+async function rulesAbove(root, limits) {
+  const repository = await repositoryAbove(root)
+  if (!repository) return { prefix: '', rules: [], ignored: null }
+  const segments = path.relative(repository, root).split(path.sep)
+  let rules = []
+  let directory = repository
+  let base = ''
+  for (const segment of segments) {
+    rules = rules.concat(await readIgnoreIfFile(directory, base, limits))
+    const relative = `${base}${segment}`
+    if (isIgnored(rules, relative, true)) {
+      return { prefix: `${relative}/`, rules, ignored: `${relative}/` }
+    }
+    directory = path.join(directory, segment)
+    base = `${relative}/`
+  }
+  return { prefix: base, rules, ignored: null }
+}
+
+/** `readIgnore` for a folder that may have no `.gitignore`. */
+async function readIgnoreIfFile(directory, base, limits) {
+  try {
+    const stat = await fsp.lstat(path.join(directory, '.gitignore'))
+    if (!stat.isFile()) return []
+  } catch {
+    return []
+  }
+  return readIgnore(directory, base, limits)
+}
+
+/**
  * The files to upload under `root`, and what was left out. Throws when the
- * folder is over the limits, naming what to leave out.
+ * folder is over the limits, naming what to leave out. Each file is recorded
+ * with its device and inode, which `packZip` checks the file it opens against.
  */
 async function collectFiles(root, limits = LIMITS) {
+  limits = { ...LIMITS, ...limits }
   const files = []
   const leftOut = []
   let total = 0
 
+  // Paths in `.gitignore` rules are from the repository's top; `prefix` is
+  // where `root` is in it.
+  const above = await rulesAbove(root, limits)
+  if (above.ignored) {
+    leftOut.push(
+      `${path.basename(root)}/ (${above.ignored} is in a .gitignore above it)`
+    )
+    return { files, leftOut, total }
+  }
+  const { prefix } = above
+
   const walk = async (directory, relative, rules) => {
-    // A directory swapped for a symlink since it was listed is not followed.
-    if (!(await fsp.lstat(directory)).isDirectory()) return
+    // A directory swapped for a symlink since it was listed is not followed,
+    // and one reached through a symlink above it (its real path is not where
+    // it was listed) is not read.
+    const before = await fsp.lstat(directory)
+    if (!before.isDirectory()) return
     const entries = await fsp.readdir(directory, { withFileTypes: true })
+    const after = await fsp.lstat(directory)
+    if (
+      !after.isDirectory() ||
+      after.ino !== before.ino ||
+      after.dev !== before.dev ||
+      (await fsp.realpath(directory)) !== directory
+    ) {
+      throw new Error(
+        `${directory} changed while it was read. Try again once the folder has stopped changing.`
+      )
+    }
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     if (entries.some((e) => e.name === '.gitignore' && e.isFile())) {
-      const text = await fsp.readFile(
-        path.join(directory, '.gitignore'),
-        'utf8'
+      rules = rules.concat(
+        await readIgnore(directory, `${prefix}${relative}`, limits)
       )
-      rules = rules.concat(parseIgnore(text, relative))
     }
     for (const entry of entries) {
       const name = `${relative}${entry.name}`
@@ -348,7 +496,7 @@ async function collectFiles(root, limits = LIMITS) {
       if (!isDirectory && !entry.isFile()) continue
       if (
         alwaysLeftOut(entry.name, isDirectory) ||
-        isIgnored(rules, name, isDirectory)
+        isIgnored(rules, `${prefix}${name}`, isDirectory)
       ) {
         leftOut.push(isDirectory ? `${name}/` : name)
         continue
@@ -360,7 +508,14 @@ async function collectFiles(root, limits = LIMITS) {
       }
       const stat = await fsp.lstat(absolute)
       if (!stat.isFile()) continue
-      files.push({ name, absolute, size: stat.size, mode: stat.mode })
+      files.push({
+        name,
+        absolute,
+        size: stat.size,
+        mode: stat.mode,
+        dev: stat.dev,
+        ino: stat.ino,
+      })
       total += stat.size
       if (files.length > limits.files) {
         throw new Error(
@@ -375,7 +530,7 @@ async function collectFiles(root, limits = LIMITS) {
     }
   }
 
-  await walk(root, '', [])
+  await walk(root, '', above.rules)
   return { files, leftOut, total }
 }
 
@@ -408,6 +563,7 @@ const DOS_DATE = (0 << 9) | (1 << 5) | 1
  * really holds (a registry settings file with a credential is left out here).
  */
 async function packZip(collected, limits = LIMITS) {
+  limits = { ...LIMITS, ...limits }
   const locals = []
   const central = []
   const packed = []
@@ -419,20 +575,32 @@ async function packZip(collected, limits = LIMITS) {
       file.absolute,
       fs.constants.O_RDONLY | noFollow
     )
+    const grew = () =>
+      new Error(
+        `The folder grew past ${megabytes(limits.bytes)} while it was packed. Try again once it has stopped changing.`
+      )
     let data
     try {
       const stat = await handle.stat()
       if (!stat.isFile()) continue
-      data = await handle.readFile()
+      // The file listed, not another one a folder swapped for a symlink
+      // above it now leads to (O_NOFOLLOW covers only the last part).
+      if (
+        file.ino === undefined ||
+        stat.ino !== file.ino ||
+        stat.dev !== file.dev
+      ) {
+        throw new Error(
+          `${file.name} changed while the folder was packed. Try again once it has stopped changing.`
+        )
+      }
+      const remaining = limits.bytes - read
+      if (stat.size > remaining) throw grew()
+      data = await readHandle(handle, stat.size, remaining, grew, file.name)
     } finally {
       await handle.close()
     }
     read += data.length
-    if (read > limits.bytes) {
-      throw new Error(
-        `The folder grew past ${megabytes(limits.bytes)} while it was packed. Try again once it has stopped changing.`
-      )
-    }
     if (
       REGISTRY_SETTINGS.has(path.basename(file.name)) &&
       REGISTRY_CREDENTIAL.test(data.toString('utf8'))

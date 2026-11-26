@@ -4070,13 +4070,17 @@ pub const CONTROL_PLANE_PRIVATE_COMMAND: &str =
     "bunx @temps-sdk/cli ingress private --listen <this machine's private address, or tailscale>";
 
 /// Node 0 as a private worker (ADR-115 D6), from the consent and row 0.
-/// `None` without consent. With consent and no row yet, the loop has not
-/// applied it, or none runs in this process.
+/// `None` without consent. With consent and no row yet, or only a row
+/// written before the consent (it describes the listener of an earlier
+/// consent, which may be another address), the loop has not applied it, or
+/// none runs in this process. The loop answers every new consent with a
+/// fresh report, so waiting for one is short.
 pub fn control_plane_private_fact(
     consent: Option<&temps_config::private_ingress::PrivateIngressConsent>,
     row: Option<&node_public_ingress::Model>,
 ) -> Option<PrivateWorkerFact> {
-    consent?;
+    let consent = consent?;
+    let row = row.filter(|row| row.updated_at >= consent.updated_at);
     let id = temps_core::CONTROL_PLANE_NODE_ID;
     Some(match row {
         Some(row) => private_worker_fact(id, CONTROL_PLANE_PRIVATE_NAME, row),
@@ -4558,6 +4562,56 @@ impl TunnelMoveGuard for WaysIn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A report from before the consent describes an earlier listener (a
+    /// consent moved from address A to B): planning must not use A, so node 0
+    /// counts as not having applied the consent until it reports again.
+    #[test]
+    fn node_0_reports_older_than_the_consent_are_not_planned_on() {
+        let at = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let consent = temps_config::private_ingress::PrivateIngressConsent {
+            listen: "10.8.0.2".into(),
+            admit: vec![],
+            tailscale_serve: false,
+            updated_at: at("2026-11-24T10:00:00Z"),
+        };
+        let row = |updated: &str| node_public_ingress::Model {
+            node_id: 0,
+            listen_address: None,
+            http_port: 80,
+            https_port: 443,
+            public_address: None,
+            interfaces: None,
+            listening: Some(serde_json::json!({
+                "https": "10.8.0.1:443",
+                "admit": ["10.8.0.0/24"],
+            })),
+            mode: Some("private".into()),
+            last_check: None,
+            private_checks: None,
+            tailscale: None,
+            checked_at: None,
+            created_at: at(updated),
+            updated_at: at(updated),
+        };
+        let stale = control_plane_private_fact(Some(&consent), Some(&row("2026-11-24T09:59:59Z")))
+            .expect("consent exists");
+        assert_eq!(stale.listener, None);
+        assert_eq!(stale.ready(), None);
+        assert!(stale
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("has not applied"));
+        let fresh = control_plane_private_fact(Some(&consent), Some(&row("2026-11-24T10:00:01Z")))
+            .expect("consent exists");
+        assert_eq!(fresh.ready(), Some("10.8.0.1".parse().unwrap()));
+        assert!(control_plane_private_fact(None, Some(&row("2026-11-24T10:00:01Z"))).is_none());
+    }
 
     fn run_row(journal: Value, steps: Value) -> reachability_runs::Model {
         let now = Utc::now();

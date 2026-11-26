@@ -6,10 +6,13 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import {
+  bridgeKeyFilePath,
   bridgeUrlFromText,
   localBridgeCommand,
   MCP_SERVER_NAME,
   redactSecrets,
+  removeBridgeKeyFile,
+  writeBridgeKeyFile,
   type InstallResult,
   type McpClientAdapter,
   type McpServerEntry,
@@ -26,14 +29,19 @@ export function parseClaudeCodeMcpGetOutput(output: string): string | null {
   return match?.[1] ?? bridgeUrlFromText(output)
 }
 
+const CLAUDE_CODE_ID = 'claude-code'
+
 /**
  * The `claude mcp add` arguments for an entry: the HTTP endpoint, or the
  * bridge over stdio when it deploys local folders. The name comes before
- * `-e`, which takes several values, and `--` ends the options.
+ * `-e`, which takes several values, and `--` ends the options. `-e` values
+ * are arguments, visible in the process list while `claude mcp add` runs, so
+ * the bridge entry names the private key file (`bridgeKeyFilePath`) that
+ * `addServer` writes, never the key itself.
  */
 export function claudeCodeAddArgs(entry: McpServerEntry): string[] {
   if (entry.bridge) {
-    const command = localBridgeCommand(entry, entry.bridge)
+    const command = localBridgeCommand(entry, entry.bridge, bridgeKeyFilePath(CLAUDE_CODE_ID))
     return [
       'mcp',
       'add',
@@ -64,7 +72,7 @@ export function claudeCodeAddArgs(entry: McpServerEntry): string[] {
 // `claude` CLI (same as PostHog's installer) instead of hand-writing a JSON
 // file -- that survives Claude Code changing its config shape underneath us.
 export class ClaudeCodeAdapter implements McpClientAdapter {
-  readonly id = 'claude-code'
+  readonly id = CLAUDE_CODE_ID
   readonly label = 'Claude Code'
   private binary: string | null | undefined
 
@@ -118,6 +126,16 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
   async addServer(entry: McpServerEntry): Promise<InstallResult> {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The claude CLI was not found on PATH.' }
+    if (entry.bridge) {
+      try {
+        await writeBridgeKeyFile(CLAUDE_CODE_ID, entry.apiKey)
+      } catch (error) {
+        return {
+          success: false,
+          reason: `Could not save the API key to ${bridgeKeyFilePath(CLAUDE_CODE_ID)} (${redactSecrets(execErrorMessage(error))}).`,
+        }
+      }
+    }
     try {
       // The claude CLI's HTTP transport only accepts headers as a literal
       // --header value (no env-var-substitution flag, unlike Codex's
@@ -142,10 +160,14 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
       execFileSync(binary, ['mcp', 'remove', '--scope', 'user', MCP_SERVER_NAME], {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
+      await removeBridgeKeyFile(CLAUDE_CODE_ID)
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
-      if (/no such|not found/i.test(reason)) return { success: true, alreadyInstalled: true }
+      if (/no such|not found/i.test(reason)) {
+        await removeBridgeKeyFile(CLAUDE_CODE_ID).catch(() => undefined)
+        return { success: true, alreadyInstalled: true }
+      }
       return { success: false, reason }
     }
   }

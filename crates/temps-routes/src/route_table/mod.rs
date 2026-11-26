@@ -4126,6 +4126,25 @@ mod tests {
                 held[0].contains("only the control plane enforces"),
                 "{held:?}"
             );
+            // A worker on Tailscale admits both of its default ranges, stored
+            // as one list: the route is served with the list, not held back.
+            let mut snapshot = (*table.route_snapshot.load_full()).clone();
+            if let Some(entry) = snapshot.private.get_mut("app.internal.example.com") {
+                entry.address.range = Some("100.64.0.0/10,fd7a:115c:a1e0::/48".into());
+            }
+            table.route_snapshot.store(Arc::new(snapshot));
+            let (entries, held) = crate::route_sync::worker_private_routes(&table, &policy(&[]), 3);
+            assert!(held.is_empty(), "{held:?}");
+            assert_eq!(entries[0].range, "100.64.0.0/10,fd7a:115c:a1e0::/48");
+            // One public range in the list holds the route back.
+            let mut snapshot = (*table.route_snapshot.load_full()).clone();
+            if let Some(entry) = snapshot.private.get_mut("app.internal.example.com") {
+                entry.address.range = Some("100.64.0.0/10,8.8.8.0/24".into());
+            }
+            table.route_snapshot.store(Arc::new(snapshot));
+            let (entries, held) = crate::route_sync::worker_private_routes(&table, &policy(&[]), 3);
+            assert!(entries.is_empty());
+            assert!(held[0].contains("no private network range"), "{held:?}");
             let mut snapshot = (*table.route_snapshot.load_full()).clone();
             if let Some(entry) = snapshot.private.get_mut("app.internal.example.com") {
                 entry.address.range = Some("0.0.0.0/0".into());

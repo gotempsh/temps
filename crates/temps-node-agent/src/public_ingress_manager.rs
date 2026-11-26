@@ -343,6 +343,9 @@ async fn run(
         // ADR-115 D8: who the private listener admits. A range over a
         // container network, or no range to admit, stops the control plane
         // from making new addresses private here, with the reason.
+        // The same ranges gate every private request here, so routes already
+        // in the snapshot follow the consent as it is now, not as it was when
+        // their address was applied; an error admits nobody.
         let admit = match bound.as_ref().filter(|b| b.private) {
             Some(b) => match private_admit(&local, b.https.ip(), &local_networks()) {
                 Ok(admit) => admit,
@@ -355,8 +358,9 @@ async fn run(
             },
             None => Vec::new(),
         };
+        store.set_private_admit(admit.clone());
         let report = ListenerReport {
-            admit,
+            admit: admit.iter().map(ToString::to_string).collect(),
             interfaces: host_interfaces(),
             http: bound.as_ref().map(|b| b.http.to_string()),
             https: bound.as_ref().map(|b| b.https.to_string()),
@@ -547,7 +551,7 @@ pub fn private_admit(
     local: &LocalIngress,
     listener: IpAddr,
     own: &[temps_core::private_network::LocalNetwork],
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<temps_core::private_network::IpNet>, String> {
     use temps_core::private_network::{
         container_overlap, default_admit, is_container_interface, parse_admits,
     };
@@ -568,7 +572,7 @@ pub fn private_admit(
     if let Some(why) = container_overlap(&admit, &containers) {
         return Err(why.replace("`--admit`", "`temps agent ingress private --admit`"));
     }
-    Ok(admit.iter().map(ToString::to_string).collect())
+    Ok(admit)
 }
 
 fn own_addresses() -> Vec<(String, IpAddr)> {
@@ -1031,16 +1035,19 @@ mod tests {
             ..LocalIngress::default()
         };
         let ip = |t: &str| t.parse::<IpAddr>().unwrap();
+        let text = |admit: Vec<temps_core::private_network::IpNet>| -> Vec<String> {
+            admit.iter().map(ToString::to_string).collect()
+        };
         assert_eq!(
-            private_admit(&local(&[]), ip("10.8.0.1"), &own).unwrap(),
+            text(private_admit(&local(&[]), ip("10.8.0.1"), &own).unwrap()),
             ["10.8.0.0/24"]
         );
         assert_eq!(
-            private_admit(&local(&[]), ip("100.101.102.103"), &own).unwrap(),
+            text(private_admit(&local(&[]), ip("100.101.102.103"), &own).unwrap()),
             ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
         );
         assert_eq!(
-            private_admit(&local(&["10.8.0.0/28"]), ip("10.8.0.1"), &own).unwrap(),
+            text(private_admit(&local(&["10.8.0.0/28"]), ip("10.8.0.1"), &own).unwrap()),
             ["10.8.0.0/28"]
         );
         let why = private_admit(&local(&["172.16.0.0/12"]), ip("172.20.0.5"), &own).unwrap_err();

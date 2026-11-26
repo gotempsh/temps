@@ -105,3 +105,12 @@ export function linkAliases(
     return undefined
   return { [String(serviceId)]: option.envAliases }
 }
+
+/** Projects on the page now that were not there when the step opened, newest first as listed. */
+export function newProjects<T extends { id: number }>(
+  before: Set<number> | null,
+  list: T[] | undefined
+): T[] {
+  if (!before || !list) return []
+  return list.filter((p) => !before.has(p.id))
+}

@@ -478,10 +478,13 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     let intent = address.map(|a| intent_of(facts, a));
     let mut records = facts.dns_records.clone();
     records.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    // The admitted ranges too: they become the address's range on apply, so
+    // a listener that broadens (or narrows) who it admits since planning
+    // must not apply a range the operator never saw.
     let mut private_workers: Vec<_> = facts
         .private_workers
         .iter()
-        .map(|w| (w.id, w.listener, w.tailscale, w.error.is_some()))
+        .map(|w| (w.id, w.listener, w.tailscale, w.error.is_some(), &w.admit))
         .collect();
     private_workers.sort();
     let mut ranges = facts.private_ranges.clone();
@@ -4270,6 +4273,28 @@ mod tests {
         assert_eq!(
             fingerprint(&two, Some("shop.example.com")),
             fingerprint(&reversed, Some("shop.example.com"))
+        );
+    }
+
+    /// A listener that broadens who it admits after planning (10.8.0.0/24 to
+    /// 10.0.0.0/8, same address) must not let `apply` store the broader
+    /// range the operator never saw: the admitted ranges are fingerprinted.
+    #[test]
+    fn a_listener_admitting_other_ranges_changes_the_fingerprint() {
+        let host = Some("myapp.example.com");
+        let narrow = PlanFacts {
+            private_workers: vec![PrivateWorkerFact {
+                admit: Some("10.8.0.0/24".into()),
+                ..private_worker_fact(None)
+            }],
+            ..base()
+        };
+        let mut broad = narrow.clone();
+        broad.private_workers[0].admit = Some("10.0.0.0/8".into());
+        assert_ne!(fingerprint(&narrow, host), fingerprint(&broad, host));
+        assert_eq!(
+            fingerprint(&narrow, host),
+            fingerprint(&narrow.clone(), host)
         );
     }
 

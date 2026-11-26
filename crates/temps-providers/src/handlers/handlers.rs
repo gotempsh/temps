@@ -2861,7 +2861,8 @@ async fn link_service_to_project(
 
     match app_state
         .external_service_manager
-        .link_service_to_project_with_provisioning(
+        // The aliases are stored with the link, in one transaction.
+        .link_service_to_project_with_aliases(
             id,
             request.project_id,
             claim_user_id,
@@ -2869,25 +2870,11 @@ async fn link_service_to_project(
                 mode: request.database_provisioning_mode,
                 custom_database_name: request.custom_database_name,
             },
+            &request.env_aliases,
         )
         .await
     {
         Ok(info) => {
-            if !request.env_aliases.is_empty() {
-                app_state
-                    .external_service_manager
-                    .set_link_env_aliases(id, request.project_id, &request.env_aliases)
-                    .await
-                    .map_err(|error| {
-                        error!(service_id = id, project_id = request.project_id, %error, "failed to store variable aliases on a new link");
-                        internal_server_error()
-                            .detail(format!(
-                                "Service {id} was linked to project {}, but its variable aliases were not stored: {error}. Link it again to retry.",
-                                request.project_id
-                            ))
-                            .build()
-                    })?;
-            }
             let service_name = app_state
                 .external_service_manager
                 .get_service(id)

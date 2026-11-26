@@ -52,6 +52,11 @@ const COMMAND_GRACE: Duration = Duration::from_secs(15);
 const DEFAULT_READ_LINES: usize = 500;
 const MAX_READ_LINES: usize = 2_000;
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
+/// Largest file `sandbox_read_file` reads. The sandbox refuses a larger one
+/// before sending it, so a one-line read of a huge generated file never
+/// lands in the control plane's memory; the model pages it with
+/// `sandbox_exec` (`sed -n`, `head`) instead.
+const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The sandbox an agent run works in. [`RegistrySandbox`] is the real one;
 /// tests use an in-memory one.
@@ -60,7 +65,8 @@ pub trait RunSandbox: Send + Sync {
     /// Absolute work directory that relative paths resolve against.
     fn work_dir(&self) -> &str;
     async fn exec(&self, cmd: Vec<String>) -> Result<SandboxExecResult, AgentError>;
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, AgentError>;
+    /// The file at `path`, refused when larger than `max_bytes`.
+    async fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>, AgentError>;
     async fn write_file(&self, path: &str, contents: &[u8], mode: u32) -> Result<(), AgentError>;
 }
 
@@ -95,8 +101,10 @@ impl RunSandbox for RegistrySandbox {
             .await
     }
 
-    async fn read_file(&self, path: &str) -> Result<Vec<u8>, AgentError> {
-        self.registry.read_file(self.run_id, path).await
+    async fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>, AgentError> {
+        self.registry
+            .read_file_bounded(self.run_id, path, max_bytes)
+            .await
     }
 
     async fn write_file(&self, path: &str, contents: &[u8], mode: u32) -> Result<(), AgentError> {
@@ -275,11 +283,26 @@ pub async fn run_agent_loop(
                         .unwrap_or_else(|_| json!({ "raw": call.arguments })),
                 }))
                 .await;
+            // The deadline is the whole run's, so it bounds every call in the
+            // batch: none starts once it has passed, and one that runs into
+            // it ends the run as timed out, not as a finished turn.
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let (output, is_error) = match execute_tool(sandbox, &call, remaining).await {
-                Ok(output) => (output, false),
-                Err(message) => (message, true),
+            if remaining.is_zero() {
+                return Err(timed_out(&request, turn));
+            }
+            let (output, is_error) = match tokio::time::timeout(
+                remaining,
+                execute_tool(sandbox, &call, remaining),
+            )
+            .await
+            {
+                Ok(Ok(output)) => (output, false),
+                Ok(Err(message)) => (message, true),
+                Err(_) => return Err(timed_out(&request, turn)),
             };
+            if Instant::now() >= deadline {
+                return Err(timed_out(&request, turn));
+            }
             let output = bound(&output, MAX_TOOL_OUTPUT_CHARS);
             transcript
                 .push(json!({
@@ -374,13 +397,15 @@ async fn execute_tool(
                 .timeout_secs
                 .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
                 .clamp(1, MAX_COMMAND_TIMEOUT_SECS)
-                .min(remaining.as_secs().max(1));
+                .min(remaining.as_secs())
+                .max(1);
             let cwd = args
                 .cwd
                 .map(|cwd| resolve(sandbox.work_dir(), &cwd))
                 .unwrap_or_else(|| sandbox.work_dir().to_string());
             let cmd = exec_command(&cwd, &args.command, secs);
-            let wait = Duration::from_secs(secs) + COMMAND_GRACE;
+            // Never past the run's deadline, which the caller also enforces.
+            let wait = (Duration::from_secs(secs) + COMMAND_GRACE).min(remaining);
             let result = tokio::time::timeout(wait, sandbox.exec(cmd))
                 .await
                 .map_err(|_| format!("The command did not finish within {secs} seconds"))?
@@ -391,9 +416,14 @@ async fn execute_tool(
             let args: ReadArgs = parse_args(call)?;
             let path = resolve(sandbox.work_dir(), &args.path);
             let bytes = sandbox
-                .read_file(&path)
+                .read_file(&path, MAX_READ_BYTES)
                 .await
-                .map_err(|error| format!("Could not read {path}: {error}"))?;
+                .map_err(|error| {
+                    format!(
+                        "Could not read {path}: {error}. Files over {MAX_READ_BYTES} bytes are \
+                         not read whole; page through one with {SANDBOX_EXEC_TOOL} (sed -n, head)."
+                    )
+                })?;
             let text =
                 String::from_utf8(bytes).map_err(|_| format!("{path} is not a text file"))?;
             Ok(read_window(
@@ -479,8 +509,8 @@ fn describe_exec(result: &SandboxExecResult, secs: u64) -> String {
 
 /// Lines `offset..offset+limit` of a file, with a note on where to go next.
 fn read_window(path: &str, text: &str, offset: usize, limit: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
+    // Counted and sliced lazily: no vector of every line for a one-line read.
+    let total = text.lines().count();
     let start = offset.max(1);
     let limit = limit.clamp(1, MAX_READ_LINES);
     if total == 0 {
@@ -490,7 +520,12 @@ fn read_window(path: &str, text: &str, offset: usize, limit: usize) -> String {
         return format!("[{path} has {total} lines; offset {start} is past the end]");
     }
     let last = (start + limit - 1).min(total);
-    let mut out = lines[start - 1..last].join("\n");
+    let mut out = text
+        .lines()
+        .skip(start - 1)
+        .take(last + 1 - start)
+        .collect::<Vec<_>>()
+        .join("\n");
     if start > 1 || last < total {
         out.push_str(&format!("\n[lines {start}-{last} of {total}"));
         if last < total {
@@ -564,6 +599,9 @@ mod tests {
     struct MemorySandbox {
         files: Mutex<HashMap<String, Vec<u8>>>,
         commands: Mutex<Vec<Vec<String>>>,
+        read_limits: Mutex<Vec<u64>>,
+        /// How long each `exec` takes.
+        exec_delay: Duration,
     }
 
     #[async_trait]
@@ -573,21 +611,30 @@ mod tests {
         }
         async fn exec(&self, cmd: Vec<String>) -> Result<SandboxExecResult, AgentError> {
             self.commands.lock().unwrap().push(cmd);
+            tokio::time::sleep(self.exec_delay).await;
             Ok(SandboxExecResult {
                 exit_code: 1,
                 stdout: "1 failed".to_string(),
                 stderr: "boom".to_string(),
             })
         }
-        async fn read_file(&self, path: &str) -> Result<Vec<u8>, AgentError> {
-            self.files
+        async fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>, AgentError> {
+            self.read_limits.lock().unwrap().push(max_bytes);
+            let contents = self
+                .files
                 .lock()
                 .unwrap()
                 .get(path)
                 .cloned()
                 .ok_or_else(|| AgentError::Validation {
                     message: format!("{path} does not exist"),
-                })
+                })?;
+            if contents.len() as u64 > max_bytes {
+                return Err(AgentError::Validation {
+                    message: format!("{path} is larger than {max_bytes} bytes"),
+                });
+            }
+            Ok(contents)
         }
         async fn write_file(
             &self,
@@ -747,6 +794,100 @@ mod tests {
             finish,
             json!({ "type": "temps.finish", "reason": "max_turns", "turns": 2 })
         );
+    }
+
+    /// The run's deadline bounds the whole batch: a call that runs into it
+    /// ends the run as timed out, the calls after it never start, and the
+    /// last turn does not report a turn cap instead.
+    #[tokio::test]
+    async fn a_tool_batch_stops_at_the_run_deadline() {
+        let ai = ScriptedAi::new(vec![Ok(ChatTurnResponse {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".to_string(),
+                    name: SANDBOX_EXEC_TOOL.to_string(),
+                    arguments: json!({ "command": "sleep 60" }).to_string(),
+                },
+                ToolCall {
+                    id: "c2".to_string(),
+                    name: SANDBOX_WRITE_TOOL.to_string(),
+                    arguments: json!({ "path": "late.txt", "content": "x" }).to_string(),
+                },
+            ],
+        })]);
+        let sandbox = MemorySandbox {
+            exec_delay: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut req = request(1);
+        req.timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let error = run_agent_loop(&ai, &sandbox, req, None).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AgentError::AgentTimedOut {
+                    run_id: 7,
+                    turns: 1,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        // Not the exec's own 1 s floor plus its 15 s grace.
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!sandbox
+            .files
+            .lock()
+            .unwrap()
+            .contains_key("/workspace/late.txt"));
+    }
+
+    /// A read asks the sandbox for at most MAX_READ_BYTES, so a huge file is
+    /// refused there instead of being buffered here, and the model is told
+    /// how to page it.
+    #[tokio::test]
+    async fn a_read_is_bounded_before_the_file_is_buffered() {
+        let ai = ScriptedAi::new(vec![
+            Ok(tool_turn(
+                "c1",
+                SANDBOX_READ_TOOL,
+                json!({ "path": "big.log", "limit": 1 }),
+            )),
+            Ok(text_turn("done")),
+        ]);
+        let sandbox = MemorySandbox::default();
+        sandbox.files.lock().unwrap().insert(
+            "/workspace/big.log".to_string(),
+            vec![b'a'; MAX_READ_BYTES as usize + 1],
+        );
+        run_agent_loop(&ai, &sandbox, request(3), None)
+            .await
+            .unwrap();
+        assert_eq!(*sandbox.read_limits.lock().unwrap(), vec![MAX_READ_BYTES]);
+        let requests = ai.requests.lock().unwrap();
+        let result = &requests[1].messages.last().unwrap().content;
+        assert!(
+            result.contains("Could not read /workspace/big.log"),
+            "{result}"
+        );
+        assert!(result.contains("sed -n"), "{result}");
+    }
+
+    #[test]
+    fn a_read_window_slices_lines_without_collecting_them_all() {
+        let text = "one\ntwo\nthree\nfour\n";
+        assert_eq!(
+            read_window("/f", text, 2, 2),
+            "two\nthree\n[lines 2-3 of 4; continue with offset=4]"
+        );
+        assert_eq!(read_window("/f", text, 1, 10), "one\ntwo\nthree\nfour");
+        assert_eq!(
+            read_window("/f", text, 9, 1),
+            "[/f has 4 lines; offset 9 is past the end]"
+        );
+        assert_eq!(read_window("/f", "", 1, 1), "[/f is empty]");
     }
 
     #[tokio::test]

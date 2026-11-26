@@ -6,7 +6,6 @@ import {
   getProjectsOptions,
   getProjectsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { ProjectResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { CopyButton } from '@/components/ui/copy-button'
 import { problemDetail } from '@/lib/api-problem'
@@ -16,6 +15,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ChoiceList } from './ChoiceList'
 import { LATER_REASONS, deployAppPrompt } from './onboarding'
+import { newProjects } from './ship'
 import { useUpdateOnboarding } from './useOnboarding'
 
 type Source = 'agent' | 'project'
@@ -41,23 +41,20 @@ export function ShipStep() {
   const origin = window.location.origin
   const prompt = deployAppPrompt(origin)
 
-  // The projects that existed when the step opened; one that isn't among
-  // them is the agent's.
+  // The projects that existed when the step opened. One that isn't among
+  // them is only new: projects carry no creator, and another operator may
+  // create one meanwhile, so the operator says which is their agent's and
+  // the step keeps watching until they do.
   const [before, setBefore] = useState<Set<number> | null>(null)
-  const newProject = (list: ProjectResponse[] | undefined) =>
-    (before && list?.find((p) => !before.has(p.id))) || null
   const projects = useQuery({
     ...getProjectsOptions({ query: { page: 1, per_page: 20 } }),
-    refetchInterval: (query) =>
-      source === 'agent' && !newProject(query.state.data?.projects)
-        ? 3000
-        : false,
+    refetchInterval: source === 'agent' ? 3000 : false,
   })
   const list = projects.data?.projects
   // Recorded once, during render: React's pattern for state derived from
   // the first value of something else.
   if (list && before === null) setBefore(new Set(list.map((p) => p.id)))
-  const created = newProject(list)
+  const appeared = newProjects(before, list)
 
   const finish = async (path: string) => {
     await updateOnboarding.mutateAsync({ done: ['app'], completed: true })
@@ -138,13 +135,36 @@ export function ShipStep() {
           >
             {prompt}
           </pre>
-          {created ? (
-            <Callout
-              tone="success"
-              title={`Your agent created ${created.name}`}
-            >
-              Open it to follow the deploy.
-            </Callout>
+          {appeared.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-sm font-medium" id="ship-agent-status">
+                New since this step opened. Open the one your agent created.
+              </p>
+              <ul className="space-y-2" aria-label="New projects">
+                {appeared.map((p) => (
+                  <li
+                    key={p.id}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-3"
+                  >
+                    <span className="text-sm [overflow-wrap:anywhere]">
+                      {p.name}
+                    </span>
+                    <Button
+                      size="sm"
+                      busy={
+                        openCreated.isPending &&
+                        openCreated.variables === p.slug
+                      }
+                      busyLabel="Opening…"
+                      aria-disabled={pending || undefined}
+                      onClick={() => !pending && openCreated.mutate(p.slug)}
+                    >
+                      {`Open ${p.name}`}
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </div>
           ) : (
             <p
               id="ship-agent-status"
@@ -169,17 +189,9 @@ export function ShipStep() {
       ) : null}
 
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        {source === 'agent' && (
-          <Button
-            busy={openCreated.isPending}
-            busyLabel="Opening…"
-            aria-disabled={!created || pending || undefined}
-            aria-describedby={created ? undefined : 'ship-agent-status'}
-            onClick={() =>
-              created && !pending && openCreated.mutate(created.slug)
-            }
-          >
-            {created ? `Open ${created.name}` : 'Open the project'}
+        {source === 'agent' && appeared.length === 0 && (
+          <Button aria-disabled aria-describedby="ship-agent-status">
+            Open the project
           </Button>
         )}
         {source === 'project' && (

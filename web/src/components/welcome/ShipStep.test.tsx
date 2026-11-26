@@ -47,7 +47,7 @@ function mock(status: 'connected' | 'missing', projects: () => unknown[]) {
   return { api, patches }
 }
 
-test('with an agent connected, it leads, and the project it creates is the way on', async () => {
+test('with an agent connected, it leads, and the operator opens the new project their agent made', async () => {
   let list = [project(1, 'existing')]
   const { api, patches } = mock('connected', () => list)
   const { view, client } = renderStep()
@@ -66,11 +66,35 @@ test('with an agent connected, it leads, and the project it creates is the way o
   fireEvent.click(open)
   expect(patches).toEqual([])
 
-  // A project that was already there is not the agent's; a new one is.
+  // A project that was already there is not offered; a new one is, without
+  // claiming the agent made it.
   list = [project(2, 'my-app'), ...list]
   await act(() => client.refetchQueries())
-  await view.findByText('Your agent created my-app')
+  await view.findByText(/New since this step opened/)
+  expect(view.queryByText(/Your agent created/)).toBeNull()
+  expect(view.queryByRole('button', { name: 'Open existing' })).toBeNull()
   fireEvent.click(view.getByRole('button', { name: 'Open my-app' }))
+  await view.findByText('Project page')
+  expect(patches).toEqual([{ done: ['app'], completed: true }])
+  api.restore()
+})
+
+test('a project another operator creates meanwhile is offered, not credited, and the step keeps watching', async () => {
+  let list = [project(1, 'existing')]
+  const { api, patches } = mock('connected', () => list)
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  list = [project(2, 'someone-elses'), ...list]
+  await act(() => client.refetchQueries())
+  await view.findByRole('button', { name: 'Open someone-elses' })
+  // Nothing is completed until the operator opens one.
+  expect(patches).toEqual([])
+
+  // A later project still appears beside it, so the agent's is reachable.
+  list = [project(3, 'agents-app'), ...list]
+  await act(() => client.refetchQueries())
+  fireEvent.click(await view.findByRole('button', { name: 'Open agents-app' }))
   await view.findByText('Project page')
   expect(patches).toEqual([{ done: ['app'], completed: true }])
   api.restore()

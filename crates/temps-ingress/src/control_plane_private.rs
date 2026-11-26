@@ -210,6 +210,14 @@ pub struct ControlPlanePrivateIngressLoop {
     checker: Arc<dyn InsideChecker>,
 }
 
+/// How a pass of the loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Done,
+    /// The consent changed while it ran; the next pass starts at once.
+    Interrupted,
+}
+
 /// What the loop keeps between passes.
 #[derive(Default)]
 struct LoopState {
@@ -250,7 +258,11 @@ impl ControlPlanePrivateIngressLoop {
         tokio::spawn(async move {
             let mut state = LoopState::default();
             loop {
-                this.sync(&mut state).await;
+                // A consent change during the inside checks ends the pass
+                // early; sync again at once rather than after the poll.
+                if this.sync(&mut state).await == Pass::Interrupted {
+                    continue;
+                }
                 tokio::select! {
                     _ = shutdown.notified() => {
                         this.runtime.set_serving(None);
@@ -264,14 +276,14 @@ impl ControlPlanePrivateIngressLoop {
         })
     }
 
-    async fn sync(&self, state: &mut LoopState) {
+    async fn sync(&self, state: &mut LoopState) -> Pass {
         let consent = match self.consent.get().await {
             Ok(consent) => consent,
             Err(error) => {
                 // Keep serving what was consented; the database may be
                 // briefly unavailable.
                 warn!(%error, "could not read the private ingress consent; keeping the last state");
-                return;
+                return Pass::Done;
             }
         };
         let input = consent.as_ref().and_then(|c| {
@@ -306,7 +318,7 @@ impl ControlPlanePrivateIngressLoop {
             if let Err(error) = self.clear_report().await {
                 warn!(%error, "could not clear node 0's private ingress report");
             }
-            return;
+            return Pass::Done;
         };
 
         // Inside checks (ADR 064 D7): after the addresses change, else
@@ -323,7 +335,16 @@ impl ControlPlanePrivateIngressLoop {
             state.last_checks = if hosts.is_empty() {
                 Vec::new()
             } else {
-                self.checker.check(hosts.clone()).await
+                // Up to one DNS timeout per host: a withdrawn or narrowed
+                // consent must not wait for all of them. The checks are of
+                // a decision that no longer holds, so they are dropped.
+                tokio::select! {
+                    checks = self.checker.check(hosts.clone()) => checks,
+                    _ = self.runtime.changed() => {
+                        debug!("the private ingress consent changed during the inside checks; syncing again");
+                        return Pass::Interrupted;
+                    }
+                }
             };
             state.last_hosts = hosts;
             state.checked_at = Some(Instant::now());
@@ -336,7 +357,7 @@ impl ControlPlanePrivateIngressLoop {
         // every new consent.
         let consent_at = consent.as_ref().map(|c| c.updated_at);
         if !must_write(state, &report, ran_checks, consent_at) {
-            return;
+            return Pass::Done;
         }
         match temps_routes::public_ingress_store::PublicIngressStore::new(&self.db)
             .record_listener_report(CONTROL_PLANE_NODE_ID, report.clone())
@@ -348,6 +369,7 @@ impl ControlPlanePrivateIngressLoop {
             }
             Err(error) => warn!(%error, "could not write node 0's private ingress report"),
         }
+        Pass::Done
     }
 
     async fn clear_report(&self) -> Result<(), sea_orm::DbErr> {

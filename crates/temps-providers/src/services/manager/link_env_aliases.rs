@@ -74,20 +74,23 @@ pub fn stored_env_aliases(value: &serde_json::Value) -> BTreeMap<String, String>
 
 /// Add each alias to `vars`, copying the injected variable's value. An alias
 /// never overrides a variable the service injects itself, and one pointing
-/// at a name the service did not inject is skipped.
+/// at a name the service did not inject is skipped. Aliases resolve against
+/// what the service injected, never against another alias, so `B → A` with
+/// `A → POSTGRES_URL` adds no `B` whatever the names' order.
 pub fn apply_env_aliases(
     vars: &mut HashMap<String, String>,
     aliases: &BTreeMap<String, String>,
     service_id: i32,
     project_id: i32,
 ) {
+    let injected_vars = vars.clone();
     for (alias, injected) in aliases {
-        if vars.contains_key(alias) {
+        if injected_vars.contains_key(alias) {
             continue;
         }
-        match vars.get(injected).cloned() {
+        match injected_vars.get(injected) {
             Some(value) => {
-                vars.insert(alias.clone(), value);
+                vars.insert(alias.clone(), value.clone());
             }
             None => warn!(
                 service_id,
@@ -183,6 +186,27 @@ mod tests {
         );
         assert_eq!(vars["DATABASE_URL"], "mysql://x");
         assert!(!vars.contains_key("REDIS_URL"));
+    }
+
+    #[test]
+    fn a_chained_alias_resolves_to_nothing_in_either_order() {
+        for (first, second) in [("A", "B"), ("Z", "B")] {
+            let mut vars = HashMap::from([(
+                "POSTGRES_URL".to_string(),
+                "postgresql://app@db:5432/app".to_string(),
+            )]);
+            apply_env_aliases(
+                &mut vars,
+                &aliases(&[(first, "POSTGRES_URL"), (second, first)]),
+                3,
+                9,
+            );
+            assert_eq!(vars[first], "postgresql://app@db:5432/app");
+            assert!(
+                !vars.contains_key(second),
+                "{second} -> {first} must not resolve through another alias"
+            );
+        }
     }
 
     #[test]
