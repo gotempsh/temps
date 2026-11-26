@@ -305,6 +305,25 @@ describe('import', () => {
   })
 })
 
+describe('import from a public repository', () => {
+  test('--fresh and --base-url go to the public preset scan', async () => {
+    const run = await runWithApi(
+      registerProjectGroupsCommands,
+      ['project-groups', 'import', 'shop', '--dry-run', '--fresh', '--base-url', 'https://gitlab.example.com', '--json'],
+      {
+        'GET /project-groups/by-slug/shop': shop,
+        'GET /project-groups/9/repository': {
+          repository: { repo_owner: 'acme', repo_name: 'shop', main_branch: 'main', public_provider: 'gitlab' },
+        },
+        'GET /git/public/gitlab/acme/shop/presets': { presets: [] },
+        'GET /projects': { projects: [], page: 1, per_page: 100, total: 0 },
+      }
+    )
+    const scan = run.requests.find((r) => r.startsWith('GET /git/public/gitlab/acme/shop/presets'))
+    expect(scan).toBe('GET /git/public/gitlab/acme/shop/presets?branch=main&fresh=true&base_url=https%3A%2F%2Fgitlab.example.com')
+  })
+})
+
 describe('vars', () => {
   const routes = {
     'GET /project-groups/by-slug/shop': shop,

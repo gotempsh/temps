@@ -53,6 +53,7 @@ List tables, collections, keys or objects in a container
 |------|-------------|---------|----------|
 | `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
 | `--limit <n>` | Maximum entities to return (default: 100) | - | No |
+| `--next-token <token>` | Continue from the next_token of a previous page | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `data schema` (alias: `columns`)

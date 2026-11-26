@@ -20,6 +20,13 @@ Manage custom domains
 - `orders` (`order`) - Manage ACME orders for SSL certificate provisioning
 - `dns-challenge` - Setup DNS challenge records automatically using a DNS provider
 - `http-debug` - Debug HTTP-01 challenge for a domain
+- `get-by-host` - Get domain details by hostname
+- `get-on-demand-cert-status` - Get on-demand TLS certificate status for a hostname
+- `list-on-demand-certs` - List on-demand TLS certificate attempts
+- `get-certificate-settings` - Get certificate settings
+- `update-certificate-settings` - Update certificate settings
+- `get-by-id` - Get domain by ID
+- `get-challenge-token` - Get challenge token for a domain (returns plain text token)
 
 ### `domains list` (alias: `ls`)
 
@@ -30,6 +37,9 @@ List domains
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--search <value>` | Only domains whose name contains this | - | No |
+| `--sort-by <value>` | Sort column (default created_at) (one of: created_at, domain, status, expiration) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 ### `domains add`
 
@@ -121,6 +131,8 @@ List all ACME orders
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--sort-by <value>` | Sort column (default created_at) | - | No |
+| `--sort-order <value>` | Sort direction (one of: asc, desc) | - | No |
 
 #### `domains orders show`
 
@@ -185,4 +197,96 @@ Debug HTTP-01 challenge for a domain
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-by-host`
+
+Get domain details by hostname
+
+**Usage:** `domains get-by-host <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-on-demand-cert-status`
+
+Get on-demand TLS certificate status for a hostname
+
+**Usage:** `domains get-on-demand-cert-status <hostname> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains list-on-demand-certs`
+
+List on-demand TLS certificate attempts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (1-indexed) | - | No |
+| `--page-size <n>` | Number of items per page (max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-certificate-settings`
+
+Get certificate settings
+
+**Usage:** `domains get-certificate-settings <domain-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains update-certificate-settings`
+
+Update certificate settings
+
+**Usage:** `domains update-certificate-settings <domain-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--alert-days <n>` | Override the instance SSL expiry warning threshold; null inherits it | - | No |
+| `--alerts-enabled` | Override instance SSL expiry alerts; null inherits it | - | No |
+| `--no-alerts-enabled` | Set alerts_enabled to false | - | No |
+| `--challenge-type <value>` | Validation method for future ACME orders [required] | - | No |
+| `--renewal-days <n>` | Start ACME renewal this many days before expiry (1–90) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-by-id`
+
+Get domain by ID
+
+**Usage:** `domains get-by-id <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `domains get-challenge-token`
+
+Get challenge token for a domain (returns plain text token)
+
+**Usage:** `domains get-challenge-token <domain> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-o, --output <path>` | Where to write the reply (default: stdout) | `-` | No |
 | `--json` | Output in JSON format | - | No |

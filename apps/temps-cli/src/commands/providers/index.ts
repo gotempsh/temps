@@ -35,6 +35,9 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 import { addCredentialSources } from '../../lib/value-source.js'
+import { fieldFlags } from '../../lib/endpoint.js'
+import type { ListSyncedRepositoriesData } from '../../api/types.gen.js'
+import { ValidationError } from '../../utils/errors.js'
 
 interface AddOptions {
   provider?: string
@@ -103,6 +106,7 @@ interface IdForceOptions {
 interface UpdateTokenOptions {
   id: string
   token?: string
+  refreshToken?: string
 }
 
 export function registerProvidersCommands(program: Command): void {
@@ -200,19 +204,20 @@ export function registerProvidersCommands(program: Command): void {
     { flag: 'password', what: 'the Bitbucket app password' },
   ])
 
-  git
-    .command('repos')
-    .description('List available repositories')
-    .option('--id <id>', 'Connection ID (lists every synced repository if omitted)')
-    .option('--json', 'Output in JSON format')
-    .option('--search <term>', 'Search repositories by name')
-    .option('--page <n>', 'Page number')
-    .option('--per-page <n>', 'Items per page (max: 100)')
-    .option('--sort <field>', 'Sort by field (name, created_at, updated_at, stars)')
-    .option('--direction <dir>', 'Sort direction: asc or desc')
-    .option('--language <lang>', 'Filter by programming language')
-    .option('--owner <owner>', 'Filter by repository owner')
-    .action(listRepos)
+  REPOS_EXTRA.addTo(
+    git
+      .command('repos')
+      .description('List available repositories')
+      .option('--id <id>', 'Connection ID (lists every synced repository if omitted)')
+      .option('--json', 'Output in JSON format')
+      .option('--search <term>', 'Search repositories by name')
+      .option('--page <n>', 'Page number')
+      .option('--per-page <n>', 'Items per page (max: 100)')
+      .option('--sort <field>', 'Sort by field (name, created_at, updated_at, stars)')
+      .option('--direction <dir>', 'Sort direction: asc or desc')
+      .option('--language <lang>', 'Filter by programming language')
+      .option('--owner <owner>', 'Filter by repository owner'),
+  ).action(listRepos)
 
   // Connections subcommands
   const connections = providers.command('connections').alias('conn').description('Manage Git provider connections')
@@ -274,8 +279,12 @@ export function registerProvidersCommands(program: Command): void {
     .description('Update access token for a Git connection')
     .requiredOption('--id <id>', 'Connection ID')
     .option('-t, --token <token>', 'New access token (prefer --token-file or --token-stdin, which keep it out of shell history)')
+    .option('--refresh-token <token>', 'New refresh token, for providers whose access tokens expire (prefer --refresh-token-file or --refresh-token-stdin)')
     .action(updateTokenAction)
-  addCredentialSources(updateTokenCommand, [{ flag: 'token', what: 'the new access token' }])
+  addCredentialSources(updateTokenCommand, [
+    { flag: 'token', what: 'the new access token' },
+    { flag: 'refresh-token', what: 'the new refresh token' },
+  ])
 
   connections
     .command('validate')
@@ -722,7 +731,20 @@ async function connectGitProvider(options: ConnectOptions): Promise<void> {
   })
 }
 
+const REPOS_EXTRA = fieldFlags<NonNullable<ListSyncedRepositoriesData['query']>>(
+  {
+    updated_after: { kind: 'string', help: 'Only repositories updated on or after this time (RFC 3339)' },
+    preset: { kind: 'string', help: 'Only repositories detected as this preset (e.g. nextjs); not with --id' },
+    git_provider_connection_id: { kind: 'int', help: 'Only repositories of this connection; not with --id' },
+  },
+  'query',
+)
+
 async function listRepos(options: ReposOptions): Promise<void> {
+  const { updated_after, ...syncedOnly } = await REPOS_EXTRA.read(options)
+  if (options.id && Object.keys(syncedOnly).length) {
+    throw new ValidationError('--preset and --git-provider-connection-id filter the synced list; they cannot be used with --id')
+  }
   await requireAuth()
   await setupClient()
 
@@ -737,6 +759,7 @@ async function listRepos(options: ReposOptions): Promise<void> {
     ...(options.search && { search: options.search }),
     ...(options.language && { language: options.language }),
     ...(options.owner && { owner: options.owner }),
+    ...(updated_after !== undefined && { updated_after }),
   }
 
   const result = await withSpinner('Fetching repositories...', async () => {
@@ -757,7 +780,7 @@ async function listRepos(options: ReposOptions): Promise<void> {
     } else {
       const { data, error } = await listSyncedRepositories({
         client,
-        query: repoQuery,
+        query: { ...repoQuery, ...syncedOnly },
       })
       if (error) {
         throw new Error(getErrorMessage(error))
@@ -1097,7 +1120,7 @@ async function updateTokenAction(options: UpdateTokenOptions): Promise<void> {
     const { data, error } = await updateConnectionToken({
       client,
       path: { connection_id: id },
-      body: { access_token: token },
+      body: { access_token: token, ...(options.refreshToken && { refresh_token: options.refreshToken }) },
     })
     if (error) {
       throw new Error(getErrorMessage(error))

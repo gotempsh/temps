@@ -60,8 +60,12 @@ import {
   fetchGitConnections,
 } from '../../lib/git-connection.js'
 import { selectStorageServices } from '../../lib/service-setup.js'
+import { CREATE_PROJECT_EXTRA } from './field-flags.js'
+import type { CreateProjectRequest } from '../../api/types.gen.js'
 
 interface CreateOptions {
+  /** Read from CREATE_PROJECT_EXTRA's flags at the start of `create`. */
+  extra?: Partial<CreateProjectRequest>
   name?: string
   branch?: string
   directory?: string
@@ -148,6 +152,7 @@ async function createExternalProject(options: CreateOptions, skipPrompts: boolea
         source_type: 'manual',
         automatic_deploy: false,
         storage_service_ids: [],
+        ...options.extra,
       },
     })
     if (apiError || !data) {
@@ -164,6 +169,7 @@ async function createExternalProject(options: CreateOptions, skipPrompts: boolea
 }
 
 export async function create(options: CreateOptions): Promise<void> {
+  options = { ...options, extra: await CREATE_PROJECT_EXTRA.read(options) }
   // Validate before auth so a typo fails fast instead of after the wizard.
   let deliveryProvider: DeliveryProviderChoice | undefined
   if (options.deliveryProvider !== undefined) {
@@ -361,6 +367,7 @@ export async function create(options: CreateOptions): Promise<void> {
           storage_service_ids: serviceIds,
           environment_variables: envVars.length > 0 ? envVars : undefined,
           ...(deliveryProvider && { delivery_provider: deliveryProvider }),
+          ...options.extra,
         },
       })
 
@@ -508,6 +515,7 @@ async function createManualProject(
           storage_service_ids: serviceIds,
           environment_variables: envVars.length > 0 ? envVars : undefined,
           ...(deliveryProvider && { delivery_provider: deliveryProvider }),
+          ...options.extra,
         },
       })
 

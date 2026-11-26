@@ -7,6 +7,7 @@
 
 import { readFile } from 'node:fs/promises'
 import type { Command } from 'commander'
+import { parseIntegerFlag } from '../../lib/project-id.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, getErrorMessage } from '../../lib/api-client.js'
 import {
@@ -172,6 +173,8 @@ export function registerNodesSshCommands(nodes: Command): void {
       'Add servers over SSH: the control plane logs in, installs temps if needed, pairs the ' +
         'server and starts its agent. Lists recent ones and their progress'
     )
+    .option('--page <n>', 'Page to show (default 1)')
+    .option('--per-page <n>', 'Servers per page (default 20, max 100)')
     .option('--json', 'Output in JSON format')
     .action(sshListAction)
 
@@ -226,12 +229,14 @@ export function registerNodesSshCommands(nodes: Command): void {
 // Actions
 // ============================================================================
 
-async function sshListAction(options: { json?: boolean }): Promise<void> {
+async function sshListAction(options: { json?: boolean; page?: string; perPage?: string }): Promise<void> {
+  const page = options.page === undefined ? undefined : parseIntegerFlag(options.page, '--page', 1)
+  const per_page = options.perPage === undefined ? undefined : parseIntegerFlag(options.perPage, '--per-page', 1, 100)
   await requireAuth()
   await setupClient()
 
   const result = await withSpinner('Reading SSH enrollments...', async () => {
-    const { data, error } = await nodeSshEnrollmentList()
+    const { data, error } = await nodeSshEnrollmentList({ query: { page, per_page } })
     if (error || !data) {
       throw new Error(getErrorMessage(error))
     }

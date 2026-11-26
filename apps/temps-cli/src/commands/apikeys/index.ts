@@ -11,7 +11,8 @@ import {
   getApiKeyPermissions,
   listApiKeys
 } from '../../api/sdk.gen.js'
-import type { ApiKeyResponse } from '../../api/types.gen.js'
+import type { ApiKeyResponse, ListApiKeysData } from '../../api/types.gen.js'
+import { fieldFlags } from '../../lib/endpoint.js'
 import { requireAuth } from '../../config/store.js'
 import { client, getErrorMessage, setupClient } from '../../lib/api-client.js'
 import { colors, header, icons, info, json, keyValue, newline, success, warning } from '../../ui/output.js'
@@ -89,12 +90,12 @@ export function registerApiKeysCommands(program: Command): void {
     .alias('keys')
     .description('Manage API keys for programmatic access')
 
-  apikeys
+  const list = apikeys
     .command('list')
     .alias('ls')
     .description('List all API keys')
     .option('--json', 'Output in JSON format')
-    .action(listApiKeysAction)
+  LIST_QUERY.addTo(list).action(listApiKeysAction)
 
   apikeys
     .command('create')
@@ -144,12 +145,15 @@ export function registerApiKeysCommands(program: Command): void {
     .action(listPermissions)
 }
 
+const LIST_QUERY = fieldFlags<NonNullable<ListApiKeysData['query']>>({ page: 'int', page_size: { kind: 'int', help: 'Keys per page (max 100)' } }, 'query')
+
 async function listApiKeysAction(options: { json?: boolean }): Promise<void> {
+  const query = await LIST_QUERY.read(options)
   await requireAuth()
   await setupClient()
 
   const keysData = await withSpinner('Fetching API keys...', async () => {
-    const { data, error } = await listApiKeys({ client })
+    const { data, error } = await listApiKeys({ client, query })
     if (error) {
       throw new Error(getErrorMessage(error))
     }

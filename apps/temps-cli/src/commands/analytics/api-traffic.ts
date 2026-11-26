@@ -29,6 +29,7 @@ interface ApiTrafficOptions {
   project?: string
   period?: string
   environmentId?: string
+  refresh?: boolean
   json?: boolean
 }
 
@@ -746,6 +747,7 @@ export async function apiSummary(options: ApiTrafficOptions): Promise<void> {
         environment_id: environmentId,
         start_date: startDate,
         end_date: endDate,
+        ...(options.refresh && { refresh: true }),
       },
     })
     if (error) throw new Error(getErrorMessage(error))

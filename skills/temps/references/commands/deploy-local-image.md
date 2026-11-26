@@ -16,6 +16,9 @@ Build and deploy a local Docker image (or deploy existing image with --image)
 | `-f, --dockerfile <path>` | Path to Dockerfile | `Dockerfile` | No |
 | `-c, --context <path>` | Build context directory | `.` | No |
 | `--build-arg <arg...>` | Build arguments (can be specified multiple times) | - | No |
+| `--build-command <cmd>` | With no Dockerfile: the build command in the one generated from the project's preset | - | No |
+| `--install-command <cmd>` | With no Dockerfile: the install command in the generated one | - | No |
+| `--output-dir <dir>` | With no Dockerfile: the static output directory in the generated one | - | No |
 | `--no-build` | Skip building, requires --image | - | No |
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Target environment name | `production` | No |

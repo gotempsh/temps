@@ -226,3 +226,24 @@ describe('secrets create/update value sources', () => {
     expect(run.requests).toEqual([])
   })
 })
+
+describe('project-scoped secrets', () => {
+  test('create, update and delete pass the project only when --project is given', async () => {
+    const created = await runWithApi(
+      registerSecretsCommands,
+      ['secrets', 'create', '-n', 'db', '--value-stdin', '-p', 'web'],
+      { 'GET /projects/by-slug/web': { id: 7, slug: 'web' }, 'POST /settings/secrets': { name: 'db', secret_type: 'env' } },
+      { stdin: 'pw' },
+    )
+    expect(created.error).toBeUndefined()
+    expect(created.bodies.at(-1)?.body).toMatchObject({ name: 'db', value: 'pw', project_id: 7 })
+    const removed = await runWithApi(registerSecretsCommands, ['secrets', 'delete', 'db', '-p', '7', '--yes'], {
+      'DELETE /settings/secrets/db': new Response(null, { status: 204 }),
+    })
+    expect(removed.requests).toEqual(['DELETE /settings/secrets/db?project_id=7'])
+    const instanceWide = await runWithApi(registerSecretsCommands, ['secrets', 'delete', 'db', '--yes'], {
+      'DELETE /settings/secrets/db': new Response(null, { status: 204 }),
+    })
+    expect(instanceWide.requests).toEqual(['DELETE /settings/secrets/db'])
+  })
+})

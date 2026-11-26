@@ -19,6 +19,7 @@ interface ListOptions {
   offset?: string
   operationType?: string
   userId?: string
+  resourceId?: string
   from?: string
   to?: string
 }
@@ -42,6 +43,7 @@ export function registerAuditCommands(program: Command): void {
     .option('--offset <n>', 'Number of logs to skip')
     .option('--operation-type <type>', 'Filter by operation type')
     .option('--user-id <id>', 'Filter by user ID')
+    .option('--resource-id <id>', 'Filter by the ID of the resource acted on')
     .option('--from <timestamp>', 'Start timestamp (ISO 8601 or epoch ms)')
     .option('--to <timestamp>', 'End timestamp (ISO 8601 or epoch ms)')
     .action(listAuditLogsAction)
@@ -113,6 +115,7 @@ async function listAuditLogsAction(options: ListOptions): Promise<void> {
         offset,
         operation_type: options.operationType ?? undefined,
         user_id: userId ?? undefined,
+        resource_id: options.resourceId ?? undefined,
         from: options.from ?? undefined,
         to: options.to ?? undefined,
       },

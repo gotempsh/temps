@@ -35,8 +35,11 @@ describe('generateDocs', () => {
     expect(commands.some((command) => command.name === 'otel-forward')).toBe(true)
     expect(commands.some((command) => command.name === 'projects')).toBe(true)
     expect(commands.some((command) => command.name === 'cloud')).toBe(true)
+    // kv and blob are implemented now, so the docs list them.
+    expect(commands.some((command) => command.name === 'kv')).toBe(true)
+    expect(commands.some((command) => command.name === 'blob')).toBe(true)
     // Registered but not implemented: neither help nor docs advertise them.
-    for (const unavailable of ['kv', 'blob', 'exec', 'dev']) {
+    for (const unavailable of ['exec', 'dev']) {
       expect(commands.some((command) => command.name === unavailable)).toBe(false)
     }
   })
@@ -68,7 +71,10 @@ describe('generateDocs', () => {
     const { createProgram } = await import('../cli.js')
     const program = createProgram()
     const help = program.helpInformation()
-    for (const unavailable of ['kv', 'blob', 'exec', 'dev']) {
+    for (const available of ['kv', 'blob']) {
+      expect(help).toMatch(new RegExp(`^\\s+${available}\\b`, 'm'))
+    }
+    for (const unavailable of ['exec', 'dev']) {
       expect(help).not.toMatch(new RegExp(`^\\s+${unavailable}\\b`, 'm'))
       expect(program.commands.some((command) => command.name() === unavailable)).toBe(
         true,
@@ -114,8 +120,17 @@ describe('generateDocs', () => {
     expect(skill).not.toContain('npm install --global')
     expect(commandReference).toContain('## Command index')
     expect(commandReference).toContain(`bunx @temps-sdk/cli@${channel} [command]`)
-    expect(commandReference).toContain('[`backups`](#backups)')
-    expect(commandReference).toContain('[`otel-forward`](#otel-forward)')
+    expect(commandReference).toMatch(/\[`backups`\]\(#backups(-alias-[a-z0-9-]+)?\)/)
+    expect(commandReference).toMatch(/\[`otel-forward`\]\(#otel-forward(-alias-[a-z0-9-]+)?\)/)
+    // Every index link opens its heading, whose fragment includes the aliases.
+    expect(commandReference).toContain('[`preview-gateway`](#preview-gateway-alias-pgw)')
+    const fragments = new Set(
+      [...commandReference.matchAll(/^#{2,6} (.+)$/gm)].map((m) =>
+        (m[1] as string).toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-'),
+      ),
+    )
+    const broken = [...commandReference.matchAll(/\]\(#([^)]+)\)/g)].map((m) => m[1]).filter((f) => !fragments.has(f as string))
+    expect(broken).toEqual([])
     expect(commandReference).toContain(
       `bunx @temps-sdk/cli@${channel} --target-context production projects create --name my-app`,
     )

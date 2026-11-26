@@ -18,6 +18,7 @@ Create and build TypeScript plugins, or install and manage external plugins
 - `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
 - `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
+- `api` - Api commands
 
 ### `plugin install`
 
@@ -220,3 +221,78 @@ Build, publish native npm packages, verify ownership and submit for review; resu
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-y, --yes` | Confirm public npm publication non-interactively | - | No |
+
+### `plugin api`
+
+Api commands
+
+**Subcommands:**
+
+- `list-chat-watches` - List chat plugin watches
+- `change-chat-watch` - Change chat plugin watch
+- `get-ai-tools` - Get plugin ai tools
+- `put-ai-tools` - Put plugin ai tools
+
+#### `plugin api list-chat-watches`
+
+List chat plugin watches
+
+**Usage:** `plugin api list-chat-watches <chat> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `plugin api change-chat-watch`
+
+Change chat plugin watch
+
+**Usage:** `plugin api change-chat-watch <chat> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--action <value>` | Body field action (one of: create, pause, resume, remove) [required] | - | No |
+| `--digest <value>` | Body field digest | - | No |
+| `--mode <value>` | Body field mode (one of: notify, wake) | - | No |
+| `--plugin <value>` | Body field plugin | - | No |
+| `--source <value>` | Body field source | - | No |
+| `--subject <value>` | Body field subject | - | No |
+| `--where <json>` | Body field where (JSON) | - | No |
+| `--id <value>` | Body field id | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `plugin api get-ai-tools`
+
+Get plugin ai tools
+
+**Usage:** `plugin api get-ai-tools <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `plugin api put-ai-tools`
+
+Put plugin ai tools
+
+**Usage:** `plugin api put-ai-tools <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--actor-id <value>` | Current actor_id returned by GET; replacing the installation requires fresh consent [required] | - | No |
+| `--enabled` | Body field enabled [required] | - | No |
+| `--no-enabled` | Set enabled to false | - | No |
+| `--installation-revision <value>` | Binary revision returned by GET; a changed binary requires fresh consent [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |

@@ -367,3 +367,23 @@ describe('unsupported on a worker node (422)', () => {
     await expect(run('snapshot', 'sbx_1')).rejects.toThrow('--node control-plane')
   })
 })
+
+describe('sandbox create limits and clone options', () => {
+  it('sends --pids-limit and --creation-id', async () => {
+    route = () => ({ status: 201, body: { sandbox: sandboxInner() } })
+    await run('create', '--pids-limit', '256', '--creation-id', 'create-0001', '--json')
+    expect(requests[0]?.body).toEqual({ pids_limit: 256, creation_id: 'create-0001' })
+  })
+
+  it('rejects a malformed creation id before sending anything', async () => {
+    route = () => ({ status: 201, body: { sandbox: sandboxInner() } })
+    await expect(run('create', '--creation-id', 'short', '--json')).rejects.toThrow('--creation-id must be 8 to 64')
+    expect(requests).toEqual([])
+  })
+
+  it('clone --strip-git-metadata asks for the .git directory to be removed', async () => {
+    route = (req) => (req.path === '/v1/sandboxes/sbx_1/source' ? { status: 200, body: { sandbox: sandboxInner() } } : undefined)
+    await run('clone', 'sbx_1', '--git-url', 'https://git.example.com/app.git', '--strip-git-metadata')
+    expect(requests[0]?.body).toMatchObject({ strip_git_metadata: true })
+  })
+})

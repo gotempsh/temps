@@ -24,6 +24,8 @@ import { setupClient, getErrorMessage } from '../../lib/api-client.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable } from '../../ui/table.js'
 import { colors, header, info, json, keyValue, newline, success } from '../../ui/output.js'
+import { readJsonObject } from '../../lib/json-edit.js'
+import { ValidationError } from '../../utils/errors.js'
 
 /** The body of a generated SDK call, or its error as a thrown message. */
 async function unwrap<T>(
@@ -46,6 +48,19 @@ function parseIdArg(value: string, what: string): number {
 }
 
 /** One line per worker, for the tunnels table. */
+/** The credential answers of `--secrets-file`: a JSON object of strings, kept out of argv. */
+export async function readConnectorSecrets(source: string, stdin?: AsyncIterable<Uint8Array | string>): Promise<Record<string, string>> {
+  const object = await readJsonObject(source, 'the tunnel secrets', stdin)
+  const secrets: Record<string, string> = {}
+  for (const [key, value] of Object.entries(object)) {
+    if (typeof value !== 'string') {
+      throw new ValidationError(`Secret "${key}" in ${source === '-' ? 'stdin' : source} must be a string, got ${Array.isArray(value) ? 'a list' : typeof value}`)
+    }
+    secrets[key] = value
+  }
+  return secrets
+}
+
 export function describeWorkers(connector: ConnectorView): string {
   if (connector.nodes.length === 0) return 'none'
   return connector.nodes
@@ -135,6 +150,8 @@ export function registerTunnelsCommands(program: Command): void {
     .requiredOption('--domain <domain>', 'Zone (or subdomain of one) whose apps it publishes')
     .requiredOption('--node <ids...>', 'Worker node ids to run it on')
     .option('--provider <kind>', 'Tunnel provider kind', 'cloudflare_tunnel')
+    .option('--host-suffix <suffix>', 'Name environment hosts <label>-<suffix>.<domain>, one level under the zone')
+    .option('--secrets-file <path>', "JSON object of the provider's credential fields by key (- reads stdin)")
     .option('--json', 'Output in JSON format')
     .action(
       async (options: {
@@ -143,8 +160,11 @@ export function registerTunnelsCommands(program: Command): void {
         domain: string
         node: string[]
         provider: string
+        hostSuffix?: string
+        secretsFile?: string
         json?: boolean
       }) => {
+        const secrets = options.secretsFile ? await readConnectorSecrets(options.secretsFile) : undefined
         await ready()
         const connector = await withSpinner('Creating the tunnel...', () =>
           unwrap(
@@ -157,6 +177,8 @@ export function registerTunnelsCommands(program: Command): void {
                   domain: options.domain,
                 },
                 node_ids: options.node.map((n) => parseIdArg(n, 'node id')),
+                ...(options.hostSuffix && { host_suffix: options.hostSuffix }),
+                ...(secrets && { secrets }),
               },
             })
           )

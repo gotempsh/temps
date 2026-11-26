@@ -10,9 +10,11 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   createErrorInboundFilter,
   deleteErrorInboundFilter,
+  getErrorInboundFilter,
   listErrorInboundFilters,
   updateErrorInboundFilter,
 } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type { InboundFilterKind, InboundFilterResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable } from '../../ui/table.js'
@@ -111,6 +113,12 @@ export function registerInboundFilterCommands(errors: Command): void {
   const filters = errors
     .command('filters')
     .description('Drop noisy error events before they are stored (browser extensions, crawlers, localhost, message or release patterns)')
+
+  endpoint(filters, getErrorInboundFilter, {
+    name: 'get',
+    description: "Show one of a project's inbound filters",
+    path: { project_id: 'project', filter_id: 'int' },
+  })
 
   filters
     .command('list')

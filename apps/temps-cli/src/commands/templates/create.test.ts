@@ -80,6 +80,26 @@ describe('parseServiceNames', () => {
 })
 
 describe('buildInstantiateRequest', () => {
+  test('--runtime-overrides is sent by service name, and checked against the template', () => {
+    const request = buildInstantiateRequest(
+      asTemplate(single),
+      { runtimeOverrides: '{"plausible":{"image":"registry.example/app:2","exposed_port":8080}}' },
+      { type: 'no_project' },
+      'k'
+    )
+    expect(request.runtime_overrides).toEqual({ plausible: { image: 'registry.example/app:2', exposed_port: 8080 } })
+    expect(buildInstantiateRequest(asTemplate(single), {}, { type: 'no_project' }, 'k')).not.toHaveProperty('runtime_overrides')
+    expect(() =>
+      buildInstantiateRequest(asTemplate(single), { runtimeOverrides: '{"web":{}}' }, { type: 'no_project' }, 'k')
+    ).toThrow(/no service "web"/)
+    expect(() =>
+      buildInstantiateRequest(asTemplate(single), { runtimeOverrides: '[1]' }, { type: 'no_project' }, 'k')
+    ).toThrow(/JSON object keyed by service name/)
+    expect(() =>
+      buildInstantiateRequest(asTemplate(single), { runtimeOverrides: '{"plausible":' }, { type: 'no_project' }, 'k')
+    ).toThrow(/not valid JSON/)
+  })
+
   test('every database defaults to a new one unless linked', () => {
     const request = buildInstantiateRequest(asTemplate(multi), { database: ['postgres=4'] }, { type: 'no_project' }, 'key-1')
     expect(request.databases).toEqual({ postgres: { type: 'existing', service_id: 4 }, redis: { type: 'create' } })

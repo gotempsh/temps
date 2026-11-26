@@ -4,6 +4,30 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`logs search`](#logs-search)
+- [`logs facets`](#logs-facets)
+- [`logs attributes`](#logs-attributes)
+- [`logs histogram`](#logs-histogram)
+- [`logs aggregate`](#logs-aggregate)
+- [`logs capabilities`](#logs-capabilities)
+- [`logs saved`](#logs-saved)
+- [`logs keys`](#logs-keys)
+- [`logs get-context`](#logs-get-context)
+- [`logs global-aggregate`](#logs-global-aggregate)
+- [`logs global-attribute-keys`](#logs-global-attribute-keys)
+- [`logs global-capabilities`](#logs-global-capabilities)
+- [`logs global-facets-attrs`](#logs-global-facets-attrs)
+- [`logs global-histogram`](#logs-global-histogram)
+- [`logs ingest`](#logs-ingest)
+- [`logs ingest-budget`](#logs-ingest-budget)
+- [`logs tail`](#logs-tail)
+- [`logs purge`](#logs-purge)
+- [`logs project-search`](#logs-project-search)
+- [`logs get-saved-search`](#logs-get-saved-search)
+- [`logs update-saved-search`](#logs-update-saved-search)
+
 ## `logs` (alias: `glogs`)
 
 Search collected logs across every project and database you can access
@@ -18,6 +42,19 @@ Search collected logs across every project and database you can access
 - `capabilities` - Whether container logs are being collected, and whether attribute facets, histograms and aggregates are available
 - `saved` - Saved log searches: named filters you can reopen, chart on a dashboard and alert on
 - `keys` - Ingest keys for POST /api/logs/ingest (newline-delimited JSON from Vector, Fluent Bit or any HTTP client)
+- `get-context` - Get context lines surrounding a specific log line
+- `global-aggregate` - Global log aggregate
+- `global-attribute-keys` - Global log attribute keys
+- `global-capabilities` - Global log capabilities
+- `global-facets-attrs` - Global log facets attrs
+- `global-histogram` - Global log histogram
+- `ingest` - Ingest newline-delimited JSON log lines with a log ingest key
+- `ingest-budget` - The ingestion budget and the containers dropping lines over it, for the warnings on the log views
+- `tail` - Live tail logs via Server-Sent Events
+- `purge` - Purge all logs for a project before a given timestamp
+- `project-search` - Search one project's (or one database's) log lines, newest first, with a cursor for the next page
+- `get-saved-search` - Read one saved log search
+- `update-saved-search` - Change a saved log search
 
 ### `logs search`
 
@@ -288,3 +325,238 @@ Revoke an ingest key; collectors using it are refused
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
+
+### `logs get-context`
+
+Get context lines surrounding a specific log line
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--timestamp <value>` | Target line timestamp (RFC 3339) [required] | - | No |
+| `--container-id <value>` | Target line container ID [required] | - | No |
+| `--line-id <value>` | Target line_id, as a decimal string [required] | - | No |
+| `--lines <n>` | Context lines before and after (default: 25, max 50) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-aggregate`
+
+Global log aggregate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--group-by <value>` | Comma-separated label names and/or attr:<name> [required] | - | No |
+| `--metric <value>` | count \| count_distinct:<k> \| avg:<k> \| p50:<k> \| p95:<k> \| p99:<k> \| max:<k> \| sum:<k> [required] | - | No |
+| `--limit <n>` | Max rows returned (default 50, cap 1000) | - | No |
+| `--attr <value>` | Repeatable attribute predicate: <key><op><value> or <key>? (repeatable) [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-attribute-keys`
+
+Global log attribute keys
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--limit <n>` | Max keys returned (default/cap 1000) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-capabilities`
+
+Global log capabilities
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-facets-attrs`
+
+Global log facets attrs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--keys <value>` | Comma-separated label names or attr:<name> [required] | - | No |
+| `--attr <value>` | Repeatable attribute predicate: <key><op><value> or <key>? (repeatable) [required] | - | No |
+| `--limit <n>` | Max values per key (default/cap 1000) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs global-histogram`
+
+Global log histogram
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--start-time <value>` | Window start (RFC 3339) [required] | - | No |
+| `--end-time <value>` | Window end (RFC 3339) [required] | - | No |
+| `--source <value>` | Source kind (default: all) (one of: collected, application, service) | - | No |
+| `--projects <value>` | Project selectors (repeatable) (repeatable) | - | No |
+| `--external-services <value>` | External service selectors (repeatable) (repeatable) | - | No |
+| `--scopes <value>` | Scope selectors (repeatable) (repeatable) | - | No |
+| `--levels <value>` | Levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Container ids (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Node ids (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Deployment id | - | No |
+| `--bucket-secs <n>` | Bucket width in seconds (default 60) | - | No |
+| `--group-by <value>` | One label name or attr:<name> to split series by | - | No |
+| `--max-groups <n>` | Max series before folding the rest into "other" (default 8) | - | No |
+| `--attr <value>` | Repeatable attribute predicate: <key><op><value> or <key>? (repeatable) [required] | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs ingest`
+
+Ingest newline-delimited JSON log lines with a log ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--input <path>` | The file to upload (- for stdin) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `logs ingest-budget`
+
+The ingestion budget and the containers dropping lines over it, for the warnings on the log views
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `logs tail`
+
+Live tail logs via Server-Sent Events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <value>` | Project ID [required] | - | No |
+| `--service <value>` | Service name [required] | - | No |
+| `--env <value>` | Environment [required] | - | No |
+| `--levels <value>` | Optional level filters (repeatable) [required] | - | No |
+| `--text <value>` | Optional text filter | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs purge`
+
+Purge all logs for a project before a given timestamp
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--before <value>` | Delete all logs before this timestamp (ISO 8601) [required] | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `-y, --yes` | Do not ask for confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs project-search`
+
+Search one project's (or one database's) log lines, newest first, with a cursor for the next page
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <n>` | Project ID (0 with --external-service-id searches a database's logs) [required] | - | No |
+| `--external-service-id <n>` | Search this external service's (database's) logs instead | - | No |
+| `--start-time <value>` | Window start (RFC 3339; default: 24 hours ago) | - | No |
+| `--end-time <value>` | Window end (RFC 3339; default: now) | - | No |
+| `--text <value>` | Only lines containing this text | - | No |
+| `--levels <value>` | Only these levels (repeatable) (one of: TRACE, DEBUG, INFO, WARN, ERROR) (repeatable) | - | No |
+| `--envs <value>` | Only these environments (repeatable) (repeatable) | - | No |
+| `--services <value>` | Only these services (repeatable) (repeatable) | - | No |
+| `--container-ids <value>` | Only these containers (repeatable) (repeatable) | - | No |
+| `--node-ids <n>` | Only lines from these nodes (repeatable) (repeatable) | - | No |
+| `--deploy-id <n>` | Only lines from this deployment | - | No |
+| `--context-lines <n>` | Lines of context around each match | - | No |
+| `--page-size <n>` | Lines per page | - | No |
+| `--cursor <value>` | Resume from a previous next_cursor | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs get-saved-search`
+
+Read one saved log search
+
+**Usage:** `logs get-saved-search <saved-search-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `logs update-saved-search`
+
+Change a saved log search
+
+**Usage:** `logs update-saved-search <saved-search-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug-or-id>` | Project slug or ID (default: the linked project) | - | No |
+| `--description <value>` | Absent leaves the description unchanged; an empty string clears it | - | No |
+| `--name <value>` | Absent leaves the name unchanged | - | No |
+| `--pinned` | Body field pinned | - | No |
+| `--no-pinned` | Set pinned to false | - | No |
+| `--query <json>` | The stored filter set of a saved search (JSON) | - | No |
+| `--time-range <value>` | Body field time_range | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
+| `--json` | Output in JSON format | - | No |

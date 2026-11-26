@@ -98,9 +98,8 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
 
   for (const cmd of commands) {
     const heading = '#'.repeat(level)
-    const aliasText = cmd.aliases.length > 0 ? ` (alias: \`${cmd.aliases.join('`, `')}\`)` : ''
 
-    md += `${heading} \`${cmd.name}\`${aliasText}\n\n`
+    md += `${heading} ${headingTitle(cmd)}\n\n`
 
     if (cmd.description) {
       md += `${cmd.description}\n\n`
@@ -146,7 +145,14 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
   return md
 }
 
-function markdownAnchor(name: string): string {
+/** A command's heading text: its name and, when it has any, its aliases. */
+function headingTitle(cmd: Pick<CommandInfo, 'name' | 'aliases'>): string {
+  const aliasText = cmd.aliases.length > 0 ? ` (alias: \`${cmd.aliases.join('`, `')}\`)` : ''
+  return `\`${cmd.name}\`${aliasText}`
+}
+
+/** The fragment GitHub gives a heading: lowercase, punctuation dropped, spaces as hyphens. */
+export function markdownAnchor(name: string): string {
   return name
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')
@@ -159,7 +165,8 @@ function generateCommandIndex(commands: CommandInfo[]): string {
   index += 'Use this index or search for a top-level command heading to load only the relevant group.\n\n'
 
   for (const command of commands) {
-    index += `- [\`${command.name}\`](#${markdownAnchor(command.name)}) - ${command.description}\n`
+    // Link the heading's own fragment, which includes its aliases.
+    index += `- [\`${command.name}\`](#${markdownAnchor(headingTitle(command))}) - ${command.description}\n`
   }
 
   return `${index}\n## Commands\n\n`

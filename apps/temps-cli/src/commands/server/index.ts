@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from "commander";
+import { metricWindowQuery, registerServerExtraCommands } from "./extra.js";
 import { requireAuth } from "../../config/store.js";
 import { setupClient, client, getErrorMessage } from "../../lib/api-client.js";
 import {
@@ -183,9 +184,13 @@ export function registerServerCommands(program: Command): void {
       "Metric name (node.cpu_percent, node.memory_used_bytes, node.disk_used_bytes, node.disk_read_bytes_total, node.network_tx_bytes_total, ...)",
     )
     .option("--range <range>", `Time window: ${SERVER_RANGES.join(", ")}`, "1h")
+    .option("--start <time>", "Start of an explicit window (ISO 8601); with --end, instead of --range")
+    .option("--end <time>", "End of an explicit window (ISO 8601)")
+    .option("--percentile <p>", "Aggregate each bucket at this percentile (e.g. 0.95) instead of the mean")
     .option("--node <id>", "Node ID (0 = control plane)", "0")
     .option("--json", "Output in JSON format")
     .action(serverMetricsAction);
+  registerServerExtraCommands(server);
 
   server
     .command("docker-disk-usage")
@@ -258,6 +263,9 @@ async function serverStatusAction(options: {
 async function serverMetricsAction(options: {
   metric: string;
   range?: string;
+  start?: string;
+  end?: string;
+  percentile?: string;
   node?: string;
   json?: boolean;
 }): Promise<void> {
@@ -277,7 +285,7 @@ async function serverMetricsAction(options: {
       const { data, error } = await nodeMetricsGetRange({
         client,
         path: { id: nodeId },
-        query: { metric: options.metric, range },
+        query: { metric: options.metric, range, ...metricWindowQuery(options) },
       });
       if (error || !data) throw new Error(getErrorMessage(error));
       return data;

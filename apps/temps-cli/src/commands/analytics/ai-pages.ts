@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import chalk from 'chalk'
+import { ENVIRONMENT_FILTER } from './scope.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -28,6 +29,7 @@ function formatNumber(n: number): string {
 }
 
 export async function aiPages(options: AiPagesOptions): Promise<void> {
+  const environment = await ENVIRONMENT_FILTER.read(options)
   await requireAuth()
   await setupClient()
 
@@ -58,6 +60,7 @@ export async function aiPages(options: AiPagesOptions): Promise<void> {
         project_id: projectId,
         start_time: startDate,
         end_time: endDate,
+        ...environment,
         limit,
         path: options.path,
       },
@@ -83,6 +86,7 @@ export async function aiPages(options: AiPagesOptions): Promise<void> {
               project_id: projectId,
               start_time: startDate,
               end_time: endDate,
+              ...environment,
               limit: 50,
               path: p.path,
             },

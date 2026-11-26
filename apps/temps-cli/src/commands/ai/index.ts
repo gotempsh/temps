@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
+import { registerAiUploadCommand } from './upload.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -225,6 +226,7 @@ async function providerLogin(
 
 export function registerAiCommands(program: Command): void {
   const ai = program.command('ai').description('AI assistant status for a project')
+  registerAiUploadCommand(ai)
 
   const provider = ai
     .command('provider')

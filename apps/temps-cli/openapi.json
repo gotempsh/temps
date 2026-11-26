@@ -38568,10 +38568,17 @@
       "GetResponse": {
         "description": "Response for get operation",
         "properties": {
+          "exists": {
+            "description": "Whether the key exists, so a stored JSON `null` is not mistaken for a\nmissing key",
+            "type": "boolean"
+          },
           "value": {
-            "description": "The value, or null if not found"
+            "description": "The value, or null if not found. A stored JSON `null` is also null\nhere; `exists` tells the two apart."
           }
         },
+        "required": [
+          "exists"
+        ],
         "type": "object"
       },
       "GetSessionReplayResponse": {
@@ -77211,14 +77218,14 @@
         "description": "Response for set operation",
         "properties": {
           "result": {
-            "description": "Always \"OK\" on success",
+            "description": "\"OK\" when the value was written; null when an NX/XX condition did not\nhold and the key was left unchanged (the Redis reply)",
             "example": "OK",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
-        "required": [
-          "result"
-        ],
         "type": "object"
       },
       "SetWireguardMeshHubRequest": {
@@ -137693,7 +137700,7 @@
                 }
               }
             },
-            "description": "Value set"
+            "description": "Value set, or `result: null` when an NX/XX condition did not hold"
           },
           "401": {
             "description": "Unauthorized"

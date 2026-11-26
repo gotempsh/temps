@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import chalk from 'chalk'
+import { BREAKDOWN_FILTERS } from './scope.js'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
@@ -50,6 +51,7 @@ export function resolveDimension(dimension: string): { groupBy: string; label: s
 }
 
 export async function breakdown(dimension: string, options: BreakdownOptions): Promise<void> {
+  const filters = await BREAKDOWN_FILTERS.read(options)
   const dim = resolveDimension(dimension)
 
   await requireAuth()
@@ -85,6 +87,7 @@ export async function breakdown(dimension: string, options: BreakdownOptions): P
         end_date: endDate,
         group_by: dim.groupBy,
         limit,
+        ...filters,
       },
     })
 
