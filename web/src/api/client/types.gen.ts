@@ -3441,9 +3441,19 @@ export type AssetCachePurgeResponse = {
     deleted: number;
 };
 
+/**
+ * Body of `POST /users/{user_id}/roles`. The target user comes from the
+ * path; the body names only the role.
+ */
 export type AssignRoleRequest = {
     role_type: string;
-    user_id: number;
+    /**
+     * Deprecated: the target is the path's `user_id`. Still accepted for
+     * older clients, but only when it equals the path id (otherwise 400).
+     *
+     * @deprecated
+     */
+    user_id?: number | null;
 };
 
 /**
@@ -10163,6 +10173,12 @@ export type CreateRepositoryRequest = {
 
 export type CreateRouteRequest = {
     domain: string;
+    /**
+     * Whether the route serves traffic as soon as it is created. Defaults
+     * to `true`; send `false` to create the route disabled and enable it
+     * later with `PUT /lb/routes/{domain}`.
+     */
+    enabled?: boolean | null;
     host: string;
     port: number;
     /**
@@ -23581,9 +23597,12 @@ export type ModelCatalogEntry = {
     provider: string;
     release_date?: string | null;
     source_url: string;
-    supports_reasoning: boolean;
-    supports_tools: boolean;
-    supports_vision: boolean;
+    supports_reasoning?: boolean | null;
+    /**
+     * `null` when the catalog does not say.
+     */
+    supports_tools?: boolean | null;
+    supports_vision?: boolean | null;
 };
 
 /**
@@ -24404,6 +24423,30 @@ export type NodeBackend = {
      * Why the node cannot run it, and how to fix that when it can be fixed.
      */
     reason?: string | null;
+};
+
+/**
+ * A worker's effective build limits.
+ */
+export type NodeBuildLimitsResponse = {
+    /**
+     * How long a build may run, in seconds.
+     */
+    build_timeout_seconds: number;
+    /**
+     * Builds the node runs at once.
+     */
+    concurrency: number;
+    /**
+     * True when no limits were saved for the node, so these are the
+     * defaults (and follow a future change of them).
+     */
+    is_default: boolean;
+    node_id: number;
+    /**
+     * How long a build may wait for a free slot, in seconds.
+     */
+    queue_wait_seconds: number;
 };
 
 /**
@@ -32178,7 +32221,7 @@ export type ResolverCoverageHost = {
 /**
  * What a resolver looks like right now.
  */
-export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting' | 'no_local_resolver';
+export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting' | 'no_local_resolver' | 'unsupported';
 
 /**
  * Quick count of resources involved in the migration
@@ -32772,6 +32815,9 @@ export type RouteRefreshResponse = {
 };
 
 export type RouteResponse = {
+    /**
+     * When the route was created (ISO 8601, UTC)
+     */
     created_at: string;
     domain: string;
     enabled: boolean;
@@ -32782,6 +32828,9 @@ export type RouteResponse = {
      * Route type: "http" or "tls"
      */
     route_type: string;
+    /**
+     * When the route was last changed (ISO 8601, UTC)
+     */
     updated_at: string;
 };
 
@@ -36046,6 +36095,13 @@ export type SetNodePublicIngressResponse = {
 };
 
 export type SetNodeResourcesRequest = {
+    /**
+     * Put `system_reserved` back to the default, so `system_reserved_is_default`
+     * is true again: the control plane's stored values are cleared (it then
+     * follows the default), a worker gets its role's default. Cannot be
+     * combined with `system_reserved`.
+     */
+    reset_system_reserved?: boolean;
     resource_policy?: NodeResourcePolicy | null;
     system_reserved?: SystemReserved | null;
 };
@@ -41845,13 +41901,36 @@ export type UpdateProviderCredentialsRequest = {
      */
     client_id?: string | null;
     client_secret?: SecretString | null;
+    password?: SecretString | null;
     private_key?: SecretString | null;
+    /**
+     * SSH public key (one OpenSSH line) of an SSH-key provider. Replaced
+     * together with `private_key`, which then carries the SSH private key.
+     */
+    public_key?: string | null;
     /**
      * OAuth redirect URI (GitLab OAuth / GitLab App).
      */
     redirect_uri?: string | null;
     token?: SecretString | null;
+    /**
+     * Username of a basic-auth provider (generic Git server, Bitbucket app
+     * password). Omit to keep the stored username.
+     */
+    username?: string | null;
     webhook_secret?: SecretString | null;
+};
+
+/**
+ * Result of a credential update: the provider and the names of the
+ * credential fields that were replaced. Credential values are never returned.
+ */
+export type UpdateProviderCredentialsResponse = ProviderResponse & {
+    /**
+     * Names of the fields that were replaced, e.g. `["password"]`. Fields
+     * that do not apply to the provider's auth method are not listed.
+     */
+    updated_fields: Array<string>;
 };
 
 export type UpdateProviderKeyRequest = {
@@ -42245,9 +42324,23 @@ export type UpdateTraefikRouteEnabledRequest = {
     enabled: boolean;
 };
 
+/**
+ * Body of `PATCH /users/{user_id}`. Unknown fields are rejected so a
+ * misspelt field is an error instead of a silent no-op.
+ */
 export type UpdateUserRequest = {
     email?: string | null;
+    /**
+     * Deprecated: the old name of `username`, still accepted. Sending both
+     * with different values is refused.
+     *
+     * @deprecated
+     */
     name?: string | null;
+    /**
+     * The new username, as in `CreateUserRequest`.
+     */
+    username?: string | null;
 };
 
 export type UpdateWebhookProviderRequest = {
@@ -43703,6 +43796,11 @@ export type WireguardMeshStatusResponse = {
      */
     ca_rotation_required: boolean;
     /**
+     * Whether `DELETE /nodes/wireguard` can turn the mesh off now: it is
+     * on and nothing depends on it.
+     */
+    can_disable: boolean;
+    /**
      * Whether `POST /nodes/wireguard` can turn the mesh on here.
      */
     can_enable: boolean;
@@ -43711,6 +43809,12 @@ export type WireguardMeshStatusResponse = {
      */
     cidr?: string | null;
     control_plane?: WireguardMeshControlPlaneEntry | null;
+    /**
+     * What prevents turning it off, when the mesh is on and `can_disable`
+     * is false (nodes on the mesh, pairings in progress, the control
+     * plane's overlay on its mesh address). Rendered verbatim.
+     */
+    disable_blocker?: string | null;
     /**
      * What prevents enabling it, when `can_enable` is false and the mesh is
      * off. Rendered verbatim.
@@ -66268,7 +66372,7 @@ export type UpdateGitProviderCredentialsData = {
 
 export type UpdateGitProviderCredentialsErrors = {
     /**
-     * Bad request
+     * Invalid credentials for the provider's auth method
      */
     400: unknown;
     /**
@@ -66293,7 +66397,7 @@ export type UpdateGitProviderCredentialsResponses = {
     /**
      * Credentials updated
      */
-    200: ProviderResponse;
+    200: UpdateProviderCredentialsResponse;
 };
 
 export type UpdateGitProviderCredentialsResponse = UpdateGitProviderCredentialsResponses[keyof UpdateGitProviderCredentialsResponses];
@@ -68854,6 +68958,50 @@ export type AdminGetNodeResponses = {
 
 export type AdminGetNodeResponse = AdminGetNodeResponses[keyof AdminGetNodeResponses];
 
+export type AdminGetNodeBuildLimitsData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/build-limits';
+};
+
+export type AdminGetNodeBuildLimitsErrors = {
+    /**
+     * The node is the control plane or not a worker
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Stored limits are invalid or storage failed
+     */
+    500: unknown;
+};
+
+export type AdminGetNodeBuildLimitsResponses = {
+    /**
+     * The worker's effective build limits, and whether they are the defaults
+     */
+    200: NodeBuildLimitsResponse;
+};
+
+export type AdminGetNodeBuildLimitsResponse = AdminGetNodeBuildLimitsResponses[keyof AdminGetNodeBuildLimitsResponses];
+
 export type AdminSetNodeBuildLimitsData = {
     body: BuildLimits;
     path: {
@@ -68868,7 +69016,7 @@ export type AdminSetNodeBuildLimitsData = {
 
 export type AdminSetNodeBuildLimitsErrors = {
     /**
-     * Invalid limits or node role
+     * Invalid limits, node role, or the control plane (node 0)
      */
     400: unknown;
     /**
@@ -69466,6 +69614,9 @@ export type AdminGetNodeResourcesErrors = {
 export type AdminGetNodeResourcesError = AdminGetNodeResourcesErrors[keyof AdminGetNodeResourcesErrors];
 
 export type AdminGetNodeResourcesResponses = {
+    /**
+     * The node's capacity, reservation and what is placed on it
+     */
     200: NodeResourcesResponse;
 };
 
@@ -69485,7 +69636,7 @@ export type AdminSetNodeResourcesData = {
 
 export type AdminSetNodeResourcesErrors = {
     /**
-     * Invalid reserve
+     * Invalid reserve, nothing to change, or system_reserved together with reset_system_reserved
      */
     400: ProblemDetails;
     /**
@@ -69509,6 +69660,9 @@ export type AdminSetNodeResourcesErrors = {
 export type AdminSetNodeResourcesError = AdminSetNodeResourcesErrors[keyof AdminSetNodeResourcesErrors];
 
 export type AdminSetNodeResourcesResponses = {
+    /**
+     * The node's resources after the change
+     */
     200: NodeResourcesResponse;
 };
 
@@ -72184,6 +72338,45 @@ export type NodeSshHostKeyResponses = {
 };
 
 export type NodeSshHostKeyResponse2 = NodeSshHostKeyResponses[keyof NodeSshHostKeyResponses];
+
+export type WireguardMeshDisableData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard';
+};
+
+export type WireguardMeshDisableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Something still depends on the mesh; the detail says what
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshDisableResponses = {
+    /**
+     * Mesh off; current state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshDisableResponse = WireguardMeshDisableResponses[keyof WireguardMeshDisableResponses];
 
 export type WireguardMeshStatusGetData = {
     body?: never;
@@ -102611,6 +102804,12 @@ export type GetAiProviderHarnessUpdateData = {
          * Look inside the workspace again instead of returning the cached check.
          */
         refresh?: boolean;
+        /**
+         * Return only what was last read, never looking inside the workspace
+         * (which could create or wake it). Not checked yet: every version field
+         * and `checked_at` are null. Ignored when `refresh` is set.
+         */
+        cached_only?: boolean;
     };
     url: '/settings/ai-providers/{provider_id}/harness-update';
 };
@@ -108018,7 +108217,7 @@ export type AssignRoleData = {
 
 export type AssignRoleErrors = {
     /**
-     * Invalid role type
+     * Invalid role type, or a deprecated body user_id that differs from the path
      */
     400: unknown;
     /**
@@ -108041,10 +108240,12 @@ export type AssignRoleErrors = {
 
 export type AssignRoleResponses = {
     /**
-     * Role assigned successfully
+     * Role assigned; the user and all of its roles
      */
-    200: unknown;
+    200: RouteUserWithRoles;
 };
+
+export type AssignRoleResponse = AssignRoleResponses[keyof AssignRoleResponses];
 
 export type RemoveRoleData = {
     body?: never;

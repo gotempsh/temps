@@ -7383,17 +7383,24 @@
         "type": "object"
       },
       "AssignRoleRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /users/{user_id}/roles`. The target user comes from the\npath; the body names only the role.",
         "properties": {
           "role_type": {
+            "example": "admin",
             "type": "string"
           },
           "user_id": {
+            "deprecated": true,
+            "description": "Deprecated: the target is the path's `user_id`. Still accepted for\nolder clients, but only when it equals the path id (otherwise 400).",
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
-          "user_id",
           "role_type"
         ],
         "type": "object"
@@ -21003,6 +21010,14 @@
         "properties": {
           "domain": {
             "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "description": "Whether the route serves traffic as soon as it is created. Defaults\nto `true`; send `false` to create the route disabled and enable it\nlater with `PUT /lb/routes/{domain}`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "host": {
             "type": "string"
@@ -50784,22 +50799,29 @@
             "type": "string"
           },
           "supports_reasoning": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "supports_tools": {
-            "type": "boolean"
+            "description": "`null` when the catalog does not say.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "supports_vision": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [
           "provider",
           "model_id",
           "display_name",
-          "supports_tools",
-          "supports_vision",
-          "supports_reasoning",
           "deprecated",
           "source_url",
           "fetched_at"
@@ -52394,6 +52416,45 @@
         "required": [
           "backend",
           "available"
+        ],
+        "type": "object"
+      },
+      "NodeBuildLimitsResponse": {
+        "description": "A worker's effective build limits.",
+        "properties": {
+          "build_timeout_seconds": {
+            "description": "How long a build may run, in seconds.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "concurrency": {
+            "description": "Builds the node runs at once.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "is_default": {
+            "description": "True when no limits were saved for the node, so these are the\ndefaults (and follow a future change of them).",
+            "type": "boolean"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "queue_wait_seconds": {
+            "description": "How long a build may wait for a free slot, in seconds.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "node_id",
+          "concurrency",
+          "queue_wait_seconds",
+          "build_timeout_seconds",
+          "is_default"
         ],
         "type": "object"
       },
@@ -68069,7 +68130,8 @@
           "node_unavailable",
           "agent_too_old",
           "not_reporting",
-          "no_local_resolver"
+          "no_local_resolver",
+          "unsupported"
         ],
         "type": "string"
       },
@@ -69259,6 +69321,8 @@
       "RouteResponse": {
         "properties": {
           "created_at": {
+            "description": "When the route was created (ISO 8601, UTC)",
+            "example": "2026-11-25T11:39:26Z",
             "format": "date-time",
             "type": "string"
           },
@@ -69284,6 +69348,8 @@
             "type": "string"
           },
           "updated_at": {
+            "description": "When the route was last changed (ISO 8601, UTC)",
+            "example": "2026-11-25T11:39:26Z",
             "format": "date-time",
             "type": "string"
           }
@@ -76952,6 +77018,10 @@
       },
       "SetNodeResourcesRequest": {
         "properties": {
+          "reset_system_reserved": {
+            "description": "Put `system_reserved` back to the default, so `system_reserved_is_default`\nis true again: the control plane's stored values are cleared (it then\nfollows the default), a worker gets its role's default. Cannot be\ncombined with `system_reserved`.",
+            "type": "boolean"
+          },
           "resource_policy": {
             "oneOf": [
               {
@@ -88958,6 +89028,17 @@
               }
             ]
           },
+          "password": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Password or app password of a basic-auth provider."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "private_key": {
             "oneOf": [
               {
@@ -88967,6 +89048,13 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "public_key": {
+            "description": "SSH public key (one OpenSSH line) of an SSH-key provider. Replaced\ntogether with `private_key`, which then carries the SSH private key.",
+            "type": [
+              "string",
+              "null"
             ]
           },
           "redirect_uri": {
@@ -88987,6 +89075,13 @@
               }
             ]
           },
+          "username": {
+            "description": "Username of a basic-auth provider (generic Git server, Bitbucket app\npassword). Omit to keep the stored username.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "webhook_secret": {
             "oneOf": [
               {
@@ -89000,6 +89095,29 @@
           }
         },
         "type": "object"
+      },
+      "UpdateProviderCredentialsResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ProviderResponse"
+          },
+          {
+            "properties": {
+              "updated_fields": {
+                "description": "Names of the fields that were replaced, e.g. `[\"password\"]`. Fields\nthat do not apply to the provider's auth method are not listed.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "updated_fields"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "Result of a credential update: the provider and the names of the\ncredential fields that were replaced. Credential values are never returned."
       },
       "UpdateProviderKeyRequest": {
         "properties": {
@@ -89923,6 +90041,8 @@
         "type": "object"
       },
       "UpdateUserRequest": {
+        "additionalProperties": false,
+        "description": "Body of `PATCH /users/{user_id}`. Unknown fields are rejected so a\nmisspelt field is an error instead of a silent no-op.",
         "properties": {
           "email": {
             "example": "john.doe@example.com",
@@ -89932,7 +90052,17 @@
             ]
           },
           "name": {
-            "example": "John Doe",
+            "deprecated": true,
+            "description": "Deprecated: the old name of `username`, still accepted. Sending both\nwith different values is refused.",
+            "example": "john.doe",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "username": {
+            "description": "The new username, as in `CreateUserRequest`.",
+            "example": "john.doe",
             "type": [
               "string",
               "null"
@@ -93672,6 +93802,10 @@
             "description": "Whether the cluster CA must be rotated before the mesh can be turned\non: it predates certificate address history, so no pool can be\nproven free of its worker certificates. Always `false` once the mesh\nis on.",
             "type": "boolean"
           },
+          "can_disable": {
+            "description": "Whether `DELETE /nodes/wireguard` can turn the mesh off now: it is\non and nothing depends on it.",
+            "type": "boolean"
+          },
           "can_enable": {
             "description": "Whether `POST /nodes/wireguard` can turn the mesh on here.",
             "type": "boolean"
@@ -93691,6 +93825,13 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "disable_blocker": {
+            "description": "What prevents turning it off, when the mesh is on and `can_disable`\nis false (nodes on the mesh, pairings in progress, the control\nplane's overlay on its mesh address). Rendered verbatim.",
+            "type": [
+              "string",
+              "null"
             ]
           },
           "enable_blocker": {
@@ -93769,6 +93910,7 @@
           "ca_rotation_required",
           "listen_port",
           "can_enable",
+          "can_disable",
           "enable_command",
           "nodes",
           "links"
@@ -131400,14 +131542,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProviderResponse"
+                  "$ref": "#/components/schemas/UpdateProviderCredentialsResponse"
                 }
               }
             },
             "description": "Credentials updated"
           },
           "400": {
-            "description": "Bad request"
+            "description": "Invalid credentials for the provider's auth method"
           },
           "401": {
             "description": "Unauthorized"
@@ -131427,7 +131569,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Partially update credentials for an existing git provider. Only the fields\nyou send are replaced; omitted fields keep their stored values. Fields that\ndon't apply to the provider's auth method are ignored on the service side.",
+        "summary": "Partially update credentials for an existing git provider. Only the fields\nyou send are replaced; omitted fields keep their stored values. Basic-auth\nproviders rotate `username`/`password`, SSH-key providers `private_key` and\n`public_key` together; both refuse fields of another auth method. For the\nother auth methods, fields that don't apply are ignored. A new token or\npassword is also written to the provider's connections. The response names\nthe replaced fields, never their values.",
         "tags": [
           "Git Providers"
         ]
@@ -135617,6 +135759,57 @@
       }
     },
     "/internal/nodes/{node_id}/build-limits": {
+      "get": {
+        "operationId": "admin_get_node_build_limits",
+        "parameters": [
+          {
+            "description": "Worker node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeBuildLimitsResponse"
+                }
+              }
+            },
+            "description": "The worker's effective build limits, and whether they are the defaults"
+          },
+          "400": {
+            "description": "The node is the control plane or not a worker"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "500": {
+            "description": "Stored limits are invalid or storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read a worker node's effective build limits, and whether they are the\ndefaults. The control plane (node 0) has no per-node build limits and is\nanswered with a 400 that says so.",
+        "tags": [
+          "Nodes"
+        ]
+      },
       "put": {
         "operationId": "admin_set_node_build_limits",
         "parameters": [
@@ -135652,7 +135845,7 @@
             }
           },
           "400": {
-            "description": "Invalid limits or node role"
+            "description": "Invalid limits, node role, or the control plane (node 0)"
           },
           "401": {
             "description": "Unauthorized"
@@ -136431,7 +136624,8 @@
                   "$ref": "#/components/schemas/NodeResourcesResponse"
                 }
               }
-            }
+            },
+            "description": "The node's capacity, reservation and what is placed on it"
           },
           "401": {
             "content": {
@@ -136515,7 +136709,8 @@
                   "$ref": "#/components/schemas/NodeResourcesResponse"
                 }
               }
-            }
+            },
+            "description": "The node's resources after the change"
           },
           "400": {
             "content": {
@@ -136525,7 +136720,7 @@
                 }
               }
             },
-            "description": "Invalid reserve"
+            "description": "Invalid reserve, nothing to change, or system_reserved together with reset_system_reserved"
           },
           "401": {
             "content": {
@@ -141143,6 +141338,46 @@
       }
     },
     "/nodes/wireguard": {
+      "delete": {
+        "operationId": "WireguardMeshDisable",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireguardMeshStatusResponse"
+                }
+              }
+            },
+            "description": "Mesh off; current state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Something still depends on the mesh; the detail says what"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn the cluster's WireGuard mesh off (idempotent: an off mesh answers\nwith its status). Refused with 409 and the reason while anything depends\non it: nodes on the mesh, pairings in progress, or the control plane's\noverlay running on its mesh address (`can_disable` / `disable_blocker` in\n`GET /nodes/wireguard` say so in advance). This changes the cluster\nsetting: new joins and pairings over the mesh are refused and the control\nplane stops tending its end; the control plane's kernel interface is left\nin place until the host removes it or Temps restarts.",
+        "tags": [
+          "Nodes"
+        ],
+        "x-maturity": "beta"
+      },
       "get": {
         "operationId": "WireguardMeshStatusGet",
         "responses": {
@@ -141224,7 +141459,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Turn on the cluster's WireGuard mesh (idempotent). The running control\nplane brings its end up within a minute and nodes follow; it cannot be\nturned off again from the API.",
+        "summary": "Turn on the cluster's WireGuard mesh (idempotent). The running control\nplane brings its end up within a minute and nodes follow.\n`DELETE /nodes/wireguard` turns it off while nothing depends on it.",
         "tags": [
           "Nodes"
         ],
@@ -191747,6 +191982,15 @@
             "schema": {
               "type": "boolean"
             }
+          },
+          {
+            "description": "Return only what was last read, never looking inside the workspace\n(which could create or wake it). Not checked yet: every version field\nand `checked_at` are null. Ignored when `refresh` is set.",
+            "in": "query",
+            "name": "cached_only",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -199441,10 +199685,17 @@
         },
         "responses": {
           "200": {
-            "description": "Role assigned successfully"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteUserWithRoles"
+                }
+              }
+            },
+            "description": "Role assigned; the user and all of its roles"
           },
           "400": {
-            "description": "Invalid role type"
+            "description": "Invalid role type, or a deprecated body user_id that differs from the path"
           },
           "401": {
             "description": "Unauthorized"
