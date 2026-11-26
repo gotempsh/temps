@@ -274,6 +274,16 @@ pub fn uri_host(host: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The monitor URI a data node registers and connects with. It carries no
+/// password: libpq reads the `autoctl_node` one from `~postgres/.pgpass`.
+fn monitor_uri(monitor_hostname: &str, monitor_port: u16) -> String {
+    format!(
+        "postgresql://autoctl_node@{}:{}/pg_auto_failover",
+        uri_host(monitor_hostname),
+        monitor_port
+    )
+}
+
 fn generate_cluster_secret() -> String {
     use rand::{distr::Alphanumeric, RngExt};
     rand::rng()
@@ -420,12 +430,17 @@ chown postgres:postgres "$PGPASS_FILE"
 chmod 600 "$PGPASS_FILE""#;
 
 /// Data node, prepare: store the replication password and the SCRAM auth
-/// method in pg_autoctl's config, inject the `autoctl_node` password into
-/// the configured monitor URI (clusters created before SCRAM have none), and
-/// set the replicator role password on whichever node is primary (it
-/// replicates to the standbys). Expects `PGDATA`, `NODE_PORT`,
+/// method in pg_autoctl's config, remove any password from the configured
+/// monitor URI, and set the replicator role password on whichever node is
+/// primary (it replicates to the standbys). Expects `PGDATA`, `NODE_PORT`,
 /// `AUTOCTL_NODE_PASSWORD` and `REPLICATION_PASSWORD`. Starts a background
 /// retry loop.
+///
+/// The `autoctl_node` password lives only in `~postgres/.pgpass`
+/// ([`NODE_PGPASS_SNIPPET`], always written before this runs), never in the
+/// monitor URI: pg_autoctl logs that URI verbatim when it cannot reach the
+/// monitor. Members configured by earlier versions had the password
+/// injected into it; this rewrites their URI without it.
 ///
 /// Every configuration change goes through `autoctl_config_helpers!`: during
 /// the in-place upgrade the keeper is running and rewrites the file these
@@ -447,7 +462,7 @@ const NODE_PREPARE_SNIPPET: &str = concat!(
   autoctl_config_run get pg_autoctl.monitor || exit 1
   CURRENT_MONITOR=$AUTOCTL_OUT
   if [ -n "$CURRENT_MONITOR" ]; then
-    WANTED_MONITOR=$(printf '%s' "$CURRENT_MONITOR" | sed -E "s#^(postgres(ql)?://autoctl_node)(:[^@]*)?@#\1:${AUTOCTL_NODE_PASSWORD}@#")
+    WANTED_MONITOR=$(printf '%s' "$CURRENT_MONITOR" | sed -E "s#^(postgres(ql)?://autoctl_node):[^@]*@#\1@#")
     if [ "$WANTED_MONITOR" != "$CURRENT_MONITOR" ]; then
       autoctl_config_set pg_autoctl.monitor "$WANTED_MONITOR" || exit 1
     fi
@@ -727,16 +742,14 @@ impl PostgresClusterService {
         env.insert("NODE_HOSTNAME".to_string(), node_hostname.to_string());
         env.insert("NODE_PORT".to_string(), node_port.to_string());
         env.insert("NODE_NAME".to_string(), node_name.to_string());
-        // The secret is alphanumeric (see `ClusterAuthSecrets`), so it needs
-        // no percent-encoding inside the URI.
+        // No password in the URI: pg_autoctl prints the monitor URI
+        // verbatim in some error paths (and it would sit in the container's
+        // environment and pg_autoctl's configuration). libpq takes the
+        // `autoctl_node` password from `~postgres/.pgpass`, which
+        // `NODE_PGPASS_SNIPPET` writes before pg_autoctl first connects.
         env.insert(
             "MONITOR_URI".to_string(),
-            format!(
-                "postgresql://autoctl_node:{}@{}:{}/pg_auto_failover",
-                auth.autoctl_node_password,
-                uri_host(monitor_hostname),
-                monitor_port
-            ),
+            monitor_uri(monitor_hostname, monitor_port),
         );
         env.insert("POSTGRES_USER".to_string(), config.username.clone());
         env.insert(
@@ -1885,6 +1898,22 @@ exit 0
         stale_sets: u32,
         config_file_exists: bool,
     ) -> Option<NodePrepareRun> {
+        run_node_prepare_from(
+            flaky_config_calls,
+            stale_sets,
+            config_file_exists,
+            LEGACY_MONITOR_URI,
+        )
+    }
+
+    /// [`run_node_prepare`] on a member whose configured monitor URI is
+    /// `configured_monitor_uri`.
+    fn run_node_prepare_from(
+        flaky_config_calls: u32,
+        stale_sets: u32,
+        config_file_exists: bool,
+        configured_monitor_uri: &str,
+    ) -> Option<NodePrepareRun> {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
@@ -1907,7 +1936,7 @@ exit 0
         let store = dir.path().join("config-store");
         std::fs::write(
             format!("{}.pg_autoctl.monitor", store.display()),
-            LEGACY_MONITOR_URI,
+            configured_monitor_uri,
         )
         .unwrap();
         let pgdata = dir.path().join("pgdata");
@@ -1956,8 +1985,8 @@ exit 0
         assert!(run.success, "NodePrepare failed: {}", run.stderr);
         assert_eq!(run.replication_password, "replication-secret");
         assert_eq!(
-            run.monitor_uri,
-            "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover"
+            run.monitor_uri, LEGACY_MONITOR_URI,
+            "the monitor password is never put into the configured URI"
         );
         assert!(
             !run.stderr.contains("replication-secret") && !run.stderr.contains("node-secret"),
@@ -1970,16 +1999,50 @@ exit 0
     /// NodePrepare reads every value back and stores it again.
     #[test]
     fn node_prepare_stores_again_a_value_the_keeper_overwrote() {
-        let Some(run) = run_node_prepare(0, 2, true) else {
+        let Some(run) = run_node_prepare_from(
+            0,
+            2,
+            true,
+            "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover",
+        ) else {
             eprintln!("bash unavailable; skipping");
             return;
         };
         assert!(run.success, "NodePrepare failed: {}", run.stderr);
         assert_eq!(run.replication_password, "replication-secret");
-        assert_eq!(
-            run.monitor_uri,
-            "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover"
-        );
+        assert_eq!(run.monitor_uri, LEGACY_MONITOR_URI);
+    }
+
+    /// Regression for the `autoctl_node` password appearing in plain text in
+    /// data members' logs: pg_autoctl prints its configured monitor URI when
+    /// it cannot reach the monitor, and earlier versions injected the
+    /// password into it. NodePrepare rewrites such a URI without the
+    /// password (libpq reads it from .pgpass) and leaves the rest intact.
+    #[test]
+    fn node_prepare_removes_the_password_from_the_configured_monitor_uri() {
+        for (configured, wanted) in [
+            (
+                "postgresql://autoctl_node:node-secret@monitor-host:5432/pg_auto_failover",
+                LEGACY_MONITOR_URI,
+            ),
+            (
+                "postgres://autoctl_node:old-secret@[fd00::10]:6030/pg_auto_failover?sslmode=require",
+                "postgres://autoctl_node@[fd00::10]:6030/pg_auto_failover?sslmode=require",
+            ),
+            (LEGACY_MONITOR_URI, LEGACY_MONITOR_URI),
+        ] {
+            let Some(run) = run_node_prepare_from(0, 0, true, configured) else {
+                eprintln!("bash unavailable; skipping");
+                return;
+            };
+            assert!(run.success, "NodePrepare failed: {}", run.stderr);
+            assert_eq!(run.monitor_uri, wanted, "from {configured}");
+            assert!(
+                !run.stderr.contains("secret"),
+                "credentials must never be printed: {}",
+                run.stderr
+            );
+        }
     }
 
     /// A keeper that overwrites the value every time must not keep the step
@@ -2879,10 +2942,19 @@ host app_db app_user 10.0.0.0/8 md5
         assert_eq!(params.container_port, 6101);
         assert_eq!(
             params.environment.get("MONITOR_URI").unwrap(),
-            &format!(
-                "postgresql://autoctl_node:{}@10.100.0.1:6100/pg_auto_failover",
-                test_auth().autoctl_node_password
-            )
+            "postgresql://autoctl_node@10.100.0.1:6100/pg_auto_failover"
+        );
+        // pg_autoctl logs the monitor URI verbatim when it cannot reach the
+        // monitor, and the environment is visible to `docker inspect`: the
+        // `autoctl_node` password goes only to the .pgpass it writes.
+        assert!(
+            params
+                .environment
+                .iter()
+                .filter(|(key, _)| key.as_str() != "AUTOCTL_NODE_PASSWORD")
+                .all(|(_, value)| !value.contains(&test_auth().autoctl_node_password)),
+            "the autoctl_node password must appear only in AUTOCTL_NODE_PASSWORD: {:?}",
+            params.environment
         );
         assert_eq!(
             params.environment.get("REPLICATION_PASSWORD"),
@@ -3660,7 +3732,8 @@ mod scram_docker_tests {
             for node in [&n1, &n2] {
                 let (code, uri) = fx.sh(node, "gosu postgres pg_autoctl config get --pgdata /var/lib/postgresql/pgdata pg_autoctl.monitor").await;
                 assert_eq!(code, 0, "keeper configuration must be readable");
-                assert!(uri.contains(&format!("autoctl_node:{}@", auth.autoctl_node_password)), "keeper monitor credentials were not installed");
+                assert!(!uri.contains(&auth.autoctl_node_password), "the keeper's monitor URI must not carry the autoctl_node password: {uri}");
+                assert!(uri.contains("autoctl_node@"), "keeper monitor URI must name autoctl_node: {uri}");
             }
             // Re-running is a no-op.
             for step in AuthUpgradeStep::ORDER {

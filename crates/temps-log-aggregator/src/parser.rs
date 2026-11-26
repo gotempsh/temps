@@ -197,6 +197,22 @@ pub fn parse_log_line(
     stream: LogStream,
     ctx: &ContainerContext,
 ) -> LogLine {
+    // A managed service's own tooling can print a connection URI with its
+    // password (pg_autoctl does when it cannot reach its monitor). Those
+    // logs are ingested by default and readable by anyone who can view the
+    // service, so the password is masked before the line is stored.
+    let masked;
+    let raw = if ctx.external_service_id.is_some() {
+        match mask_uri_passwords(raw) {
+            std::borrow::Cow::Borrowed(raw) => raw,
+            std::borrow::Cow::Owned(line) => {
+                masked = line;
+                masked.as_str()
+            }
+        }
+    } else {
+        raw
+    };
     let trimmed = raw.trim();
 
     // Try JSON parse first
@@ -227,6 +243,63 @@ pub fn parse_log_line(
         deploy_id: ctx.deploy_id,
         node_id: None,
         node_name: None,
+    }
+}
+
+/// What replaces the password of a `scheme://user:password@host` URI.
+const MASKED_PASSWORD: &str = "****";
+
+/// `line` with the password of every `scheme://user:password@host` URI
+/// replaced by [`MASKED_PASSWORD`]; borrowed (no allocation) when it holds
+/// none, which is every line without `://`.
+///
+/// The authority ends at the first `/`, `?`, `#`, whitespace, quote or
+/// bracket-closing delimiter after `://`; its userinfo is everything before
+/// the last `@` in it, and the password whatever follows the first `:` of
+/// the userinfo. A URI without a password (`postgres://user@host`) is left
+/// as it is.
+pub fn mask_uri_passwords(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains("://") {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let bytes = line.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(found) = line[search..].find("://") {
+        let authority_start = search + found + 3;
+        let authority_end = bytes[authority_start..]
+            .iter()
+            .position(|b| {
+                matches!(
+                    b,
+                    b'/' | b'?' | b'#' | b'"' | b'\'' | b'`' | b'<' | b'>' | b')' | b','
+                ) || b.is_ascii_whitespace()
+            })
+            .map_or(bytes.len(), |end| authority_start + end);
+        let authority = &line[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            if let Some(colon) = authority[..at].find(':') {
+                let password_start = authority_start + colon + 1;
+                let password_end = authority_start + at;
+                if password_end > password_start
+                    && &line[password_start..password_end] != MASKED_PASSWORD
+                {
+                    let out = out.get_or_insert_with(|| String::with_capacity(line.len()));
+                    out.push_str(&line[copied..password_start]);
+                    out.push_str(MASKED_PASSWORD);
+                    copied = password_end;
+                }
+            }
+        }
+        search = authority_end;
+    }
+    match out {
+        Some(mut out) => {
+            out.push_str(&line[copied..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(line),
     }
 }
 
@@ -839,6 +912,68 @@ mod tests {
             container_id: "abc123".to_string(),
             deploy_id: None,
         }
+    }
+
+    #[test]
+    fn mask_uri_passwords_hides_the_password_and_keeps_the_rest() {
+        let cases = [
+            (
+                r#"ERROR Failed to connect to monitor database at "postgresql://autoctl_node:Zq81secret@10.0.0.3:6000/pg_auto_failover", see above for details"#,
+                r#"ERROR Failed to connect to monitor database at "postgresql://autoctl_node:****@10.0.0.3:6000/pg_auto_failover", see above for details"#,
+            ),
+            (
+                "postgres://u:p4ss@[fd00::10]:6030/db?sslmode=require and redis://:r3dis@cache:6379/0",
+                "postgres://u:****@[fd00::10]:6030/db?sslmode=require and redis://:****@cache:6379/0",
+            ),
+            ("mongodb://admin:pw@db1,db2/admin", "mongodb://admin:****@db1,db2/admin"),
+            ("postgresql://user:pw@host", "postgresql://user:****@host"),
+        ];
+        for (raw, wanted) in cases {
+            assert_eq!(mask_uri_passwords(raw), wanted, "{raw}");
+        }
+    }
+
+    #[test]
+    fn mask_uri_passwords_leaves_lines_without_a_password_borrowed() {
+        for raw in [
+            "plain line without any uri",
+            r#"Failed to connect to "postgres://autoctl_node@monitor:6000/pg_auto_failover?password=****""#,
+            "see https://example.com/docs:install@anchor",
+            "already masked postgres://u:****@h/db",
+            "dangling postgres://",
+            "empty password postgres://u:@h/db",
+        ] {
+            assert!(
+                matches!(mask_uri_passwords(raw), std::borrow::Cow::Borrowed(_)),
+                "{raw}"
+            );
+        }
+    }
+
+    /// A managed service's container log keeps no connection password; an
+    /// application's own log is stored as it was written.
+    #[test]
+    fn service_container_lines_are_stored_without_uri_passwords() {
+        let raw = r#"ERROR Failed to connect to monitor database at "postgresql://autoctl_node:Zq81secret@10.0.0.3:6000/pg_auto_failover""#;
+        let service_ctx = ContainerContext {
+            external_service_id: Some(7),
+            ..test_ctx()
+        };
+        let line = parse_log_line(raw, Utc::now(), LogStream::Stderr, &service_ctx);
+        assert!(!line.msg.contains("Zq81secret"), "{}", line.msg);
+        assert!(
+            line.msg.contains("autoctl_node:****@10.0.0.3"),
+            "{}",
+            line.msg
+        );
+        assert!(!format!("{:?}", line.fields).contains("Zq81secret"));
+
+        let json = r#"{"level":"error","msg":"dial postgres://app:Zq81secret@db/app failed"}"#;
+        let line = parse_log_line(json, Utc::now(), LogStream::Stderr, &service_ctx);
+        assert!(!line.msg.contains("Zq81secret"), "{}", line.msg);
+
+        let app = parse_log_line(raw, Utc::now(), LogStream::Stderr, &test_ctx());
+        assert!(app.msg.contains("Zq81secret"));
     }
 
     #[test]
