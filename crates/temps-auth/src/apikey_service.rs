@@ -5,8 +5,8 @@ use crate::permissions::{Permission, Role};
 use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;

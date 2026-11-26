@@ -135,8 +135,8 @@ pub fn derive_ai_harness_status(
     let Some(key) = harness_key else {
         // The caller selects the row for one user; there is no dedicated key
         // here to compare its owner against.
-        if let Some((agent, (kind, last_used_at))) = agent_key
-            .and_then(|agent| used_agent_credential(agent).map(|used| (agent, used)))
+        if let Some((agent, (kind, last_used_at))) =
+            agent_key.and_then(|agent| used_agent_credential(agent).map(|used| (agent, used)))
         {
             return AiHarnessStatusResponse {
                 status: AiHarnessState::Connected,
@@ -294,7 +294,9 @@ mod tests {
         ] {
             let status = derive_ai_harness_status(None, Some(&agent));
             assert_eq!(status.status, AiHarnessState::Connected, "{}", agent.name);
-            let via = status.connected_via.expect("connected names its credential");
+            let via = status
+                .connected_via
+                .expect("connected names its credential");
             assert_eq!(via.kind, kind);
             assert_eq!(via.id, agent.id);
             assert_eq!(status.key_id, None);
