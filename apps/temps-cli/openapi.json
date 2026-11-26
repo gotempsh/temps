@@ -5237,7 +5237,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -18262,7 +18262,7 @@
           },
           "expires_at": {
             "description": "When the key stops working. Must be in the future. Defaults to one\nyear after creation when left out: API keys always expire.",
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -18274,7 +18274,7 @@
             "type": "string"
           },
           "permissions": {
-            "description": "The key's permissions, required with `role_type: custom` and refused\nwith any other role, which carries its own. Fixed once the key is\ncreated.",
+            "description": "The key's permissions, required with `role_type: custom`. Any other\nrole carries its own: a non-empty list with it is refused, while an\nempty list or none gives the role's permissions. Fixed once the key is\ncreated.",
             "example": [
               "projects:read",
               "deployments:read"
@@ -18325,7 +18325,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -18899,7 +18899,7 @@
           },
           "expires_at": {
             "description": "When the token stops working. Must be in the future; leave it out for\na token that does not expire.",
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -18952,7 +18952,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -25543,7 +25543,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -86444,8 +86444,8 @@
       "UpdateApiKeyRequest": {
         "properties": {
           "expires_at": {
-            "description": "A new expiry, which must be in the future. API keys always expire, so\n`null` is refused for a key that has an expiry. Leave it out to keep\nthe current one.",
-            "example": "2024-12-31T23:59:59Z",
+            "description": "A new expiry, which must be in the future. Leave it out, or send the\nkey's current expiry back unchanged (even one that has passed), to\nkeep it: an expired key can be renamed or deactivated without\nextending it. API keys always expire, so `null` is refused for a key\nthat has an expiry.",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -87251,8 +87251,8 @@
       "UpdateDeploymentTokenRequest": {
         "properties": {
           "expires_at": {
-            "description": "A future time sets a new expiry, `null` removes it (the token no\nlonger expires), and leaving the field out keeps the current one.",
-            "example": "2024-12-31T23:59:59Z",
+            "description": "A future time sets a new expiry, `null` removes it (the token no\nlonger expires), and leaving the field out, or sending the current\nexpiry back unchanged (even one that has passed), keeps it.",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -88805,7 +88805,7 @@
             ]
           },
           "environment_ids": {
-            "description": "Replaces the environments the secret applies to. An empty list applies\nit to every environment of the project. Omit to keep the current\nenvironments.",
+            "description": "Replaces the environments the secret applies to. Omit to keep the\ncurrent environments. Bindings to deleted environments are always\nkept, so an empty list applies the secret to every environment of the\nproject only when it has none; a secret still bound to a deleted\nenvironment stays limited to it.",
             "items": {
               "format": "int32",
               "type": "integer"
@@ -112825,7 +112825,7 @@
             "description": "API key updated successfully"
           },
           "400": {
-            "description": "Bad request: a blank name, an expiry in the past or removed, or permissions that differ from the key's (they cannot change after creation)"
+            "description": "Bad request: a blank name, a new expiry in the past (the key's current expiry may be sent back unchanged), a removed expiry, or permissions that differ from the key's (they cannot change after creation)"
           },
           "401": {
             "description": "Unauthorized"
@@ -162216,7 +162216,7 @@
             "description": "Deployment token updated successfully"
           },
           "400": {
-            "description": "Invalid request: blank name, empty permissions or an expiry in the past"
+            "description": "Invalid request: blank name, empty permissions or a new expiry in the past (the token's current expiry may be sent back unchanged)"
           },
           "401": {
             "description": "Unauthorized"
@@ -184063,7 +184063,10 @@
             "description": "Value too large or an invalid compose service name"
           },
           "404": {
-            "description": "Secret not found"
+            "description": "The secret, or a requested environment, was not found in the project"
+          },
+          "409": {
+            "description": "Another secret with the same key already applies to one of the requested environments"
           },
           "500": {
             "description": "Internal server error"

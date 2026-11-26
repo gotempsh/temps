@@ -8725,8 +8725,9 @@ export type CreateApiKeyRequest = {
      */
     name: string;
     /**
-     * The key's permissions, required with `role_type: custom` and refused
-     * with any other role, which carries its own. Fixed once the key is
+     * The key's permissions, required with `role_type: custom`. Any other
+     * role carries its own: a non-empty list with it is refused, while an
+     * empty list or none gives the role's permissions. Fixed once the key is
      * created.
      */
     permissions?: Array<string> | null;
@@ -40287,9 +40288,11 @@ export type UpdateAnalyticsIngestKeyRequest = {
 
 export type UpdateApiKeyRequest = {
     /**
-     * A new expiry, which must be in the future. API keys always expire, so
-     * `null` is refused for a key that has an expiry. Leave it out to keep
-     * the current one.
+     * A new expiry, which must be in the future. Leave it out, or send the
+     * key's current expiry back unchanged (even one that has passed), to
+     * keep it: an expired key can be renamed or deactivated without
+     * extending it. API keys always expire, so `null` is refused for a key
+     * that has an expiry.
      */
     expires_at?: string | null;
     is_active?: boolean | null;
@@ -40696,7 +40699,8 @@ export type UpdateDeploymentConfigRequest = {
 export type UpdateDeploymentTokenRequest = {
     /**
      * A future time sets a new expiry, `null` removes it (the token no
-     * longer expires), and leaving the field out keeps the current one.
+     * longer expires), and leaving the field out, or sending the current
+     * expiry back unchanged (even one that has passed), keeps it.
      */
     expires_at?: string | null;
     is_active?: boolean | null;
@@ -41451,9 +41455,11 @@ export type UpdateProjectSecretRequest = {
      */
     compose_services?: Array<string> | null;
     /**
-     * Replaces the environments the secret applies to. An empty list applies
-     * it to every environment of the project. Omit to keep the current
-     * environments.
+     * Replaces the environments the secret applies to. Omit to keep the
+     * current environments. Bindings to deleted environments are always
+     * kept, so an empty list applies the secret to every environment of the
+     * project only when it has none; a secret still bound to a deleted
+     * environment stays limited to it.
      */
     environment_ids?: Array<number> | null;
     /**
@@ -53976,7 +53982,7 @@ export type UpdateApiKeyData = {
 
 export type UpdateApiKeyErrors = {
     /**
-     * Bad request: a blank name, an expiry in the past or removed, or permissions that differ from the key's (they cannot change after creation)
+     * Bad request: a blank name, a new expiry in the past (the key's current expiry may be sent back unchanged), a removed expiry, or permissions that differ from the key's (they cannot change after creation)
      */
     400: unknown;
     /**
@@ -84472,7 +84478,7 @@ export type UpdateDeploymentTokenData = {
 
 export type UpdateDeploymentTokenErrors = {
     /**
-     * Invalid request: blank name, empty permissions or an expiry in the past
+     * Invalid request: blank name, empty permissions or a new expiry in the past (the token's current expiry may be sent back unchanged)
      */
     400: unknown;
     /**
@@ -97938,9 +97944,13 @@ export type UpdateProjectSecretErrors = {
      */
     400: unknown;
     /**
-     * Secret not found
+     * The secret, or a requested environment, was not found in the project
      */
     404: unknown;
+    /**
+     * Another secret with the same key already applies to one of the requested environments
+     */
+    409: unknown;
     /**
      * Internal server error
      */
