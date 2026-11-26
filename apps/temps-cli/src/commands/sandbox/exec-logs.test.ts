@@ -96,11 +96,20 @@ describe('sandbox logs', () => {
   })
 
   test('a stream that closes before the job ended is not reported as finished', async () => {
-    await expect(
-      program().parseAsync(['sandbox', 'logs', 'sbx_1', 'job_cut'], { from: 'user' }),
-    ).rejects.toThrow(
+    const reported: string[] = []
+    const errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      reported.push(args.map(String).join(' '))
+    })
+    try {
+      // No `process.exit`: that could drop log lines still queued for a pipe.
+      await program().parseAsync(['sandbox', 'logs', 'sbx_1', 'job_cut'], { from: 'user' })
+    } finally {
+      errorSpy.mockRestore()
+    }
+    expect(written).toEqual(['step 1\n'])
+    expect(reported.join('\n')).toContain(
       'The log stream of job job_cut closed before the job ended, so the output above may be incomplete.',
     )
-    expect(written).toEqual(['step 1\n'])
+    expect(process.exitCode).toBe(1)
   })
 })

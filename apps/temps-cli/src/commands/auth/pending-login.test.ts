@@ -208,6 +208,51 @@ describe('pollForDeviceApproval with a bounded wait', () => {
     expect((error as Error).message).toContain('https://temps.example.com/cli-login/ABCD-EFGH')
     expect((error as Error).message).toContain('Nothing is signed in yet')
   })
+
+  test('a wait shorter than the interval still sees an approval when the first poll goes at once', async () => {
+    const approved = {
+      status: 'approved' as const,
+      api_key: 'tk_example',
+      key_prefix: 'tk_exa',
+      user_id: 1,
+      email: 'admin@example.com',
+      role: 'admin',
+      expires_at: null,
+    }
+    const runWith = (pollFirst: boolean) => {
+      let clock = NOW
+      let polls = 0
+      const run = pollForDeviceApproval({
+        pollUrl: 'https://temps.example.com/api/auth/cli/device/poll',
+        intervalSecs: 5,
+        expiresInSecs: 1,
+        pollFirst,
+        timeoutError: () => new LoginStillPendingError(pending(), 1),
+        sleep: async (ms) => {
+          clock += ms
+        },
+        now: () => clock,
+        poll: async () => {
+          polls += 1
+          return {
+            res: new Response('{}', { status: 200 }),
+            rawBody: JSON.stringify(approved),
+            json: approved,
+          }
+        },
+      })
+      return run.then(
+        (body) => ({ body, polls }),
+        (error: unknown) => ({ error, polls }),
+      )
+    }
+
+    expect(await runWith(true)).toEqual({ body: approved, polls: 1 })
+    // Sleeping the interval first uses up the whole wait without asking once.
+    const late = await runWith(false)
+    expect(late.polls).toBe(0)
+    expect((late as { error: unknown }).error).toBeInstanceOf(LoginStillPendingError)
+  })
 })
 
 /** A device-authorization server whose poll answer the test controls. */
@@ -284,6 +329,29 @@ describe('split browser sign-in against a device-authorization server', () => {
     expect(error).toBeInstanceOf(LoginStillPendingError)
     expect((error as LoginStillPendingError).exitCode).toBe(2)
     expect(await getPendingLogin('local')).not.toBeNull()
+  })
+
+  test('--resume asks at once, so a wait shorter than the interval still polls', async () => {
+    const fake = fakeDeviceServer(() => 'authorization_pending')
+    await savePendingLogin(
+      pending({
+        context: 'local',
+        apiBaseUrl: `${fake.origin}/api`,
+        intervalSecs: 5,
+        expiresAt: new Date(Date.now() + 15 * 60_000).toISOString(),
+      }),
+    )
+    let error: unknown
+    try {
+      await resumeDeviceLogin({ url: fake.origin, context: 'local', waitSecs: 1 })
+    } catch (e) {
+      error = e
+    } finally {
+      await fake.server.stop(true)
+    }
+
+    expect(error).toBeInstanceOf(LoginStillPendingError)
+    expect(fake.requests).toEqual(['/api/auth/cli/device/poll'])
   })
 
   test('--resume forgets a sign-in the person denied', async () => {
@@ -384,9 +452,12 @@ describe('split browser sign-in against a device-authorization server', () => {
       await fake.server.stop(true)
     }
 
-    expect((error as Error).message).toBe(
-      'restarting The sign-in is still waiting: run the same command again to keep waiting for the same approval.',
+    const message = (error as Error).message
+    expect(message).toStartWith(
+      'restarting The sign-in was kept: run the same command again to keep waiting for the same approval.',
     )
+    // The server hands the key out once, so a lost approval cannot be fetched again.
+    expect(message).toContain('the next run then says the sign-in ended, and a new sign-in is needed.')
     expect(await getPendingLogin('local')).not.toBeNull()
   })
 

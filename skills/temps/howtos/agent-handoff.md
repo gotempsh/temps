@@ -37,7 +37,9 @@ bunx @temps-sdk/cli@beta login https://temps.example.com --context temps-example
 - A denied or expired sign-in ends it. Tell the person and start again only if
   they want to.
 - A network or server error during `--resume` keeps the sign-in waiting. Run
-  the same command again; the person's link still belongs to it.
+  the same command again; the person's link still belongs to it. If that run
+  says the sign-in ended, the approval was already used up by the lost reply:
+  tell the person, as for an expired one.
 - If `--no-wait` or `--resume` says the context already points to another
   instance, stop and tell the person. Never remove, rename or switch their
   contexts to make room.

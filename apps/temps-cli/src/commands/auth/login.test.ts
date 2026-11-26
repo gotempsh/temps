@@ -247,6 +247,11 @@ describe('pollForDeviceApproval', () => {
     await expect(harness([{ status: 200, body: { status: 'expired_token' } }]).run()).rejects.toThrow(
       /expired/,
     )
+    // The server answers `expired_token` too once the key was handed out, so a
+    // lost approval reply is not called an expiry before approval.
+    await expect(harness([{ status: 200, body: { status: 'expired_token' } }]).run()).rejects.toThrow(
+      'its code expired, or its approval was already collected by an earlier request',
+    )
   })
 })
 

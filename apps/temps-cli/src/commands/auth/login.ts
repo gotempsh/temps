@@ -550,6 +550,9 @@ export async function resumeDeviceLogin(
           timeoutError: boundedByWait
             ? () => new LoginStillPendingError(pending, waitSecs)
             : undefined,
+          // The interval was last waited out by an earlier run, if at all: ask
+          // at once, so a wait shorter than the interval still sees an approval.
+          pollFirst: true,
           poll: (signal) =>
             debugFetch(
               pollUrl,
@@ -571,11 +574,14 @@ export async function resumeDeviceLogin(
       throw err
     }
     if (err instanceof LoginStillPendingError) throw err
-    // A dropped connection or a server error is not the end of the sign-in:
-    // the person's link still works, so keep it and say how to go on.
+    // A dropped connection or a server error is usually not the end of the
+    // sign-in, so keep it. The server hands the key out once, though: if the
+    // lost reply was the approval, the next run is told the sign-in ended.
     const reason = err instanceof Error ? err.message : String(err)
     throw new AuthenticationError(
-      `${reason} The sign-in is still waiting: run the same command again to keep waiting for the same approval.`,
+      `${reason} The sign-in was kept: run the same command again to keep waiting for the same approval. ` +
+        'If it had already been approved, the lost reply may have carried the key, which the server hands out only once; ' +
+        'the next run then says the sign-in ended, and a new sign-in is needed.',
     )
   }
 
@@ -709,6 +715,13 @@ export interface PollForDeviceApprovalOptions {
    * out of it means "not approved yet", not "start again".
    */
   timeoutError?: () => Error
+  /**
+   * Send the first poll at once instead of after one interval. `--resume`
+   * sets it: the session was created by an earlier run, so there is nothing
+   * to wait out first, and a `--wait-secs` shorter than the interval would
+   * otherwise end without asking.
+   */
+  pollFirst?: boolean
 }
 
 /**
@@ -758,7 +771,7 @@ export async function pollForDeviceApproval(
   const now = opts.now ?? Date.now
   const deadline = now() + opts.expiresInSecs * 1000
   let intervalMs = Math.min(Math.max(500, opts.intervalSecs * 1000), MAX_POLL_DELAY_MS)
-  let nextDelayMs = intervalMs
+  let nextDelayMs = opts.pollFirst ? 0 : intervalMs
   let throttledLastPoll = false
 
   for (;;) {
@@ -820,7 +833,8 @@ export async function pollForDeviceApproval(
         throw new DeviceLoginEndedError('Authorization denied in the browser.')
       case 'expired_token':
         throw new DeviceLoginEndedError(
-          'Authorization code expired before approval. Run `temps login` again.',
+          'This sign-in has ended: its code expired, or its approval was already collected by an earlier request. ' +
+            'Run `temps login` again.',
         )
       case 'approved':
         return body
