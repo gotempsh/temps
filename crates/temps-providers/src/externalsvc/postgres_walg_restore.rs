@@ -142,6 +142,7 @@ pub async fn walg_restore_on_node(
         recovery_target,
         target_user_data,
         operation_id: _,
+        set_configured_login,
     } = request;
     let service = live_service_config.name.clone();
     if live_service_config.service_type != ServiceType::Postgres
@@ -207,6 +208,11 @@ pub async fn walg_restore_on_node(
             &live_service_config,
             recovery_target.as_ref(),
             target_user_data.as_deref(),
+            if set_configured_login {
+                crate::externalsvc::RestoredLogin::SetConfiguredPassword
+            } else {
+                crate::externalsvc::RestoredLogin::AsConfigured
+            },
             writes.as_ref(),
         )
         .await
@@ -351,6 +357,7 @@ mod tests {
             recovery_target: None,
             target_user_data: None,
             operation_id: None,
+            set_configured_login: false,
         };
         let pg = |host: &str| config("orders", ServiceType::Postgres, host);
         let cases = [

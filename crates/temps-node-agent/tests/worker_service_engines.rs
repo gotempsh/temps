@@ -1452,6 +1452,7 @@ async fn a_worker_postgres_is_restored_and_recovered_to_a_point_in_time_through_
         target_user_data: uuid
             .map(|uuid| serde_json::json!({ "temps_backup_id": uuid }).to_string()),
         operation_id: None,
+        set_configured_login: false,
     };
     let inspect = || async {
         docker
@@ -1767,6 +1768,7 @@ async fn another_services_walg_backup_is_restored_into_a_worker_postgres_through
             recovery_target: Some(RecoveryTarget::Time { time: t }),
             target_user_data: Some(serde_json::json!({ "temps_backup_id": "cross-1" }).to_string()),
             operation_id: None,
+            set_configured_login: false,
         },
     )
     .await;
@@ -2040,6 +2042,7 @@ async fn a_control_plane_postgres_is_restored_and_recovered_by_the_same_walg_res
                     &config,
                     target.as_ref(),
                     user_data.as_deref(),
+                    temps_providers::externalsvc::RestoredLogin::AsConfigured,
                     &temps_providers::externalsvc::NoopRestoreGate,
                 )
                 .await
@@ -3121,6 +3124,7 @@ async fn mongo_restore(
                     live_target_config: fixture.config.clone(),
                     pool: &pool,
                     gate: &NoopRestoreGate,
+                    restored_login: temps_providers::externalsvc::RestoredLogin::AsConfigured,
                 })
                 .await
                 .map_err(|e| e.to_string())

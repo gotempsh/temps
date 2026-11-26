@@ -29,6 +29,8 @@ mod schema;
 mod service_metadata;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::environment_preview_project;
 mod transactions;
 mod types;
 
@@ -42,6 +44,10 @@ pub use manager::{
     ServiceHealthcheckUpdate,
 };
 pub use manager::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
+pub use manager::{
+    InventoryError, InventoryRole, LinkedDatabase, LinkedEnvironment, PostgresInventory,
+    ServiceLinkedDatabases, MAX_INVENTORY_ENTRIES,
+};
 pub use manager::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};
 #[cfg(test)]
 pub(crate) use manager::{HEALTHCHECK_CHANNEL, HEALTHCHECK_REGISTRY_TEST_LOCK};

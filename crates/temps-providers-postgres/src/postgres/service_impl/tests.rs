@@ -1425,6 +1425,7 @@ async fn test_restore_pitr_rejects_legacy_backup_without_docker_work() {
         source_config: cfg,
         pool: &mock_db,
         gate: &crate::externalsvc::NoopRestoreGate,
+        restored_login: crate::externalsvc::RestoredLogin::AsConfigured,
     };
 
     let err = pg

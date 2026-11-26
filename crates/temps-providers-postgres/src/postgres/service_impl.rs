@@ -957,6 +957,7 @@ impl ExternalService for PostgresService {
                 None,
                 None,
                 None,
+                crate::externalsvc::RestoredLogin::AsConfigured,
                 &crate::externalsvc::NoopRestoreGate,
             )
             .await
@@ -1001,6 +1002,7 @@ impl ExternalService for PostgresService {
                 Some(&ctx.live_target_config),
                 None,
                 target_user_data.as_deref(),
+                ctx.restored_login,
                 ctx.gate,
             )
             .await
@@ -1461,6 +1463,7 @@ impl ExternalService for PostgresService {
                     None,
                     None,
                     target_user_data.as_deref(),
+                    ctx.restored_login,
                     ctx.gate,
                 )
                 .await?;
@@ -1584,6 +1587,7 @@ impl ExternalService for PostgresService {
                     None,
                     Some(&target),
                     target_user_data.as_deref(),
+                    ctx.restored_login,
                     ctx.gate,
                 )
                 .await?;
@@ -1627,6 +1631,7 @@ impl ExternalService for PostgresService {
                 Some(&ctx.live_target_config),
                 Some(&target),
                 target_user_data.as_deref(),
+                ctx.restored_login,
                 ctx.gate,
             )
             .await?;

@@ -23,6 +23,7 @@ import {
   getProviderMetadata,
   getProvidersMetadata,
   getQueryContainerInfo,
+  getRestoredDatabases,
   getServiceHealthStatus,
   getServiceHealthcheck,
   getServiceLogIngestion,
@@ -53,6 +54,7 @@ import {
   testWalArchiveTarget,
   triggerServiceHealthCheck,
   updateHealthcheckDefaults,
+  updateLinkDatabase,
   updateServiceHealthcheck,
   updateServiceLogIngestion,
   updateServiceResources,
@@ -310,6 +312,22 @@ export function registerServicesEndpoints(program: Command): void {
     name: "get-tls",
     description: "Get service tls",
     path: { id: 'int' },
+  })
+
+  endpoint(group, getRestoredDatabases, {
+    name: "restored-databases",
+    description: "What the latest PostgreSQL restore brought back: its databases and users, which linked project reads each, and linked databases the backup does not have",
+    path: { id: 'int' },
+  })
+
+  endpoint(group, updateLinkDatabase, {
+    name: "set-link-database",
+    description: "Change which database a linked project reads from this service, for example one a restore brought back. Its apps read it from their next deployment",
+    path: { id: 'int', project_id: 'project' },
+    body: {
+      database_provisioning_mode: { kind: 'string!', help: "project_environment (one database per environment), project (one for the whole project) or custom (the name in --custom-database-name)", values: ["project_environment","project","custom"] },
+      custom_database_name: { kind: 'string', help: "The database every environment reads, in custom mode: lowercase letters, digits and _" },
+    },
   })
 
   endpoint(group, updateServiceTls, {

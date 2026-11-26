@@ -1012,6 +1012,7 @@ impl ExternalServiceManager {
         recovery_target: Option<crate::remote_service_client::RecoveryTarget>,
         target_user_data: Option<String>,
         operation_id: Option<String>,
+        set_configured_login: bool,
     ) -> Result<crate::remote_service_client::PostgresWalgRestoreResult, ExternalServiceError> {
         let (node_id, live_service_config) = self
             .worker_service_target(service_id, "WAL-G restore")
@@ -1037,6 +1038,7 @@ impl ExternalServiceManager {
                 recovery_target,
                 target_user_data,
                 operation_id,
+                set_configured_login,
             })
             .await?;
         self.republish_after_worker_restore(
