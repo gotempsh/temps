@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Private addresses the control plane serves itself (ADR-114 D2, D3, D6).
+//! Private addresses the control plane serves itself (ADR-115 D2, D3, D6).
 //!
 //! A worker's agent binds its private listener where its owner said, checks
 //! its private addresses from inside and reports both. The control plane
@@ -49,7 +49,7 @@ pub trait LocalAddresses: Send + Sync {
 }
 
 /// The machine's container networks (Docker's), by name: no admitted range
-/// may overlap one (ADR-114 D8).
+/// may overlap one (ADR-115 D8).
 #[async_trait]
 pub trait ContainerNetworks: Send + Sync {
     async fn networks(&self) -> Vec<(String, IpNet)>;

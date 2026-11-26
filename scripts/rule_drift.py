@@ -54,7 +54,7 @@ METRICS: dict[str, str] = {
     "anyhow_in_library": "anyhow usage in library crates (use a thiserror enum)",
     "files_over_3000_lines": f"production files over {FILE_LINE_LIMIT} lines (split by responsibility)",
     "functions_over_300_lines": f"functions over {FUNCTION_LINE_LIMIT} lines (extract steps)",
-    "provider_named_outside_module": "temps-ingress code naming an ingress provider outside its module (go through the registry and the provider traits, ADR-116 D1)",
+    "provider_named_outside_module": "temps-ingress code naming an ingress provider outside its module (go through the registry and the provider traits, ADR-117 D1)",
 }
 
 SKIPPED_DIRS = frozenset({"tests", "benches", "examples", "target", "fuzz"})
@@ -358,7 +358,7 @@ _ERROR_DERIVE = re.compile(r"#\[derive\([^)]*\bError\b[^)]*\)\]")
 _ENUM_HEAD = re.compile(r"\benum\s+\w+[^{;]*\{")
 _STRING_VARIANT = re.compile(r"^\s*(\w+)\s*\(\s*(?:std::string::)?String\s*\)\s*,?\s*$")
 _ANYHOW = re.compile(r"\banyhow\b")
-# ADR-116 D1: an ingress provider lives in its own module, and the rest of
+# ADR-117 D1: an ingress provider lives in its own module, and the rest of
 # temps-ingress reaches it only through the registry and the traits.
 _PROVIDER_CRATE = "temps-ingress"
 _PROVIDER_MODULES = ("src/providers/",)

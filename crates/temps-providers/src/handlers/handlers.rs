@@ -3339,12 +3339,17 @@ fn runtime_credentials_problem(e: crate::services::ExternalServiceError) -> Prob
 }
 
 /// Get all environment variables for a service-project pair
+///
+/// Returns an object mapping each variable name the service provides to the
+/// project to `***`: this bulk read never returns values. Read one value
+/// through `GET /external-services/{id}/projects/{project_id}/environment/{var_name}`,
+/// which is audit-logged and says whether the variable is sensitive.
 #[utoipa::path(
     get,
     path = "/external-services/{id}/projects/{project_id}/environment",
     tag = "External Services",
     responses(
-        (status = 200, description = "List of environment variables", body = Vec<EnvironmentVariableInfo>),
+        (status = 200, description = "Map of variable name to its masked value (`***`)", body = HashMap<String, String>, example = json!({"POSTGRES_HOST": "***", "POSTGRES_PASSWORD": "***"})),
         (status = 400, description = "The service's stored configuration cannot be used to build its variables"),
         (status = 404, description = "Service or project not found"),
         (status = 500, description = "Internal server error")
@@ -4133,6 +4138,19 @@ pub struct ExternalServiceApiDoc;
 
 #[cfg(test)]
 mod tests {
+    /// The bulk environment read returns a name-to-value map; the published
+    /// schema used to declare an array of `{name, sensitive, value}`, so
+    /// clients generated from it failed to decode the response.
+    #[test]
+    fn service_environment_response_is_declared_as_a_map() {
+        use utoipa::OpenApi;
+        let doc = serde_json::to_value(ExternalServiceApiDoc::openapi()).expect("doc serializes");
+        let schema = &doc["paths"]["/external-services/{id}/projects/{project_id}/environment"]
+            ["get"]["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(schema["type"], "object", "{schema}");
+        assert_eq!(schema["additionalProperties"]["type"], "string", "{schema}");
+    }
+
     use super::super::metrics_handlers::require_access_to_any_linked_project;
     use super::*;
     use axum::response::IntoResponse;

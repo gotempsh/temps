@@ -102,6 +102,23 @@ pub(super) fn validated_snapshot_prefix(
     Ok(build_s3_key(configured_root, &relative_prefix))
 }
 
+/// Whether a WAL-G deletion whose service container could not run the
+/// command can continue through the container-less orphan helper instead.
+///
+/// Only when the service row is gone (so a fresh request would take that
+/// path too) and the engine's orphan cleanup is supported. A service that
+/// still exists is stopping or restarting: the caller should retry.
+fn orphan_cleanup_replaces_missing_container(
+    service_exists: bool,
+    engine: WalgDeletionEngine,
+) -> bool {
+    !service_exists
+        && matches!(
+            engine,
+            WalgDeletionEngine::Postgres | WalgDeletionEngine::PostgresCluster
+        )
+}
+
 impl BackupService {
     pub async fn delete_backup(&self, backup_id: &str) -> Result<(Backup, u64), BackupError> {
         info!(backup_id, "Deleting backup");
@@ -241,7 +258,7 @@ impl BackupService {
                 }
                 None
             };
-            Some((service_name, container, target, deletion_engine))
+            Some((service_id, service_name, container, target, deletion_engine))
         } else {
             for location in std::iter::once(backup.s3_location.as_str())
                 .chain(children.iter().map(|child| child.s3_location.as_str()))
@@ -297,8 +314,13 @@ impl BackupService {
             relative.starts_with("backups/")
         });
         let mut deleted_objects = 0_u64;
-        if let Some((service_name, container, target, deletion_engine)) = walg_plan {
-            time::timeout_at(
+        if let Some((service_id, service_name, container, target, deletion_engine)) = walg_plan {
+            let walg_timeout = || BackupError::PartialDeletion {
+                backup_id: backup.backup_id.clone(),
+                deleted_objects: 0,
+                reason: "Timed out waiting for WAL-G exact-target deletion".to_string(),
+            };
+            let result = time::timeout_at(
                 remote_deadline,
                 self.delete_walg_target_with_optional_service(
                     &backup,
@@ -310,11 +332,53 @@ impl BackupService {
                 ),
             )
             .await
-            .map_err(|_| BackupError::PartialDeletion {
-                backup_id: backup.backup_id.clone(),
-                deleted_objects: 0,
-                reason: "Timed out waiting for WAL-G exact-target deletion".to_string(),
-            })??;
+            .map_err(|_| walg_timeout())?;
+            match result {
+                Ok(()) => {}
+                // The service was found above, but its container could not
+                // run WAL-G: a concurrent stop or delete of the service. When
+                // the service is gone by now, do what a retry of this request
+                // would do and clean up through the orphan helper, which
+                // needs no service container.
+                Err(BackupError::ServiceContainerUnavailable {
+                    service_name: busy_service,
+                    container: busy_container,
+                    reason,
+                }) => {
+                    let service_exists =
+                        temps_entities::external_services::Entity::find_by_id(service_id)
+                            .one(self.db.as_ref())
+                            .await?
+                            .is_some();
+                    if !orphan_cleanup_replaces_missing_container(service_exists, deletion_engine) {
+                        return Err(BackupError::ServiceContainerUnavailable {
+                            service_name: busy_service,
+                            container: busy_container,
+                            reason,
+                        });
+                    }
+                    warn!(
+                        backup_id = %backup.backup_id,
+                        service_id,
+                        reason = %reason,
+                        "Service was deleted during backup deletion; cleaning up through the orphan helper"
+                    );
+                    time::timeout_at(
+                        remote_deadline,
+                        self.delete_walg_target_with_optional_service(
+                            &backup,
+                            &s3_source,
+                            &service_name,
+                            None,
+                            &target,
+                            deletion_engine,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| walg_timeout())??;
+                }
+                Err(error) => return Err(error),
+            }
             deleted_objects = 1;
         }
         for prefix in prefixes {
@@ -528,6 +592,28 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use temps_core::EncryptionService;
     use temps_entities::s3_sources;
+
+    /// A WAL-G delete whose service was deleted mid-request continues through
+    /// the orphan helper, exactly as the retry that used to succeed did; a
+    /// service that still exists is busy and the caller retries.
+    #[test]
+    fn missing_container_falls_back_to_orphan_cleanup_only_when_the_service_is_gone() {
+        for engine in [
+            WalgDeletionEngine::Postgres,
+            WalgDeletionEngine::PostgresCluster,
+        ] {
+            assert!(orphan_cleanup_replaces_missing_container(false, engine));
+            assert!(!orphan_cleanup_replaces_missing_container(true, engine));
+        }
+        for engine in [
+            WalgDeletionEngine::Redis,
+            WalgDeletionEngine::MongoDb,
+            WalgDeletionEngine::MariaDb,
+        ] {
+            assert!(!orphan_cleanup_replaces_missing_container(false, engine));
+            assert!(!orphan_cleanup_replaces_missing_container(true, engine));
+        }
+    }
 
     #[test]
     fn snapshot_prefix_validation_requires_configured_root_and_exact_backup_id() {

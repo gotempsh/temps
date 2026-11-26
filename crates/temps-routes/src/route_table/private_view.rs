@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The control plane's private view (ADR-114 D3).
+//! The control plane's private view (ADR-115 D3).
 //!
 //! A private address is withdrawn from every map a public connection is
 //! matched against (ADR 064 D5). When node `0`, the control plane, serves
@@ -58,7 +58,7 @@ fn control_plane_private_snapshot(snapshot: &RouteTableSnapshot) -> RouteTableSn
 }
 
 impl CachedPeerTable {
-    /// The control plane's private view (ADR-114 D3), created on first use
+    /// The control plane's private view (ADR-115 D3), created on first use
     /// from the current snapshot and kept current by every reload after it.
     pub fn private_view(&self) -> Arc<CachedPeerTable> {
         let view = self.private_view.get_or_init(|| {

@@ -551,6 +551,11 @@ pub struct NodeResourceSettings {
 pub struct NodeResourceUpdate {
     pub resource_policy: Option<NodeResourcePolicy>,
     pub system_reserved: Option<SystemReserved>,
+    /// Put `system_reserved` back to the default: for the control plane the
+    /// stored values are cleared, so it follows a future change of the
+    /// default; a worker gets its role's default. Exclusive with
+    /// `system_reserved`.
+    pub reset_system_reserved: bool,
 }
 
 /// One shadow run's inputs: what the deploy job asks `NodeScheduler`.
@@ -1122,6 +1127,14 @@ impl WorkloadPlacementService {
         node_id: i32,
         update: NodeResourceUpdate,
     ) -> Result<(NodeResourceSettings, NodeResourceSettings), WorkloadPlacementError> {
+        if update.reset_system_reserved && update.system_reserved.is_some() {
+            return Err(WorkloadPlacementError::Validation {
+                message: format!(
+                    "Node {node_id}: send either system_reserved or reset_system_reserved, not \
+                     both"
+                ),
+            });
+        }
         if let Some(reserved) = &update.system_reserved {
             Self::validate_reserved(reserved)?;
         }
@@ -1168,6 +1181,10 @@ impl WorkloadPlacementService {
                 settings.control_plane_resources.system_reserved_memory_mb =
                     Some(reserved.memory_mb);
             }
+            if update.reset_system_reserved {
+                settings.control_plane_resources.system_reserved_cpu_millis = None;
+                settings.control_plane_resources.system_reserved_memory_mb = None;
+            }
             self.config_service
                 .update_settings(settings)
                 .await
@@ -1185,6 +1202,14 @@ impl WorkloadPlacementService {
             }
             if let Some(reserved) = update.system_reserved {
                 active.system_reserved = Set(reserved);
+            }
+            if update.reset_system_reserved {
+                let row = node_resource_settings::Entity::find_by_id(node_id)
+                    .one(self.db.as_ref())
+                    .await
+                    .map_err(db_error("reading the node's role"))?
+                    .ok_or(WorkloadPlacementError::NodeNotFound { node_id })?;
+                active.system_reserved = Set(SystemReserved::default_for_role(&row.role));
             }
             active.updated_at = Set(Utc::now());
             active
@@ -1643,6 +1668,108 @@ mod tests {
         assert_eq!(facts.system_reserved.memory_mb, 2048);
     }
 
+    /// A system reservation can be put back to its default (#2050): node 0's
+    /// stored values are cleared, so it follows the default again, and a
+    /// worker gets its role's default.
+    #[tokio::test]
+    async fn a_system_reservation_resets_to_the_default() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Postgres unavailable, skipping the reservation reset test: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let ids = insert_nodes(db.as_ref()).await.expect("seed nodes");
+        let node_service = Arc::new(NodeService::new(db.clone()));
+        let legacy = NodeScheduler::new(node_service.clone());
+        let config_service = proof_config_service(db.clone());
+        let service = WorkloadPlacementService::new(
+            db.clone(),
+            node_service,
+            config_service.clone(),
+            &legacy,
+        );
+        let custom = SystemReserved {
+            cpu_millis: 1000,
+            memory_mb: 2048,
+        };
+        let worker = ids["a-worker"];
+        for node_id in [CONTROL_PLANE_NODE_ID, worker] {
+            let (_, set) = service
+                .set_node_resources(
+                    node_id,
+                    NodeResourceUpdate {
+                        system_reserved: Some(custom),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("custom reserve");
+            assert_eq!(set.system_reserved, custom);
+            assert!(!set.system_reserved_is_default, "node {node_id}");
+
+            let (previous, reset) = service
+                .set_node_resources(
+                    node_id,
+                    NodeResourceUpdate {
+                        reset_system_reserved: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("reset");
+            assert_eq!(previous.system_reserved, custom);
+            assert!(reset.system_reserved_is_default, "node {node_id}");
+        }
+        assert_eq!(
+            service
+                .node_resources(CONTROL_PLANE_NODE_ID)
+                .await
+                .unwrap()
+                .system_reserved,
+            SystemReserved::CONTROL_PLANE_LOCAL_DATABASE
+        );
+        let stored = config_service
+            .get_settings()
+            .await
+            .unwrap()
+            .control_plane_resources;
+        assert_eq!(
+            (
+                stored.system_reserved_cpu_millis,
+                stored.system_reserved_memory_mb
+            ),
+            (None, None),
+            "node 0 follows the default again"
+        );
+        assert_eq!(
+            service
+                .node_resources(worker)
+                .await
+                .unwrap()
+                .system_reserved,
+            SystemReserved::WORKER
+        );
+
+        let both = service
+            .set_node_resources(
+                worker,
+                NodeResourceUpdate {
+                    system_reserved: Some(custom),
+                    reset_system_reserved: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a value and a reset are contradictory");
+        assert!(
+            matches!(&both, WorkloadPlacementError::Validation { message } if message.contains("not both")),
+            "{both}"
+        );
+    }
+
     #[tokio::test]
     async fn an_enforced_control_plane_with_room_schedules_a_deployment() {
         let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
@@ -1664,7 +1791,7 @@ mod tests {
         .with_control_plane_usage(Arc::new(|| None));
         let enforce = NodeResourceUpdate {
             resource_policy: Some(NodeResourcePolicy::Enforced),
-            system_reserved: None,
+            ..Default::default()
         };
         let refused = unknown
             .set_node_resources(CONTROL_PLANE_NODE_ID, enforce)
@@ -1837,6 +1964,7 @@ mod tests {
                         cpu_millis: 250,
                         memory_mb: 512,
                     }),
+                    reset_system_reserved: false,
                 },
             )
             .await
@@ -2373,7 +2501,7 @@ mod tests {
                 ids["h-enforced"],
                 NodeResourceUpdate {
                     resource_policy: Some(NodeResourcePolicy::Enforced),
-                    system_reserved: None,
+                    ..Default::default()
                 },
             )
             .await

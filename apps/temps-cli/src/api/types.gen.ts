@@ -3416,9 +3416,19 @@ export type AssetCachePurgeResponse = {
     deleted: number;
 };
 
+/**
+ * Body of `POST /users/{user_id}/roles`. The target user comes from the
+ * path; the body names only the role.
+ */
 export type AssignRoleRequest = {
     role_type: string;
-    user_id: number;
+    /**
+     * Deprecated: the target is the path's `user_id`. Still accepted for
+     * older clients, but only when it equals the path id (otherwise 400).
+     *
+     * @deprecated
+     */
+    user_id?: number | null;
 };
 
 /**
@@ -9939,6 +9949,11 @@ export type CreateProjectGroupRequest = {
 
 export type CreateProjectRequest = {
     automatic_deploy?: boolean | null;
+    /**
+     * Build command; the same setting as `preset_config.buildCommand`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     build_command?: string | null;
     /**
      * Override the instance default for this new project.
@@ -9984,12 +9999,22 @@ export type CreateProjectRequest = {
      * `hosted`.
      */
     hosting?: Hosting;
+    /**
+     * Install command; the same setting as `preset_config.installCommand`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     install_command?: string | null;
     is_on_demand?: boolean | null;
     is_public_repo?: boolean | null;
     is_web_app?: boolean | null;
     main_branch?: string;
     name: string;
+    /**
+     * Build output directory; the same setting as `preset_config.outputDir`.
+     * Rejected when the preset has no such setting or `preset_config` sets
+     * a different value.
+     */
     output_dir?: string | null;
     performance_metrics_enabled?: boolean;
     preset?: string;
@@ -10122,6 +10147,12 @@ export type CreateRepositoryRequest = {
 
 export type CreateRouteRequest = {
     domain: string;
+    /**
+     * Whether the route serves traffic as soon as it is created. Defaults
+     * to `true`; send `false` to create the route disabled and enable it
+     * later with `PUT /lb/routes/{domain}`.
+     */
+    enabled?: boolean | null;
     host: string;
     port: number;
     /**
@@ -19732,6 +19763,98 @@ export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
 
 /**
+ * What coordination did for this project in the last 30 days.
+ */
+export type IdenticalBuildActivityResponse = {
+    /**
+     * Builds of this project building for their group right now.
+     */
+    building: number;
+    /**
+     * Coordinated builds that built their own image.
+     */
+    built: number;
+    /**
+     * Deployments that deployed an identical build's image instead of building.
+     */
+    reused: number;
+    /**
+     * Builds of this project waiting for an identical build right now.
+     */
+    waiting: number;
+};
+
+/**
+ * What a build does when an identical build is already running.
+ */
+export type IdenticalBuildMode = 'parallel' | 'queue' | 'share';
+
+/**
+ * One mode, explained for the console and the CLI.
+ */
+export type IdenticalBuildModeOption = {
+    /**
+     * What the mode does, in plain words.
+     */
+    description: string;
+    /**
+     * A concrete case.
+     */
+    example: string;
+    id: IdenticalBuildMode;
+    label: string;
+};
+
+/**
+ * Which builds count as "the same group" for queueing.
+ *
+ * The scope only ever widens queueing. Reusing an image always requires the
+ * full fingerprint to match, whatever the scope.
+ */
+export type IdenticalBuildScope = 'fingerprint' | 'source';
+
+/**
+ * One grouping scope, explained for the console and the CLI.
+ */
+export type IdenticalBuildScopeOption = {
+    description: string;
+    id: IdenticalBuildScope;
+    label: string;
+};
+
+export type IdenticalBuildsResponse = {
+    /**
+     * The last 30 days.
+     */
+    activity: IdenticalBuildActivityResponse;
+    /**
+     * Whether the caller may change the setting.
+     */
+    can_edit: boolean;
+    /**
+     * The longest a build waits before it fails with a reason.
+     */
+    max_wait_seconds: number;
+    /**
+     * What this project's builds do when an identical build is running.
+     * `parallel` (the default) builds every deployment. Applies from the
+     * next build.
+     */
+    mode: IdenticalBuildMode;
+    modes: Array<IdenticalBuildModeOption>;
+    /**
+     * How long after it succeeded a shared image is offered to identical
+     * builds that start later.
+     */
+    reuse_window_seconds: number;
+    /**
+     * Which builds wait for each other.
+     */
+    scope: IdenticalBuildScope;
+    scopes: Array<IdenticalBuildScopeOption>;
+};
+
+/**
  * What an identify call did.
  */
 export type IdentifyOutcome = 'updated' | 'unchanged' | 'visitor_not_found' | 'cookieless_project' | 'browser_identify_refused' | 'server_identity_kept';
@@ -22145,7 +22268,7 @@ export type LiveVisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -23487,9 +23610,12 @@ export type ModelCatalogEntry = {
     provider: string;
     release_date?: string | null;
     source_url: string;
-    supports_reasoning: boolean;
-    supports_tools: boolean;
-    supports_vision: boolean;
+    supports_reasoning?: boolean | null;
+    /**
+     * `null` when the catalog does not say.
+     */
+    supports_tools?: boolean | null;
+    supports_vision?: boolean | null;
 };
 
 /**
@@ -24279,6 +24405,30 @@ export type NodeBackend = {
      * Why the node cannot run it, and how to fix that when it can be fixed.
      */
     reason?: string | null;
+};
+
+/**
+ * A worker's effective build limits.
+ */
+export type NodeBuildLimitsResponse = {
+    /**
+     * How long a build may run, in seconds.
+     */
+    build_timeout_seconds: number;
+    /**
+     * Builds the node runs at once.
+     */
+    concurrency: number;
+    /**
+     * True when no limits were saved for the node, so these are the
+     * defaults (and follow a future change of them).
+     */
+    is_default: boolean;
+    node_id: number;
+    /**
+     * How long a build may wait for a free slot, in seconds.
+     */
+    queue_wait_seconds: number;
 };
 
 /**
@@ -28202,7 +28352,7 @@ export type PrincipalKind = 'login' | 'tag';
  */
 export type PrivateIngressConsent = {
     /**
-     * Who counts as inside (ADR-114 D8): private ranges such as
+     * Who counts as inside (ADR-115 D8): private ranges such as
      * `10.8.0.0/24`. Empty means the listen address's own network (the
      * interface's subnet, or Tailscale's ranges).
      */
@@ -28256,7 +28406,7 @@ export type PrivateIngressStatus = {
     error?: string | null;
     /**
      * This machine's private networks, with what serving on each would
-     * admit, for choosing one (ADR-114 D8). Empty where no private-ingress
+     * admit, for choosing one (ADR-115 D8). Empty where no private-ingress
      * loop runs in this process.
      */
     networks: Array<PrivateNetworkOption>;
@@ -31906,7 +32056,7 @@ export type ResolverCoverageHost = {
 /**
  * What a resolver looks like right now.
  */
-export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting' | 'no_local_resolver';
+export type ResolverHealth = 'healthy' | 'stale' | 'down' | 'off' | 'node_unavailable' | 'agent_too_old' | 'not_reporting' | 'no_local_resolver' | 'unsupported';
 
 /**
  * Quick count of resources involved in the migration
@@ -32295,7 +32445,7 @@ export type RestoreRunView = {
      * it. Always present; its fields are `None` where they are unknown.
      */
     source_backup: RestoreRunSourceBackup;
-    source_backup_id: number;
+    source_backup_id?: number | null;
     source_service_id: number;
     started_at?: string | null;
     status: string;
@@ -32500,7 +32650,10 @@ export type RouteRefreshResponse = {
 };
 
 export type RouteResponse = {
-    created_at: number;
+    /**
+     * When the route was created (ISO 8601, UTC)
+     */
+    created_at: string;
     domain: string;
     enabled: boolean;
     host: string;
@@ -32510,7 +32663,10 @@ export type RouteResponse = {
      * Route type: "http" or "tls"
      */
     route_type: string;
-    updated_at: number;
+    /**
+     * When the route was last changed (ISO 8601, UTC)
+     */
+    updated_at: string;
 };
 
 export type RouteRole = {
@@ -35552,7 +35708,7 @@ export type SessionReplayWithVisitorDto = {
     visitor_country_code?: string | null;
     visitor_crawler_name?: string | null;
     visitor_custom_data?: unknown;
-    visitor_environment_id: number;
+    visitor_environment_id?: number | null;
     visitor_first_seen: string;
     visitor_id: number;
     visitor_is_crawler: boolean;
@@ -35774,6 +35930,13 @@ export type SetNodePublicIngressResponse = {
 };
 
 export type SetNodeResourcesRequest = {
+    /**
+     * Put `system_reserved` back to the default, so `system_reserved_is_default`
+     * is true again: the control plane's stored values are cleared (it then
+     * follows the default), a worker gets its role's default. Cannot be
+     * combined with `system_reserved`.
+     */
+    reset_system_reserved?: boolean;
     resource_policy?: NodeResourcePolicy | null;
     system_reserved?: SystemReserved | null;
 };
@@ -36775,6 +36938,10 @@ export type SourceBackupIndexResponse = {
      * When the index was last updated
      */
     last_updated: string;
+    /**
+     * Errors encountered during the optional bucket scan.
+     */
+    scan_errors: Array<string>;
 };
 
 /**
@@ -37679,10 +37846,22 @@ export type StatusPageResponse = {
      */
     public_feed_url?: string | null;
     /**
+     * Path of the machine-readable form (`/api/status/{slug}/summary.json`);
+     * always present, like `public_path`.
+     */
+    public_json_path: string;
+    /**
      * Machine-readable form of the public page. `None` exactly when
      * `public_url` is.
      */
     public_json_url?: string | null;
+    /**
+     * Path of the public HTML page (`/api/status/{slug}`), on any address
+     * this install's public listener is reachable at. Always present, so a
+     * client can build the link itself when `public_url` is `None` because
+     * no public URL is configured.
+     */
+    public_path: string;
     /**
      * Public HTML page. Serves 404 while the page is unpublished. `None`
      * when this install has no public address to build it from; see
@@ -41052,6 +41231,14 @@ export type UpdateHostImagePreparationBody = {
     keep_prepared: boolean;
 };
 
+export type UpdateIdenticalBuildsRequest = {
+    mode: IdenticalBuildMode;
+    /**
+     * Defaults to `source` (same repository and path).
+     */
+    scope?: IdenticalBuildScope;
+};
+
 export type UpdateInboundFilterRequest = {
     enabled?: boolean | null;
     pattern?: string | null;
@@ -41249,8 +41436,26 @@ export type UpdateMetricAlertRequest = {
     window_secs?: number | null;
 };
 
+/**
+ * Fields to change on a monitor. Every field is optional, a field left out
+ * keeps its stored value, and at least one must be present. The monitor's ID
+ * and uptime history are kept.
+ */
 export type UpdateMonitorRequest = {
-    check_path: string;
+    /**
+     * How often to probe, in seconds. **Clamped, not rejected**, exactly
+     * like on create: values below 30 are stored as 30 and non-positive
+     * values as 60, and the response reports the stored value.
+     */
+    check_interval_seconds?: number | null;
+    /**
+     * Path probed on the monitored environment; must start with `/`.
+     */
+    check_path?: string | null;
+    /**
+     * Display name; 1 to 255 characters after trimming.
+     */
+    name?: string | null;
 };
 
 export type UpdateNotificationEmailProviderRequest = {
@@ -41503,13 +41708,36 @@ export type UpdateProviderCredentialsRequest = {
      */
     client_id?: string | null;
     client_secret?: SecretString | null;
+    password?: SecretString | null;
     private_key?: SecretString | null;
+    /**
+     * SSH public key (one OpenSSH line) of an SSH-key provider. Replaced
+     * together with `private_key`, which then carries the SSH private key.
+     */
+    public_key?: string | null;
     /**
      * OAuth redirect URI (GitLab OAuth / GitLab App).
      */
     redirect_uri?: string | null;
     token?: SecretString | null;
+    /**
+     * Username of a basic-auth provider (generic Git server, Bitbucket app
+     * password). Omit to keep the stored username.
+     */
+    username?: string | null;
     webhook_secret?: SecretString | null;
+};
+
+/**
+ * Result of a credential update: the provider and the names of the
+ * credential fields that were replaced. Credential values are never returned.
+ */
+export type UpdateProviderCredentialsResponse = ProviderResponse & {
+    /**
+     * Names of the fields that were replaced, e.g. `["password"]`. Fields
+     * that do not apply to the provider's auth method are not listed.
+     */
+    updated_fields: Array<string>;
 };
 
 export type UpdateProviderKeyRequest = {
@@ -41886,9 +42114,23 @@ export type UpdateTraefikRouteEnabledRequest = {
     enabled: boolean;
 };
 
+/**
+ * Body of `PATCH /users/{user_id}`. Unknown fields are rejected so a
+ * misspelt field is an error instead of a silent no-op.
+ */
 export type UpdateUserRequest = {
     email?: string | null;
+    /**
+     * Deprecated: the old name of `username`, still accepted. Sending both
+     * with different values is refused.
+     *
+     * @deprecated
+     */
     name?: string | null;
+    /**
+     * The new username, as in `CreateUserRequest`.
+     */
+    username?: string | null;
 };
 
 export type UpdateWebhookProviderRequest = {
@@ -42537,7 +42779,7 @@ export type VisitorDetails = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42652,7 +42894,7 @@ export type VisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42808,7 +43050,7 @@ export type VisitorWithGeolocation = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -43344,6 +43586,11 @@ export type WireguardMeshStatusResponse = {
      */
     ca_rotation_required: boolean;
     /**
+     * Whether `DELETE /nodes/wireguard` can turn the mesh off now: it is
+     * on and nothing depends on it.
+     */
+    can_disable: boolean;
+    /**
      * Whether `POST /nodes/wireguard` can turn the mesh on here.
      */
     can_enable: boolean;
@@ -43352,6 +43599,12 @@ export type WireguardMeshStatusResponse = {
      */
     cidr?: string | null;
     control_plane?: WireguardMeshControlPlaneEntry | null;
+    /**
+     * What prevents turning it off, when the mesh is on and `can_disable`
+     * is false (nodes on the mesh, pairings in progress, the control
+     * plane's overlay on its mesh address). Rendered verbatim.
+     */
+    disable_blocker?: string | null;
     /**
      * What prevents enabling it, when `can_enable` is false and the mesh is
      * off. Rendered verbatim.
@@ -54909,6 +55162,10 @@ export type CreateS3SourceErrors = {
      */
     403: ProblemDetails;
     /**
+     * Another request changed the default source at the same time; nothing was saved, retry
+     */
+    409: ProblemDetails;
+    /**
      * Internal server error
      */
     500: ProblemDetails;
@@ -55853,7 +56110,7 @@ export type DeleteBackupData = {
     body?: never;
     path: {
         /**
-         * Backup UUID
+         * Backup UUID (`backup_id`), or its integer `id` as returned by the backup lists
          */
         id: string;
     };
@@ -55883,9 +56140,13 @@ export type DeleteBackupErrors = {
      */
     409: ProblemDetails;
     /**
-     * Object storage or database error
+     * Object storage or database error; the `failure` field says which
      */
     500: ProblemDetails;
+    /**
+     * Transient failure (the backup's service is restarting or being deleted, or the database is unavailable); retry after the `Retry-After` header
+     */
+    503: ProblemDetails;
 };
 
 export type DeleteBackupError = DeleteBackupErrors[keyof DeleteBackupErrors];
@@ -62590,9 +62851,11 @@ export type GetServiceEnvironmentVariablesErrors = {
 
 export type GetServiceEnvironmentVariablesResponses = {
     /**
-     * List of environment variables
+     * Map of variable name to its masked value (`***`)
      */
-    200: Array<EnvironmentVariableInfo>;
+    200: {
+        [key: string]: string;
+    };
 };
 
 export type GetServiceEnvironmentVariablesResponse = GetServiceEnvironmentVariablesResponses[keyof GetServiceEnvironmentVariablesResponses];
@@ -65828,7 +66091,7 @@ export type UpdateGitProviderCredentialsData = {
 
 export type UpdateGitProviderCredentialsErrors = {
     /**
-     * Bad request
+     * Invalid credentials for the provider's auth method
      */
     400: unknown;
     /**
@@ -65853,7 +66116,7 @@ export type UpdateGitProviderCredentialsResponses = {
     /**
      * Credentials updated
      */
-    200: ProviderResponse;
+    200: UpdateProviderCredentialsResponse;
 };
 
 export type UpdateGitProviderCredentialsResponse = UpdateGitProviderCredentialsResponses[keyof UpdateGitProviderCredentialsResponses];
@@ -68405,6 +68668,50 @@ export type AdminGetNodeResponses = {
 
 export type AdminGetNodeResponse = AdminGetNodeResponses[keyof AdminGetNodeResponses];
 
+export type AdminGetNodeBuildLimitsData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/build-limits';
+};
+
+export type AdminGetNodeBuildLimitsErrors = {
+    /**
+     * The node is the control plane or not a worker
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Stored limits are invalid or storage failed
+     */
+    500: unknown;
+};
+
+export type AdminGetNodeBuildLimitsResponses = {
+    /**
+     * The worker's effective build limits, and whether they are the defaults
+     */
+    200: NodeBuildLimitsResponse;
+};
+
+export type AdminGetNodeBuildLimitsResponse = AdminGetNodeBuildLimitsResponses[keyof AdminGetNodeBuildLimitsResponses];
+
 export type AdminSetNodeBuildLimitsData = {
     body: BuildLimits;
     path: {
@@ -68419,7 +68726,7 @@ export type AdminSetNodeBuildLimitsData = {
 
 export type AdminSetNodeBuildLimitsErrors = {
     /**
-     * Invalid limits or node role
+     * Invalid limits, node role, or the control plane (node 0)
      */
     400: unknown;
     /**
@@ -69017,6 +69324,9 @@ export type AdminGetNodeResourcesErrors = {
 export type AdminGetNodeResourcesError = AdminGetNodeResourcesErrors[keyof AdminGetNodeResourcesErrors];
 
 export type AdminGetNodeResourcesResponses = {
+    /**
+     * The node's capacity, reservation and what is placed on it
+     */
     200: NodeResourcesResponse;
 };
 
@@ -69036,7 +69346,7 @@ export type AdminSetNodeResourcesData = {
 
 export type AdminSetNodeResourcesErrors = {
     /**
-     * Invalid reserve
+     * Invalid reserve, nothing to change, or system_reserved together with reset_system_reserved
      */
     400: ProblemDetails;
     /**
@@ -69060,6 +69370,9 @@ export type AdminSetNodeResourcesErrors = {
 export type AdminSetNodeResourcesError = AdminSetNodeResourcesErrors[keyof AdminSetNodeResourcesErrors];
 
 export type AdminSetNodeResourcesResponses = {
+    /**
+     * The node's resources after the change
+     */
     200: NodeResourcesResponse;
 };
 
@@ -71735,6 +72048,45 @@ export type NodeSshHostKeyResponses = {
 };
 
 export type NodeSshHostKeyResponse2 = NodeSshHostKeyResponses[keyof NodeSshHostKeyResponses];
+
+export type WireguardMeshDisableData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/nodes/wireguard';
+};
+
+export type WireguardMeshDisableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Something still depends on the mesh; the detail says what
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type WireguardMeshDisableResponses = {
+    /**
+     * Mesh off; current state
+     */
+    200: WireguardMeshStatusResponse;
+};
+
+export type WireguardMeshDisableResponse = WireguardMeshDisableResponses[keyof WireguardMeshDisableResponses];
 
 export type WireguardMeshStatusGetData = {
     body?: never;
@@ -78163,6 +78515,84 @@ export type SetProjectHostingResponses = {
 };
 
 export type SetProjectHostingResponse = SetProjectHostingResponses[keyof SetProjectHostingResponses];
+
+export type GetIdenticalBuildsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type GetIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type GetIdenticalBuildsResponse = GetIdenticalBuildsResponses[keyof GetIdenticalBuildsResponses];
+
+export type UpdateIdenticalBuildsData = {
+    body: UpdateIdenticalBuildsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type UpdateIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * An unknown mode or scope
+     */
+    422: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type UpdateIdenticalBuildsResponse = UpdateIdenticalBuildsResponses[keyof UpdateIdenticalBuildsResponses];
 
 export type GetLastDeploymentData = {
     body?: never;
@@ -85858,6 +86288,50 @@ export type DeleteEnvironmentVariableResponses = {
 };
 
 export type DeleteEnvironmentVariableResponse = DeleteEnvironmentVariableResponses[keyof DeleteEnvironmentVariableResponses];
+
+export type GetEnvironmentVariableData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/env-vars/{var_id}';
+};
+
+export type GetEnvironmentVariableErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or variable not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetEnvironmentVariableResponses = {
+    /**
+     * The environment variable, value masked
+     */
+    200: EnvironmentVariableResponse;
+};
+
+export type GetEnvironmentVariableResponse = GetEnvironmentVariableResponses[keyof GetEnvironmentVariableResponses];
 
 export type UpdateEnvironmentVariableData = {
     body: UpdateEnvironmentVariableRequest;
@@ -101591,6 +102065,12 @@ export type GetAiProviderHarnessUpdateData = {
          * Look inside the workspace again instead of returning the cached check.
          */
         refresh?: boolean;
+        /**
+         * Return only what was last read, never looking inside the workspace
+         * (which could create or wake it). Not checked yet: every version field
+         * and `checked_at` are null. Ignored when `refresh` is set.
+         */
+        cached_only?: boolean;
     };
     url: '/settings/ai-providers/{provider_id}/harness-update';
 };
@@ -106926,7 +107406,7 @@ export type AssignRoleData = {
 
 export type AssignRoleErrors = {
     /**
-     * Invalid role type
+     * Invalid role type, or a deprecated body user_id that differs from the path
      */
     400: unknown;
     /**
@@ -106949,10 +107429,12 @@ export type AssignRoleErrors = {
 
 export type AssignRoleResponses = {
     /**
-     * Role assigned successfully
+     * Role assigned; the user and all of its roles
      */
-    200: unknown;
+    200: RouteUserWithRoles;
 };
+
+export type AssignRoleResponse = AssignRoleResponses[keyof AssignRoleResponses];
 
 export type RemoveRoleData = {
     body?: never;
@@ -107224,7 +107706,13 @@ export type CreateSandboxErrors = {
      * Internal server error
      */
     500: unknown;
+    /**
+     * The project stores no clone URL and its git connection could not look up the project's repository
+     */
+    502: ProblemDetails;
 };
+
+export type CreateSandboxError = CreateSandboxErrors[keyof CreateSandboxErrors];
 
 export type CreateSandboxResponses = {
     /**

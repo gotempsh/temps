@@ -420,6 +420,7 @@ impl TunnelProvider for CloudflareTunnelProvider {
                         arch: pin.arch.into(),
                         url: pin.url.into(),
                         sha256: pin.sha256.into(),
+                        archive_entry: pin.archive_entry.map(Into::into),
                     })
                     .collect(),
                 args: args.clone(),
@@ -688,7 +689,7 @@ const JA4: Ja4Header = Ja4Header {
     source: "cloudflare",
 };
 
-/// What every Cloudflare Tunnel connector is (ADR-116 D2): public, through
+/// What every Cloudflare Tunnel connector is (ADR-117 D2): public, through
 /// ADR-107 D3's loopback origin with Cloudflare's client-address and JA4
 /// headers, with DNS that Temps writes.
 pub fn capabilities() -> Capabilities {

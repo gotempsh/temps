@@ -11,7 +11,9 @@ pub struct Model {
     pub id: i32,
     pub visitor_id: String,
     pub project_id: i32,
-    pub environment_id: i32,
+    /// Environment the visitor was first seen in; `None` when the request
+    /// resolved to a project but not to an environment.
+    pub environment_id: Option<i32>,
     pub first_seen: DBDateTime,
     pub last_seen: DBDateTime,
     pub user_agent: Option<String>,

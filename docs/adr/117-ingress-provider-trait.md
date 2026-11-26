@@ -3,14 +3,14 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-116: An ingress provider is one trait implementation
+# ADR-117: An ingress provider is one trait implementation
 
 **Status:** Proposed
 **Date:** 2026-11-25
 **Supersedes:** [ADR-058](./058-ingress-modes-and-a-shared-app-domain.md) D3 ("tunnels are connectors, defined as data")
 **Amends:** ADR-058 D8 ("providers are registered and describe themselves")
 
-Related: ADR-064 D4 (plans, journal, undo), ADR-065 (Tailscale Serve and Services; the Temps gate and Cloudflare Access), ADR-107 (the control plane runs tunnel connectors), ADR-114 (the control plane serves private addresses).
+Related: ADR-064 D4 (plans, journal, undo), ADR-065 (Tailscale Serve and Services; the Temps gate and Cloudflare Access), ADR-107 (the control plane runs tunnel connectors), ADR-115 (the control plane serves private addresses).
 
 ## Context
 

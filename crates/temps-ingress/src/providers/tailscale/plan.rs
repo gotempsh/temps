@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Tailscale's part of planning (ADR-116 D3, ADR 065 D1, D6): it plans
+//! Tailscale's part of planning (ADR-117 D3, ADR 065 D1, D6): it plans
 //! private and tailnet-users addresses whole. A name under a tailnet is a
 //! worker's machine name, served with Tailscale Serve, or a Service; any
 //! other name falls to the worker's own private listener, which the engine
@@ -381,7 +381,7 @@ fn tailnet_users_ways(facts: &PlanFacts) -> ReachabilityPlan {
             let Some((worker, ip)) = private_worker(facts) else {
                 return false;
             };
-            // ADR-114 D7: the control plane does not check who a tailnet
+            // ADR-115 D7: the control plane does not check who a tailnet
             // visitor is yet.
             if worker.id == temps_core::CONTROL_PLANE_NODE_ID {
                 refusals.push((

@@ -877,6 +877,19 @@ impl ExternalServiceManager {
             !(Self::is_sensitive_parameter(name)
                 && value.as_str().is_some_and(|value| value == "***"))
         });
+        // A client doing read-modify-write sends back every parameter it
+        // read, read-only ones included. Sending a read-only value unchanged
+        // is not an attempt to change it, so it is dropped here instead of
+        // failing the whole update below.
+        // Ports are stored as strings, the way creation stores them, and the
+        // engines' configurations read them as strings: a number sent here
+        // used to be stored as is and break every later read of the service.
+        stringify_numeric_ports(&mut update_params);
+        drop_unchanged_fixed_parameters(
+            &mut update_params,
+            &existing_params,
+            &strategy.updateable_keys(),
+        );
         if let Some(docker_image) = &request.docker_image {
             info!(
                 "Updating service {} with new Docker image: {}",
@@ -1518,6 +1531,50 @@ impl ExternalServiceManager {
             sensitive_parameters,
         })
     }
+}
+
+/// Remove from `updates` every parameter an update may not change whose
+/// value equals the stored one, so only real changes are validated.
+///
+/// Values compare as the API returns them: a stored `"5432"` equals a sent
+/// `5432`, since parameters are stored as strings but often typed as numbers.
+pub(crate) fn drop_unchanged_fixed_parameters(
+    updates: &mut HashMap<String, serde_json::Value>,
+    stored: &HashMap<String, serde_json::Value>,
+    updateable_keys: &[&str],
+) {
+    updates.retain(|name, value| {
+        updateable_keys.contains(&name.as_str())
+            || !stored
+                .get(name)
+                .is_some_and(|stored| same_parameter_value(stored, value))
+    });
+}
+
+/// Store a port sent as a JSON number (`"port": 6543`, `"console_port":
+/// 9001`) as the string every stored port is (`"6543"`).
+pub(crate) fn stringify_numeric_ports(updates: &mut HashMap<String, serde_json::Value>) {
+    for (name, value) in updates.iter_mut() {
+        if name == "port" || name.ends_with("_port") {
+            if let serde_json::Value::Number(number) = value {
+                *value = serde_json::Value::String(number.to_string());
+            }
+        }
+    }
+}
+
+fn same_parameter_value(stored: &serde_json::Value, sent: &serde_json::Value) -> bool {
+    fn scalar_text(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            serde_json::Value::Bool(flag) => Some(flag.to_string()),
+            serde_json::Value::Null
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => None,
+        }
+    }
+    stored == sent || scalar_text(stored).is_some_and(|text| Some(text) == scalar_text(sent))
 }
 
 #[cfg(test)]

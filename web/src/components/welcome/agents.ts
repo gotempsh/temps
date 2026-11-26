@@ -6,7 +6,7 @@ import type { Choice } from './ChoiceList'
 
 /**
  * Agents that can load the Temps skill, by the id their logo is under.
- * Temps signs in to no harness of its own (ADR-115): the agent you already
+ * Temps signs in to no harness of its own (ADR-116): the agent you already
  * use drives Temps through the skill and an API key its login creates.
  */
 export const CONNECTABLE_AGENTS: Array<{ id: string; name: string }> = [

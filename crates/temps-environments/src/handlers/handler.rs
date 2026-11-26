@@ -329,7 +329,8 @@ impl From<crate::services::secret_service::SecretError> for Problem {
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environments(
     State(state): State<Arc<AppState>>,
@@ -404,7 +405,8 @@ pub async fn get_environments(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment(
     State(state): State<Arc<AppState>>,
@@ -477,7 +479,8 @@ pub async fn get_environment(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment_domains(
     State(state): State<Arc<AppState>>,
@@ -528,7 +531,8 @@ pub async fn get_environment_domains(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn add_environment_domain(
     State(state): State<Arc<AppState>>,
@@ -587,7 +591,8 @@ pub async fn add_environment_domain(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug"),
         ("domain_id" = i32, Path, description = "Domain ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_environment_domain(
     State(state): State<Arc<AppState>>,
@@ -623,7 +628,8 @@ pub async fn delete_environment_domain(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID to filter by")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment_variables(
     State(state): State<Arc<AppState>>,
@@ -642,44 +648,89 @@ pub async fn get_environment_variables(
 
     // Mask values in the list response. Regular values can be read through
     // the audited per-key endpoint; marked secret values remain write-only.
-    let response: Vec<EnvironmentVariableResponse> = vars
-        .into_iter()
-        .map(|v| {
-            // Non-secret rows get a masked preview so the UI never has the
-            // plaintext sitting in memory in a list view. Secret rows return
-            // `None` so the UI can render the secret affordance (and so an
-            // accidental JSON dump never contains a value at all).
-            let value = if v.is_secret {
-                None
-            } else {
-                Some("***".to_string())
-            };
-            let secret_suggestion =
-                SecretSuggestionResponse::for_variable(v.secret_suggestion, &v.key);
-            EnvironmentVariableResponse {
-                id: v.id,
-                key: v.key,
-                value,
-                created_at: v.created_at.timestamp_millis(),
-                updated_at: v.updated_at.timestamp_millis(),
-                environments: v
-                    .environments
-                    .into_iter()
-                    .map(|env| EnvironmentInfo {
-                        id: env.id,
-                        name: env.name,
-                        main_url: env.main_url,
-                        current_deployment_id: env.current_deployment_id,
-                    })
-                    .collect(),
-                include_in_preview: v.include_in_preview,
-                is_secret: v.is_secret,
-                secret_suggestion,
-            }
-        })
-        .collect();
+    let response: Vec<EnvironmentVariableResponse> =
+        vars.into_iter().map(masked_variable_response).collect();
 
     Ok(Json(response))
+}
+
+/// A variable as the list and single-variable reads return it.
+///
+/// Non-secret rows get a masked preview: reading a plaintext value needs the
+/// reveal permission and is audit-logged, through
+/// `GET /projects/{project_id}/env-vars/{key}/value`, and a read that only
+/// needs `EnvironmentsRead` must not bypass that. Secret rows return `None`
+/// so the UI can render the secret affordance (and so an accidental JSON dump
+/// never contains a value at all).
+fn masked_variable_response(
+    v: crate::services::EnvVarWithEnvironments,
+) -> EnvironmentVariableResponse {
+    let value = if v.is_secret {
+        None
+    } else {
+        Some("***".to_string())
+    };
+    let secret_suggestion = SecretSuggestionResponse::for_variable(v.secret_suggestion, &v.key);
+    EnvironmentVariableResponse {
+        id: v.id,
+        key: v.key,
+        value,
+        created_at: v.created_at.timestamp_millis(),
+        updated_at: v.updated_at.timestamp_millis(),
+        environments: v
+            .environments
+            .into_iter()
+            .map(|env| EnvironmentInfo {
+                id: env.id,
+                name: env.name,
+                main_url: env.main_url,
+                current_deployment_id: env.current_deployment_id,
+            })
+            .collect(),
+        include_in_preview: v.include_in_preview,
+        is_secret: v.is_secret,
+        secret_suggestion,
+    }
+}
+
+/// Get one environment variable of a project by its ID
+///
+/// Returns the variable exactly as the list does: a regular variable's value
+/// is masked as `***` and a secret's is `null`. Read a regular value with
+/// `GET /projects/{project_id}/env-vars/{key}/value?var_id={var_id}`, which
+/// needs the reveal permission and is audit-logged.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/env-vars/{var_id}",
+    tag = "Projects",
+    responses(
+        (status = 200, description = "The environment variable, value masked", body = EnvironmentVariableResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Project or variable not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("var_id" = i32, Path, description = "Environment variable ID")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_environment_variable(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, var_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let var = state
+        .env_var_service
+        .get_environment_variable(project_id, var_id)
+        .await?;
+
+    Ok(Json(masked_variable_response(var)))
 }
 
 /// Resolved env vars for a project (manual + integration-sourced, merged).
@@ -705,7 +756,8 @@ pub async fn get_environment_variables(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID to filter manual vars by")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_resolved_environment_variables(
     State(state): State<Arc<AppState>>,
@@ -871,7 +923,8 @@ pub async fn get_resolved_environment_variables(
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID"),
         ("var_id" = Option<i32>, Query, description = "Exact manual environment-variable row ID"),
         ("service_id" = Option<i32>, Query, description = "Integration service ID shown by the resolved list")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_resolved_environment_variable_value(
     State(state): State<Arc<AppState>>,
@@ -1014,7 +1067,8 @@ pub async fn get_resolved_environment_variable_value(
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn create_environment_variable(
     State(state): State<Arc<AppState>>,
@@ -1117,7 +1171,8 @@ pub async fn create_environment_variable(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("var_id" = i32, Path, description = "Environment variable ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_environment_variable(
     State(state): State<Arc<AppState>>,
@@ -1254,7 +1309,8 @@ pub async fn dismiss_environment_variable_secret_suggestion(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("var_id" = i32, Path, description = "Environment variable ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_environment_variable(
     State(state): State<Arc<AppState>>,
@@ -1382,7 +1438,8 @@ pub async fn update_environment_variable(
         ("key" = String, Path, description = "Environment variable key"),
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID"),
         ("var_id" = Option<i32>, Query, description = "Exact environment-variable row ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment_variable_value(
     State(state): State<Arc<AppState>>,
@@ -1560,7 +1617,8 @@ fn settings_change_granted_runtime(settings: &UpdateEnvironmentSettingsRequest) 
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_environment_settings(
     State(state): State<Arc<AppState>>,
@@ -1801,7 +1859,8 @@ pub async fn update_environment_settings(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_environment_subdomain(
     State(state): State<Arc<AppState>>,
@@ -1919,7 +1978,8 @@ pub async fn update_environment_subdomain(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("env_id" = i32, Path, description = "Environment ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn wake_environment(
     State(state): State<Arc<AppState>>,
@@ -2079,7 +2139,8 @@ pub async fn wake_environment(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("env_id" = i32, Path, description = "Environment ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn sleep_environment(
     State(state): State<Arc<AppState>>,
@@ -2230,7 +2291,8 @@ pub async fn sleep_environment(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("env_id" = i32, Path, description = "Environment ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_environment(
     State(state): State<Arc<AppState>>,
@@ -2351,7 +2413,8 @@ async fn require_environment_deletion_authorization(
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn create_environment(
     State(state): State<Arc<AppState>>,
@@ -2467,7 +2530,8 @@ pub async fn create_environment(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("environment_id" = Option<i32>, Query, description = "Optional environment filter")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn list_project_secrets(
     State(state): State<Arc<AppState>>,
@@ -2526,7 +2590,8 @@ pub async fn list_project_secrets(
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn create_project_secret(
     State(state): State<Arc<AppState>>,
@@ -2639,7 +2704,8 @@ async fn record_secret_write(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("secret_id" = i32, Path, description = "Secret ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_project_secret(
     State(state): State<Arc<AppState>>,
@@ -2718,7 +2784,8 @@ pub async fn update_project_secret(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("secret_id" = i32, Path, description = "Secret ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_project_secret(
     State(state): State<Arc<AppState>>,
@@ -2816,7 +2883,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/env-vars/{var_id}",
-            put(update_environment_variable),
+            get(get_environment_variable).put(update_environment_variable),
         )
         .route(
             "/projects/{project_id}/env-vars/{var_id}",
@@ -2860,6 +2927,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         add_environment_domain,
         delete_environment_domain,
         get_environment_variables,
+        get_environment_variable,
         get_resolved_environment_variables,
         create_environment_variable,
         update_environment_variable,
@@ -2960,6 +3028,48 @@ mod tests {
     }
     use std::sync::Mutex;
     use temps_core::{AuditLogger, AuditOperation};
+
+    /// Reading one variable needs only `EnvironmentsRead`, so it masks a
+    /// regular value exactly like the list does; the plaintext stays behind
+    /// the audited reveal endpoint.
+    #[test]
+    fn single_variable_read_masks_the_value_like_the_list() {
+        let variable = |is_secret: bool| crate::services::EnvVarWithEnvironments {
+            id: 5,
+            project_id: 10,
+            key: "DATABASE_URL".to_string(),
+            value: if is_secret {
+                None
+            } else {
+                Some("postgres://db".to_string())
+            },
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            environments: Vec::new(),
+            include_in_preview: false,
+            is_secret,
+            secret_suggestion: None,
+        };
+
+        let regular = masked_variable_response(variable(false));
+        assert_eq!(regular.id, 5);
+        assert_eq!(regular.value.as_deref(), Some("***"));
+
+        let secret = masked_variable_response(variable(true));
+        assert!(secret.value.is_none());
+
+        let source = include_str!("handler.rs");
+        let handler = source
+            .split("pub async fn get_environment_variable(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n").next())
+            .expect("get_environment_variable source is present");
+        assert!(handler.contains("permission_guard!(auth, EnvironmentsRead)"));
+        assert!(handler.contains("project_scope_guard!(auth, project_id)"));
+        assert!(handler.contains("project_access_guard!("));
+        assert!(handler.contains("masked_variable_response"));
+        assert!(source.contains("get(get_environment_variable).put(update_environment_variable)"));
+    }
 
     #[test]
     fn environment_settings_write_uses_project_scoped_permission_guard() {
@@ -4038,6 +4148,84 @@ mod tests {
                 .contains(&missing.to_string()));
 
             assert!(audit.serialized_operations.lock().unwrap().is_empty());
+        }
+
+        async fn get_variable(
+            app: axum::Router,
+            project_id: i32,
+            var_id: i32,
+            auth: Option<temps_auth::AuthContext>,
+        ) -> (StatusCode, HeaderMap, serde_json::Value) {
+            let mut request = Request::builder()
+                .uri(format!("/projects/{project_id}/env-vars/{var_id}"))
+                .body(Body::empty())
+                .unwrap();
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, headers, body)
+        }
+
+        #[tokio::test]
+        async fn reading_one_variable_needs_a_token() {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let (status, _, _) = get_variable(app(untouchable_db(), audit, None), 3, 9, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn one_variable_is_read_masked_and_only_within_its_project() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let var_id = insert_variable(&test_db, project_id, false).await;
+            let app = app(
+                test_db.connection_arc(),
+                Arc::new(RecordingAuditLogger::default()),
+                None,
+            );
+            let reader = || Some(test_auth_context(temps_auth::Role::Reader));
+
+            let (status, _, body) = get_variable(app.clone(), project_id, var_id, reader()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["id"], var_id);
+            assert_eq!(body["key"], "DATABASE_URL");
+            assert_eq!(body["value"], "***");
+            assert!(!body.to_string().contains("hunter2"));
+
+            // The same ID under another project is not found, not leaked.
+            let (status, headers, body) =
+                get_variable(app.clone(), project_id + 1000, var_id, reader()).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(is_problem(&headers));
+            assert!(body["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&var_id.to_string()));
+
+            // `resolved` is still its own route, not a variable ID.
+            let request = Request::builder()
+                .uri(format!("/projects/{project_id}/env-vars/resolved"))
+                .body(Body::empty())
+                .unwrap();
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(test_auth_context(temps_auth::Role::Admin));
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
         }
     }
 }

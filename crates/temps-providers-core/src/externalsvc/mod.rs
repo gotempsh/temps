@@ -49,6 +49,7 @@ pub mod restore_image;
 pub mod restore_staging;
 pub mod s3_util;
 pub mod server_tls;
+pub mod walg_fetch;
 
 // Test utilities for backup and restore testing
 #[allow(

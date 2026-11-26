@@ -40,7 +40,7 @@ export function Welcome() {
   const onboarding = useOnboarding()
   const update = useUpdateOnboarding()
   const host = useQuery({ ...getHostFactsOptions(), staleTime: 60_000 })
-  // This machine's private networks (ADR-114 D8); absent where the proxy
+  // This machine's private networks (ADR-115 D8); absent where the proxy
   // runs in another process, and the facts then fall back to Tailscale.
   const privateIngress = useQuery({
     ...getPrivateIngressOptions(),

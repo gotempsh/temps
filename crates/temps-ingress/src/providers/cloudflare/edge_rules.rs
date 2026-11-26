@@ -5,7 +5,7 @@
 //! bodies and references a run writes, and the calls that add, find, read
 //! and delete them. The words a plan and a run store about them
 //! ([`EdgeRulePurpose`], [`crate::reachability::edge_rules::HttpPolicy`]) stay in
-//! [`crate::reachability::edge_rules`] (ADR-116 D5).
+//! [`crate::reachability::edge_rules`] (ADR-117 D5).
 //!
 //! Rules are only ever added: to the phase's entry point with
 //! `POST …/rulesets/{id}/rules`, or, when the zone has none, by creating the

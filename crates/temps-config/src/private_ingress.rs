@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The operator's consent for the control plane to serve private addresses
-//! (ADR-114 D2).
+//! (ADR-115 D2).
 //!
 //! On a worker the machine's owner consents in `agent.json`. On the control
 //! plane the owner and the operator are the same person, so the consent is
@@ -81,7 +81,7 @@ impl PrivateListen {
 pub struct PrivateIngressConsent {
     /// `tailscale`, or the private address to serve on.
     pub listen: String,
-    /// Who counts as inside (ADR-114 D8): private ranges such as
+    /// Who counts as inside (ADR-115 D8): private ranges such as
     /// `10.8.0.0/24`. Empty means the listen address's own network (the
     /// interface's subnet, or Tailscale's ranges).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -138,7 +138,7 @@ pub struct PrivateIngressStatus {
     /// Why nothing is served although consent was given, with the fix.
     pub error: Option<String>,
     /// This machine's private networks, with what serving on each would
-    /// admit, for choosing one (ADR-114 D8). Empty where no private-ingress
+    /// admit, for choosing one (ADR-115 D8). Empty where no private-ingress
     /// loop runs in this process.
     pub networks: Vec<temps_core::private_network::PrivateNetworkOption>,
     /// When the control plane last applied the consent.
@@ -511,7 +511,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, PrivateIngressError::Validation { .. }));
-        // ADR-114 D8: only private ranges can be admitted.
+        // ADR-115 D8: only private ranges can be admitted.
         let error = service
             .put(PrivateIngressRequest {
                 listen: "10.8.0.1".into(),

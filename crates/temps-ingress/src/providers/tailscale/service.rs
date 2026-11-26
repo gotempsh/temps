@@ -4,7 +4,7 @@
 //! What planning and applying ask of Tailscale (ADR 065 D2, D4, D5): the
 //! cluster's OAuth client, its scope check, the Service a plan names and the
 //! hosts advertising it. The engine holds one [`Tailnet`] and calls it by
-//! method; everything Tailscale-shaped stays here (ADR-116 D1).
+//! method; everything Tailscale-shaped stays here (ADR-117 D1).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};

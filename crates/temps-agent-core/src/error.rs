@@ -48,7 +48,7 @@ pub enum AgentError {
     #[error("AI CLI '{provider}' timed out after {timeout_secs} seconds")]
     AiCliTimeout { provider: String, timeout_secs: u64 },
 
-    /// ADR-115 D2: a model turn of an agent run failed in the AI gateway
+    /// ADR-116 D2: a model turn of an agent run failed in the AI gateway
     /// (no provider configured, the provider refused, a limit was hit).
     #[error("Agent run {run_id}: the AI gateway could not answer turn {turn}: {reason}")]
     AgentModelFailed {
@@ -57,7 +57,7 @@ pub enum AgentError {
         reason: String,
     },
 
-    /// ADR-115 D2: an agent run used its whole time budget before the model
+    /// ADR-116 D2: an agent run used its whole time budget before the model
     /// gave its final answer.
     #[error("Agent run {run_id} did not finish within {timeout_secs} seconds ({turns} turns)")]
     AgentTimedOut {

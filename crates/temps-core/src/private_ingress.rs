@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The control plane's private ingress (ADR-114 D3).
+//! The control plane's private ingress (ADR-115 D3).
 //!
 //! When the operator consents, the control plane serves private addresses
 //! on its proxy's own listener: a connection whose **local** address is the
@@ -30,7 +30,7 @@ use crate::worker_ingress::{check_private_listen, PRIVATE_HTTPS_PORT, PRIVATE_HT
 pub struct PrivateIngressServing {
     /// The consented private address (`10.8.0.1`, `100.101.102.103`).
     pub address: IpAddr,
-    /// The ranges a visitor's TCP peer must be in (ADR-114 D8): the
+    /// The ranges a visitor's TCP peer must be in (ADR-115 D8): the
     /// interface's subnet, Tailscale's ranges, or what the operator named.
     pub admit: Vec<IpNet>,
 }
@@ -72,7 +72,7 @@ pub enum PrivateArrival {
 pub struct ControlPlanePrivateIngress {
     serving: ArcSwapOption<PrivateIngressServing>,
     /// This machine's private networks, as the loop last found them, for
-    /// the console to offer (ADR-114 D8).
+    /// the console to offer (ADR-115 D8).
     networks: ArcSwap<Vec<PrivateNetworkOption>>,
     /// Every address the proxy's HTTP and HTTPS listeners bound, set once
     /// at startup.
@@ -151,7 +151,7 @@ impl ControlPlanePrivateIngress {
 
     /// Why the proxy's listeners do not take connections to `address` on
     /// ports 443 and 80, or `None` when they do. Pingora binds only at
-    /// startup, so the fix is a restart (ADR-114 D3).
+    /// startup, so the fix is a restart (ADR-115 D3).
     pub fn not_covered(&self, address: IpAddr) -> Option<String> {
         let Some(listeners) = self.proxy_listeners() else {
             return Some(

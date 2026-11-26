@@ -340,7 +340,7 @@ async fn run(
             None
         };
 
-        // ADR-114 D8: who the private listener admits. A range over a
+        // ADR-115 D8: who the private listener admits. A range over a
         // container network, or no range to admit, stops the control plane
         // from making new addresses private here, with the reason.
         let admit = match bound.as_ref().filter(|b| b.private) {
@@ -512,7 +512,7 @@ const NON_PUBLIC_INTERFACES: &[&str] = &[
 
 /// Every address on this host with its interface name.
 /// Every address on this host with its interface, prefix and whether it is
-/// Tailscale's (ADR-114 D8). The control plane reads its own the same way.
+/// Tailscale's (ADR-115 D8). The control plane reads its own the same way.
 pub fn local_networks() -> Vec<temps_core::private_network::LocalNetwork> {
     if_addrs::get_if_addrs()
         .map(|interfaces| {
@@ -540,7 +540,7 @@ pub fn local_networks() -> Vec<temps_core::private_network::LocalNetwork> {
         .unwrap_or_default()
 }
 
-/// What a private listener on `listener` admits (ADR-114 D8): the ranges
+/// What a private listener on `listener` admits (ADR-115 D8): the ranges
 /// its owner named, else the listen interface's subnet (Tailscale's ranges
 /// on Tailscale), never a range over one of this host's container bridges.
 pub fn private_admit(

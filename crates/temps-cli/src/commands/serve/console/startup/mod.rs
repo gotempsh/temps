@@ -110,7 +110,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // Initialize plugin manager
     let mut plugin_manager = PluginManager::new();
-    // ADR-114: the consent endpoint wakes the control plane's private
+    // ADR-115: the consent endpoint wakes the control plane's private
     // ingress when one runs beside this console.
     if let Some(private_ingress) = control_plane_private_ingress {
         plugin_manager

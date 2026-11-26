@@ -28,7 +28,9 @@ use crate::handlers::provider_audit::{
 use crate::handlers::types::AiGatewayAppState;
 use crate::provider_url::KeyTrust;
 use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
-use crate::services::{NewProviderKey, ProviderKeyUpdate, TrustChange, TrustRequest};
+use crate::services::{
+    NewProviderKey, ProviderKeyService, ProviderKeyUpdate, TrustChange, TrustRequest,
+};
 use crate::types::DiscoveredModel;
 
 // ============================================================================
@@ -395,22 +397,18 @@ pub struct UpdateProviderKeyRequest {
     pub capabilities: Option<SelfHostedCapabilities>,
 }
 
-/// The endpoint and model a replacement key is checked against: those the same
-/// request sets, otherwise the ones already on the key. A field the request
-/// clears is checked as cleared, which is how the key will then be used.
-fn replacement_check_target<'a>(
+/// The endpoint a replacement key is checked against: the one the same
+/// request sets, otherwise the key's own. An endpoint the request clears is
+/// checked as cleared, which is how the key will then be used. The model is
+/// chosen by `ProviderKeyService::replacement_check`.
+fn replacement_check_base_url<'a>(
     current: &'a temps_entities::ai_provider_keys::Model,
     request: &'a UpdateProviderKeyRequest,
-) -> (Option<&'a str>, Option<&'a str>) {
-    let base_url = match request.base_url.as_ref() {
+) -> Option<&'a str> {
+    match request.base_url.as_ref() {
         Some(requested) => requested.as_deref(),
         None => current.base_url.as_deref(),
-    };
-    let default_model = match request.default_model.as_ref() {
-        Some(requested) => requested.as_deref(),
-        None => current.default_model.as_deref(),
-    };
-    (base_url, default_model)
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1006,32 +1004,38 @@ async fn update_provider_key(
     let before = app_state.provider_key_service.get_by_id(id).await?;
 
     // A replacement key is verified like a new one, against the endpoint and
-    // model it will be used with, before it overwrites a working key.
+    // the model internal calls will use through it, before it overwrites a
+    // working key.
     if let Some(api_key) = request.api_key.as_ref() {
-        let (base_url, default_model) = replacement_check_target(&before, &request);
+        let base_url = replacement_check_base_url(&before, &request);
         let check_trust = match request.trust_private_address {
             Some(trust) => requested_key_trust(&auth, trust, base_url)?,
             None => KeyTrust::from_stored(before.trusted_private_address.as_deref()),
         };
+        let check = app_state
+            .provider_key_service
+            .replacement_check(
+                &before,
+                request.default_model.as_ref().map(|model| model.as_deref()),
+            )
+            .await?;
         app_state
             .gateway_service
             .test_provider(
                 &before.provider,
                 api_key.expose(),
                 base_url,
-                default_model,
+                check.model.as_deref(),
                 check_trust,
             )
             .await
             .map_err(|error| match error {
                 AiGatewayError::InvalidProviderUrl { .. } => error,
-                other => AiGatewayError::Validation {
-                    message: format!(
-                        "API key verification failed for provider key {id} ('{}'); the current key was kept: {}",
-                        before.display_name,
-                        other.summary()
-                    ),
-                },
+                other => ProviderKeyService::replacement_verification_failed(
+                    &before,
+                    &check,
+                    &other.summary(),
+                ),
             })?;
     }
 
@@ -1283,7 +1287,7 @@ mod patch_deser_tests {
 
 #[cfg(test)]
 mod replacement_check_tests {
-    use super::{replacement_check_target, UpdateProviderKeyRequest};
+    use super::{replacement_check_base_url, UpdateProviderKeyRequest};
     use chrono::Utc;
     use temps_entities::ai_provider_keys;
 
@@ -1314,9 +1318,11 @@ mod replacement_check_tests {
         let current = key(Some("https://llm.example.test/v1"), Some("small-model"));
         let update = request(r#"{"api_key":"sk-new"}"#);
         assert_eq!(
-            replacement_check_target(&current, &update),
-            (Some("https://llm.example.test/v1"), Some("small-model"))
+            replacement_check_base_url(&current, &update),
+            Some("https://llm.example.test/v1")
         );
+        // An absent default model leaves the key's routing to decide.
+        assert_eq!(update.default_model, None);
     }
 
     #[test]
@@ -1326,16 +1332,20 @@ mod replacement_check_tests {
             r#"{"api_key":"sk-new","base_url":"https://new.example.test/v1","default_model":"new-model"}"#,
         );
         assert_eq!(
-            replacement_check_target(&current, &update),
-            (Some("https://new.example.test/v1"), Some("new-model"))
+            replacement_check_base_url(&current, &update),
+            Some("https://new.example.test/v1")
         );
+        assert_eq!(update.default_model, Some(Some("new-model".to_string())));
     }
 
     #[test]
     fn a_cleared_endpoint_or_model_is_checked_as_cleared() {
         let current = key(Some("https://old.example.test/v1"), Some("old-model"));
         let update = request(r#"{"api_key":"sk-new","base_url":null,"default_model":null}"#);
-        assert_eq!(replacement_check_target(&current, &update), (None, None));
+        assert_eq!(replacement_check_base_url(&current, &update), None);
+        // A cleared default model is not an absent one: the key will route
+        // without its pin, and that is what is checked.
+        assert_eq!(update.default_model, Some(None));
     }
 
     #[test]

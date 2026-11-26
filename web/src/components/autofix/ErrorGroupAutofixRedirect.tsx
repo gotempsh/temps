@@ -5,7 +5,7 @@ import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 
 /**
  * `/errors/:errorGroupId/autofix`, the old "Fix with AI" address, now opens
- * the error group, where autofix incidents start (ADR-115 D2).
+ * the error group, where autofix incidents start (ADR-116 D2).
  */
 export function ErrorGroupAutofixRedirect() {
   return <RedirectWithQuery to="../errors/:errorGroupId" />

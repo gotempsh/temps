@@ -21,7 +21,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 const APPLY_DELAY_MS = 2_000
 
 /**
- * ADR-114 D2, D8: let this machine serve private addresses on one of its
+ * ADR-115 D2, D8: let this machine serve private addresses on one of its
  * private networks, in one click, then plan again. With several networks it
  * asks which; a network it cannot use says why. The CLI form stays beside it.
  */

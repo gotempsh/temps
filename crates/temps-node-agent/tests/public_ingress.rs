@@ -1319,6 +1319,142 @@ async fn test_public_ingress_streams_response_before_backend_finishes() {
     assert!(String::from_utf8_lossy(&received).contains("first-second"));
 }
 
+/// A backend that answers every request with `response`, verbatim.
+async fn start_fixed_backend(response: &'static [u8]) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixed-response backend");
+    let address = listener
+        .local_addr()
+        .expect("read fixed-response backend address");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = vec![0; 8192];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(response).await;
+            });
+        }
+    });
+    address
+}
+
+/// A sign-in answer that sets three cookies, as a login endpoint does.
+const THREE_COOKIES: &[u8] = b"HTTP/1.1 200 OK\r\n\
+    Set-Cookie: access=a1; Path=/; HttpOnly\r\n\
+    Set-Cookie: refresh=r2; Path=/; HttpOnly\r\n\
+    Set-Cookie: session=s3; Path=/\r\n\
+    Content-Length: 2\r\nConnection: close\r\n\r\nok";
+
+fn set_cookies(response: &str) -> Vec<String> {
+    let head = response.split("\r\n\r\n").next().unwrap_or_default();
+    head.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("set-cookie")
+                .then(|| value.trim().to_string())
+        })
+        .collect()
+}
+
+/// #2043: every `Set-Cookie` an app sends reaches the visitor through a
+/// tunnel connector, in order. They are separate fields that must never be
+/// folded (RFC 6265 §3); keeping only the last one signed visitors out.
+#[tokio::test]
+async fn test_tunnel_origin_relays_every_set_cookie() {
+    let backend_address = start_fixed_backend(THREE_COOKIES).await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+    let headers = Arc::new(arc_swap::ArcSwap::from_pointee(
+        temps_node_agent::internal_proxy::TunnelOriginHeaders::new(None, None)
+            .expect("valid header names"),
+    ));
+    let origin = spawn_tunnel_origin(
+        "127.0.0.1:0".parse().expect("parse loopback address"),
+        Arc::clone(&ingress.store),
+        Arc::clone(&ingress.shutdown),
+        headers,
+    )
+    .await
+    .expect("start tunnel origin");
+    let mut stream = TcpStream::connect(origin)
+        .await
+        .expect("connect to tunnel origin");
+    stream
+        .write_all(b"POST /sign-in HTTP/1.1\r\nHost: app.example.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write request to tunnel origin");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .expect("tunnel origin response timed out")
+        .expect("read tunnel origin response");
+    let response = String::from_utf8_lossy(&response).into_owned();
+
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            "access=a1; Path=/; HttpOnly",
+            "refresh=r2; Path=/; HttpOnly",
+            "session=s3; Path=/",
+        ],
+        "{response}"
+    );
+}
+
+/// #2043: an app that declines an upgrade answers with an ordinary
+/// response, and its cookies are relayed the same way.
+#[tokio::test]
+async fn test_public_ingress_declined_upgrade_relays_every_set_cookie() {
+    let backend_address = start_fixed_backend(
+        b"HTTP/1.1 401 Unauthorized\r\n\
+          Set-Cookie: access=; Max-Age=0\r\n\
+          Set-Cookie: refresh=; Max-Age=0\r\n\
+          Set-Cookie: session=; Max-Age=0\r\n\
+          Content-Length: 0\r\n\r\n",
+    )
+    .await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+    let mut client = TcpStream::connect(ingress.address)
+        .await
+        .expect("connect to public ingress");
+    client
+        .write_all(
+            b"GET /socket HTTP/1.1\r\nHost: app.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC1vbmx5LWtleQ==\r\n\r\n",
+        )
+        .await
+        .expect("write websocket upgrade request");
+
+    let mut response = Vec::new();
+    let mut byte = [0; 1];
+    timeout(Duration::from_secs(3), async {
+        while !response.ends_with(b"\r\n\r\n") {
+            client
+                .read_exact(&mut byte)
+                .await
+                .expect("read declined upgrade response");
+            response.push(byte[0]);
+        }
+    })
+    .await
+    .expect("declined upgrade response timed out");
+    let response = String::from_utf8_lossy(&response).into_owned();
+
+    assert!(
+        response.starts_with("HTTP/1.1 401 Unauthorized"),
+        "{response}"
+    );
+    assert_eq!(
+        set_cookies(&response),
+        vec![
+            "access=; Max-Age=0",
+            "refresh=; Max-Age=0",
+            "session=; Max-Age=0"
+        ],
+        "{response}"
+    );
+}
+
 #[tokio::test]
 async fn test_public_ingress_websocket_upgrade_tunnels_bidirectionally() {
     let listener = TcpListener::bind("127.0.0.1:0")

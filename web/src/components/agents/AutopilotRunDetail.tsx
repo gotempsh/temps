@@ -526,7 +526,7 @@ function parseClaudeOutput(output: string): ConversationEvent[] {
 }
 
 /** Parse a run's output into conversation events: a Temps agent transcript
- *  (ADR-115), or the stream of a coding CLI from a run made before it. */
+ *  (ADR-116), or the stream of a coding CLI from a run made before it. */
 function parseStreamOutput(output: string): ConversationEvent[] {
   if (isTempsAgentTranscript(output)) return parseTempsAgentTranscript(output)
   if (isOpenCodeFormat(output)) return parseOpenCodeOutput(output)

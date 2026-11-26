@@ -122,6 +122,15 @@ pub struct WireguardMeshEnabledAudit {
     pub listen_port: u16,
 }
 
+/// An operator turned the cluster's WireGuard mesh off. `cidr` and
+/// `listen_port` are what it used, so the audit trail shows what was removed.
+#[derive(Debug, Clone, Serialize)]
+pub struct WireguardMeshDisabledAudit {
+    pub context: AuditContext,
+    pub cidr: Option<String>,
+    pub listen_port: Option<u16>,
+}
+
 /// An operator started pairing a node the control plane will dial (ADR 048
 /// D2b): whoever runs the returned command at that address joins the mesh.
 /// Also recorded when a worker that joins outbound only starts its own
@@ -324,6 +333,7 @@ impl_audit_operation!(NodeBuildLimitsChangedAudit, "NODE_BUILD_LIMITS_CHANGED");
 impl_audit_operation!(NodeRemovalAudit, "NODE_REMOVAL");
 impl_audit_operation!(NodeDrainAudit, "NODE_DRAIN");
 impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");
+impl_audit_operation!(WireguardMeshDisabledAudit, "WIREGUARD_MESH_DISABLED");
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodeRejoinStartedAudit, "NODE_REJOIN_STARTED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
@@ -461,6 +471,8 @@ pub struct NodeResourcesChangedAudit {
     pub resource_policy: String,
     pub previous_system_reserved: temps_entities::node_resource_settings::SystemReserved,
     pub system_reserved: temps_entities::node_resource_settings::SystemReserved,
+    /// The reservation was put back to the default (`reset_system_reserved`).
+    pub system_reserved_reset: bool,
 }
 
 impl_audit_operation!(NodeResourcesChangedAudit, "NODE_RESOURCES_CHANGED");

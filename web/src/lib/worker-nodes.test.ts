@@ -406,6 +406,7 @@ describe('nodesAdvancedSection', () => {
   test('names the advanced card a hash links to', () => {
     expect(nodesAdvancedSection('#cluster-dns')).toBe('cluster-dns')
     expect(nodesAdvancedSection('cluster-trust')).toBe('cluster-trust')
+    expect(nodesAdvancedSection('#mesh-turn-off')).toBe('mesh-turn-off')
     expect(CLUSTER_DNS_URL).toBe('/settings/nodes#cluster-dns')
   })
 

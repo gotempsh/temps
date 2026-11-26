@@ -1427,7 +1427,7 @@ impl ServeCommand {
             );
         }
 
-        // ADR-114: private addresses the control plane serves itself, on its
+        // ADR-115: private addresses the control plane serves itself, on its
         // proxy's own listener, so only with the proxy in this process. The
         // loop is idle until the operator consents.
         let private_ingress = (self.role == ServeRole::All)

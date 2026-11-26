@@ -121,7 +121,7 @@ pub struct ProviderDeps<'a> {
 pub trait ProviderFactory: Send + Sync {
     fn info(&self) -> ProviderInfo;
 
-    /// What this provider's way in is like (ADR-116 D2): for `connector`
+    /// What this provider's way in is like (ADR-117 D2): for `connector`
     /// when there is one, else for a way in that needs no connector row
     /// (a Tailscale machine name).
     fn capabilities(&self, connector: Option<&ingress_connectors::Model>) -> Capabilities;
@@ -144,13 +144,13 @@ pub trait ProviderFactory: Send + Sync {
     }
 
     /// Its part of planning, for a provider that plans audiences whole
-    /// (ADR-116 D3).
+    /// (ADR-117 D3).
     fn plans(&self) -> Option<&dyn crate::reachability::plan::ProviderPlan> {
         None
     }
 
     /// This provider's part of a reachability run, over the live effects
-    /// (ADR-116 D3). `None` for a provider with no steps of its own.
+    /// (ADR-117 D3). `None` for a provider with no steps of its own.
     fn run<'a>(&self, _live: &'a LiveOps) -> Option<Box<dyn ProviderRun + 'a>> {
         None
     }
@@ -361,7 +361,7 @@ mod tests {
     }
 
     /// The headers nodes are told to trust are the ones the provider
-    /// declares for its origin (ADR-116 D4).
+    /// declares for its origin (ADR-117 D4).
     #[test]
     fn a_tunnel_spec_trusts_exactly_what_its_origin_declares() {
         let registry = ProviderRegistry::builtin();

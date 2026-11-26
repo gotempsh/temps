@@ -609,7 +609,7 @@ mod tests {
         let now = Utc::now();
         temps_entities::restore_runs::Model {
             id: 7,
-            source_backup_id: 3,
+            source_backup_id: Some(3),
             source_service_id: 11,
             target_service_id: None,
             target_service_name: target_name.map(str::to_string),

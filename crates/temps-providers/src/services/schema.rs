@@ -178,7 +178,21 @@ impl ExternalServiceManager {
             }
             _ => parameter_schema_for_service_type(service_type),
         };
-        Ok(schema.map(|schema| service_creation_schema(service_type, schema)))
+        let selection: HashMap<String, serde_json::Value> = backend
+            .map(str::trim)
+            .filter(|backend| !backend.is_empty())
+            .map(|backend| {
+                HashMap::from([(
+                    "backend".to_string(),
+                    serde_json::Value::String(backend.to_string()),
+                )])
+            })
+            .unwrap_or_default();
+        let strategy_key = Self::update_strategy_key(&service_type.to_string(), &selection);
+        Ok(schema.map(|mut schema| {
+            align_editable_with_update_rules(&mut schema, &strategy_key);
+            service_creation_schema(service_type, schema)
+        }))
     }
 
     /// Docker-free parameter-schema lookup for an existing service's stored
@@ -192,7 +206,41 @@ impl ExternalServiceManager {
             serde_json::to_value(parameters).map_err(|e| ExternalServiceError::InternalError {
                 reason: format!("Failed to inspect managed S3 backend parameters: {}", e),
             })?;
-        parameter_schema_for_parameters(service_type, &parameter_value)
+        let strategy_key = Self::update_strategy_key(&service_type.to_string(), parameters);
+        Ok(
+            parameter_schema_for_parameters(service_type, &parameter_value)?.map(|mut schema| {
+                align_editable_with_update_rules(&mut schema, &strategy_key);
+                schema
+            }),
+        )
+    }
+}
+
+/// Set each property's `x-editable` to whether `PUT /external-services/{id}`
+/// accepts a change to it, as decided by the engine's update strategy.
+///
+/// The engines annotate their schemas by hand, and those annotations drifted
+/// from the rules updates enforce (a PostgreSQL `password` was advertised as
+/// editable and then rejected). The strategy is what the update path
+/// enforces, so it is the one source of truth for both.
+pub(super) fn align_editable_with_update_rules(schema: &mut serde_json::Value, strategy_key: &str) {
+    let Some(strategy) = crate::parameter_strategies::get_strategy(strategy_key) else {
+        return;
+    };
+    let updateable = strategy.updateable_keys();
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for (name, property) in properties.iter_mut() {
+        if let Some(property) = property.as_object_mut() {
+            property.insert(
+                "x-editable".to_string(),
+                serde_json::Value::Bool(updateable.contains(&name.as_str())),
+            );
+        }
     }
 }
 
@@ -318,6 +366,71 @@ mod tests {
                 "{service_type} schema must keep the creation defaults: {schema}"
             );
         }
+    }
+
+    /// A client that trusts `x-editable` must never send a change the update
+    /// then rejects: every published flag matches what the engine's update
+    /// strategy accepts (a PostgreSQL `password` used to be advertised as
+    /// editable and then refused as read-only).
+    #[tokio::test]
+    async fn published_editable_flags_match_what_an_update_accepts() {
+        let manager = control_plane_manager();
+        let cases = [
+            (ServiceType::Postgres, None, "postgres"),
+            (ServiceType::Mariadb, None, "mariadb"),
+            (ServiceType::Mongodb, None, "mongodb"),
+            (ServiceType::Redis, None, "redis"),
+            (ServiceType::Kv, None, "kv"),
+            (ServiceType::S3, None, "s3"),
+            (ServiceType::S3, Some("garage"), "garage"),
+            (ServiceType::Blob, None, "blob"),
+            (ServiceType::Rustfs, None, "rustfs"),
+        ];
+        for (service_type, backend, strategy_key) in cases {
+            let schema = manager
+                .get_service_type_schema_for_backend(service_type, backend)
+                .await
+                .unwrap_or_else(|e| panic!("{service_type} schema: {e}"))
+                .unwrap_or_else(|| panic!("{service_type} must publish a schema"));
+            let strategy = crate::parameter_strategies::get_strategy(strategy_key)
+                .unwrap_or_else(|| panic!("{strategy_key} has an update strategy"));
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{service_type} schema has properties"));
+            let updateable = strategy.updateable_keys();
+            for (name, property) in properties {
+                let editable = property["x-editable"]
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("{service_type}.{name} has x-editable"));
+                assert_eq!(
+                    editable,
+                    updateable.contains(&name.as_str()),
+                    "{service_type} ({strategy_key}).{name}: x-editable must match the update rules"
+                );
+                if !editable {
+                    // A read-only field is refused on update whatever its
+                    // value, so advertising it as editable would be a lie.
+                    let change = HashMap::from([(name.clone(), serde_json::json!("changed"))]);
+                    assert!(
+                        strategy.validate_for_update(&change).is_err(),
+                        "{service_type} ({strategy_key}).{name} is read-only but an update accepts it"
+                    );
+                }
+            }
+        }
+
+        let postgres = manager
+            .get_service_type_schema(ServiceType::Postgres)
+            .await
+            .unwrap()
+            .unwrap();
+        for read_only in ["password", "database", "username", "host"] {
+            assert_eq!(
+                postgres["properties"][read_only]["x-editable"], false,
+                "postgres.{read_only}"
+            );
+        }
+        assert_eq!(postgres["properties"]["port"]["x-editable"], true);
     }
 
     /// The static dispatch must agree with the engine a provisioning request

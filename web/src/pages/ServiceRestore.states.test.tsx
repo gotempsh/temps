@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
+import { fireEvent, render, within } from '@testing-library/react'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { Link, MemoryRouter, Route, Routes } from 'react-router'
 import type { RestoreRunView } from '@/api/client/types.gen'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { ServiceRestore } from './ServiceRestore'
@@ -14,6 +17,7 @@ import {
   restoreRunQuery,
   restoreServiceQuery,
   restoreSourcesQuery,
+  restoreSourceBackupsQuery,
   serviceRestoreRunsQuery,
 } from './service-restore/restore-queries'
 import { toQueryError } from './service-restore/restore-state'
@@ -30,6 +34,9 @@ interface PageSeeds {
   service?: Seed
   capabilities?: Seed
   sources?: Seed
+  navigationHref?: string
+  trackedBackups?: Seed
+  scannedBackups?: Seed
   ownBackups?: Seed
   runs?: Seed
   run?: {
@@ -107,7 +114,7 @@ function urlParts(url: string) {
 const START_DISABLED =
   /<button[^>]*disabled=""[^>]*>(?:(?!<\/button>).)*Start restore/
 
-function renderPage(seeds: PageSeeds = {}) {
+function restorePage(seeds: PageSeeds) {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false, retryOnMount: false, staleTime: Infinity },
@@ -128,6 +135,16 @@ function renderPage(seeds: PageSeeds = {}) {
     restoreSourcesQuery().queryKey,
     seeds.sources ?? { data: sourceData }
   )
+  seed(
+    client,
+    restoreSourceBackupsQuery(1, true).queryKey,
+    seeds.scannedBackups
+  )
+  seed(
+    client,
+    restoreSourceBackupsQuery(1, false).queryKey,
+    seeds.trackedBackups
+  )
   seed(client, restoreOwnBackupsQuery(SERVICE_ID).queryKey, seeds.ownBackups)
   seed(
     client,
@@ -137,7 +154,7 @@ function renderPage(seeds: PageSeeds = {}) {
   if (seeds.run) {
     seed(client, restoreRunQuery(seeds.run.id).queryKey, seeds.run.seed)
   }
-  const markup = renderToStaticMarkup(
+  const page = (
     <QueryClientProvider client={client}>
       <MemoryRouter
         initialEntries={[
@@ -147,6 +164,12 @@ function renderPage(seeds: PageSeeds = {}) {
           },
         ]}
       >
+        {seeds.navigationHref && (
+          <>
+            <Link to={seeds.navigationHref}>Open snapshot</Link>
+            {seeds.url && <Link to={seeds.url}>Return to snapshot</Link>}
+          </>
+        )}
         <BreadcrumbProvider>
           <Routes>
             <Route path="/storage/:id/restore" element={<ServiceRestore />} />
@@ -155,9 +178,37 @@ function renderPage(seeds: PageSeeds = {}) {
       </MemoryRouter>
     </QueryClientProvider>
   )
+  return { page, client }
+}
+
+function renderPage(seeds: PageSeeds = {}) {
+  const { page, client } = restorePage(seeds)
+  const markup = renderToStaticMarkup(page)
   client.clear()
   return markup
 }
+
+const repository =
+  's3://backups-bucket/external_services/postgres/service-a/walg'
+const locations = ['base_0001', 'base_0002'].map(
+  (base) => `${repository}/basebackups_005/${base}_backup_stop_sentinel.json`
+)
+const scannedRows = (keys: string[]) => ({
+  data: {
+    scan_errors: [],
+    backups: keys.map((location, i) => ({
+      location,
+      source: 's3_scan',
+      id: 0,
+      backup_id: '',
+      engine: 'postgres',
+      format: 'walg',
+      state: 'completed',
+      origin_service_name: 'service-a',
+      created_at: `2026-01-0${i + 1}T00:00:00Z`,
+    })),
+  },
+})
 
 describe('service load errors (#1238)', () => {
   test('loading shows a skeleton, not a spinner', () => {
@@ -271,6 +322,63 @@ describe('capability and source errors (#1238)', () => {
     })
     expect(markup).toContain('This database has no backups yet.')
     expect(markup).not.toContain('Could not load storage sources')
+  })
+
+  test('a link to an S3-only backup shows its origin and any scan errors', () => {
+    const markup = renderPage({
+      url: `/storage/${SERVICE_ID}/restore?source=1&location=service-a/backup.sql.gz`,
+      scannedBackups: {
+        data: {
+          backups: [
+            {
+              source: 's3_scan',
+              id: 0,
+              backup_id: '',
+              engine: 'postgres',
+              name: 'service-a',
+              origin_service_name: 'service-a',
+              location: 'service-a/backup.sql.gz',
+              format: 'pg_dump',
+              state: 'completed',
+              created_at: '2026-01-02T03:00:00Z',
+            },
+          ],
+          scan_errors: ['Could not read WAL-G metadata'],
+        },
+      },
+    })
+    expect(markup).toContain(
+      'Also search the S3 bucket for backups made by other servers'
+    )
+    expect(markup).toContain('Found in S3')
+    expect(markup).toContain('Could not read WAL-G metadata')
+  })
+
+  test('selects exactly one imported WAL-G snapshot and blocks ambiguous repository paths', () => {
+    for (const location of locations) {
+      const markup = renderPage({
+        url: `/storage/${SERVICE_ID}/restore?source=1&location=${encodeURIComponent(location)}`,
+        scannedBackups: scannedRows(locations),
+      })
+      const radios =
+        markup.match(
+          /<button[^>]*role="radio"[^>]*aria-label="Restore backup[^>]*>/g
+        ) ?? []
+      expect(radios).toHaveLength(2)
+      expect(
+        radios.filter((tag) => tag.includes('aria-checked="true"'))
+      ).toHaveLength(1)
+      expect(
+        radios.find((tag) => tag.includes('aria-checked="true"'))
+      ).toContain(`value="s3:${location}"`)
+    }
+    const ambiguous = renderPage({
+      url: `/storage/${SERVICE_ID}/restore?source=1&location=${encodeURIComponent(repository)}`,
+      scannedBackups: scannedRows([repository, repository]),
+    })
+    expect(ambiguous).toContain('Update the destination Temps server')
+    expect(ambiguous).toMatch(START_DISABLED)
+    expect(ambiguous).not.toContain(`Selected: ${repository}`)
   })
 
   test('a genuinely empty source list onboards', () => {
@@ -437,5 +545,172 @@ describe('run tracking (#1237)', () => {
     })
     expect(failed).toContain('Restore failed')
     expect(failed).toContain('disk full')
+  })
+})
+
+describe('imported backup interaction', () => {
+  installBrowserWindow()
+
+  test('partial scans retain the selected orphan across storage source changes until a complete scan removes it', async () => {
+    let partial = true
+    const api = mockApi({
+      'GET /backups/s3-sources/1/backups': () =>
+        jsonResponse({
+          backups: [],
+          scan_errors: partial ? ['Could not list backups'] : [],
+          last_updated: '2026-01-01T00:00:00Z',
+        }),
+    })
+    const { page, client } = restorePage({
+      url: `/storage/${SERVICE_ID}/restore?source=1&location=${encodeURIComponent(locations[0])}`,
+      scannedBackups: scannedRows([locations[0]]),
+      sources: {
+        data: [...sourceData, { ...sourceData[0], id: 2, is_default: false }],
+      },
+      navigationHref: `?source=2&location=${encodeURIComponent(locations[1])}`,
+    })
+    seed(
+      client,
+      restoreSourceBackupsQuery(2, true).queryKey,
+      scannedRows([locations[1]])
+    )
+    const view = render(page)
+    try {
+      await view.findByText(`Selected: ${locations[0]}`)
+      fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+      await view.findByText('Previously discovered')
+      expect(view.getByText(`Selected: ${locations[0]}`)).toBeTruthy()
+      fireEvent.click(view.getByRole('link', { name: 'Open snapshot' }))
+      await view.findByText(`Selected: ${locations[1]}`)
+      expect(view.queryByText('Previously discovered')).toBeNull()
+      fireEvent.click(view.getByRole('link', { name: 'Return to snapshot' }))
+      await view.findByText(`Selected: ${locations[0]}`)
+      expect(view.getByText('Previously discovered')).toBeTruthy()
+      partial = false
+      fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+      await view.findByText('The linked backup is not on this source')
+      expect(view.queryByText('Previously discovered')).toBeNull()
+    } finally {
+      view.unmount()
+      client.clear()
+      api.restore()
+    }
+  })
+
+  test('navigating to an orphan link starts a scoped scan and keeps tracked rows visible until it finishes', async () => {
+    let finish: ((response: Response) => void) | undefined
+    const row = {
+      ...scannedRows(locations).data.backups[0],
+      source: 'db',
+      id: 18,
+      backup_id: 'backup-a',
+      origin_service_name: 'tracked-service',
+    }
+    const tracked = {
+      backups: [row],
+      scan_errors: [],
+      last_updated: row.created_at,
+    }
+    const api = mockApi({
+      'GET /backups/s3-sources/1/backups': (request) =>
+        new URL(request.url).searchParams.get('include_s3_scan') === 'true'
+          ? new Promise<Response>((resolve) => {
+              finish = resolve
+            })
+          : jsonResponse(tracked),
+    })
+    const { page, client } = restorePage({
+      trackedBackups: { data: tracked },
+      navigationHref: `?source=1&location=${encodeURIComponent(locations[1])}`,
+    })
+    const view = render(page)
+    try {
+      const checkbox = view.getByLabelText(
+        'Also search the S3 bucket for backups made by other servers'
+      )
+      expect(checkbox.getAttribute('aria-checked')).toBe('false')
+      fireEvent.click(view.getByRole('link', { name: 'Open snapshot' }))
+      await view.findByText('Searching the S3 bucket…')
+      expect(checkbox.getAttribute('aria-checked')).toBe('true')
+      expect(view.getByText('tracked-service')).toBeTruthy()
+      expect(
+        view.queryByText('The linked backup is not on this source')
+      ).toBeNull()
+      if (!finish) throw new Error('Expected a pending bucket scan')
+      finish(
+        jsonResponse({
+          ...tracked,
+          backups: [row, ...scannedRows([locations[1]]).data.backups],
+        })
+      )
+      await view.findByText(`Selected: ${locations[1]}`)
+      fireEvent.click(checkbox)
+      expect(checkbox.getAttribute('aria-checked')).toBe('false')
+      expect(view.queryByText(`Selected: ${locations[1]}`)).toBeNull()
+    } finally {
+      view.unmount()
+      client.clear()
+      api.restore()
+    }
+  })
+
+  test('previews and starts only the selected snapshot, and keeps failure details on screen', async () => {
+    const previews: string[] = []
+    const starts: string[] = []
+    const detail =
+      'Re-enter this S3 source’s credentials on the destination server.'
+    const api = mockApi({
+      'GET /external-services/7/restore-runs': () => jsonResponse([]),
+      'POST /external-services/7/restore-plan': async (request) => {
+        previews.push((await request.json()).backup_location)
+        if (previews.length === 1)
+          return jsonResponse({ title: 'Preview failed', detail }, 500)
+        return jsonResponse({
+          strategy: 'walg_restore',
+          destructive: false,
+          cross_service: true,
+          target_service: { container: 'service-b' },
+          source_backup: { location_was_resolved: false },
+          errors: [],
+          warnings: [],
+          steps: [],
+        })
+      },
+      'POST /external-services/7/restore': async (request) => {
+        starts.push((await request.json()).backup_location)
+        return jsonResponse(
+          {
+            title: 'Internal Server Error',
+            detail: 'The restore operation could not be completed',
+          },
+          500
+        )
+      },
+    })
+    const { page, client } = restorePage({
+      url: `/storage/7/restore?source=1&mode=new_service&location=${encodeURIComponent(locations[0])}`,
+      scannedBackups: scannedRows(locations),
+    })
+    const view = render(page)
+    try {
+      expect(await view.findByText(detail)).toBeTruthy()
+      fireEvent.click(view.getByRole('button', { name: 'Retry preview' }))
+      await view.findByText('walg_restore')
+      const group = within(
+        view.getByRole('radiogroup', { name: 'Backup to restore' })
+      )
+      fireEvent.click(group.getByRole('radio', { checked: false }))
+      await view.findByText(`Selected: ${locations[1]}`)
+      await view.findByText('walg_restore')
+      expect(group.getAllByRole('radio', { checked: true })).toHaveLength(1)
+      expect(previews).toEqual([locations[0], locations[0], locations[1]])
+      fireEvent.click(view.getByRole('button', { name: 'Start restore' }))
+      expect(await view.findByText(/Check the restore history/)).toBeTruthy()
+      expect(starts).toEqual([locations[1]])
+    } finally {
+      view.unmount()
+      client.clear()
+      api.restore()
+    }
   })
 })

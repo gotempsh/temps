@@ -1130,3 +1130,87 @@ fn an_exact_bundled_price_beats_a_providers_catalog_price_for_its_parent() {
         .base;
     assert_eq!((snapshot.input, snapshot.output), (2.5, 15.0));
 }
+
+fn anthropic_price(model: &str, input: f64, output: f64) -> CatalogPrice {
+    CatalogPrice {
+        provider: "anthropic".into(),
+        ..catalog_price(model, input, output)
+    }
+}
+
+/// The price list with `prices` applied, built without installing them in
+/// the process-wide table other tests read.
+fn listed_with(prices: &[CatalogPrice], provider: &str, model: &str) -> ModelPricing {
+    pricing_list(&rate_table().with_catalog(prices))
+        .into_iter()
+        .find(|row| row.provider == provider && row.model == model)
+        .unwrap_or_else(|| panic!("{provider} {model} is listed"))
+}
+
+#[test]
+fn an_unchanged_catalog_price_keeps_the_published_batch_rates() {
+    let bundled = listed_with(&[], "anthropic", "claude-haiku-5-5");
+    assert!(bundled.batch_input_per_million.is_some());
+
+    // The published catalog repeats the bundled base prices and carries no
+    // batch fields: the batch rates still hold.
+    let refreshed = listed_with(
+        &[anthropic_price(
+            "claude-haiku-5-5",
+            bundled.input_per_million,
+            bundled.output_per_million,
+        )],
+        "anthropic",
+        "claude-haiku-5-5",
+    );
+    assert_eq!(refreshed.source, PriceSource::Catalog);
+    assert_eq!(
+        refreshed.batch_input_per_million,
+        bundled.batch_input_per_million
+    );
+    assert_eq!(
+        refreshed.batch_output_per_million,
+        bundled.batch_output_per_million
+    );
+    assert_eq!(
+        refreshed.cache_hit_per_million,
+        bundled.cache_hit_per_million
+    );
+    assert_eq!(
+        refreshed.cache_write_1h_per_million,
+        bundled.cache_write_1h_per_million
+    );
+
+    // A changed base price: the batch discount it implied is unknown.
+    let changed = listed_with(
+        &[anthropic_price(
+            "claude-haiku-5-5",
+            bundled.input_per_million * 2.0,
+            bundled.output_per_million * 2.0,
+        )],
+        "anthropic",
+        "claude-haiku-5-5",
+    );
+    assert_eq!(changed.batch_input_per_million, None);
+    assert_eq!(changed.batch_output_per_million, None);
+}
+
+#[test]
+fn the_price_list_reports_the_cache_rates_estimates_charge() {
+    // Sonnet 4.6 is bundled at $3 input, $0.30 cache read, $3.75 / $6 cache
+    // writes. A catalog doubles the input price and omits cache prices.
+    let prices = [anthropic_price("claude-sonnet-4-6", 6.0, 30.0)];
+    let row = listed_with(&prices, "anthropic", "claude-sonnet-4-6");
+    assert_eq!(row.cache_hit_per_million, Some(0.6));
+    assert_eq!(row.cache_write_5m_per_million, Some(7.5));
+    assert_eq!(row.cache_write_1h_per_million, Some(12.0));
+
+    // ...which are exactly the rates a cached read and a cache write are
+    // billed at.
+    let rates = rate_table()
+        .with_catalog(&prices)
+        .rates_for("anthropic", "claude-sonnet-4-6")
+        .expect("priced");
+    assert_eq!(Some(rates.base.cache_read), row.cache_hit_per_million);
+    assert_eq!(Some(rates.base.cache_write), row.cache_write_1h_per_million);
+}

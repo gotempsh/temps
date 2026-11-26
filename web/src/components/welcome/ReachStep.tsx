@@ -83,7 +83,7 @@ export function ReachStep({
       }
       const provider = dnsProviderFor(choice)
       if (provider && facts.privateNetwork) {
-        // ADR-114: the record and the certificate need the provider, and
+        // ADR-115: the record and the certificate need the provider, and
         // this machine serves the apps only on its private network.
         requireDeliveryData(await createDnsProvider({ body: provider }))
         await putPrivateIngress({

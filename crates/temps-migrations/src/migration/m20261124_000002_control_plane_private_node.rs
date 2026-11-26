@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Let the control plane (node `0`) serve private addresses (ADR-114 D1).
+//! Let the control plane (node `0`) serve private addresses (ADR-115 D1).
 //!
 //! `environment_domains.private_node_id`, `project_custom_domains.private_node_id`
 //! and `node_public_ingress.node_id` referenced `nodes(id)`, and the control

@@ -20,6 +20,7 @@
 
 use super::*;
 use crate::S3Credentials;
+use temps_providers_core::externalsvc::walg_fetch::WalgFetchSelector;
 
 /// The data directory: the root of the service's volume.
 const DATADIR: &str = "/var/lib/mysql";
@@ -442,14 +443,8 @@ impl MariaDbService {
         if s3_credentials.uses_path_style() {
             env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
-        if let Some(target_user_data) = target_user_data {
-            env.push(format!("WALG_FETCH_TARGET_USER_DATA={target_user_data}"));
-        }
-        let fetch_target = if target_user_data.is_some() {
-            "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
-        } else {
-            "LATEST"
-        };
+        let (fetch_target, fetch_env) = walg_fetch_selection(target_user_data);
+        env.extend(fetch_env);
 
         self.set_restart_policy(&container, Self::no_restart())
             .await?;
@@ -915,9 +910,44 @@ impl MariaDbService {
     }
 }
 
+/// The `wal-g backup-fetch` argument for a MariaDB base, and the environment
+/// entry it reads. MariaDB never names a base, so this selects by the backup's
+/// user data, or the latest. The user data travels under the same name the
+/// PostgreSQL restores use, never `WALG_FETCH_TARGET_USER_DATA`, which WAL-G
+/// reads as its own setting and would combine with any named backup.
+fn walg_fetch_selection(target_user_data: Option<&str>) -> (String, Option<String>) {
+    let selector = WalgFetchSelector::new(None, target_user_data);
+    (selector.fetch_argument(), selector.env_entry())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fetch reads the backup's user data from the shared, non-`WALG_`
+    /// variable, and the shell expands the argument to exactly that value.
+    #[cfg(unix)]
+    #[test]
+    fn walg_fetch_reads_user_data_from_a_variable_walg_does_not_own() {
+        let user_data = r#"{"temps_backup_id":"backup-a"}"#;
+        let (argument, entry) = walg_fetch_selection(Some(user_data));
+        let entry = entry.expect("user data is passed in the environment");
+        let (name, value) = entry.split_once('=').expect("NAME=value");
+        assert!(!name.starts_with("WALG_"), "{name} is a WAL-G setting");
+        assert_eq!(value, user_data);
+        let expanded = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -- {argument}; printf '%s|%s' \"$1\" \"$2\""))
+            .env(name, value)
+            .output()
+            .expect("run sh");
+        assert_eq!(
+            String::from_utf8_lossy(&expanded.stdout),
+            format!("--target-user-data|{user_data}")
+        );
+
+        assert_eq!(walg_fetch_selection(None), ("LATEST".to_string(), None));
+    }
 
     /// A gate that refuses the write phase, as a node's deadline does once
     /// it expired before the restore began writing.

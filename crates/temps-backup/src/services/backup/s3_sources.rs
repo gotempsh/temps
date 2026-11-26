@@ -158,16 +158,30 @@ impl BackupService {
         self.verify_s3_destination(&request, crate::services::s3_probe::MissingBucket::Create)
             .await?;
 
-        // First source is automatically default; subsequent sources require an explicit
-        // set-default call. An explicit `is_default: true` in the request is honored and
-        // will swap default atomically.
+        self.persist_verified_s3_source(request).await
+    }
+
+    /// Insert a source whose destination was already verified, deciding
+    /// whether it becomes the default.
+    ///
+    /// The first source is automatically the default; later ones only when
+    /// the request says so, which moves the default atomically. The decision
+    /// and the insert run under [`lock_default_source_assignment`], so two
+    /// sources created at the same time on an empty server cannot both
+    /// decide to be the first (the second would then hit the single-default
+    /// index and fail).
+    pub(crate) async fn persist_verified_s3_source(
+        &self,
+        request: CreateS3SourceRequest,
+    ) -> Result<temps_entities::s3_sources::Model, BackupError> {
+        let txn = self.db.begin().await?;
+        lock_default_source_assignment(&txn).await?;
+
         let existing_count = temps_entities::s3_sources::Entity::find()
-            .count(self.db.as_ref())
+            .count(&txn)
             .await?;
         let explicit_default = request.is_default.unwrap_or(false);
         let should_be_default = existing_count == 0 || explicit_default;
-
-        let txn = self.db.begin().await?;
 
         if should_be_default && existing_count > 0 {
             // Clear existing default before inserting new default
@@ -209,8 +223,18 @@ impl BackupService {
             request.backing_service_id,
         )
         .await
-        .map_err(|error| BackupError::Internal {
-            message: format!("Failed to create S3 source '{}': {}", request.name, error),
+        .map_err(|error| match error {
+            // The lock above serializes every writer of the default, so this
+            // only fires if a writer that bypasses it races us. Still a
+            // conflict the client can retry, not a server fault.
+            temps_entities::s3_sources::S3SourceCredentialError::Database {
+                ref source, ..
+            } if is_single_default_violation(source) => BackupError::DefaultSourceConflict {
+                name: request.name.clone(),
+            },
+            other => BackupError::Internal {
+                message: format!("Failed to create S3 source '{}': {}", request.name, other),
+            },
         })?;
         // ADR-102: `scoped` is the column's default; only the operator's
         // explicit choice widens it, in the same transaction.
@@ -302,10 +326,17 @@ impl BackupService {
         &self,
         id: i32,
     ) -> Result<temps_entities::s3_sources::Model, BackupError> {
-        // Verify target exists
-        self.get_s3_source(id).await?;
-
         let txn = self.db.begin().await?;
+        lock_default_source_assignment(&txn).await?;
+        // Checked under the lock: a source deleted in the meantime must not
+        // leave the install with the old default cleared and no new one.
+        if temps_entities::s3_sources::Entity::find_by_id(id)
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            return Err(s3_source_not_found(id));
+        }
 
         temps_entities::s3_sources::Entity::update_many()
             .col_expr(
@@ -330,9 +361,14 @@ impl BackupService {
             .exec(&txn)
             .await?;
 
+        // Read back in the same transaction: after the commit, a concurrent
+        // delete or set-default could already have changed the row.
+        let updated = temps_entities::s3_sources::Entity::find_by_id(id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| s3_source_not_found(id))?;
         txn.commit().await?;
 
-        let updated = self.get_s3_source(id).await?;
         info!("S3 source {} is now the default", updated.name);
         Ok(updated)
     }
@@ -353,15 +389,10 @@ impl BackupService {
         &self,
         id: i32,
     ) -> Result<temps_entities::s3_sources::Model, BackupError> {
-        let source = temps_entities::s3_sources::Entity::find_by_id(id)
+        temps_entities::s3_sources::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| BackupError::NotFound {
-                resource: "S3Source".to_string(),
-                detail: "S3 source not found".to_string(),
-            })?;
-
-        Ok(source)
+            .ok_or_else(|| s3_source_not_found(id))
     }
 
     /// Resolve every managed service that can be identified as the provider
@@ -434,8 +465,18 @@ impl BackupService {
         Ok(service_ids)
     }
 
-    /// Delete an S3 source
-    pub async fn delete_s3_source(&self, id: i32) -> Result<bool, BackupError> {
+    /// Delete an S3 source.
+    ///
+    /// Deleting the default source while others exist moves the default to
+    /// the oldest remaining source, in the same transaction, and returns it
+    /// in [`S3SourceDeletion::promoted_default`]. Refusing instead blocked
+    /// declarative clients that delete several sources at once, and leaving
+    /// no default would make every later "use the default destination"
+    /// operation (automatic schedules for new services, pre-upgrade backups)
+    /// fail until an operator noticed. The default was itself chosen
+    /// implicitly when the first source was created, so the same rule picks
+    /// the next one.
+    pub async fn delete_s3_source(&self, id: i32) -> Result<S3SourceDeletion, BackupError> {
         // First check if source exists and is not in use
         let source = self.get_s3_source(id).await?;
 
@@ -451,25 +492,24 @@ impl BackupService {
             )));
         }
 
-        // Refuse to delete the default source while other sources exist. The caller
-        // should set a different source as default first.
-        if source.is_default {
-            let other_count = temps_entities::s3_sources::Entity::find()
-                .filter(temps_entities::s3_sources::Column::Id.ne(id))
-                .count(self.db.as_ref())
-                .await?;
-            if other_count > 0 {
-                return Err(BackupError::Validation(format!(
-                    "S3 source '{}' is the default. Set a different source as default before deleting.",
-                    source.name
-                )));
-            }
-        }
+        // Check, delete and, when it was the default, hand the default on, as
+        // one write under the same lock every default change takes. The
+        // source row is locked first: inserting a backup or a schedule that
+        // references it must take a key-share lock on that row, so none can
+        // commit between the reference checks below and the delete (one that
+        // did would be removed by the `ON DELETE CASCADE` on `backups`).
+        let txn = self.db.begin().await?;
+        lock_default_source_assignment(&txn).await?;
+        let current = temps_entities::s3_sources::Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| s3_source_not_found(id))?;
 
         // Refuse to delete if any backup schedule still references this source.
         let schedule_count = temps_entities::backup_schedules::Entity::find()
             .filter(temps_entities::backup_schedules::Column::S3SourceId.eq(id))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await?;
         if schedule_count > 0 {
             return Err(BackupError::Validation(format!(
@@ -485,7 +525,7 @@ impl BackupService {
         // of leaking a database foreign-key violation as HTTP 500.
         let backup_count = temps_entities::backups::Entity::find()
             .filter(temps_entities::backups::Column::S3SourceId.eq(id))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await?;
         if backup_count > 0 {
             return Err(BackupError::Validation(format!(
@@ -494,12 +534,57 @@ impl BackupService {
             )));
         }
 
+        // `is_default` as of the lock: a concurrent set-default may have moved
+        // it since the read above.
+        let was_default = current.is_default;
         let result = temps_entities::s3_sources::Entity::delete_by_id(id)
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await?;
+        let promoted_default = if was_default && result.rows_affected > 0 {
+            let next = temps_entities::s3_sources::Entity::find()
+                .order_by_asc(temps_entities::s3_sources::Column::Id)
+                .one(&txn)
+                .await?;
+            match next {
+                Some(next) => {
+                    temps_entities::s3_sources::Entity::update_many()
+                        .col_expr(
+                            temps_entities::s3_sources::Column::IsDefault,
+                            sea_orm::sea_query::Expr::value(true),
+                        )
+                        .col_expr(
+                            temps_entities::s3_sources::Column::UpdatedAt,
+                            sea_orm::sea_query::Expr::value(Utc::now()),
+                        )
+                        .filter(temps_entities::s3_sources::Column::Id.eq(next.id))
+                        .exec(&txn)
+                        .await?;
+                    Some(PromotedDefaultSource {
+                        id: next.id,
+                        name: next.name,
+                    })
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        txn.commit().await?;
 
-        debug!("Deleted S3 source: {}", source.name);
-        Ok(result.rows_affected > 0)
+        match &promoted_default {
+            Some(next) => info!(
+                deleted_source_id = id,
+                promoted_source_id = next.id,
+                "Deleted default S3 source '{}'; '{}' is now the default",
+                source.name,
+                next.name
+            ),
+            None => debug!("Deleted S3 source: {}", source.name),
+        }
+        Ok(S3SourceDeletion {
+            deleted: result.rows_affected > 0,
+            promoted_default,
+        })
     }
 
     /// Resolve an optional `s3_source_id` into a concrete ID. If `Some`, returns it
@@ -716,6 +801,60 @@ impl BackupService {
         let updated = active.update(self.db.as_ref()).await?;
         Ok(updated)
     }
+}
+
+/// What deleting an S3 source did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3SourceDeletion {
+    /// A row was removed (false only if another request deleted it first).
+    pub deleted: bool,
+    /// The source that became the default because the deleted one was it.
+    pub promoted_default: Option<PromotedDefaultSource>,
+}
+
+/// A source made the default because the previous default was deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedDefaultSource {
+    pub id: i32,
+    pub name: String,
+}
+
+/// Name of the unique index that allows at most one default source.
+const SINGLE_DEFAULT_INDEX: &str = "idx_s3_sources_single_default";
+
+/// Serialize every change to which source is the default (create, set
+/// default, delete) for the rest of `txn`. Each of them reads the current
+/// state and then writes based on it; without this, two writers both read
+/// "no default yet" and the second fails on the single-default index.
+/// The error every S3 source lookup returns for an ID that does not exist.
+fn s3_source_not_found(id: i32) -> BackupError {
+    BackupError::NotFound {
+        resource: "S3Source".to_string(),
+        detail: format!("S3 source {id} not found"),
+    }
+}
+
+async fn lock_default_source_assignment(
+    txn: &sea_orm::DatabaseTransaction,
+) -> Result<(), BackupError> {
+    sea_orm::ConnectionTrait::execute(
+        txn,
+        sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtext('temps.s3_sources.default'))",
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Whether `error` is the single-default unique index rejecting a write.
+fn is_single_default_violation(error: &sea_orm::DbErr) -> bool {
+    matches!(
+        error.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(ref message))
+            if message.contains(SINGLE_DEFAULT_INDEX)
+    )
 }
 
 /// The endpoint a create/update request stores: with its scheme spelled out,

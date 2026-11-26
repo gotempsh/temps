@@ -204,7 +204,7 @@ pub struct ReachabilityService {
     /// Environments with a run in progress: one at a time each.
     active: Arc<Mutex<HashSet<i32>>>,
     timing: Timing,
-    /// The providers whose steps runs hand over (ADR-116 D3).
+    /// The providers whose steps runs hand over (ADR-117 D3).
     providers: ProviderRegistry,
 }
 
@@ -438,7 +438,7 @@ impl ReachabilityService {
         })
     }
 
-    /// Node 0 as a private worker (ADR-114 D6), when the operator lets the
+    /// Node 0 as a private worker (ADR-115 D6), when the operator lets the
     /// control plane serve private addresses.
     async fn control_plane_private_fact(
         &self,
@@ -1436,7 +1436,7 @@ impl ReachabilityService {
             String::new()
         };
         let served_by_workers = attached_here.iter().any(|a| served.contains(a));
-        // ADR-114 D6: what the control plane runs, node 0 serves privately,
+        // ADR-115 D6: what the control plane runs, node 0 serves privately,
         // once the operator allowed it; no worker can.
         let mut private_workers = private_workers;
         if audience.is_private() && gathered.deployed && !served_by_workers {
@@ -3118,7 +3118,7 @@ impl RunSink for DbSink {
 
 /// The run's steps against the real services.
 /// What a reachability run does for real. Providers' own effects are
-/// implemented on it in their modules (ADR-116 D3).
+/// implemented on it in their modules (ADR-117 D3).
 pub struct LiveOps {
     pub(crate) deps: Arc<ReachabilityDeps>,
     pub(crate) http: reqwest::Client,
@@ -4065,11 +4065,11 @@ fn set_address_audience_on(
 /// How plans and statuses name the control plane serving a private address.
 pub const CONTROL_PLANE_PRIVATE_NAME: &str = "this machine";
 
-/// The CLI form of the control plane's consent (ADR-114 D2).
+/// The CLI form of the control plane's consent (ADR-115 D2).
 pub const CONTROL_PLANE_PRIVATE_COMMAND: &str =
     "bunx @temps-sdk/cli ingress private --listen <this machine's private address, or tailscale>";
 
-/// Node 0 as a private worker (ADR-114 D6), from the consent and row 0.
+/// Node 0 as a private worker (ADR-115 D6), from the consent and row 0.
 /// `None` without consent. With consent and no row yet, the loop has not
 /// applied it, or none runs in this process.
 pub fn control_plane_private_fact(
@@ -4162,7 +4162,7 @@ pub fn private_facts_of(
         .filter(|e| !e.trim().is_empty())
         .map(str::to_string);
     let bound = match (node, row) {
-        // ADR-114 D6: the control plane has no `nodes` row; its row 0 is
+        // ADR-115 D6: the control plane has no `nodes` row; its row 0 is
         // there only while the operator lets it serve private addresses.
         (_, None) if control_plane => Err(format!(
             "This machine no longer serves private addresses. Serve them again from this \

@@ -178,7 +178,7 @@ pub struct PrivateWorkerFact {
     pub tailscale: bool,
     /// Why the listener is not running, as the worker reported it.
     pub error: Option<String>,
-    /// The ranges the listener admits (ADR-114 D8), `10.8.0.0/24`; `None`
+    /// The ranges the listener admits (ADR-115 D8), `10.8.0.0/24`; `None`
     /// from agents that predate it.
     pub admit: Option<String>,
 }
@@ -262,7 +262,7 @@ pub struct PlanFacts {
     /// Custom domains of every other environment.
     pub taken_elsewhere: HashSet<String>,
     /// The console's host and the public ingress host: never an app's
-    /// address (ADR-114 D5), whatever its audience.
+    /// address (ADR-115 D5), whatever its audience.
     pub platform_hosts: Vec<String>,
     pub tunnels: Vec<TunnelFact>,
     pub zones: Vec<ZoneFact>,
@@ -1328,7 +1328,7 @@ pub fn choice(facts: &PlanFacts, providers: &ProviderRegistry) -> AudienceChoice
     }
 }
 
-/// A provider's part of planning (ADR-116 D3): the audiences it plans
+/// A provider's part of planning (ADR-117 D3): the audiences it plans
 /// whole, for the ways in only it offers there. The first registered
 /// provider that plans an audience plans it; offering two providers' ways
 /// in side by side arrives with the second provider that needs it.
@@ -1372,7 +1372,7 @@ pub fn plan(facts: &PlanFacts, providers: &ProviderRegistry) -> ReachabilityPlan
     {
         return empty(facts.audience, facts.requested.clone(), None, blocked);
     }
-    // An audience a provider plans whole (ADR-116 D3).
+    // An audience a provider plans whole (ADR-117 D3).
     if let Some(planner) = providers.planner(facts.audience) {
         return planner.plan(facts);
     }
@@ -2570,7 +2570,7 @@ pub(crate) fn plan_listener(
     let block = |reason: String, action: Option<ReachAction>| PlanBlocked { reason, action };
     let shown = address.clone().unwrap_or_else(|| "the address".to_string());
 
-    // ADR-114 D6: what the control plane runs, this machine serves, once
+    // ADR-115 D6: what the control plane runs, this machine serves, once
     // the operator lets it.
     let on_control_plane = facts.deployed && !facts.served_by_workers;
     if on_control_plane && facts.private_workers.is_empty() {
@@ -4464,7 +4464,7 @@ mod tests {
         assert!(plan_of(&taken).options.is_empty());
 
         // Where the environment runs on the control plane and the operator
-        // has not let it serve privately (ADR-114 D2), the plan asks for that
+        // has not let it serve privately (ADR-115 D2), the plan asks for that
         // consent, in one click or one command.
         let on_cp = plan_of(&PlanFacts {
             served_by_workers: false,
@@ -4509,7 +4509,7 @@ mod tests {
         }
     }
 
-    /// ADR-114 D5: the console's own host is never planned as an app's.
+    /// ADR-115 D5: the console's own host is never planned as an app's.
     #[test]
     fn the_console_host_is_never_an_apps_address() {
         for audience in [Audience::Private, Audience::Public] {
@@ -4530,7 +4530,7 @@ mod tests {
         }
     }
 
-    /// ADR-114 D6: an environment on the control plane is served privately
+    /// ADR-115 D6: an environment on the control plane is served privately
     /// by this machine, through the same DNS-01 plan as a worker's.
     #[test]
     fn the_control_plane_serves_privately_what_it_runs() {
@@ -4573,7 +4573,7 @@ mod tests {
         );
         assert!(blocked.action.is_none());
 
-        // ADR-114 D7: chosen tailnet users are not served from here yet.
+        // ADR-115 D7: chosen tailnet users are not served from here yet.
         let users = plan_of(&PlanFacts {
             audience: Audience::TailnetUsers,
             principals: vec![
@@ -4866,7 +4866,7 @@ mod tests {
         }
     }
 
-    /// ADR-116 D3: an audience no provider plans is the engine's. Private
+    /// ADR-117 D3: an audience no provider plans is the engine's. Private
     /// addresses still get a worker's own listener, never a tailnet way in;
     /// anything else private is not offered.
     #[test]

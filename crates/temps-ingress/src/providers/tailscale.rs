@@ -1093,7 +1093,7 @@ impl TailscaleFactory {
     }
 }
 
-/// What every Tailscale way in is (ADR-116 D2), a machine name or a
+/// What every Tailscale way in is (ADR-117 D2), a machine name or a
 /// Service: only the tailnet reaches it, through the per-address Serve socket
 /// (ADR 065 D3) where tailscaled's identity headers are trusted, under the
 /// tailnet's own `*.ts.net` names.

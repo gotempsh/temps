@@ -356,12 +356,33 @@ impl GitProviderManager {
 
     /// Validate and refresh connection token if needed
     /// Returns the valid access token
+    ///
+    /// A GitHub App installation token minted while the connection's grant was
+    /// replaced (a PAT took over, a reauthorization) is dropped, and the
+    /// connection's current credentials are read again once: the replacement
+    /// stands, and the caller gets the token it now holds.
     pub async fn validate_and_refresh_connection_token(
         &self,
         connection_id: i32,
     ) -> Result<String, GitProviderManagerError> {
+        match self.current_connection_token(connection_id).await {
+            Err(GitProviderManagerError::ConnectionGrantReplaced { .. }) => {
+                warn!(
+                    connection_id,
+                    "Connection credentials were replaced while an installation token was minted; using the current credentials"
+                );
+                self.current_connection_token(connection_id).await
+            }
+            other => other,
+        }
+    }
+
+    /// One pass of [`Self::validate_and_refresh_connection_token`].
+    async fn current_connection_token(
+        &self,
+        connection_id: i32,
+    ) -> Result<String, GitProviderManagerError> {
         use chrono::Utc;
-        use sea_orm::{ActiveModelTrait, Set};
 
         let connection = self.get_connection(connection_id).await?;
         Self::ensure_refresh_not_blocked(&connection)?;
@@ -403,15 +424,17 @@ impl GitProviderManager {
                     .await
                     .map(|(token, _)| token)?;
 
-                // Save the new token
-                let encrypted_access_token = self.encrypt_string(&new_access_token).await?;
-                let mut active_connection: git_provider_connections::ActiveModel =
-                    connection.into();
-                active_connection.access_token = Set(Some(encrypted_access_token));
-                active_connection.token_expires_at =
-                    Set(Some(Utc::now() + chrono::Duration::hours(1)));
-                active_connection.updated_at = Set(Utc::now());
-                active_connection.update(self.db.as_ref()).await?;
+                // Save the new token, unless the grant it was minted for was
+                // replaced meanwhile: that write matches no row and returns
+                // `ConnectionGrantReplaced`, so a replacement PAT is never
+                // overwritten by an hour-long installation token.
+                self.update_connection_tokens(
+                    &connection,
+                    new_access_token.clone(),
+                    None,
+                    Some(Utc::now() + chrono::Duration::hours(1)),
+                )
+                .await?;
 
                 Ok(new_access_token)
             }
@@ -564,6 +587,63 @@ impl GitProviderManager {
             "Connection {} is not backed by a GitHub App installation; PAT/OAuth connections cannot mint scoped per-op tokens",
             connection_id
         )))
+    }
+
+    /// Mint a single-repo, narrow-permission credential for the grant
+    /// `connection` was read under, the grant the caller authorized.
+    ///
+    /// Unlike [`Self::mint_scoped_repo_token_for_connection`] this does not
+    /// reread the row before minting, and it rereads it afterwards: if the
+    /// grant was replaced meanwhile (a PAT replacing the installation, a
+    /// reauthorization), the result is
+    /// [`GitProviderManagerError::ConnectionGrantReplaced`], whether the mint
+    /// succeeded or not, so a token for the old installation is never handed
+    /// out and the caller can start again from the current row. A mint that
+    /// fails under an unchanged grant returns the provider's error.
+    pub async fn mint_scoped_repo_token_for_grant(
+        &self,
+        connection: &git_provider_connections::Model,
+        owner: &str,
+        repo: &str,
+        operation: crate::services::git_provider::ScopedTokenOp,
+    ) -> Result<crate::services::git_provider::ScopedTokenGrant, GitProviderManagerError> {
+        let Some(installation_id) = connection.installation_id.as_deref() else {
+            return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                "Connection {} is not backed by a GitHub App installation; PAT/OAuth connections cannot mint scoped per-op tokens",
+                connection.id
+            )));
+        };
+        let minted = match self.get_provider_service(connection.provider_id).await {
+            Ok(provider_service) => provider_service
+                .mint_scoped_repo_token(Some(installation_id), owner, repo, operation)
+                .await
+                .map_err(GitProviderManagerError::from),
+            Err(error) => Err(error),
+        };
+        self.keep_minted_token_for_grant(connection, minted).await
+    }
+
+    /// Return `minted` only if `connection`'s grant is still the stored one.
+    async fn keep_minted_token_for_grant<T>(
+        &self,
+        connection: &git_provider_connections::Model,
+        minted: Result<T, GitProviderManagerError>,
+    ) -> Result<T, GitProviderManagerError> {
+        let current = self.get_connection(connection.id).await?;
+        if current.credential_generation != connection.credential_generation
+            || current.provider_id != connection.provider_id
+            || current.installation_id != connection.installation_id
+        {
+            tracing::warn!(
+                connection_id = connection.id,
+                minted = minted.is_ok(),
+                "git connection grant changed while a scoped token was minted; dropping the result"
+            );
+            return Err(GitProviderManagerError::ConnectionGrantReplaced {
+                connection_id: connection.id,
+            });
+        }
+        minted
     }
 
     /// Get decrypted webhook secret for a provider
@@ -1400,5 +1480,311 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert!(!error.to_string().contains(raw_token));
+    }
+
+    /// A manager whose provider 7 is a GitHub App, answering from `results`.
+    /// The installation token is minted by a stand-in provider service, which
+    /// hands back an empty token without any network call.
+    fn github_app_manager(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+    ) -> GitProviderManager {
+        GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
+        )
+    }
+
+    fn github_app_provider() -> git_providers::Model {
+        use crate::services::git_provider::AuthMethod;
+        let mut provider = github_provider_fixture();
+        provider.auth_method = "github_app".to_string();
+        provider.auth_config = serde_json::to_value(AuthMethod::GitHubApp {
+            app_id: 1,
+            client_id: "example-client".to_string(),
+            client_secret: "example-secret".to_string(),
+            private_key: "unused".to_string(),
+            webhook_secret: "unused".to_string(),
+        })
+        .expect("auth method should serialize");
+        provider
+    }
+
+    fn installation_connection() -> git_provider_connections::Model {
+        let mut connection = connection_fixture(11, None);
+        connection.installation_id = Some("12345".to_string());
+        connection
+    }
+
+    async fn use_stand_in_minter(manager: &GitProviderManager) {
+        use crate::services::generic_provider::GenericProvider;
+        use crate::services::git_provider::{AuthMethod, GitProviderService};
+        let minter: Arc<dyn GitProviderService> = Arc::new(GenericProvider::new(
+            None,
+            AuthMethod::PersonalAccessToken {
+                token: "unused".to_string(),
+            },
+        ));
+        manager.providers_cache.write().await.insert(7, minter);
+    }
+
+    #[tokio::test]
+    async fn a_minted_installation_token_is_stored_only_for_the_grant_it_was_minted_for() {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[installation_connection()]])
+                .append_query_results([[github_app_provider()]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let manager = github_app_manager(db.clone(), encryption_service);
+        use_stand_in_minter(&manager).await;
+
+        let token = manager
+            .validate_and_refresh_connection_token(11)
+            .await
+            .expect("an unchanged grant keeps the minted token");
+        assert_eq!(token, "", "the stand-in minter's token is returned");
+
+        drop(manager);
+        let log = Arc::try_unwrap(db)
+            .expect("the manager released the database")
+            .into_transaction_log();
+        let update = log
+            .iter()
+            .map(|statement| format!("{statement:?}"))
+            .find(|statement| statement.contains("UPDATE"))
+            .expect("the minted token is stored");
+        assert!(
+            update.contains(".\\\"credential_generation\\\" = $"),
+            "the write is conditional on the grant it was minted for: {update}"
+        );
+        assert!(update.contains("token_expires_at"), "{update}");
+    }
+
+    #[tokio::test]
+    async fn an_installation_token_minted_while_a_pat_replaced_the_grant_is_dropped() {
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        // What the PAT replacement left: no installation, the new token, and a
+        // generation the in-flight mint does not carry.
+        let mut replaced = connection_fixture(11, None);
+        replaced.credential_generation = 1;
+        replaced.access_token = Some(
+            encryption_service
+                .encrypt_string("replacement-pat")
+                .expect("test token should encrypt"),
+        );
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[installation_connection()]])
+                .append_query_results([[github_app_provider()]])
+                // The generation-checked write matches no row.
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .append_query_results([[replaced]])
+                .append_query_results([[github_app_provider()]])
+                .into_connection(),
+        );
+        let manager = github_app_manager(db.clone(), encryption_service);
+        use_stand_in_minter(&manager).await;
+
+        let token = manager
+            .validate_and_refresh_connection_token(11)
+            .await
+            .expect("the replacement's credentials are used");
+        assert_eq!(token, "replacement-pat");
+
+        drop(manager);
+        let log = Arc::try_unwrap(db)
+            .expect("the manager released the database")
+            .into_transaction_log();
+        let updates = log
+            .iter()
+            .map(|statement| format!("{statement:?}"))
+            .filter(|statement| statement.contains("UPDATE"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates.len(),
+            1,
+            "the PAT is never overwritten: {updates:?}"
+        );
+        assert!(
+            updates[0].contains(".\\\"credential_generation\\\" = $"),
+            "{updates:?}"
+        );
+    }
+
+    fn scoped_grant_fixture() -> crate::services::git_provider::ScopedTokenGrant {
+        crate::services::git_provider::ScopedTokenGrant {
+            username: "x-access-token".to_string(),
+            password: "scoped-installation-token".to_string(),
+            expires_at: None,
+        }
+    }
+
+    fn manager_reading(current: git_provider_connections::Model) -> GitProviderManager {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[current]])
+                .into_connection(),
+        );
+        github_app_manager(
+            db,
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .expect("test encryption key should be valid"),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_scoped_token_minted_while_the_grant_was_replaced_is_dropped() {
+        let authorized = installation_connection();
+        // A PAT replaced the installation while the mint was in flight.
+        let mut replaced = connection_fixture(11, None);
+        replaced.credential_generation = authorized.credential_generation + 1;
+        let manager = manager_reading(replaced);
+
+        let err = manager
+            .keep_minted_token_for_grant(&authorized, Ok(scoped_grant_fixture()))
+            .await
+            .expect_err("a token for the replaced installation");
+        assert!(
+            matches!(
+                err,
+                GitProviderManagerError::ConnectionGrantReplaced { connection_id: 11 }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_installation_drops_a_scoped_token_even_at_the_same_generation() {
+        let authorized = installation_connection();
+        let mut reinstalled = installation_connection();
+        reinstalled.installation_id = Some("67890".to_string());
+        let manager = manager_reading(reinstalled);
+
+        let err = manager
+            .keep_minted_token_for_grant(&authorized, Ok(scoped_grant_fixture()))
+            .await
+            .expect_err("a token for the previous installation");
+        assert!(
+            matches!(
+                err,
+                GitProviderManagerError::ConnectionGrantReplaced { connection_id: 11 }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_scoped_mint_under_a_replaced_grant_asks_for_a_retry() {
+        let authorized = installation_connection();
+        let mut replaced = connection_fixture(11, None);
+        replaced.credential_generation = authorized.credential_generation + 1;
+        let manager = manager_reading(replaced);
+
+        let err = manager
+            .keep_minted_token_for_grant::<crate::services::git_provider::ScopedTokenGrant>(
+                &authorized,
+                Err(GitProviderManagerError::InvalidConfiguration(
+                    "installation 12345 is gone".to_string(),
+                )),
+            )
+            .await
+            .expect_err("the installation is gone");
+        assert!(
+            matches!(
+                err,
+                GitProviderManagerError::ConnectionGrantReplaced { connection_id: 11 }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_mint_under_an_unchanged_grant_keeps_its_result() {
+        let authorized = installation_connection();
+        let manager = manager_reading(installation_connection());
+        let grant = manager
+            .keep_minted_token_for_grant(&authorized, Ok(scoped_grant_fixture()))
+            .await
+            .expect("the grant did not change");
+        assert_eq!(grant.password, "scoped-installation-token");
+
+        let manager = manager_reading(installation_connection());
+        let err = manager
+            .keep_minted_token_for_grant::<crate::services::git_provider::ScopedTokenGrant>(
+                &authorized,
+                Err(GitProviderManagerError::InvalidConfiguration(
+                    "the App lost access to the repository".to_string(),
+                )),
+            )
+            .await
+            .expect_err("an ordinary mint failure stays terminal");
+        assert!(
+            matches!(err, GitProviderManagerError::InvalidConfiguration(ref reason)
+                if reason.contains("lost access")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_mint_for_a_pat_connection_is_refused_before_the_provider() {
+        use crate::services::git_provider::ScopedTokenOp;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        // No rows queued: the refusal must not read anything.
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let manager = github_app_manager(
+            db,
+            Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .expect("test encryption key should be valid"),
+            ),
+        );
+
+        let err = manager
+            .mint_scoped_repo_token_for_grant(
+                &connection_fixture(11, None),
+                "acme",
+                "api",
+                ScopedTokenOp::Fetch,
+            )
+            .await
+            .expect_err("a PAT connection has no installation");
+        assert!(
+            matches!(err, GitProviderManagerError::InvalidConfiguration(ref reason)
+                if reason.contains("Connection 11 is not backed by a GitHub App installation")),
+            "{err:?}"
+        );
     }
 }

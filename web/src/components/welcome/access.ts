@@ -27,7 +27,7 @@ export interface BoxFacts {
     tailnet: string | null
   } | null
   /**
-   * The private network this box would serve private apps on (ADR-114 D8):
+   * The private network this box would serve private apps on (ADR-115 D8):
    * Tailscale, WireGuard, NetBird, the LAN… `null` when it is on none it
    * can use.
    */

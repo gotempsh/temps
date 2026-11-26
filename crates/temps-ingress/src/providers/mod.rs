@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The ingress providers that ship with Temps (ADR-116 D1): the one place
+//! The ingress providers that ship with Temps (ADR-117 D1): the one place
 //! outside a provider's own module that names it. Everything else reaches a
 //! provider through [`crate::registry::ProviderRegistry`] and the provider
 //! traits.
 
 // Private to `providers`, so the compiler keeps the engine from naming a
-// provider (ADR-116 D1). Tests reach in for their fixtures.
+// provider (ADR-117 D1). Tests reach in for their fixtures.
 #[cfg(not(test))]
 mod cloudflare;
 #[cfg(test)]

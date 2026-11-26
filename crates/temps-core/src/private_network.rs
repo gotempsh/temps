@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Who counts as inside a private network (ADR-114 D8).
+//! Who counts as inside a private network (ADR-115 D8).
 //!
 //! A private listener admits the ranges the operator gave, or by default the
 //! subnet of the interface it listens on. Tailscale is a preset: its

@@ -22,6 +22,11 @@ grep -Fq 'cp /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg /etc/apt/k
 grep -Fq 'apt-get install -y --no-install-recommends "postgresql-client-${PG_CLIENT_MAJOR}"' "$dockerfile"
 grep -Fq 'pg_dump --version | grep -Eq "^pg_dump \(PostgreSQL\) ${PG_CLIENT_MAJOR}\."' "$dockerfile"
 grep -Fq 'pg_dumpall --version | grep -Eq "^pg_dumpall \(PostgreSQL\) ${PG_CLIENT_MAJOR}\."' "$dockerfile"
+# postgresql-common pulls in ssl-cert, which generates a private key at install
+# time. It must be purged, not just removed, so no key ships in the image.
+grep -Fq 'apt-get purge -y postgresql-common ssl-cert' "$dockerfile"
+grep -Fq 'apt-get autoremove -y --purge' "$dockerfile"
+grep -Fq 'test -z "$(find /etc/ssl/private -type f 2>/dev/null)"' "$dockerfile"
 
 if grep -Eq 'FROM alpine|\bapk (add|update|upgrade)' "$dockerfile"; then
     echo 'Dockerfile.release must not use a musl/Alpine runtime for glibc release artifacts' >&2

@@ -12,7 +12,7 @@
     "anyhow_in_library": "anyhow usage in library crates (use a thiserror enum)",
     "files_over_3000_lines": "production files over 3000 lines (split by responsibility)",
     "functions_over_300_lines": "functions over 300 lines (extract steps)",
-    "provider_named_outside_module": "temps-ingress code naming an ingress provider outside its module (go through the registry and the provider traits, ADR-116 D1)"
+    "provider_named_outside_module": "temps-ingress code naming an ingress provider outside its module (go through the registry and the provider traits, ADR-117 D1)"
   },
   "crates": {
     "temps-ai-agent-cli": {
@@ -78,9 +78,9 @@
       "handler_db_access": 1,
       "lazy_error_variants": 7,
       "ignore_with_reason": 1,
-      "anyhow_in_library": 31,
+      "anyhow_in_library": 26,
       "files_over_3000_lines": 2,
-      "functions_over_300_lines": 8
+      "functions_over_300_lines": 7
     },
     "temps-blob": {
       "lazy_error_variants": 7

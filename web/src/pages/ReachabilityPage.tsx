@@ -10,13 +10,7 @@
 
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  AlertTriangle,
-  ArrowRight,
-  CheckCircle2,
-  Circle,
-  Loader2,
-} from 'lucide-react'
+import { AlertTriangle, ArrowRight, ChevronDown, Loader2 } from 'lucide-react'
 import { useEffect, useMemo, type ReactNode } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import {
@@ -53,6 +47,11 @@ import { SetupFieldInput } from '@/components/reachability/SetupFieldInput'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Form,
@@ -91,6 +90,7 @@ import {
   resolveEnvironmentParam,
   RUN_STATE_LABELS,
   selectAudience,
+  unavailableByReason,
   unfinishedRun,
   writePageParams,
   type AudienceCard,
@@ -224,10 +224,9 @@ function ReachabilityFlow({
     <div className="w-full min-w-0 space-y-6">
       <PageHeader
         title="Make it reachable"
-        description={`Give ${environment.name} an address, for the people who should open it. Temps sets up only what is missing, and can undo it.`}
         actions={
           <Button variant="outline" asChild>
-            <Link to={domainsHref}>Who can reach it</Link>
+            <Link to={domainsHref}>All addresses</Link>
           </Button>
         }
       />
@@ -496,24 +495,22 @@ function PlanForm({
     plan.data?.address ?? (typedAddress.trim() || null)
   )
 
+  const available = cards.filter((card) => card.available)
+
   return (
     <>
       <Form {...form}>
         <form
           onSubmit={form.handleSubmit(submit)}
-          className="space-y-8"
+          className="space-y-6"
           aria-label="Make it reachable"
         >
-          {/* 1. Who can open it */}
-          <section aria-labelledby="audience-heading" className="space-y-3">
-            <SectionHeading id="audience-heading" step={1}>
-              Who can open it
-            </SectionHeading>
+          <section aria-labelledby="audience-heading" className="space-y-2">
+            <FieldHeading id="audience-heading">Who can open it</FieldHeading>
             {choices.isPending ? (
-              <div className="grid gap-3 md:grid-cols-2">
-                {[0, 1, 2, 3].map((i) => (
-                  <Skeleton key={i} className="h-24 w-full" />
-                ))}
+              <div className="grid gap-2 sm:grid-cols-2">
+                <Skeleton className="h-16 w-full" />
+                <Skeleton className="h-16 w-full" />
               </div>
             ) : choices.isError ? (
               <Alert variant="destructive">
@@ -545,29 +542,29 @@ function PlanForm({
                     </AlertDescription>
                   </Alert>
                 )}
-                {audience === null && (
-                  <Alert variant="warning">
-                    <AlertTriangle className="h-4 w-4" />
-                    <AlertDescription>
-                      Nothing can make {environment.name} reachable yet. Each
-                      option below says what is missing.
-                    </AlertDescription>
-                  </Alert>
+                {available.length > 0 && (
+                  <RadioGroup
+                    aria-label="Who can open it"
+                    value={audience ?? ''}
+                    onValueChange={(next) =>
+                      chooseAudience(next as PageAudience)
+                    }
+                    className="grid gap-2 sm:grid-cols-2"
+                  >
+                    {available.map((card) => (
+                      <AudienceOption
+                        key={card.audience}
+                        card={card}
+                        selected={card.audience === audience}
+                      />
+                    ))}
+                  </RadioGroup>
                 )}
-                <RadioGroup
-                  aria-label="Who can open it"
-                  value={audience ?? ''}
-                  onValueChange={(next) => chooseAudience(next as PageAudience)}
-                  className="grid gap-3 md:grid-cols-2"
-                >
-                  {cards.map((card) => (
-                    <AudienceCardView
-                      key={card.audience}
-                      card={card}
-                      selected={card.audience === audience}
-                    />
-                  ))}
-                </RadioGroup>
+                <UnavailableAudiences
+                  cards={cards}
+                  environmentName={environment.name}
+                  nothingWorks={audience === null}
+                />
                 {audience === 'signed_in' && (
                   <GateChoice
                     entries={
@@ -582,74 +579,68 @@ function PlanForm({
             )}
           </section>
 
-          {/* 2. Address and how visitors get in */}
-          <section aria-labelledby="address-heading" className="space-y-4">
-            <SectionHeading id="address-heading" step={2}>
-              Address and how visitors get in
-            </SectionHeading>
-            {audience === null ? (
-              <p className="text-sm text-muted-foreground">
-                Choose who can open it first.
-              </p>
-            ) : (
-              <>
-                {audience === 'tailnet_users' && (
-                  <FormField
-                    control={form.control}
-                    name="principals"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Tailnet users and tags</FormLabel>
-                        <FormControl>
-                          <Textarea
-                            autoComplete="off"
-                            rows={2}
-                            placeholder="alice@example.com, tag:ci"
-                            {...field}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Logins as Tailscale shows them, or a device tag such
-                          as <code>tag:server</code>, separated by commas or new
-                          lines. Everyone else on the tailnet is refused.
-                        </FormDescription>
-                        {listed.invalid.length > 0 && (
-                          <p className="text-sm text-destructive">
-                            Not a login or a tag: {listed.invalid.join(', ')}
-                          </p>
-                        )}
-                      </FormItem>
-                    )}
-                  />
-                )}
+          {audience !== null && (
+            <>
+              {audience === 'tailnet_users' && (
                 <FormField
                   control={form.control}
-                  name="address"
+                  name="principals"
                   render={({ field }) => (
-                    <FormItem className="max-w-xl">
-                      <FormLabel>Address</FormLabel>
+                    <FormItem>
+                      <FormLabel>Tailnet users and tags</FormLabel>
                       <FormControl>
-                        <Input
+                        <Textarea
                           autoComplete="off"
-                          placeholder={
-                            choice?.suggested_address ?? 'myapp.example.com'
-                          }
+                          rows={2}
+                          placeholder="alice@example.com, tag:ci"
                           {...field}
                         />
                       </FormControl>
                       <FormDescription>
-                        {audience === 'private' || audience === 'tailnet_users'
-                          ? 'The name people on your network will open: a tailnet name, or a hostname on a domain you own.'
-                          : 'The hostname people will open, on a domain you own.'}
+                        Everyone else on the tailnet is refused.
                       </FormDescription>
-                      {plan.data?.address_error && (
+                      {listed.invalid.length > 0 && (
                         <p className="text-sm text-destructive">
-                          {plan.data.address_error}
+                          Not a login or a tag: {listed.invalid.join(', ')}
                         </p>
                       )}
                     </FormItem>
                   )}
                 />
+              )}
+              <FormField
+                control={form.control}
+                name="address"
+                render={({ field }) => (
+                  <FormItem className="max-w-xl">
+                    <FormLabel>Address</FormLabel>
+                    <FormControl>
+                      <Input
+                        autoComplete="off"
+                        placeholder={
+                          choice?.suggested_address ?? 'myapp.example.com'
+                        }
+                        {...field}
+                      />
+                    </FormControl>
+                    {(audience === 'private' ||
+                      audience === 'tailnet_users') && (
+                      <FormDescription>
+                        A tailnet name, or a hostname on a domain you own.
+                      </FormDescription>
+                    )}
+                    {plan.data?.address_error && (
+                      <p className="text-sm text-destructive">
+                        {plan.data.address_error}
+                      </p>
+                    )}
+                  </FormItem>
+                )}
+              />
+              <section aria-labelledby="way-heading" className="space-y-2">
+                <FieldHeading id="way-heading">
+                  How visitors get in
+                </FieldHeading>
                 <WaysIn
                   options={options}
                   loading={plan.isPending || !planCurrent}
@@ -673,112 +664,35 @@ function PlanForm({
                   }}
                 />
                 {choice && choice.not_offered.length > 0 && (
-                  <div className="space-y-1 text-sm text-muted-foreground">
-                    <p className="font-medium text-foreground">Not offered</p>
+                  <div className="space-y-1 text-xs text-muted-foreground">
                     {choice.not_offered.map((note) => (
                       <BlockedReason key={note.reason} blocked={note} />
                     ))}
                   </div>
                 )}
-                {option && fields.length > 0 && (
-                  <div className="max-w-xl space-y-4">
-                    {fields.map((setupField) => (
-                      <SetupFieldInput
-                        key={setupField.key}
-                        field={setupField}
-                        control={form.control}
-                        address={typedAddress}
-                        token={answers[setupField.key] ?? ''}
-                      />
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-          </section>
-
-          {/* 3. Plan */}
-          <section aria-labelledby="plan-heading" className="space-y-4">
-            <SectionHeading id="plan-heading" step={3}>
-              Plan
-            </SectionHeading>
-            {option ? (
-              <div className="grid gap-6 lg:grid-cols-2">
-                <div className="min-w-0 space-y-2">
-                  <h3 className="text-sm font-medium">What Temps will do</h3>
-                  <ol className="space-y-2" aria-label="What Temps will do">
-                    {option.steps.map((step, index) => (
-                      <li
-                        key={`${step.kind}-${index}`}
-                        className="flex gap-2 text-sm"
-                      >
-                        <span
-                          aria-hidden="true"
-                          className="mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full border text-xs text-muted-foreground"
-                        >
-                          {index + 1}
-                        </span>
-                        <span className="min-w-0 break-words">
-                          {step.label}
-                        </span>
-                      </li>
-                    ))}
-                  </ol>
-                  {option.warnings.map((warning) => (
-                    <p key={warning} className="text-sm text-warning-strong">
-                      {warning}
-                    </p>
+              </section>
+              {option && fields.length > 0 && (
+                <div className="max-w-xl space-y-4">
+                  {fields.map((setupField) => (
+                    <SetupFieldInput
+                      key={setupField.key}
+                      field={setupField}
+                      control={form.control}
+                      address={typedAddress}
+                      token={answers[setupField.key] ?? ''}
+                    />
                   ))}
                 </div>
-                <div className="min-w-0 space-y-2">
-                  <h3 className="text-sm font-medium">What it leaves alone</h3>
-                  <ul className="space-y-2 text-sm text-muted-foreground">
-                    {leftAlone.map((a) => (
-                      <li key={a.address} className="flex gap-2">
-                        <Circle
-                          aria-hidden="true"
-                          className="mt-1 size-3 shrink-0"
-                        />
-                        <span className="min-w-0 break-all">
-                          {a.address}{' '}
-                          <span className="whitespace-nowrap">
-                            ({AUDIENCE_LABELS[a.audience]}), as it is
-                          </span>
-                        </span>
-                      </li>
-                    ))}
-                    <li className="flex gap-2">
-                      <Circle
-                        aria-hidden="true"
-                        className="mt-1 size-3 shrink-0"
-                      />
-                      Every DNS record, tunnel and certificate not listed on the
-                      left.
-                    </li>
-                    <li className="flex gap-2">
-                      <Circle
-                        aria-hidden="true"
-                        className="mt-1 size-3 shrink-0"
-                      />
-                      Anything already there is used as found; undo never
-                      removes it, and a record someone else changes is never
-                      overwritten without asking you.
-                    </li>
-                  </ul>
-                </div>
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                Pick a way in to see exactly what Temps will create.
-              </p>
-            )}
-          </section>
+              )}
+            </>
+          )}
 
-          {/* 4. Run */}
-          <section aria-labelledby="start-heading" className="space-y-4">
-            <SectionHeading id="start-heading" step={4}>
-              Run
-            </SectionHeading>
+          <div className="space-y-4 border-t pt-6">
+            {option?.warnings.map((warning) => (
+              <p key={warning} className="text-sm text-warning-strong">
+                {warning}
+              </p>
+            ))}
             {option?.confirmation && (
               <FormField
                 control={form.control}
@@ -833,27 +747,76 @@ function PlanForm({
                 </AlertDescription>
               </Alert>
             )}
-            <p className="text-sm text-muted-foreground">
-              The setup runs on the server. You can leave this page while it
-              runs; it gets its own link, and{' '}
-              <Link
-                className="underline"
-                to={`/projects/${project.slug}/domains`}
-              >
-                Who can reach it
-              </Link>{' '}
-              links back to it.
-            </p>
-            <Button
-              type="submit"
-              disabled={!option || !planCurrent || apply.isPending}
-            >
-              {(apply.isPending || (option && !planCurrent)) && (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            <Collapsible>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="submit"
+                  disabled={!option || !planCurrent || apply.isPending}
+                >
+                  {(apply.isPending || (option && !planCurrent)) && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  {option ? option.title : 'Make it reachable'}
+                </Button>
+                {option && (
+                  <CollapsibleTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="group text-muted-foreground"
+                    >
+                      What Temps will do
+                      <ChevronDown
+                        aria-hidden="true"
+                        className="ml-1 h-4 w-4 transition-transform duration-200 group-data-[state=open]:rotate-180"
+                      />
+                    </Button>
+                  </CollapsibleTrigger>
+                )}
+              </div>
+              {option && (
+                <CollapsibleContent className="space-y-4 pt-4">
+                  <ol
+                    className="space-y-1.5 text-sm"
+                    aria-label="What Temps will do"
+                  >
+                    {option.steps.map((step, index) => (
+                      <li key={`${step.kind}-${index}`} className="flex gap-2">
+                        <span
+                          aria-hidden="true"
+                          className="w-4 shrink-0 text-right tabular-nums text-muted-foreground"
+                        >
+                          {index + 1}.
+                        </span>
+                        <span className="min-w-0 break-words">
+                          {step.label}
+                        </span>
+                      </li>
+                    ))}
+                  </ol>
+                  <div className="space-y-1.5 text-sm text-muted-foreground">
+                    <p className="font-medium text-foreground">Left alone</p>
+                    <ul className="space-y-1.5">
+                      {leftAlone.map((a) => (
+                        <li
+                          key={a.address}
+                          className="[overflow-wrap:anywhere]"
+                        >
+                          {a.address} ({AUDIENCE_LABELS[a.audience]}), as it is
+                        </li>
+                      ))}
+                      <li>
+                        Every other DNS record, tunnel and certificate. Anything
+                        already there is used as found, undo never removes it,
+                        and a record someone else changes is never overwritten
+                        without asking you.
+                      </li>
+                    </ul>
+                  </div>
+                </CollapsibleContent>
               )}
-              {option ? option.title : 'Make it reachable'}
-            </Button>
-          </section>
+            </Collapsible>
+          </div>
         </form>
       </Form>
       {verificationDialog}
@@ -861,29 +824,25 @@ function PlanForm({
   )
 }
 
-function SectionHeading({
-  id,
-  step,
-  children,
-}: {
-  id: string
-  step: number
-  children: ReactNode
-}) {
+/** "Only my private network and only these tailnet users". */
+function audienceList(audiences: PageAudience[]): string {
+  const labels = audiences.map((a) => AUDIENCE_COPY[a].label.toLowerCase())
+  const text =
+    labels.length > 1
+      ? `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`
+      : (labels[0] ?? '')
+  return text.charAt(0).toUpperCase() + text.slice(1)
+}
+
+function FieldHeading({ id, children }: { id: string; children: ReactNode }) {
   return (
-    <h2 id={id} className="flex items-center gap-2 text-lg font-semibold">
-      <span
-        aria-hidden="true"
-        className="flex size-6 items-center justify-center rounded-full bg-muted text-sm"
-      >
-        {step}
-      </span>
+    <h2 id={id} className="text-sm font-medium">
       {children}
     </h2>
   )
 }
 
-function AudienceCardView({
+function AudienceOption({
   card,
   selected,
 }: {
@@ -893,54 +852,66 @@ function AudienceCardView({
   const copy = AUDIENCE_COPY[card.audience]
   const id = `audience-${card.audience}`
   return (
-    <div
+    <label
+      htmlFor={id}
       className={cn(
-        'flex items-start gap-3 rounded-md border p-4',
-        selected ? 'border-primary' : 'border-border',
-        card.available
-          ? 'hover:border-primary/50'
-          : 'bg-muted/40 text-muted-foreground'
+        'flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors',
+        selected ? 'border-primary' : 'border-border hover:border-primary/50'
       )}
     >
       <RadioGroupItem
         id={id}
         value={card.audience}
-        disabled={!card.available}
         aria-describedby={`${id}-help`}
         className="mt-0.5"
       />
-      <div className="min-w-0 space-y-1">
-        <label
-          htmlFor={id}
-          className={cn(
-            'block text-sm font-medium',
-            card.available ? 'cursor-pointer' : 'cursor-not-allowed'
-          )}
-        >
-          {copy.label}
-        </label>
-        <p id={`${id}-help`} className="text-xs text-muted-foreground">
-          {card.available ? copy.help : 'Not possible here yet.'}
-        </p>
-        {!card.available && card.blocked && (
-          <BlockedReason blocked={card.blocked} />
-        )}
-        {card.available && <WaysInSummary entries={card.entries} />}
-      </div>
-    </div>
+      <span className="min-w-0 space-y-0.5">
+        <span className="block text-sm font-medium">{copy.label}</span>
+        <span id={`${id}-help`} className="block text-xs text-muted-foreground">
+          {copy.help}
+        </span>
+      </span>
+    </label>
   )
 }
 
-/** The ways in an audience offers, in a line, before it is chosen. */
-function WaysInSummary({ entries }: { entries: AudienceChoice[] }) {
-  const ways = [
-    ...new Set(
-      entries.flatMap((e) => e.ways_in.map((w) => wayInLabel(w.way_in)))
-    ),
-  ]
-  if (ways.length === 0) return null
+/**
+ * The audiences that cannot work here, folded into one line per reason
+ * (they usually share one), with the fix.
+ */
+function UnavailableAudiences({
+  cards,
+  environmentName,
+  nothingWorks,
+}: {
+  cards: AudienceCard[]
+  environmentName: string
+  nothingWorks: boolean
+}) {
+  const groups = unavailableByReason(cards)
+  if (groups.length === 0) return null
   return (
-    <p className="text-xs text-muted-foreground">Ways in: {ways.join(', ')}</p>
+    <div
+      className={cn(
+        'space-y-2 text-xs',
+        nothingWorks ? 'text-foreground' : 'text-muted-foreground'
+      )}
+    >
+      {groups.map((group) => (
+        <div key={group.audiences.join()} className="space-y-1">
+          <p>
+            <span className="font-medium">
+              {nothingWorks ? 'Nothing works for ' : 'Not possible for '}
+              {environmentName} yet:
+            </span>{' '}
+            {audienceList(group.audiences)}. {group.blocked?.reason}
+          </p>
+          {group.blocked?.action && (
+            <ActionLink action={group.blocked.action} />
+          )}
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -1083,47 +1054,57 @@ function WaysIn({
         </AlertDescription>
       </Alert>
     )
+  if (options.length === 1) {
+    const only = options[0]
+    return (
+      <div className={cn('space-y-0.5 text-sm', loading && 'opacity-60')}>
+        <p className="font-medium">{only.title}</p>
+        <p className="text-muted-foreground">{only.description}</p>
+        <p className="text-xs text-muted-foreground">
+          {wayInLabel(only.way_in)} · {dnsHandling(only)}
+        </p>
+      </div>
+    )
+  }
   return (
     <RadioGroup
       aria-label="How visitors get in"
       aria-busy={loading || undefined}
       value={value}
       onValueChange={onChange}
-      className={cn('grid gap-3 lg:grid-cols-2', loading && 'opacity-60')}
+      className={cn('grid gap-2', loading && 'opacity-60')}
     >
       {options.map((option) => {
         const id = `way-${option.kind}`
         return (
-          <div
+          <label
             key={option.kind}
+            htmlFor={id}
             className={cn(
-              'flex items-start gap-3 rounded-md border p-3',
+              'flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors',
               option.kind === value
                 ? 'border-primary'
                 : 'border-border hover:border-primary/50'
             )}
           >
-            <RadioGroupItem id={id} value={option.kind} className="mt-1" />
-            <div className="min-w-0 flex-1 space-y-1">
-              <label htmlFor={id} className="block cursor-pointer font-medium">
+            <RadioGroupItem id={id} value={option.kind} className="mt-0.5" />
+            <span className="min-w-0 flex-1 space-y-0.5">
+              <span className="block text-sm font-medium">
                 {option.title}
                 {option.recommended && (
                   <span className="ml-2 text-xs font-normal text-muted-foreground">
                     Recommended
                   </span>
                 )}
-              </label>
-              <p className="text-sm text-muted-foreground">
+              </span>
+              <span className="block text-xs text-muted-foreground">
                 {option.description}
-              </p>
-              <p className="flex items-center gap-1 text-xs text-muted-foreground">
-                {option.kind === value ? (
-                  <CheckCircle2 aria-hidden="true" className="size-3" />
-                ) : null}
+              </span>
+              <span className="block text-xs text-muted-foreground">
                 {wayInLabel(option.way_in)} · {dnsHandling(option)}
-              </p>
-            </div>
-          </div>
+              </span>
+            </span>
+          </label>
         )
       })}
     </RadioGroup>

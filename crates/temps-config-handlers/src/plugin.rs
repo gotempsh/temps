@@ -140,7 +140,7 @@ impl TempsPlugin for ConfigPlugin {
             audit_service: audit_service.clone(),
         });
 
-        // ADR-114 D2: the consent wakes the control plane's private-ingress
+        // ADR-115 D2: the consent wakes the control plane's private-ingress
         // loop when one runs in this process (`temps serve --role all`).
         let private_ingress_state = Arc::new(crate::private_ingress::PrivateIngressHandlerState {
             private_ingress_service: Arc::new(

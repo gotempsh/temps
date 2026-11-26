@@ -1029,6 +1029,8 @@ impl PublicStatusPageService {
         Ok(models
             .into_iter()
             .map(|model| StatusPageResponse {
+                public_path: public_page_path(&model.slug),
+                public_json_path: public_json_path(&model.slug),
                 public_url: base.page_url(&model.slug),
                 public_json_url: base.json_url(&model.slug),
                 public_feed_url: if model.password_hash.is_some() {
@@ -1052,6 +1054,17 @@ impl PublicStatusPageService {
             })
             .collect())
     }
+}
+
+/// Path of a page's public HTML form, relative to any address this install
+/// is reachable at. Known even when no public URL is configured.
+pub(crate) fn public_page_path(slug: &str) -> String {
+    format!("/api/status/{slug}")
+}
+
+/// Path of a page's machine-readable form; see [`public_page_path`].
+pub(crate) fn public_json_path(slug: &str) -> String {
+    format!("/api/status/{slug}/summary.json")
 }
 
 /// The base every public status page address is built from, and whether it is
@@ -1119,13 +1132,13 @@ impl PublicUrlBase {
     fn page_url(&self, slug: &str) -> Option<String> {
         self.base
             .as_ref()
-            .map(|base| format!("{base}/api/status/{slug}"))
+            .map(|base| format!("{base}{}", public_page_path(slug)))
     }
 
     fn json_url(&self, slug: &str) -> Option<String> {
         self.base
             .as_ref()
-            .map(|base| format!("{base}/api/status/{slug}/summary.json"))
+            .map(|base| format!("{base}{}", public_json_path(slug)))
     }
 
     fn feed_url(&self, slug: &str) -> Option<String> {
@@ -1213,6 +1226,62 @@ mod tests {
             .expect("an unconfigured install explains itself");
         assert!(reason.contains("not configured"), "{reason}");
         assert!(!reason.contains("localho.st"), "{reason}");
+    }
+
+    #[test]
+    fn public_paths_do_not_depend_on_a_configured_host() {
+        assert_eq!(
+            public_page_path(SLUG),
+            "/api/status/0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            public_json_path(SLUG),
+            "/api/status/0123456789abcdef0123456789abcdef/summary.json"
+        );
+        let base = PublicUrlBase::from_settings(&settings(Some("https://temps.example.com"), None));
+        assert_eq!(
+            base.page_url(SLUG),
+            Some(format!(
+                "https://temps.example.com{}",
+                public_page_path(SLUG)
+            ))
+        );
+        assert_eq!(
+            base.json_url(SLUG),
+            Some(format!(
+                "https://temps.example.com{}",
+                public_json_path(SLUG)
+            ))
+        );
+    }
+
+    /// The service rejects an empty selection; the schema says so too, so a
+    /// generated client or a plan-time validator catches it before sending.
+    #[test]
+    fn monitor_selection_is_declared_non_empty_in_the_schema() {
+        use utoipa::PartialSchema;
+        for (name, schema) in [
+            (
+                "CreateStatusPageRequest",
+                serde_json::to_value(super::super::types::CreateStatusPageRequest::schema()),
+            ),
+            (
+                "UpdateStatusPageRequest",
+                serde_json::to_value(super::super::types::UpdateStatusPageRequest::schema()),
+            ),
+        ] {
+            let schema = schema.expect("schema serializes");
+            let monitors = &schema["properties"]["monitors"];
+            let min_items = monitors["minItems"]
+                .as_u64()
+                .or_else(|| {
+                    monitors["oneOf"]
+                        .as_array()
+                        .and_then(|variants| variants.iter().find_map(|v| v["minItems"].as_u64()))
+                })
+                .unwrap_or_else(|| panic!("{name}.monitors has no minItems: {monitors}"));
+            assert_eq!(min_items, 1, "{name}");
+        }
     }
 
     #[test]

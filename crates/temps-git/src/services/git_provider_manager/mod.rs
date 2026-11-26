@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 mod connections;
+mod credentials;
 mod error;
 mod git_push;
 mod health;
@@ -47,6 +48,7 @@ mod tokens;
 mod types;
 mod validation;
 
+pub use credentials::{CredentialsUpdated, ProviderCredentialsUpdate};
 pub use error::GitProviderManagerError;
 pub(crate) use git_push::CommitCancellation;
 pub use types::{
@@ -98,8 +100,10 @@ impl GitProviderManager {
         self.db.as_ref()
     }
 
-    /// HTTPS clone username for a stored provider type.
-    fn clone_username_for_provider_type(provider_type: &str) -> &'static str {
+    /// HTTPS clone username for a stored provider type: what the deploy
+    /// pipeline pairs with a connection's token, and what any other clone with
+    /// that token must send too.
+    pub fn clone_username_for_provider_type(provider_type: &str) -> &'static str {
         match provider_type {
             "gitlab" => "oauth2",
             "bitbucket" => "x-token-auth",

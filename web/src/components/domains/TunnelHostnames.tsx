@@ -20,6 +20,13 @@ import type { ConnectorView, HostnameView } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -116,6 +123,16 @@ export function StateBadge({ view }: { view: HostnameView }) {
   }
 }
 
+/** The tunnel Automatic picks: the longest matching domain that publishes everything. */
+function automaticCandidate(view: HostnameView) {
+  return view.candidates
+    .filter((c) => c.auto_publish)
+    .sort(
+      (a, b) =>
+        b.domain.length - a.domain.length || a.connector_id - b.connector_id
+    )[0]
+}
+
 /** Automatic, a specific tunnel, or no tunnel, for one hostname. */
 export function HostnameChoice({ view }: { view: HostnameView }) {
   const refresh = useRefreshIngress()
@@ -127,16 +144,8 @@ export function HostnameChoice({ view }: { view: HostnameView }) {
         description: problemDetail(error, 'Try again in a moment.'),
       }),
   })
-  const value =
-    view.mode === 'tunnel' && view.chosen_connector_id != null
-      ? `tunnel:${view.chosen_connector_id}`
-      : view.mode
-  const automatic = view.candidates
-    .filter((c) => c.auto_publish)
-    .sort(
-      (a, b) =>
-        b.domain.length - a.domain.length || a.connector_id - b.connector_id
-    )[0]
+  const value = choiceValue(view)
+  const automatic = automaticCandidate(view)
   return (
     <Select
       value={value}
@@ -288,30 +297,110 @@ export function TunnelHostnames({ connector }: { connector: ConnectorView }) {
   )
 }
 
-/**
- * One hostname's tunnel status and choice, for the pages that list domains.
- * Renders nothing when no tunnel is involved.
- */
-export function HostnameTunnelStatus({ hostname }: { hostname: string }) {
+/** The tunnel view of one hostname, or `undefined` while none is known. */
+function useHostnameView(hostname: string): HostnameView | undefined {
   const hostnamesQuery = useHostnames()
   const host = hostname.trim().replace(/\.$/, '').toLowerCase()
-  const view = hostnamesQuery.data?.find((h) => h.hostname === host)
-  if (
-    !view ||
-    (view.candidates.length === 0 &&
-      view.mode === 'automatic' &&
-      view.state === 'not_published')
-  ) {
-    return null
-  }
+  return hostnamesQuery.data?.find((h) => h.hostname === host)
+}
+
+/** Whether a tunnel has anything to do with a hostname. */
+function tunnelInvolved(view: HostnameView | undefined): boolean {
   return (
-    <div className="mt-2 space-y-1">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs text-muted-foreground">Tunnel</span>
-        <StateBadge view={view} />
-        <HostnameChoice view={view} />
-      </div>
-      <p className="text-xs text-muted-foreground">{view.detail}</p>
+    !!view &&
+    !(
+      view.candidates.length === 0 &&
+      view.mode === 'automatic' &&
+      view.state === 'not_published'
+    )
+  )
+}
+
+function choiceValue(view: HostnameView): string {
+  return view.mode === 'tunnel' && view.chosen_connector_id != null
+    ? `tunnel:${view.chosen_connector_id}`
+    : view.mode
+}
+
+/**
+ * The tunnel choice as a submenu of a hostname's actions menu: Automatic,
+ * a specific tunnel, or no tunnel. Nothing when no tunnel is involved.
+ */
+export function HostnameTunnelMenu({ hostname }: { hostname: string }) {
+  const view = useHostnameView(hostname)
+  if (!view || !tunnelInvolved(view)) return null
+  return <TunnelChoiceSubmenu view={view} />
+}
+
+function TunnelChoiceSubmenu({ view }: { view: HostnameView }) {
+  const refresh = useRefreshIngress()
+  const choose = useMutation({
+    ...setIngressHostnameChoiceMutation(),
+    onSuccess: async () => {
+      await refresh()
+      toast.success(`Changed how ${view.hostname} reaches visitors`)
+    },
+    onError: (error) =>
+      toast.error(`Could not change ${view.hostname}`, {
+        description: problemDetail(error, 'Try again in a moment.'),
+      }),
+  })
+  const automatic = automaticCandidate(view)
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger disabled={choose.isPending}>
+        Tunnel
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        <DropdownMenuRadioGroup
+          value={choiceValue(view)}
+          onValueChange={(next) => {
+            const [mode, id] = next.split(':')
+            choose.mutate({
+              path: { hostname: view.hostname },
+              body:
+                mode === 'tunnel'
+                  ? { mode: 'tunnel', connector_id: Number(id) }
+                  : { mode: mode as 'automatic' | 'off' },
+            })
+          }}
+        >
+          <DropdownMenuRadioItem value="automatic">
+            Automatic{automatic ? ` (${automatic.name})` : ' (none)'}
+          </DropdownMenuRadioItem>
+          {view.candidates.map((c) => (
+            <DropdownMenuRadioItem
+              key={c.connector_id}
+              value={`tunnel:${c.connector_id}`}
+            >
+              Through {c.name}
+            </DropdownMenuRadioItem>
+          ))}
+          <DropdownMenuRadioItem value="off">
+            Not through a tunnel
+          </DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  )
+}
+
+/**
+ * A hostname's tunnel publication while it needs attention (publishing, or
+ * failed, with the retry); nothing once it is live or no tunnel is involved.
+ */
+export function HostnameTunnelProblem({ hostname }: { hostname: string }) {
+  const view = useHostnameView(hostname)
+  if (!view) return null
+  if (view.state !== 'pending' && view.state !== 'error') return null
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      <StateBadge view={view} />
+      <span>{view.detail}</span>
+      <RetryHostnameDns
+        hostname={view.hostname}
+        connectorId={view.retry_dns_connector_id}
+      />
     </div>
   )
 }

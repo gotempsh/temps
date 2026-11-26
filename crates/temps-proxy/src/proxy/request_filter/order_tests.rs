@@ -216,6 +216,8 @@ fn project(id: i32) -> projects::Model {
         log_ingest_kib_per_sec: None,
         instantiation_token: None,
         allowed_capabilities: Vec::new(),
+        identical_build_mode: Default::default(),
+        identical_build_scope: Default::default(),
     }
 }
 
@@ -2218,7 +2220,7 @@ fn loopback_serving(range: &'static str) -> temps_core::private_ingress::Private
     }
 }
 
-/// ADR-114 D3: on the private address, plain HTTP for a private host only
+/// ADR-115 D3: on the private address, plain HTTP for a private host only
 /// redirects to HTTPS, as on a worker's private listener.
 #[tokio::test]
 async fn a_private_host_on_the_private_address_is_redirected_to_https() {
@@ -2240,7 +2242,7 @@ async fn a_private_host_on_the_private_address_is_redirected_to_https() {
     );
 }
 
-/// ADR-114 D3: a public host is unknown on the private address. It is never
+/// ADR-115 D3: a public host is unknown on the private address. It is never
 /// matched against the public maps there, and never falls through to the
 /// console.
 #[tokio::test]
@@ -2259,7 +2261,7 @@ async fn a_public_host_on_the_private_address_has_no_route() {
         .contains("x-temps-private-ingress: no-route"));
 }
 
-/// ADR-114 D3: a TCP peer outside the listener's range is refused, whatever
+/// ADR-115 D3: a TCP peer outside the listener's range is refused, whatever
 /// host it asks for; so is one outside the address's own range.
 #[tokio::test]
 async fn a_peer_outside_the_range_is_refused_on_the_private_address() {

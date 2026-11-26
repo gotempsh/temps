@@ -612,7 +612,7 @@ impl IngressConnectorService {
         reject_plain_secret_answers(&info, &request.values)
     }
 
-    /// Whether `kind` serves only a private network (ADR-116 D2). An
+    /// Whether `kind` serves only a private network (ADR-117 D2). An
     /// unknown kind does not.
     pub fn serves_privately(&self, kind: &str) -> bool {
         matches!(
@@ -2642,7 +2642,7 @@ fn assign_generated<'a>(
 
 struct PlannedConnector {
     model: ingress_connectors::Model,
-    /// Temps writes the DNS of what it publishes (ADR-116 D2).
+    /// Temps writes the DNS of what it publishes (ADR-117 D2).
     writes_dns: bool,
     /// `None` when its domain is no longer managed; it then covers nothing.
     zone: Option<String>,

@@ -1229,7 +1229,7 @@ impl TempsPlugin for AgentsPlugin {
         Box::pin(async move {
             let executor = context.require_service::<AgentExecutor>();
 
-            // ADR-115 D1: agent turns go through the AI gateway.
+            // ADR-116 D1: agent turns go through the AI gateway.
             if let Some(ai) = context.get_service::<dyn temps_ai::AiService>() {
                 executor.attach_ai_service(ai).await;
             } else {

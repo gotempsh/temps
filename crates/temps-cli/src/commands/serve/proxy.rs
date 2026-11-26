@@ -62,6 +62,56 @@ fn cluster_dns_wanted(read: Option<bool>, previous: bool) -> bool {
     read.unwrap_or(previous)
 }
 
+/// Why no resolver can run on this host, after looking up the app network's
+/// gateway: a gateway found is probed, while a failed lookup (Docker briefly
+/// unreachable) says nothing about where the gateway lives, so the previous
+/// answer stands rather than turning an unsupported host into an outage.
+fn unsupported_after_lookup<E>(
+    lookup: &Result<std::net::IpAddr, E>,
+    previous: Option<&str>,
+    probe: impl FnOnce(std::net::IpAddr) -> Option<String>,
+) -> Option<String> {
+    match lookup {
+        Ok(gateway) => probe(*gateway),
+        Err(_) => previous.map(str::to_string),
+    }
+}
+
+/// Whether node 0 may report now. While enabled, not before the first
+/// attempt to start the resolver: until then nothing is known, and a report
+/// would say "not running" (an outage) on every start, even on a host that
+/// cannot run one.
+fn cluster_dns_reportable(enabled: bool, attempted: bool) -> bool {
+    !enabled || attempted
+}
+
+/// What node 0's report may describe on this pass: while cluster DNS is off,
+/// nothing it ran, even on the pass that stops it. That report is the one the
+/// gate then holds for an interval, so it must already say it stopped.
+fn reported_services<R, P>(
+    enabled: bool,
+    resolver: Option<R>,
+    routing: Option<P>,
+) -> (Option<R>, Option<P>) {
+    if enabled {
+        (resolver, routing)
+    } else {
+        (None, None)
+    }
+}
+
+/// How long until the next pass. A failing Docker lookup on a host known not
+/// to run the resolver still backs off, but never past the report interval:
+/// node 0 must keep reporting it unsupported, or its stored report goes stale
+/// and the console reads it as not reporting.
+fn next_pass_delay(failures: u32, unsupported: bool) -> Duration {
+    match failures {
+        0 => DNS_RETRY_INTERVAL,
+        failures if unsupported => dns_retry_delay(failures).min(temps_dns::CP_REPORT_INTERVAL),
+        failures => dns_retry_delay(failures),
+    }
+}
+
 /// What the control plane needs to serve `*.temps.local` HTTP calls to its
 /// own containers next to its resolver (ADR-104): the route table it serves
 /// from and where the routes snapshot is kept. `None` in a standalone
@@ -150,6 +200,11 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             ))
         };
         let mut last_error: Option<String> = None;
+        // Why no resolver can run on this host at all (Docker in a VM, or on
+        // another host), reported instead of an outage.
+        let mut unsupported: Option<String> = None;
+        // Whether the resolver was tried since cluster DNS was last enabled.
+        let mut attempted = false;
         loop {
             let read = match config_service.get_settings().await {
                 Ok(settings) => Some(settings.cluster_dns.enabled),
@@ -170,16 +225,30 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                     if wanted { "starting" } else { "stopping" }
                 );
                 enabled = wanted;
+                reporter.expire();
             }
             if !enabled {
                 last_error = None;
+                unsupported = None;
+                attempted = false;
             }
-            let routing_report = routing
-                .as_ref()
-                .and_then(|_| super::internal_routing::ControlPlaneRouting::report());
-            reporter
-                .maybe_report(active.as_ref(), last_error.as_deref(), routing_report)
-                .await;
+            if cluster_dns_reportable(enabled, attempted) {
+                let (resolver, routing_report) = reported_services(
+                    enabled,
+                    active.as_ref(),
+                    routing
+                        .as_ref()
+                        .and_then(|_| super::internal_routing::ControlPlaneRouting::report()),
+                );
+                reporter
+                    .maybe_report(
+                        resolver,
+                        last_error.as_deref(),
+                        unsupported.as_deref(),
+                        routing_report,
+                    )
+                    .await;
+            }
             if !enabled {
                 if let Err(error) = publish_dns_gateway(&overlay_dns_slot, None) {
                     warn!(error = %error, "Could not clear the cluster DNS slot");
@@ -212,8 +281,39 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
             .await
             .unwrap_or(Err(ProxyDnsBootstrapError::NetworkTimeout));
 
-            let served = gateway.as_ref().ok().copied();
+            let now_unsupported = unsupported_after_lookup(
+                &gateway,
+                unsupported.as_deref(),
+                temps_dns::control_plane_resolver_unsupported,
+            );
+            if now_unsupported != unsupported {
+                match &now_unsupported {
+                    Some(reason) => warn!(
+                        reason = %reason,
+                        "Cluster DNS cannot run on this control plane; containers here keep Docker's embedded DNS"
+                    ),
+                    None if unsupported.is_some() => info!(
+                        "The app network's gateway is now an address of this machine; starting the control-plane resolver"
+                    ),
+                    None => {}
+                }
+                unsupported = now_unsupported;
+                reporter.expire();
+            }
+            let served = gateway
+                .as_ref()
+                .ok()
+                .copied()
+                .filter(|_| unsupported.is_none());
             let attempt = match gateway {
+                // Not an outage: it fails the same way on every attempt, so
+                // nothing is started and nothing is retried as a failure.
+                Ok(_) if unsupported.is_some() => {
+                    if let Some(resolver) = active.take() {
+                        resolver.shutdown().await;
+                    }
+                    publish_dns_gateway(&overlay_dns_slot, None)
+                }
                 Ok(gateway) => {
                     let healthy = if active.as_ref().is_some_and(|resolver| resolver.gateway() == gateway) {
                         temps_dns::probe_control_plane_resolver(std::net::SocketAddr::new(gateway, 53)).await
@@ -245,6 +345,7 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                 Err(error) => Err(error),
             };
             last_error = attempt.as_ref().err().map(ToString::to_string);
+            attempted = true;
             let now_served = attempt.as_ref().ok().and(served);
             // The proxy follows the resolver: same gateway, and only while it
             // answers there and no worker has a bridge, which is when the
@@ -302,17 +403,12 @@ pub(crate) fn spawn_control_plane_dns_bootstrap(
                     warn!(
                         error = %error,
                         attempts = failures,
-                        retry_in_secs = dns_retry_delay(failures).as_secs(),
+                        retry_in_secs = next_pass_delay(failures, unsupported.is_some()).as_secs(),
                         "Proxy cluster DNS reconciliation failed; containers keep Docker's embedded DNS until it recovers"
                     );
                 }
             }
-            tokio::time::sleep(if failures == 0 {
-                DNS_RETRY_INTERVAL
-            } else {
-                dns_retry_delay(failures)
-            })
-            .await;
+            tokio::time::sleep(next_pass_delay(failures, unsupported.is_some())).await;
         }
     });
 }
@@ -645,7 +741,7 @@ pub fn start_proxy_server(
         host_metrics: true,
         // ADR-107 D3: the loopback listener connectors on node 0 forward to.
         tunnel_origin,
-        // ADR-114 D3: node 0's private addresses, once consented.
+        // ADR-115 D3: node 0's private addresses, once consented.
         private_ingress,
     };
 
@@ -730,6 +826,65 @@ mod tests {
         // A failed read keeps whatever the previous pass acted on.
         assert!(cluster_dns_wanted(None, true));
         assert!(!cluster_dns_wanted(None, false));
+    }
+
+    #[test]
+    fn a_failed_gateway_lookup_keeps_an_unsupported_host_unsupported() {
+        let gateway: std::net::IpAddr = [172, 20, 0, 1].into();
+        let not_here = |_| Some("not an address of this machine".to_string());
+        let local = |_| None;
+        let failed: Result<std::net::IpAddr, ()> = Err(());
+
+        // Docker unreachable: nothing is learnt, the classification stands.
+        assert_eq!(
+            unsupported_after_lookup(&failed, Some("VM gateway"), local).as_deref(),
+            Some("VM gateway")
+        );
+        assert_eq!(unsupported_after_lookup(&failed, None, not_here), None);
+        // A gateway found is probed, either way.
+        assert_eq!(
+            unsupported_after_lookup(&Ok::<_, ()>(gateway), None, not_here).as_deref(),
+            Some("not an address of this machine")
+        );
+        assert_eq!(
+            unsupported_after_lookup(&Ok::<_, ()>(gateway), Some("VM gateway"), local),
+            None
+        );
+    }
+
+    #[test]
+    fn an_enabled_resolver_is_not_reported_down_before_it_was_tried() {
+        // Enabled, not tried yet: nothing is known, so nothing is reported.
+        assert!(!cluster_dns_reportable(true, false));
+        assert!(cluster_dns_reportable(true, true));
+        // Off is known without trying.
+        assert!(cluster_dns_reportable(false, false));
+    }
+
+    #[test]
+    fn the_pass_that_turns_cluster_dns_off_reports_nothing_running() {
+        assert_eq!(
+            reported_services(false, Some("resolver"), Some("routing")),
+            (None, None)
+        );
+        assert_eq!(
+            reported_services(true, Some("resolver"), Some("routing")),
+            (Some("resolver"), Some("routing"))
+        );
+    }
+
+    #[test]
+    fn an_unsupported_host_keeps_reporting_while_docker_lookups_fail() {
+        assert_eq!(next_pass_delay(0, true), DNS_RETRY_INTERVAL);
+        assert_eq!(next_pass_delay(2, true), Duration::from_secs(10));
+        // Backs off, but reports again within the interval.
+        assert_eq!(next_pass_delay(7, true), temps_dns::CP_REPORT_INTERVAL);
+        assert_eq!(
+            next_pass_delay(u32::MAX, true),
+            temps_dns::CP_REPORT_INTERVAL
+        );
+        // A resolver that fails to start keeps the long backoff.
+        assert_eq!(next_pass_delay(7, false), Duration::from_secs(300));
     }
 
     #[test]

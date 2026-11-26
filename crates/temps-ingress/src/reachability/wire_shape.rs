@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The words plans, runs and journals are stored and served with (ADR-116
+//! The words plans, runs and journals are stored and served with (ADR-117
 //! D5), pinned so that moving providers behind the trait cannot rename one.
 //!
 //! `reachability_plans.plan` stores a [`ReachabilityPlan`], and
@@ -98,7 +98,7 @@ pub(crate) fn assert_golden(name: &str, golden: &str, actual: &str) {
     let written = std::fs::write(&out, actual).is_ok();
     panic!(
         "The stored or served shape of reachability plans and runs changed ({name}). Stored \
-         rows and the generated clients use these names (ADR-116 D5). If the change is \
+         rows and the generated clients use these names (ADR-117 D5). If the change is \
          intended, migrate the stored rows and replace \
          crates/temps-ingress/src/reachability/wire_shape/{name} with {}{}.",
         out.display(),

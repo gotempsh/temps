@@ -3,7 +3,7 @@
 
 //! `GET`, `PUT` and `DELETE /settings/private-ingress`: the operator's
 //! consent for the control plane to serve private addresses on this machine
-//! (ADR-114 D2). See [`temps_config::private_ingress`].
+//! (ADR-115 D2). See [`temps_config::private_ingress`].
 
 use axum::{
     extract::{Extension, State},

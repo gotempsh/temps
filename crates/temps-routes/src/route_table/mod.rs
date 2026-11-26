@@ -1606,7 +1606,7 @@ pub struct CachedPeerTable {
     /// does not parse configuration.
     traefik_discovery_network: RwLock<Option<String>>,
 
-    /// The control plane's private view (ADR-114 D3): a table holding only
+    /// The control plane's private view (ADR-115 D3): a table holding only
     /// the private addresses node `0` serves on its listener, republished
     /// from every snapshot this table stores. Created on first use, so an
     /// install that never serves a private address pays nothing.
@@ -3860,6 +3860,8 @@ mod tests {
                 log_ingest_lines_per_sec: None,
                 log_ingest_kib_per_sec: None,
                 allowed_capabilities: Vec::new(),
+                identical_build_mode: Default::default(),
+                identical_build_scope: Default::default(),
             })
         }
 

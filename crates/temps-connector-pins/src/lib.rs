@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The connector builds Temps runs for its ingress providers (ADR-116 D7),
+//! The connector builds Temps runs for its ingress providers (ADR-117 D7),
 //! pinned by checksum, one module per provider.
 //!
 //! The control plane (`temps-ingress`) puts these in the specs it hands to
@@ -21,8 +21,12 @@ pub struct PinnedBinary {
     /// `std::env::consts::ARCH` of the node that may run it.
     pub arch: &'static str,
     pub url: &'static str,
-    /// Lowercase hex SHA-256 of the file at `url`.
+    /// Lowercase hex SHA-256 of the file at `url`: of the archive itself when
+    /// `archive_entry` is set.
     pub sha256: &'static str,
+    /// The file to run from inside a gzipped tarball download; `None` when
+    /// the download is the binary.
+    pub archive_entry: Option<&'static str>,
 }
 
 /// Every pinned binary of every provider: what an agent agrees to download
@@ -43,12 +47,30 @@ pub mod cloudflared {
             arch: "x86_64",
             url: "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-linux-amd64",
             sha256: "3bfc539f45d2620c71debb7a86be0efa737ed5ccbad9eb85c787116900e5c586",
+            archive_entry: None,
         },
         PinnedBinary {
             os: "linux",
             arch: "aarch64",
             url: "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-linux-arm64",
             sha256: "2c65dfabf616c40efc7545d107d7a57ad5e21377e2964b7e88af19a238074a46",
+            archive_entry: None,
+        },
+        // cloudflared publishes macOS builds only as `.tgz` archives holding
+        // the `cloudflared` binary; these pin the archives.
+        PinnedBinary {
+            os: "macos",
+            arch: "x86_64",
+            url: "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-darwin-amd64.tgz",
+            sha256: "3b0dbaf378337e9d7fb6cd235a76d1d6a7dee434c2d8edf9281164fb6a3837ab",
+            archive_entry: Some("cloudflared"),
+        },
+        PinnedBinary {
+            os: "macos",
+            arch: "aarch64",
+            url: "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-darwin-arm64.tgz",
+            sha256: "647615df99d49cd179ea5e13ef760b9bbfb33630f6ae62f87e33dfadda60adcc",
+            archive_entry: Some("cloudflared"),
         },
     ];
 
@@ -73,6 +95,25 @@ mod tests {
                 "{} has a checksum that is not lowercase hex",
                 binary.url
             );
+        }
+    }
+
+    #[test]
+    fn an_archive_and_only_an_archive_names_the_file_to_run() {
+        for binary in binaries() {
+            assert_eq!(
+                binary.url.ends_with(".tgz"),
+                binary.archive_entry.is_some(),
+                "{}",
+                binary.url
+            );
+            if let Some(entry) = binary.archive_entry {
+                assert!(
+                    !entry.is_empty() && !entry.contains('/') && !entry.contains(".."),
+                    "{} runs {entry:?}, which is not a plain file name",
+                    binary.url
+                );
+            }
         }
     }
 

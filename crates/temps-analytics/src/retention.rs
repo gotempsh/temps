@@ -1907,7 +1907,7 @@ mod integration_tests {
         visitor::ActiveModel {
             visitor_id: Set(name.to_string()),
             project_id: Set(ids.0),
-            environment_id: Set(ids.1),
+            environment_id: Set(Some(ids.1)),
             first_seen: Set(seen),
             last_seen: Set(seen),
             ip_address_id: Set(ip_address_id),

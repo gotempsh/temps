@@ -264,7 +264,7 @@ fn describe(ingress: &LocalIngress) -> String {
                 }
                 (None, false) => "private on no address".to_string(),
             };
-            // ADR-114 D8: who may connect, when the owner named it.
+            // ADR-115 D8: who may connect, when the owner named it.
             if ingress.admit.is_empty() {
                 described
             } else {

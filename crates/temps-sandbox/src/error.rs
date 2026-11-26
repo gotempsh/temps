@@ -272,6 +272,21 @@ pub enum SandboxError {
     )]
     ProjectHasNoRepo { project_id: i32, name: String },
 
+    /// The project stores no clone URL, and asking its git connection for
+    /// the URL of the repository it names failed (the repository is gone,
+    /// the connection lost access or needs reauthorizing). Mapped to HTTP
+    /// 502: the provider, not the request, is what failed.
+    #[error(
+        "Project {project_id} ('{name}') stores no clone URL, and git connection {connection_id} could not look up its repository {repository}: {reason}"
+    )]
+    ProjectRepositoryUnresolved {
+        project_id: i32,
+        name: String,
+        connection_id: i32,
+        repository: String,
+        reason: String,
+    },
+
     /// An operation exceeded the per-sandbox timeout.
     #[error("Operation timed out in sandbox {sandbox_id} after {timeout_secs}s")]
     Timeout {
@@ -452,6 +467,29 @@ pub enum SandboxError {
 }
 
 impl SandboxError {
+    /// What a caller is told about this error: the `Display` text, except for
+    /// [`Self::ProjectRepositoryUnresolved`], whose provider `reason` describes
+    /// a git connection the caller may not own (an organization's). That
+    /// reason belongs in the server log; the caller gets the project, the
+    /// connection, the repository and how to recover.
+    pub fn caller_detail(&self) -> String {
+        match self {
+            SandboxError::ProjectRepositoryUnresolved {
+                project_id,
+                name,
+                connection_id,
+                repository,
+                ..
+            } => format!(
+                "Project {project_id} ('{name}') stores no clone URL, and git connection \
+                 {connection_id} could not look up its repository {repository}. Check that the \
+                 repository still exists and that the connection still has access to it, or \
+                 set the project's repository URL."
+            ),
+            other => other.to_string(),
+        }
+    }
+
     /// An explicit request for the control plane on a server that runs no
     /// workloads (ADR 063).
     pub fn control_plane_requested_without_workloads() -> Self {
@@ -1063,5 +1101,34 @@ mod tests {
             },
         );
         assert!(matches!(err, SandboxError::Unavailable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_caller_is_not_shown_the_providers_error_about_a_project_connection() {
+        let err = SandboxError::ProjectRepositoryUnresolved {
+            project_id: 3,
+            name: "example-project".into(),
+            connection_id: 11,
+            repository: "example-owner/example-repository".into(),
+            reason: "403 from https://git.example.test for installation 99".into(),
+        };
+        // The log keeps everything.
+        assert!(err.to_string().contains("installation 99"));
+        let detail = err.caller_detail();
+        assert!(detail.contains("Project 3 ('example-project')"), "{detail}");
+        assert!(detail.contains("git connection 11"), "{detail}");
+        assert!(
+            detail.contains("example-owner/example-repository"),
+            "{detail}"
+        );
+        assert!(!detail.contains("git.example.test"), "{detail}");
+        assert!(!detail.contains("installation 99"), "{detail}");
+
+        // Every other error is told as it is.
+        let other = SandboxError::ProjectHasNoRepo {
+            project_id: 3,
+            name: "example-project".into(),
+        };
+        assert_eq!(other.caller_detail(), other.to_string());
     }
 }

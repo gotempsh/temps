@@ -851,7 +851,7 @@ pub fn private_listener_of(
 }
 
 /// The ranges a worker's private listener admits, as it reported them
-/// (ADR-114 D8): `10.8.0.0/24,fd00:1::/64`. `None` when it reports none
+/// (ADR-115 D8): `10.8.0.0/24,fd00:1::/64`. `None` when it reports none
 /// (an agent that predates it) or any it reports is not a private range,
 /// so the caller falls back to the listener's private block.
 pub fn private_admit_of(

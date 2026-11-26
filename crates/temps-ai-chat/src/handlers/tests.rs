@@ -2461,6 +2461,32 @@ fn workspace_secret_file_filter_allows_documented_examples() {
         "config/google-service-account.json"
     ));
     assert!(is_sensitive_workspace_path("../outside"));
+    // Issue #2023: names the original list missed.
+    for path in [
+        "keys/id_ecdsa",
+        "keys/ID_ED25519_SK",
+        "infra/prod.tfvars",
+        "infra/prod.tfvars.json",
+        ".pgpass",
+        ".my.cnf",
+        "public/.htpasswd",
+        "kubeconfig",
+        "deploy/staging.kubeconfig",
+        ".dockercfg",
+        ".boto",
+        ".s3cfg",
+        "AuthKey_ABC123.p8",
+    ] {
+        assert!(is_sensitive_workspace_path(path), "{path}");
+    }
+    assert!(!is_sensitive_workspace_path("keys/id_ecdsa.pub"));
+    assert!(!is_sensitive_workspace_path(
+        "infra/terraform.tfvars.example"
+    ));
+    assert!(!is_sensitive_workspace_path("docs/kubeconfig.md"));
+    // Public apt keyrings are .gpg files a Dockerfile copies in.
+    assert!(!is_sensitive_workspace_path("keys/nodesource.gpg"));
+    assert!(is_sensitive_workspace_path(".gnupg/private-keys-v1.d/key"));
     assert!(!is_sensitive_workspace_path(".env.example"));
     assert!(!is_sensitive_workspace_path("src/config.ts"));
     assert!(validate_workspace_import_path("src/config.ts").is_ok());

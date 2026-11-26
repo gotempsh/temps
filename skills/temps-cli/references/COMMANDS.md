@@ -304,6 +304,7 @@ Manage services: each one deployable app (the console calls these Services). To 
 - `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 - `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `container-security` - Show or change which Linux capabilities the project's deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)
+- `identical-builds` - Show or change what the project's builds do when an identical build (same repository, commit, build path and build-time values) is already running: build in parallel, queue, or build once and share the image
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a service
 
@@ -545,6 +546,19 @@ Show or change which Linux capabilities the project's deployment containers get 
 | `--remove <capabilities...>` | Stop allowing these capabilities | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip the confirmation (for automation) | - | No |
+
+### `projects identical-builds`
+
+Show or change what the project's builds do when an identical build (same repository, commit, build path and build-time values) is already running: build in parallel, queue, or build once and share the image
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mode <mode>` | parallel (default), queue or share | - | No |
+| `--scope <scope>` | Which builds wait for each other: source (same repository and path, the default) or fingerprint (only identical builds) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `projects config`
 
@@ -4369,13 +4383,14 @@ WireGuard mesh: lets nodes that only share the internet with the control plane j
 
 **Subcommands:**
 
-- `enable` - Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it cannot be turned off again
+- `enable` - Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it can be turned off again only while no node is on it
+- `disable` - Turn the WireGuard mesh off. Refused, with the reason, while a node is on it, a pairing is in progress or the cluster network runs over it. The control plane stops tending its end; the interface itself goes away when `temps serve` restarts
 - `hub` - Mesh hub: a member that relays between members that cannot reach each other (two nodes behind NAT). Shows the hub and every pair it carries
 - `doctor` - Check the mesh from the control plane: its end, every node link and every pairing in progress, each failure with what fixes it. Exits 1 when a check fails. For a node's own end, run `temps doctor mesh` on it
 
 #### `nodes mesh enable`
 
-Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it cannot be turned off again
+Turn the WireGuard mesh on. The control plane and every agent move onto it within a minute; it can be turned off again only while no node is on it
 
 **Options:**
 
@@ -4384,6 +4399,17 @@ Turn the WireGuard mesh on. The control plane and every agent move onto it withi
 | `--cidr <cidr>` | Mesh address pool (private IPv4, clear of the compute pool) | - | No |
 | `--port <port>` | UDP port every node must accept from the others | - | No |
 | `--node-api-port <port>` | TCP port nodes reach this control plane on over the mesh (default: the mesh port) | - | No |
+| `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes mesh disable`
+
+Turn the WireGuard mesh off. Refused, with the reason, while a node is on it, a pairing is in progress or the cluster network runs over it. The control plane stops tending its end; the interface itself goes away when `temps serve` restarts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -7229,7 +7255,9 @@ Create a new IP access control rule
 | `--ip <ip_or_cidr>` | IPv4 or IPv6 address or CIDR range (e.g., "192.168.1.1", "10.0.0.0/24", or "2001:db8::/32") | - | No |
 | `--action <action>` | Action to take: "allow" or "deny" | - | No |
 | `--description <desc>` | Optional description/reason for the rule | - | No |
-| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--confirm-broad-range` | Save a block range wider than /8 (IPv4) or /16 (IPv6) | - | No |
+| `--acknowledge-lockout` | Save a block rule even if it matches the address you are calling from | - | No |
+| `-y, --yes` | Skip prompts (for automation); does not confirm a broad range or a lockout | - | No |
 
 ### `ip-access show`
 
@@ -7254,6 +7282,8 @@ Update an IP access control rule
 | `--ip <ip>` | New IP address or CIDR range | - | No |
 | `--action <action>` | New action: "allow" or "deny" | - | No |
 | `--description <desc>` | New description/reason | - | No |
+| `--confirm-broad-range` | Save a block range wider than /8 (IPv4) or /16 (IPv6) | - | No |
+| `--acknowledge-lockout` | Save a block rule even if it matches the address you are calling from | - | No |
 
 ### `ip-access remove` (alias: `rm`)
 

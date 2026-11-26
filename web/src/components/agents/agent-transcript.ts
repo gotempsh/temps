@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * The transcript of an agent run on Temps' own tool loop (ADR-115 D2): one
+ * The transcript of an agent run on Temps' own tool loop (ADR-116 D2): one
  * JSON object per line, `temps.text`, `temps.tool_call`, `temps.tool_result`
  * and `temps.finish`.
  */

@@ -447,7 +447,7 @@ pub struct ProxyContext {
     /// not set the gate's cookies or pass for the gate.
     pub gated_host: bool,
     /// Node `0`'s private route for this request, when it arrived on the
-    /// consented private address (ADR-114 D3). The request then goes to this
+    /// consented private address (ADR-115 D3). The request then goes to this
     /// route and nowhere else: never the console.
     pub private_route: Option<temps_routes::RouteInfo>,
     /// Who the gate admitted, for a signed-in address.
@@ -615,7 +615,7 @@ pub struct LoadBalancer {
     /// The signed-in gate (ADR 065 D8). `None` only in test harnesses that
     /// never serve a signed-in address; `setup_proxy_server` always sets it.
     gate: Option<Arc<crate::handler::gate::ProxyGate>>,
-    /// The control plane's private path (ADR-114 D3). `None` outside
+    /// The control plane's private path (ADR-115 D3). `None` outside
     /// `temps serve`: nothing is ever served privately here then.
     private_ingress: Option<Arc<PrivateIngressPath>>,
 }
@@ -1033,7 +1033,7 @@ impl LoadBalancer {
     }
 
     /// Serve node `0`'s private addresses on the consented private address
-    /// (ADR-114 D3).
+    /// (ADR-115 D3).
     pub fn with_private_ingress(mut self, path: Option<Arc<PrivateIngressPath>>) -> Self {
         self.private_ingress = path;
         self
@@ -4499,7 +4499,7 @@ impl ProxyHttp for LoadBalancer {
                 target.select_backend_avoiding(&ctx.failed_upstreams),
             )?
         } else if let Some(route) = ctx.private_route.as_ref() {
-            // ADR-114 D3: the private route admitted in `request_filter`, and
+            // ADR-115 D3: the private route admitted in `request_filter`, and
             // nothing else; no fallback to the console.
             crate::services::peer_for_selection(
                 route.select_backend_avoiding(&ctx.failed_upstreams),

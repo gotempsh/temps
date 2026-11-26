@@ -34,6 +34,9 @@ pub struct S3SourceDeletedAudit {
     pub source_id: i32,
     pub name: String,
     pub bucket_name: String,
+    /// Source that became the default because the deleted one was it.
+    pub promoted_default_source_id: Option<i32>,
+    pub promoted_default_source_name: Option<String>,
 }
 
 // Backup audit structs
@@ -110,7 +113,7 @@ pub struct RestoreRunAudit {
     pub source_service_id: i32,
     pub source_service_name: String,
     pub service_type: String,
-    pub source_backup_id: i32,
+    pub source_backup_id: Option<i32>,
     pub mode: String,
     pub target_service_name: Option<String>,
     /// Services recorded as having produced the backup (empty when unknown).
@@ -131,8 +134,8 @@ pub struct RestoreRunCancelledAudit {
     pub service_id: i32,
     pub service_name: String,
     pub service_type: String,
-    /// `0` for a restore from a raw S3 location.
-    pub source_backup_id: i32,
+    /// Local backup row, when the backup is tracked on this server.
+    pub source_backup_id: Option<i32>,
     pub mode: String,
     /// Name of the service a new-service restore would have created.
     pub target_service_name: Option<String>,
@@ -547,5 +550,51 @@ impl AuditOperation for PgUpgradeMutationAudit {
 
     fn serialize(&self) -> temps_core::AuditResult<String> {
         temps_core::serialize_audit_operation(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphan_restore_start_and_cancellation_audit_a_null_source() -> Result<(), serde_json::Error>
+    {
+        let context = AuditContext {
+            user_id: 1,
+            ip_address: None,
+            user_agent: "test".into(),
+        };
+        let start = RestoreRunAudit {
+            context: context.clone(),
+            restore_run_id: 3,
+            source_service_id: 4,
+            source_service_name: "service-a".into(),
+            service_type: "postgres".into(),
+            source_backup_id: None,
+            mode: "in_place".into(),
+            target_service_name: None,
+            backup_origin_service_ids: vec![],
+            cross_service: true,
+            cross_service_confirmed: true,
+        };
+        let cancel = RestoreRunCancelledAudit {
+            context,
+            restore_run_id: 3,
+            service_id: 4,
+            service_name: "service-a".into(),
+            service_type: "postgres".into(),
+            source_backup_id: None,
+            mode: "in_place".into(),
+            target_service_name: None,
+            phase: "prepare".into(),
+        };
+        for audit in [serde_json::to_value(start)?, serde_json::to_value(cancel)?] {
+            assert_eq!(
+                audit.get("source_backup_id"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+        Ok(())
     }
 }

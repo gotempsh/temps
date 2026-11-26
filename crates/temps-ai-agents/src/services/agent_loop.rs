@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! An agent run on Temps' own tool loop (ADR-115 D2).
+//! An agent run on Temps' own tool loop (ADR-116 D2).
 //!
 //! The model comes from the AI gateway ([`AiService::chat`]); the agent works
 //! in its run's sandbox through three tools, the same ones a chat with a

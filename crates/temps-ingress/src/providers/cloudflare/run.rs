@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Cloudflare's part of a reachability run (ADR-116 D3): the steps only a
+//! Cloudflare's part of a reachability run (ADR-117 D3): the steps only a
 //! Cloudflare zone or tunnel has, and the journal entries they write, which
 //! only Cloudflare can find again and undo. The engine
 //! ([`crate::reachability::run`]) keeps the journal and its rules; these steps

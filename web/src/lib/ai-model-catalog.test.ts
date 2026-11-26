@@ -8,11 +8,14 @@ import {
   catalogSettingsSchema,
   catalogSettingsToForm,
   catalogSourceLabel,
+  clampPage,
   formatPerMillion,
   formatTokens,
   isNewerVersion,
   latestReleaseVersion,
   newestVersion,
+  releaseCheckOutcome,
+  updateOutcome,
 } from './ai-model-catalog'
 
 const settings = {
@@ -238,5 +241,275 @@ describe('agentVersionState', () => {
     expect(isNewerVersion('2.1.263', '2.1.263')).toBe(false)
     expect(isNewerVersion('2.1.263-beta.1', '2.1.263')).toBe(false)
     expect(isNewerVersion('unknown', '2.1.263')).toBe(false)
+  })
+})
+
+describe('agentVersionState after a withdrawn release', () => {
+  it('ignores the workspace flag once a newer check says the release is gone', () => {
+    // The workspace cached 1.1.0 at 10:00; npm withdrew it and an 11:00
+    // registry check reports 1.0.0, which is what is installed.
+    expect(
+      agentVersionState(
+        { latest_version: '1.0.0', checked_at: '2026-11-24T11:00:00Z' },
+        {
+          installed_version: '1.0.0',
+          latest_version: '1.1.0',
+          update_available: true,
+          updating: false,
+          checked_at: '2026-11-24T10:00:00Z',
+        }
+      )
+    ).toEqual({ kind: 'current', installed: '1.0.0' })
+  })
+
+  it('never takes a failed registry lookup for a newer check', () => {
+    // The registry last found 1.0.0; the workspace since found 1.1.0. A
+    // lookup that times out at 11:00 keeps 1.0.0 with the failure's time:
+    // that is no evidence 1.1.0 was withdrawn.
+    const workspace = {
+      installed_version: '1.0.0',
+      latest_version: '1.1.0',
+      update_available: true,
+      updating: false,
+      checked_at: '2026-11-24T10:00:00Z',
+    }
+    const failed = {
+      latest_version: '1.0.0',
+      checked_at: '2026-11-24T11:00:00Z',
+      error: 'registry request timed out',
+    }
+    expect(agentVersionState(failed, workspace)).toEqual({
+      kind: 'behind',
+      installed: '1.0.0',
+      latest: '1.1.0',
+    })
+    expect(latestReleaseVersion(failed, workspace)).toBe('1.1.0')
+  })
+
+  it('keeps a dated workspace check over a failed lookup with a higher version', () => {
+    // The registry kept 1.1.0 from before a failed 09:00 lookup; the
+    // workspace checked at 10:00 and found 1.0.0 is the latest (1.1.0 was
+    // withdrawn), which is installed.
+    const failed = {
+      latest_version: '1.1.0',
+      checked_at: '2026-11-24T09:00:00Z',
+      error: 'registry request timed out',
+    }
+    const workspace = {
+      installed_version: '1.0.0',
+      latest_version: '1.0.0',
+      update_available: false,
+      updating: false,
+      checked_at: '2026-11-24T10:00:00Z',
+    }
+    expect(latestReleaseVersion(failed, workspace)).toBe('1.0.0')
+    expect(agentVersionState(failed, workspace)).toEqual({
+      kind: 'current',
+      installed: '1.0.0',
+    })
+    // Without a workspace date there is nothing to rank: the newer one.
+    expect(
+      latestReleaseVersion(failed, { ...workspace, checked_at: null })
+    ).toBe('1.1.0')
+  })
+
+  it('confirms nothing about a version kept from before a failed read', () => {
+    const kept = {
+      installed_version: '1.1.0',
+      latest_version: '1.1.0',
+      update_available: false,
+      updating: false,
+      checked_at: '2026-11-24T10:00:00Z',
+    }
+    expect(
+      agentVersionState(
+        { latest_version: '1.1.0' },
+        kept,
+        'Your workspace could not be inspected'
+      )
+    ).toEqual({
+      kind: 'unknown',
+      installed: '1.1.0',
+      reason: 'Your workspace could not be inspected',
+    })
+    // A read that succeeded is still trusted.
+    expect(agentVersionState({ latest_version: '1.1.0' }, kept)).toEqual({
+      kind: 'current',
+      installed: '1.1.0',
+    })
+  })
+})
+
+describe('agentVersionState before the workspace was read', () => {
+  it('is unchecked rather than unknown when nothing was read yet', () => {
+    expect(
+      agentVersionState(
+        { latest_version: '1.1.0' },
+        {
+          installed_version: null,
+          latest_version: null,
+          update_available: false,
+          updating: false,
+          checked_at: null,
+          detail: null,
+        }
+      )
+    ).toEqual({ kind: 'unchecked' })
+    // A failed read is not "unchecked": it says why.
+    expect(
+      agentVersionState(
+        { latest_version: '1.1.0' },
+        {
+          installed_version: null,
+          update_available: false,
+          updating: false,
+          checked_at: '2026-11-24T10:00:00Z',
+          detail: 'the installed version could not be read from the workspace',
+        }
+      )
+    ).toEqual({
+      kind: 'unknown',
+      reason: 'the installed version could not be read from the workspace',
+    })
+  })
+})
+
+describe('updateOutcome', () => {
+  const release = { latest_version: '1.1.0', checked_at: null, error: null }
+
+  it('is a success only when the workspace reports the new version', () => {
+    expect(
+      updateOutcome('Codex', release, {
+        installed_version: '1.1.0',
+        latest_version: '1.1.0',
+        update_available: false,
+        updating: false,
+      })
+    ).toEqual({ level: 'success', message: 'Codex updated to 1.1.0' })
+    const stillBehind = updateOutcome('Codex', release, {
+      installed_version: '1.0.0',
+      latest_version: '1.1.0',
+      update_available: true,
+      updating: false,
+    })
+    expect(stillBehind.level).toBe('warning')
+    expect(stillBehind.message).toContain('still reports 1.0.0')
+    const unreadable = updateOutcome('Codex', release, {
+      installed_version: null,
+      latest_version: '1.1.0',
+      update_available: false,
+      updating: false,
+      detail: 'the installed version could not be read from the workspace',
+    })
+    expect(unreadable.level).toBe('warning')
+    expect(unreadable.message).toContain('could not be read')
+    expect(unreadable.message).not.toContain('latest release')
+  })
+
+  it('checks against the registry release when the workspace lookup failed', () => {
+    // A home install without npm: the updater exited zero, the workspace
+    // could not look up the latest release, and the CLI is still old.
+    const stale = updateOutcome('Codex', release, {
+      installed_version: '1.0.0',
+      latest_version: null,
+      update_available: false,
+      updating: false,
+      detail: 'the latest version could not be looked up (exit 127)',
+    })
+    expect(stale).toEqual({
+      level: 'warning',
+      message:
+        'Codex still reports 1.0.0 (latest 1.1.0); another copy may come first on PATH',
+    })
+    expect(
+      updateOutcome('Codex', release, {
+        installed_version: '1.1.0',
+        latest_version: null,
+        update_available: false,
+        updating: false,
+      })
+    ).toEqual({ level: 'success', message: 'Codex updated to 1.1.0' })
+  })
+
+  it('names a pre-release instead of reporting the update as done', () => {
+    const beta = updateOutcome('Codex', release, {
+      installed_version: '1.1.0-beta.1',
+      latest_version: '1.1.0',
+      update_available: false,
+      updating: false,
+    })
+    expect(beta).toEqual({
+      level: 'warning',
+      message:
+        'Codex now reports 1.1.0-beta.1, a pre-release; the latest release 1.1.0 is not installed',
+    })
+    // The row still counts it as current, as the server does.
+    expect(
+      agentVersionState(release, {
+        installed_version: '1.1.0-beta.1',
+        latest_version: '1.1.0',
+        update_available: false,
+        updating: false,
+        checked_at: '2026-11-25T09:00:00Z',
+      }).kind
+    ).toBe('current')
+    // The exact release, with or without a leading v, is a success.
+    expect(
+      updateOutcome('Codex', release, {
+        installed_version: 'v1.1.0',
+        latest_version: '1.1.0',
+        update_available: false,
+        updating: false,
+      }).level
+    ).toBe('success')
+  })
+
+  it('never claims success when no latest release is known at all', () => {
+    const unconfirmed = updateOutcome(
+      'Codex',
+      { latest_version: null, error: 'the registry did not answer' },
+      {
+        installed_version: '1.0.0',
+        latest_version: null,
+        update_available: false,
+        updating: false,
+      }
+    )
+    expect(unconfirmed.level).toBe('warning')
+    expect(unconfirmed.message).toContain('could not be looked up to confirm')
+  })
+})
+
+describe('releaseCheckOutcome', () => {
+  it('reports lookups that failed instead of a plain success', () => {
+    expect(releaseCheckOutcome([{ name: 'Codex' }])).toEqual({
+      level: 'success',
+      message: 'Checked for new releases',
+    })
+    expect(
+      releaseCheckOutcome([
+        { name: 'Claude Code', error: 'registry returned 503' },
+        { name: 'Codex' },
+      ])
+    ).toEqual({
+      level: 'warning',
+      message: 'Releases could not be looked up for Claude Code',
+    })
+    expect(
+      releaseCheckOutcome([
+        { name: 'Claude Code', error: 'registry returned 503' },
+        { name: 'Codex', error: 'registry returned 503' },
+      ]).level
+    ).toBe('error')
+  })
+})
+
+describe('clampPage', () => {
+  it('moves back to the last page that exists', () => {
+    expect(clampPage(2, 10, 20)).toBe(1)
+    expect(clampPage(3, 41, 20)).toBe(3)
+    expect(clampPage(5, 41, 20)).toBe(3)
+    expect(clampPage(2, 0, 20)).toBe(1)
+    expect(clampPage(0, 30, 20)).toBe(1)
   })
 })

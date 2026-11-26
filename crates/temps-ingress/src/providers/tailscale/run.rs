@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Tailscale's part of a reachability run (ADR-116 D3, ADR 065): saving
+//! Tailscale's part of a reachability run (ADR-117 D3, ADR 065): saving
 //! a pasted OAuth client, defining the address's Service, declaring the
 //! worker's Serve entry, and waiting for the admin to approve the worker as
 //! the Service's host. The engine ([`crate::reachability::run`]) keeps the

@@ -1121,7 +1121,6 @@ function GoalSuggestions({
   const resultsHeading = useRef<HTMLHeadingElement>(null)
   useEffect(() => {
     onResultsChange(step === 'goals')
-    if (step === 'goals') resultsHeading.current?.focus()
   }, [step, onResultsChange])
   const [requestedUrl, setRequestedUrl] = useState<string | null>(null)
   const selectedDomain = domains.data?.find(
@@ -1147,6 +1146,13 @@ function GoalSuggestions({
     // The status says whether a cooldown started and when it ends.
     onSettled: onActionSettled,
   })
+  // The goals render once the step and the suggestions are both in; the
+  // mutation's onSuccess sets the step a render before its data, so focus
+  // follows the rendered heading, not the step.
+  const showingGoals = step === 'goals' && suggest.data != null
+  useEffect(() => {
+    if (showingGoals) resultsHeading.current?.focus()
+  }, [showingGoals])
   return (
     <section aria-label="Website analysis">
       <div className="space-y-4">
@@ -1305,7 +1311,7 @@ function GoalSuggestions({
             </Button>
           </div>
         )}
-        {step === 'goals' && suggest.data && (
+        {showingGoals && suggest.data && (
           <div className="space-y-6">
             <div className="space-y-4">
               <Button

@@ -7,7 +7,7 @@ import { Wand2 } from 'lucide-react'
 import { Link } from 'react-router'
 
 /**
- * Shown on a run of the earlier, CLI-driven autofixer (ADR-115 D2): the run
+ * Shown on a run of the earlier, CLI-driven autofixer (ADR-116 D2): the run
  * stays readable, and fixing the error again starts an autofix incident from
  * its error group.
  */

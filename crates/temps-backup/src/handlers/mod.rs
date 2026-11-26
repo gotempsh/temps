@@ -6,6 +6,8 @@ pub(crate) mod authz;
 pub(crate) mod backup_handler;
 pub(crate) mod pg_upgrade_handler;
 pub(crate) mod restore_handler;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod types;
 
 // Re-export commonly used types and functions

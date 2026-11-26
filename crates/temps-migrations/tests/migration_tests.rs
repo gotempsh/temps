@@ -10768,3 +10768,319 @@ async fn test_ai_model_catalog_tables_default_bound_and_reverse() -> anyhow::Res
     }
     Ok(())
 }
+
+/// `visitor.environment_id` stored "no environment" as a `0` sentinel (#2029).
+/// `up` makes the column nullable and turns existing `0` rows into `NULL`,
+/// leaving real environment ids alone; `down` maps `NULL` back to `0` and
+/// restores `NOT NULL`, losing nothing because the two meant the same thing.
+#[tokio::test]
+async fn test_visitor_environment_zero_becomes_null_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261124_000002_nullable_visitor_environment";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping visitor.environment_id migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert_eq!(
+        visitor_environment_nullable(&db).await?,
+        "NO",
+        "before the migration"
+    );
+    db.execute_unprepared(
+        "INSERT INTO projects (id, name, slug, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at) \
+         VALUES (1, 'Sample site', 'sample-site', 'sample', 'example', '/', 'main', 'static', now(), now()); \
+         INSERT INTO visitor (visitor_id, first_seen, last_seen, project_id, environment_id) VALUES \
+           ('visitor-no-environment', now(), now(), 1, 0), \
+           ('visitor-with-environment', now(), now(), 1, 4)",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(visitor_environment_nullable(&db).await?, "YES");
+    assert_eq!(
+        visitor_environments(&db).await?,
+        vec![
+            ("visitor-no-environment".to_string(), None),
+            ("visitor-with-environment".to_string(), Some(4)),
+        ]
+    );
+    db.execute_unprepared(
+        "INSERT INTO visitor (visitor_id, first_seen, last_seen, project_id, environment_id) \
+         VALUES ('visitor-written-after-upgrade', now(), now(), 1, NULL)",
+    )
+    .await?;
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert_eq!(visitor_environment_nullable(&db).await?, "NO");
+    assert_eq!(
+        visitor_environments(&db).await?,
+        vec![
+            ("visitor-no-environment".to_string(), Some(0)),
+            ("visitor-with-environment".to_string(), Some(4)),
+            ("visitor-written-after-upgrade".to_string(), Some(0)),
+        ]
+    );
+    Ok(())
+}
+
+async fn visitor_environment_nullable(db: &DatabaseConnection) -> anyhow::Result<String> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_name = 'visitor' AND column_name = 'environment_id'"
+                .to_string(),
+        ))
+        .await?
+        .expect("visitor.environment_id column");
+    Ok(row.try_get("", "is_nullable")?)
+}
+
+async fn visitor_environments(
+    db: &DatabaseConnection,
+) -> anyhow::Result<Vec<(String, Option<i32>)>> {
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT visitor_id, environment_id FROM visitor ORDER BY visitor_id".to_string(),
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get("", "visitor_id")?,
+                row.try_get("", "environment_id")?,
+            ))
+        })
+        .collect()
+}
+
+/// `status_monitor_interval_changes` records the interval a monitor had
+/// before each change, so uptime coverage of windows that have ended does not
+/// move with a later interval change (#2039). Rows need a monitor, reject a
+/// non-positive interval and go with their monitor; `down` drops the table.
+#[tokio::test]
+async fn test_status_monitor_interval_changes_table_up_and_down() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000001_status_monitor_interval_changes";
+    const TABLE: &str = "status_monitor_interval_changes";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping monitor interval history migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(
+        !table_exists(&db, TABLE).await?,
+        "{TABLE} before the migration"
+    );
+    db.execute_unprepared(
+        "INSERT INTO projects (id, name, slug, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at) \
+         VALUES (1, 'Sample site', 'sample-site', 'sample', 'example', '/', 'main', 'static', now(), now()); \
+         INSERT INTO status_monitors (id, project_id, name, monitor_type, check_interval_seconds, is_active, created_at, updated_at) \
+         VALUES (7, 1, 'Sample monitor', 'web', 60, true, now(), now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    assert!(table_exists(&db, TABLE).await?, "{TABLE} after up");
+    db.execute_unprepared(
+        "INSERT INTO status_monitor_interval_changes (monitor_id, previous_interval_seconds) \
+         VALUES (7, 60)",
+    )
+    .await?;
+    for rejected in [
+        "INSERT INTO status_monitor_interval_changes (monitor_id, previous_interval_seconds) VALUES (7, 0)",
+        "INSERT INTO status_monitor_interval_changes (monitor_id, previous_interval_seconds) VALUES (999, 60)",
+    ] {
+        assert!(
+            db.execute_unprepared(rejected).await.is_err(),
+            "{rejected} must be rejected"
+        );
+    }
+    db.execute_unprepared("DELETE FROM status_monitors WHERE id = 7")
+        .await?;
+    let remaining = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM status_monitor_interval_changes".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(
+        remaining.try_get::<i64>("", "n")?,
+        0,
+        "rows go with their monitor"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(!table_exists(&db, TABLE).await?, "{TABLE} after down");
+    Ok(())
+}
+
+/// Whether each catalog capability was stated lives in new `*_stated`
+/// columns, leaving `supports_*` `NOT NULL` so the previous binary still reads
+/// every row: existing rows and rows inserted without the new columns count as
+/// stated, and `down` drops the three columns.
+#[tokio::test]
+async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000002_ai_model_catalog_unknown_capabilities";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!(
+                    "Skipping AI model catalog capability migration test: Docker unavailable"
+                );
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, supports_tools, source_url, fetched_at) \
+         VALUES ('openai', 'existing-model', 'Existing', TRUE, 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    // The previous binary inserts without the new columns.
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, source_url, fetched_at) \
+         VALUES ('openai', 'previous-binary-model', 'Previous', 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+    // The new binary records an unknown capability as FALSE, not stated.
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, supports_vision, vision_stated, source_url, fetched_at) \
+         VALUES ('openai', 'silent-model', 'Silent', FALSE, FALSE, 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+    let stated = |model: &'static str| {
+        let db = &db;
+        async move {
+            db.query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT tools_stated, vision_stated, reasoning_stated \
+                 FROM ai_model_catalog_entries WHERE model_id = $1",
+                [model.into()],
+            ))
+            .await
+            .map(|row| {
+                let row = row.expect("entry");
+                (
+                    row.try_get::<bool>("", "tools_stated").expect("tools"),
+                    row.try_get::<bool>("", "vision_stated").expect("vision"),
+                    row.try_get::<bool>("", "reasoning_stated")
+                        .expect("reasoning"),
+                )
+            })
+        }
+    };
+    assert_eq!(stated("existing-model").await?, (true, true, true));
+    assert_eq!(stated("previous-binary-model").await?, (true, true, true));
+    assert_eq!(stated("silent-model").await?, (true, false, true));
+    assert!(
+        db.execute_unprepared(
+            "UPDATE ai_model_catalog_entries SET supports_tools = NULL WHERE model_id = 'silent-model'"
+        )
+        .await
+        .is_err(),
+        "supports_tools stays NOT NULL for the previous binary"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    for column in ["tools_stated", "vision_stated", "reasoning_stated"] {
+        assert!(
+            !column_exists(&db, "ai_model_catalog_entries", column).await?,
+            "{column} after down"
+        );
+    }
+    Ok(())
+}

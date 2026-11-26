@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-115: Agents run on the AI gateway only
+# ADR-116: Agents run on the AI gateway only
 
 **Status:** Proposed
 **Date:** 2026-11-24

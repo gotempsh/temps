@@ -555,11 +555,13 @@ impl PostgresService {
             for key in properties.keys().cloned().collect::<Vec<_>>() {
                 // Define which fields should be editable
                 let editable = match key.as_str() {
-                    "host" => false,           // Don't change host after creation
-                    "port" => true,            // Port can be changed
-                    "database" => false,       // Don't change database name after creation
-                    "username" => false,       // Don't change username after creation
-                    "password" => true,        // Password can be changed by user
+                    "host" => false,     // Don't change host after creation
+                    "port" => true,      // Port can be changed
+                    "database" => false, // Don't change database name after creation
+                    "username" => false, // Don't change username after creation
+                    // Changing it would need the role's password changed in
+                    // the running database too; updates reject it.
+                    "password" => false,
                     "max_connections" => true, // Max connections can be adjusted
                     "ssl_mode" => true,        // SSL mode can be changed
                     "docker_image" => true,    // Docker image can be upgraded

@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use temps_connector_pins::PinnedBinary;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use temps_connector_pins::PinnedBinary;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
@@ -54,6 +54,7 @@ fn ensure_trusted(artifact: &Artifact) -> Result<(), String> {
             && t.arch == artifact.arch
             && t.url == artifact.url
             && t.sha256 == sha256
+            && t.archive_entry == artifact.archive_entry.as_deref()
     });
     if trusted {
         Ok(())
@@ -98,9 +99,33 @@ impl ProcessDriver {
             .find(|a| a.os == std::env::consts::OS && a.arch == std::env::consts::ARCH)
     }
 
-    /// The verified binary for `artifact`, downloading it on first use.
+    /// The verified binary for `artifact`, downloading it on first use. An
+    /// archive is verified the same way, then its entry is extracted afresh on
+    /// every start, so what runs always comes from a checked download.
     async fn binary(&self, artifact: &Artifact, bin_dir: &Path) -> Result<PathBuf, String> {
         ensure_trusted(artifact)?;
+        let download = self.download(artifact, bin_dir).await?;
+        match artifact.archive_entry.as_deref() {
+            None => Ok(download),
+            Some(entry) => {
+                let target =
+                    bin_dir.join(format!("{}-{entry}", artifact.sha256.to_ascii_lowercase()));
+                let entry = entry.to_string();
+                let url = artifact.url.clone();
+                tokio::task::spawn_blocking(move || {
+                    extract_entry(&download, &entry, &target, &url).map(|()| target)
+                })
+                .await
+                .map_err(|e| {
+                    format!("extracting the connector from {} failed: {e}", artifact.url)
+                })?
+            }
+        }
+    }
+
+    /// The file at `artifact.url`, verified against its pinned checksum and
+    /// cached by it, downloading it on first use.
+    async fn download(&self, artifact: &Artifact, bin_dir: &Path) -> Result<PathBuf, String> {
         let expected = artifact.sha256.to_ascii_lowercase();
         let path = bin_dir.join(&expected);
         if sha256_of_file(&path).await.ok().as_deref() == Some(expected.as_str()) {
@@ -129,7 +154,7 @@ impl ProcessDriver {
         }
         // Streamed to disk and hashed as it arrives: a large body (an error
         // page served with 200, say) must not be buffered in memory first.
-        let tmp = bin_dir.join(format!("{expected}.part"));
+        let tmp = unique_part(&path);
         let actual = match download_to(response, &tmp, &artifact.url).await {
             Ok(actual) => actual,
             Err(error) => {
@@ -144,14 +169,36 @@ impl ProcessDriver {
                 artifact.url
             ));
         }
-        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+        // An archive is only read, never run.
+        let mode = if artifact.archive_entry.is_some() {
+            0o644
+        } else {
+            0o755
+        };
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
             .await
-            .map_err(|e| format!("could not make {} executable: {e}", tmp.display()))?;
+            .map_err(|e| format!("could not set the mode of {}: {e}", tmp.display()))?;
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| format!("could not install {}: {e}", path.display()))?;
         Ok(path)
     }
+}
+
+/// A temporary path beside `path` that no other write uses. Two connectors
+/// starting at once with the same artifact each download and extract into
+/// their own file, so neither truncates the other's, and only a complete,
+/// checked file is renamed over `path`.
+fn unique_part(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{}.{n}.part", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Larger than any connector binary we pin (cloudflared is about 40 MiB);
@@ -197,6 +244,67 @@ async fn download_to(
         .await
         .map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Install the regular file `entry` of the gzipped tarball `archive` at
+/// `target`, executable. Only that exact name at the archive's root is taken
+/// (`./` aside): no other path, link or directory, and nothing larger than
+/// [`MAX_CONNECTOR_BYTES`]. Written beside `target` and renamed over it, so a
+/// partial write never replaces a working binary.
+fn extract_entry(archive: &Path, entry: &str, target: &Path, url: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    if !valid_secret_name(entry) {
+        return Err(format!("{url}: refusing archive entry name '{entry}'"));
+    }
+    let file = std::fs::File::open(archive)
+        .map_err(|e| format!("could not open {}: {e}", archive.display()))?;
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let entries = tar
+        .entries()
+        .map_err(|e| format!("{url} is not a readable .tar.gz: {e}"))?;
+    for item in entries {
+        let mut item = item.map_err(|e| format!("{url} is not a readable .tar.gz: {e}"))?;
+        let path = item
+            .path()
+            .map_err(|e| format!("{url} has an unreadable entry name: {e}"))?;
+        let name = path.strip_prefix(".").unwrap_or(&path);
+        if name != Path::new(entry) {
+            continue;
+        }
+        if !item.header().entry_type().is_file() {
+            return Err(format!(
+                "{url}: '{entry}' is not a regular file in the archive; refusing to run it"
+            ));
+        }
+        if item.size() > MAX_CONNECTOR_BYTES {
+            return Err(too_large(url));
+        }
+        let tmp = unique_part(target);
+        let written = (|| -> std::io::Result<()> {
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&tmp)?;
+            let mut limited = (&mut item).take(MAX_CONNECTOR_BYTES);
+            std::io::copy(&mut limited, &mut out)?;
+            out.flush()?;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::rename(&tmp, target)
+        })();
+        return written.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!(
+                "could not extract '{entry}' from {url} to {}: {e}",
+                target.display()
+            )
+        });
+    }
+    Err(format!(
+        "{url} has no '{entry}' at its root; refusing to guess which file to run"
+    ))
 }
 
 /// Hex SHA-256 of a file, read in chunks.
@@ -518,7 +626,169 @@ mod tests {
             arch: arch.into(),
             url: url.into(),
             sha256: sha256.into(),
+            archive_entry: None,
         }
+    }
+
+    fn cloudflared_archive(arch: &str, url: &str, sha256: &str, entry: Option<&str>) -> Artifact {
+        Artifact {
+            os: "macos".into(),
+            arch: arch.into(),
+            url: url.into(),
+            sha256: sha256.into(),
+            archive_entry: entry.map(String::from),
+        }
+    }
+
+    /// A gzipped tarball of `(path, contents, entry type)`.
+    fn tgz(dir: &Path, entries: &[(&str, &[u8], tar::EntryType)]) -> PathBuf {
+        let path = dir.join("archive.tgz");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            file,
+            flate2::Compression::fast(),
+        ));
+        for (name, contents, kind) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(*kind);
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_path(name).unwrap();
+            header.set_cksum();
+            builder.append(&header, *contents).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn an_archive_is_trusted_only_with_its_pinned_entry() {
+        let pinned = trusted_artifacts()
+            .find(|t| t.archive_entry.is_some())
+            .expect("a pinned archive");
+        let artifact = |entry| cloudflared_archive(pinned.arch, pinned.url, pinned.sha256, entry);
+        let mut exact = artifact(pinned.archive_entry);
+        exact.os = pinned.os.into();
+        assert!(ensure_trusted(&exact).is_ok());
+        for other in [None, Some("cloudflared-other")] {
+            let mut wrong = artifact(other);
+            wrong.os = pinned.os.into();
+            assert!(ensure_trusted(&wrong).is_err(), "entry {other:?} trusted");
+        }
+        let mut on_linux = artifact(pinned.archive_entry);
+        on_linux.os = "linux".into();
+        assert!(ensure_trusted(&on_linux).is_err());
+    }
+
+    #[test]
+    fn extracts_only_the_named_root_file_as_an_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = tgz(
+            dir.path(),
+            &[
+                ("README", b"docs", tar::EntryType::Regular),
+                ("nested/cloudflared", b"wrong one", tar::EntryType::Regular),
+                ("./cloudflared", b"the binary", tar::EntryType::Regular),
+            ],
+        );
+        let target = dir.path().join("abc-cloudflared");
+        std::fs::write(&target, b"old binary").unwrap();
+        extract_entry(&archive, "cloudflared", &target, "https://x/a.tgz").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"the binary");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(part_files(dir.path()), Vec::<String>::new());
+    }
+
+    fn part_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".part"))
+            .collect()
+    }
+
+    #[test]
+    fn every_write_gets_its_own_temporary_file() {
+        let target = Path::new("/bin-dir/abc-cloudflared");
+        let (a, b) = (unique_part(target), unique_part(target));
+        assert_ne!(a, b);
+        for part in [&a, &b] {
+            assert_eq!(part.parent(), target.parent());
+            let name = part.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("abc-cloudflared."), "{name}");
+            assert!(name.ends_with(".part"), "{name}");
+        }
+    }
+
+    #[test]
+    fn concurrent_extractions_of_one_artifact_each_install_a_complete_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        // Large enough that the copies overlap.
+        let binary = vec![7u8; 8 * 1024 * 1024];
+        let archive = tgz(
+            dir.path(),
+            &[("cloudflared", binary.as_slice(), tar::EntryType::Regular)],
+        );
+        let target = dir.path().join("abc-cloudflared");
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        extract_entry(&archive, "cloudflared", &target, "https://x/a.tgz")
+                    })
+                })
+                .collect();
+            starts.into_iter().map(|s| s.join().unwrap()).collect()
+        });
+        for result in results {
+            assert_eq!(result, Ok(()));
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), binary);
+        assert_eq!(part_files(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn refuses_a_missing_or_non_file_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("abc-cloudflared");
+
+        let archive = tgz(
+            dir.path(),
+            &[("nested/cloudflared", b"x", tar::EntryType::Regular)],
+        );
+        let missing =
+            extract_entry(&archive, "cloudflared", &target, "https://x/a.tgz").unwrap_err();
+        assert!(
+            missing.contains("has no 'cloudflared' at its root"),
+            "{missing}"
+        );
+
+        let archive = tgz(
+            dir.path(),
+            &[("cloudflared", b"", tar::EntryType::Directory)],
+        );
+        let not_file =
+            extract_entry(&archive, "cloudflared", &target, "https://x/a.tgz").unwrap_err();
+        assert!(not_file.contains("is not a regular file"), "{not_file}");
+
+        let bad_name =
+            extract_entry(&archive, "../cloudflared", &target, "https://x/a.tgz").unwrap_err();
+        assert!(
+            bad_name.contains("refusing archive entry name"),
+            "{bad_name}"
+        );
+        assert!(!target.exists());
+
+        std::fs::write(dir.path().join("archive.tgz"), b"not gzip").unwrap();
+        let corrupt = extract_entry(
+            &dir.path().join("archive.tgz"),
+            "cloudflared",
+            &target,
+            "https://x/a.tgz",
+        )
+        .unwrap_err();
+        assert!(corrupt.contains("https://x/a.tgz"), "{corrupt}");
     }
 
     #[test]
@@ -569,6 +839,7 @@ mod tests {
                     arch: pin.arch.into(),
                     url: pin.url.into(),
                     sha256: pin.sha256.into(),
+                    archive_entry: pin.archive_entry.map(Into::into),
                 })
                 .is_ok(),
                 "the control plane pins {} ({}) but this agent does not trust it",

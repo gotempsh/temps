@@ -13,7 +13,7 @@
 //!    (`X-Temps-Demo-Mode`, identity headers, the status-host tag).
 //!    Workflow executor paths are then refused before hostname routing,
 //!    wake, cache or upstream operations.
-//!    On the control plane's consented private address (ADR-114 D3), the
+//!    On the control plane's consented private address (ADR-115 D3), the
 //!    private path answers next: outside the range, an unknown host and
 //!    plain HTTP never reach a later stage.
 //! 2. Status-page hostname: answered here and nowhere else. A connection
@@ -108,7 +108,7 @@ impl LoadBalancer {
         stage!(self.read_request_facts(session, ctx));
         Self::strip_inbound_trust_headers(session);
 
-        // ADR-114 D3: a connection on the control plane's private address is
+        // ADR-115 D3: a connection on the control plane's private address is
         // answered from node 0's private routes only, before anything else
         // can match its host against the public maps.
         stage!(self.private_ingress_stage(session, ctx));

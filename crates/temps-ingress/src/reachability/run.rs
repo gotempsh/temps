@@ -251,7 +251,7 @@ pub enum ServeRelease {
 }
 
 /// Everything a run does to the rest of Temps. A provider's own calls are
-/// its own ops trait, reached through [`RunOps::providers`] (ADR-116 D3).
+/// its own ops trait, reached through [`RunOps::providers`] (ADR-117 D3).
 #[async_trait]
 pub trait RunOps: Send + Sync {
     /// Finds what `intent` describes, if it exists: how a pending journal
@@ -377,7 +377,7 @@ pub trait RunOps: Send + Sync {
     async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String>;
     async fn sleep(&self, duration: Duration);
     /// The providers whose steps and journal entries this run hands over
-    /// (ADR-116 D3), over this same set of effects.
+    /// (ADR-117 D3), over this same set of effects.
     fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>>;
 }
 
@@ -413,7 +413,7 @@ pub fn lookup_backoff(failures: u32) -> Duration {
     Duration::from_secs(base.min(15 * 60))
 }
 
-/// A provider's part of a run (ADR-116 D3): the steps only it has, and the
+/// A provider's part of a run (ADR-117 D3): the steps only it has, and the
 /// journal entries they write, which only it can find again and undo. The
 /// engine keeps the journal, its order and its rules (ADR 064 D4); a provider
 /// step writes to the journal only through [`StepRun`], so it cannot skip the
@@ -498,7 +498,7 @@ pub enum UndoCheck {
     Unreadable(String),
 }
 
-/// What a provider step may use of the run (ADR-116 D3).
+/// What a provider step may use of the run (ADR-117 D3).
 #[async_trait]
 pub trait StepRun: Send {
     fn input(&self) -> &RunInput;
@@ -1156,7 +1156,7 @@ pub fn decide(
             entry.conflict.as_deref().unwrap_or("something else")
         ));
     }
-    // A provider's own entries are decided by its rules (ADR-116 D3).
+    // A provider's own entries are decided by its rules (ADR-117 D3).
     if let Some(decided) = providers
         .iter()
         .find(|p| p.owns(&entry.intent))
@@ -2844,7 +2844,7 @@ pub async fn undo(
         };
         let checked = entry.undo_decision == Some(Decision::Overwrite);
         // A provider's own resource is undone, or checked, by the provider
-        // (ADR-116 D3).
+        // (ADR-117 D3).
         let provider = ops
             .providers()
             .into_iter()
@@ -6399,7 +6399,7 @@ mod tests {
     }
 
     /// `reachability_runs.context` stores the run input and a resume reads
-    /// it back (ADR-116 D5): every way in's fixture, as paths and types.
+    /// it back (ADR-117 D5): every way in's fixture, as paths and types.
     #[test]
     fn a_stored_run_input_keeps_its_shape() {
         use crate::reachability::wire_shape::{assert_golden, paths};

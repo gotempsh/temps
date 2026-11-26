@@ -3,7 +3,10 @@
 
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { getGitProviderQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getGitProviderQueryKey,
+  updateGitProviderCredentialsMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -18,11 +21,13 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Info, RefreshCw } from 'lucide-react'
+import { problemDetail } from '@/lib/api-problem'
 import {
-  updateGitProviderCredentials,
+  credentialFieldErrors,
+  fieldsForProvider,
+  type Props,
   type UpdateProviderCredentialsBody,
-} from '@/lib/git-providers'
-import { fieldsForProvider, type Props } from './CredentialsEditorDialog-shared'
+} from './CredentialsEditorDialog-shared'
 
 export function CredentialsEditorDialog({
   provider,
@@ -40,8 +45,7 @@ export function CredentialsEditorDialog({
   }
 
   const mutation = useMutation({
-    mutationFn: (body: UpdateProviderCredentialsBody) =>
-      updateGitProviderCredentials(provider.id, body),
+    ...updateGitProviderCredentialsMutation(),
     onSuccess: () => {
       toast.success('Credentials updated')
       setValues({})
@@ -52,16 +56,29 @@ export function CredentialsEditorDialog({
       })
       onOpenChange(false)
     },
-    onError: (err: Error) => {
-      toast.error(`Failed to update credentials: ${err.message}`)
+    onError: (error) => {
+      toast.error('Failed to update credentials', {
+        description: problemDetail(error, 'Check the values and try again.'),
+      })
     },
   })
+
+  const handleOpenChange = (next: boolean) => {
+    // A save in flight keeps the dialog open: closing would not cancel the
+    // request, and its success would later clear a reopened form.
+    if (!next && mutation.isPending) return
+    // Reopening starts from a clean form, without the last attempt's error.
+    if (!next) mutation.reset()
+    onOpenChange(next)
+  }
 
   if (fields.length === 0) {
     return null
   }
 
   const hasChanges = Object.values(values).some((v) => v.trim().length > 0)
+  const fieldErrors = credentialFieldErrors(fields, values)
+  const hasErrors = Object.keys(fieldErrors).length > 0
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -76,11 +93,12 @@ export function CredentialsEditorDialog({
       toast.info('No changes to save')
       return
     }
-    mutation.mutate(body)
+    if (hasErrors) return
+    mutation.mutate({ path: { provider_id: provider.id }, body })
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Edit credentials</DialogTitle>
@@ -102,8 +120,13 @@ export function CredentialsEditorDialog({
           {fields.map((field) => {
             const id = `cred-${field.key}`
             const value = values[field.key as string] ?? ''
-            const onChange = (v: string) =>
+            const onChange = (v: string) => {
+              // A failed save stays on screen until the user changes a value.
+              if (mutation.isError) mutation.reset()
               setValues((prev) => ({ ...prev, [field.key as string]: v }))
+            }
+            const error = fieldErrors[field.key]
+            const errorId = `${id}-error`
 
             return (
               <div key={field.key as string}>
@@ -115,6 +138,8 @@ export function CredentialsEditorDialog({
                     onChange={(e) => onChange(e.target.value)}
                     placeholder={field.placeholder}
                     rows={6}
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
                     className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                   />
                 ) : (
@@ -126,7 +151,14 @@ export function CredentialsEditorDialog({
                     placeholder={field.placeholder}
                     className="mt-1 font-mono"
                     autoComplete="off"
+                    aria-invalid={error ? true : undefined}
+                    aria-describedby={error ? errorId : undefined}
                   />
+                )}
+                {error && (
+                  <p id={errorId} className="mt-1 text-xs text-destructive">
+                    {error}
+                  </p>
                 )}
                 {field.help && (
                   <p className="text-xs text-muted-foreground mt-1">
@@ -137,16 +169,25 @@ export function CredentialsEditorDialog({
             )
           })}
 
+          {mutation.isError && (
+            <p role="alert" className="text-sm text-destructive">
+              Credentials were not saved:{' '}
+              {problemDetail(mutation.error, 'Check the values and try again.')}
+            </p>
+          )}
           <DialogFooter>
             <Button
               type="button"
               variant="outline"
-              onClick={() => onOpenChange(false)}
+              onClick={() => handleOpenChange(false)}
               disabled={mutation.isPending}
             >
               Cancel
             </Button>
-            <Button type="submit" disabled={!hasChanges || mutation.isPending}>
+            <Button
+              type="submit"
+              disabled={!hasChanges || hasErrors || mutation.isPending}
+            >
               {mutation.isPending ? (
                 <>
                   <RefreshCw className="mr-2 h-4 w-4 animate-spin" />

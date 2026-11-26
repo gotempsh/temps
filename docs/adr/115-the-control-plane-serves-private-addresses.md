@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-114: The control plane serves private addresses
+# ADR-115: The control plane serves private addresses
 
 **Status:** Proposed
 **Date:** 2026-11-24

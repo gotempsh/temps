@@ -51,7 +51,7 @@ pub struct ProxyConfig {
     /// single-process `temps serve` sets it; the proxy binds the listener
     /// at startup and records the port here.
     pub tunnel_origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
-    /// The control plane's private ingress (ADR-114 D3): where node `0`'s
+    /// The control plane's private ingress (ADR-115 D3): where node `0`'s
     /// private addresses are served, once the operator consents. Only the
     /// single-process `temps serve` sets it; the proxy records what its
     /// listeners bound here.

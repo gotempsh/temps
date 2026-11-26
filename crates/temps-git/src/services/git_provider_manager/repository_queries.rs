@@ -97,6 +97,82 @@ impl GitProviderManager {
         Ok(commit)
     }
 
+    /// The HTTPS clone URL the provider reports for `owner/name` behind a
+    /// connection: the URL a deployment of that repository clones.
+    ///
+    /// The format is never assembled here. GitHub, GitLab, Gitea and
+    /// Bitbucket (cloud or self-hosted) each answer with their own clone URL,
+    /// so a caller that needs "where would a deployment clone this from"
+    /// gets the same answer the deploy pipeline acts on.
+    pub async fn repository_clone_url(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        name: &str,
+    ) -> Result<String, GitProviderManagerError> {
+        let connection = self.get_connection(connection_id).await?;
+        let provider_service = self.get_provider_service(connection.provider_id).await?;
+        let access_token = self
+            .validate_and_refresh_connection_token(connection_id)
+            .await?;
+        let repository = self
+            .fetch_connection_repository(
+                connection_id,
+                &provider_service,
+                &access_token,
+                owner,
+                name,
+            )
+            .await?;
+        Ok(repository.clone_url)
+    }
+
+    /// Ask the provider for a connected repository, refreshing the token and
+    /// retrying once when the first answer is an authentication failure.
+    ///
+    /// The deploy pipeline's clones and [`Self::repository_clone_url`] share
+    /// this lookup so they agree on which URL a repository clones from. A
+    /// provider failure is [`GitProviderManagerError::RepositoryOperation`];
+    /// a failed refresh keeps its own variant.
+    pub(super) async fn fetch_connection_repository(
+        &self,
+        connection_id: i32,
+        provider_service: &Arc<dyn GitProviderService>,
+        access_token: &str,
+        owner: &str,
+        name: &str,
+    ) -> Result<crate::services::git_provider::Repository, GitProviderManagerError> {
+        let lookup_failed = |operation: &'static str, error: GitProviderError| {
+            GitProviderManagerError::RepositoryOperation {
+                connection_id,
+                repository: format!("{owner}/{name}"),
+                operation,
+                reason: error.to_string(),
+            }
+        };
+        match provider_service
+            .get_repository(access_token, owner, name)
+            .await
+        {
+            Ok(repository) => Ok(repository),
+            Err(error) if Self::is_auth_failure(&error.to_string()) => {
+                warn!(
+                    connection_id,
+                    "get_repository hit auth failure ({}); force-refreshing token and retrying",
+                    error
+                );
+                let refreshed = self.force_refresh_connection_token(connection_id).await?;
+                provider_service
+                    .get_repository(&refreshed, owner, name)
+                    .await
+                    .map_err(|error| {
+                        lookup_failed("look up the repository after a token refresh", error)
+                    })
+            }
+            Err(error) => Err(lookup_failed("look up the repository", error)),
+        }
+    }
+
     pub async fn get_repository_by_id(
         &self,
         id: i32,
@@ -246,6 +322,133 @@ mod tests {
             create_test_config_service(db),
             Arc::new(temps_core::NoopAuditLogger),
         )
+    }
+
+    /// A PAT connection whose provider answers from `server`, so
+    /// `repository_clone_url` runs the deploy pipeline's lookup offline.
+    async fn mock_manager_with_provider(server: &mockito::ServerGuard) -> GitProviderManager {
+        use crate::services::github_provider::GitHubProvider;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let mut connection = connection_fixture(11, None);
+        connection.access_token = Some(
+            encryption_service
+                .encrypt_string("test-access-token")
+                .expect("test access token should encrypt"),
+        );
+        let auth_method = AuthMethod::PersonalAccessToken {
+            token: "unused-constructor-token".to_string(),
+        };
+        let mut provider = github_provider_fixture();
+        provider.auth_config =
+            serde_json::to_value(&auth_method).expect("auth method should serialize");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // repository_clone_url's connection lookup, then the token
+                // validation's connection and provider lookups.
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection]])
+                .append_query_results([[provider]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
+        );
+        let service: Arc<dyn GitProviderService> =
+            Arc::new(GitHubProvider::new(Some(server.url()), auth_method));
+        manager.providers_cache.write().await.insert(7, service);
+        manager
+    }
+
+    #[tokio::test]
+    async fn repository_clone_url_is_the_url_the_provider_reports() {
+        let mut server = mockito::Server::new_async().await;
+        // A self-hosted instance: the provider's answer, not a URL assembled
+        // from owner and name, decides where the repository clones from.
+        let repository = server
+            .mock("GET", "/repos/example-owner/example-repository")
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "id": 1,
+                    "name": "example-repository",
+                    "full_name": "example-owner/example-repository",
+                    "owner": { "login": "example-owner" },
+                    "description": null,
+                    "private": true,
+                    "default_branch": "main",
+                    "clone_url": "https://git.example.test/example-owner/example-repository.git",
+                    "ssh_url": "git@git.example.test:example-owner/example-repository.git",
+                    "html_url": "https://git.example.test/example-owner/example-repository",
+                    "language": null,
+                    "size": 0,
+                    "stargazers_count": 0,
+                    "forks_count": 0,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "pushed_at": null
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let manager = mock_manager_with_provider(&server).await;
+
+        let clone_url = manager
+            .repository_clone_url(11, "example-owner", "example-repository")
+            .await
+            .expect("a connected repository has a clone URL");
+
+        assert_eq!(
+            clone_url,
+            "https://git.example.test/example-owner/example-repository.git"
+        );
+        repository.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repository_clone_url_names_the_repository_and_connection_it_could_not_read() {
+        let mut server = mockito::Server::new_async().await;
+        let repository = server
+            .mock("GET", "/repos/example-owner/example-repository")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let manager = mock_manager_with_provider(&server).await;
+
+        let error = manager
+            .repository_clone_url(11, "example-owner", "example-repository")
+            .await
+            .expect_err("a repository the provider cannot read has no clone URL");
+
+        match &error {
+            GitProviderManagerError::RepositoryOperation {
+                connection_id,
+                repository,
+                operation,
+                ..
+            } => {
+                assert_eq!(*connection_id, 11);
+                assert_eq!(repository, "example-owner/example-repository");
+                assert_eq!(*operation, "look up the repository");
+            }
+            other => panic!("expected RepositoryOperation, got {other:?}"),
+        }
+        repository.assert_async().await;
     }
 
     // Connections (and the repositories behind them) are shared across all

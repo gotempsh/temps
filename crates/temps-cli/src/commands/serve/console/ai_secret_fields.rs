@@ -566,7 +566,11 @@ mod tests {
             &["/auth/token", "/auth/password"],
             &["/name"],
         ),
-        ("update_git_provider_credentials", &["/token"], &[]),
+        (
+            "update_git_provider_credentials",
+            &["/token", "/password", "/private_key", "/client_secret"],
+            &["/username", "/public_key"],
+        ),
         // S3 seals its access key id too (DNS and email treat it as an
         // identifier); either way the secret half is sealed.
         (

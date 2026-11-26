@@ -759,7 +759,7 @@ pub fn setup_proxy_server(
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?)
     .with_tunnel_origin(proxy_config.tunnel_origin.clone())
-    // ADR-114 D3: node 0's private addresses, from their own view of the
+    // ADR-115 D3: node 0's private addresses, from their own view of the
     // route table, only on the consented private address.
     .with_private_ingress(proxy_config.private_ingress.clone().map(|runtime| {
         Arc::new(crate::proxy::PrivateIngressPath::new(
@@ -961,7 +961,7 @@ pub fn setup_proxy_server(
         );
     }
 
-    // ADR-114 D3: what the listeners bound decides whether a private
+    // ADR-115 D3: what the listeners bound decides whether a private
     // address can be served here; Pingora binds them only now.
     if let Some(private) = proxy_config.private_ingress.as_deref() {
         private.set_proxy_listeners(

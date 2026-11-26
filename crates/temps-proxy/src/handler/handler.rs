@@ -158,7 +158,13 @@ pub async fn create_route(
     let route_type = parse_route_type(req.route_type.as_ref());
     let route = app_state
         .lb_service
-        .create_route(req.domain, req.host, req.port, route_type)
+        .create_route(
+            req.domain,
+            req.host,
+            req.port,
+            route_type,
+            req.enabled.unwrap_or(true),
+        )
         .await?;
 
     write_audit(
@@ -352,6 +358,7 @@ mod tests {
             host: host.to_string(),
             port: 8080,
             route_type: None,
+            enabled: None,
         }
     }
 
@@ -603,6 +610,68 @@ mod tests {
         .await
         .expect("disabling is how an operator retires an old row");
         assert_eq!(audit.entries()[0].0, "CUSTOM_ROUTE_UPDATED");
+    }
+
+    /// A route created with `"enabled": false` is stored and returned
+    /// disabled, and one created without the field is enabled (#2045).
+    #[tokio::test]
+    async fn a_route_can_be_created_disabled_in_one_request() {
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker not available, skipping disabled route creation test");
+                return;
+            }
+            Err(error) => panic!("test database: {error}"),
+        };
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = Arc::new(AppState {
+            lb_service: Arc::new(LbService::new(test_db.connection_arc())),
+            audit_service: audit.clone(),
+        });
+        let admin = || RequireAuth(AuthContext::new_session(test_user(), Role::Admin));
+        let created = |domain: &str, enabled: Option<bool>| {
+            let state = state.clone();
+            let mut request = create_request(domain, "8.8.8.8");
+            request.enabled = enabled;
+            async move {
+                let response = create_route(
+                    State(state),
+                    admin(),
+                    Extension(test_metadata("203.0.113.9")),
+                    Json(request),
+                )
+                .await
+                .map_err(|problem| problem.status_code)
+                .expect("an admin creates the route")
+                .into_response();
+                assert_eq!(response.status(), StatusCode::CREATED);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        let disabled = created("legacy.example.com", Some(false)).await;
+        assert_eq!(disabled["enabled"], false);
+        let stored = state
+            .lb_service
+            .get_route("legacy.example.com")
+            .await
+            .unwrap();
+        assert!(!stored.enabled, "the disabled flag is persisted");
+        assert!(
+            disabled["created_at"]
+                .as_str()
+                .is_some_and(|at| at.ends_with('Z')),
+            "{disabled}"
+        );
+
+        let enabled = created("app.example.com", None).await;
+        assert_eq!(enabled["enabled"], true, "enabled defaults to true");
+        assert_eq!(audit.entries().len(), 2);
     }
 
     #[test]

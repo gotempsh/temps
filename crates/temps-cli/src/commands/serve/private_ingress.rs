@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Private addresses the control plane serves itself (ADR-114).
+//! Private addresses the control plane serves itself (ADR-115).
 //!
 //! `temps-ingress` decides what node `0` serves privately and records it;
 //! the inside checks are `temps-node-agent`'s own code, exactly as on a
@@ -140,7 +140,7 @@ pub(super) fn start_control_plane_private_ingress(
         }
     });
     private.start(shutdown);
-    info!("control-plane private ingress runs in this process (ADR-114)");
+    info!("control-plane private ingress runs in this process (ADR-115)");
 }
 
 #[cfg(test)]

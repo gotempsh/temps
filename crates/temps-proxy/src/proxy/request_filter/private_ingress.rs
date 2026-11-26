@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The control plane's private path (ADR-114 D3).
+//! The control plane's private path (ADR-115 D3).
 //!
 //! A connection that arrived on the consented private address is never
 //! matched against the public maps. It gets the answers a worker's private

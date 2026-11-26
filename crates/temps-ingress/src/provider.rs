@@ -51,7 +51,7 @@ pub enum DnsIntent {
 }
 
 /// What the rest of Temps must know about a way in, beyond its own steps
-/// (ADR-116 D2). A provider answers per connector, so two connectors of one
+/// (ADR-117 D2). A provider answers per connector, so two connectors of one
 /// provider may differ. A value is added to these types only together with
 /// the provider that needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,12 +67,12 @@ pub struct Capabilities {
 pub enum Reach {
     /// The internet.
     Public,
-    /// Only people on this private network (ADR-114).
+    /// Only people on this private network (ADR-115).
     Private { network: &'static str },
 }
 
 /// Where a node hands a way in's traffic to Temps, and what is trusted there
-/// and only there (ADR-116 D4).
+/// and only there (ADR-117 D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     /// ADR-107 D3's plain-HTTP tunnel origin on loopback. The connector's

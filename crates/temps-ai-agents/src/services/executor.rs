@@ -144,7 +144,7 @@ pub struct AgentExecutor {
     run_service: Arc<AgentRunService>,
     config_service: Arc<AgentConfigService>,
     notification_service: Arc<NotificationService>,
-    /// The AI gateway every agent turn goes through (ADR-115 D1). Attached
+    /// The AI gateway every agent turn goes through (ADR-116 D1). Attached
     /// once every plugin has registered; a run without one fails saying no
     /// AI provider is configured.
     ai_service: tokio::sync::RwLock<Option<Arc<dyn AiService>>>,
@@ -781,7 +781,7 @@ impl AgentExecutor {
             ))
         };
 
-        // ADR-115 D3: a run's sandbox gets no model credential. The agent's
+        // ADR-116 D3: a run's sandbox gets no model credential. The agent's
         // model turns run on the control plane, through the AI gateway.
         let mut sandbox_env = std::collections::HashMap::new();
 
@@ -2569,7 +2569,7 @@ impl AgentExecutor {
             tracing::warn!("Run {}: failed to persist prompt_text: {}", run_id, e);
         }
 
-        // Step 9: the model. ADR-115 D5: an agent saved with a coding CLI
+        // Step 9: the model. ADR-116 D5: an agent saved with a coding CLI
         // runs on the AI gateway's default model; any other agent keeps the
         // gateway model it names.
         let model = gateway_model(&config.ai_provider, config.ai_model.as_deref());
@@ -2609,7 +2609,7 @@ impl AgentExecutor {
         tracing::info!("Run {}: agent loop started", run_id);
 
         // Step 11: the agent works in its sandbox on Temps' own tool loop
-        // (ADR-115 D2); every step streams to the run's log.
+        // (ADR-116 D2); every step streams to the run's log.
         let run_service_for_stream = self.run_service.clone();
         let stream_run_id = run_id;
         let on_event: OnEventCallback = Arc::new(move |line: String| {
@@ -3659,7 +3659,7 @@ impl AgentExecutor {
 }
 
 /// Build the CLI command args for running Claude (or Codex) in a sandbox.
-/// Coding CLIs an agent could be set up for before ADR-115.
+/// Coding CLIs an agent could be set up for before ADR-116.
 const RETIRED_HARNESSES: [&str; 3] = ["claude_cli", "codex_cli", "opencode"];
 
 /// Whether an agent's saved provider is a coding CLI agents no longer run.
@@ -3669,7 +3669,7 @@ pub fn is_retired_harness(ai_provider: &str) -> bool {
 
 /// The gateway model an agent runs on: none (the gateway's default) for an
 /// agent saved with a coding CLI, whose model ids the gateway does not know;
-/// otherwise the model it names, if any (ADR-115 D5).
+/// otherwise the model it names, if any (ADR-116 D5).
 pub fn gateway_model(ai_provider: &str, ai_model: Option<&str>) -> Option<String> {
     if is_retired_harness(ai_provider) {
         return None;
@@ -3853,7 +3853,7 @@ pub fn extract_report_text(output: &str) -> String {
         };
 
         match event_type {
-            // Temps' own agent loop (ADR-115): {"type":"temps.text","text":"..."}
+            // Temps' own agent loop (ADR-116): {"type":"temps.text","text":"..."}
             "temps.text" => {
                 if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
                     if !text.is_empty() {
@@ -4580,6 +4580,8 @@ pub(crate) mod tests {
             cross_project_trace_sharing: true,
             serves_own_temps_api: false,
             allowed_capabilities: Vec::new(),
+            identical_build_mode: Default::default(),
+            identical_build_scope: Default::default(),
         }
     }
 
