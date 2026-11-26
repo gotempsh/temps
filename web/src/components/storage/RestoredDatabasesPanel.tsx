@@ -74,7 +74,7 @@ function MissingProjectRow({
       </span>
       {choice ? (
         <span className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          {candidates.length > 1 && (
+          {candidates.length > 1 ? (
             <Select
               value={choice}
               onValueChange={setPicked}
@@ -94,14 +94,19 @@ function MissingProjectRow({
                 ))}
               </SelectContent>
             </Select>
+          ) : (
+            <span className="font-mono text-sm [overflow-wrap:anywhere]">
+              {choice}
+            </span>
           )}
           <Button
             size="sm"
             disabled={disabled}
+            title={`Point ${project.projectName} at ${choice}`}
             onClick={() => onUse(project, choice)}
           >
             {pending && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
-            Use {choice}
+            Use
           </Button>
         </span>
       ) : (
@@ -321,7 +326,7 @@ export function RestoredDatabasesPanel({
             ? `${confirming.project.environmentNames.join(', ')} will all read ${confirming.database} from their next deployment, so they share its data.`
             : ''
         }
-        confirmLabel={confirming ? `Use ${confirming.database}` : 'Use'}
+        confirmLabel="Use database"
         onConfirm={() => {
           if (confirming) apply(confirming.project, confirming.database)
           setConfirming(null)

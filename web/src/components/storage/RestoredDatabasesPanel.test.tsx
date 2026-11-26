@@ -21,7 +21,8 @@ describe('RestoredDatabasesView', () => {
     expect(html).toContain(
       '(production, staging) reads shop_production and shop_staging'
     )
-    expect(html).toContain('Use shop_prod')
+    expect(html).toContain('title="Point Shop at shop_prod"')
+    expect(html).toContain('>shop_prod</span>')
     expect(html).toContain('href="/projects/shop"')
   })
 
@@ -39,11 +40,13 @@ describe('RestoredDatabasesView', () => {
       },
     })
     expect(html).toContain('Rename a restored database')
-    expect(html).not.toContain('Use ')
+    expect(html).not.toContain('>Use</button>')
   })
 
   it('locks every action while a link is being changed', () => {
     const html = render({ pendingProjectId: 1 })
-    expect(html).toMatch(/<button[^>]*disabled[^>]*>.*Use shop_prod/)
+    expect(html).toMatch(
+      /<button[^>]*disabled[^>]*title="Point Shop at shop_prod"/
+    )
   })
 })
