@@ -119,3 +119,34 @@ test('a successful save keeps the new revision for the next save', async () => {
   await waitFor(() => expect(result.current.isSuccess).toBe(true))
   expect(result.current.data?.revision).toBe('r2')
 })
+
+test('a form that merged a refetch into its edits sends the revision the edits started from', async () => {
+  let sent: { expected_revision?: unknown } = {}
+  mockApi({
+    'GET /settings': () =>
+      jsonResponse({ preview_domain: 'other.example.com', revision: 'r2' }),
+    'PUT /settings': async (request) => {
+      sent = await request.json()
+      return jsonResponse({ message: 'Updated', revision: 'r3' })
+    },
+  })
+  const client = new QueryClient()
+  // The background refetch already brought someone else's save.
+  client.setQueryData(['platform-settings'], {
+    preview_domain: 'other.example.com',
+    revision: 'r2',
+  })
+  const { result } = renderHook(
+    () => useUpdateSettings({ baseRevision: 'r1' }),
+    {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    }
+  )
+  act(() => {
+    result.current.mutate({ preview_domain: 'mine.example.com' })
+  })
+  await waitFor(() => expect(result.current.isSuccess).toBe(true))
+  expect(sent.expected_revision).toBe('r1')
+})

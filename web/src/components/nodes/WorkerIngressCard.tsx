@@ -63,6 +63,7 @@ import { WorkerIngressSummary } from '@/components/nodes/WorkerIngressSummary'
 import { WorkerTunnels } from '@/components/nodes/WorkerTunnels'
 import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import { useFormBaseRevision } from '@/hooks/useFormBaseRevision'
 import { problemDetail } from '@/lib/api-problem'
 import { isStaleRevision, STALE_REVISION_MESSAGE } from '@/lib/stale-revision'
 import { AUTOMATIC_LISTEN, ingressSaveBody } from './worker-ingress-save'
@@ -135,6 +136,9 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   const queryClient = useQueryClient()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
+  const settingsQueryKey = adminGetNodePublicIngressSettingsOptions({
+    path: { node_id: node.id },
+  }).queryKey
   const settingsQuery = useQuery({
     ...adminGetNodePublicIngressSettingsOptions({
       path: { node_id: node.id },
@@ -156,6 +160,13 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
     values: reported,
     resetOptions: { keepDirtyValues: true },
   })
+  // Refetches merge into unsaved edits (`keepDirtyValues`), but a save sends
+  // the revision the edits started from: only a clean refresh, the re-read
+  // after a refused save or a successful save moves it.
+  const { baseRevision, adopt: adoptRevision } = useFormBaseRevision(
+    form.formState.isDirty,
+    settings?.revision
+  )
   const watched = useWatch({ control: form.control })
   const draft: Draft | null = settings ? { ...EMPTY_DRAFT, ...watched } : null
   const [check, setCheck] = useState<PublicIngressCheck | null>(null)
@@ -172,11 +183,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
 
   const refresh = async () => {
     await Promise.all([
-      queryClient.invalidateQueries({
-        queryKey: adminGetNodePublicIngressSettingsOptions({
-          path: { node_id: node.id },
-        }).queryKey,
-      }),
+      queryClient.invalidateQueries({ queryKey: settingsQueryKey }),
       queryClient.invalidateQueries({
         queryKey: adminGetNodeOptions({ path: { node_id: node.id } }).queryKey,
       }),
@@ -194,6 +201,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           ? 'Saved. The worker applies it within a few seconds.'
           : 'Public ingress turned off'
       )
+      queryClient.setQueryData(settingsQueryKey, saved)
       form.reset(draftFrom(saved))
       setCheck(null)
       await refresh()
@@ -204,7 +212,12 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
       if (isStaleRevision(error)) {
         // Re-read: the form keeps the operator's edited fields and shows the
         // other save for the rest, so saving again applies on top of it.
-        void refresh()
+        void refresh().then(() =>
+          adoptRevision(
+            queryClient.getQueryData<PublicIngressSettings>(settingsQueryKey)
+              ?.revision
+          )
+        )
         toast.error('Public ingress was changed by someone else', {
           description: STALE_REVISION_MESSAGE,
         })
@@ -234,7 +247,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   const save = (next: Draft) =>
     update.mutate({
       path: { node_id: node.id },
-      body: ingressSaveBody(next, settings?.revision),
+      body: ingressSaveBody(next, baseRevision),
     })
 
   const state = workerIngressStatus(node)

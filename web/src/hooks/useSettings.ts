@@ -67,7 +67,13 @@ export function useSettingsPage() {
   }
 }
 
-export function useUpdateSettings() {
+/**
+ * `baseRevision` is the revision the page's form values are based on
+ * (`useFormBaseRevision`); a form that merges refetches into unsaved edits
+ * passes it, so a refetch does not make a save of those edits unconditional.
+ * Without it, the revision of the cached read is sent.
+ */
+export function useUpdateSettings(options: { baseRevision?: string } = {}) {
   const queryClient = useQueryClient()
 
   return useMutation({
@@ -75,9 +81,10 @@ export function useUpdateSettings() {
     // by someone else since this page loaded is refused instead of reverted.
     mutationFn: (changes: Partial<PlatformSettings>) =>
       updateSettingsApi(changes, {
-        expectedRevision: queryClient.getQueryData<PlatformSettings>([
-          'platform-settings',
-        ])?.revision,
+        expectedRevision:
+          options.baseRevision ??
+          queryClient.getQueryData<PlatformSettings>(['platform-settings'])
+            ?.revision,
       }),
     onSuccess: (data, changes) => {
       if (changes.agent_sandbox) {

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -45,6 +46,11 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
     resolver: zodResolver(limitsSchema),
     defaultValues: limits,
   })
+  // The revision of the limits the form holds. It moves only when the form
+  // takes new values (load, "Load latest", a save), never with a background
+  // refetch of the node: sending a newer revision than the form was based on
+  // would let this save revert another admin's without a conflict.
+  const [baseRevision, setBaseRevision] = useState(node.build_limits_revision)
   const queryClient = useQueryClient()
   const nodeQueryKey = adminGetNodeOptions({
     path: { node_id: node.id },
@@ -53,6 +59,7 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
     ...adminSetNodeBuildLimitsMutation(),
     onSuccess: async (saved) => {
       toast.success('Builder limits saved')
+      setBaseRevision(saved.revision)
       form.reset({
         concurrency: saved.concurrency,
         queue_wait_seconds: saved.queue_wait_seconds,
@@ -93,7 +100,7 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
                 // if someone else saved since, instead of reverting them.
                 body: {
                   ...next,
-                  expected_revision: node.build_limits_revision,
+                  expected_revision: baseRevision,
                 },
               })
           })}
@@ -158,6 +165,7 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
                 variant="outline"
                 onClick={() => {
                   update.reset()
+                  setBaseRevision(node.build_limits_revision)
                   form.reset(limits)
                 }}
               >

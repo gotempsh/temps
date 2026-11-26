@@ -131,3 +131,73 @@ test('a save refused because someone else saved since says so and loads their li
   expect(view.queryByRole('alert')).toBeNull()
   client.clear()
 })
+
+test('a save sends the revision the form was loaded with, not one a background refetch brought', async () => {
+  const submitted: unknown[] = []
+  mockApi({
+    'PUT /internal/nodes/7/build-limits': async (request) => {
+      const body = (await request.json()) as Record<string, number>
+      submitted.push(body)
+      return jsonResponse({
+        node_id: 7,
+        concurrency: body.concurrency,
+        queue_wait_seconds: body.queue_wait_seconds,
+        build_timeout_seconds: body.build_timeout_seconds,
+        is_default: false,
+        revision: '6',
+      })
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  const read = {
+    id: 7,
+    build_limits: {
+      concurrency: 1,
+      queue_wait_seconds: 300,
+      build_timeout_seconds: 1800,
+    },
+    build_limits_revision: '4',
+  } as NodeInfoResponse
+  const panel = (node: NodeInfoResponse) => (
+    <QueryClientProvider client={client}>
+      <BuilderLimitsPanel node={node} />
+    </QueryClientProvider>
+  )
+  const view = render(panel(read))
+  // Another admin saved; the node refetched while this form shows revision 4.
+  view.rerender(
+    panel({
+      ...read,
+      build_limits: { ...read.build_limits, concurrency: 4 },
+      build_limits_revision: '5',
+    } as NodeInfoResponse)
+  )
+  const concurrency = view.getByLabelText(
+    'Concurrent builds'
+  ) as HTMLInputElement
+  fireEvent.change(concurrency, { target: { value: '3' } })
+  const form = view
+    .getByRole('button', { name: 'Save builder limits' })
+    .closest('form')!
+  fireEvent.submit(form)
+  await waitFor(() => expect(submitted).toHaveLength(1))
+  expect(submitted[0]).toMatchObject({ expected_revision: '4' })
+
+  // After a save, the next one is based on the revision that save returned.
+  await waitFor(() =>
+    expect(
+      (
+        view.getByRole('button', {
+          name: 'Save builder limits',
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true)
+  )
+  fireEvent.change(concurrency, { target: { value: '2' } })
+  fireEvent.submit(form)
+  await waitFor(() => expect(submitted).toHaveLength(2))
+  expect(submitted[1]).toMatchObject({ expected_revision: '6' })
+  client.clear()
+})
