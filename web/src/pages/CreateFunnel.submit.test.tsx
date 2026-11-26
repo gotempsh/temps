@@ -55,7 +55,27 @@ test('the form stays disabled between a create and the redirect, so it cannot cr
       }),
     'POST /projects/3/funnels': () => {
       creates += 1
-      return jsonResponse({ funnel_id: 41 }, 201)
+      // The created funnel, as the API answers a create.
+      return jsonResponse(
+        {
+          id: 41,
+          project_id: 3,
+          name: 'Checkout',
+          description: null,
+          is_active: true,
+          steps: [
+            {
+              id: 1,
+              order: 1,
+              event_name: 'checkout_started',
+              event_filter: [],
+            },
+          ],
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-01T00:00:00Z',
+        },
+        201
+      )
     },
   })
   const view = renderPage()

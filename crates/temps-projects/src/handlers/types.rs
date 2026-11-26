@@ -427,9 +427,9 @@ pub struct ProjectResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<PresetConfigSchema>)]
     pub preset_config: Option<serde_json::Value>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub last_deployment: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub last_deployment: Option<chrono::DateTime<chrono::Utc>>,
     pub git_provider_connection_id: Option<i32>,
     /// Git provider behind `git_provider_connection_id`: `github`,
     /// `github_app`, `gitlab`, `gitea`, `bitbucket` or `generic`. `null` when
@@ -586,9 +586,9 @@ impl ProjectResponse {
             service_template_image_url: project.service_template_image_url,
             service_template_version: project.service_template_version,
             preset_config: project.preset_config,
-            created_at: project.created_at.timestamp_millis(),
-            updated_at: project.updated_at.timestamp_millis(),
-            last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
+            created_at: project.created_at,
+            updated_at: project.updated_at,
+            last_deployment: project.last_deployment,
             git_provider_connection_id: project.git_provider_connection_id,
             git_provider_type: project.git_provider_type,
             is_public_repo: project.is_public_repo,
@@ -783,10 +783,10 @@ pub struct CustomDomainResponse {
     pub branch: Option<String>,
     pub status: String,
     pub message: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub expiration_time: Option<i64>,
-    pub last_renewed: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_renewed: Option<chrono::DateTime<chrono::Utc>>,
     /// Docker Compose service name this domain routes to
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
@@ -815,14 +815,10 @@ impl From<CustomDomainWithInfo> for CustomDomainResponse {
             branch: domain.branch,
             status: domain.status,
             message: domain.message,
-            created_at: domain.created_at.timestamp_millis(),
-            updated_at: domain.updated_at.timestamp_millis(),
-            expiration_time: domain_info
-                .as_ref()
-                .and_then(|info| info.expiration_time.map(|dt| dt.timestamp_millis())),
-            last_renewed: domain_info
-                .as_ref()
-                .and_then(|info| info.last_renewed.map(|dt| dt.timestamp_millis())),
+            created_at: domain.created_at,
+            updated_at: domain.updated_at,
+            expiration_time: domain_info.as_ref().and_then(|info| info.expiration_time),
+            last_renewed: domain_info.as_ref().and_then(|info| info.last_renewed),
             service_name: domain.service_name,
         }
     }
@@ -1167,8 +1163,8 @@ pub struct EnvironmentVariableResponse {
     pub id: i32,
     pub key: String,
     pub value: String,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
     pub environments: Vec<EnvironmentInfo>,
 }
 
@@ -1190,7 +1186,7 @@ pub struct EnvironmentDomainResponse {
     pub id: i32,
     pub environment_id: i32,
     pub domain: String,
-    pub created_at: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

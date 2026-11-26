@@ -71,7 +71,7 @@ describe('isProvisionedStatus', () => {
 })
 
 describe('domainTimestamp', () => {
-  test('treats API timestamps as epoch milliseconds', () => {
-    expect(domainTimestamp(1_796_278_035_000).toISOString()).toBe('2026-12-03T06:07:15.000Z')
+  test('reads API timestamps as ISO 8601', () => {
+    expect(domainTimestamp('2026-12-03T06:07:15Z').toISOString()).toBe('2026-12-03T06:07:15.000Z')
   })
 })

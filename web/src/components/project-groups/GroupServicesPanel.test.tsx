@@ -56,14 +56,14 @@ describe("the project overview's databases", () => {
     expect(
       screen.queryByText('No databases are linked to these services yet.')
     ).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Retry databases' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(retries()).toBe(1)
   })
 
   test('a partly failed read keeps what loaded and offers a retry', () => {
     const retries = renderList([cache], { failed: 2 })
     expect(screen.getByText('cache'))
-    fireEvent.click(screen.getByRole('button', { name: 'Retry databases' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
     expect(retries()).toBe(1)
   })
 
@@ -86,7 +86,7 @@ describe("the project overview's databases", () => {
 
   test('a complete read offers no retry', () => {
     renderList([cache], {})
-    expect(screen.queryByRole('button', { name: 'Retry databases' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull()
   })
 })
 

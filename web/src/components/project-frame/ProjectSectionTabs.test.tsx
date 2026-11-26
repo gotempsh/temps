@@ -2,90 +2,209 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
-import { resolveProjectLocation } from '@/lib/project-navigation'
+import { SidebarProvider, useSidebar } from '@/components/ui/sidebar'
+import { projectLocationFor } from '@/lib/project-navigation'
 import { installBrowserWindow } from '@/test/dom'
 import { ProjectSectionTabs } from './ProjectSectionTabs'
 
 installBrowserWindow()
-afterEach(cleanup)
+const desktopWidth = window.innerWidth
+function setWidth(width: number) {
+  Object.defineProperty(window, 'innerWidth', {
+    value: width,
+    configurable: true,
+    writable: true,
+  })
+}
+afterEach(() => {
+  cleanup()
+  setWidth(desktopWidth)
+  window.localStorage.clear()
+})
 
-function renderTabs(route: string) {
+function Drawer() {
+  return <p data-testid="drawer">{String(useSidebar().openMobile)}</p>
+}
+
+function renderTabs(route: string, sourceType = 'git') {
+  const project = { id: 7, slug: 'synthetic-api', source_type: sourceType }
   return render(
     <MemoryRouter initialEntries={[`/projects/synthetic-api/${route}`]}>
-      <ProjectSectionTabs
-        projectSlug="synthetic-api"
-        location={resolveProjectLocation(route)}
-      />
+      <SidebarProvider>
+        <ProjectSectionTabs
+          project={project}
+          location={projectLocationFor(project, route.split('?')[0])}
+        />
+        <Drawer />
+      </SidebarProvider>
     </MemoryRouter>
   )
 }
 
-test('edge rules is a tab of Security & access, current on its page', () => {
+const titles = (nav: HTMLElement) =>
+  [...nav.querySelectorAll('a')].map((a) => a.textContent)
+
+const open = (trigger: HTMLElement) =>
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false })
+
+test("a service's page has one row of tabs: the pages of the view shown", () => {
+  const view = renderTabs('environments')
+  // The views themselves are in the sidebar, not a strip above this one.
+  expect(view.getAllByRole('navigation')).toHaveLength(1)
+  const pages = view.getByRole('navigation', { name: 'Deployments pages' })
+  expect(titles(pages)).toEqual(['Deployments', 'Environments', 'Build'])
+  expect(pages.querySelector('[aria-current="page"]')?.textContent).toBe(
+    'Environments'
+  )
+})
+
+test('the Overview holds what says whether the service is healthy, and what it owns', async () => {
+  const view = renderTabs('metrics/dashboards')
+  expect(view.getAllByRole('navigation')).toHaveLength(1)
+  const pages = view.getByRole('navigation', { name: 'Overview pages' })
+  expect(
+    [...pages.querySelectorAll('[data-tab]')].map((tab) => tab.textContent)
+  ).toEqual([
+    'Overview',
+    'Activity',
+    'MetricsDashboards',
+    'Uptime',
+    'Alerts',
+    'Domains',
+    'Databases',
+  ])
+  // A held section of several pages opens a menu, marked on any of them.
+  const metrics = view.getByRole('button', { name: /^Metrics/ })
+  expect(metrics.getAttribute('aria-current')).toBe('true')
+  // The quick tour points at it here.
+  expect(metrics.getAttribute('data-tour')).toBe('metrics')
+  open(metrics)
+  const menu = await view.findByRole('menu')
+  expect(
+    [...menu.querySelectorAll('a')].map((a) => [
+      a.textContent,
+      a.getAttribute('href'),
+    ])
+  ).toEqual([
+    ['Metrics', '/projects/synthetic-api/metrics/explore'],
+    ['Dashboards', '/projects/synthetic-api/metrics/dashboards'],
+  ])
+  expect(menu.querySelector('[aria-current="page"]')?.textContent).toBe(
+    'Dashboards'
+  )
+  cleanup()
+  // One of a single page is a plain tab.
+  const domains = renderTabs('domains')
+  const link = domains.getByRole('link', { name: 'Domains' })
+  expect(link.getAttribute('aria-current')).toBe('page')
+  expect(link.getAttribute('href')).toBe('/projects/synthetic-api/domains')
+})
+
+test('Logs holds the traces, as what happened', () => {
+  const view = renderTabs('ai-gateway')
+  const pages = view.getByRole('navigation', { name: 'Logs pages' })
+  expect(
+    [...pages.querySelectorAll('[data-tab]')].map((tab) => tab.textContent)
+  ).toEqual(['Application', 'Requests', 'OpenTelemetry', 'TracesAI traces'])
+  expect(
+    view.getByRole('button', { name: /^Traces/ }).getAttribute('data-tour')
+  ).toBe('traces')
+})
+
+test('security, automation and the service settings are the pages of Settings', () => {
   const view = renderTabs('settings/edge-rules')
-  const nav = view.getByRole('navigation', { name: 'Security & access pages' })
-  const tab = view.getByRole('link', { name: 'Edge rules' })
-  expect(nav.contains(tab)).toBe(true)
-  expect(tab.getAttribute('aria-current')).toBe('page')
-  expect(tab.getAttribute('href')).toBe(
-    '/projects/synthetic-api/settings/edge-rules'
+  expect(view.getAllByRole('navigation')).toHaveLength(1)
+  const pages = view.getByRole('navigation', { name: 'Settings pages' })
+  expect(titles(pages)).toEqual([
+    'General',
+    'Data ingest',
+    'Protection',
+    'Edge rules',
+    'Access',
+    'Scans',
+    'Automation',
+    'Integrations',
+  ])
+  expect(pages.querySelector('[aria-current="page"]')?.textContent).toBe(
+    'Edge rules'
   )
 })
 
-test('a rule opened for editing keeps the Edge rules tab current', () => {
+test('a rule opened for editing keeps the Edge rules page current', () => {
   const view = renderTabs('settings/edge-rules/new')
-  expect(
-    view.getByRole('link', { name: 'Edge rules' }).getAttribute('aria-current')
-  ).toBe('page')
-})
-
-test('tab icons sit before the label and drop on a phone', () => {
-  const view = renderTabs('settings/security')
-  const icon = view.getByRole('link', { name: 'Protection' }).firstElementChild
-  expect(icon?.tagName.toLowerCase()).toBe('svg')
-  expect(icon?.getAttribute('aria-hidden')).toBe('true')
-  expect(icon?.getAttribute('class')).toContain('max-sm:hidden')
-})
-
-test('on a narrow strip, the current tab is scrolled into view', () => {
-  // A 300px strip whose tabs are 100px apart: Check-ins, the sixth, starts
-  // past the edge.
-  // Restored by descriptor: assigning the inherited method back would leave
-  // an own copy on `HTMLElement` that hides later tests' fakes.
-  const original = Object.getOwnPropertyDescriptor(
-    HTMLElement.prototype,
-    'getBoundingClientRect'
+  const pages = view.getByRole('navigation', { name: 'Settings pages' })
+  expect(pages.querySelector('[aria-current="page"]')?.textContent).toBe(
+    'Edge rules'
   )
-  HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
-    if (this.tagName === 'NAV')
-      return { left: 0, right: 300, width: 300 } as DOMRect
-    const index = Array.from(this.parentElement?.children ?? []).indexOf(this)
-    const left = index * 100 - (this.parentElement?.scrollLeft ?? 0)
-    return { left, right: left + 80, width: 80 } as DOMRect
-  }
-  try {
-    const view = renderTabs('check-ins')
-    const nav = view.getByRole('navigation', { name: 'Monitoring pages' })
-    expect(
-      view.getByRole('link', { name: 'Check-ins' }).getAttribute('aria-current')
-    ).toBe('page')
-    // Centred: 500 - 0 - (300 - 80) / 2.
-    expect(nav.scrollLeft).toBe(390)
-  } finally {
-    if (original)
-      Object.defineProperty(
-        HTMLElement.prototype,
-        'getBoundingClientRect',
-        original
-      )
-    else Reflect.deleteProperty(HTMLElement.prototype, 'getBoundingClientRect')
-  }
 })
 
-test('a tab already in view leaves the strip where it is', () => {
-  const view = renderTabs('metrics/explore')
+test('a page that holds several is a tab that opens a menu, not a second row', async () => {
+  const view = renderTabs('errors/inbound-filters')
+  expect(view.getAllByRole('navigation')).toHaveLength(1)
+  const pages = view.getByRole('navigation', { name: 'Errors pages' })
+  expect(titles(pages)).toEqual(['Issues', 'Feedback', 'Releases'])
+  // The tab is marked on any of its pages, and says which one is shown.
+  const settings = view.getByRole('button', { name: /^Settings/ })
+  expect(settings.getAttribute('aria-current')).toBe('true')
+  expect(settings.textContent).toBe('SettingsInbound filters')
+
+  open(settings)
+  const menu = await view.findByRole('menu')
   expect(
-    view.getByRole('navigation', { name: 'Monitoring pages' }).scrollLeft
-  ).toBe(0)
+    [...menu.querySelectorAll('a')].map((a) => [
+      a.textContent,
+      a.getAttribute('href'),
+    ])
+  ).toEqual([
+    ['Source maps', '/projects/synthetic-api/errors/source-maps'],
+    ['Inbound filters', '/projects/synthetic-api/errors/inbound-filters'],
+    ['Attachments', '/projects/synthetic-api/errors/attachments'],
+    ['Ownership', '/projects/synthetic-api/errors/ownership'],
+    ['SDK health', '/projects/synthetic-api/client-outcomes'],
+    ['Setup', '/projects/synthetic-api/errors/setup'],
+  ])
+  expect(menu.querySelector('[aria-current="page"]')?.textContent).toBe(
+    'Inbound filters'
+  )
+})
+
+test('a tab that opens a menu is not marked while another tab is shown', () => {
+  const view = renderTabs('errors')
+  const settings = view.getByRole('button', { name: /^Settings/ })
+  expect(settings.getAttribute('aria-current')).toBeNull()
+  expect(settings.textContent).toBe('Settings')
+})
+
+test('a link keeps the environment chosen in the bar', () => {
+  const view = renderTabs('deployments?env=staging')
+  expect(
+    view.getByRole('link', { name: 'Environments' }).getAttribute('href')
+  ).toBe('/projects/synthetic-api/environments?env=staging')
+})
+
+test('on a desktop the sidebar names the view, so the page adds no button', () => {
+  const view = renderTabs('settings/general')
+  expect(view.queryByRole('button', { name: /Show all views/ })).toBeNull()
+})
+
+test('on a phone a button names the view and opens the sidebar on its views', () => {
+  setWidth(390)
+  const view = renderTabs('settings/general')
+  const button = view.getByRole('button', {
+    name: 'Settings. Show all views',
+  })
+  expect(view.getByTestId('drawer').textContent).toBe('false')
+  fireEvent.click(button)
+  expect(view.getByTestId('drawer').textContent).toBe('true')
+})
+
+test('"Add hosting" belongs to no view: no tabs, and the button says so', () => {
+  setWidth(390)
+  const view = renderTabs('hosting', 'external')
+  expect(view.queryByRole('navigation')).toBeNull()
+  expect(
+    view.getByRole('button', { name: 'Add hosting. Show all views' })
+  ).toBeTruthy()
 })

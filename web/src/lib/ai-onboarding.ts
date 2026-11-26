@@ -8,7 +8,19 @@ import type {
 } from '@/api/client'
 
 export const AI_HARNESS_KEY_NAME = 'Temps AI harness'
-export const TEMPS_CLI_VERSION = '0.1.38'
+/**
+ * The CLI the console's copied commands run: the npm dist-tag of the CLI's
+ * release channel (`beta` while it is a prerelease, `latest` once stable), not
+ * an exact version. A server release is public before a maintainer approves its
+ * CLI on npm, so an exact version would name a package npm does not serve yet;
+ * the dist-tag always resolves to an installable CLI. The release moves this
+ * spec when the CLI changes channel (the CLI's `channel_pinned` files in
+ * `.github/releases/packages.json`). Keep it the only literal spec here.
+ */
+const TEMPS_CLI_PACKAGE = '@temps-sdk/cli@beta'
+export const TEMPS_CLI_VERSION = TEMPS_CLI_PACKAGE.slice(
+  TEMPS_CLI_PACKAGE.lastIndexOf('@') + 1
+)
 
 export type AiHarnessStatus = AiHarnessState
 

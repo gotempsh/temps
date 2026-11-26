@@ -37,6 +37,6 @@ pub use repository::{
 };
 pub use routes::GroupRouteService;
 pub use service::{
-    CreateProjectGroupRequest, ProjectGroupService, ProjectGroupWithMembers,
+    CreateProjectGroupRequest, LateMemberAuthorizer, ProjectGroupService, ProjectGroupWithMembers,
     UpdateProjectGroupRequest,
 };

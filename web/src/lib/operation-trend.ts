@@ -93,7 +93,7 @@ export function changePercent(ratio: number | null | undefined): string {
 
 /** Deployments a regression check can compare, newest first. */
 export function comparableDeployments<
-  T extends { status: string; finished_at?: number | null; created_at: number },
+  T extends { status: string; finished_at?: string | null; created_at: string },
 >(deployments: T[]): T[] {
   return deployments
     .filter(
@@ -101,7 +101,7 @@ export function comparableDeployments<
         ['deployed', 'completed', 'running', 'healthy'].includes(d.status) ||
         d.finished_at != null
     )
-    .sort((a, b) => b.created_at - a.created_at)
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
 }
 
 /** "42%" for a share from 0 to 1 (or more, for parallel calls). */

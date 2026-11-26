@@ -22,7 +22,7 @@ temps-monitoring = { path = "../temps-monitoring" }
 temps-notifications = { path = "../temps-notifications" }
 axum = { workspace = true }
 tracing = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

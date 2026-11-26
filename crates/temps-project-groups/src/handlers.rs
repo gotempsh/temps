@@ -34,7 +34,7 @@ use crate::routes::{
     CreateGroupRouteRequest, GroupRouteEnvironment, GroupRouteResponse, GroupRouteService,
 };
 use crate::service::{
-    CreateProjectGroupRequest, ProjectGroupService, ProjectGroupWithMembers,
+    CreateProjectGroupRequest, LateMemberAuthorizer, ProjectGroupService, ProjectGroupWithMembers,
     UpdateProjectGroupRequest,
 };
 
@@ -86,7 +86,9 @@ pub fn router(state: Arc<ProjectGroupsAppState>) -> Router {
         )
         .route(
             "/project-groups/{group_id}/env-vars/{var_id}",
-            axum::routing::patch(update_group_env_var).delete(delete_group_env_var),
+            get(get_group_env_var)
+                .patch(update_group_env_var)
+                .delete(delete_group_env_var),
         )
         .route(
             "/project-groups/{group_id}/routes",
@@ -419,10 +421,18 @@ pub(crate) async fn hidden_projects(
     state: &ProjectGroupsAppState,
     auth: &temps_authz::context::AuthContext,
 ) -> Result<HashSet<i32>, Problem> {
+    hidden_projects_for(&state.project_access_checker, auth).await
+}
+
+/// [`hidden_projects`] given only the access checker.
+async fn hidden_projects_for(
+    project_access_checker: &Option<Arc<dyn ProjectAccessChecker>>,
+    auth: &temps_authz::context::AuthContext,
+) -> Result<HashSet<i32>, Problem> {
     if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
         return Ok(HashSet::new());
     }
-    let Some(checker) = state.project_access_checker.as_ref() else {
+    let Some(checker) = project_access_checker.as_ref() else {
         return Ok(HashSet::new());
     };
     let Some(user_id) = auth.user_id_opt() else {
@@ -506,6 +516,59 @@ enum MemberPermission {
     EnvironmentsRead,
     EnvironmentsWrite,
     ProjectsWrite,
+}
+
+/// [`LateMemberAuthorizer`] for a placement: a project that joined the
+/// destination after the caller was authorized needs what every other member
+/// needed (visible to the caller, and `EnvironmentsWrite` on it).
+///
+/// The service asks it with no transaction open, so the access checker's
+/// queries take a pooled connection without holding the group lock.
+pub(crate) struct EnvWriteOnLateMembers<'a> {
+    pub(crate) project_access_checker: &'a Option<Arc<dyn ProjectAccessChecker>>,
+    pub(crate) auth: &'a temps_authz::context::AuthContext,
+}
+
+#[async_trait::async_trait]
+impl LateMemberAuthorizer for EnvWriteOnLateMembers<'_> {
+    async fn unauthorized(
+        &self,
+        group_id: i32,
+        project_ids: &[i32],
+    ) -> Result<Vec<i32>, ProjectGroupError> {
+        let check_failed = |problem: Problem| ProjectGroupError::LateMemberCheckFailed {
+            group_id,
+            project_ids: project_ids.to_vec(),
+            reason: format!("the project access lookup answered {}", problem.status_code),
+        };
+        let hidden = hidden_projects_for(self.project_access_checker, self.auth)
+            .await
+            .map_err(check_failed)?;
+        let mut denied = Vec::new();
+        for &project_id in project_ids {
+            if hidden.contains(&project_id) {
+                denied.push(project_id);
+                continue;
+            }
+            match require_on_projects(
+                self.auth,
+                self.project_access_checker,
+                &[project_id],
+                MemberPermission::EnvironmentsWrite,
+            )
+            .await
+            {
+                Ok(()) => {}
+                // The guards answer a lack of access with 403; anything else
+                // is the check itself failing.
+                Err(problem) if problem.status_code == StatusCode::FORBIDDEN => {
+                    denied.push(project_id);
+                }
+                Err(problem) => return Err(check_failed(problem)),
+            }
+        }
+        Ok(denied)
+    }
 }
 
 /// `permission` on every project in `project_ids`: the instance-wide
@@ -955,7 +1018,7 @@ pub async fn delete_project_group(
         (status = 200, description = "Project placed in the group (moved out of any other group)", body = ProjectGroupResponse),
         (status = 403, description = "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them; or no ProjectsWrite on a service whose route to or from the project is dropped by leaving its previous group"),
         (status = 404, description = "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"),
-        (status = 409, description = "A route involving the project appeared, the project changed group, or a project joined the destination group, while the request was being authorized; retry"),
+        (status = 409, description = "A route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -997,9 +1060,22 @@ pub async fn add_project_to_group(
     let authorized =
         authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
 
+    // A project that joined the group while this request was being authorized
+    // (typically a concurrent placement) is checked again under the group
+    // lock, so only a real lack of access to it refuses the placement.
+    let late_members = EnvWriteOnLateMembers {
+        project_access_checker: &state.project_access_checker,
+        auth: &auth,
+    };
     let placement = state
         .service
-        .add_project_checked(group_id, project_id, &authorized, &authorized_members)
+        .add_project_reauthorizing(
+            group_id,
+            project_id,
+            &authorized,
+            &authorized_members,
+            &late_members,
+        )
         .await?;
     let previous = placement.previous_group_id;
     let group = state.service.get_group(group_id).await?;
@@ -1253,6 +1329,37 @@ pub async fn list_group_env_vars(
             .map(GroupEnvVarResponse::masked)
             .collect::<Vec<_>>(),
     ))
+}
+
+/// One variable every project in the group inherits, as listed: a plain
+/// value is masked and a secret's value is never returned.
+#[utoipa::path(
+    tag = "Project Groups",
+    get,
+    path = "/project-groups/{group_id}/env-vars/{var_id}",
+    operation_id = "get_group_env_var",
+    params(
+        ("group_id" = i32, Path, description = "Project group ID"),
+        ("var_id" = i32, Path, description = "Variable ID"),
+    ),
+    responses(
+        (status = 200, description = "The variable (value masked)", body = GroupEnvVarResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions on a member project"),
+        (status = 404, description = "Project group or variable not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_group_env_var(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProjectGroupsAppState>>,
+    Path((group_id, var_id)): Path<(i32, i32)>,
+) -> Result<Json<GroupEnvVarResponse>, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    authorize_group_env(&state, &auth, group_id, false).await?;
+    let var = state.env_vars.get(group_id, var_id).await?;
+    Ok(Json(GroupEnvVarResponse::masked(var)))
 }
 
 #[utoipa::path(
@@ -1935,6 +2042,7 @@ pub async fn delete_group_route(
         set_repository_inheritance,
         get_project_group_membership,
         list_group_env_vars,
+        get_group_env_var,
         create_group_env_var,
         update_group_env_var,
         delete_group_env_var,
@@ -2018,6 +2126,69 @@ mod tests {
 
     fn checker(allowed: &[i32]) -> Option<Arc<dyn ProjectAccessChecker>> {
         Some(Arc::new(Allow(allowed.to_vec())))
+    }
+
+    /// A project that joined during a placement is re-checked like any other
+    /// member: an admin, or a user with write access to it, is not refused;
+    /// a user who cannot see it or only reads it is.
+    #[tokio::test]
+    async fn late_members_are_reauthorized_with_the_members_permission() {
+        let admin = user_auth(Role::Admin);
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &checker(&[]),
+            auth: &admin,
+        };
+        assert!(late.unauthorized(1, &[4, 5]).await.unwrap().is_empty());
+
+        let user = user_auth(Role::User);
+        let team = checker(&[4]);
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &team,
+            auth: &user,
+        };
+        assert_eq!(late.unauthorized(1, &[4, 5]).await.unwrap(), vec![5]);
+
+        let reader = user_auth(Role::Reader);
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &team,
+            auth: &reader,
+        };
+        assert_eq!(late.unauthorized(1, &[4]).await.unwrap(), vec![4]);
+    }
+
+    /// Answers every access question with an infrastructure error.
+    struct Broken;
+
+    #[async_trait::async_trait]
+    impl ProjectAccessChecker for Broken {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Err("access store unavailable".into())
+        }
+    }
+
+    /// A lookup that fails is an error the placement reports as such, not a
+    /// denial that would surface as "members changed, retry" (409).
+    #[tokio::test]
+    async fn a_failing_access_lookup_on_late_members_is_an_error_not_a_denial() {
+        let user = user_auth(Role::User);
+        let broken: Option<Arc<dyn ProjectAccessChecker>> = Some(Arc::new(Broken));
+        let late = EnvWriteOnLateMembers {
+            project_access_checker: &broken,
+            auth: &user,
+        };
+        let err = late.unauthorized(7, &[4, 5]).await.unwrap_err();
+        assert!(
+            matches!(err, ProjectGroupError::LateMemberCheckFailed { group_id: 7, ref project_ids, .. } if *project_ids == vec![4, 5]),
+            "got {err:?}"
+        );
+        assert_eq!(
+            Problem::from(err).status_code,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
@@ -2347,6 +2518,67 @@ mod tests {
     }
 
     const ENV_WRITE: &str = "environments:write";
+
+    /// One group variable reads back masked to a reader of every member; a
+    /// missing one is a 404 naming it; a caller without environment read on
+    /// a member is refused.
+    #[tokio::test]
+    async fn one_group_variable_reads_back_masked() {
+        let base = 9831;
+        let Some(fixture) = delete_fixture(base, None).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group variable read test");
+            return;
+        };
+        let members: HashSet<i32> = [base, base + 1].into();
+        let var = fixture
+            .state
+            .env_vars
+            .create_checked(
+                fixture.group_id,
+                &members,
+                crate::env_vars::CreateGroupEnvVarRequest {
+                    key: "SENTRY_ENVIRONMENT".to_string(),
+                    value: "plain-value".to_string(),
+                    is_secret: false,
+                    environment_slug: None,
+                    include_in_preview: false,
+                },
+            )
+            .await
+            .expect("create variable");
+        let read = |auth: AuthContext, var_id: i32| {
+            get_group_env_var(
+                RequireAuth(auth),
+                State(fixture.state.clone()),
+                Path((fixture.group_id, var_id)),
+            )
+        };
+
+        let Json(found) = read(user_auth(Role::Reader), var.id)
+            .await
+            .expect("a reader of every member reads the variable");
+        assert_eq!(found.id, var.id);
+        assert_eq!(found.key, "SENTRY_ENVIRONMENT");
+        assert_eq!(found.value.as_deref(), Some("***"));
+
+        let missing = var.id + 1000;
+        let not_found = read(user_auth(Role::Reader), missing)
+            .await
+            .expect_err("missing variable");
+        assert_eq!(not_found.status_code, StatusCode::NOT_FOUND);
+        let detail = not_found
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains(&missing.to_string()), "{detail}");
+
+        let forbidden = read(user_auth(Role::MetricsIngest), var.id)
+            .await
+            .expect_err("no environments:read");
+        assert_eq!(forbidden.status_code, StatusCode::FORBIDDEN);
+    }
 
     #[tokio::test]
     async fn deleting_a_group_requires_write_on_both_ends_of_each_route() {

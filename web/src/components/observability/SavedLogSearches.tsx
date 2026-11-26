@@ -1,14 +1,22 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link } from 'react-router'
 import { useForm, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { z } from 'zod'
-import { Bell, Bookmark, Pin, PinOff, Trash2 } from 'lucide-react'
+import {
+  Bell,
+  Bookmark,
+  BookmarkCheck,
+  Check,
+  Pin,
+  PinOff,
+  Trash2,
+} from 'lucide-react'
 import {
   createSavedSearchMutation,
   deleteSavedSearchMutation,
@@ -39,7 +47,10 @@ import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { cn } from '@/lib/utils'
+import { LogServiceList } from './LogServiceList'
+import { useLogServices } from './use-log-services'
 import {
   alertOnSearchHref,
   orderSavedSearches,
@@ -61,8 +72,12 @@ const saveSchema = z.object({
 type SaveForm = z.infer<typeof saveSchema>
 
 export interface SavedLogSearchesProps {
-  /** Saved searches belong to one service; `undefined` shows how to pick one. */
+  /** Saved searches belong to one service; `undefined` offers the services. */
   projectId: number | undefined
+  /** Narrows the page to the service chosen where none was picked. */
+  onPickService: (serviceId: number) => void
+  /** The saved search the page shows right now, unchanged since it opened. */
+  openedId?: number
   /** The filters on the page right now, as a saved search stores them. */
   currentQuery: SavedSearchQuery
   /** The relative range the page shows, under the server's names. */
@@ -72,16 +87,21 @@ export interface SavedLogSearchesProps {
 
 /**
  * Saved searches for the logs page: open one, save the current filters,
- * pin, delete, or start an alert from one.
+ * pin, delete, or start an alert from one. It sits beside the search it
+ * stores, not among the page's actions.
  */
 export function SavedLogSearches({
   projectId,
   currentQuery,
   currentRange,
   onOpen,
+  onPickService,
+  openedId,
 }: SavedLogSearchesProps) {
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
+  const content = useRef<HTMLDivElement>(null)
+  const services = useLogServices(open && !projectId)
   // What "Save" stores is fixed when the dialog opens: if the page's
   // filters or project change underneath it (browser history, another
   // tab's link), the dialog still saves what the user chose to save.
@@ -159,22 +179,57 @@ export function SavedLogSearches({
     <>
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <Button size="sm" variant="outline" className="h-9 gap-2">
-            <Bookmark className="size-4" />
-            <span className="max-sm:sr-only">Saved searches</span>
+          <Button
+            size="sm"
+            variant={openedId === undefined ? 'outline' : 'secondary'}
+            className="h-9 shrink-0 gap-2"
+            aria-label="Saved searches"
+            title={
+              openedId === undefined
+                ? 'Open a saved search, or save this one'
+                : 'Showing a saved search'
+            }
+          >
+            {openedId === undefined ? (
+              <Bookmark className="size-4" />
+            ) : (
+              <BookmarkCheck className="size-4" />
+            )}
+            {/* Named where the search row has room: stacked above the
+                time range, or on one line in a wide page. */}
+            <span className="max-sm:sr-only lg:sr-only @5xl:not-sr-only">
+              Saved
+            </span>
           </Button>
         </PopoverTrigger>
-        <PopoverContent align="end" className="w-[min(24rem,90vw)] p-0">
+        <PopoverContent
+          ref={content}
+          tabIndex={-1}
+          align="end"
+          className="w-[min(24rem,90vw)] p-0 focus-visible:outline-none"
+        >
           {!projectId ? (
-            <div className="space-y-1 p-4 text-sm">
-              <p className="font-medium">Saved searches belong to a service</p>
-              <p className="text-muted-foreground">
-                Filter by a service (type <code>project:</code> in the search)
-                to save this search, chart it on a dashboard or alert on it.
+            <div className="space-y-2 p-2">
+              <p className="px-2 pt-1 text-sm font-medium">
+                Whose saved searches?
               </p>
+              <LogServiceList
+                services={services}
+                onPick={(serviceId) => {
+                  onPickService(serviceId)
+                  // The chosen row is gone; keep the keyboard inside.
+                  content.current?.focus()
+                }}
+              />
             </div>
           ) : (
             <div className="flex flex-col">
+              {project.data && (
+                <p className="flex items-center gap-2 border-b px-3 py-2 text-xs text-muted-foreground">
+                  <ServiceIcon service={project.data} size="xxs" />
+                  <span className="min-w-0 truncate">{project.data.name}</span>
+                </p>
+              )}
               <div className="max-h-80 overflow-y-auto p-1">
                 {searches.isPending ? (
                   <div className="space-y-1 p-2">
@@ -206,13 +261,27 @@ export function SavedLogSearches({
                         <button
                           type="button"
                           className="min-w-0 flex-1 px-1 py-1.5 text-left text-sm"
+                          aria-current={
+                            search.id === openedId ? 'true' : undefined
+                          }
                           onClick={() => {
                             setOpen(false)
                             onOpen(search)
                           }}
                         >
-                          <span className="block truncate font-medium">
-                            {search.name}
+                          <span className="flex items-center gap-1.5 font-medium">
+                            <span className="min-w-0 truncate">
+                              {search.name}
+                            </span>
+                            {search.id === openedId && (
+                              <>
+                                <Check
+                                  aria-hidden="true"
+                                  className="size-3.5 shrink-0"
+                                />
+                                <span className="sr-only">, showing now</span>
+                              </>
+                            )}
                           </span>
                           {search.description && (
                             <span className="block truncate text-xs text-muted-foreground">

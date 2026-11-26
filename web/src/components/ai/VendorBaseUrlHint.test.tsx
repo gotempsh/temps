@@ -14,9 +14,9 @@ test('renders nothing without a custom base URL on a vendor provider', () => {
   expect(render(false)).toBe('')
 })
 
-test('explains the vendor model check and offers the OpenAI-compatible switch', () => {
+test('explains the vendor model check and offers the OpenAI API switch', () => {
   const html = render(true)
   expect(html).toContain('verified with OpenAI&#x27;s own models')
-  expect(html).toContain('add an OpenAI-compatible provider')
-  expect(html).toContain('Switch to OpenAI-compatible')
+  expect(html).toContain('add an OpenAI API provider')
+  expect(html).toContain('Switch to OpenAI API')
 })

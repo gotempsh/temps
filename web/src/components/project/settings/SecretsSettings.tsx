@@ -6,6 +6,7 @@ import {
   createProjectSecretMutation,
   deleteProjectSecretMutation,
   getEnvironmentsOptions,
+  getProjectSecretQueryKey,
   listProjectSecretsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
@@ -26,7 +27,13 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { FileLock2, Pencil, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
@@ -35,6 +42,7 @@ import { useVariableChangeRedeploy } from '@/hooks/useVariableChangeRedeploy'
 import type { VariableChangeScope } from '@/lib/variable-change-redeploy'
 import { toast } from 'sonner'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
+import { usePageInRange } from '@/hooks/usePageInRange'
 import {
   EnvironmentVariableChecks,
   type EnvironmentVariableCheck,
@@ -51,6 +59,7 @@ interface SecretsSettingsProps {
 // authoritative; this just lets us surface errors before a round-trip.
 const MAX_SECRET_BYTES = 1_048_576 // 1 MiB
 const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,254}$/
+const SECRETS_PER_PAGE = 20
 
 export function SecretsSettings({ project }: SecretsSettingsProps) {
   const queryClient = useQueryClient()
@@ -65,12 +74,24 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
   const secretPath = (id: number) =>
     `/projects/${project.slug}/settings/secrets/${id}`
 
+  const [page, setPage] = useState(1)
   const secretsQuery = useQuery({
     ...listProjectSecretsOptions({
       path: { project_id: project.id },
-      query: {},
+      query: { page, page_size: SECRETS_PER_PAGE },
     }),
+    placeholderData: keepPreviousData,
   })
+  const secretsTotal = secretsQuery.data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(secretsTotal / SECRETS_PER_PAGE))
+  // Deleting the last secret of the last page leaves that page empty.
+  usePageInRange(
+    page,
+    secretsQuery.data && !secretsQuery.isPlaceholderData
+      ? { rows: secretsQuery.data.items.length, totalPages }
+      : undefined,
+    setPage
+  )
 
   const environmentsQuery = useQuery({
     ...getEnvironmentsOptions({
@@ -88,16 +109,16 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
     callback: () => setIsCreateOpen(true),
   })
 
+  // Every page of the list: the key without `query` matches them all.
   const refetchSecrets = () => {
     queryClient.invalidateQueries({
       queryKey: listProjectSecretsOptions({
         path: { project_id: project.id },
-        query: {},
       }).queryKey,
     })
   }
 
-  const secrets = secretsQuery.data ?? []
+  const secrets = secretsQuery.data?.items ?? []
   const editingSecret: ProjectSecretResponse | null =
     secrets.find((s) => s.id === editingSecretId) ?? null
   const environments = environmentsQuery.data ?? []
@@ -170,6 +191,12 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
               }
               onDeleted={() => {
                 refetchSecrets()
+                // Its detail page must not show it from the cache.
+                queryClient.removeQueries({
+                  queryKey: getProjectSecretQueryKey({
+                    path: { project_id: project.id, secret_id: s.id },
+                  }),
+                })
                 void notifyChange(
                   `Secret ${s.key} deleted`,
                   secretScope(s.environments)
@@ -178,6 +205,16 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
             />
           ))}
         </div>
+      )}
+      {secretsTotal > SECRETS_PER_PAGE && (
+        <ResponsivePagination
+          page={page}
+          pageSize={SECRETS_PER_PAGE}
+          total={secretsTotal}
+          totalPages={totalPages}
+          onPageChange={setPage}
+          ariaLabel="Secret list pagination"
+        />
       )}
 
       <SecretEditDialog
@@ -243,8 +280,8 @@ interface SecretRowProps {
     id: number
     key: string
     include_in_preview: boolean
-    created_at: number
-    updated_at: number
+    created_at: string
+    updated_at: string
     environments: Array<{ id: number; name: string; main_url: string }>
     compose_services?: string[]
   }

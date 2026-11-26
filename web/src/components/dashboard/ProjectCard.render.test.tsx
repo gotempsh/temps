@@ -122,3 +122,29 @@ describe('ProjectCard deployment state', () => {
     expect(markup).toContain('src="/templates/keycloak.svg"')
   })
 })
+
+describe('ProjectCard in a dense list', () => {
+  const render = (overrides: Partial<ProjectResponse>) =>
+    renderToStaticMarkup(
+      <MemoryRouter>
+        <ProjectCard project={{ ...project, ...overrides }} layout="dense" />
+      </MemoryRouter>
+    )
+
+  test('a monitored service is one row like the others, not a card', () => {
+    const markup = render({
+      source_type: 'external',
+      hosting: 'external',
+      last_deployment: null,
+    } as Partial<ProjectResponse>)
+    expect(markup).toContain('href="/projects/example"')
+    expect(markup).not.toContain('rounded-xl border bg-card')
+    expect(markup).toContain('Monitored')
+    expect(markup).toContain('Runs outside Temps')
+    expect(markup).not.toContain('Source upload')
+  })
+
+  test('every row shows it opens its service', () => {
+    expect(render({})).toContain('lucide-chevron-right')
+  })
+})

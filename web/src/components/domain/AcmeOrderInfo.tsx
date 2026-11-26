@@ -16,9 +16,9 @@ interface AcmeOrderInfoProps {
     id: number
     status: string
     email: string
-    expires_at?: number | null
-    created_at: number
-    updated_at: number
+    expires_at?: string | null
+    created_at: string
+    updated_at: string
     error?: string | null
     error_type?: string | null
   }

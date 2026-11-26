@@ -43,8 +43,9 @@ interface DeploymentJobResponse {
   status: string
   error_message?: string | null
   log_id: string
-  started_at?: number | null
-  finished_at?: number | null
+  /** ISO 8601 (older servers sent epoch seconds or milliseconds). */
+  started_at?: string | number | null
+  finished_at?: string | number | null
 }
 
 interface LogEntry {
@@ -85,17 +86,29 @@ const FAILURE_STATUSES = ['failed', 'error', 'cancelled']
 const FAILED_JOB_STATUSES = ['failure', 'cancelled']
 const RETRYABLE_CLIENT_STATUSES = new Set([408, 425, 429])
 
-// Convert API timestamp to milliseconds
-function toMs(timestamp: number): number {
-  if (timestamp < 946684800000) {
-    return timestamp * 1000
-  }
-  return timestamp
+/**
+ * A job timestamp in milliseconds, or `undefined` when it cannot be read.
+ * The API sends ISO 8601; older servers sent epoch seconds or milliseconds.
+ */
+function toMs(timestamp: string | number): number | undefined {
+  const ms =
+    typeof timestamp === 'string'
+      ? Date.parse(timestamp)
+      : timestamp < 946684800000
+        ? timestamp * 1000
+        : timestamp
+  return Number.isFinite(ms) ? ms : undefined
 }
 
-function formatDuration(startTimestamp: number, endTimestamp?: number): string {
+/** `1m 5s` from start to end (or to now); empty when either is unreadable. */
+export function formatDuration(
+  startTimestamp: string | number,
+  endTimestamp?: string | number | null,
+  now: number = Date.now()
+): string {
   const startMs = toMs(startTimestamp)
-  const endMs = endTimestamp ? toMs(endTimestamp) : Date.now()
+  const endMs = endTimestamp == null ? now : toMs(endTimestamp)
+  if (startMs === undefined || endMs === undefined) return ''
   const duration = endMs - startMs
 
   if (duration < 0 || duration > 86400000) {

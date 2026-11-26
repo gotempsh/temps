@@ -14,6 +14,10 @@
  * 1, so browsing history never accumulates rows -- see `operations-queries`
  * for the memory bound.
  *
+ * The button is in the top bar only while work is running or waiting for
+ * review, or while the tray is open (a toast's "View", the command palette's
+ * "Operations"): idle, the top bar keeps to the assistant.
+ *
  * Polling is on only when it is useful: every 5s while the popover is open,
  * every 10s while something is running, otherwise not at all (one fetch on
  * mount plus window-focus refetches).
@@ -22,6 +26,7 @@ import { problemDetail } from '@/lib/api-problem'
 import {
   OPERATIONS_HISTORY_PAGE_SIZE,
   OPERATIONS_RUNNING_PAGE_SIZE,
+  operationsTrayShown,
   operationsBadgeText,
   operationsClampPage,
   operationsLeftRunning,
@@ -163,6 +168,16 @@ export function OperationsTray() {
     if (next) setNow(Date.now())
     setOperationsTrayOpen(next)
   }
+
+  if (
+    !operationsTrayShown({
+      open,
+      runningCount,
+      localCount,
+      waitingCount: feed.waiting.length,
+    })
+  )
+    return null
 
   return (
     <Popover open={open} onOpenChange={handleOpenChange}>

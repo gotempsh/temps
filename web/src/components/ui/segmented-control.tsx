@@ -3,13 +3,15 @@
 
 import { cn } from '@/lib/utils'
 import type { LucideIcon } from 'lucide-react'
-import { useRef, type KeyboardEvent } from 'react'
+import { useRef, type KeyboardEvent, type ReactNode } from 'react'
 
 export interface SegmentedOption<T extends string> {
   value: T
   label: string
   /** Shown before the label, never instead of it. */
   icon?: LucideIcon
+  /** Shown before the label like `icon`, for an image (a service's logo). */
+  media?: ReactNode
 }
 
 /**
@@ -83,6 +85,7 @@ export function SegmentedControl<T extends string>({
             )}
           >
             {Icon && <Icon className="size-3.5" aria-hidden="true" />}
+            {option.media}
             {option.label}
           </button>
         )

@@ -45,8 +45,8 @@ function job(id: number, name: string): DeploymentJobResponse {
     deployment_id: 7,
     status: 'success',
     execution_order: id,
-    created_at: 1,
-    updated_at: 1,
+    created_at: new Date(1).toISOString(),
+    updated_at: new Date(1).toISOString(),
   } as DeploymentJobResponse
 }
 

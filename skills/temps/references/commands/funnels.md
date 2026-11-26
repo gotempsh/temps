@@ -10,7 +10,7 @@ Manage analytics funnels for projects
 
 **Subcommands:**
 
-- `list` (`ls`) - List all funnels for a project
+- `list` (`ls`) - List the funnels of a project, newest first
 - `create` (`add`) - Create a new funnel for a project
 - `update` - Update a funnel
 - `remove` (`rm`) - Delete a funnel
@@ -19,13 +19,15 @@ Manage analytics funnels for projects
 
 ### `funnels list` (alias: `ls`)
 
-List all funnels for a project
+List the funnels of a project, newest first
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--project-id <id>` | Project ID | - | Yes |
+| `--page <n>` | Page number (default: 1) | - | No |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `funnels create` (alias: `add`)

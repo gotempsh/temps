@@ -56,7 +56,7 @@ test('every signal leads with a library and folds curl away', () => {
     expect(html).toContain('1. Get the credential')
     expect(html).toContain('Without a library: endpoints and a curl test')
     expect(html).not.toContain('curl -i -X POST')
-    expect(html).toContain('Copy AI prompt')
+    expect(html).toContain('Hand off to agent')
   }
 })
 
@@ -237,7 +237,7 @@ test('a failed refresh keeps the loaded setup visible with a Retry', () => {
   expect(html).toContain('Could not refresh the ingest endpoints')
   expect(html).toContain('Retry')
   expect(html).toContain('https://temps.example.com/api/otel/v1/traces')
-  expect(html).toContain('Copy AI prompt')
+  expect(html).toContain('Hand off to agent')
   expect(html).not.toContain('Could not load the ingest endpoints')
 })
 
@@ -264,6 +264,6 @@ test('the prompt button offers a retry when the setup failed to load', () => {
     { kind: 'loaded', data: ingestSetupFixture() },
     <CopySetupPromptButton project={project} signal="logs" />
   )
-  expect(loaded).toContain('Copy AI prompt')
+  expect(loaded).toContain('Hand off to agent')
   expect(loaded).not.toContain('Retry prompt')
 })

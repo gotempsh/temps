@@ -51,6 +51,7 @@ pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
 pub mod openapi;
+pub mod pagination;
 pub mod payload_blobs;
 pub mod plugin;
 pub mod plugin_builder;
@@ -116,6 +117,7 @@ pub use docker_handle::{
     WORKER_NODE_REQUIRED_TYPE, WORKER_NODE_SETUP_PATH,
 };
 pub use docker_socket_grant::{DockerSocketGrant, DOCKER_SOCKET_PROJECTS_ENV};
+pub use pagination::PageQuery;
 pub use problemdetails::ProblemDetails;
 pub use self_update::{
     ReleaseCheckResult, SelfUpdateAttempt, SelfUpdateBlocker, SelfUpdateCapability,

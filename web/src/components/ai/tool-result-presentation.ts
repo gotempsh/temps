@@ -25,23 +25,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-export function isTempsReadTool(name: string): boolean {
-  return name === 'temps' || name === 'mcp__temps-chat__temps'
-}
-
 function isTempsWriteTool(name: string): boolean {
   return name === 'temps_write' || name === 'mcp__temps-chat__temps_write'
-}
-
-function operationFromArguments(argumentsJson: string): string | null {
-  try {
-    const value: unknown = JSON.parse(argumentsJson)
-    if (!isRecord(value) || typeof value.command !== 'string') return null
-    const [section, operation] = value.command.trim().split(/\s+/)
-    return section === 'projects' ? (operation ?? null) : null
-  } catch {
-    return null
-  }
 }
 
 function projectItem(value: unknown): ProjectCollectionItem | null {
@@ -63,56 +48,6 @@ function projectItem(value: unknown): ProjectCollectionItem | null {
     repoOwner:
       typeof value.repo_owner === 'string' ? value.repo_owner : undefined,
     preset: typeof value.preset === 'string' ? value.preset : undefined,
-  }
-}
-
-/**
- * Select a trusted native presentation from a read-tool receipt. The operation
- * id and response envelope come from Temps; the model never supplies a React
- * component name. Unknown operations deliberately fall back to ToolCard.
- */
-export function projectCollectionFromTool(
-  tool: ToolCall
-): ProjectCollectionPresentation | null {
-  if (
-    !isTempsReadTool(tool.name) ||
-    operationFromArguments(tool.arguments) !== 'get_projects' ||
-    !tool.result
-  ) {
-    return null
-  }
-
-  try {
-    const envelope: unknown = JSON.parse(tool.result)
-    if (!isRecord(envelope)) return null
-    if (envelope.operation !== 'get_projects') return null
-    if (
-      typeof envelope.status !== 'number' ||
-      envelope.status < 200 ||
-      envelope.status >= 300 ||
-      !isRecord(envelope.data) ||
-      !Array.isArray(envelope.data.projects)
-    ) {
-      return null
-    }
-
-    const items = envelope.data.projects
-      .map(projectItem)
-      .filter((item): item is ProjectCollectionItem => item !== null)
-    return {
-      items,
-      total:
-        typeof envelope.data.total === 'number'
-          ? envelope.data.total
-          : items.length,
-      page: typeof envelope.data.page === 'number' ? envelope.data.page : 1,
-      perPage:
-        typeof envelope.data.per_page === 'number'
-          ? envelope.data.per_page
-          : items.length,
-    }
-  } catch {
-    return null
   }
 }
 

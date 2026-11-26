@@ -61,7 +61,7 @@ export async function list(options: ListOptions): Promise<void> {
     { header: 'Branch', key: 'main_branch', width: 15 },
     {
       header: 'Updated',
-      accessor: (p) => formatRelativeTime(new Date(p.updated_at * 1000).toISOString()),
+      accessor: (p) => formatRelativeTime(p.updated_at),
       color: (v) => colors.muted(v),
     },
   ]

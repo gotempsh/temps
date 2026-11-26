@@ -50,6 +50,15 @@ pub struct StatusPageWebhookCreatedResponse {
 pub struct CreateStatusPageWebhookRequest {
     /// `https://` URL with a public address, at most 2048 characters.
     pub url: String,
+    /// Whether events are posted to it (default `true`). A webhook created
+    /// switched off receives nothing until it is enabled.
+    #[serde(default = "enabled_by_default")]
+    #[schema(default = true)]
+    pub enabled: bool,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 /// Fields left out are unchanged.

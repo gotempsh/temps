@@ -3,6 +3,7 @@
 
 import { useCallback, type ReactNode } from 'react'
 import { Link } from 'react-router'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Input } from '@/components/ui/input'
@@ -75,15 +76,28 @@ export function ProjectScope({
   if (scope) {
     // Inside a project the picker lists only the project's services.
     return (
-      <FilterSelect
-        label={`Service in ${scope.label}`}
+      <Select
         value={view.projectId ? String(view.projectId) : ''}
-        onChange={(id) => view.patch({ project_id: id })}
+        onValueChange={(id) => view.patch({ project_id: id })}
         disabled={disabled || scope.services.length === 0}
-        options={scope.services.map(
-          (service) => [String(service.id), service.name] as const
-        )}
-      />
+      >
+        <SelectTrigger
+          aria-label={`Service in ${scope.label}`}
+          className="h-9 w-auto min-w-32 max-w-56 gap-2 text-xs"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {scope.services.map((service) => (
+            <SelectItem key={service.id} value={String(service.id)}>
+              <span className="flex min-w-0 items-center gap-2">
+                <ServiceIcon service={service} size="xs" />
+                <span className="truncate">{service.name}</span>
+              </span>
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
     )
   }
   return (
@@ -103,11 +117,13 @@ export function ProjectScope({
 export function ServerWideLink({
   scope,
 }: {
-  scope: { serverWide: { title: string; url: string } }
+  scope: { serverWide: { label: string; title: string; url: string } }
 }) {
   return (
     <Button asChild variant="outline" size="sm">
-      <Link to={scope.serverWide.url}>{scope.serverWide.title}</Link>
+      <Link to={scope.serverWide.url} title={scope.serverWide.title}>
+        {scope.serverWide.label}
+      </Link>
     </Button>
   )
 }

@@ -7,14 +7,13 @@ import {
   ASSISTANT_OPERATE_PROMPTS,
   assistantExamplePrompts,
   NO_PROVIDER_REASON,
-  OPENROUTER_SETUP_PATH,
+  PROVIDER_SETUP_PATH,
   ASK_BEFORE_CHANGES_MODE,
   RUN_CHANGES_AUTOMATICALLY_MODE,
   assistantReadiness,
   asksBeforeChanges,
   chatTint,
   isAssistantConversation,
-  permissionModeForAsk,
   setupPathFromProblem,
   loadLastAssistantKeyId,
   loadLastAssistantModel,
@@ -52,11 +51,11 @@ describe('assistantReadiness', () => {
     })
   })
 
-  test('falls back to the default reason and OpenRouter path when omitted', () => {
+  test('falls back to the default reason and the AI providers page when omitted', () => {
     expect(assistantReadiness(undefined)).toEqual({
       state: 'unconfigured',
       reason: NO_PROVIDER_REASON,
-      setupPath: OPENROUTER_SETUP_PATH,
+      setupPath: PROVIDER_SETUP_PATH,
     })
     expect(
       assistantReadiness({ gateway_available: false, reason: '   ' })
@@ -71,7 +70,7 @@ describe('assistantReadiness', () => {
     ]) {
       expect(
         assistantReadiness({ gateway_available: false, setup_path })
-      ).toMatchObject({ setupPath: OPENROUTER_SETUP_PATH })
+      ).toMatchObject({ setupPath: PROVIDER_SETUP_PATH })
     }
   })
 
@@ -106,6 +105,11 @@ describe('isAssistantConversation', () => {
 })
 
 describe('example prompts', () => {
+  test('the default reason names no single vendor', () => {
+    expect(NO_PROVIDER_REASON).not.toMatch(/openrouter|openai|anthropic/i)
+    expect(PROVIDER_SETUP_PATH).toBe('/ai-gateway')
+  })
+
   test('lead with an app Temps builds and deploys from nothing', () => {
     expect(ASSISTANT_EXAMPLE_PROMPTS[0].toLowerCase()).toContain('calculator')
     for (const prompt of ASSISTANT_EXAMPLE_PROMPTS) {
@@ -170,11 +174,9 @@ describe('ask before changes', () => {
     expect(asksBeforeChanges(null)).toBe(false)
   })
 
-  test('round-trips through the permission mode ids the server accepts', () => {
-    expect(permissionModeForAsk(true)).toBe('confirm-actions')
-    expect(permissionModeForAsk(false)).toBe('auto')
-    expect(asksBeforeChanges(permissionModeForAsk(true))).toBe(true)
-    expect(asksBeforeChanges(permissionModeForAsk(false))).toBe(false)
+  test('the mode ids are the ones the server accepts', () => {
+    expect(ASK_BEFORE_CHANGES_MODE).toBe('confirm-actions')
+    expect(RUN_CHANGES_AUTOMATICALLY_MODE).toBe('auto')
   })
 })
 

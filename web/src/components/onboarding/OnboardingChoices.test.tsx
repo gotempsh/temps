@@ -44,7 +44,7 @@ test('unconfigured features remain visible with prerequisites and honest effort 
   expect(html).toContain('5–15 min')
   expect(html).toContain('not a completion-time guarantee')
   expect(html).toContain('waiting time')
-  expect(html).toContain('href="/tools"')
+  expect(html).toContain('href="/resources"')
 })
 
 test('the standalone page supplies its own question without a duplicate heading', () => {

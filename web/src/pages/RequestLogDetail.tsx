@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useParams, useSearchParams } from 'react-router'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import {
   useListBack,
   type ListReturnState,
@@ -138,6 +139,22 @@ export default function RequestLogDetail({
       <ArrowLeft className="h-4 w-4 mr-2" />
       Back to logs
     </Button>
+  )
+
+  // Declare what is on the page once, for "Hand off to agent" and the
+  // built-in assistant alike.
+  usePageSubject(
+    logId && logDetail
+      ? {
+          kind: 'proxy_log',
+          logId,
+          project: {
+            id: projectResponse.id,
+            slug: projectResponse.slug,
+            name: projectResponse.name,
+          },
+        }
+      : null
   )
 
   if (isLoading) {

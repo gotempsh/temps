@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, patch},
+    routing::get,
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,7 @@ use crate::services::inbound_filters::{
 #[openapi(
     paths(
         list_inbound_filters,
+        get_inbound_filter,
         create_inbound_filter,
         update_inbound_filter,
         delete_inbound_filter
@@ -52,7 +53,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route(
             "/projects/{project_id}/error-inbound-filters/{filter_id}",
-            patch(update_inbound_filter).delete(delete_inbound_filter),
+            get(get_inbound_filter)
+                .patch(update_inbound_filter)
+                .delete(delete_inbound_filter),
         )
 }
 
@@ -185,7 +188,7 @@ async fn audit(
     operation_id = "listErrorInboundFilters",
     params(("project_id" = i32, Path, description = "Project ID")),
     responses(
-        (status = 200, description = "The project's inbound filters", body = InboundFiltersResponse),
+        (status = 200, description = "The project's inbound filters, oldest first. Not paginated: bounded by design to 50 rules per project", body = InboundFiltersResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "Internal server error")
@@ -259,6 +262,41 @@ pub async fn create_inbound_filter(
     )
     .await;
     Ok((StatusCode::CREATED, Json(filter.into())))
+}
+
+/// Get one inbound filter and how many events it dropped.
+#[utoipa::path(
+    get,
+    path = "/projects/{project_id}/error-inbound-filters/{filter_id}",
+    tag = "error-tracking",
+    operation_id = "getErrorInboundFilter",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("filter_id" = i32, Path, description = "Inbound filter ID")
+    ),
+    responses(
+        (status = 200, description = "The filter, as listed", body = InboundFilterResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No such filter in this project"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_inbound_filter(
+    State(state): State<Arc<AppState>>,
+    RequireAuth(auth): RequireAuth,
+    Path((project_id, filter_id)): Path<(i32, i32)>,
+) -> Result<Json<InboundFilterResponse>, Problem> {
+    permission_guard!(auth, ErrorTrackingRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+    let filter = state
+        .error_tracking_service
+        .inbound_filters
+        .get(project_id, filter_id)
+        .await?;
+    Ok(Json(filter.into()))
 }
 
 /// Change an inbound filter's pattern or switch it on or off.
@@ -362,6 +400,80 @@ mod tests {
     use axum::response::IntoResponse;
     use temps_authz::Role;
     use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+    fn filter_row(id: i32) -> temps_entities::error_inbound_filters::Model {
+        let now = chrono::Utc::now();
+        temps_entities::error_inbound_filters::Model {
+            id,
+            project_id: 1,
+            kind: "web_crawlers".to_string(),
+            pattern: None,
+            enabled: true,
+            dropped_count: 4,
+            last_dropped_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_inbound_filter_can_be_read_back() {
+        use tower::ServiceExt;
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![filter_row(3)]])
+                .append_query_results([Vec::<temps_entities::error_inbound_filters::Model>::new()])
+                .into_connection(),
+        );
+        let state = app_state(&db, Arc::new(RecordingAuditLogger::default()));
+
+        let unauthenticated = routes()
+            .with_state(state.clone())
+            .oneshot(
+                axum::http::Request::get("/projects/1/error-inbound-filters/3")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("the router answers");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let no_read = temps_authz::AuthContext::new_api_key(
+            test_user(9, Role::Admin)
+                .user
+                .clone()
+                .expect("a session has a user"),
+            None,
+            Some(vec![temps_authz::Permission::ProjectsRead]),
+            "ci".to_string(),
+            2,
+        );
+        let denied = get_inbound_filter(State(state.clone()), RequireAuth(no_read), Path((1, 3)))
+            .await
+            .expect_err("error-tracking read is required");
+        assert_eq!(denied.into_response().status(), StatusCode::FORBIDDEN);
+
+        let filter = get_inbound_filter(
+            State(state.clone()),
+            RequireAuth(test_user(9, Role::Reader)),
+            Path((1, 3)),
+        )
+        .await
+        .expect("a reader can read a filter")
+        .0;
+        assert_eq!(filter.id, 3);
+        assert_eq!(filter.dropped_count, 4);
+
+        let missing = get_inbound_filter(
+            State(state),
+            RequireAuth(test_user(9, Role::Reader)),
+            Path((1, 99)),
+        )
+        .await
+        .expect_err("no such filter")
+        .into_response();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
 
     #[tokio::test]
     async fn a_reader_can_list_but_not_change_inbound_filters() {

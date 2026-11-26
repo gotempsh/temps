@@ -62,7 +62,7 @@ export function MetricCorrelations({
   // itself), so pass the metric's range through untouched.
   const tracesHref = `${base}/traces?range=${timeRange}&env=${env}`
   const errorsHref = `${base}/errors?range=${timeRange}`
-  const observeHref = `${base}/observe`
+  const observeHref = `${base}/activity`
 
   return (
     <div className="rounded-lg border border-border bg-card p-4">

@@ -65,7 +65,6 @@ import {
   ChevronLeft,
   ChevronsUpDown,
   ExternalLink,
-  LayoutDashboard,
   FolderGit2,
   GitBranch,
   Loader2,
@@ -91,13 +90,10 @@ import {
   type ReactNode,
 } from 'react'
 import { useDefaultLayout, usePanelRef } from 'react-resizable-panels'
-import { Link, useNavigate, useSearchParams } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
 import { AssistantHeaderSlot } from './assistant-header-slot'
 
-/** Where "Back to console" lands. */
-const CONSOLE_HOME_PATH = '/projects'
 import { toast } from 'sonner'
-import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { AiChatContext, useAiAssistant } from './AiAssistantContext'
 import { AiAssistantGate } from './AiAssistantGate'
@@ -1215,7 +1211,9 @@ export function DockBody({
   )
 
   const headerTitle = inAssistant
-    ? (assistant?.conversation.title ?? 'Temps assistant')
+    ? (assistant?.conversation.title ??
+      // On its page the console already says "Ask": name the chat instead.
+      (isPage ? 'New chat' : 'Temps assistant'))
     : inConversation
       ? (active?.title ?? 'AI chat')
       : picking
@@ -1292,7 +1290,6 @@ export function DockBody({
                   headerTitle
                 )}
               </h2>
-              {isPage && <FeatureMaturityBadge featureKey="ai-chat" />}
             </div>
             {inAssistant ? (
               <p className={cn(subtitleClass, 'text-sm text-muted-foreground')}>
@@ -1345,14 +1342,6 @@ export function DockBody({
                 aria-label={`View source: ${sourceLabel}`}
               >
                 <ExternalLink className="size-4" />
-              </Button>
-            )}
-            {isPage && (
-              <Button asChild size="sm" variant="ghost" className="h-8 gap-1">
-                <Link to={CONSOLE_HOME_PATH} title="Back to console">
-                  <LayoutDashboard className="size-4" />
-                  <span className="max-sm:sr-only">Console</span>
-                </Link>
               </Button>
             )}
             {!inConversation && !picking && (
@@ -1415,9 +1404,9 @@ export function DockBody({
                 <Maximize2 className="h-4 w-4" />
               </button>
             )}
-            {inAssistant && isPage && (
-              // The full-page view has room for a label; an icon-only "+"
-              // next to the labelled "Console" button read as decoration.
+            {assistant !== null && isPage && (
+              // The full-page view has room for a label. Not offered on a
+              // chat nothing was sent in yet: that is the new chat.
               <Button
                 type="button"
                 size="sm"

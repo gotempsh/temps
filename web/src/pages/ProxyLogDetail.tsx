@@ -4,6 +4,7 @@
 import { ProxyLogDetail } from '@/components/proxy-logs/ProxyLogDetail'
 import { Button } from '@/components/ui/button'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect } from 'react'
@@ -34,6 +35,10 @@ export default function ProxyLogDetailPage() {
   }, [setBreadcrumbs, logId])
 
   usePageTitle(`Proxy Log ${logId}`)
+
+  // Declare what is on the page once, for "Hand off to agent" and the
+  // built-in assistant alike.
+  usePageSubject(logId ? { kind: 'proxy_log', logId, projectId } : null)
 
   if (!logId) {
     return (

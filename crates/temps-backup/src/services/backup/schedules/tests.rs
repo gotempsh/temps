@@ -1851,3 +1851,35 @@ async fn five_field_cron_is_rejected_with_the_expected_format_and_a_fix() {
         .validate_backup_schedule("0 0 3 * * *")
         .is_ok());
 }
+
+/// A schedule's history is served a page at a time, newest first, with the
+/// total; a missing schedule is reported before anything is counted.
+#[tokio::test]
+async fn backups_of_a_schedule_are_listed_a_page_at_a_time() {
+    let count = |n: i64| {
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(n)),
+        )])
+    };
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![make_test_schedule(4, 1)]])
+        .append_query_results([vec![count(45)]])
+        .append_query_results([vec![make_test_backup_model(9), make_test_backup_model(8)]])
+        .append_query_results([Vec::<backup_schedules::Model>::new()])
+        .into_connection();
+    let service = make_scope_test_service(Arc::new(db));
+    let page = temps_core::PageQuery {
+        page: Some(3),
+        page_size: Some(2),
+    };
+
+    let (backups, total) = service.list_backups_for_schedule(4, page).await.unwrap();
+    assert_eq!(total, 45);
+    assert_eq!(backups.iter().map(|b| b.id).collect::<Vec<_>>(), [9, 8]);
+
+    assert!(matches!(
+        service.list_backups_for_schedule(5, page).await,
+        Err(BackupError::NotFound { .. })
+    ));
+}
