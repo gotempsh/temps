@@ -12,7 +12,9 @@ import { Command } from 'commander'
 // Scripted answers, consumed in order. Unscripted prompts fall through to the
 // real ones, so other test files that import the module are unaffected.
 const answers: { confirm: boolean[]; text: string[] } = { confirm: [], text: [] }
-const realPrompts = await import('../../ui/prompts.js')
+// Copied before mocking: Bun rewrites the module's live namespace to the
+// mock, so falling back through it would call the wrapper again.
+const realPrompts = { ...(await import('../../ui/prompts.js')) }
 mock.module('../../ui/prompts.js', () => ({
   ...realPrompts,
   promptConfirm: async (options: Parameters<typeof realPrompts.promptConfirm>[0]) =>
@@ -21,6 +23,7 @@ mock.module('../../ui/prompts.js', () => ({
     answers.text.length > 0 ? answers.text.shift()! : realPrompts.promptText(options),
 }))
 const { registerApiKeysCommands } = await import('./index.js')
+const prompts = await import('../../ui/prompts.js')
 
 const PERMISSIONS = ['projects:read', 'deployments:read', 'deployments:write']
 
@@ -91,6 +94,12 @@ async function create(...argv: string[]) {
   registerApiKeysCommands(program)
   await program.parseAsync(['apikeys', 'create', ...argv], { from: 'user' })
 }
+
+test('an unscripted prompt falls back to the real prompt, not the stub', () => {
+  // The stub is installed, and its fallback is the original function.
+  expect(realPrompts.promptConfirm).not.toBe(prompts.promptConfirm)
+  expect(realPrompts.promptText).not.toBe(prompts.promptText)
+})
 
 describe('apikeys create, interactive', () => {
   test('--permissions is the key\'s permissions without asking for them', async () => {
