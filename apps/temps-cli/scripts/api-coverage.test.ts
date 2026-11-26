@@ -147,6 +147,12 @@ describe('computeCoverage', () => {
     expect(report.gaps).toContain('GET /widgets --json')
   })
 
+  test('an area that registers through endpoint() offers --json', () => {
+    const source = "import { endpoint } from '../../lib/endpoint.js'\nendpoint(group, listWidgets, { query: { page: 'int' } })"
+    const report = computeCoverage(spec, sdk, areas({ widgets: source }))
+    expect(report.gaps).not.toContain('GET /widgets --json')
+  })
+
   test('an SDK name only counts as a whole identifier', () => {
     const report = computeCoverage(spec, sdk, areas({ widgets: 'listWidgetsFast()' }))
     expect(report.covered).toEqual([])

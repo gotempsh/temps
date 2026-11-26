@@ -222,6 +222,8 @@ export function readCommandAreas(dir: string = COMMANDS_DIR): CommandAreas {
   return areas
 }
 
+const ENDPOINT_IMPORT = /from '(?:\.\.\/)+lib\/endpoint\.js'/
+
 function mentions(source: string, identifier: string): boolean {
   return new RegExp(`(?<![\\w$])${identifier.replace(/[$]/g, '\\$')}(?![\\w$])`).test(source)
 }
@@ -272,7 +274,8 @@ export function computeCoverage(spec: unknown, sdkSource: string, areas: Command
       if (mentions(text, name)) fieldsCovered++
       else gaps.push(`${op.key} ${field}`)
     }
-    if (op.method === 'get' && !text.includes('--json')) gaps.push(`${op.key} --json`)
+    // `endpoint()` (src/lib/endpoint.ts) gives every command it registers `--json`.
+    if (op.method === 'get' && !text.includes('--json') && !ENDPOINT_IMPORT.test(text)) gaps.push(`${op.key} --json`)
   }
   const known = new Set(operations.map((op) => `${op.method.toUpperCase()} ${normalizePath(op.path)}`))
   const unknownMarkers = new Set<string>()

@@ -35,6 +35,8 @@ export interface MockRunOptions {
    * runner's own stdin in place.
    */
   stdin?: string | Uint8Array | 'tty'
+  /** The API base URL the command sees (default: an address nothing listens on). */
+  apiUrl?: string
 }
 
 /** A stand-in for `process.stdin`: a pipe yielding `input`, or an empty terminal. */
@@ -61,7 +63,7 @@ export async function runWithApi(
     Object.defineProperty(process, 'stdin', { value: fakeStdin(options.stdin), configurable: true, writable: true })
   }
   const saved = { url: process.env.TEMPS_API_URL, token: process.env.TEMPS_TOKEN, exitCode: process.exitCode }
-  process.env.TEMPS_API_URL = 'http://127.0.0.1:9'
+  process.env.TEMPS_API_URL = options.apiUrl ?? 'http://127.0.0.1:9'
   process.env.TEMPS_TOKEN = 'test-token-never-sent'
   // Bun ignores `process.exitCode = undefined`, so 0 marks "not set".
   process.exitCode = 0
