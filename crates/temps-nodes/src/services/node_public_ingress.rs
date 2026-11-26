@@ -39,16 +39,41 @@ pub enum NodePublicIngressError {
     StaleRevision(#[from] temps_core::revision::StaleRevision),
 }
 
+/// The HTTP port of a node with no stored settings.
+pub const DEFAULT_HTTP_PORT: u16 = 80;
+/// The HTTPS port of a node with no stored settings.
+pub const DEFAULT_HTTPS_PORT: u16 = 443;
+
+/// A stored port as the node uses it: `default` when unset (0) or invalid.
+pub fn effective_port(value: i32, default: u16) -> u16 {
+    u16::try_from(value)
+        .ok()
+        .filter(|p| *p != 0)
+        .unwrap_or(default)
+}
+
+/// The HTTP and HTTPS ports in effect, the defaults when nothing is stored.
+pub fn effective_ports(row: Option<&node_public_ingress::Model>) -> (u16, u16) {
+    row.map_or((DEFAULT_HTTP_PORT, DEFAULT_HTTPS_PORT), |r| {
+        (
+            effective_port(r.http_port, DEFAULT_HTTP_PORT),
+            effective_port(r.https_port, DEFAULT_HTTPS_PORT),
+        )
+    })
+}
+
 /// Revision of the settings the console writes (the enabled flag, listen
 /// address, ports and public address), whichever path changed them last.
 /// What the agent reports is left out: it changes on its own and is never
-/// written back by a save.
+/// written back by a save. The ports are the ones in effect, so a check or
+/// report that first creates the row with the defaults changes nothing.
 pub fn settings_revision(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> String {
+    let (http_port, https_port) = effective_ports(row);
     temps_core::revision::document_revision(&serde_json::json!({
         "enabled": node.public_ingress_enabled,
         "listen_address": row.and_then(|r| r.listen_address.as_deref()),
-        "http_port": row.map(|r| r.http_port),
-        "https_port": row.map(|r| r.https_port),
+        "http_port": http_port,
+        "https_port": https_port,
         "public_address": row.and_then(|r| r.public_address.as_deref()),
     }))
 }
@@ -180,8 +205,8 @@ impl NodePublicIngressService {
         let stored = node_public_ingress::ActiveModel {
             node_id: Set(node_id),
             listen_address: Set(None),
-            http_port: Set(80),
-            https_port: Set(443),
+            http_port: Set(i32::from(DEFAULT_HTTP_PORT)),
+            https_port: Set(i32::from(DEFAULT_HTTPS_PORT)),
             public_address: Set(None),
             interfaces: Set(None),
             listening: Set(None),
@@ -299,5 +324,63 @@ mod tests {
             .save(node.id, &change(443, None), None)
             .await
             .expect("an older client without a revision");
+    }
+
+    #[test]
+    fn a_check_that_creates_the_settings_row_keeps_the_revision() {
+        let node = nodes::Model {
+            public_ingress_enabled: false,
+            ..test_node()
+        };
+        let now = chrono::Utc::now();
+        // What `record_check` stores for a node that had no settings row.
+        let created_by_a_check = node_public_ingress::Model {
+            node_id: node.id,
+            listen_address: None,
+            http_port: i32::from(DEFAULT_HTTP_PORT),
+            https_port: i32::from(DEFAULT_HTTPS_PORT),
+            public_address: None,
+            interfaces: None,
+            listening: None,
+            mode: None,
+            last_check: Some(serde_json::json!({"reachable": false})),
+            private_checks: None,
+            tailscale: None,
+            checked_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        assert_eq!(
+            settings_revision(&node, None),
+            settings_revision(&node, Some(&created_by_a_check))
+        );
+        let moved = node_public_ingress::Model {
+            https_port: 8443,
+            ..created_by_a_check
+        };
+        assert_ne!(
+            settings_revision(&node, None),
+            settings_revision(&node, Some(&moved))
+        );
+    }
+
+    fn test_node() -> nodes::Model {
+        serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "name": "ingress-worker",
+            "token_hash": "unused",
+            "address": "https://10.100.0.9:3100",
+            "private_address": "10.100.0.9",
+            "role": "worker",
+            "status": "active",
+            "labels": {},
+            "capacity": {},
+            "dns_resolver_consecutive_failures": 0,
+            "public_ingress_enabled": false,
+            "public_ingress_unsupported_reasons": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("a node row")
     }
 }

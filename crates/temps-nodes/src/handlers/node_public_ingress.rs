@@ -32,7 +32,9 @@ use crate::handlers::audit::{
     NodePublicIngressCheckedAudit, NodePublicIngressSettingsChangedAudit,
 };
 use crate::handlers::types::NodeAdminState;
-use crate::services::node_public_ingress::{NodePublicIngressError, PublicIngressChange};
+use crate::services::node_public_ingress::{
+    effective_ports, NodePublicIngressError, PublicIngressChange,
+};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PublicIngressInterface {
@@ -138,13 +140,6 @@ fn internal(detail: impl Into<String>) -> Problem {
         .with_detail(detail.into())
 }
 
-fn port(value: i32, default: u16) -> u16 {
-    u16::try_from(value)
-        .ok()
-        .filter(|p| *p != 0)
-        .unwrap_or(default)
-}
-
 fn parse_ip(value: &str) -> Option<IpAddr> {
     value
         .parse::<IpAddr>()
@@ -220,8 +215,8 @@ fn view(node: &nodes::Model, row: Option<&node_public_ingress::Model>) -> Public
         node_id: node.id,
         enabled: node.public_ingress_enabled,
         listen_address: row.and_then(|r| r.listen_address.clone()),
-        http_port: row.map_or(80, |r| port(r.http_port, 80)),
-        https_port: row.map_or(443, |r| port(r.https_port, 443)),
+        http_port: effective_ports(row).0,
+        https_port: effective_ports(row).1,
         public_address: row.and_then(|r| r.public_address.clone()),
         effective_public_address: effective.map(|ip| ip.to_string()),
         effective_public_scope: effective.map(address_scope),
@@ -380,8 +375,7 @@ pub async fn update_public_ingress_settings(
         }
         Some(IngressMode::Off | IngressMode::Fixed) => {
             let stored_listen = existing.as_ref().and_then(|r| r.listen_address.clone());
-            let stored_http = existing.as_ref().map_or(80, |r| port(r.http_port, 80));
-            let stored_https = existing.as_ref().map_or(443, |r| port(r.https_port, 443));
+            let (stored_http, stored_https) = effective_ports(existing.as_ref());
             if listen_address != stored_listen
                 || http_port != stored_http
                 || https_port != stored_https
