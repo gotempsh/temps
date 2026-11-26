@@ -2355,6 +2355,7 @@ mod tests {
             "last_activity_at",
             "ingress_mode",
             "workload_mode",
+            "egress_recording",
         ]
         .map(|column| format!(r#""environments"."{column}""#))
         .join(", ");

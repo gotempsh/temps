@@ -15489,7 +15489,6 @@ dependencies = [
 name = "temps-sandbox"
 version = "0.1.0-beta.63"
 dependencies = [
- "arc-swap",
  "argon2 0.6.0",
  "async-stream",
  "async-trait",
@@ -15522,7 +15521,6 @@ dependencies = [
  "temps-network-policy",
  "temps-otel",
  "temps-pty-agent",
- "temps-routes",
  "temps-sandbox-providers",
  "temps-test-utils",
  "temps-workload",

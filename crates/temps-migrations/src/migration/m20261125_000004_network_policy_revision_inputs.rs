@@ -26,7 +26,7 @@ pub const TRIGGERS: &[(&str, &str, &str)] = &[
     (
         "sandboxes_network_policy_revision_update",
         "sandboxes",
-        "UPDATE OF status, egress_recording, project_id, node_id, public_id",
+        "UPDATE OF status, egress_recording, node_id, public_id",
     ),
     (
         "service_members_network_policy_revision",

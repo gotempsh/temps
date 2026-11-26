@@ -124,7 +124,7 @@ The request path: reverse proxy, edge cache, route table and bot protection.
 | [`temps-edge`](../../crates/temps-edge) | Database-free edge CDN node that caches static assets locally and proxies dynamic requests to a Temps control plane | **1**: cli |  |
 | [`temps-edge-rules`](../../crates/temps-edge-rules) | Edge rule model, validation and evaluation engine (ADR-089). Pure: no I/O. | **1**: proxy |  |
 | [`temps-proxy`](../../crates/temps-proxy) | Pingora reverse proxy: request routing, TLS and on-demand certificates, request logs, IP access control, rate limits and Shield | **2**: cli, observability |  |
-| [`temps-routes`](../../crates/temps-routes) | Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync | **12**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, flags, ingress, network-policy, proxy, sandbox, surveys, workload-egress |  |
+| [`temps-routes`](../../crates/temps-routes) | Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync | **11**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, flags, ingress, network-policy, proxy, surveys, workload-egress |  |
 | [`temps-shield`](../../crates/temps-shield) | Shield: proof-of-work challenges, clearance cookies and reputation lists (ADR 066) | **5**: environments, node-agent, projects, proxy, routes |  |
 
 ## domain
