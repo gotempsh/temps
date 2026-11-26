@@ -710,9 +710,11 @@ pub struct UpdateProjectSecretRequest {
     /// New plaintext value, <= 1 MiB. Omit to keep the existing value.
     #[serde(default)]
     pub value: Option<String>,
-    /// Replaces the environments the secret applies to. An empty list applies
-    /// it to every environment of the project. Omit to keep the current
-    /// environments.
+    /// Replaces the environments the secret applies to. Omit to keep the
+    /// current environments. Bindings to deleted environments are always
+    /// kept, so an empty list applies the secret to every environment of the
+    /// project only when it has none; a secret still bound to a deleted
+    /// environment stays limited to it.
     #[serde(default)]
     pub environment_ids: Option<Vec<i32>>,
     /// Whether preview environments receive the secret. Omit to keep the

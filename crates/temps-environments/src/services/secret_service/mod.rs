@@ -134,6 +134,20 @@ fn echoed(value: &str) -> String {
     shown
 }
 
+/// Why a name was refused for the character at `index` (0-based). The
+/// character is quoted only when it falls inside the excerpt [`echoed`]
+/// shows, so the error never repeats more of the input than that.
+fn invalid_character(index: usize, c: char, allowed: &str) -> String {
+    if index < MAX_ECHOED_CHARS {
+        format!("invalid character '{c}' (allowed: {allowed})")
+    } else {
+        format!(
+            "invalid character at position {} (allowed: {allowed})",
+            index + 1
+        )
+    }
+}
+
 /// Validates a secret key. Keys become file names under `/run/secrets/` and
 /// are commonly consumed as env-var-like identifiers, so we require the same
 /// conservative shape: uppercase letters, digits, and underscores; must start
@@ -164,11 +178,11 @@ fn validate_secret_key(key: &str) -> Result<(), SecretError> {
             reason: "key must start with a letter or underscore".to_string(),
         });
     }
-    for c in chars {
+    for (index, c) in chars.enumerate() {
         if !(c.is_ascii_alphanumeric() || c == '_') {
             return Err(SecretError::InvalidKey {
                 key: echoed(key),
-                reason: format!("invalid character '{}' (allowed: A-Z, a-z, 0-9, _)", c),
+                reason: invalid_character(index + 1, c, "A-Z, a-z, 0-9, _"),
             });
         }
     }
@@ -201,13 +215,14 @@ fn validate_compose_service_name(name: &str) -> Result<(), SecretError> {
             reason: "service name cannot be '.' or '..'".to_string(),
         });
     }
-    if let Some(c) = name
+    if let Some((index, c)) = name
         .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-'))
+        .enumerate()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-'))
     {
         return Err(SecretError::InvalidComposeService {
             service: echoed(name),
-            reason: format!("invalid character '{c}' (allowed: A-Z, a-z, 0-9, '.', '_', '-')"),
+            reason: invalid_character(index, c, "A-Z, a-z, 0-9, '.', '_', '-'"),
         });
     }
     Ok(())

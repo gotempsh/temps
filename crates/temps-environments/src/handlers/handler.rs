@@ -2707,7 +2707,8 @@ async fn record_secret_write(
     responses(
         (status = 200, description = "Secret updated", body = ProjectSecretResponse),
         (status = 400, description = "Value too large or an invalid compose service name"),
-        (status = 404, description = "Secret not found"),
+        (status = 404, description = "The secret, or a requested environment, was not found in the project"),
+        (status = 409, description = "Another secret with the same key already applies to one of the requested environments"),
         (status = 500, description = "Internal server error")
     ),
     params(

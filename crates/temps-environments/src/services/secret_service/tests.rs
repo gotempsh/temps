@@ -199,6 +199,37 @@ async fn refusals_of_oversized_names_do_not_echo_them_in_full() {
 }
 
 #[test]
+fn a_refused_character_beyond_the_excerpt_is_not_quoted() {
+    // 64 allowed characters, then the refused one: the excerpt stops before it.
+    let past = format!("{}/", "s".repeat(64));
+    let message = validate_compose_service_name(&past)
+        .unwrap_err()
+        .to_string();
+    assert!(!message.contains('/'), "{message}");
+    assert!(
+        message.contains("invalid character at position 65"),
+        "{message}"
+    );
+    let key_past = format!("{}/", "K".repeat(64));
+    let message = validate_secret_key(&key_past).unwrap_err().to_string();
+    assert!(!message.contains('/'), "{message}");
+    assert!(
+        message.contains("invalid character at position 65"),
+        "{message}"
+    );
+
+    // The last character the excerpt shows is still quoted.
+    let inside = format!("{}/", "s".repeat(63));
+    let message = validate_compose_service_name(&inside)
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("invalid character '/'"), "{message}");
+    let key_inside = format!("{}/", "K".repeat(63));
+    let message = validate_secret_key(&key_inside).unwrap_err().to_string();
+    assert!(message.contains("invalid character '/'"), "{message}");
+}
+
+#[test]
 fn short_refused_names_are_echoed_whole() {
     let err = validate_compose_service_name("web/api").unwrap_err();
     assert_eq!(
