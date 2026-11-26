@@ -130,6 +130,16 @@ pub struct PrivateAllowList {
     pub cidr: String,
 }
 
+/// Whether a stored range list (`100.64.0.0/10,fd7a:115c:a1e0::/48`, the
+/// form a private address's `private_range` takes when its listener admits
+/// several ranges) admits only private ranges: every comma-separated entry
+/// parses and is private. An empty list is not.
+pub fn range_list_is_private(ranges: &str) -> bool {
+    let mut parts = ranges.split(',').map(str::trim).peekable();
+    parts.peek().is_some_and(|first| !first.is_empty())
+        && parts.all(|part| cidr_is_private(part) == Some(true))
+}
+
 /// Whether an allow list of `cidrs` admits only private ranges: every entry
 /// parses and is private. An empty list is not.
 pub fn only_private(cidrs: &[String]) -> bool {
@@ -187,6 +197,20 @@ mod tests {
             "93.184.215.0/24".into()
         ]));
         assert!(!only_private(&[]));
+    }
+
+    #[test]
+    fn a_range_list_is_private_only_when_every_range_is() {
+        assert!(range_list_is_private("100.64.0.0/10"));
+        assert!(range_list_is_private("100.64.0.0/10,fd7a:115c:a1e0::/48"));
+        assert!(range_list_is_private("10.8.0.0/24, fd00:1::/64"));
+        // One public range, an unparsable one or an empty entry admits nobody.
+        assert!(!range_list_is_private("100.64.0.0/10,0.0.0.0/0"));
+        assert!(!range_list_is_private("100.64.0.0/10,not-a-range"));
+        assert!(!range_list_is_private("100.64.0.0/10,"));
+        assert!(!range_list_is_private(""));
+        // The single-range check this replaces cannot read a list.
+        assert_eq!(cidr_is_private("100.64.0.0/10,fd7a:115c:a1e0::/48"), None);
     }
 
     #[test]

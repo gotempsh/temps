@@ -113,8 +113,19 @@ pub fn parse_admit(text: &str) -> Result<IpNet, String> {
     Ok(net)
 }
 
+/// Most ranges one private listener admits. Every private address it serves
+/// stores and ships the whole list, so it stays short.
+pub const MAX_ADMITS: usize = 16;
+
 /// Parse every admitted range, or the first reason one is refused.
 pub fn parse_admits(texts: &[String]) -> Result<Vec<IpNet>, String> {
+    if texts.len() > MAX_ADMITS {
+        return Err(format!(
+            "{} ranges were given; a private listener admits at most {MAX_ADMITS}. Admit a \
+             wider private range that covers several of them.",
+            texts.len()
+        ));
+    }
     texts.iter().map(|t| parse_admit(t)).collect()
 }
 
@@ -261,6 +272,15 @@ mod tests {
         let why = default_admit(&ptp).unwrap_err();
         assert!(why.contains("wg1 (10.9.0.2) has no subnet"), "{why}");
         assert!(why.contains("--admit"), "{why}");
+    }
+
+    #[test]
+    fn a_listener_admits_a_bounded_number_of_ranges() {
+        let ranges =
+            |n: usize| -> Vec<String> { (0..n).map(|i| format!("10.{i}.0.0/16")).collect() };
+        assert_eq!(parse_admits(&ranges(MAX_ADMITS)).unwrap().len(), MAX_ADMITS);
+        let why = parse_admits(&ranges(MAX_ADMITS + 1)).unwrap_err();
+        assert!(why.contains("at most 16"), "{why}");
     }
 
     #[test]
