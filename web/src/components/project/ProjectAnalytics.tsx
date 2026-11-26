@@ -21,6 +21,11 @@ import {
   VisitorIdentityCard,
 } from '@/components/analytics/VisitorIdentityCard'
 import { IdentifyUsersCard } from '@/components/analytics/IdentifyUsersCard'
+import {
+  fetchAllIngestKeys,
+  INGEST_KEYS_PAGE_SIZE,
+  ingestKeyState,
+} from '@/components/project/ingest-keys'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -167,7 +172,10 @@ import {
 import { format } from 'date-fns'
 import { toast } from 'sonner'
 import { useUrlState } from '@temps-sdk/ds'
-import { setProjectHosting } from '@/api/client/sdk.gen'
+import {
+  listAnalyticsIngestKeys,
+  setProjectHosting,
+} from '@/api/client/sdk.gen'
 import { getErrorMessage } from '@/utils/errorHandling'
 import {
   dateFilterFromParams,
@@ -1743,9 +1751,6 @@ function renderBaseUrlNote(source: IngestBaseUrlSource, readFailed: boolean) {
   return null
 }
 
-/** The most keys one request returns (the API's maximum page size). */
-const INGEST_KEYS_SHOWN = 100
-
 function IngestKeySetup({ project }: ProjectAnalyticsProps) {
   const queryClient = useQueryClient()
   const [revokeTarget, setRevokeTarget] =
@@ -1769,21 +1774,28 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     path: { project_id: project.id },
   }).queryKey
 
-  // The newest keys, as many as one page holds: a project keeps a handful
-  // of active keys, and older revoked ones past this page do not matter here.
+  // Every key, page by page: the list is newest first and keeps revoked
+  // keys, so the active one can sit behind a full page of newer revoked ones.
+  // The key extends `keysQueryKey`, so invalidating that refetches it.
   const {
-    data: keyPage,
+    data: allKeys,
     isLoading: isLoadingKeys,
     isError: isErrorKeys,
     refetch: refetchKeys,
   } = useQuery({
-    ...listAnalyticsIngestKeysOptions({
-      path: { project_id: project.id },
-      query: { page: 1, page_size: INGEST_KEYS_SHOWN },
-    }),
+    queryKey: [...keysQueryKey, 'all-pages'] as const,
+    queryFn: ({ signal }) =>
+      fetchAllIngestKeys(async (page) => {
+        const { data } = await listAnalyticsIngestKeys({
+          path: { project_id: project.id },
+          query: { page, page_size: INGEST_KEYS_PAGE_SIZE },
+          signal,
+          throwOnError: true,
+        })
+        return data
+      }),
   })
-  const keys = keyPage?.items
-  const olderKeys = Math.max(0, (keyPage?.total ?? 0) - (keys?.length ?? 0))
+  const olderKeys = allKeys?.unread ?? 0
 
   const invalidateKeys = () => {
     void queryClient.invalidateQueries({ queryKey: keysQueryKey })
@@ -1821,15 +1833,10 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     },
   })
 
-  const activeKeys = React.useMemo(
-    () => (keys ?? []).filter((k: AnalyticsIngestKey) => k.is_active),
-    [keys]
+  const { revokedKeys, primaryKey } = React.useMemo(
+    () => ingestKeyState(allKeys?.keys ?? []),
+    [allKeys]
   )
-  const revokedKeys = React.useMemo(
-    () => (keys ?? []).filter((k: AnalyticsIngestKey) => !k.is_active),
-    [keys]
-  )
-  const primaryKey = activeKeys[0]
   const keySnippetValue = primaryKey?.public_key ?? 'pa_YOUR_INGEST_KEY'
 
   return (
