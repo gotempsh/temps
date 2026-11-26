@@ -66735,6 +66735,10 @@ export type GetPublicBranchErrors = {
      * Internal server error
      */
     500: unknown;
+    /**
+     * The provider could not answer for this branch (its listing was capped and it has no single-branch endpoint)
+     */
+    502: unknown;
 };
 
 export type GetPublicBranchResponses = {

@@ -81,8 +81,11 @@ export function useBranchVerification({
   branch,
   enabled,
 }: BranchVerificationInput): BranchVerification {
-  const name = branch?.trim() ?? ''
-  const canAsk = enabled && !!repoOwner && !!repoName && !!name
+  // Ask for exactly this name. Git allows U+00A0 in a ref, and `trim()`
+  // would strip it and verify a different branch; only an all-whitespace
+  // name is treated as no name.
+  const name = branch ?? ''
+  const canAsk = enabled && !!repoOwner && !!repoName && name.trim() !== ''
 
   const connectionQuery = useQuery({
     ...getRepositoryBranchOptions({

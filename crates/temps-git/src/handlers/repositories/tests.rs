@@ -477,4 +477,42 @@ mod branch_lookup_handler_tests {
         token.assert_async().await;
         branch.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn the_branch_name_is_looked_up_exactly_as_given() {
+        // Git allows U+00A0 in a ref. `release\u{a0}` is a different branch
+        // from `release`, so the provider must be asked for the name as sent.
+        let mut server = mockito::Server::new_async().await;
+        let token = mock_valid_token(&mut server).await;
+        let exact = server
+            .mock("GET", "/repos/temps/example/branches/release%C2%A0")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Branch not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let trimmed = server
+            .mock("GET", "/repos/temps/example/branches/release")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let response = router()
+            .with_state(state_over(database(&server.url())))
+            .oneshot(
+                Request::builder()
+                    .uri("/repositories/temps/example/branch?connection_id=7&name=release%C2%A0")
+                    .extension(AuthContext::new_session(test_user(), Role::Admin))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        token.assert_async().await;
+        exact.assert_async().await;
+        trimmed.assert_async().await;
+    }
 }

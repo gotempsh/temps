@@ -11509,9 +11509,10 @@ export const getPublicBranchQueryKey = (options: Options<GetPublicBranchData>) =
 /**
  * Look up one branch of a public repository by exact name
  *
- * Answers with one provider request, so it is exact for repositories with
- * more branches than `.../branches` returns. A 404 here is the only sound
- * basis for telling a user a branch does not exist.
+ * Reads the branch by name (after the visibility check every public route
+ * makes), so it is exact for repositories with more branches than
+ * `.../branches` returns. A 404 here is the only sound basis for telling a
+ * user a branch does not exist.
  */
 export const getPublicBranchOptions = (options: Options<GetPublicBranchData>) => queryOptions<GetPublicBranchResponse, DefaultError, GetPublicBranchResponse, ReturnType<typeof getPublicBranchQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {

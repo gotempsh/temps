@@ -131972,7 +131972,7 @@
     },
     "/git/public/{provider}/{owner}/{repo}/branch": {
       "get": {
-        "description": "Answers with one provider request, so it is exact for repositories with\nmore branches than `.../branches` returns. A 404 here is the only sound\nbasis for telling a user a branch does not exist.",
+        "description": "Reads the branch by name (after the visibility check every public route\nmakes), so it is exact for repositories with more branches than\n`.../branches` returns. A 404 here is the only sound basis for telling a\nuser a branch does not exist.",
         "operationId": "get_public_branch",
         "parameters": [
           {
@@ -132052,6 +132052,9 @@
           },
           "500": {
             "description": "Internal server error"
+          },
+          "502": {
+            "description": "The provider could not answer for this branch (its listing was capped and it has no single-branch endpoint)"
           }
         },
         "summary": "Look up one branch of a public repository by exact name",

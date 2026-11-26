@@ -606,7 +606,8 @@ pub struct PublicBranchQueryParams {
         (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository or branch not found"),
         (status = 429, description = "API rate limit exceeded"),
-        (status = 500, description = "Internal server error")
+        (status = 500, description = "Internal server error"),
+        (status = 502, description = "The provider could not answer for this branch (its listing was capped and it has no single-branch endpoint)")
     ),
     tag = "Public Repositories"
 )]
@@ -616,8 +617,11 @@ pub async fn get_public_branch(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicBranchQueryParams>,
 ) -> Result<Json<BranchInfo>, Problem> {
-    let branch_name = params.name.trim().to_string();
-    if branch_name.is_empty() {
+    // Look up exactly the name asked for. Git allows non-ASCII whitespace
+    // such as U+00A0 in a ref, and trimming it would answer for a different
+    // branch; only a name with nothing but whitespace is rejected.
+    let branch_name = params.name.clone();
+    if branch_name.trim().is_empty() {
         return Err(problem_new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Branch Name")
             .with_detail("The branch name to look up must not be empty."));

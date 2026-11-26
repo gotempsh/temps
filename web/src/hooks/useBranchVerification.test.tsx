@@ -196,3 +196,19 @@ test('a refresh that fails for another reason leaves the branch unverified', asy
   fireEvent.click(view.getByText('refresh'))
   await waitFor(() => expect(view.getByText('unverified:none')).toBeTruthy())
 })
+
+test('the branch is looked up by its exact name, non-breaking space included', async () => {
+  const asked: (string | null)[] = []
+  const { view } = renderProbe(
+    {
+      'GET /repositories/temps/example/branch': (request) => {
+        asked.push(new URL(request.url).searchParams.get('name'))
+        return jsonResponse({ title: 'Branch Not Found' }, 404)
+      },
+    },
+    { branch: 'release ' }
+  )
+
+  await waitFor(() => expect(view.getByText('missing:none')).toBeTruthy())
+  expect(asked).toEqual(['release '])
+})

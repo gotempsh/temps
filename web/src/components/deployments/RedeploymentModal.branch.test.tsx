@@ -227,3 +227,50 @@ test('typing a replacement for a confirmed-missing branch keeps the field mounte
   expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
   expect(document.activeElement).toBe(input)
 })
+
+test('a lookup that failed in manual entry can be checked again', async () => {
+  let replacementAttempts = 0
+  const { view } = renderModal({
+    truncated: true,
+    lookup: (request) => {
+      const name = new URL(request.url).searchParams.get('name')
+      if (name === 'main')
+        return jsonResponse({ title: 'Branch Not Found' }, 404)
+      replacementAttempts += 1
+      return replacementAttempts === 1
+        ? jsonResponse({ title: 'Rate limit exceeded' }, 429)
+        : jsonResponse({
+            name: 'main-2',
+            commit_sha: 'c'.repeat(40),
+            protected: false,
+            is_default: false,
+          })
+    },
+  })
+
+  const trigger = await waitFor(() => {
+    const element = view.baseElement.querySelector<HTMLElement>('#environment')
+    if (!element || element.hasAttribute('data-disabled')) {
+      throw new Error('environment picker not ready')
+    }
+    return element
+  })
+  fireEvent.pointerDown(trigger, {
+    button: 0,
+    ctrlKey: false,
+    pointerType: 'mouse',
+  })
+  fireEvent.click(await view.findByRole('option', { name: 'staging' }))
+  const input = await view.findByPlaceholderText('Enter branch name manually')
+
+  fireEvent.change(input, { target: { value: 'main-2' } })
+  await waitFor(() => expect(view.getByText(UNVERIFIED)).toBeTruthy())
+
+  // The combobox and its refresh control are not shown in manual entry, so
+  // the alert itself offers the retry.
+  fireEvent.click(view.getByRole('button', { name: 'Check again' }))
+  await waitFor(() => expect(view.queryByText(UNVERIFIED)).toBeNull())
+  expect(view.queryByText(NOT_FOUND)).toBeNull()
+  expect(replacementAttempts).toBe(2)
+  expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
+})

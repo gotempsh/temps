@@ -662,6 +662,15 @@ impl GitProviderService for GiteaProvider {
                 )));
             }
 
+            // How many branches the repository has. Gitea clamps `limit` to
+            // the instance's `[api] MAX_RESPONSE_ITEMS`, so a page shorter
+            // than we asked for is not proof it is the last one.
+            let total = response
+                .headers()
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<usize>().ok());
+
             let branches: Vec<GiteaBranch> = response.json().await.map_err(|e| {
                 GitProviderError::ApiError(format!("Failed to parse branches: {}", e))
             })?;
@@ -682,8 +691,11 @@ impl GitProviderService for GiteaProvider {
             if dropped_by_cap {
                 return Ok(BranchList::truncated(all_branches));
             }
-            // A short page is the last one, so the list is complete.
-            if count < per_page {
+            // An empty page, or as many branches as the instance says it has,
+            // ends the listing. Without the total a short page proves
+            // nothing (the instance may cap pages below `per_page`), so ask
+            // for the next one and let an empty page end it.
+            if count == 0 || total.is_some_and(|total| all_branches.len() >= total) {
                 break;
             }
             // A full page with no budget left: more may follow, and saying so

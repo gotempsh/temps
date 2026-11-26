@@ -317,8 +317,11 @@ pub async fn get_repository_branch(
 ) -> Result<Json<BranchInfo>, Problem> {
     permission_check!(auth, Permission::GitRepositoriesRead);
 
-    let branch_name = params.name.trim().to_string();
-    if branch_name.is_empty() {
+    // Look up exactly the name asked for. Git allows non-ASCII whitespace
+    // such as U+00A0 in a ref, and trimming it would answer for a different
+    // branch; only a name with nothing but whitespace is rejected.
+    let branch_name = params.name.clone();
+    if branch_name.trim().is_empty() {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Invalid Branch Name")
             .detail("The branch name to look up must not be empty.")

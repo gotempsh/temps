@@ -1002,12 +1002,27 @@ export function RedeploymentModal({
                     {branchUnverified && (
                       <Alert className="border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30">
                         <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-600" />
-                        <AlertDescription className="text-amber-800 dark:text-amber-400">
-                          The branch “{effectiveBranch}” could not be verified:
-                          this repository returns more branches than the{' '}
-                          {availableBranches.length} the list above holds, and
-                          the branch lookup did not answer. Deploying this
-                          branch still works if it exists.
+                        <AlertDescription className="flex items-center justify-between gap-3 text-amber-800 dark:text-amber-400">
+                          <span>
+                            The branch “{effectiveBranch}” could not be
+                            verified: this repository returns more branches than
+                            the {availableBranches.length} the list above holds,
+                            and the branch lookup did not answer. Deploying this
+                            branch still works if it exists.
+                          </span>
+                          {/* The only retry while the field is free text:
+                              the combobox and its refresh control are not
+                              shown then. */}
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="shrink-0"
+                            disabled={isLoading}
+                            onClick={() => void branchVerification.refresh()}
+                          >
+                            Check again
+                          </Button>
                         </AlertDescription>
                       </Alert>
                     )}
