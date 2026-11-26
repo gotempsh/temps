@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 import { useQueryClient } from '@tanstack/react-query'
 import { FOCUS_COMPOSER_HINT } from './assistant-view'
 import { uploadChatAttachment } from './chat-attachment-upload'
@@ -166,6 +165,9 @@ import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAiAssistant } from './AiAssistantContext'
 import { AssistantPermissionSelect } from './AssistantPermissionSelect'
+import { AssistantCodeBlock } from './views/AssistantCodeBlock'
+import { viewsAsMarkdown } from './views/view-markdown'
+import { ViewStreamingContext } from './views/view-streaming'
 import { AssistantModelChip } from './AssistantModelPicker'
 import {
   assistantRuntimeSelection,
@@ -490,11 +492,14 @@ function dropOptimisticTurn(setMessages: SetMessages, turnId: string) {
  */
 function messageCopyText(m: ChatMessage): string {
   if (m.role === 'user') return m.content
-  return assistantParts(m)
-    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
-    .map((p) => p.text)
-    .join('\n')
-    .trim()
+  // A view is copied as the Markdown that says the same thing, not as the
+  // patch lines it was drawn from.
+  return viewsAsMarkdown(
+    assistantParts(m)
+      .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+      .map((p) => p.text)
+      .join('\n')
+  ).trim()
 }
 
 const toolBlockClasses =
@@ -1685,9 +1690,10 @@ const ChatInlineCode: NonNullable<Components['code']> = (props) => {
 }
 
 const markdownComponents: Components = {
-  // Give horizontally-scrolling code blocks a thin, subtle scrollbar instead of
-  // the chunky default OS bar over the dark code surface.
-  pre: MarkdownCodeBlock,
+  // A block fenced as a view is drawn with the console's components; every
+  // other block is code, with a thin, subtle scrollbar instead of the chunky
+  // default OS bar over the dark code surface.
+  pre: AssistantCodeBlock,
   // SECURITY: cross-origin images from model output never auto-load. Shared
   // with every other renderer of untrusted Markdown — see the module for why.
   ...untrustedMarkdownImage,
@@ -2129,7 +2135,9 @@ export function AssistantBody({
     )
 
   return (
-    <>
+    // A view in this answer fills in while it is written and falls back to
+    // its source only once the answer has settled.
+    <ViewStreamingContext.Provider value={streaming}>
       {segments.map((segment) =>
         segment.kind === 'work' ? (
           <AssistantWorkGroup
@@ -2148,7 +2156,7 @@ export function AssistantBody({
         liveWorkKey === null && (
           <TurnActivity label={activityLabel} startedAt={turnStartedAt} />
         )}
-    </>
+    </ViewStreamingContext.Provider>
   )
 }
 

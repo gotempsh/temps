@@ -107,6 +107,16 @@ Unless the user, the code or the accepted architecture says otherwise:
 - No secret in a file, a command or a message. Linked services hand the app their variables; other credentials go through `request_secret` or the project's environment variables page.
 - A turn has a limited number of tool rounds: batch independent calls in one round, and if the work will not fit, stop at a working point and say what comes next."#;
 
+/// How the assistant draws a result with the console's own components: a
+/// fenced block the chat renders as a table, figures or a record's facts.
+///
+/// Generated from the console's view catalog, so the components listed here
+/// are the ones it can draw. Do not edit it by hand: change the catalog under
+/// `web/src/components/ai/views/` and run
+/// `bun run scripts/write-assistant-views.ts` in `web/`. A console test fails
+/// when the two differ.
+const ASSISTANT_VIEWS: &str = include_str!("assistant_views.md");
+
 /// Seeds a private, projectless chat that runs on the AI gateway (for example
 /// an OpenRouter key) with no sandbox behind it.
 ///
@@ -135,9 +145,10 @@ impl ConversationContextProvider for AssistantChatProvider {
         }
         Some(ConversationSeed {
             system: format!(
-                "{ASSISTANT_PERSONA}\n\n{}\n\n{ASSISTANT_SCOPE_AND_AUTHORITY}\n\n{ASSISTANT_GETTING_STARTED}\n\n{ASSISTANT_BUILDING}\n\n{}",
+                "{ASSISTANT_PERSONA}\n\n{}\n\n{ASSISTANT_SCOPE_AND_AUTHORITY}\n\n{ASSISTANT_GETTING_STARTED}\n\n{ASSISTANT_BUILDING}\n\n{}\n\n{}",
                 TOOL_USAGE_GUIDANCE,
-                console_links_guidance()
+                console_links_guidance(),
+                ASSISTANT_VIEWS.trim_end()
             ),
             first_assistant: None,
             title: Some("Temps assistant".to_string()),
@@ -213,6 +224,46 @@ mod tests {
                 .contains("Read the platform first (projects, Git providers"),
             "the assistant must not survey every area before each task"
         );
+    }
+
+    #[tokio::test]
+    async fn seed_teaches_views_after_the_console_links_they_point_to() {
+        let seed = AssistantChatProvider
+            .seed(None, "assistant_x")
+            .await
+            .expect("assistant ids are seeded");
+        let views = seed
+            .system
+            .find("## Views")
+            .expect("the assistant is told how to draw a view");
+        let links = seed
+            .system
+            .find(&console_links_guidance())
+            .expect("the assistant is told the console's links");
+        // A view's `href` is built from "the console links above".
+        assert!(links < views);
+        assert!(seed.system.contains("```spec"));
+        // A view reports on a real platform: nothing in it is made up.
+        assert!(seed
+            .system
+            .contains("Show only values a tool returned in this conversation"));
+        assert!(!seed.system.to_lowercase().contains("sample data"));
+        // Each component the console draws is listed with its props.
+        for component in [
+            "Stack",
+            "Stats",
+            "Stat",
+            "Status",
+            "KeyValues",
+            "Table",
+            "Trend",
+            "Bars",
+        ] {
+            assert!(
+                seed.system.contains(&format!("\n- {component}: {{")),
+                "the view instructions do not list {component}"
+            );
+        }
     }
 
     #[tokio::test]
