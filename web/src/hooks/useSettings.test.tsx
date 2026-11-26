@@ -2,17 +2,33 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+} from '@tanstack/react-query'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  renderHook,
+  screen,
+  waitFor,
+} from '@testing-library/react'
+import { Toaster, toast } from 'sonner'
 import type { ReactNode } from 'react'
 import { getSandboxResourceDefaultsQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { isStaleRevision } from '@/lib/stale-revision'
+import { getPlatformSettings } from '@/api/platformSettings'
 import { useUpdateSettings } from './useSettings'
 
 installBrowserWindow()
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  toast.dismiss()
+})
 
 test('saving sandbox settings invalidates cached limits for every placement', async () => {
   const api = mockApi({
@@ -149,4 +165,76 @@ test('a form that merged a refetch into its edits sends the revision the edits s
   })
   await waitFor(() => expect(result.current.isSuccess).toBe(true))
   expect(sent.expected_revision).toBe('r1')
+})
+
+test('after a refused save, "Load latest" re-reads the settings in place and hands them to the page', async () => {
+  let reads = 0
+  mockApi({
+    'GET /settings': () => {
+      reads += 1
+      return jsonResponse({
+        preview_domain: 'other.example.com',
+        revision: 'r2',
+      })
+    },
+    'PUT /settings': () =>
+      jsonResponse(
+        {
+          title: 'Settings Changed Since They Were Read',
+          detail: 'Platform settings changed since it was read',
+          expected_revision: 'r1',
+          current_revision: 'r2',
+        },
+        409
+      ),
+  })
+  const client = new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  })
+  client.setQueryData(['platform-settings'], {
+    preview_domain: 'example.com',
+    revision: 'r1',
+  })
+  const loaded: string[] = []
+  let reloaded = false
+  const reload = window.location.reload
+  window.location.reload = () => {
+    reloaded = true
+  }
+  const { result } = renderHook(
+    () => {
+      // The page's read of the settings (fresh: seeded below).
+      useQuery({
+        queryKey: ['platform-settings'],
+        queryFn: getPlatformSettings,
+        staleTime: Infinity,
+      })
+      return useUpdateSettings({
+        baseRevision: 'r1',
+        onLatestLoaded: (latest) => loaded.push(latest.revision ?? ''),
+      })
+    },
+    {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>
+          {children}
+          <Toaster />
+        </QueryClientProvider>
+      ),
+    }
+  )
+  act(() => {
+    result.current.mutate({ preview_domain: 'mine.example.com' })
+  })
+  await waitFor(() => expect(result.current.isError).toBe(true))
+  const loadLatest = await screen.findByRole('button', { name: 'Load latest' })
+  // The save read the settings once itself, before writing.
+  const readsBefore = reads
+  await act(async () => {
+    fireEvent.click(loadLatest)
+  })
+  await waitFor(() => expect(loaded).toEqual(['r2']))
+  expect(reads).toBe(readsBefore + 1)
+  expect(reloaded).toBe(false)
+  window.location.reload = reload
 })

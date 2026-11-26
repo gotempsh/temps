@@ -68,12 +68,38 @@ export function useSettingsPage() {
 }
 
 /**
+ * Re-read the settings after a save was refused as stale, and hand the
+ * stored document to `onLatestLoaded` (a form that keeps its unsaved edits
+ * across refetches adopts its revision, so saving again applies the edits
+ * on top of the other save).
+ */
+export async function loadLatestSettings(
+  queryClient: ReturnType<typeof useQueryClient>,
+  onLatestLoaded?: (latest: PlatformSettings) => void
+) {
+  await queryClient.refetchQueries({
+    queryKey: ['platform-settings'],
+    exact: true,
+  })
+  const latest = queryClient.getQueryData<PlatformSettings>([
+    'platform-settings',
+  ])
+  if (latest) onLatestLoaded?.(latest)
+}
+
+/**
  * `baseRevision` is the revision the page's form values are based on
  * (`useFormBaseRevision`); a form that merges refetches into unsaved edits
  * passes it, so a refetch does not make a save of those edits unconditional.
- * Without it, the revision of the cached read is sent.
+ * Without it, the revision of the cached read is sent. `onLatestLoaded`
+ * runs when the operator loads the latest settings after a refused save.
  */
-export function useUpdateSettings(options: { baseRevision?: string } = {}) {
+export function useUpdateSettings(
+  options: {
+    baseRevision?: string
+    onLatestLoaded?: (latest: PlatformSettings) => void
+  } = {}
+) {
   const queryClient = useQueryClient()
 
   return useMutation({
@@ -97,11 +123,16 @@ export function useUpdateSettings(options: { baseRevision?: string } = {}) {
     },
     onError: (error) => {
       if (isStaleRevision(error)) {
-        // A reload resets the page's form to the stored values; refetching
-        // alone would leave the stale form able to save over them.
+        // Re-read in place, not a page reload: a form that keeps unsaved
+        // edits across refetches keeps them, shows the other save in the
+        // fields it did not touch, and adopts its revision.
         toast.error('Settings were changed by someone else', {
           description: STALE_REVISION_MESSAGE,
-          action: { label: 'Reload', onClick: () => window.location.reload() },
+          action: {
+            label: 'Load latest',
+            onClick: () =>
+              void loadLatestSettings(queryClient, options.onLatestLoaded),
+          },
         })
         return
       }
