@@ -23,7 +23,7 @@ Helper scripts for Temps development and operations.
 ```
 
 A libraries-only release tags `libraries/vX.Y.Z-beta.N`, reserving that server
-beta number; see "Libraries-only releases" in `docs/release-testing.md`.
+beta number; `./scripts/release.sh --libraries --help` lists its steps.
 
 ### What it does
 
