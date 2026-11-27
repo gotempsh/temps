@@ -2329,7 +2329,11 @@ async fn the_file_stage_refuses_a_private_static_route_its_environment_did_not_a
             // Served from the route's own directory: not refused, and not
             // passed on as though the host had no static files.
             assert_ne!(ctx.routing_status, "private_route_unadmitted");
-            assert!(matches!(flow, super::Flow::Answered), "{}", ctx.routing_status);
+            assert!(
+                matches!(flow, super::Flow::Answered),
+                "{}",
+                ctx.routing_status
+            );
         } else {
             assert!(matches!(flow, super::Flow::Answered));
             assert_eq!(ctx.routing_status, "private_route_unadmitted");

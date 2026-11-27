@@ -391,9 +391,8 @@ impl<'de> Deserialize<'de> for CreateProjectEnvVar {
                 }
                 // A generated secret is made here, on the server, so it never
                 // passes through the client; it is always stored as a secret.
-                let (value, is_secret) =
-                    resolve_create_value(&key, value, is_secret, generate)
-                        .map_err(serde::de::Error::custom)?;
+                let (value, is_secret) = resolve_create_value(&key, value, is_secret, generate)
+                    .map_err(serde::de::Error::custom)?;
                 CreateProjectEnvVar {
                     key,
                     value,
