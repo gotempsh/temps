@@ -27,11 +27,20 @@ name: Release
 # (`type=registry,ref=ghcr.io/...:buildcache`) — it does not touch the 10GB
 # Actions cache budget and is readable across refs.
 
+# Libraries-only releases: a `libraries/vX.Y.Z-beta.N` tag publishes the SDKs
+# and the CLI prepared for it in .github/releases/prepared.json and skips the
+# server entirely: no web or server build, no daemon, sandbox, preview-gateway,
+# database or server images, no GitHub Release. It runs here, not in a separate
+# workflow, because each registry's trusted publisher names this workflow file
+# and its `sdk` environment. The mode comes from the tag alone
+# (validate-release-ref.sh); `*` never matches `/`, so the server patterns
+# below never match a libraries tag. Cut one with `scripts/release.sh --libraries`.
 on:
   push:
     tags:
       - "v*.*.*"
       - "v*.*.*-*"
+      - "libraries/v*.*.*-beta.*"
   # Manual dispatch lets us dry-run the pipeline without minting a junk
   # tag. Useful when iterating on the workflow itself or verifying a fix
   # before cutting a real release. The artifact tags include the run id
@@ -59,6 +68,7 @@ permissions: {}
 jobs:
   daemon-images:
     needs: [validate-release-ref, require-tests]
+    if: needs.validate-release-ref.outputs.server == 'true'
     uses: ./.github/workflows/daemon-images.yml
     permissions:
       contents: read
@@ -77,6 +87,7 @@ jobs:
     # required tag is anonymously pullable. Freshness is owned by the weekly
     # schedule in database-images.yml, not by the release cadence.
     needs: [validate-release-ref, require-tests]
+    if: needs.validate-release-ref.outputs.server == 'true'
     uses: ./.github/workflows/database-images.yml
     permissions:
       contents: read
@@ -89,6 +100,8 @@ jobs:
   validate-release-ref:
     name: Validate Release Ref
     outputs:
+      # 'false' for a libraries-only release: every server job is skipped.
+      server: ${{ steps.ref.outputs.server }}
       sdk_selected: ${{ steps.sdk.outputs.selected }}
       sdk_channel: ${{ steps.sdk.outputs.channel }}
       sdk_kinds: ${{ steps.sdk.outputs.kinds }}
@@ -105,11 +118,20 @@ jobs:
           persist-credentials: false
 
       - name: Reject unsafe publishing refs
+        id: ref
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: .github/scripts/validate-release-ref.sh "$DRY_RUN" "$REF_TYPE" "$REF_NAME"
+
+      # A libraries-only release reserves a server beta number: a server tag and
+      # a libraries tag of the same version would publish the SDKs twice under it.
+      - name: Refuse a release number another release already took
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/sdk_release.py check-release-tag --tag "$RELEASE_TAG" --at-tag
 
       - name: Plan SDK releases from committed manifests
         id: sdk
@@ -208,7 +230,7 @@ jobs:
             --timeout-minutes 180
 
   build-web-assets:
-    name: Build web assets (WASM + dist)
+    name: Build web assets (WASM + dist) and SDK packages
     # The web console + captcha WASM are pure static output with no
     # platform/arch dependency, but crates/temps-cli/build.rs rebuilds them
     # on every `cargo build --release` invocation. Build them once here and
@@ -216,7 +238,8 @@ jobs:
     # instead of paying bun install + wasm-pack + rsbuild build 4x — the
     # most expensive repeat was the macOS Intel job's wasm-pack step alone
     # (7m26s on the last release), on top of a redundant rsbuild build in
-    # each of the other 3 jobs.
+    # each of the other 3 jobs. A libraries-only release skips the web
+    # steps and only tests and packages the SDKs on this runner.
     needs: validate-release-ref
     runs-on: ubuntu-latest
     permissions:
@@ -232,29 +255,34 @@ jobs:
           toolchain: 1.99.1
 
       - name: Install Bun
+        if: needs.validate-release-ref.outputs.server == 'true'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.14
           no-cache: true
 
       - name: Restore Bun dependencies
+        if: needs.validate-release-ref.outputs.server == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
 
       - name: Install web dependencies
+        if: needs.validate-release-ref.outputs.server == 'true'
         run: |
           cd web
           bun install --frozen-lockfile
 
       - name: Install wasm-pack and Build WASM
+        if: needs.validate-release-ref.outputs.server == 'true'
         run: |
           cargo install wasm-pack --version 0.15.0 --locked
           cd crates/temps-captcha-wasm
           bun run build
 
       - name: Build web dist
+        if: needs.validate-release-ref.outputs.server == 'true'
         run: |
           cd web
           bun run build
@@ -263,6 +291,7 @@ jobs:
           TEMPS_VERSION: ${{ github.ref_name }}
 
       - name: Upload web dist artifact
+        if: needs.validate-release-ref.outputs.server == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: web-dist
@@ -317,7 +346,18 @@ jobs:
   publish-sdks:
     name: Publish prepared SDK releases
     needs: [validate-release-ref, require-tests, build-web-assets, create-release]
-    if: inputs.dry_run != true && needs.validate-release-ref.outputs.sdk_selected == 'true'
+    # A server release publishes SDKs only after its GitHub Release exists; a
+    # libraries-only release has none, so there the skipped create-release is
+    # accepted. `!cancelled()` replaces the implicit success() check, so every
+    # other dependency must still have succeeded.
+    if: >-
+      !cancelled() && inputs.dry_run != true &&
+      needs.validate-release-ref.result == 'success' &&
+      needs.require-tests.result == 'success' &&
+      needs.build-web-assets.result == 'success' &&
+      needs.validate-release-ref.outputs.sdk_selected == 'true' &&
+      (needs.create-release.result == 'success' ||
+       (needs.validate-release-ref.outputs.server == 'false' && needs.create-release.result == 'skipped'))
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # One environment for both channels, so each registry needs a single
@@ -1071,8 +1111,10 @@ jobs:
             ignore=""
           else
             # A beta/RC/stable lists everything since the previous non-nightly
-            # release; the nightlies in between are folded into this section.
-            previous="$(git describe --tags --abbrev=0 --exclude '*-nightly.*' "$RELEASE_TAG^" 2>/dev/null || true)"
+            # release; the nightlies in between are folded into this section,
+            # and so are libraries-only releases (libraries/v*) and package
+            # tags (sdk/*), which `v[0-9]*` does not match.
+            previous="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-nightly.*' "$RELEASE_TAG^" 2>/dev/null || true)"
             # Quoted so the pattern survives the action's unquoted expansion
             # of `args`; git-cliff matches it against the whole tag name.
             ignore="--ignore-tags '.*-nightly\\..*'"
@@ -1646,6 +1688,7 @@ jobs:
   prepare-sandbox-context:
     name: Prepare sandbox build context
     needs: validate-release-ref
+    if: needs.validate-release-ref.outputs.server == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1735,6 +1778,7 @@ jobs:
   build-and-push-sandbox-images:
     name: Build sandbox image (${{ matrix.runtime }})
     needs: [validate-release-ref, require-tests, prepare-sandbox-context]
+    if: needs.validate-release-ref.outputs.server == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1853,6 +1897,7 @@ jobs:
   build-and-push-preview-gateway:
     name: Build preview gateway image
     needs: [validate-release-ref, require-tests, prepare-sandbox-context]
+    if: needs.validate-release-ref.outputs.server == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
