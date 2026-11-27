@@ -19,7 +19,13 @@
 //! {"type":"temps.tool_result","id":"…","output":"…","is_error":false}
 //! {"type":"temps.finish","reason":"stop"|"max_turns","turns":3}
 //! ```
+//!
+//! The log gets every line. The transcript returned keeps the last
+//! [`MAX_TRANSCRIPT_BYTES`] of them (the report and the run's end are last),
+//! opened by `{"type":"temps.truncated","dropped_lines":N}` when earlier
+//! lines were dropped, so a long run's memory stays bounded.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -313,7 +319,7 @@ pub async fn run_agent_loop(
                 });
             }
             transcript
-                .push(json!({ "type": "temps.finish", "reason": "stop", "turns": turn }))
+                .finish(json!({ "type": "temps.finish", "reason": "stop", "turns": turn }))
                 .await;
             return Ok(AgentLoopOutcome {
                 transcript: transcript.into_text(),
@@ -376,7 +382,7 @@ pub async fn run_agent_loop(
     }
 
     transcript
-        .push(json!({ "type": "temps.finish", "reason": "max_turns", "turns": max_turns }))
+        .finish(json!({ "type": "temps.finish", "reason": "max_turns", "turns": max_turns }))
         .await;
     Ok(AgentLoopOutcome {
         transcript: transcript.into_text(),
@@ -413,30 +419,73 @@ fn timed_out(request: &AgentLoopRequest, turns: u32) -> AgentError {
     }
 }
 
-/// The run's transcript, kept and streamed line by line.
+/// Most bytes of transcript a run keeps in memory; the log has the rest.
+pub(crate) const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+
+/// The run's transcript, streamed line by line, its last
+/// [`MAX_TRANSCRIPT_BYTES`] kept.
 struct Transcript {
-    lines: Vec<String>,
+    lines: VecDeque<String>,
+    /// Bytes in `lines`, each counted with its newline.
+    bytes: usize,
+    /// Lines dropped from the front to stay under the limit.
+    dropped: usize,
     on_event: Option<OnEventCallback>,
 }
 
 impl Transcript {
     fn new(on_event: Option<OnEventCallback>) -> Self {
         Self {
-            lines: Vec::new(),
+            lines: VecDeque::new(),
+            bytes: 0,
+            dropped: 0,
             on_event,
         }
     }
 
+    /// Append a line; the oldest go while the transcript is over its limit,
+    /// never the newest, however large.
     async fn push(&mut self, event: serde_json::Value) {
+        self.push_keeping(event, 1).await;
+    }
+
+    /// Append the finish line. The line before it (the final answer, which
+    /// the report is read from) is kept too, however large: the transcript
+    /// is complete then, so it is over its limit only as it is returned.
+    async fn finish(&mut self, event: serde_json::Value) {
+        self.push_keeping(event, 2).await;
+    }
+
+    async fn push_keeping(&mut self, event: serde_json::Value, newest: usize) {
         let line = event.to_string();
         if let Some(on_event) = &self.on_event {
             on_event(line.clone()).await;
         }
-        self.lines.push(line);
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line);
+        while self.bytes > MAX_TRANSCRIPT_BYTES && self.lines.len() > newest {
+            if let Some(oldest) = self.lines.pop_front() {
+                self.bytes -= oldest.len() + 1;
+                self.dropped += 1;
+            }
+        }
     }
 
     fn into_text(self) -> String {
-        self.lines.join("\n")
+        let mut text = String::with_capacity(self.bytes + 64);
+        if self.dropped > 0 {
+            text.push_str(
+                &json!({"type": "temps.truncated", "dropped_lines": self.dropped}).to_string(),
+            );
+            text.push('\n');
+        }
+        for (at, line) in self.lines.into_iter().enumerate() {
+            if at > 0 {
+                text.push('\n');
+            }
+            text.push_str(&line);
+        }
+        text
     }
 }
 
@@ -633,6 +682,92 @@ fn bound(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A run longer than the limit keeps its last lines, says how many went
+    /// before them, and never holds more than the limit; the log saw all.
+    #[tokio::test]
+    async fn the_transcript_kept_is_bounded_to_its_last_lines() {
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&seen);
+        let on_event: super::OnEventCallback = std::sync::Arc::new(move |_line: String| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        });
+        let mut transcript = super::Transcript::new(Some(on_event));
+        let chunk = "x".repeat(10_000);
+        let total = 300;
+        for i in 0..total {
+            transcript
+                .push(serde_json::json!({"type": "temps.text", "text": format!("{i} {chunk}")}))
+                .await;
+            assert!(transcript.bytes <= super::MAX_TRANSCRIPT_BYTES);
+        }
+        let dropped = transcript.dropped;
+        assert!(dropped > 0);
+        let text = transcript.into_text();
+        assert!(text.len() <= super::MAX_TRANSCRIPT_BYTES + 64);
+        let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(first["type"], "temps.truncated");
+        assert_eq!(first["dropped_lines"], dropped);
+        assert!(text
+            .lines()
+            .last()
+            .unwrap()
+            .contains(&format!("{} ", total - 1)));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), total);
+    }
+
+    /// A final answer as large as the limit is still there after the finish
+    /// line, so the report can be read from the transcript.
+    #[tokio::test]
+    async fn the_finish_never_pushes_out_the_final_answer() {
+        let mut transcript = super::Transcript::new(None);
+        transcript
+            .push(serde_json::json!({"type": "temps.text", "text": "x".repeat(10_000)}))
+            .await;
+        let answer = "a".repeat(super::MAX_TRANSCRIPT_BYTES);
+        transcript
+            .push(serde_json::json!({"type": "temps.text", "text": answer}))
+            .await;
+        transcript
+            .finish(serde_json::json!({"type": "temps.finish", "reason": "stop", "turns": 1}))
+            .await;
+        let text = transcript.into_text();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3, "the marker, the answer and the finish");
+        assert_eq!(lines[0]["type"], "temps.truncated");
+        assert_eq!(
+            lines[1]["text"].as_str().map(str::len),
+            Some(super::MAX_TRANSCRIPT_BYTES)
+        );
+        assert_eq!(lines[2]["type"], "temps.finish");
+    }
+
+    /// While the run goes on, a large text before a large tool call is let
+    /// go: only the newest line may hold the transcript over its limit.
+    #[tokio::test]
+    async fn before_the_finish_only_the_newest_line_is_kept_past_the_limit() {
+        let mut transcript = super::Transcript::new(None);
+        let half = "t".repeat(super::MAX_TRANSCRIPT_BYTES * 6 / 10);
+        transcript
+            .push(serde_json::json!({"type": "temps.text", "text": half}))
+            .await;
+        transcript
+            .push(serde_json::json!({
+                "type": "temps.tool_call",
+                "id": "c1",
+                "name": "sandbox_exec",
+                "input": {"command": half},
+            }))
+            .await;
+        assert_eq!(transcript.lines.len(), 1);
+        assert!(transcript.lines[0].contains("temps.tool_call"));
+        assert_eq!(transcript.dropped, 1);
+        assert!(transcript.bytes <= super::MAX_TRANSCRIPT_BYTES);
+    }
+
     use super::*;
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;

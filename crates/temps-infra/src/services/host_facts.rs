@@ -33,6 +33,9 @@ use super::PlatformInfoService;
 
 /// How long a local port probe may take.
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// The most local addresses a port is probed on; a machine with more
+/// interface addresses than this has the first ones probed.
+const MAX_PROBED_ADDRESSES: usize = 64;
 /// How long the MagicDNS reverse lookup may take.
 const MAGIC_DNS_TIMEOUT: Duration = Duration::from_millis(800);
 /// How long Docker may take to report its version.
@@ -180,15 +183,15 @@ pub fn listener_probe_address(address: &str) -> Option<SocketAddr> {
 /// Who holds a port: Temps when one of its configured listeners on the port
 /// answered at its own address and Temps' proxy proved it is running
 /// (`proxy_identified`), someone else when something answered without that
-/// proof (another server took the stopped proxy's address) or only local
-/// loopback answered, and nobody when nothing did (a configured proxy that
-/// is stopped serves nothing).
+/// proof (another server took the stopped proxy's address) or only on one of
+/// this machine's other addresses, and nobody when nothing did (a configured
+/// proxy that is stopped serves nothing).
 pub fn port_holder(
     temps_answered: bool,
     proxy_identified: bool,
-    loopback_answered: bool,
+    local_answered: bool,
 ) -> PortHolder {
-    match (temps_answered, proxy_identified, loopback_answered) {
+    match (temps_answered, proxy_identified, local_answered) {
         (true, true, _) => PortHolder::Temps,
         (true, false, _) | (false, _, true) => PortHolder::Other,
         (false, _, false) => PortHolder::Free,
@@ -251,23 +254,202 @@ async fn answers(address: SocketAddr) -> bool {
         .unwrap_or(false)
 }
 
-/// Who holds `port`, given the probe addresses of Temps' own listeners and
-/// whether its proxy proved it is running.
+/// Whether any of `addresses` accepts a connection. The probes run at once,
+/// so the whole check takes one probe timeout however many there are, and
+/// the rest stop once one answers.
+async fn any_answers(addresses: impl IntoIterator<Item = SocketAddr>) -> bool {
+    let mut probes = tokio::task::JoinSet::new();
+    for address in addresses.into_iter().take(MAX_PROBED_ADDRESSES) {
+        probes.spawn(answers(address));
+    }
+    while let Some(answered) = probes.join_next().await {
+        if matches!(answered, Ok(true)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A probe target for `ip` (port `0`, set per probe), with its interface's
+/// scope when `ip` is an IPv6 link-local address, which cannot be reached
+/// without one.
+fn probe_target(ip: IpAddr, scope: Option<u32>) -> SocketAddr {
+    match ip {
+        IpAddr::V6(v6) if v6.is_unicast_link_local() => {
+            SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, scope.unwrap_or(0)))
+        }
+        _ => SocketAddr::new(ip, 0),
+    }
+}
+
+/// The IPv6 link-local addresses in a `/proc/net/if_inet6` listing, with
+/// their interface index as the scope. Each line is the address in 32 hex
+/// digits, then the interface index in hex, the prefix length, scope, flags
+/// and name; a line that does not read so is skipped.
+fn link_local_from_if_inet6(listing: &str) -> Vec<SocketAddr> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let hex = fields.next()?;
+            let index = u32::from_str_radix(fields.next()?, 16).ok()?;
+            let ip = std::net::Ipv6Addr::from(u128::from_str_radix(hex, 16).ok()?);
+            (hex.len() == 32 && ip.is_unicast_link_local())
+                .then(|| probe_target(IpAddr::V6(ip), Some(index)))
+        })
+        .collect()
+}
+
+/// This machine's IPv6 link-local addresses, which `if_addrs` leaves out.
+/// Read on Linux, where Temps' servers run; elsewhere there are none.
+fn link_local_addresses() -> Vec<SocketAddr> {
+    /// More than any real listing; a larger one is not read past this.
+    const MAX_LISTING_BYTES: u64 = 256 * 1024;
+    if !cfg!(target_os = "linux") {
+        return Vec::new();
+    }
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open("/proc/net/if_inet6") else {
+        return Vec::new();
+    };
+    let mut listing = String::new();
+    if file
+        .take(MAX_LISTING_BYTES)
+        .read_to_string(&mut listing)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    link_local_from_if_inet6(&listing)
+}
+
+/// This machine's own addresses a server can listen on, as probe targets
+/// (port `0`): both loopbacks and every interface address, IPv4 and IPv6,
+/// link-local ones with their interface's scope. A server bound only to a
+/// LAN, overlay or IPv6 address answers nowhere else, so loopback alone
+/// would call its port free. At most [`MAX_PROBED_ADDRESSES`], each once.
+#[cfg(test)]
+fn local_addresses() -> Vec<SocketAddr> {
+    local_probe_targets().0
+}
+
+/// [`local_addresses`], and whether they are all of this machine's: false
+/// when its interfaces could not be listed or more were found than are
+/// probed, so a port none of them answers on is not yet known to be free.
+fn local_probe_targets() -> (Vec<SocketAddr>, bool) {
+    let listed = if_addrs::get_if_addrs();
+    let complete = listed.is_ok();
+    let interfaces = listed.unwrap_or_default();
+    let candidates = [
+        probe_target(IpAddr::V4(Ipv4Addr::LOCALHOST), None),
+        probe_target(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), None),
+    ]
+    .into_iter()
+    .chain(interfaces.iter().map(|i| probe_target(i.ip(), i.index)))
+    .chain(link_local_addresses());
+    // One past the limit is enough to know some address is left out, so no
+    // more are kept than that, however many the machine has.
+    let mut seen = std::collections::HashSet::new();
+    let mut distinct: Vec<SocketAddr> = candidates
+        .filter(|target| seen.insert(*target))
+        .take(MAX_PROBED_ADDRESSES + 1)
+        .collect();
+    let complete = complete && distinct.len() <= MAX_PROBED_ADDRESSES;
+    distinct.truncate(MAX_PROBED_ADDRESSES);
+    (distinct, complete)
+}
+
+/// Who holds a port no probed address answered on, when not every local
+/// address was probed: Linux's socket tables list every socket listening on
+/// it, whatever its address. Read, not tried with a bind, which a port under
+/// 1024 refuses without the privilege, a connection in TIME_WAIT from a
+/// stopped server blocks with nothing listening, and another probe doing
+/// the same at once would take for a listener. Where the tables cannot be
+/// read (not Linux), a bind on every address tells instead.
+async fn unprobed_holder(port: u16) -> PortHolder {
+    match tokio::task::spawn_blocking(move || listening_in_socket_tables(port)).await {
+        Ok(Some(true)) => PortHolder::Other,
+        Ok(Some(false)) => PortHolder::Free,
+        _ => wildcard_bind_holder(port),
+    }
+}
+
+/// Who holds `port` by binding it on every IPv4 and then every IPv6
+/// address, without `SO_REUSEADDR`: the bind fails while a socket uses the
+/// port on any address. Only where no socket table can be read; there a
+/// connection lingering after a server stopped also counts as held.
+fn wildcard_bind_holder(port: u16) -> PortHolder {
+    let in_use = [
+        tokio::net::TcpSocket::new_v4().map(|socket| (socket, IpAddr::V4(Ipv4Addr::UNSPECIFIED))),
+        tokio::net::TcpSocket::new_v6()
+            .map(|socket| (socket, IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))),
+    ]
+    .into_iter()
+    .filter_map(Result::ok)
+    .any(|(socket, ip)| {
+        // Each is dropped before the next, so it never blocks the other.
+        matches!(
+            socket.bind(SocketAddr::new(ip, port)),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse
+        )
+    });
+    if in_use {
+        PortHolder::Other
+    } else {
+        PortHolder::Free
+    }
+}
+
+/// Whether a socket listens on TCP `port` by Linux's `/proc/net/tcp` and
+/// `tcp6`; `None` when neither can be read.
+fn listening_in_socket_tables(port: u16) -> Option<bool> {
+    let mut read_any = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(file) = std::fs::File::open(table) else {
+            continue;
+        };
+        read_any = true;
+        if socket_table_listens(std::io::BufReader::new(file), port) {
+            return Some(true);
+        }
+    }
+    read_any.then_some(false)
+}
+
+/// Whether a `/proc/net/tcp`-style table has a socket in LISTEN (`0A`) on
+/// local `port`. Read line by line, stopping at the first one.
+fn socket_table_listens(table: impl std::io::BufRead, port: u16) -> bool {
+    table.lines().map_while(Result::ok).skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        // `sl`, then `local_address`; then `rem_address`, then `st`.
+        let local = fields.nth(1);
+        let state = fields.nth(1);
+        let local_port = local
+            .and_then(|address| address.rsplit(':').next())
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+        state == Some("0A") && local_port == Some(port)
+    })
+}
+
+/// Who holds `port`, given the probe addresses of Temps' own listeners,
+/// whether its proxy proved it is running, and this machine's addresses
+/// (`local_addresses`).
 async fn probe_port(
     port: u16,
     temps_listeners: &[SocketAddr],
     proxy_identified: bool,
+    local: &[SocketAddr],
 ) -> PortHolder {
-    let mut temps_answered = false;
-    for listener in temps_listeners.iter().filter(|l| l.port() == port) {
-        if answers(*listener).await {
-            temps_answered = true;
-            break;
-        }
-    }
-    let loopback_answered =
-        !temps_answered && answers(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await;
-    port_holder(temps_answered, proxy_identified, loopback_answered)
+    let temps_answered =
+        any_answers(temps_listeners.iter().copied().filter(|l| l.port() == port)).await;
+    let local_answered = !temps_answered
+        && any_answers(local.iter().map(|target| {
+            let mut target = *target;
+            target.set_port(port);
+            target
+        }))
+        .await;
+    port_holder(temps_answered, proxy_identified, local_answered)
 }
 
 /// The first address on Tailscale's own interface among `interfaces`
@@ -440,14 +622,32 @@ impl HostFactsService {
             Some(http) => proxy_identifies(http, &self.proxy.key).await,
             None => false,
         };
-        let mut facts = Vec::with_capacity(2);
-        for port in [80u16, 443] {
-            facts.push(PortFact {
-                port,
-                holder: probe_port(port, &self.proxy.listeners, identified).await,
-            });
+        let (local, complete) = tokio::task::spawn_blocking(local_probe_targets)
+            .await
+            .unwrap_or_else(|_| (vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))], false));
+        let listeners = &self.proxy.listeners;
+        let (mut http, mut https) = tokio::join!(
+            probe_port(80, listeners, identified, &local),
+            probe_port(443, listeners, identified, &local),
+        );
+        if !complete {
+            if http == PortHolder::Free {
+                http = unprobed_holder(80).await;
+            }
+            if https == PortHolder::Free {
+                https = unprobed_holder(443).await;
+            }
         }
-        facts
+        vec![
+            PortFact {
+                port: 80,
+                holder: http,
+            },
+            PortFact {
+                port: 443,
+                holder: https,
+            },
+        ]
     }
 
     async fn tailscale(&self) -> TailscaleFact {
@@ -586,6 +786,44 @@ mod tests {
         assert_eq!(port_holder(false, false, false), PortHolder::Free);
     }
 
+    /// Only a socket in LISTEN holds a port: one in TIME_WAIT (`06`) or an
+    /// established connection (`01`) from a stopped server does not.
+    #[test]
+    fn the_socket_tables_name_only_listeners() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0050 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0 100 0 0 10 0
+   1: 0A00000F:01BB 0A000020:D431 06 00000000:00000000 03:00000F1A 00000000     0        0 0 3 0
+   2: 0A00000F:01BB 0A000021:D432 01 00000000:00000000 00:00000000 00000000     0        0 2 1 0 20 4 30 10 -1
+";
+        // 0x50 is 80, 0x1BB is 443.
+        assert!(socket_table_listens(table.as_bytes(), 80));
+        assert!(!socket_table_listens(table.as_bytes(), 443));
+        assert!(!socket_table_listens(table.as_bytes(), 8080));
+    }
+
+    /// A listener on any local address holds its port even where that
+    /// address was not probed; once it stops, nothing does. Linux reads its
+    /// socket tables, elsewhere a bind on every address tells.
+    #[tokio::test]
+    async fn a_listener_on_an_unprobed_address_holds_its_port() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(unprobed_holder(port).await, PortHolder::Other);
+        drop(listener);
+        assert_eq!(unprobed_holder(port).await, PortHolder::Free);
+    }
+
+    /// Without socket tables, a bind on every address finds a listener on
+    /// one address only, and none once it stopped.
+    #[test]
+    fn a_bind_on_every_address_finds_a_listener_on_one() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(wildcard_bind_holder(port), PortHolder::Other);
+        drop(listener);
+        assert_eq!(wildcard_bind_holder(port), PortHolder::Free);
+    }
+
     /// A minimal HTTP server on loopback that answers every request with
     /// `answer`, for the identity probe.
     async fn http_server(answer: &'static str) -> SocketAddr {
@@ -668,7 +906,7 @@ mod tests {
             let other = http_server(answer).await;
             assert!(!proxy_identifies(other, "test-installation-key").await);
             assert_eq!(
-                probe_port(other.port(), &[other], false).await,
+                probe_port(other.port(), &[other], false, &[]).await,
                 PortHolder::Other
             );
         }
@@ -683,7 +921,8 @@ mod tests {
     }
 
     /// A proxy bound to one address answers there, not on loopback; probing
-    /// loopback alone called its port free.
+    /// loopback alone called its port free. Another server bound only to a
+    /// LAN address holds the port too.
     #[tokio::test]
     async fn a_proxy_bound_to_one_address_holds_its_port() {
         let lan = if_addrs::get_if_addrs().ok().and_then(|ifs| {
@@ -700,21 +939,34 @@ mod tests {
         let port = bound.port();
         // Nothing on loopback answers for that port.
         assert!(!answers(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await);
+        let local = local_addresses();
+        assert!(local.iter().any(|t| t.ip() == lan), "{local:?} lists {lan}");
         let configured = listener_probe_address(&bound.to_string()).unwrap();
         assert_eq!(
-            probe_port(port, &[configured], true).await,
+            probe_port(port, &[configured], true, &local).await,
             PortHolder::Temps
         );
-        // Someone else's listener: not Temps'.
-        assert_eq!(probe_port(port, &[], true).await, PortHolder::Free);
+        // Someone else's listener on the LAN address only: the port is taken.
+        assert_eq!(probe_port(port, &[], true, &local).await, PortHolder::Other);
         let unspecified = listener_probe_address(&format!("0.0.0.0:{port}")).unwrap();
         assert_eq!(
-            probe_port(port, &[unspecified], true).await,
+            probe_port(port, &[unspecified], true, &local).await,
+            PortHolder::Other
+        );
+        // Loopback alone does not see it, which is why every address is probed.
+        assert_eq!(
+            probe_port(
+                port,
+                &[],
+                true,
+                &[SocketAddr::from((Ipv4Addr::LOCALHOST, 0))]
+            )
+            .await,
             PortHolder::Free
         );
         drop(listener);
         assert_eq!(
-            probe_port(port, &[configured], true).await,
+            probe_port(port, &[configured], true, &local).await,
             PortHolder::Free
         );
     }
@@ -726,9 +978,94 @@ mod tests {
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let all = listener_probe_address(&format!("0.0.0.0:{port}")).unwrap();
-        assert_eq!(probe_port(port, &[all], true).await, PortHolder::Temps);
-        assert_eq!(probe_port(port, &[all], false).await, PortHolder::Other);
-        assert_eq!(probe_port(port, &[], true).await, PortHolder::Other);
+        let local = local_addresses();
+        assert_eq!(
+            probe_port(port, &[all], true, &local).await,
+            PortHolder::Temps
+        );
+        assert_eq!(
+            probe_port(port, &[all], false, &local).await,
+            PortHolder::Other
+        );
+        assert_eq!(probe_port(port, &[], true, &local).await, PortHolder::Other);
+    }
+
+    /// The probe list holds each address once, never more than the cap,
+    /// and IPv6 link-local addresses with their interface's scope.
+    #[test]
+    fn local_addresses_are_listed_once_with_their_scope() {
+        let local = local_addresses();
+        assert!(local.len() <= MAX_PROBED_ADDRESSES);
+        let distinct: std::collections::HashSet<_> = local.iter().collect();
+        assert_eq!(distinct.len(), local.len());
+        assert!(local.contains(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0))));
+        let link_local: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+        assert_eq!(
+            probe_target(IpAddr::V6(link_local), Some(4)),
+            SocketAddr::V6(std::net::SocketAddrV6::new(link_local, 0, 0, 4))
+        );
+    }
+
+    #[test]
+    fn link_local_addresses_are_read_with_their_interface_index() {
+        let listing = "\
+fe800000000000000a0027fffe4e1c2d 02 40 20 80     eth0
+00000000000000000000000000000001 01 80 10 80       lo
+fd7a115ca1e000000000000000000001 0a 80 00 80 tailscale0
+not-an-address 03 40 20 80 eth1
+";
+        let ip: std::net::Ipv6Addr = "fe80::a00:27ff:fe4e:1c2d".parse().unwrap();
+        assert_eq!(
+            link_local_from_if_inet6(listing),
+            vec![SocketAddr::V6(std::net::SocketAddrV6::new(ip, 0, 0, 2))]
+        );
+    }
+
+    /// A server listening only on an interface's IPv6 link-local address
+    /// holds its port: dropping those addresses called it free.
+    #[tokio::test]
+    async fn a_server_on_a_link_local_address_only_holds_its_port() {
+        let Some(target) = local_addresses().into_iter().find(|t| {
+            matches!(t, SocketAddr::V6(v6) if v6.ip().is_unicast_link_local() && v6.scope_id() != 0)
+        }) else {
+            println!("no scoped IPv6 link-local address, skipping");
+            return;
+        };
+        let Ok(listener) = tokio::net::TcpListener::bind(target).await else {
+            println!("cannot listen on {target}, skipping");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(
+            probe_port(port, &[], true, &local_addresses()).await,
+            PortHolder::Other
+        );
+    }
+
+    /// A server listening only on IPv6 holds its port: probing IPv4 alone
+    /// called it free.
+    #[tokio::test]
+    async fn a_server_on_ipv6_only_holds_its_port() {
+        let Ok(listener) = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await
+        else {
+            println!("no IPv6 loopback, skipping");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(
+            probe_port(
+                port,
+                &[],
+                true,
+                &[SocketAddr::from((Ipv4Addr::LOCALHOST, 0))]
+            )
+            .await,
+            PortHolder::Free
+        );
+        assert_eq!(
+            probe_port(port, &[], true, &local_addresses()).await,
+            PortHolder::Other
+        );
     }
 
     #[test]

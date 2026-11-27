@@ -38164,7 +38164,8 @@
       "GeneratedValueKind": {
         "description": "What to generate.",
         "enum": [
-          "secret"
+          "secret",
+          "laravel_app_key"
         ],
         "type": "string"
       },
@@ -61114,6 +61115,10 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "create_only": {
+            "description": "Only give consent where none exists: refused with a 409, changing\nnothing, when one does. For a client that showed a plan made when\nthere was no consent, so it never replaces one given meanwhile (with\nits own ranges) or recreates one withdrawn under a plan built on it.",
+            "type": "boolean"
           },
           "listen": {
             "description": "`tailscale`, or a private address of this machine: one in\n`100.64.0.0/10`, RFC 1918 or `fd00::/8`.",
@@ -194745,7 +194750,7 @@
             "description": "Insufficient permissions"
           },
           "409": {
-            "description": "The console and proxy run as separate processes, so nothing here serves private addresses"
+            "description": "The console and proxy run as separate processes, so nothing here serves private addresses; or `create_only` was asked and a consent exists, which is kept"
           },
           "500": {
             "description": "The consent could not be written"

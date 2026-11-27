@@ -311,6 +311,7 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::AgentModelFailed { .. }
         | AgentError::AgentTimedOut { .. }
         | AgentError::AgentWroteNoReport { .. }
+        | AgentError::AgentReportUnfinished { .. }
         | AgentError::GitError { .. }
         | AgentError::EncryptionError { .. }
         | AgentError::SecretNotFound { .. }

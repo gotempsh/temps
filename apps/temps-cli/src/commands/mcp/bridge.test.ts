@@ -58,7 +58,7 @@ describe('bridge settings', () => {
 })
 
 describe('temps mcp bridge', () => {
-  test('speaks MCP on stdout only, forwards to Temps with the key, and deploys the allowed folder', async () => {
+  test('speaks MCP on stdout only, forwards to Temps with the key, and deploys the allowed folder in one call', async () => {
     const project = join(SCRATCH, 'projects', 'my-app')
     mkdirSync(project, { recursive: true })
     writeFileSync(join(project, 'index.html'), '<h1>hi</h1>')
@@ -72,6 +72,9 @@ describe('temps mcp bridge', () => {
       async fetch(req) {
         const url = new URL(req.url)
         seen.push({ path: `${url.pathname}${url.search}`, auth: req.headers.get('authorization') })
+        if (url.pathname === '/mcp/tools') {
+          return Response.json({ groups: [] })
+        }
         if (url.pathname === '/mcp') {
           const body = await req.json()
           const result = body.method === 'tools/list' ? { tools: [{ name: 'temps' }] } : { ok: true }
@@ -108,22 +111,24 @@ describe('temps mcp bridge', () => {
         stderr: 'pipe',
       },
     )
-    const messages = [
-      { jsonrpc: '2.0', id: 1, method: 'initialize', params: {} },
-      { jsonrpc: '2.0', id: 2, method: 'tools/list' },
-      {
-        jsonrpc: '2.0',
-        id: 3,
-        method: 'tools/call',
-        params: { name: 'temps_deploy_folder', arguments: { path: project, project_id: 4 } },
-      },
+    const deploy = (id: number, extra: Record<string, string> = {}) => ({
+      jsonrpc: '2.0',
+      id,
+      method: 'tools/call',
+      params: { name: 'temps_deploy_folder', arguments: { path: project, project_id: 4, ...extra } },
+    })
+    const messages: ((lines: string[]) => { id: number })[] = [
+      () => ({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
+      () => ({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+      () => deploy(3),
     ]
     const lines: string[] = []
     const reader = child.stdout.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
     try {
-      for (const message of messages) {
+      for (const next of messages) {
+        const message = next(lines)
         child.stdin.write(`${JSON.stringify(message)}\n`)
         child.stdin.flush()
         const deadline = Date.now() + 15_000
@@ -157,6 +162,7 @@ describe('temps mcp bridge', () => {
     expect(seen.map((s) => s.path)).toEqual([
       '/mcp?write=1',
       '/mcp?write=1',
+      '/mcp/tools',
       '/api/projects/4/environments',
       '/api/projects/4/environments/7/deploy/source',
     ])

@@ -11,7 +11,20 @@
 //! - before a row is written, a non-zero id must name a `nodes` row, locked
 //!   `FOR KEY SHARE` exactly as the foreign key check locks it;
 //! - deleting a node does what the foreign key did: `SET NULL` for
-//!   `private_node_id`, `CASCADE` for `node_public_ingress`.
+//!   `private_node_id`, `CASCADE` for `node_public_ingress`;
+//! - changing a node's id while a row names it is refused, as the foreign
+//!   key's `NO ACTION` refused it, so no row is left naming a node that is
+//!   gone (and `down` can add the foreign keys back).
+//!
+//! The foreign keys checked the rows naming a node against the newest
+//! committed data. These triggers can only read their transaction's
+//! snapshot, which under `READ COMMITTED` is taken for each of their
+//! statements, so a row committed by then is seen and one still being
+//! written holds the node `FOR KEY SHARE` until it commits. A `REPEATABLE
+//! READ` or `SERIALIZABLE` snapshot can be older than a row committed since,
+//! so deleting or renumbering a node there is refused rather than leaving
+//! that row naming a node that is gone. Temps deletes nodes under `READ
+//! COMMITTED`.
 //!
 //! `0` stays an ordinary integer rather than `NULL`, so a binary rolled back
 //! after this upgrade still decodes every row. No backfill: no row uses `0`.
@@ -82,6 +95,10 @@ CREATE TRIGGER node_public_ingress_node_exists
 
 CREATE OR REPLACE FUNCTION private_ingress_drop_node() RETURNS trigger AS $$
 BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'node % can only be deleted or renumbered in a READ COMMITTED transaction: an older snapshot can miss a private address or ingress report written since', OLD.id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
     UPDATE environment_domains SET private_node_id = NULL WHERE private_node_id = OLD.id;
     UPDATE project_custom_domains SET private_node_id = NULL WHERE private_node_id = OLD.id;
     DELETE FROM node_public_ingress WHERE node_id = OLD.id;
@@ -92,6 +109,31 @@ DROP TRIGGER IF EXISTS private_ingress_drop_node ON nodes;
 CREATE TRIGGER private_ingress_drop_node
     AFTER DELETE ON nodes
     FOR EACH ROW EXECUTE FUNCTION private_ingress_drop_node();
+
+CREATE OR REPLACE FUNCTION private_ingress_keep_node_id() RETURNS trigger AS $$
+BEGIN
+    IF NEW.id IS NOT DISTINCT FROM OLD.id THEN
+        RETURN NEW;
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'node % can only be deleted or renumbered in a READ COMMITTED transaction: an older snapshot can miss a private address or ingress report written since', OLD.id
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    IF (
+        EXISTS (SELECT 1 FROM environment_domains WHERE private_node_id = OLD.id)
+        OR EXISTS (SELECT 1 FROM project_custom_domains WHERE private_node_id = OLD.id)
+        OR EXISTS (SELECT 1 FROM node_public_ingress WHERE node_id = OLD.id)
+    ) THEN
+        RAISE EXCEPTION 'node % cannot become node %: private addresses or an ingress report still name it', OLD.id, NEW.id
+            USING ERRCODE = 'foreign_key_violation';
+    END IF;
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS private_ingress_keep_node_id ON nodes;
+CREATE TRIGGER private_ingress_keep_node_id
+    AFTER UPDATE OF id ON nodes
+    FOR EACH ROW EXECUTE FUNCTION private_ingress_keep_node_id();
 "#;
 
 const DOWN: &str = r#"
@@ -108,9 +150,11 @@ BEGIN
     DROP TRIGGER IF EXISTS project_custom_domains_private_node_exists ON project_custom_domains;
     DROP TRIGGER IF EXISTS node_public_ingress_node_exists ON node_public_ingress;
     DROP TRIGGER IF EXISTS private_ingress_drop_node ON nodes;
+    DROP TRIGGER IF EXISTS private_ingress_keep_node_id ON nodes;
     DROP FUNCTION IF EXISTS private_node_exists();
     DROP FUNCTION IF EXISTS node_public_ingress_node_exists();
     DROP FUNCTION IF EXISTS private_ingress_drop_node();
+    DROP FUNCTION IF EXISTS private_ingress_keep_node_id();
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid = 'environment_domains'::regclass AND contype = 'f'
@@ -157,7 +201,7 @@ impl MigrationTrait for Migration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+    use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 
     async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
         db.query_one(Statement::from_string(sea_orm::DbBackend::Postgres, sql))
@@ -229,6 +273,40 @@ mod tests {
             let err = db.execute_unprepared(sql).await.expect_err(sql);
             assert!(err.to_string().contains("node 9 does not exist"), "{sql}: {err}");
         }
+
+        // A node a row names keeps its id, as the foreign keys kept it; one
+        // nothing names may change.
+        for sql in [
+            "UPDATE nodes SET id = 6 WHERE id = 4",
+            "UPDATE nodes SET id = 6 WHERE id = 5",
+        ] {
+            let err = db.execute_unprepared(sql).await.expect_err(sql);
+            assert!(err.to_string().contains("cannot become node 6"), "{sql}: {err}");
+        }
+        db.execute_unprepared("INSERT INTO nodes VALUES (7); UPDATE nodes SET id = 8 WHERE id = 7")
+            .await
+            .unwrap();
+
+        // An older snapshot could miss a row committed since it was taken, so
+        // a node is neither renumbered nor deleted from one; nothing changes.
+        for sql in [
+            "UPDATE nodes SET id = 9 WHERE id = 8",
+            "DELETE FROM nodes WHERE id = 8",
+        ] {
+            for level in [
+                sea_orm::IsolationLevel::RepeatableRead,
+                sea_orm::IsolationLevel::Serializable,
+            ] {
+                let txn = db.begin_with_config(Some(level), None).await.unwrap();
+                let err = txn.execute_unprepared(sql).await.expect_err(sql);
+                assert!(err.to_string().contains("READ COMMITTED"), "{sql}: {err}");
+                txn.rollback().await.unwrap();
+            }
+        }
+        assert_eq!(
+            count(&db, "SELECT count(*) AS count FROM nodes WHERE id = 8").await,
+            1
+        );
 
         // Deleting a worker clears what it served, and only that.
         db.execute_unprepared("DELETE FROM nodes WHERE id = 4")

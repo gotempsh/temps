@@ -43,7 +43,7 @@
           "null"
         ]
       },
-      "way_in": {
+      "description": {
         "type": "string"
       },
       "fields": {
@@ -70,11 +70,17 @@
           "$ref": "#/components/schemas/PlanStep"
         }
       },
+      "title": {
+        "type": "string"
+      },
       "warnings": {
         "type": "array",
         "items": {
           "type": "string"
         }
+      },
+      "way_in": {
+        "type": "string"
       }
     }
   },

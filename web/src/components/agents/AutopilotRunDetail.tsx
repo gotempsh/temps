@@ -54,6 +54,7 @@ import { LegacyAutofixNotice } from './LegacyAutofixNotice'
 import {
   isTempsAgentTranscript,
   parseTempsAgentTranscript,
+  resultLine,
 } from './agent-transcript'
 import { useCancelRun } from './useCancelRun'
 import { cn } from '@/lib/utils'
@@ -608,19 +609,8 @@ function ConversationViewer({
         summary: e.toolResult.slice(0, 200),
         raw: e,
       })
-    } else if (e.type === 'result') {
-      viewEvents.push({
-        kind: 'result',
-        label: 'Result',
-        summary: [
-          e.numTurns != null ? `${e.numTurns} turns` : null,
-          e.costUsd != null ? `$${e.costUsd.toFixed(4)}` : null,
-          e.tokensInput != null ? `${e.tokensInput.toLocaleString()} in` : null,
-        ]
-          .filter(Boolean)
-          .join(' · '),
-        raw: e,
-      })
+    } else if (e.type === 'result' || e.type === 'notice') {
+      viewEvents.push({ kind: 'result', ...resultLine(e), raw: e })
     }
   }
 
@@ -831,7 +821,7 @@ function ConversationViewer({
                         kindStyle('result')
                       )}
                     >
-                      <span className="font-medium mr-2">Result</span>
+                      <span className="font-medium mr-2">{v.label}</span>
                       <span className="tabular-nums">{v.summary}</span>
                     </div>
                   )

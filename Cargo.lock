@@ -13716,6 +13716,7 @@ version = "0.1.0-beta.63"
 dependencies = [
  "argon2 0.6.0",
  "axum",
+ "base64 0.23.1",
  "chrono",
  "http 1.5.0",
  "rand 0.10.3",

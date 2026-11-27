@@ -217,6 +217,20 @@ describe('ClaudeCodeAdapter.addServer with a bridge', () => {
     })
   })
 
+  test('a bridge pinned to another CLI version is not the one asked for', () => {
+    const upgraded = {
+      ...bridgeTo('https://a.example.test', 'key-a'),
+      bridge: { folders: ['/srv/a'], packageSpec: '@temps-sdk/cli@2.0.0' },
+    }
+    const old = { ...upgraded, bridge: { ...upgraded.bridge, packageSpec: '@temps-sdk/cli@1.0.0' } }
+    const printed =
+      'temps:\n  Type: stdio\n  Command: npx\n  Args: -y @temps-sdk/cli@1.0.0 mcp bridge --url https://a.example.test --folder /srv/a\n'
+    expect(claudeCodeEntryMatches(printed, old)).toBe(true)
+    expect(claudeCodeEntryMatches(printed, upgraded)).toBe(false)
+    expect(claudeCodeEntryMatches(printed, old, savedArgs(old))).toBe(true)
+    expect(claudeCodeEntryMatches(printed, upgraded, savedArgs(old))).toBe(false)
+  })
+
   test('different folder lists that print the same line are never taken for each other', () => {
     const two = {
       ...bridgeTo('https://a.example.test', 'key-a'),

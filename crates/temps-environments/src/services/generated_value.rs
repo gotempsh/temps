@@ -24,6 +24,11 @@ pub const DEFAULT_GENERATED_BYTES: u32 = 32;
 pub enum GeneratedValueKind {
     /// Random bytes, hex encoded (`bytes * 2` characters).
     Secret,
+    /// A Laravel application key (`APP_KEY`): 32 random bytes, base64
+    /// encoded behind `base64:`, as `php artisan key:generate` writes it.
+    /// Its default cipher (AES-256-CBC) needs exactly 32 bytes, so `bytes`
+    /// must be 32 or left out.
+    LaravelAppKey,
 }
 
 /// Ask the server to generate the value instead of sending one.
@@ -72,7 +77,29 @@ pub fn resolve_create_value(
     }
     match generate.kind {
         GeneratedValueKind::Secret => Ok((random_hex(generate.bytes as usize), true)),
+        GeneratedValueKind::LaravelAppKey if generate.bytes != LARAVEL_KEY_BYTES => {
+            Err(EnvVarError::InvalidInput(format!(
+                "Environment variable '{key}': a Laravel application key is always \
+                 {LARAVEL_KEY_BYTES} random bytes, not {}; leave 'bytes' out",
+                generate.bytes
+            )))
+        }
+        GeneratedValueKind::LaravelAppKey => Ok((laravel_app_key(), true)),
     }
+}
+
+/// The key length Laravel's default cipher (AES-256-CBC) needs.
+const LARAVEL_KEY_BYTES: u32 = 32;
+
+/// A key Laravel's default cipher accepts: 32 random bytes, base64 encoded
+/// behind `base64:`, which tells Laravel to decode it.
+fn laravel_app_key() -> String {
+    use base64::Engine as _;
+    let bytes: [u8; LARAVEL_KEY_BYTES as usize] = rand::random();
+    format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
 }
 
 /// `bytes` random bytes from the thread's CSPRNG, hex encoded.
@@ -150,6 +177,55 @@ mod tests {
         }
         assert!(resolve_create_value("K", None, true, secret(16)).is_ok());
         assert!(resolve_create_value("K", None, true, secret(64)).is_ok());
+    }
+
+    /// Every key, `APP_KEY` included, gets what it asked for: `bytes * 2`
+    /// hex characters. A client that needs another format (Laravel's
+    /// 32-character key) asks for the length that gives it.
+    #[test]
+    fn every_key_gets_the_hex_secret_it_asked_for() {
+        for (key, bytes) in [("APP_KEY", 64), ("APP_KEY", 16), ("SESSION_SECRET", 32)] {
+            let (value, is_secret) = resolve_create_value(key, None, false, secret(bytes)).unwrap();
+            assert_eq!(value.len(), bytes as usize * 2, "{key}");
+            assert!(
+                value.bytes().all(|c| c.is_ascii_hexdigit()),
+                "{key}: {value}"
+            );
+            assert!(is_secret);
+        }
+    }
+
+    /// Asked for explicitly, a Laravel key is the 32 bytes its cipher
+    /// needs, behind `base64:`; another length is refused, not ignored.
+    #[test]
+    fn a_laravel_app_key_is_the_32_bytes_its_cipher_needs() {
+        use base64::Engine as _;
+        let laravel = |bytes| {
+            resolve_create_value(
+                "APP_KEY",
+                None,
+                false,
+                Some(GenerateValueRequest {
+                    kind: GeneratedValueKind::LaravelAppKey,
+                    bytes,
+                }),
+            )
+        };
+        let (value, is_secret) = laravel(DEFAULT_GENERATED_BYTES).unwrap();
+        assert!(is_secret);
+        let encoded = value
+            .strip_prefix("base64:")
+            .expect("Laravel's base64: prefix");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(decoded.len(), 32);
+        assert_ne!(laravel(32).unwrap().0, value);
+        let error = laravel(64).unwrap_err().to_string();
+        assert!(error.contains("APP_KEY") && error.contains("64"), "{error}");
+        let request: GenerateValueRequest =
+            serde_json::from_value(serde_json::json!({"kind": "laravel_app_key"})).unwrap();
+        assert_eq!(request.kind, GeneratedValueKind::LaravelAppKey);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  directClientEncrypts,
   MCP_APPS,
   MCP_KEY_ROLES,
   mcpAddCommand,
@@ -61,5 +62,37 @@ describe('MCP apps', () => {
     expect(mcpKeyName('cursor', new Date('2026-11-25T10:31:05.123Z'))).toBe(
       'mcp-cursor-2026-11-25T10-31-05Z'
     )
+  })
+})
+
+describe('a direct MCP app keeps its key encrypted', () => {
+  test('over HTTPS, on this computer or inside a tailnet', () => {
+    for (const origin of [
+      'https://temps.example.com',
+      'https://server',
+      'http://localhost:3000',
+      'http://127.0.0.1:8080',
+      'http://[::1]:8080',
+      'http://temps.tail1234.ts.net',
+      'http://[fd7a:115c:a1e0::1]:8080',
+    ]) {
+      expect(directClientEncrypts(origin)).toBe(true)
+    }
+  })
+
+  test('not over plain HTTP across a LAN, even to a single-label name', () => {
+    for (const origin of [
+      'http://server',
+      'http://nas:8080',
+      'http://192.168.1.10:8080',
+      // Carrier-grade NAT shares Tailscale's IPv4 range: no proof of a tailnet.
+      'http://100.101.102.103',
+      'http://100.64.0.1:8080',
+      'http://temps.example.com',
+      'ftp://temps.example.com',
+      'not a url',
+    ]) {
+      expect(directClientEncrypts(origin)).toBe(false)
+    }
   })
 })

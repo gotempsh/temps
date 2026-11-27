@@ -774,9 +774,14 @@ impl GitProviderService for BitbucketProvider {
         }
 
         // Bitbucket returns file content directly (not base64 encoded).
-        let content = response.text().await.map_err(|e| {
-            GitProviderError::ApiError(format!("Failed to read file content: {}", e))
-        })?;
+        let content = String::from_utf8_lossy(
+            &super::git_provider::read_body_limited(
+                response,
+                super::git_provider::MAX_FILE_RESPONSE_BYTES,
+            )
+            .await?,
+        )
+        .into_owned();
 
         Ok(FileContent {
             path: path.to_string(),

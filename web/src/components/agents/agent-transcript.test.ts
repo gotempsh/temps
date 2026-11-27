@@ -5,6 +5,7 @@ import { expect, test } from 'bun:test'
 import {
   isTempsAgentTranscript,
   parseTempsAgentTranscript,
+  resultLine,
 } from './agent-transcript'
 
 const transcript = [
@@ -64,4 +65,27 @@ test('a live run shows a tool still running, and a capped run says it ran out of
       numTurns: 30,
     },
   ])
+})
+
+test('a transcript whose earlier steps were left out says so, before what it kept', () => {
+  const output = [
+    JSON.stringify({ type: 'temps.truncated', dropped_lines: 7 }),
+    JSON.stringify({ type: 'temps.text', text: 'Done.' }),
+    JSON.stringify({ type: 'temps.finish', reason: 'stop', turns: 9 }),
+  ].join('\n')
+  expect(isTempsAgentTranscript(output)).toBe(true)
+  const parsed = parseTempsAgentTranscript(output)
+  const notice =
+    "7 earlier steps are not shown here: the run was long. The run's log has every step."
+  expect(parsed[0]).toEqual({ type: 'notice', content: notice })
+  expect(parsed[1]).toEqual({ type: 'assistant_text', content: 'Done.' })
+  // The conversation view shows the notice itself, not a bare "Result".
+  expect(resultLine(parsed[0]!)).toEqual({
+    label: 'Not shown',
+    summary: notice,
+  })
+  expect(resultLine(parsed[2]!)).toEqual({
+    label: 'Result',
+    summary: '9 turns',
+  })
 })

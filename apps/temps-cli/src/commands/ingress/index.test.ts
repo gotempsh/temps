@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
-import { describeNetwork, describePrivateStatus, networkName, privateIntent } from './index.js'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { describeNetwork, describePrivateStatus, networkName, privateIntent, registerIngressCommands } from './index.js'
 
 describe('privateIntent', () => {
   test('no flags shows the status', () => {
@@ -89,5 +89,43 @@ describe('networks', () => {
     expect(describeNetwork({ ...wg, admit: [], problem: 'it has no subnet' })).toBe(
       'Cannot be used: it has no subnet',
     )
+  })
+})
+
+describe('ingress private --json', () => {
+  /** Run `ingress private <argv>` against a server that stores what it is sent; returns what was printed. */
+  async function run(argv: string[]) {
+    const { Command } = await import('commander')
+    const store = await import('../../config/store.js')
+    const api = await import('../../lib/api-client.js')
+    const sdk = await import('../../api/sdk.gen.js')
+    const printed: string[] = []
+    const consent = { listen: 'tailscale', admit: [], tailscale_serve: false, updated_at: '2026-11-27T10:00:00Z' }
+    const spies = [
+      spyOn(store, 'requireAuth').mockResolvedValue('tk_login' as never),
+      spyOn(api, 'setupClient').mockResolvedValue(undefined),
+      spyOn(sdk, 'putPrivateIngress').mockResolvedValue({ data: consent, error: undefined } as never),
+      spyOn(sdk, 'deletePrivateIngress').mockResolvedValue({ data: undefined, error: undefined } as never),
+      spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+        printed.push(args.join(' '))
+      }),
+    ]
+    try {
+      const program = new Command().exitOverride()
+      registerIngressCommands(program)
+      await program.parseAsync(['ingress', 'private', ...argv, '--json'], { from: 'user' })
+      return { output: printed.join('\n'), consent }
+    } finally {
+      spies.forEach((spy) => spy.mockRestore())
+    }
+  }
+
+  test('giving consent prints the consent stored, as JSON', async () => {
+    const { output, consent } = await run(['--listen', 'tailscale'])
+    expect(JSON.parse(output)).toEqual({ consent })
+  })
+
+  test('withdrawing it prints that there is none, as JSON', async () => {
+    expect(JSON.parse((await run(['--off'])).output)).toEqual({ consent: null })
   })
 })

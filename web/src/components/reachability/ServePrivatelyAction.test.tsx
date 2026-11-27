@@ -44,7 +44,19 @@ const bridged: PrivateNetworkOption = {
 
 type Call = { method: string; url: string; body: any }
 
+type Report = { serving: string | null; admit: string[]; error: string | null }
+const NO_REPORT: Report = { serving: null, admit: [], error: null }
+
 function mockServer(
+  networks: PrivateNetworkOption[],
+  put: { status: number; body: unknown } | null = null,
+  consent: unknown = null,
+  report: Report = NO_REPORT
+) {
+  return mockServerWith(networks, put ?? undefined, consent, report)
+}
+
+function mockServerWith(
   networks: PrivateNetworkOption[],
   put: { status: number; body: unknown } = {
     status: 200,
@@ -53,7 +65,9 @@ function mockServer(
       tailscale_serve: false,
       updated_at: '2026-11-24T10:00:00Z',
     },
-  }
+  },
+  consent: unknown = null,
+  report: Report = NO_REPORT
 ) {
   const previous = client.getConfig()
   const calls: Call[] = []
@@ -69,10 +83,8 @@ function mockServer(
           : {
               status: 200,
               body: {
-                consent: null,
-                serving: null,
-                admit: [],
-                error: null,
+                consent,
+                ...report,
                 reported_at: null,
                 networks,
               },
@@ -128,6 +140,7 @@ test('with one private network, one click serves on it and plans again', async (
     expect(server.puts()[0].body).toEqual({
       listen: 'tailscale',
       tailscale_serve: false,
+      create_only: true,
     })
   } finally {
     server.restore()
@@ -150,6 +163,7 @@ test('with several networks it asks which, and says why one cannot be used', asy
     expect(server.puts()[0].body).toEqual({
       listen: '10.8.0.1',
       tailscale_serve: false,
+      create_only: true,
     })
   } finally {
     server.restore()
@@ -186,6 +200,137 @@ test('a refusal is shown in place', async () => {
       expect(view.container.textContent).toContain(
         'is not an address of this machine'
       )
+    )
+  } finally {
+    server.restore()
+  }
+})
+
+const narrowConsent = {
+  listen: '10.8.0.1',
+  admit: ['10.8.0.7/32'],
+  tailscale_serve: false,
+  updated_at: '2026-11-24T09:00:00Z',
+}
+
+test('a consent already given is never replaced: it is shown, and the plan made again', async () => {
+  const server = mockServer([tailscale, wireguard], null, narrowConsent, {
+    serving: '10.8.0.1:443',
+    admit: ['10.8.0.7/32'],
+    error: null,
+  })
+  const queryClient = new QueryClient()
+  queryClient.setQueryData(['reachabilityPlan', 1, 2], { stale: false })
+  try {
+    const view = renderAction(queryClient)
+    await view.findByText(
+      'This machine serves private addresses on 10.8.0.1:443, to 10.8.0.7/32.'
+    )
+    expect(view.queryByText('Serve on this network')).toBeNull()
+    // The terminal command replaces a consent, so it is not offered.
+    expect(view.queryByText('Or from a terminal:')).toBeNull()
+    fireEvent.click(view.getByText('Plan again'))
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryState(['reachabilityPlan', 1, 2])?.isInvalidated
+      ).toBe(true)
+    )
+    expect(server.puts()).toEqual([])
+  } finally {
+    server.restore()
+  }
+})
+
+test('a consent whose listener failed says so, with the reason, and never claims to serve', async () => {
+  const server = mockServer([wireguard], null, narrowConsent, {
+    serving: null,
+    admit: [],
+    error:
+      'Could not listen on 10.8.0.1:443: the address is no longer on this machine.',
+  })
+  try {
+    const view = renderAction()
+    await view.findByText(
+      'Private addresses are allowed on 10.8.0.1, to 10.8.0.7/32. This machine is not serving them:'
+    )
+    expect(
+      view.getByText(
+        'Could not listen on 10.8.0.1:443: the address is no longer on this machine.'
+      )
+    ).toBeTruthy()
+    expect(view.container.textContent).not.toContain('This machine serves')
+    expect(view.queryByText('Or from a terminal:')).toBeNull()
+  } finally {
+    server.restore()
+  }
+})
+
+test('a consent not applied yet is not shown as serving', async () => {
+  const server = mockServer([wireguard], null, narrowConsent)
+  try {
+    const view = renderAction()
+    await view.findByText(
+      'Private addresses are allowed on 10.8.0.1, to 10.8.0.7/32. This machine has not applied that yet.'
+    )
+    expect(view.queryByText('Or from a terminal:')).toBeNull()
+  } finally {
+    server.restore()
+  }
+})
+
+test('a console run without its proxy says what to run instead, with no network advice or command', async () => {
+  const split =
+    'This control plane runs its console and proxy as separate processes, so it serves no private address itself.'
+  const server = mockServer([], null, null, {
+    ...NO_REPORT,
+    error: split,
+    available: false,
+  } as Report)
+  try {
+    const view = renderAction()
+    await view.findByText(split)
+    expect(view.queryByText(/This machine is on no private network/)).toBeNull()
+    expect(view.queryByText('Or from a terminal:')).toBeNull()
+  } finally {
+    server.restore()
+  }
+})
+
+test('with no consent the terminal command is offered beside the button', async () => {
+  const server = mockServer([wireguard])
+  try {
+    const view = renderAction()
+    await view.findByText('Or from a terminal:')
+  } finally {
+    server.restore()
+  }
+})
+
+test('a consent given after this was shown is kept: the refusal says so, and it is read again', async () => {
+  const server = mockServer([wireguard], {
+    status: 409,
+    body: {
+      title: 'Private Ingress Consent Already Given',
+      detail:
+        'A private ingress consent on 10.8.0.1 was given at 2026-11-24T09:00:00Z and is kept; nothing was changed.',
+      status: 409,
+    },
+  })
+  try {
+    const view = renderAction()
+    fireEvent.click(
+      await view.findByText(
+        'Serve private addresses from this machine on wg0 (10.8.0.1)'
+      )
+    )
+    await waitFor(() =>
+      expect(view.container.textContent).toContain(
+        'is kept; nothing was changed'
+      )
+    )
+    expect(server.puts()[0].body.create_only).toBe(true)
+    await waitFor(() =>
+      expect(server.calls.filter((c) => c.method === 'GET').length).toBe(2)
     )
   } finally {
     server.restore()

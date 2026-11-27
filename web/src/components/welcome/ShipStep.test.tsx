@@ -23,10 +23,11 @@ const project = (id: number, name: string, created_at = BEFORE) => ({
   created_at,
 })
 
-function renderStep() {
-  const client = new QueryClient({
+function renderStep(
+  client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
+) {
   const view = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={['/welcome']}>
@@ -116,6 +117,32 @@ test('with an agent connected, it leads, and the operator opens the new project 
   fireEvent.click(openNew)
   await view.findByText('Project page')
   expect(patches).toEqual([{ done: ['app'], completed: true }])
+  api.restore()
+})
+
+test('returning to the step, a project created while away is not new: the list from the last visit is no baseline', async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  // What the last visit listed, still cached.
+  client.setQueryData(
+    ['welcome', 'ship', 'projects'],
+    {
+      list: [project(1, 'existing')],
+      serverDate: 'Thu, 26 Nov 2026 09:00:00 GMT',
+    },
+    { updatedAt: Date.now() - 60_000 }
+  )
+  // Created while the operator was on another step.
+  const list = [project(2, 'made-while-away', AFTER), project(1, 'existing')]
+  const { api } = mock('connected', () => list)
+  const { view } = renderStep(client)
+  await view.findByText('Waiting for a new project…')
+  await act(() => client.refetchQueries())
+  expect(
+    view.queryByRole('button', { name: 'Open made-while-away' })
+  ).toBeNull()
+  expect(view.getByText('Waiting for a new project…')).toBeTruthy()
   api.restore()
 })
 

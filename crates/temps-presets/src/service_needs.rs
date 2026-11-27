@@ -155,13 +155,17 @@ pub const MANIFEST_FILES: &[&str] = &[
     "prisma/schema.prisma",
 ];
 
-/// The kind a URL-shaped example value points at (`postgres://...`).
+/// The kind a URL-shaped example value points at (`postgres://...`). A
+/// driver after `+` names how to connect, not the database
+/// (SQLAlchemy's `postgresql+asyncpg://`, `mysql+pymysql://`, and
+/// `mongodb+srv://`).
 fn kind_from_url(value: &str) -> Option<DatabaseKind> {
     let scheme = value.trim().split_once("://")?.0.to_ascii_lowercase();
-    match scheme.as_str() {
+    let database = scheme.split('+').next().unwrap_or_default();
+    match database {
         "postgres" | "postgresql" => Some(DatabaseKind::Postgres),
         "mysql" | "mariadb" => Some(DatabaseKind::Mariadb),
-        "mongodb" | "mongodb+srv" => Some(DatabaseKind::Mongodb),
+        "mongodb" => Some(DatabaseKind::Mongodb),
         "redis" | "rediss" => Some(DatabaseKind::Redis),
         _ => None,
     }
@@ -208,15 +212,28 @@ fn dependency_kind(manifest: &str, name: &str) -> Option<DatabaseKind> {
             "ioredis" | "redis" | "bullmq" | "bull" => Some(DatabaseKind::Redis),
             _ => None,
         },
-        "requirements.txt" | "pyproject.toml" => match name {
-            "psycopg2" | "psycopg2-binary" | "psycopg" | "asyncpg" => Some(DatabaseKind::Postgres),
-            "mysqlclient" | "pymysql" | "mysql-connector-python" | "aiomysql" => {
-                Some(DatabaseKind::Mariadb)
+        "requirements.txt" | "pyproject.toml" => {
+            // `psycopg[binary]` is psycopg: extras pick optional parts of a
+            // package, and names compare with `_` and `.` as `-` (PEP 503).
+            let (base, extras) = match name.split_once('[') {
+                Some((base, rest)) => (base, rest.trim_end_matches(']')),
+                None => (name, ""),
+            };
+            let base = base.trim().replace(['_', '.'], "-");
+            let has_extra = |wanted: &str| extras.split(',').any(|e| e.trim() == wanted);
+            match base.as_str() {
+                "psycopg2" | "psycopg2-binary" | "psycopg" | "psycopg-binary" | "asyncpg" => {
+                    Some(DatabaseKind::Postgres)
+                }
+                "mysqlclient" | "pymysql" | "mysql-connector-python" | "aiomysql" => {
+                    Some(DatabaseKind::Mariadb)
+                }
+                "pymongo" | "motor" | "mongoengine" => Some(DatabaseKind::Mongodb),
+                "redis" | "rq" => Some(DatabaseKind::Redis),
+                "celery" if has_extra("redis") => Some(DatabaseKind::Redis),
+                _ => None,
             }
-            "pymongo" | "motor" | "mongoengine" => Some(DatabaseKind::Mongodb),
-            "redis" | "celery[redis]" | "rq" => Some(DatabaseKind::Redis),
-            _ => None,
-        },
+        }
         "Gemfile" => match name {
             "pg" => Some(DatabaseKind::Postgres),
             "mysql2" | "trilogy" => Some(DatabaseKind::Mariadb),
@@ -261,25 +278,22 @@ fn dependencies(path: &str, content: &str) -> Vec<String> {
             .map(|l| l.split('#').next().unwrap_or_default().trim())
             .filter(|l| !l.is_empty() && !l.starts_with('-'))
             .map(|l| {
-                l.split(['=', '<', '>', '~', '!', ';', ' '])
-                    .next()
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .collect(),
-        "pyproject.toml" => content
-            .lines()
-            .filter_map(|l| {
-                // `"psycopg[binary]>=3"` in a dependency list, or
-                // `psycopg = "^3"` in a Poetry table.
-                let l = l.trim().trim_start_matches('"');
+                // The name, then its extras (`psycopg [binary]`) kept whole.
                 let end = l
-                    .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                    .find(['=', '<', '>', '~', '!', ';', ' ', '\t', '[', '@'])
                     .unwrap_or(l.len());
-                let name = &l[..end];
-                (!name.is_empty()).then(|| name.to_string())
+                let (name, rest) = l.split_at(end);
+                match rest
+                    .trim_start()
+                    .strip_prefix('[')
+                    .and_then(|r| r.split_once(']'))
+                {
+                    Some((extras, _)) => format!("{name}[{extras}]"),
+                    None => name.to_string(),
+                }
             })
             .collect(),
+        "pyproject.toml" => pyproject_dependencies(content),
         "Gemfile" => content
             .lines()
             .filter_map(|l| {
@@ -302,8 +316,9 @@ fn dependencies(path: &str, content: &str) -> Vec<String> {
     }
 }
 
-/// The datasource provider of a Prisma schema.
-fn prisma_provider(content: &str) -> Option<DatabaseKind> {
+/// The provider a Prisma schema's datasource names: the quoted string
+/// after `provider =`, whatever follows it (a `//` comment).
+fn prisma_provider_name(content: &str) -> Option<String> {
     let mut in_datasource = false;
     for line in content.lines() {
         let line = line.trim();
@@ -313,17 +328,143 @@ fn prisma_provider(content: &str) -> Option<DatabaseKind> {
             in_datasource = false;
         } else if in_datasource {
             if let Some(value) = line.strip_prefix("provider") {
-                let value = value.trim().trim_start_matches('=').trim().trim_matches('"');
-                return match value {
-                    "postgresql" | "postgres" | "cockroachdb" => Some(DatabaseKind::Postgres),
-                    "mysql" => Some(DatabaseKind::Mariadb),
-                    "mongodb" => Some(DatabaseKind::Mongodb),
-                    _ => None,
+                let Some(value) = value.trim().strip_prefix('=') else {
+                    continue;
                 };
+                let value = value.trim();
+                let value = match value.strip_prefix('"') {
+                    Some(quoted) => quoted.split('"').next().unwrap_or_default(),
+                    None => value
+                        .split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default(),
+                };
+                return Some(value.trim().to_ascii_lowercase());
             }
         }
     }
     None
+}
+
+/// The database a Prisma provider name is, when Temps offers it.
+fn prisma_kind(provider: &str) -> Option<DatabaseKind> {
+    match provider {
+        // CockroachDB speaks Postgres's protocol but is another engine, whose
+        // migrations (`unique_rowid()`, `crdb_internal`) Postgres refuses:
+        // Temps offers none, so nothing is suggested for it.
+        "postgresql" | "postgres" => Some(DatabaseKind::Postgres),
+        "mysql" => Some(DatabaseKind::Mariadb),
+        "mongodb" => Some(DatabaseKind::Mongodb),
+        _ => None,
+    }
+}
+
+/// Whether a connection string example names a database of its own
+/// (`file:./dev.db`, `sqlserver://…`): one Temps does not offer, which a
+/// bare DATABASE_URL must not be taken to mean Postgres for. An empty
+/// value or a placeholder names none.
+fn names_another_database(value: &str) -> bool {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    kind_from_url(value).is_none()
+        && (value.contains("://") || lower.starts_with("file:") || lower.starts_with("sqlite:"))
+}
+
+/// The packages a `pyproject.toml` depends on: the quoted requirements in
+/// the arrays of `[project]` (`dependencies`), `[project.optional-dependencies]`
+/// and `[dependency-groups]`, inline or over several lines, and the keys of
+/// Poetry's dependency tables. Nothing else in the file is a dependency.
+fn pyproject_dependencies(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut section = String::new();
+    let mut in_array = false;
+    // The name with its extras (`celery[redis]`), which can pick a service
+    // as requirements.txt's do.
+    let requirement_name = |requirement: &str| {
+        let requirement = requirement.trim();
+        let end = requirement
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+            .unwrap_or(requirement.len());
+        if end == 0 {
+            return None;
+        }
+        let name = &requirement[..end];
+        let rest = requirement[end..].trim_start();
+        match rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
+            Some((extras, _)) => Some(format!("{name}[{extras}]")),
+            None => Some(name.to_string()),
+        }
+    };
+    // The requirements quoted in `text`, and whether it closes the array.
+    let quoted = |text: &str, out: &mut Vec<String>| {
+        let (strings, closes) = toml_array_strings(text);
+        out.extend(strings.iter().filter_map(|s| requirement_name(s)));
+        closes
+    };
+    for raw in content.lines() {
+        if in_array {
+            in_array = !quoted(raw, &mut out);
+            continue;
+        }
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') && !line.contains('=') {
+            section = line.trim_matches(|c| c == '[' || c == ']').trim().to_string();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"');
+        let value = value.trim();
+        let poetry_table = section.starts_with("tool.poetry")
+            && section.ends_with("dependencies");
+        let array_section = (section == "project" && key == "dependencies")
+            || section == "project.optional-dependencies"
+            || section == "dependency-groups";
+        if poetry_table {
+            if key != "python" {
+                out.extend(requirement_name(key));
+            }
+        } else if array_section && value.starts_with('[') {
+            let value = raw.split_once('=').map_or("", |(_, v)| v);
+            in_array = !quoted(value, &mut out);
+        }
+    }
+    out
+}
+
+/// The strings in one line of a TOML array, in double or single quotes,
+/// and whether the line closes the array: a `]` outside quotes (an extra
+/// such as `psycopg[binary]` is inside them). A `#` outside quotes starts
+/// a comment. Strings in an inline table are no requirement: in
+/// `{ include-group = "redis" }` the string names a dependency group.
+fn toml_array_strings(line: &str) -> (Vec<String>, bool) {
+    let mut strings = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut current = String::new();
+    let mut table_depth = 0usize;
+    for c in line.chars() {
+        match quote {
+            Some(q) if c == q => {
+                let string = std::mem::take(&mut current);
+                if table_depth == 0 {
+                    strings.push(string);
+                }
+                quote = None;
+            }
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => break,
+            None if c == '{' => table_depth += 1,
+            None if c == '}' => table_depth = table_depth.saturating_sub(1),
+            None if c == ']' && table_depth == 0 => return (strings, true),
+            None => {}
+        }
+    }
+    (strings, false)
 }
 
 /// The database a Compose service image is.
@@ -361,10 +502,11 @@ pub fn suggest_services(
 
     // A Prisma schema names its provider; that decides what a bare
     // DATABASE_URL means.
-    let prisma = files
+    let prisma_provider = files
         .iter()
         .find(|f| f.path.ends_with("schema.prisma"))
-        .and_then(|f| prisma_provider(&f.content));
+        .and_then(|f| prisma_provider_name(&f.content));
+    let prisma = prisma_provider.as_deref().and_then(prisma_kind);
 
     for (key, example) in env {
         let kind = kind_from_env(key, example).or_else(|| {
@@ -398,8 +540,13 @@ pub fn suggest_services(
     // A DATABASE_URL whose example does not say which database it is goes to
     // the one SQL or document database the rest of the evidence names; with
     // none, to Postgres, the most common ask.
+    // A schema or example that names a database Temps does not offer
+    // (SQLite, SQL Server) is not a bare DATABASE_URL: nothing is suggested.
     if let Some((key, _)) = env.iter().find(|(k, v)| {
-        k.eq_ignore_ascii_case("DATABASE_URL") && kind_from_url(v).is_none() && prisma.is_none()
+        k.eq_ignore_ascii_case("DATABASE_URL")
+            && kind_from_url(v).is_none()
+            && !names_another_database(v)
+            && prisma_provider.is_none()
     }) {
         let candidates: Vec<DatabaseKind> = evidence
             .keys()
@@ -466,24 +613,74 @@ pub fn looks_secret(key: &str) -> bool {
     ]
     .iter()
     .any(|s| k.ends_with(s))
-        || matches!(k.as_str(), "SECRET" | "SECRET_KEY_BASE" | "APP_KEY" | "PASSWORD")
+        || matches!(
+            k.as_str(),
+            "SECRET" | "SECRET_KEY_BASE" | "APP_KEY" | "PASSWORD" | "TOKEN" | "KEY" | "SALT" | "PEPPER"
+        )
 }
 
-/// Whether the server can generate a value for this key: a secret that is
-/// not a credential for some other service (an API key or a password the
-/// operator must bring).
+/// Words that name what an app's own secret protects (its sessions, its
+/// cookies, its tokens), never another service: `SESSION_SECRET`,
+/// `JWT_SECRET`, `BETTER_AUTH_SECRET`. A name with any other word
+/// (`TWILIO_API_SECRET`, `STRIPE_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY`)
+/// may be a credential that service issued, which a random value breaks.
+const OWN_SECRET_WORDS: &[&str] = &[
+    "APP",
+    "APPLICATION",
+    "SESSION",
+    "SESSIONS",
+    "COOKIE",
+    "COOKIES",
+    "JWT",
+    "AUTH",
+    "NEXTAUTH",
+    "BETTER",
+    "CSRF",
+    "XSRF",
+    "ENCRYPTION",
+    "SIGNING",
+    "HMAC",
+    "HASH",
+    "HASHING",
+    "ACCESS",
+    "REFRESH",
+    "TOKEN",
+    "ADMIN",
+    "SECRET",
+    "PAYLOAD",
+    "DJANGO",
+    "FLASK",
+    "RAILS",
+];
+
+/// Whether the server can generate a value for this key: a secret the app
+/// keeps for itself, never a credential some other service issues (an API
+/// key, a client or webhook secret, a password the operator brings).
 pub fn can_generate(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
-    looks_secret(&k)
-        && (k.ends_with("_SECRET")
-            || k.ends_with("_SALT")
-            || k.ends_with("_PEPPER")
-            || matches!(
-                k.as_str(),
-                "SECRET" | "SECRET_KEY_BASE" | "APP_KEY" | "SECRET_KEY" | "ENCRYPTION_KEY"
-            ))
-        && !k.contains("CLIENT_SECRET")
-        && !k.contains("WEBHOOK_SECRET")
+    if !looks_secret(&k) || k.contains("CLIENT_SECRET") || k.contains("WEBHOOK_SECRET") {
+        return false;
+    }
+    if matches!(
+        k.as_str(),
+        "SECRET" | "SECRET_KEY" | "SECRET_KEY_BASE" | "APP_KEY" | "ENCRYPTION_KEY"
+    ) {
+        return true;
+    }
+    // A salt or pepper is always the app's own: no service issues one.
+    if k.ends_with("_SALT") || k.ends_with("_PEPPER") {
+        return true;
+    }
+    let Some(prefix) = ["_SECRET_KEY", "_SECRET", "_SIGNING_KEY", "_ENCRYPTION_KEY"]
+        .iter()
+        .find_map(|suffix| k.strip_suffix(suffix))
+    else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix
+            .split('_')
+            .all(|word| OWN_SECRET_WORDS.contains(&word))
 }
 
 /// The injected variable that fills `key` when a database of `kind` is
@@ -508,7 +705,9 @@ pub fn env_aliases<'a>(
     keys.into_iter()
         .filter_map(|key| {
             let injected = provided_by(key, kind)?;
-            (!key.eq_ignore_ascii_case(injected)).then(|| (key.to_string(), injected.to_string()))
+            // Names are case-sensitive in the environment: `postgres_url`
+            // is not `POSTGRES_URL`, so it gets an alias of its own.
+            (key != injected).then(|| (key.to_string(), injected.to_string()))
         })
         .collect()
 }
@@ -624,7 +823,10 @@ mod tests {
 
     #[test]
     fn secrets_are_recognised_but_public_keys_never() {
-        for key in ["SESSION_SECRET", "STRIPE_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "SECRET_KEY_BASE"] {
+        for key in [
+            "SESSION_SECRET", "STRIPE_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "SECRET_KEY_BASE", "TOKEN", "KEY",
+            "PRIVATE_KEY",
+        ] {
             assert!(looks_secret(key), "{key}");
         }
         for key in ["NEXT_PUBLIC_API_KEY", "VITE_MAPS_KEY", "STRIPE_PUBLISHABLE_KEY", "PORT", "NODE_ENV", "KEYCLOAK_URL"] {
@@ -641,6 +843,43 @@ mod tests {
         assert!(!can_generate("GITHUB_CLIENT_SECRET"));
         assert!(!can_generate("STRIPE_WEBHOOK_SECRET"));
         assert!(!can_generate("PORT"));
+    }
+
+    /// A secret named for another service is the one it issued: a random
+    /// value in its place fails every call to it.
+    #[test]
+    fn a_secret_named_for_another_service_is_never_generated() {
+        for key in [
+            "JWT_SECRET",
+            "NEXTAUTH_SECRET",
+            "AUTH_SECRET",
+            "BETTER_AUTH_SECRET",
+            "COOKIE_SECRET",
+            "APP_SECRET",
+            "JWT_ACCESS_SECRET",
+            "REFRESH_TOKEN_SECRET",
+            "ADMIN_JWT_SECRET",
+            "API_TOKEN_SALT",
+            "DJANGO_SECRET_KEY",
+            "SESSION_SIGNING_KEY",
+            "SECRET_KEY",
+        ] {
+            assert!(can_generate(key), "{key}");
+        }
+        for key in [
+            "TWILIO_API_SECRET",
+            "STRIPE_SECRET",
+            "STRIPE_SECRET_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SECRET",
+            "SHOPIFY_API_SECRET",
+            "PUSHER_APP_SECRET",
+            "GOOGLE_CLIENT_SECRET",
+            "API_SECRET",
+            "SLACK_SIGNING_SECRET",
+        ] {
+            assert!(!can_generate(key), "{key}");
+        }
     }
 
     #[test]
@@ -664,6 +903,172 @@ mod tests {
             ]
         );
         assert!(env_aliases(["DATABASE_URL"], DatabaseKind::Mariadb).is_empty());
+    }
+
+    #[test]
+    fn a_lowercase_key_gets_an_alias_of_its_own() {
+        // Environment names are case-sensitive: the app reads postgres_url,
+        // which POSTGRES_URL does not fill.
+        let aliases = env_aliases(["postgres_url", "POSTGRES_URL"], DatabaseKind::Postgres);
+        assert_eq!(
+            aliases.into_iter().collect::<Vec<_>>(),
+            vec![("postgres_url".to_string(), "POSTGRES_URL".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_database_temps_does_not_offer_is_not_taken_for_postgres() {
+        let sqlite = "datasource db {\n  provider = \"sqlite\"\n  url = env(\"DATABASE_URL\")\n}\n";
+        let got = suggest_services(
+            &env(&[("DATABASE_URL", "file:./dev.db")]),
+            &[file("prisma/schema.prisma", sqlite)],
+            &[],
+        );
+        assert!(got.is_empty(), "{got:?}");
+        // The example alone says so too.
+        for example in ["file:./dev.db", "sqlite:///app.db", "sqlserver://db:1433"] {
+            let got = suggest_services(&env(&[("DATABASE_URL", example)]), &[], &[]);
+            assert!(got.is_empty(), "{example}: {got:?}");
+        }
+        // A bare one still means Postgres.
+        let got = suggest_services(&env(&[("DATABASE_URL", "")]), &[], &[]);
+        assert_eq!(got.first().map(|s| s.kind), Some(DatabaseKind::Postgres));
+    }
+
+    #[test]
+    fn pyproject_dependencies_are_read_from_its_arrays_and_tables() {
+        let inline = "[project]\nname = \"psycopg-app\"\ndependencies = [\"pymongo>=4\", \"flask\"]\n";
+        let got = suggest_services(
+            &env(&[("DATABASE_URL", "")]),
+            &[file("pyproject.toml", inline)],
+            &[],
+        );
+        assert_eq!(got.first().map(|s| s.kind), Some(DatabaseKind::Mongodb));
+        assert_eq!(
+            pyproject_dependencies(
+                "[project]\nname = \"redis\"\nversion = \"1\"\ndependencies = [\n  \"psycopg[binary]>=3\", # db\n  \"flask\",\n]\n\n[project.optional-dependencies]\ncache = [\"redis>=5\"]\n\n[tool.poetry.dependencies]\npython = \"^3.12\"\npymongo = \"^4\"\n"
+            ),
+            // Extras stay with the name: `celery[redis]` means Redis.
+            vec!["psycopg[binary]", "flask", "redis", "pymongo"]
+        );
+        // A project named like a driver is not a dependency on it.
+        assert!(pyproject_dependencies("[project]\nname = \"redis\"\n").is_empty());
+    }
+
+    /// TOML's single-quoted literal strings are requirements too, with
+    /// either quote inside the other's string and comments after them.
+    #[test]
+    fn single_quoted_pyproject_requirements_are_read() {
+        let inline = "[project]\nname = \"redis\"\ndependencies = ['pymongo>=4']\n";
+        assert_eq!(pyproject_dependencies(inline), vec!["pymongo"]);
+        let got = suggest_services(
+            &env(&[("DATABASE_URL", "")]),
+            &[file("pyproject.toml", inline)],
+            &[],
+        );
+        assert_eq!(got.first().map(|s| s.kind), Some(DatabaseKind::Mongodb));
+        assert_eq!(
+            pyproject_dependencies(
+                "[project]\ndependencies = [\n  'psycopg[binary]>=3', # the driver\n  \"flask # web\",\n]\n"
+            ),
+            vec!["psycopg[binary]", "flask"]
+        );
+    }
+
+    /// A package asked for with extras, or spelled another way pip accepts,
+    /// is still that package.
+    #[test]
+    fn python_extras_and_spellings_name_the_package() {
+        for (requirements, kind) in [
+            ("psycopg[binary]>=3\n", DatabaseKind::Postgres),
+            ("Psycopg[binary,pool] ~= 3.2\n", DatabaseKind::Postgres),
+            ("mysql_connector_python==9.0\n", DatabaseKind::Mariadb),
+            ("celery[redis]>=5\n", DatabaseKind::Redis),
+            ("celery[ redis , msgpack ]\n", DatabaseKind::Redis),
+        ] {
+            let got = suggest_services(&[], &[file("requirements.txt", requirements)], &[]);
+            assert_eq!(got.len(), 1, "{requirements}");
+            assert_eq!(got[0].kind, kind, "{requirements}");
+        }
+        // Celery with another broker needs no Redis.
+        let got = suggest_services(&[], &[file("requirements.txt", "celery[sqs]\n")], &[]);
+        assert!(got.is_empty());
+        // The same requirements in pyproject.toml's arrays.
+        for pyproject in [
+            "[project]\ndependencies = [\"celery[redis]>=5\"]\n",
+            "[project]\ndependencies = [\n  \"celery [redis] >=5\",\n]\n",
+        ] {
+            let got = suggest_services(&[], &[file("pyproject.toml", pyproject)], &[]);
+            assert_eq!(got.len(), 1, "{pyproject}");
+            assert_eq!(got[0].kind, DatabaseKind::Redis, "{pyproject}");
+        }
+        let sqs = suggest_services(&[], &[file("pyproject.toml", "[project]\ndependencies = [\"celery[sqs]\"]\n")], &[]);
+        assert!(sqs.is_empty());
+    }
+
+    /// CockroachDB is another engine: no managed Postgres is offered for it,
+    /// even for a bare DATABASE_URL.
+    #[test]
+    fn a_cockroachdb_schema_is_not_offered_postgres() {
+        let schema = "datasource db {\n  provider = \"cockroachdb\"\n  url = env(\"DATABASE_URL\")\n}\n";
+        let got = suggest_services(
+            &env(&[("DATABASE_URL", "")]),
+            &[
+                file("package.json", r#"{"dependencies":{"@prisma/client":"5"}}"#),
+                file("prisma/schema.prisma", schema),
+            ],
+            &[],
+        );
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// A dependency group included by name is not a package of that name.
+    #[test]
+    fn a_dependency_group_reference_is_not_a_package() {
+        let pyproject = "[dependency-groups]\ndev = [{ include-group = 'redis' }, \"ruff\"]\nredis = ['pytest']\n";
+        assert_eq!(pyproject_dependencies(pyproject), vec!["ruff", "pytest"]);
+        let got = suggest_services(&env(&[]), &[file("pyproject.toml", pyproject)], &[]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// A driver after `+` in the scheme (SQLAlchemy) still names the
+    /// database, and its URL is the only evidence needed.
+    #[test]
+    fn a_driver_qualified_url_names_its_database() {
+        for (url, kind) in [
+            ("postgresql+asyncpg://user@db/app", DatabaseKind::Postgres),
+            ("postgresql+psycopg://db/app", DatabaseKind::Postgres),
+            ("mysql+pymysql://db/app", DatabaseKind::Mariadb),
+            ("mongodb+srv://cluster.example.com/app", DatabaseKind::Mongodb),
+        ] {
+            let got = suggest_services(&env(&[("DATABASE_URL", url)]), &[], &[]);
+            assert_eq!(got.first().map(|s| s.kind), Some(kind), "{url}");
+        }
+        // A database Temps does not offer still suggests nothing.
+        let got = suggest_services(&env(&[("DATABASE_URL", "mssql+pyodbc://db/app")]), &[], &[]);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// A comment after the Prisma provider is not part of its name.
+    #[test]
+    fn a_comment_after_the_prisma_provider_is_ignored() {
+        for schema in [
+            "datasource db {\n  provider = \"postgresql\" // primary database\n  url = env(\"DATABASE_URL\")\n}\n",
+            "datasource db {\n  provider=\"postgresql\"\n}\n",
+        ] {
+            assert_eq!(prisma_provider_name(schema).as_deref(), Some("postgresql"));
+            let got = suggest_services(
+                &env(&[("DATABASE_URL", "")]),
+                &[file("prisma/schema.prisma", schema)],
+                &[],
+            );
+            assert_eq!(got.first().map(|s| s.kind), Some(DatabaseKind::Postgres), "{schema}");
+        }
+        // A key that only starts with `provider` is not the provider.
+        assert_eq!(
+            prisma_provider_name("datasource db {\n  providerOptions = 1\n}\n"),
+            None
+        );
     }
 
     #[test]

@@ -62,6 +62,11 @@ fn private_ingress_problem(error: PrivateIngressError) -> Problem {
             .title("Private Ingress Unavailable")
             .detail(error.to_string())
             .build(),
+        PrivateIngressError::ConsentExists { .. } => ErrorBuilder::new(StatusCode::CONFLICT)
+            .type_("https://temps.sh/probs/private-ingress-consent-exists")
+            .title("Private Ingress Consent Already Given")
+            .detail(error.to_string())
+            .build(),
     }
 }
 
@@ -172,7 +177,7 @@ async fn get_private_ingress(
     responses(
         (status = 200, description = "The stored consent", body = PrivateIngressConsent),
         (status = 400, description = "The address is not one a private listener may use; the detail says why"),
-        (status = 409, description = "The console and proxy run as separate processes, so nothing here serves private addresses"),
+        (status = 409, description = "The console and proxy run as separate processes, so nothing here serves private addresses; or `create_only` was asked and a consent exists, which is kept"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "The consent could not be written")
@@ -452,6 +457,33 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("not a private address"));
+        assert!(audit.records.lock().unwrap().is_empty());
+    }
+
+    /// `create_only` over an existing consent is a 409 that keeps it, and
+    /// nothing is audited as changed.
+    #[tokio::test]
+    async fn create_only_over_a_consent_is_a_409_and_changes_nothing() {
+        let stored = settings_row(serde_json::json!({
+            "private_ingress": {"listen": "10.8.0.1", "admit": ["10.8.0.0/28"], "updated_at": "2026-11-24T10:00:00Z"}
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stored]])
+            .into_connection();
+        let audit = Arc::new(RecordingAudit::default());
+        let (status, body) = send(
+            app(db, audit.clone()),
+            "PUT",
+            Some(serde_json::json!({"listen": "10.8.0.1", "create_only": true})),
+            Some(admin()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["title"], "Private Ingress Consent Already Given");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("10.8.0.1"));
         assert!(audit.records.lock().unwrap().is_empty());
     }
 

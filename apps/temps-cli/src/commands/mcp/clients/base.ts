@@ -101,8 +101,14 @@ export async function writeBridgeKeyFile(file: string, apiKey: string): Promise<
   return previous
 }
 
-/** Put a key file back as `writeBridgeKeyFile` found it: removed when it did not exist. */
-export async function restoreBridgeKeyFile(file: string, previous: string | null): Promise<void> {
+/**
+ * Put a key file back as `writeBridgeKeyFile` found it (removed when it did
+ * not exist), but only while it still holds `written`, the key this install
+ * wrote: one another install wrote since, which its entry now reads, is
+ * left as it is.
+ */
+export async function restoreBridgeKeyFile(file: string, previous: string | null, written: string): Promise<void> {
+  if (readKeyFile(file) !== written.trim()) return
   if (previous === null) await fs.promises.rm(file, { force: true })
   else await replaceKeyFile(file, previous)
 }
@@ -185,6 +191,44 @@ export interface InstallResult {
   reason?: string
 }
 
+/** Most bytes read from a key file: an API key is far shorter. */
+const MAX_KEY_FILE_BYTES = 4096
+
+/** The key in a bridge key file, or undefined when it cannot be read or is not one. */
+export function readKeyFile(file: string): string | undefined {
+  let handle: number | undefined
+  try {
+    handle = fs.openSync(file, 'r')
+    const buffer = Buffer.alloc(MAX_KEY_FILE_BYTES + 1)
+    const read = fs.readSync(handle, buffer, 0, buffer.length, 0)
+    if (read > MAX_KEY_FILE_BYTES) return undefined
+    return buffer.subarray(0, read).toString('utf8').trim() || undefined
+  } catch {
+    return undefined
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle)
+  }
+}
+
+function bearerOf(value: unknown): string | undefined {
+  return typeof value === 'string' ? /^Bearer\s+(\S+)$/i.exec(value.trim())?.[1] : undefined
+}
+
+/**
+ * The API key an app's entry sends, from every place an entry this CLI
+ * writes keeps it: an `Authorization` header, `mcp-remote`'s `AUTH_HEADER`,
+ * the bridge's key file or its inline key. Undefined when it holds none
+ * (Codex's HTTP entry reads its token from the user's environment).
+ */
+export function entryApiKey(entry: unknown): string | undefined {
+  if (!entry || typeof entry !== 'object') return undefined
+  const { headers, env } = entry as { headers?: Record<string, unknown>; env?: Record<string, unknown> }
+  const header = Object.entries(headers ?? {}).find(([name]) => name.toLowerCase() === 'authorization')?.[1]
+  const file = typeof env?.TEMPS_API_KEY_FILE === 'string' ? env.TEMPS_API_KEY_FILE.trim() : ''
+  const inline = typeof env?.TEMPS_API_KEY === 'string' ? env.TEMPS_API_KEY.trim() : ''
+  return bearerOf(header) || bearerOf(env?.AUTH_HEADER) || (file ? readKeyFile(file) : undefined) || inline || undefined
+}
+
 /** The server name written into every client's config file/registry. */
 export const MCP_SERVER_NAME = 'temps'
 
@@ -208,6 +252,13 @@ export interface McpClientAdapter {
   getServerUrl(): Promise<string | null>
   addServer(entry: McpServerEntry): Promise<InstallResult>
   removeServer(): Promise<InstallResult>
+  /**
+   * The API key the configured Temps entry sends now, when this adapter can
+   * read it from the entry (undefined when there is none, or it is kept
+   * elsewhere). Read before an entry is replaced or removed, to tell
+   * whether it still held the key `mcp add` minted for it.
+   */
+  installedApiKey(): Promise<string | undefined>
   /** Human-readable description of what `addServer`/`removeServer` will change, for the pre-write confirmation prompt. */
   describeTarget(): Promise<string>
 }
@@ -252,6 +303,10 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
 
   async isServerInstalled(): Promise<boolean> {
     return (await this.readServerConfig()) !== null
+  }
+
+  async installedApiKey(): Promise<string | undefined> {
+    return entryApiKey(await this.readServerConfig())
   }
 
   async getServerUrl(): Promise<string | null> {

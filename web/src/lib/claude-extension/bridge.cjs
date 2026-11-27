@@ -299,6 +299,7 @@ function post(config, body, sessionId) {
 
 async function sendTo(config, hostname, request, localAddress) {
   const { endpoint } = config
+  const limit = config.requestTimeoutMs ?? REQUEST_TIMEOUT_MS
   const secure = endpoint.protocol === 'https:'
   const headers = {
     ...request.headers,
@@ -316,12 +317,26 @@ async function sendTo(config, hostname, request, localAddress) {
     port: endpoint.port || (secure ? 443 : 80),
     path: request.path,
     headers,
-    timeout: REQUEST_TIMEOUT_MS,
+    timeout: limit,
     agent: false,
   }
   if (localAddress) options.localAddress = localAddress
 
   return new Promise((resolve, reject) => {
+    // The socket's timeout counts only silence: a stream that keeps
+    // sending (SSE keepalives) would hold its request, and its slot, for
+    // ever. The whole exchange ends at the limit, however busy.
+    const deadline = setTimeout(() => {
+      req.destroy(
+        new Error(`Temps did not answer within ${limit / 1000} seconds.`)
+      )
+    }, limit)
+    const settle = (fn) => (value) => {
+      clearTimeout(deadline)
+      fn(value)
+    }
+    resolve = settle(resolve)
+    reject = settle(reject)
     const req = (secure ? https : http).request(options, (res) => {
       const chunks = []
       let size = 0
@@ -363,9 +378,7 @@ async function sendTo(config, hostname, request, localAddress) {
     })
     req.on('timeout', () =>
       req.destroy(
-        new Error(
-          `Temps did not answer within ${REQUEST_TIMEOUT_MS / 1000} seconds.`
-        )
+        new Error(`Temps did not answer within ${limit / 1000} seconds.`)
       )
     )
     req.on('error', reject)
@@ -558,11 +571,21 @@ function serialQueue(maxWaiting) {
   return queue
 }
 
-/** Whether a line is an MCP cancellation, read even when the bridge is busy. */
+/**
+ * Whether a line is an MCP cancellation, read even when the bridge is busy.
+ * Only a notification: one with an `id` is a request, which is answered, so
+ * it waits its turn like any other and cannot queue replies past the limit.
+ */
 function isCancellation(line) {
   if (!line.includes('notifications/cancelled')) return false
   try {
-    return JSON.parse(line).method === 'notifications/cancelled'
+    const message = JSON.parse(line)
+    return (
+      message !== null &&
+      typeof message === 'object' &&
+      message.method === 'notifications/cancelled' &&
+      !('id' in message)
+    )
   } catch {
     return false
   }
@@ -578,13 +601,40 @@ function run(config, input, output, log) {
   let buffer = ''
   let discarding = false
   let pending = 0
+  // Cancellations started past MAX_IN_FLIGHT while busy, themselves at most
+  // MAX_IN_FLIGHT: a client sending nothing else cannot start them unbounded.
+  let cancelling = 0
   let ended = false
   const deployOneAtATime = serialQueue(MAX_WAITING_DEPLOYS)
   // Folder deployments this bridge answers itself, by request id, so a
   // cancellation of one stays here: the server never saw the call.
   const localCalls = new Map()
 
-  const write = (message) => output.write(`${JSON.stringify(message)}\n`)
+  // A reply resolves once the app has taken it: while its reader lags, the
+  // request stays in flight, so at most MAX_IN_FLIGHT replies wait in
+  // memory and no further request is read meanwhile.
+  // Every reply waiting for the same drain shares one set of listeners, so
+  // a slow reader never adds more than three.
+  let drained = null
+  const write = (message) => {
+    if (output.write(`${JSON.stringify(message)}\n`)) return Promise.resolve()
+    if (output.destroyed || output.writableEnded) return Promise.resolve()
+    if (!drained) {
+      drained = new Promise((resolve) => {
+        const done = () => {
+          output.off('drain', done)
+          output.off('close', done)
+          output.off('error', done)
+          drained = null
+          resolve()
+        }
+        output.on('drain', done)
+        output.on('close', done)
+        output.on('error', done)
+      })
+    }
+    return drained
+  }
   const maybeExit = () => {
     if (ended && pending === 0 && !buffer.includes('\n')) {
       if (output !== process.stdout) output.end()
@@ -596,7 +646,7 @@ function run(config, input, output, log) {
     try {
       message = JSON.parse(line)
     } catch {
-      write(
+      await write(
         errorReply(
           null,
           -32700,
@@ -649,10 +699,10 @@ function run(config, input, output, log) {
             ),
           call
         )
-        if (!call.cancelled) write(toolResult(id, text, false))
+        if (!call.cancelled) await write(toolResult(id, text, false))
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error)
-        if (!call.cancelled) write(toolResult(id, text, true))
+        if (!call.cancelled) await write(toolResult(id, text, true))
       } finally {
         localCalls.delete(id)
       }
@@ -667,21 +717,23 @@ function run(config, input, output, log) {
         message,
         await forward(config, message, session)
       )
-      for (const reply of replies) write(reply)
+      for (const reply of replies) await write(reply)
       log(`temps: ${method} answered in ${Date.now() - started} ms`)
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error)
       log(`temps: ${text}`)
-      if (isRequest) write(errorReply(id, -32000, text))
+      if (isRequest) await write(errorReply(id, -32000, text))
     }
   }
 
   // Start the messages read so far, up to MAX_IN_FLIGHT at once; reading
   // stops while that many are running and starts again as they finish.
-  const start = (line) => {
+  const start = (line, cancellation = false) => {
     pending++
+    if (cancellation) cancelling++
     handle(line).finally(() => {
       pending--
+      if (cancellation) cancelling--
       pump()
       maybeExit()
     })
@@ -704,10 +756,14 @@ function run(config, input, output, log) {
       const partial = lines.pop()
       const kept = lines.filter((line, at) => {
         // The rest of a message too large to read is not a message.
-        if ((discarding && at === 0) || !isCancellation(line.trim())) {
+        if (
+          (discarding && at === 0) ||
+          cancelling >= MAX_IN_FLIGHT ||
+          !isCancellation(line.trim())
+        ) {
           return true
         }
-        start(line.trim())
+        start(line.trim(), true)
         return false
       })
       buffer = kept.length > 0 ? `${kept.join('\n')}\n${partial}` : partial
@@ -767,6 +823,7 @@ module.exports = {
   plainHttpSource,
   readConfig,
   parseSse,
+  sendTo,
   statusError,
   run,
   main,

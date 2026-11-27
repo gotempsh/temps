@@ -3,8 +3,8 @@
 
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { CopyButton } from '@/components/ui/copy-button'
-import { extensionCanConnect } from '@/lib/claude-extension/extension'
 import {
+  directClientEncrypts,
   MCP_APPS,
   type McpAppId,
   mcpAddCommand,
@@ -80,10 +80,11 @@ export function OtherAppSetup({
         </Select>
       </div>
 
-      {!extensionCanConnect(origin) && (
+      {!directClientEncrypts(origin) && (
         <Callout tone="warning" title="The key would travel unencrypted">
           {app.name} connects to this address over plain HTTP. Open this console
-          over HTTPS or through Tailscale before you add it.
+          over HTTPS, or by its Tailscale name (ending in .ts.net), before you
+          add it.
         </Callout>
       )}
 

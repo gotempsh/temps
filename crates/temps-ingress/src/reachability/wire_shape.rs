@@ -31,14 +31,26 @@ pub(crate) fn schema_shape<T: ToSchema>(into: &mut serde_json::Map<String, Value
 }
 
 /// Descriptions, titles and examples change with doc comments, not with
-/// what is stored.
+/// what is stored. Only a schema's own are removed: a map of named schemas
+/// (`properties`) keeps every name, even a field called `title`, so its
+/// type stays compared; literal values (`default`, `enum`) are left whole.
 fn strip_prose(value: &mut Value) {
     match value {
-        Value::Object(map) => {
+        Value::Object(schema) => {
             for key in ["description", "title", "example", "examples"] {
-                map.remove(key);
+                schema.remove(key);
             }
-            map.values_mut().for_each(strip_prose);
+            for (key, child) in schema.iter_mut() {
+                match key.as_str() {
+                    "properties" | "patternProperties" | "$defs" | "definitions" => {
+                        if let Value::Object(named) = child {
+                            named.values_mut().for_each(strip_prose);
+                        }
+                    }
+                    "default" | "enum" | "const" => {}
+                    _ => strip_prose(child),
+                }
+            }
         }
         Value::Array(items) => items.iter_mut().for_each(strip_prose),
         _ => {}
@@ -162,6 +174,34 @@ mod tests {
                 Value::String(word.into())
             );
         }
+    }
+
+    /// A field named `title` or `description` is a field: its type is
+    /// compared like any other's.
+    #[test]
+    fn a_field_named_like_prose_keeps_its_schema() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "title": "Plan option",
+            "description": "One way to reach the app",
+            "required": ["title", "description"],
+            "properties": {
+                "title": { "type": "string", "description": "Shown as the heading" },
+                "description": { "type": "string", "example": "x" }
+            }
+        });
+        strip_prose(&mut schema);
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "required": ["title", "description"],
+                "properties": {
+                    "title": { "type": "string" },
+                    "description": { "type": "string" }
+                }
+            })
+        );
     }
 
     #[test]

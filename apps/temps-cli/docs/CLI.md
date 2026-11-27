@@ -1175,7 +1175,7 @@ Set an environment variable. For a secret, read the value from a file or stdin (
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
-| `--generate-secret [bytes]` | Have the server generate a random secret of this many bytes (16 to 64, 32 by default), stored as a secret and never shown; for a new variable, instead of a value | - | No |
+| `--generate-secret [bytes\|laravel]` | Have the server generate a random secret of this many bytes (16 to 64, 32 by default, hex), stored as a secret and never shown; for a new variable, instead of a value. `laravel`, the default for APP_KEY, makes a Laravel application key (base64:, 32 bytes) | - | No |
 | `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |

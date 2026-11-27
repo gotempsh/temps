@@ -49,6 +49,10 @@ export interface PrivateNetwork {
   listen: string
   /** Who can connect: `10.8.0.0/24`. */
   admit: string[]
+  /** The network of a consent given before, which saving keeps as it is. */
+  consented?: boolean
+  /** When that consent was given or last changed: saving checks it is still the one. */
+  consentAt?: string
 }
 
 /** The subset of `PrivateNetworkOption` the access step reads. */
@@ -92,6 +96,65 @@ export interface PrivateIngressLike {
   available: boolean
   error?: string | null
   networks: PrivateNetworkLike[]
+  /** The consent already given, if any. */
+  consent?: PrivateConsentLike | null
+}
+
+/** The subset of the stored consent the access step reads. */
+export interface PrivateConsentLike {
+  listen: string
+  admit?: string[]
+  updated_at: string
+}
+
+/**
+ * The network a consent given before serves on, with the ranges it admits:
+ * the wizard keeps that consent, so its plan (the DNS record's address, who
+ * may connect) is about that network, not the first one listed. No network,
+ * and why, when this machine does not list the one the consent names, or
+ * refuses to serve it (it overlaps a container network, Docker cannot be
+ * listed): the plan would point DNS at an address nothing serves.
+ */
+export function consentedNetwork(
+  consent: PrivateConsentLike,
+  networks: PrivateNetworkLike[]
+): { network: PrivateNetwork | null; problem: string | null } {
+  const onTailscale = consent.listen === 'tailscale'
+  const where = onTailscale ? 'Tailscale' : consent.listen
+  const option = networks.find((n) =>
+    onTailscale ? n.tailscale : n.address === consent.listen
+  )
+  if (!option) {
+    return {
+      network: null,
+      problem: `The private-ingress consent serves on ${where}, which this machine does not list as one of its private networks now. Change the consent in Settings, then come back.`,
+    }
+  }
+  if (option.problem) {
+    return {
+      network: null,
+      problem: `This machine refuses to serve private addresses on ${where}, as its consent asks: ${option.problem}`,
+    }
+  }
+  // Empty admits the network's own ranges, which its option lists.
+  const admit = consent.admit?.length ? consent.admit : option.admit
+  if (admit.length === 0) {
+    return {
+      network: null,
+      problem: `The private-ingress consent on ${where} admits no range this machine can serve. Change it in Settings, then come back.`,
+    }
+  }
+  return {
+    network: {
+      label: onTailscale ? 'Tailscale' : option.interface,
+      address: option.address,
+      listen: consent.listen,
+      admit,
+      consented: true,
+      consentAt: consent.updated_at,
+    },
+    problem: null,
+  }
 }
 
 /** Said when the server reports no reason of its own. */
@@ -110,10 +173,14 @@ export function factsFromHost(
           tailnet: host.tailscale.tailnet ?? null,
         }
       : null
+  const consented =
+    privateIngress?.available && privateIngress.consent
+      ? consentedNetwork(privateIngress.consent, privateIngress.networks)
+      : null
   const unavailable =
     privateIngress && !privateIngress.available
       ? privateIngress.error || PRIVATE_UNAVAILABLE
-      : null
+      : (consented?.problem ?? null)
   return {
     publicIp: host.public_ip ?? null,
     lanIp: host.lan_ip ?? null,
@@ -125,14 +192,16 @@ export function factsFromHost(
     // Tailscale is the one private network the host facts can name.
     privateNetwork: unavailable
       ? null
-      : privateIngress?.networks.length
-        ? privateNetworkOf(privateIngress.networks)
-        : tailscale && {
-            label: 'Tailscale',
-            address: tailscale.ip,
-            listen: 'tailscale',
-            admit: ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'],
-          },
+      : consented
+        ? consented.network
+        : privateIngress?.networks.length
+          ? privateNetworkOf(privateIngress.networks)
+          : tailscale && {
+              label: 'Tailscale',
+              address: tailscale.ip,
+              listen: 'tailscale',
+              admit: ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'],
+            },
     privateUnavailable: unavailable,
   }
 }
@@ -666,7 +735,9 @@ export function accessPlan(choice: AccessChoice, facts: BoxFacts): AccessPlan {
       ...base,
       records: [
         {
-          type: 'A',
+          // An IPv6 address is published in an AAAA record; an A record
+          // holds IPv4 only, and DNS providers refuse anything else.
+          type: facts.publicIp?.includes(':') ? 'AAAA' : 'A',
           name,
           value: facts.publicIp ?? 'this box’s public IP',
           by: 'you',
@@ -740,7 +811,7 @@ export function accessPlan(choice: AccessChoice, facts: BoxFacts): AccessPlan {
         'Paste it here',
       ],
       temps: [
-        `Serve the apps under ${name} only to connections on ${facts.privateNetwork?.label} (${facts.privateNetwork?.address}:443), never on a public address`,
+        `Serve the apps under ${name} only to connections on ${facts.privateNetwork?.label} (${facts.privateNetwork?.address}:443), never on a public address${facts.privateNetwork?.consented ? ', as the private-ingress consent already given says' : ''}`,
         perApp
           ? `Get ${name} a certificate by DNS challenge, and one for each new app`
           : `Get one certificate for ${name} by DNS challenge, since the private address can’t be reached from the internet`,

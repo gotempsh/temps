@@ -225,6 +225,9 @@ pub(super) struct Gathered {
     /// Every container of the current deployment runs on a worker, which is
     /// what a tunnel can carry (ADR 058).
     pub(super) on_workers: bool,
+    /// At least one container runs on a worker: a mixed deployment is the
+    /// workers' to serve privately (ADR-115 D1), never node 0's alone.
+    pub(super) some_on_workers: bool,
     pub(super) deployed: bool,
 }
 
@@ -599,6 +602,7 @@ impl ReachabilityService {
 
         let mut running_on = Vec::new();
         let mut on_workers = false;
+        let mut some_on_workers = false;
         if let Some(deployment_id) = environment.current_deployment_id {
             let containers = deployment_containers::Entity::find()
                 .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
@@ -625,12 +629,14 @@ impl ReachabilityService {
             }
             running_on = place.into_iter().collect();
             on_workers = !containers.is_empty() && containers.iter().all(|c| c.node_id.is_some());
+            some_on_workers = containers.iter().any(|c| c.node_id.is_some());
         }
         Ok(Gathered {
             addresses,
             service_addresses: service_addresses.into_iter().collect(),
             running_on,
             on_workers,
+            some_on_workers,
             deployed: environment.current_deployment_id.is_some(),
         })
     }
@@ -802,14 +808,37 @@ impl ReachabilityService {
             .into_iter()
             .map(|n| (n.id, n))
             .collect();
-        let rows: HashMap<i32, node_public_ingress::Model> = node_public_ingress::Entity::find()
-            .filter(node_public_ingress::Column::NodeId.is_in(node_ids.iter().copied()))
-            .all(db)
+        let mut rows: HashMap<i32, node_public_ingress::Model> =
+            node_public_ingress::Entity::find()
+                .filter(node_public_ingress::Column::NodeId.is_in(node_ids.iter().copied()))
+                .all(db)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| (row.node_id, row))
+                .collect();
+        // ADR-115 D6: row 0 describes this machine only under the consent it
+        // answers. Withdrawing or changing the consent stops serving at once,
+        // while the row is deleted or replaced by the loop's next pass; a
+        // consent that cannot be read is taken as none.
+        let control_plane = temps_core::CONTROL_PLANE_NODE_ID;
+        if let Some(row) = rows.remove(&control_plane) {
+            let consent_at = temps_config::private_ingress::PrivateIngressService::new(
+                self.deps.db.clone(),
+                None,
+            )
+            .get()
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| (row.node_id, row))
-            .collect();
+            .inspect_err(|error| {
+                warn!(%error, "could not read the private ingress consent for node 0's status");
+            })
+            .ok()
+            .flatten()
+            .map(|consent| consent.updated_at);
+            if let Some(row) = current_control_plane_report(row, consent_at) {
+                rows.insert(control_plane, row);
+            }
+        }
         // ADR 065 D4: the Serve entries of the addresses served through
         // tailscaled.
         let entries: Vec<tailnet_serve_entries::Model> = if addresses
@@ -1439,7 +1468,10 @@ impl ReachabilityService {
         // ADR-115 D6: what the control plane runs, node 0 serves privately,
         // once the operator allowed it; no worker can.
         let mut private_workers = private_workers;
-        if audience.is_private() && gathered.deployed && !gathered.on_workers && !served_by_workers
+        if audience.is_private()
+            && gathered.deployed
+            && !gathered.some_on_workers
+            && !served_by_workers
         {
             private_workers = self
                 .control_plane_private_fact()
@@ -1489,6 +1521,7 @@ impl ReachabilityService {
             requested,
             served_by_workers,
             on_workers: gathered.on_workers,
+            some_on_workers: gathered.some_on_workers,
             attached_here,
             taken_elsewhere,
             platform_hosts: {
@@ -4063,6 +4096,19 @@ fn set_address_audience_on(
     active.private_service = Set(audience.private_service.clone().filter(|_| private));
 }
 
+/// Row 0, when it answers the consent given at `consent_at`; `None` without
+/// a consent, or when it was written for another one (an earlier consent
+/// whose report is not yet deleted or replaced), as serving under it has
+/// already stopped.
+pub fn current_control_plane_report(
+    row: node_public_ingress::Model,
+    consent_at: Option<chrono::DateTime<Utc>>,
+) -> Option<node_public_ingress::Model> {
+    let consent_at = consent_at?;
+    temps_core::private_ingress::report_answers_consent(row.listening.as_ref(), consent_at)
+        .then_some(row)
+}
+
 /// A worker in private mode as its last report describes it.
 /// How plans and statuses name the control plane serving a private address.
 pub const CONTROL_PLANE_PRIVATE_NAME: &str = "this machine";
@@ -4099,9 +4145,10 @@ pub fn control_plane_private_fact(
             tailscale: false,
             admit: None,
             error: Some(
-                "this machine has not applied the consent yet; it does within 15 seconds. If \
-                 it stays like this, the proxy runs in another process (`temps serve --role \
-                 console`), which cannot serve private addresses."
+                "this machine has not reported applying the consent yet; it reports as soon as \
+                 it serves it, before checking each address. If it stays like this, the proxy \
+                 runs in another process (`temps serve --role console`), which cannot serve \
+                 private addresses."
                     .to_string(),
             ),
         },
@@ -4177,8 +4224,9 @@ pub fn private_facts_of(
         // ADR-115 D6: the control plane has no `nodes` row; its row 0 is
         // there only while the operator lets it serve private addresses.
         (_, None) if control_plane => Err(format!(
-            "This machine no longer serves private addresses. Serve them again from this \
-             address's reachability plan in the console, or with \
+            "This machine does not serve private addresses under its current consent: it was \
+             withdrawn, or this machine has not reported applying a new one yet. Serve them \
+             again from this address's reachability plan in the console, or with \
              `{CONTROL_PLANE_PRIVATE_COMMAND}`."
         )),
         (None, _) if !control_plane => Err(format!("{worker} is no longer part of this cluster.")),
@@ -4622,7 +4670,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("has not applied"));
+                .contains("has not reported applying"));
         };
         // Written before B, about A.
         not_applied(
@@ -4676,6 +4724,80 @@ mod tests {
             ))
         )
         .is_none());
+    }
+
+    /// After consent is withdrawn or changed, serving stops at once while
+    /// the old row 0, with its matching listener and passing inside check,
+    /// is still in the table until the loop's next pass. The address status
+    /// must not read it as bound.
+    #[test]
+    fn node_0_status_trusts_only_the_report_of_the_current_consent() {
+        let at = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let old_consent = at("2026-11-24T09:00:00Z");
+        let new_consent = at("2026-11-24T10:00:00Z");
+        let row = node_public_ingress::Model {
+            node_id: temps_core::CONTROL_PLANE_NODE_ID,
+            listen_address: None,
+            http_port: 80,
+            https_port: 443,
+            public_address: None,
+            interfaces: None,
+            listening: Some(serde_json::json!({
+                "https": "10.8.0.1:443",
+                "admit": ["10.8.0.0/24"],
+                (temps_core::private_ingress::REPORT_CONSENT_AT_KEY): old_consent,
+            })),
+            mode: Some("private".into()),
+            last_check: None,
+            private_checks: Some(serde_json::json!([{
+                "address_id": "custom:1",
+                "listener": "10.8.0.1",
+                "outcome": "passed",
+                "message": "",
+                "received_at": old_consent,
+            }])),
+            tailscale: None,
+            checked_at: None,
+            created_at: old_consent,
+            updated_at: old_consent,
+        };
+        let binding = PrivateBinding {
+            address_id: "custom:1".into(),
+            range: Some("10.8.0.0/24".into()),
+            node_id: Some(temps_core::CONTROL_PLANE_NODE_ID),
+            listener: Some("10.8.0.1".into()),
+            via: None,
+            service: None,
+        };
+        let facts = |row: Option<&node_public_ingress::Model>| {
+            private_facts_of(
+                &binding,
+                temps_core::CONTROL_PLANE_NODE_ID,
+                None,
+                row,
+                old_consent,
+            )
+        };
+        // Under the consent it answers, the row says the address is bound.
+        let current = current_control_plane_report(row.clone(), Some(old_consent));
+        assert!(current.is_some());
+        assert_eq!(facts(current.as_ref()).bound, Ok(()));
+        // Withdrawn, or replaced by a newer consent: the row is not read.
+        for consent_at in [None, Some(new_consent)] {
+            let current = current_control_plane_report(row.clone(), consent_at);
+            assert!(current.is_none(), "{consent_at:?}");
+            let bound = facts(current.as_ref()).bound;
+            assert!(
+                bound
+                    .as_ref()
+                    .is_err_and(|e| e.contains("under its current consent")),
+                "{bound:?}"
+            );
+        }
     }
 
     fn run_row(journal: Value, steps: Value) -> reachability_runs::Model {

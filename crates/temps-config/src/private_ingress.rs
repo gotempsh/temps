@@ -121,6 +121,12 @@ pub struct PrivateIngressRequest {
     pub admit: Vec<String>,
     #[serde(default)]
     pub tailscale_serve: bool,
+    /// Only give consent where none exists: refused with a 409, changing
+    /// nothing, when one does. For a client that showed a plan made when
+    /// there was no consent, so it never replaces one given meanwhile (with
+    /// its own ranges) or recreates one withdrawn under a plan built on it.
+    #[serde(default)]
+    pub create_only: bool,
 }
 
 /// The consent and what the control plane made of it, as it last reported
@@ -220,6 +226,17 @@ pub enum PrivateIngressError {
     /// No process of this control plane applies a consent (ADR-115 D7).
     #[error("{SPLIT_ROLE_UNAVAILABLE}")]
     Unavailable,
+
+    /// `create_only` was asked and a consent exists (given at
+    /// `updated_at`, on `listen`): nothing was changed.
+    #[error(
+        "A private ingress consent on {listen} was given at {updated_at} and is kept; nothing was \
+         changed. Read it again and decide from it"
+    )]
+    ConsentExists {
+        listen: String,
+        updated_at: DateTime<Utc>,
+    },
 }
 
 /// Why node `0` serves no private address when its console and proxy run
@@ -331,20 +348,23 @@ impl PrivateIngressService {
             tailscale_serve: request.tailscale_serve,
             updated_at: Utc::now(),
         };
-        let before = self.write(Some(&after)).await?;
+        let before = self.write(Some(&after), request.create_only).await?;
         Ok((before, after))
     }
 
     /// Withdraw the consent. Returns what it was.
     pub async fn delete(&self) -> Result<Option<PrivateIngressConsent>, PrivateIngressError> {
-        self.write(None).await
+        self.write(None, false).await
     }
 
     /// Replace the consent key on the settings row, locked `FOR UPDATE`
-    /// inside a transaction; every other key is kept.
+    /// inside a transaction; every other key is kept. With `create_only`,
+    /// a consent already there is kept and the write refused, decided
+    /// under the same lock, so no write can land between the check and it.
     async fn write(
         &self,
         consent: Option<&PrivateIngressConsent>,
+        create_only: bool,
     ) -> Result<Option<PrivateIngressConsent>, PrivateIngressError> {
         let now = Utc::now();
         let value = consent.map(serde_json::to_value).transpose()?;
@@ -363,6 +383,13 @@ impl PrivateIngressService {
         let before = row
             .as_ref()
             .and_then(|r| consent_from_settings_document(&r.data));
+        if let (true, Some(existing)) = (create_only, &before) {
+            // Dropping the transaction rolls it back and releases the lock.
+            return Err(PrivateIngressError::ConsentExists {
+                listen: existing.listen.clone(),
+                updated_at: existing.updated_at,
+            });
+        }
         match (row, value) {
             (Some(existing), value) => {
                 let mut data = existing.data.clone();
@@ -605,6 +632,7 @@ mod tests {
                 listen: "10.8.0.1".into(),
                 admit: vec![],
                 tailscale_serve: false,
+                create_only: false,
             })
             .await
             .unwrap_err();
@@ -624,6 +652,7 @@ mod tests {
                 listen: "tailscale".into(),
                 admit: vec![],
                 tailscale_serve: true,
+                create_only: false,
             })
             .await
             .unwrap_err();
@@ -647,6 +676,7 @@ mod tests {
                 listen: "0.0.0.0".into(),
                 admit: vec![],
                 tailscale_serve: false,
+                create_only: false,
             })
             .await
             .unwrap_err();
@@ -657,6 +687,7 @@ mod tests {
                 listen: "10.8.0.1".into(),
                 admit: vec!["10.8.0.0/24".into(), "0.0.0.0/0".into()],
                 tailscale_serve: false,
+                create_only: false,
             })
             .await
             .unwrap_err();
@@ -696,6 +727,7 @@ mod tests {
                 listen: "TAILSCALE".into(),
                 admit: vec![" 100.64.0.7/10 ".into()],
                 tailscale_serve: false,
+                create_only: false,
             })
             .await
             .unwrap();
@@ -749,6 +781,70 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), runtime.changed())
             .await
             .expect("the loop is woken");
+    }
+
+    /// `create_only` keeps a consent given meanwhile, writing nothing and
+    /// leaving serving and the loop alone; where there is none it consents.
+    #[tokio::test]
+    async fn create_only_never_replaces_a_consent() {
+        let stored = settings_row(serde_json::json!({
+            "private_ingress": {"listen": "10.8.0.1", "admit": ["10.8.0.0/28"], "updated_at": "2026-11-24T10:00:00Z"},
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stored]])
+            .into_connection();
+        let runtime = temps_core::private_ingress::ControlPlanePrivateIngress::new();
+        let serving = temps_core::private_ingress::PrivateIngressServing::new(
+            "10.8.0.1".parse().unwrap(),
+            vec!["10.8.0.0/28".parse().unwrap()],
+        )
+        .unwrap();
+        runtime.set_serving(Some(serving.clone()));
+        let generation = runtime.consent_generation();
+        let service = PrivateIngressService::new(Arc::new(db), Some(runtime.clone()));
+        let error = service
+            .put(PrivateIngressRequest {
+                listen: "10.8.0.1".into(),
+                admit: vec![],
+                tailscale_serve: false,
+                create_only: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            PrivateIngressError::ConsentExists { listen, .. } if listen == "10.8.0.1"
+        ));
+        assert!(error.to_string().contains("nothing was changed"), "{error}");
+        // Nothing written: still served, and no pass was outdated.
+        assert_eq!(runtime.serving(), Some(serving));
+        assert_eq!(runtime.consent_generation(), generation);
+
+        // No consent yet: given.
+        let empty = settings_row(serde_json::json!({}));
+        let mut updated = empty.clone();
+        updated.data["private_ingress"] =
+            serde_json::json!({"listen": "10.8.0.1", "updated_at": "2026-11-24T10:00:00Z"});
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![empty]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .append_query_results([vec![updated]])
+            .into_connection();
+        let service = PrivateIngressService::new(Arc::new(db), Some(runtime));
+        let (before, after) = service
+            .put(PrivateIngressRequest {
+                listen: "10.8.0.1".into(),
+                admit: vec![],
+                tailscale_serve: false,
+                create_only: true,
+            })
+            .await
+            .unwrap();
+        assert!(before.is_none());
+        assert_eq!(after.listen, "10.8.0.1");
     }
 
     #[tokio::test]

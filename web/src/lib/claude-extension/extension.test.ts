@@ -65,7 +65,12 @@ describe('the Claude app extension', () => {
       'confirm_action',
       'temps_deploy_folder',
     ])
-    expect(manifest.long_description).toContain('approve')
+    // Claude asking before it runs a write tool is the approval: the
+    // extension does not promise one of its own.
+    expect(manifest.long_description).toContain(
+      'keep Claude asking you before it runs confirm_action or temps_deploy_folder'
+    )
+    expect(manifest.long_description).not.toContain('asks you itself')
   })
 
   test('deploying from this computer is limited to folders the user picks, none by default', () => {

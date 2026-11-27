@@ -25,6 +25,7 @@ interface Host {
 }
 interface Rule {
   base: string
+  regex: RegExp
 }
 interface Collected {
   files: { name: string }[]
@@ -187,6 +188,107 @@ describe('.gitignore', () => {
     expect(hit('oddn')).toBe(false)
   })
 
+  test('a ? is one byte of the name, as git reads it, so a wildcard covers a letter of two bytes', () => {
+    for (const ignoreCase of [false, true]) {
+      const rules = deploy.parseIgnore(
+        ['secret-??.txt', 'key-?.pem', 'carpeta-ñ/'].join('\n'),
+        '',
+        ignoreCase
+      )
+      const hit = (p: string, dir = false) => deploy.isIgnored(rules, p, dir)
+      // é and ñ are two bytes in UTF-8, € three.
+      expect(hit('secret-é.txt')).toBe(true)
+      expect(hit('nested/secret-é.txt')).toBe(true)
+      expect(hit('secret-ab.txt')).toBe(true)
+      expect(hit('secret-a.txt')).toBe(false)
+      expect(hit('secret-€.txt')).toBe(false)
+      expect(hit('key-é.pem')).toBe(false)
+      expect(hit('carpeta-ñ', true)).toBe(true)
+    }
+  })
+
+  test('without case, only ASCII letters are folded, as git folds them', () => {
+    const rules = deploy.parseIgnore(
+      ['Secret-É.txt', 'key[[:upper:]]'].join('\n'),
+      '',
+      true
+    )
+    const hit = (p: string) => deploy.isIgnored(rules, p, false)
+    expect(hit('SECRET-É.TXT')).toBe(true)
+    expect(hit('secret-É.txt')).toBe(true)
+    // É and é differ: git folds no letter outside ASCII.
+    expect(hit('secret-é.txt')).toBe(false)
+    expect(hit('keya')).toBe(true)
+    expect(hit('keyA')).toBe(true)
+  })
+
+  test('without case, a range keeps the endpoints it was written with', () => {
+    for (const ignoreCase of [false, true]) {
+      const rules = deploy.parseIgnore(
+        'private[A-z].txt\n[A-z].fixture',
+        '',
+        ignoreCase
+      )
+      const hit = (p: string) => deploy.isIgnored(rules, p, false)
+      // _ is between Z and a: inside [A-z], as git reads it.
+      expect(hit('private_.txt')).toBe(true)
+      expect(hit('_.fixture')).toBe(true)
+      expect(hit('privateq.txt')).toBe(true)
+      expect(hit('private-.txt')).toBe(false)
+      expect(hit('PRIVATE_.TXT')).toBe(ignoreCase)
+    }
+    const upper = deploy.parseIgnore('key[B-D]', '', true)
+    expect(deploy.isIgnored(upper, 'keyc', false)).toBe(true)
+    expect(deploy.isIgnored(upper, 'keyC', false)).toBe(true)
+    expect(deploy.isIgnored(upper, 'keye', false)).toBe(false)
+  })
+
+  test('a reversed range, an upper-case member or an unclosed bracket match as in git', () => {
+    // Each checked against git check-ignore, with core.ignoreCase off and on.
+    const cases: [string, string, boolean, boolean][] = [
+      // pattern, name, ignored with case, ignored without
+      ['[a-Z].fixture', 'a.fixture', true, true],
+      ['[a-Z].fixture', 'A.fixture', false, true],
+      ['[a-Z].fixture', 'b.fixture', false, false],
+      ['[Z-a].fixture', '_.fixture', true, true],
+      ['[Z-a].fixture', 'z.fixture', false, true],
+      ['[Z-a].fixture', 'Z.fixture', true, true],
+      ['[b-a].fixture', 'b.fixture', true, true],
+      ['[b-a].fixture', 'a.fixture', false, false],
+      // Without case git folds the name, not the bracket: [A] then matches
+      // neither A nor a, and [!A] both.
+      ['[A].fixture', 'A.fixture', true, false],
+      ['[!A].fixture', 'A.fixture', false, true],
+      ['[[:lower:]].fixture', 'A.fixture', false, true],
+      // A bracket never closed: git matches nothing with the pattern.
+      ['secret[b', 'secret[b', false, false],
+    ]
+    for (const [pattern, name, withCase, withoutCase] of cases) {
+      for (const ignoreCase of [false, true]) {
+        const rules = deploy.parseIgnore(pattern, '', ignoreCase)
+        expect([
+          pattern,
+          name,
+          ignoreCase,
+          deploy.isIgnored(rules, name, false),
+        ]).toEqual([
+          pattern,
+          name,
+          ignoreCase,
+          ignoreCase ? withoutCase : withCase,
+        ])
+      }
+    }
+  })
+
+  test('a negated bracket stays a short class, however many there are', () => {
+    const pattern = '[!a]'.repeat(128)
+    const [rule] = deploy.parseIgnore(pattern, '', true)
+    expect(rule.regex.source.length).toBeLessThan(128 * 40)
+    expect(deploy.isIgnored([rule], 'b'.repeat(128), false)).toBe(true)
+    expect(deploy.isIgnored([rule], `A${'b'.repeat(127)}`, false)).toBe(false)
+  })
+
   test('a bracket never matches a slash, and a hyphen first after ! is literal', () => {
     const hyphen = deploy.parseIgnore('credential[!-a].json', '')
     // [!-a] is "not - and not a": 1 is excluded, as git excludes it.
@@ -205,6 +307,33 @@ describe('.gitignore', () => {
     expect(hit('a/b')).toBe(false)
     expect(hit('x/z')).toBe(false)
     expect(hit('xqz')).toBe(true)
+  })
+
+  test('a run of more than two stars reads as ** across folders, as in git', () => {
+    // Each checked against git check-ignore.
+    const rules = deploy.parseIgnore(
+      ['private/***/credentials.txt', 'a***b', 'cache/****'].join('\n'),
+      ''
+    )
+    const hit = (p: string) => deploy.isIgnored(rules, p, false)
+    expect(hit('private/a/b/credentials.txt')).toBe(true)
+    expect(hit('private/credentials.txt')).toBe(true)
+    expect(hit('aqb')).toBe(true)
+    expect(hit('aq/b')).toBe(false)
+    expect(hit('cache/x/y.bin')).toBe(true)
+  })
+
+  test('a name with a newline in it is matched by ** as git matches it', () => {
+    // Each checked against git check-ignore.
+    const rules = deploy.parseIgnore(
+      ['cache/***', 'logs/**', '**/secret.txt'].join('\n'),
+      ''
+    )
+    const hit = (p: string) => deploy.isIgnored(rules, p, false)
+    expect(hit('cache/a\nb')).toBe(true)
+    expect(hit('logs/x\ny/z')).toBe(true)
+    expect(hit('q\nr/secret.txt')).toBe(true)
+    expect(hit('other\nname')).toBe(false)
   })
 
   test('patterns match the way git matches them', () => {
@@ -227,6 +356,16 @@ describe('.gitignore', () => {
     expect(ignored('secret12.txt')).toBe(false)
     expect(ignored('#notes')).toBe(true)
     expect(ignored('src/index.ts')).toBe(false)
+  })
+
+  test('a byte order mark does not hide the first rule', () => {
+    const rules = deploy.parseIgnore(
+      '\uFEFFscratch-private-data\n*.log\n',
+      '',
+      false
+    )
+    expect(deploy.isIgnored(rules, 'scratch-private-data', false)).toBe(true)
+    expect(deploy.isIgnored(rules, 'debug.log', false)).toBe(true)
   })
 
   test('where file names have no case, a pattern matches whatever the case', () => {
@@ -587,6 +726,25 @@ describe('a folder that changes while it is packed', () => {
   })
 })
 
+describe('registry settings whatever their case', () => {
+  const root = join(SCRATCH, 'npmrc-case')
+  tree(root, {
+    'package.json': '{}',
+    '.NPMRC': '//registry.npmjs.org/:_authToken=npm_secret\n',
+    '.Yarnrc.yml': 'npmAuthToken: "yarn_secret"\n',
+  })
+
+  test('a credential in .NPMRC is left out like one in .npmrc', async () => {
+    const { zip, packed } = await deploy.packZip(
+      await deploy.collectFiles(root)
+    )
+    expect(packed).toEqual(['package.json'])
+    const all = Buffer.from(zip).toString('latin1')
+    expect(all).not.toContain('npm_secret')
+    expect(all).not.toContain('yarn_secret')
+  })
+})
+
 describe('a linked worktree', () => {
   const worktree = join(SCRATCH, 'worktree')
   tree(worktree, {
@@ -604,25 +762,52 @@ describe('a linked worktree', () => {
 describe('starting the deployment', () => {
   const root = join(SCRATCH, 'deployable')
   tree(root, { 'package.json': '{}' })
-  const answering = (text: string) => async () => ({
-    status: 202,
-    headers: { 'content-type': 'application/json' },
-    text,
-  })
+  const json = { 'content-type': 'application/json' }
+  /** Temps with the MCP server on (or off), answering the deploy with `text`. */
+  const temps = (text: string, mcpOn = true) => {
+    const calls: string[] = []
+    const api = async (method: string, path: string) => {
+      calls.push(`${method} ${path}`)
+      if (path === '/mcp/tools') {
+        return mcpOn
+          ? { status: 200, headers: json, text: '{"groups":[]}' }
+          : {
+              status: 404,
+              headers: { 'content-type': 'application/problem+json' },
+              text: '{"title":"MCP Server Disabled"}',
+            }
+      }
+      return { status: 202, headers: json, text }
+    }
+    return { api, calls }
+  }
   const config = { folders: [root], origin: 'https://temps.example' }
   const args = { path: root, project_id: 4, environment_id: 7 }
+  test('one call deploys the folder and names the deployment', async () => {
+    const { api, calls } = temps('{"id":42}')
+    const text = await deploy.deployFolder(config, args, api)
+    expect(text).toContain('Deployment 42 of project 4')
+    expect(calls).toEqual([
+      'GET /mcp/tools',
+      'POST /api/projects/4/environments/7/deploy/source',
+    ])
+  })
+
+  test('with the MCP server turned off nothing is deployed', async () => {
+    const off = temps('{"id":42}', false)
+    await expect(deploy.deployFolder(config, args, off.api)).rejects.toThrow(
+      'MCP server is turned off'
+    )
+    expect(off.calls).toEqual(['GET /mcp/tools'])
+  })
 
   test('an answer naming no deployment is a failure, not a started build', async () => {
     for (const text of ['{}', '{"id":null}', '{"state":"pending"}']) {
-      await expect(
-        deploy.deployFolder(config, args, answering(text))
-      ).rejects.toThrow('did not say which deployment it started')
+      const { api } = temps(text)
+      await expect(deploy.deployFolder(config, args, api)).rejects.toThrow(
+        'did not say which deployment it started'
+      )
     }
-  })
-
-  test('an answer naming the deployment says how to follow it', async () => {
-    const text = await deploy.deployFolder(config, args, answering('{"id":42}'))
-    expect(text).toContain('Deployment 42 of project 4')
   })
 })
 

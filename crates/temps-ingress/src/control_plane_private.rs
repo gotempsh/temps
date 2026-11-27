@@ -322,10 +322,30 @@ impl CheckRotation {
     }
 
     /// Whether a hostname has never been checked.
+    #[cfg(test)]
     fn has_unchecked(&self, hosts: &[(String, PrivateAddress)]) -> bool {
         hosts
             .iter()
             .any(|(host, _)| !self.checked_at.contains_key(host))
+    }
+
+    /// The hostnames due a check: never checked, or checked `interval` ago
+    /// or longer. Each by its own result's age, so a batch checked late
+    /// never makes the others wait a further interval.
+    fn due(
+        &self,
+        hosts: &[(String, PrivateAddress)],
+        interval: Duration,
+    ) -> Vec<(String, PrivateAddress)> {
+        hosts
+            .iter()
+            .filter(|(host, _)| {
+                self.checked_at
+                    .get(host)
+                    .is_none_or(|at| at.elapsed() >= interval)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The next `limit` hostnames to check: never checked first, then the
@@ -366,6 +386,20 @@ impl CheckRotation {
             result.checked_at = Some(at);
             self.results.insert(result.hostname.clone(), result);
         }
+        // Only as many as a report carries are kept: past that, the ones
+        // checked longest ago go (each host's turn is still remembered).
+        if self.results.len() > MAX_PRIVATE_CHECKS {
+            let mut by_age: Vec<(Option<Instant>, String)> = self
+                .results
+                .keys()
+                .map(|host| (self.checked_at.get(host).copied(), host.clone()))
+                .collect();
+            by_age.sort();
+            let excess = self.results.len() - MAX_PRIVATE_CHECKS;
+            for (_, host) in by_age.into_iter().take(excess) {
+                self.results.remove(&host);
+            }
+        }
     }
 
     /// The latest results the store keeps, the most recently checked first.
@@ -400,11 +434,17 @@ struct LoopState {
     last_report: Option<ListenerReport>,
     last_hosts: Vec<(String, PrivateAddress)>,
     checks: CheckRotation,
-    checked_at: Option<Instant>,
+    /// The consent as last read, to recheck what is served against while
+    /// the database cannot be read.
+    last_input: Option<ConsentInput>,
     /// When the consent last written about was given: a new consent is
     /// always answered with a fresh report, even an identical one, since
     /// the status reads only reports made after the consent.
     reported_consent_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether node 0's report is known to be gone: cleared once on start
+    /// and on each change to serving nothing, and again only after a
+    /// report was written or a clear failed, not every poll.
+    cleared: bool,
 }
 
 impl ControlPlanePrivateIngressLoop {
@@ -438,9 +478,19 @@ impl ControlPlanePrivateIngressLoop {
             }
             let mut state = LoopState::default();
             loop {
+                // A stop during a pass (a slow batch of inside checks) ends
+                // it at once: nothing more is checked or reported.
+                let pass = tokio::select! {
+                    pass = this.sync(&mut state) => pass,
+                    _ = shutdown.notified() => {
+                        this.runtime.set_serving(None);
+                        debug!("control-plane private ingress stopped during a pass");
+                        return;
+                    }
+                };
                 // A consent change during the inside checks ends the pass
                 // early; sync again at once rather than after the poll.
-                if this.sync(&mut state).await == Pass::Interrupted {
+                if pass == Pass::Interrupted {
                     continue;
                 }
                 tokio::select! {
@@ -456,27 +506,35 @@ impl ControlPlanePrivateIngressLoop {
         })
     }
 
-    /// With the consent unreadable, stop serving what this machine no
-    /// longer allows; never start serving anything.
-    async fn recheck_without_consent(&self, generation: u64) {
-        let Some(serving) = self.runtime.serving() else {
-            return;
-        };
+    /// Why what is served now is no longer what `input` decides on this
+    /// machine as it is now (its addresses and their prefixes, Docker's
+    /// networks), or `None` while it still is, or nothing is served.
+    async fn serving_drifted(&self, input: Option<ConsentInput>) -> Option<String> {
+        let serving = self.runtime.serving()?;
         let own = self.addresses.addresses();
-        let why = if !own.iter().any(|n| n.address == serving.address) {
-            Some(format!(
-                "{} is no longer an address of this machine",
-                serving.address
-            ))
-        } else {
-            match self.containers.networks().await {
-                None => Some(CONTAINER_NETWORKS_UNKNOWN.to_string()),
-                Some(docker) => {
-                    container_overlap(&serving.admit, &all_container_networks(&own, docker))
-                }
-            }
-        };
-        if let Some(why) = why {
+        let containers = self
+            .containers
+            .networks()
+            .await
+            .map(|docker| all_container_networks(&own, docker));
+        let decision = decide(input, &own, containers.as_deref(), &self.runtime);
+        if decision.serving.as_ref() == Some(&serving) {
+            return None;
+        }
+        Some(
+            decision
+                .report
+                .and_then(|report| report.error)
+                .unwrap_or_else(|| "this machine's private networks changed".to_string()),
+        )
+    }
+
+    /// With the consent unreadable, stop serving once the last consent read
+    /// no longer decides it on this machine (a narrowed subnet, an
+    /// overlapping container network, Docker that cannot be listed, an
+    /// address gone); never start or widen serving.
+    async fn recheck_without_consent(&self, state: &LoopState, generation: u64) {
+        if let Some(why) = self.serving_drifted(state.last_input.clone()).await {
             if self.runtime.set_serving_for(generation, None) {
                 warn!(reason = %why, "stopped serving private addresses");
             }
@@ -497,7 +555,7 @@ impl ControlPlanePrivateIngressLoop {
                 // admitted range, Docker that cannot be listed, or an
                 // address the machine no longer has stops serving.
                 warn!(%error, "could not read the private ingress consent; keeping the last state while it is safe");
-                self.recheck_without_consent(generation).await;
+                self.recheck_without_consent(state, generation).await;
                 return Pass::Done;
             }
         };
@@ -510,6 +568,7 @@ impl ControlPlanePrivateIngressLoop {
         if consent.is_some() && input.is_none() {
             warn!("the stored private ingress consent names an address or range this version refuses; serving nothing");
         }
+        state.last_input = input.clone();
         let own = self.addresses.addresses();
         let listed = self.containers.networks().await;
         if listed.is_none() {
@@ -518,7 +577,7 @@ impl ControlPlanePrivateIngressLoop {
         let containers = listed.map(|docker| all_container_networks(&own, docker));
         self.runtime
             .set_networks(offered_networks(&own, containers.as_deref()));
-        let decision = decide(input, &own, containers.as_deref(), &self.runtime);
+        let decision = decide(input.clone(), &own, containers.as_deref(), &self.runtime);
         let before = self.runtime.serving();
         if !self
             .runtime
@@ -543,45 +602,73 @@ impl ControlPlanePrivateIngressLoop {
             if self.runtime.consent_generation() != generation {
                 return Pass::Interrupted;
             }
-            if let Err(error) = self.clear_report().await {
-                warn!(%error, "could not clear node 0's private ingress report");
+            if !state.cleared {
+                match self.clear_report().await {
+                    Ok(()) => state.cleared = true,
+                    Err(error) => warn!(%error, "could not clear node 0's private ingress report"),
+                }
             }
             return Pass::Done;
         };
 
-        // Inside checks (ADR 064 D7): after the addresses change, else
-        // every CHECK_INTERVAL, and only while something is served.
+        // Inside checks (ADR 064 D7), only while something is served: every
+        // hostname again once its own result is CHECK_INTERVAL old, and all
+        // of them after the addresses change. More due than one pass checks:
+        // the rest go on the next passes, POLL_INTERVAL apart.
         let mut hosts = self.route_table.control_plane_private_hosts();
         hosts.sort_by(|a, b| a.0.cmp(&b.0));
         state.checks.retain(&hosts);
-        // More hostnames than one pass checks: the rest are checked on the
-        // next passes, not after CHECK_INTERVAL.
-        let due = state
-            .checked_at
-            .is_none_or(|at| at.elapsed() >= CHECK_INTERVAL)
-            || hosts != state.last_hosts
-            || state.checks.has_unchecked(&hosts);
+        let due = if hosts != state.last_hosts {
+            hosts.clone()
+        } else {
+            state.checks.due(&hosts, CHECK_INTERVAL)
+        };
+        let consent_at = consent.as_ref().map(|c| c.updated_at);
         let mut ran_checks = false;
-        if decision.serving.is_some() && due {
+        if decision.serving.is_some() && !due.is_empty() {
             ran_checks = true;
-            let batch = state.checks.next(&hosts, CHECKS_PER_PASS);
-            let results = if batch.is_empty() {
-                Vec::new()
-            } else {
-                // Up to one DNS timeout per host: a withdrawn or narrowed
-                // consent must not wait for all of them. The checks are of
-                // a decision that no longer holds, so they are dropped.
+            // A consent served for the first time is reported before the
+            // checks, which may take minutes: until then the status reads
+            // the address as not served under it.
+            if state.reported_consent_at != consent_at {
+                let mut applied = report.clone();
+                applied.private_checks = state.checks.report();
+                if self.publish(state, applied, consent_at, generation).await == Pass::Interrupted {
+                    return Pass::Interrupted;
+                }
+            }
+            let batch = state.checks.next(&due, CHECKS_PER_PASS);
+            // Up to one DNS timeout per host: a withdrawn or narrowed
+            // consent must not wait for all of them, and neither must a
+            // change on this machine (a container network that now
+            // overlaps, a narrowed subnet), which is looked for every
+            // POLL_INTERVAL meanwhile. The checks are of a decision that no
+            // longer holds, so they are dropped and the next pass decides
+            // again at once.
+            let checks = self.checker.check(batch.clone());
+            tokio::pin!(checks);
+            let results = loop {
                 tokio::select! {
-                    checks = self.checker.check(batch.clone()) => checks,
+                    checks = &mut checks => break checks,
                     _ = self.runtime.changed() => {
                         debug!("the private ingress consent changed during the inside checks; syncing again");
                         return Pass::Interrupted;
+                    }
+                    _ = tokio::time::sleep(POLL_INTERVAL) => {
+                        if let Some(why) = self.serving_drifted(input.clone()).await {
+                            // Stop now: what is served is no longer safe,
+                            // and the next pass waits on the database and
+                            // Docker before it decides again.
+                            if self.runtime.set_serving_for(generation, None) {
+                                warn!(reason = %why, "this machine changed during the inside checks; stopped serving private addresses until the next pass decides again");
+                            }
+                            return Pass::Interrupted;
+                        }
                     }
                 }
             };
             state.checks.record(&batch, results, Instant::now());
             state.last_hosts = hosts;
-            state.checked_at = Some(Instant::now());
         } else if decision.serving.is_none() {
             state.checks.clear();
         }
@@ -589,10 +676,20 @@ impl ControlPlanePrivateIngressLoop {
 
         // Written when it changes, with every fresh check, and once for
         // every new consent.
-        let consent_at = consent.as_ref().map(|c| c.updated_at);
         if !must_write(state, &report, ran_checks, consent_at) {
             return Pass::Done;
         }
+        self.publish(state, report, consent_at, generation).await
+    }
+
+    /// Write node 0's report, stamped with the consent it answers.
+    async fn publish(
+        &self,
+        state: &mut LoopState,
+        report: ListenerReport,
+        consent_at: Option<chrono::DateTime<chrono::Utc>>,
+        generation: u64,
+    ) -> Pass {
         // Not a report of an outdated consent. One written in the instant
         // after this check is still stamped with the consent it answers,
         // which the planner and the status compare with the consent now.
@@ -607,6 +704,7 @@ impl ControlPlanePrivateIngressLoop {
             Ok(()) => {
                 state.last_report = Some(report);
                 state.reported_consent_at = consent_at;
+                state.cleared = false;
             }
             Err(error) => warn!(%error, "could not write node 0's private ingress report"),
         }
@@ -776,55 +874,141 @@ mod tests {
         }
     }
 
+    /// This machine's networks as given.
+    struct Own(Vec<LocalNetwork>);
+    impl LocalAddresses for Own {
+        fn addresses(&self) -> Vec<LocalNetwork> {
+            self.0.clone()
+        }
+    }
+
+    fn unreadable_db() -> DatabaseConnection {
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
+            .into_connection()
+    }
+
     /// A consent the database cannot read keeps the last serving only while
-    /// this machine still allows it, and never starts serving.
+    /// the last consent read still decides it on this machine, and never
+    /// starts or widens serving.
     #[tokio::test]
     async fn an_unreadable_consent_keeps_serving_only_what_is_still_safe() {
         let overlapping = vec![("new-net".to_string(), "10.8.0.0/16".parse().unwrap())];
         let apart = vec![("app-net".to_string(), "10.20.0.0/16".parse().unwrap())];
-        for (listed, address, kept) in [
-            (Some(apart.clone()), "10.8.0.1", true),
-            (Some(overlapping), "10.8.0.1", false),
-            (None, "10.8.0.1", false),
+        // wg0 narrowed from /24 to /28 while the database was down.
+        let narrowed: Vec<LocalNetwork> = own()
+            .into_iter()
+            .map(|n| {
+                if n.interface == "wg0" {
+                    LocalNetwork { prefix: 28, ..n }
+                } else {
+                    n
+                }
+            })
+            .collect();
+        let at = |address: &str| PrivateListen::Address(address.parse().unwrap());
+        for (machine, listed, listen, admit, kept) in [
+            (
+                own(),
+                Some(apart.clone()),
+                at("10.8.0.1"),
+                vec!["10.8.0.0/24"],
+                true,
+            ),
+            // The default admit, from wg0's prefix, still /24.
+            (own(), Some(apart.clone()), at("10.8.0.1"), vec![], true),
+            (
+                own(),
+                Some(overlapping),
+                at("10.8.0.1"),
+                vec!["10.8.0.0/24"],
+                false,
+            ),
+            (own(), None, at("10.8.0.1"), vec!["10.8.0.0/24"], false),
+            // The default admit is now the /28: the /24 is no longer consented.
+            (narrowed, Some(apart.clone()), at("10.8.0.1"), vec![], false),
             // An address this machine no longer has.
-            (Some(apart), "10.9.0.1", false),
+            (
+                own(),
+                Some(apart.clone()),
+                at("10.9.0.1"),
+                vec!["10.8.0.0/24"],
+                false,
+            ),
         ] {
             let runtime = wildcard();
             let serving = PrivateIngressServing::new(
-                address.parse().unwrap(),
+                "10.8.0.1".parse().unwrap(),
                 vec!["10.8.0.0/24".parse().unwrap()],
             )
             .unwrap();
             runtime.set_serving(Some(serving.clone()));
-            let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-                .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
-                .into_connection();
             let pass_loop = ControlPlanePrivateIngressLoop::new(
-                Arc::new(db),
+                Arc::new(unreadable_db()),
+                Arc::clone(&runtime),
+                Arc::new(CachedPeerTable::new(Arc::new(
+                    DatabaseConnection::Disconnected,
+                ))),
+                Arc::new(Own(machine)),
+                Arc::new(Listed(listed.clone())),
+                Arc::new(Hanging(Arc::new(Notify::new()))),
+            );
+            let mut state = LoopState {
+                last_input: consent(listen, &admit),
+                ..LoopState::default()
+            };
+            assert_eq!(pass_loop.sync(&mut state).await, Pass::Done);
+            assert_eq!(
+                runtime.serving(),
+                kept.then_some(serving),
+                "{listed:?} {listen:?} {admit:?}"
+            );
+        }
+
+        // Nothing served before, or no consent ever read: nothing starts.
+        for last_input in [
+            None,
+            consent(PrivateListen::Address("10.8.0.1".parse().unwrap()), &[]),
+        ] {
+            let runtime = wildcard();
+            let pass_loop = ControlPlanePrivateIngressLoop::new(
+                Arc::new(unreadable_db()),
                 Arc::clone(&runtime),
                 Arc::new(CachedPeerTable::new(Arc::new(
                     DatabaseConnection::Disconnected,
                 ))),
                 Arc::new(Machine),
-                Arc::new(Listed(listed.clone())),
+                Arc::new(Listed(Some(Vec::new()))),
                 Arc::new(Hanging(Arc::new(Notify::new()))),
             );
-            let mut state = LoopState::default();
-            assert_eq!(pass_loop.sync(&mut state).await, Pass::Done);
-            assert_eq!(
-                runtime.serving(),
-                kept.then_some(serving),
-                "{listed:?} at {address}"
-            );
+            pass_loop
+                .sync(&mut LoopState {
+                    last_input,
+                    ..LoopState::default()
+                })
+                .await;
+            assert_eq!(runtime.serving(), None);
         }
+    }
 
-        // Nothing served before: an unreadable consent starts nothing.
+    /// With no consent, node 0's report is cleared on the first pass, again
+    /// after a clear failed, and not on every poll after that.
+    #[tokio::test]
+    async fn with_no_consent_the_report_is_cleared_once_and_a_failed_clear_again() {
+        let no_consent = Vec::<temps_entities::settings::Model>::new;
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([no_consent(), no_consent(), no_consent(), no_consent()])
+                .append_exec_errors([sea_orm::DbErr::Custom("database unavailable".into())])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
         let runtime = wildcard();
-        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
-            .into_connection();
         let pass_loop = ControlPlanePrivateIngressLoop::new(
-            Arc::new(db),
+            Arc::clone(&db),
             Arc::clone(&runtime),
             Arc::new(CachedPeerTable::new(Arc::new(
                 DatabaseConnection::Disconnected,
@@ -833,8 +1017,165 @@ mod tests {
             Arc::new(Listed(Some(Vec::new()))),
             Arc::new(Hanging(Arc::new(Notify::new()))),
         );
-        pass_loop.sync(&mut LoopState::default()).await;
+        let mut state = LoopState::default();
+        for _ in 0..4 {
+            assert_eq!(pass_loop.sync(&mut state).await, Pass::Done);
+        }
+        assert!(state.cleared);
+        drop(pass_loop);
+        let log = Arc::try_unwrap(db)
+            .expect("only the test holds the database")
+            .into_transaction_log();
+        let deletes = log
+            .iter()
+            .filter(|t| format!("{t:?}").contains("DELETE"))
+            .count();
+        assert_eq!(deletes, 2, "the failed clear once more, then none: {log:?}");
+    }
+
+    /// Docker's networks, which change after the first look.
+    struct Changing {
+        calls: std::sync::atomic::AtomicUsize,
+        later: Vec<(String, IpNet)>,
+    }
+    #[async_trait]
+    impl ContainerNetworks for Changing {
+        async fn networks(&self) -> Option<Vec<(String, IpNet)>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(if call == 0 {
+                Vec::new()
+            } else {
+                self.later.clone()
+            })
+        }
+    }
+
+    /// A container network that starts overlapping the admitted range while
+    /// slow inside checks run is noticed within a poll interval: the pass
+    /// ends without waiting for the checks, and the next one decides again.
+    #[tokio::test(start_paused = true)]
+    async fn a_network_change_during_slow_inside_checks_ends_the_pass() {
+        let runtime = wildcard();
+        let started = Arc::new(Notify::new());
+        let mut pass_loop = pass_loop(&runtime, Containers(None), Arc::clone(&started));
+        Arc::get_mut(&mut pass_loop)
+            .expect("only this test holds it")
+            .containers = Arc::new(Changing {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            later: vec![("new-net".into(), "10.8.0.0/16".parse().unwrap())],
+        });
+        tokio::time::timeout(Duration::from_secs(1), runtime.changed())
+            .await
+            .expect("the listeners woke the loop");
+        let mut state = LoopState::default();
+        let pass = tokio::time::timeout(POLL_INTERVAL * 3, pass_loop.sync(&mut state))
+            .await
+            .expect("the pass ends within a poll interval, not after the checks");
+        assert_eq!(pass, Pass::Interrupted);
+        // Stopped at once, not once the next pass has read the database
+        // and Docker again.
         assert_eq!(runtime.serving(), None);
+        // The next pass serves nothing either: the range overlaps a
+        // container network.
+        pass_loop.sync(&mut state).await;
+        assert_eq!(runtime.serving(), None);
+    }
+
+    /// A stop while the inside checks run ends the loop at once: it does not
+    /// wait for the batch, nor serve or report anything after it.
+    #[tokio::test]
+    async fn a_stop_during_the_inside_checks_ends_the_loop_at_once() {
+        let runtime = wildcard();
+        let started = Arc::new(Notify::new());
+        let settings = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({
+                "private_ingress": {"listen": "10.8.0.1", "updated_at": "2026-11-26T10:00:00Z"}
+            }),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![settings]])
+            .append_query_results([Vec::<temps_entities::node_public_ingress::Model>::new()])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let mut pass_loop = pass_loop(&runtime, Containers(None), Arc::clone(&started));
+        let only = Arc::get_mut(&mut pass_loop).expect("only this test holds it");
+        only.db = Arc::clone(&db);
+        only.consent = PrivateIngressService::new(db, None);
+        // The wake-up the proxy's listeners left, which would otherwise end
+        // the first pass before its checks.
+        tokio::time::timeout(Duration::from_secs(1), runtime.changed())
+            .await
+            .expect("the listeners woke the loop");
+        let shutdown = Arc::new(Notify::new());
+        let task = pass_loop.start(Arc::clone(&shutdown));
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("the inside checks started");
+        shutdown.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop ends without waiting for the checks")
+            .expect("the loop did not panic");
+        assert_eq!(runtime.serving(), None);
+    }
+
+    /// A new consent is reported as applied before the inside checks, which
+    /// can take minutes; the status otherwise says it is not served.
+    #[tokio::test]
+    async fn a_new_consent_is_reported_before_its_inside_checks() {
+        let runtime = wildcard();
+        let started = Arc::new(Notify::new());
+        let settings = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({
+                "private_ingress": {"listen": "10.8.0.1", "updated_at": "2026-11-26T10:00:00Z"}
+            }),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![settings]])
+            .append_query_results([Vec::<temps_entities::node_public_ingress::Model>::new()])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let mut pass_loop = pass_loop(&runtime, Containers(None), Arc::clone(&started));
+        let only = Arc::get_mut(&mut pass_loop).expect("only this test holds it");
+        only.db = Arc::clone(&db);
+        only.consent = PrivateIngressService::new(db, None);
+        tokio::time::timeout(Duration::from_secs(1), runtime.changed())
+            .await
+            .expect("the listeners woke the loop");
+        let mut state = LoopState::default();
+        let end_checks = async {
+            started.notified().await;
+            runtime.notify_changed();
+        };
+        let (pass, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(pass_loop.sync(&mut state), end_checks)
+        })
+        .await
+        .expect("the pass ends without waiting for the checks");
+        assert_eq!(pass, Pass::Interrupted);
+        let at: chrono::DateTime<chrono::Utc> = "2026-11-26T10:00:00Z".parse().unwrap();
+        assert_eq!(
+            state.reported_consent_at,
+            Some(at),
+            "reported before the checks"
+        );
+        let report = state.last_report.expect("a report was written");
+        assert!(report.https.is_some());
+        assert!(report.private_checks.is_empty(), "no check result yet");
     }
 
     /// A consent change while the inside checks are pending ends the pass
@@ -860,6 +1201,8 @@ mod tests {
         .await
         .expect("the pass ends without waiting for the checks");
         assert_eq!(pass, Pass::Interrupted);
+        // Nothing of the checks is reported (and this mock database takes
+        // no write of the consent before them).
         assert!(state.last_report.is_none(), "nothing is reported of it");
     }
 
@@ -1230,6 +1573,27 @@ mod tests {
         assert_eq!(rotation.report().len(), 10);
     }
 
+    /// Each hostname is due by its own result's age: a batch checked a
+    /// whole interval ago is due, one just checked is not, and one never
+    /// checked always is.
+    #[test]
+    fn each_hostname_is_due_by_the_age_of_its_own_result() {
+        let hosts: Vec<_> = (0..3).map(address).collect();
+        let mut rotation = CheckRotation::default();
+        let now = Instant::now();
+        let Some(long_ago) = now.checked_sub(CHECK_INTERVAL + Duration::from_secs(1)) else {
+            return;
+        };
+        rotation.record(&hosts[..1], vec![passed(&hosts[0].0)], long_ago);
+        rotation.record(&hosts[1..2], vec![passed(&hosts[1].0)], now);
+        let due: Vec<String> = rotation
+            .due(&hosts, CHECK_INTERVAL)
+            .into_iter()
+            .map(|(host, _)| host)
+            .collect();
+        assert_eq!(due, vec![hosts[0].0.clone(), hosts[2].0.clone()]);
+    }
+
     #[test]
     fn the_report_holds_only_as_many_results_as_the_store_keeps() {
         let hosts: Vec<(String, PrivateAddress)> =
@@ -1244,6 +1608,8 @@ mod tests {
             new.iter().map(|(h, _)| passed(h)).collect(),
             start + Duration::from_secs(1),
         );
+        // The store itself keeps no more than a report carries.
+        assert_eq!(rotation.results.len(), MAX_PRIVATE_CHECKS);
         let report = rotation.report();
         assert_eq!(report.len(), MAX_PRIVATE_CHECKS);
         assert!(report

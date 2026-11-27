@@ -50,6 +50,9 @@ Examples:
 
   # Let the server generate a random secret (32 bytes, hex); it is never shown
   $ temps environments vars set SESSION_SECRET --generate-secret --environments production
+
+  # Laravel's APP_KEY gets the base64: key its cipher needs
+  $ temps environments vars set APP_KEY --generate-secret --environments production
 `
 
 export function registerEnvironmentsCommands(program: Command): void {
@@ -122,8 +125,8 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--update', 'Update existing variable instead of creating new')
     .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
     .option(
-      '--generate-secret [bytes]',
-      'Have the server generate a random secret of this many bytes (16 to 64, 32 by default), stored as a secret and never shown; for a new variable, instead of a value'
+      '--generate-secret [bytes|laravel]',
+      'Have the server generate a random secret of this many bytes (16 to 64, 32 by default, hex), stored as a secret and never shown; for a new variable, instead of a value. `laravel`, the default for APP_KEY, makes a Laravel application key (base64:, 32 bytes)'
     )
   addValueSourceOptions(setVar, { what: 'the value' })
   setVar
@@ -612,23 +615,33 @@ export interface SetEnvVarOptions {
   valueFile?: string
   valueStdin?: boolean
   trimTrailingNewline?: boolean
-  /** `--generate-secret [bytes]`: `true` without a byte count. */
+  /** `--generate-secret [bytes|laravel]`: `true` without a byte count. */
   generateSecret?: boolean | string
 }
 
+/** Laravel reads its application key from this variable, in its own format. */
+const LARAVEL_APP_KEY = 'APP_KEY'
+
 /**
- * The API's `generate` request for `--generate-secret [bytes]`, or
+ * The API's `generate` request for `--generate-secret [bytes|laravel]`, or
  * `undefined` without the flag. The server makes the value, so it is never
- * typed, piped or printed. Throws when the byte count is not 16 to 64.
+ * typed, piped or printed. `laravel`, and the bare flag on `APP_KEY`, ask
+ * for a Laravel application key: 32 bytes behind `base64:`, the only form
+ * its default cipher takes (a 64-character hex string it would refuse). A
+ * byte count always asks for hex. Throws when the byte count is not 16 to 64.
  */
 export function generateSecretRequest(
-  option: boolean | string | undefined
-): { kind: 'secret'; bytes?: number } | undefined {
+  option: boolean | string | undefined,
+  key = ''
+): { kind: 'secret' | 'laravel_app_key'; bytes?: number } | undefined {
   if (option === undefined || option === false) return undefined
+  if (option === 'laravel' || (option === true && key === LARAVEL_APP_KEY)) {
+    return { kind: 'laravel_app_key' }
+  }
   if (option === true) return { kind: 'secret' }
   const bytes = Number(option)
   if (!Number.isInteger(bytes) || bytes < 16 || bytes > 64) {
-    throw new Error(`--generate-secret takes a byte count from 16 to 64, not "${option}"`)
+    throw new Error(`--generate-secret takes a byte count from 16 to 64, or laravel, not "${option}"`)
   }
   return { kind: 'secret', bytes }
 }
@@ -663,7 +676,7 @@ async function setEnvVar(
 ): Promise<void> {
   // Read the value before anything else, so a bad file or an empty pipe
   // fails fast, and stdin is consumed before any prompt could want it.
-  const generate = generateSecretRequest(options.generateSecret)
+  const generate = generateSecretRequest(options.generateSecret, key)
   const sourcedValue = generate ? undefined : await resolveSetVarValue(key, value, options)
   if (generate && (value !== undefined || options.valueFile || options.valueStdin)) {
     throw new Error(`--generate-secret makes the value for ${key}: do not also pass one`)

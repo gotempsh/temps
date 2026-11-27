@@ -142,15 +142,25 @@ async function privateAction(options: PrivateOptions): Promise<void> {
       const { error } = await deletePrivateIngress({ client })
       if (error) throw new Error(getErrorMessage(error))
     })
+    if (options.json) {
+      json({ consent: null })
+      return
+    }
     success('This machine no longer serves private addresses')
     return
   }
 
   if (intent.kind === 'serve') {
-    await withSpinner('Storing consent...', async () => {
-      const { error } = await putPrivateIngress({ client, body: intent.request })
+    const consent = await withSpinner('Storing consent...', async () => {
+      const { data, error } = await putPrivateIngress({ client, body: intent.request })
       if (error) throw new Error(getErrorMessage(error))
+      return data
     })
+    if (options.json) {
+      // The consent as stored, in the shape `ingress private --json` reads it.
+      json({ consent: consent ?? null })
+      return
+    }
     const who = intent.request.admit?.length
       ? intent.request.admit.join(', ')
       : 'its own network'

@@ -447,6 +447,14 @@ describe('vars set value sources', () => {
     expect(() => generateSecretRequest('lots')).toThrow('from 16 to 64')
   })
 
+  test("Laravel's APP_KEY asks for the key its cipher takes, unless bytes are given", () => {
+    expect(generateSecretRequest(true, 'APP_KEY')).toEqual({ kind: 'laravel_app_key' })
+    expect(generateSecretRequest('laravel', 'ENCRYPTION_KEY')).toEqual({ kind: 'laravel_app_key' })
+    // A byte count is a hex secret of that length, whatever the name.
+    expect(generateSecretRequest('64', 'APP_KEY')).toEqual({ kind: 'secret', bytes: 64 })
+    expect(generateSecretRequest(true, 'SESSION_SECRET')).toEqual({ kind: 'secret' })
+  })
+
   test('two sources fail before any request, naming the flags', async () => {
     const path = await fixture(SECRET)
     const run = await runWithApi(registerEnvironmentsCommands,

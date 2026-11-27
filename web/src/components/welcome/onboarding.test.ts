@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  welcomeProjectCount,
   formatBytes,
   connectAgentPrompt,
   deployAppPrompt,
@@ -148,4 +149,25 @@ test('the deploy prompt logs in first when it has to, asks what to deploy, then 
   expect(deployAppPrompt('http://localhost:3014')).toContain(
     'The server runs on my computer at a localhost address.'
   )
+})
+
+describe('welcomeProjectCount', () => {
+  test('an empty install opens the welcome flow, unless the user searched or is creating a project', () => {
+    expect(welcomeProjectCount(0, { searching: false, creating: false })).toBe(
+      0
+    )
+    expect(welcomeProjectCount(3, { searching: false, creating: false })).toBe(
+      3
+    )
+    expect(
+      welcomeProjectCount(0, { searching: true, creating: false })
+    ).toBeUndefined()
+    // The command palette's Create project: the dialog is not replaced.
+    expect(
+      welcomeProjectCount(0, { searching: false, creating: true })
+    ).toBeUndefined()
+    expect(
+      welcomeProjectCount(undefined, { searching: false, creating: false })
+    ).toBeUndefined()
+  })
 })

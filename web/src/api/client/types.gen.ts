@@ -17903,7 +17903,7 @@ export type GenerateValueRequest = {
 /**
  * What to generate.
  */
-export type GeneratedValueKind = 'secret';
+export type GeneratedValueKind = 'secret' | 'laravel_app_key';
 
 /**
  * Freshness of the geolocation database backing this instance
@@ -28850,6 +28850,13 @@ export type PrivateIngressRequest = {
      * empty to admit the listen address's own network.
      */
     admit?: Array<string>;
+    /**
+     * Only give consent where none exists: refused with a 409, changing
+     * nothing, when one does. For a client that showed a plan made when
+     * there was no consent, so it never replaces one given meanwhile (with
+     * its own ranges) or recreates one withdrawn under a plan built on it.
+     */
+    create_only?: boolean;
     /**
      * `tailscale`, or a private address of this machine: one in
      * `100.64.0.0/10`, RFC 1918 or `fd00::/8`.
@@ -104824,7 +104831,7 @@ export type PutPrivateIngressErrors = {
      */
     403: unknown;
     /**
-     * The console and proxy run as separate processes, so nothing here serves private addresses
+     * The console and proxy run as separate processes, so nothing here serves private addresses; or `create_only` was asked and a consent exists, which is kept
      */
     409: unknown;
     /**

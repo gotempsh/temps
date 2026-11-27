@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process'
 import {
   bridgeKeyFilePath,
   bridgeUrlFromText,
+  entryApiKey,
   localBridgeCommand,
   MCP_SERVER_NAME,
   redactSecrets,
@@ -34,11 +35,14 @@ export function parseClaudeCodeMcpGetOutput(output: string): string | null {
 
 const CLAUDE_CODE_ID = 'claude-code'
 
-/** The text after `mcp bridge` in a printed command, its `--url` and `--folder` arguments; null when `text` starts no bridge. */
+/**
+ * A printed bridge command from the package it runs on: the package (`@temps-sdk/cli@1.2.3`),
+ * then `mcp bridge` and its `--url` and `--folder` arguments; null when `text` starts no bridge.
+ */
 function bridgeTarget(text: string): string | null {
-  const match = text.match(/\bmcp\s+bridge\b([^\n]*)/)
+  const match = text.match(/(\S+)\s+mcp\s+bridge\b([^\n]*)/)
   if (!match) return null
-  return (match[1] ?? '').trim()
+  return `${match[1]} mcp bridge ${(match[2] ?? '').trim()}`.trim()
 }
 
 /**
@@ -63,11 +67,14 @@ export function claudeCodeEntryMatches(
   const target = bridgeTarget(installed)
   if (!entry.bridge) return target === null && parseClaudeCodeMcpGetOutput(installed) === entry.url
   if (target === null) return false
+  // From the package on: a bridge pinned to another CLI version (one
+  // installed before an upgrade) is not the one asked for, so it is
+  // replaced rather than kept as already installed.
   const command = localBridgeCommand(entry, entry.bridge).args
-  const wanted = command.slice(command.indexOf('bridge') + 1)
+  const wanted = command.slice(command.indexOf(entry.bridge.packageSpec))
   if (installedArgs) {
     const at = installedArgs.indexOf('bridge')
-    return at !== -1 && JSON.stringify(installedArgs.slice(at + 1)) === JSON.stringify(wanted)
+    return at > 1 && JSON.stringify(installedArgs.slice(at - 2)) === JSON.stringify(wanted)
   }
   if (wanted.some((arg) => /\s/.test(arg))) return false
   return JSON.stringify(target.split(/\s+/).filter(Boolean)) === JSON.stringify(wanted)
@@ -154,6 +161,23 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
     }
   }
 
+  /** The user-scope `temps` entry as Claude Code saved it, or null. */
+  private installedEntry(): Record<string, unknown> | null {
+    const dir = this.profile() || this.home
+    try {
+      const config = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')) as {
+        mcpServers?: Record<string, Record<string, unknown>>
+      }
+      return config.mcpServers?.[MCP_SERVER_NAME] ?? null
+    } catch {
+      return null
+    }
+  }
+
+  async installedApiKey(): Promise<string | undefined> {
+    return entryApiKey(this.installedEntry())
+  }
+
   private keyFile(entry: McpServerEntry): string {
     return bridgeKeyFilePath(CLAUDE_CODE_ID, entry.url, this.profile(), this.home)
   }
@@ -238,7 +262,7 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
       const reason = redactSecrets(execErrorMessage(error))
       // Claude kept whatever it had, so the key file goes back to what that
       // entry reads: a refused install never changes the key it sends.
-      if (keyFile) await restoreBridgeKeyFile(keyFile, previousKey).catch(() => undefined)
+      if (keyFile) await restoreBridgeKeyFile(keyFile, previousKey, entry.apiKey).catch(() => undefined)
       if (/already exists/i.test(reason)) {
         const installedText = this.getServerEntry(binary)
         const installed = installedText ? parseClaudeCodeMcpGetOutput(installedText) : null
@@ -277,6 +301,9 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
   }
 
   async describeTarget(): Promise<string> {
-    return `claude mcp add --scope user ${MCP_SERVER_NAME} (Claude Code's user settings)`
+    // The profile's own settings file: each CLAUDE_CONFIG_DIR is another
+    // install, with its own key.
+    const settings = path.join(this.profile() || this.home, '.claude.json')
+    return `claude mcp add --scope user ${MCP_SERVER_NAME} (Claude Code's user settings in ${settings})`
   }
 }

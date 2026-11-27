@@ -4,11 +4,13 @@
 /**
  * The transcript of an agent run on Temps' own tool loop (ADR-116 D2): one
  * JSON object per line, `temps.text`, `temps.tool_call`, `temps.tool_result`
- * and `temps.finish`.
+ * and `temps.finish`, opened by `temps.truncated` when a long run's earlier
+ * lines were left out of the stored transcript (the run's log has them).
  */
 
 export interface TranscriptEvent {
-  type: 'assistant_text' | 'tool_call' | 'tool_result' | 'result'
+  /** `notice`: something the transcript says about itself, in `content`. */
+  type: 'assistant_text' | 'tool_call' | 'tool_result' | 'result' | 'notice'
   content?: string
   tool?: string
   toolUseId?: string
@@ -86,6 +88,15 @@ export function parseTempsAgentTranscript(output: string): TranscriptEvent[] {
         }
         break
       }
+      case 'temps.truncated': {
+        const dropped =
+          typeof event.dropped_lines === 'number' ? event.dropped_lines : 0
+        parsed.push({
+          type: 'notice',
+          content: `${dropped} earlier ${dropped === 1 ? 'step is' : 'steps are'} not shown here: the run was long. The run's log has every step.`,
+        })
+        break
+      }
       case 'temps.finish':
         parsed.push({
           type: 'result',
@@ -99,4 +110,29 @@ export function parseTempsAgentTranscript(output: string): TranscriptEvent[] {
     }
   }
   return parsed
+}
+
+/** The line a conversation view shows for a run's result or a transcript notice. */
+export function resultLine(event: {
+  type: string
+  content?: string
+  numTurns?: number
+  costUsd?: number
+  tokensInput?: number
+}): { label: string; summary: string } {
+  if (event.type === 'notice') {
+    return { label: 'Not shown', summary: event.content ?? '' }
+  }
+  return {
+    label: 'Result',
+    summary: [
+      event.numTurns != null ? `${event.numTurns} turns` : null,
+      event.costUsd != null ? `$${event.costUsd.toFixed(4)}` : null,
+      event.tokensInput != null
+        ? `${event.tokensInput.toLocaleString()} in`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(' · '),
+  }
 }

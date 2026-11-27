@@ -10,6 +10,7 @@ import {
   newProjects,
   projectNameFrom,
   projectsBaseline,
+  generateRequest,
   projectVariables,
   providedNames,
   rootPreset,
@@ -61,6 +62,24 @@ describe('ship', () => {
       { key: 'LOG_LEVEL', value: 'info', is_secret: false },
       { key: 'SESSION_SECRET', generate: { kind: 'secret', bytes: 32 } },
     ])
+  })
+
+  test("Laravel's APP_KEY is asked in the form its cipher takes", () => {
+    const rows = initialRows(
+      detectedFrom([
+        { key: 'APP_KEY', looksSecret: true, canGenerate: true },
+        { key: 'SESSION_SECRET', looksSecret: true, canGenerate: true },
+      ]),
+      null
+    )
+    expect(projectVariables(rows)).toEqual([
+      { key: 'APP_KEY', generate: { kind: 'laravel_app_key' } },
+      { key: 'SESSION_SECRET', generate: { kind: 'secret', bytes: 32 } },
+    ])
+    expect(generateRequest('SESSION_SECRET')).toEqual({
+      kind: 'secret',
+      bytes: 32,
+    })
   })
 
   test('aliases go on the new link only when there are some', () => {

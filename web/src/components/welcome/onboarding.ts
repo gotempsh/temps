@@ -184,3 +184,17 @@ export function formatBytes(bytes: number | null | undefined): string {
   }
   return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`
 }
+
+/**
+ * The project count the projects page gives the welcome redirect: known
+ * only from an unfiltered, fully loaded answer, so a search with no hits
+ * never redirects, and withheld while the user is creating a project (the
+ * command palette's Create project, or the dialog open), so the redirect
+ * never replaces what they asked for.
+ */
+export function welcomeProjectCount(
+  count: number | undefined,
+  { searching, creating }: { searching: boolean; creating: boolean }
+): number | undefined {
+  return searching || creating ? undefined : count
+}

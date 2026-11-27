@@ -63,6 +63,12 @@ pub enum AgentError {
     #[error("Agent run {run_id} wrote no report: its {turns} turns ended without any text from the model")]
     AgentWroteNoReport { run_id: i32, turns: u32 },
 
+    /// A report run used all its turns while still working: its last turn
+    /// called tools whose results the model never read, so what it wrote
+    /// then is progress ("I'll inspect the configuration"), not a report.
+    #[error("Agent run {run_id} used all {turns} turns before writing its report: its last turn still called tools, so its text is progress, not an analysis. Raise the workflow's max turns and run it again")]
+    AgentReportUnfinished { run_id: i32, turns: u32 },
+
     /// ADR-116 D2: an agent run used its whole time budget before the model
     /// gave its final answer.
     #[error("Agent run {run_id} did not finish within {timeout_secs} seconds ({turns} turns)")]
@@ -605,6 +611,11 @@ impl From<AgentError> for Problem {
             AgentError::AgentWroteNoReport { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("Agent Wrote No Report")
                 .with_detail(error.to_string()),
+            AgentError::AgentReportUnfinished { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Agent Report Unfinished")
+                    .with_detail(error.to_string())
+            }
             AgentError::GitError { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Git Error")
                 .with_detail(error.to_string()),

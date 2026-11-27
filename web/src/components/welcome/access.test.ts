@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   accessPlan,
+  consentedNetwork,
   AUDIENCES,
   generatedAddressesCaveat,
   accessProblems,
@@ -159,6 +160,102 @@ describe('factsFromHost', () => {
       factsFromHost(host, { available: true, networks: [] }).privateNetwork
         ?.listen
     ).toBe('tailscale')
+  })
+})
+
+describe('a consent given before', () => {
+  const host = {
+    inbound: { checked: false, reachable: null },
+    tailscale: { running: true, ip: '100.101.102.103' },
+  }
+  const networks = [
+    {
+      interface: 'tailscale0',
+      address: '100.101.102.103',
+      tailscale: true,
+      admit: ['100.64.0.0/10'],
+    },
+    {
+      interface: 'eth0',
+      address: '192.168.1.2',
+      tailscale: false,
+      admit: ['192.168.1.0/24'],
+    },
+  ]
+  const at = '2026-11-27T10:00:00Z'
+
+  test('plans on the network it serves, not the first one listed', () => {
+    const facts = factsFromHost(host, {
+      available: true,
+      networks,
+      consent: {
+        listen: '192.168.1.2',
+        admit: ['192.168.1.0/28'],
+        updated_at: at,
+      },
+    })
+    expect(facts.privateNetwork).toEqual({
+      label: 'eth0',
+      address: '192.168.1.2',
+      listen: '192.168.1.2',
+      admit: ['192.168.1.0/28'],
+      consented: true,
+      consentAt: at,
+    })
+    const plan = accessPlan(
+      choice({
+        audience: 'private',
+        way: 'tailnet_domain',
+        naming: 'wildcard',
+        domain: 'apps.example.com',
+      }),
+      facts
+    )
+    expect(plan.records[0]?.value).toBe('192.168.1.2')
+    expect(plan.temps.join(' ')).toContain(
+      'Refuse any request from outside 192.168.1.0/28'
+    )
+  })
+
+  test('with its default ranges, admits what its network does', () => {
+    expect(
+      consentedNetwork(
+        { listen: 'tailscale', admit: [], updated_at: at },
+        networks
+      ).network?.admit
+    ).toEqual(['100.64.0.0/10'])
+  })
+
+  test('a network this machine refuses to serve, or no longer lists, is not offered, and says why', () => {
+    // It now overlaps a container network, or Docker could not be listed.
+    const refused = networks.map((n) =>
+      n.interface === 'eth0'
+        ? {
+            ...n,
+            problem:
+              'it overlaps the container network app-net (192.168.1.0/24)',
+          }
+        : n
+    )
+    const facts = factsFromHost(host, {
+      available: true,
+      networks: refused,
+      consent: { listen: '192.168.1.2', updated_at: at },
+    })
+    expect(facts.privateNetwork).toBeNull()
+    expect(facts.privateUnavailable).toContain(
+      'refuses to serve private addresses on 192.168.1.2'
+    )
+    expect(facts.privateUnavailable).toContain('app-net')
+    const [domainWay] = waysFor('private', facts)
+    expect(domainWay.available).toBe(false)
+    // Not the first usable network instead: the consent is kept, and is on eth0.
+    const gone = consentedNetwork(
+      { listen: '10.9.0.1', updated_at: at },
+      networks
+    )
+    expect(gone.network).toBeNull()
+    expect(gone.problem).toContain('does not list')
   })
 })
 
@@ -339,6 +436,20 @@ describe('access', () => {
     expect(
       direct.you.some((y) => y.includes('ports 80 and 443 reach this box'))
     ).toBe(true)
+    // A box whose public address is IPv6 publishes it in an AAAA record.
+    const v6 = accessPlan(
+      choice({ way: 'direct', domain: 'apps.example.com' }),
+      {
+        ...closed,
+        publicIp: '2001:db8::42',
+      }
+    )
+    expect(v6.records[0]).toEqual({
+      type: 'AAAA',
+      name: '*.apps.example.com',
+      value: '2001:db8::42',
+      by: 'you',
+    })
     expect(
       accessPlan(choice({ way: 'direct' }), open).you.some((y) =>
         y.includes('ports 80')

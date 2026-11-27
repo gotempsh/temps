@@ -11,6 +11,7 @@ import {
   bridgeKeyFilePath,
   bridgeUrlFromArgs,
   bridgeUrlFromText,
+  entryApiKey,
   JsonConfigMcpClientAdapter,
   localBridgeCommand,
   removeBridgeKeyFiles,
@@ -88,6 +89,38 @@ describe('JsonConfigMcpClientAdapter', () => {
 
     const written = JSON.parse(readFileSync(configPath, 'utf8'))
     expect(written.mcpServers.temps.url).toBe('http://localhost:3000/mcp?write=1')
+  })
+
+  test('the key an entry sends is read back from it, whatever entry it is', async () => {
+    expect(await adapter.installedApiKey()).toBeUndefined()
+    await adapter.addServer(entry)
+    expect(await adapter.installedApiKey()).toBe('secret-key')
+    const bridge = { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' }
+    await adapter.addServer({ ...entry, apiKey: 'bridge-key', bridge })
+    expect(await adapter.installedApiKey()).toBe('bridge-key')
+    await adapter.removeServer()
+    expect(await adapter.installedApiKey()).toBeUndefined()
+  })
+
+  test('an entry key is read from its bearer header, mcp-remote header, key file or inline key', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'temps-entry-key-'))
+    try {
+      const file = join(dir, 'x.key')
+      writeFileSync(file, 'tk_file\n')
+      expect(entryApiKey({ headers: { authorization: 'Bearer tk_abc' } })).toBe('tk_abc')
+      // Claude Desktop's mcp-remote entry keeps the header in its environment.
+      expect(entryApiKey({ env: { AUTH_HEADER: 'Bearer tk_desk' } })).toBe('tk_desk')
+      expect(entryApiKey({ env: { TEMPS_API_KEY: 'tk_def', TEMPS_API_KEY_FILE: '' } })).toBe('tk_def')
+      expect(entryApiKey({ env: { TEMPS_API_KEY_FILE: file } })).toBe('tk_file')
+      expect(entryApiKey({ env: { TEMPS_API_KEY_FILE: join(dir, 'missing.key') } })).toBeUndefined()
+      // A file far larger than a key is not read as one.
+      writeFileSync(file, 'x'.repeat(5000))
+      expect(entryApiKey({ env: { TEMPS_API_KEY_FILE: file } })).toBeUndefined()
+      expect(entryApiKey({ headers: { Authorization: 'Basic dXNlcg==' } })).toBeUndefined()
+      expect(entryApiKey(null)).toBeUndefined()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test('preserves unrelated existing entries and comments', async () => {
@@ -248,13 +281,22 @@ describe('the local bridge entry', () => {
   test('restoring a key file puts back what it held, or removes one that did not exist', async () => {
     const file = bridgeKeyFilePath('claude-code', 'https://a.example.test', '', dir)
     const fresh = await writeBridgeKeyFile(file, 'new-key')
-    await restoreBridgeKeyFile(file, fresh)
+    await restoreBridgeKeyFile(file, fresh, 'new-key')
     expect(() => statSync(file)).toThrow()
     await writeBridgeKeyFile(file, 'old-key')
     const previous = await writeBridgeKeyFile(file, 'new-key')
-    await restoreBridgeKeyFile(file, previous)
+    await restoreBridgeKeyFile(file, previous, 'new-key')
     expect(readFileSync(file, 'utf8').trim()).toBe('old-key')
     expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
+  test('a failed install never rolls back a key another install wrote since', async () => {
+    const file = bridgeKeyFilePath('codex', 'https://a.example.test', '', dir)
+    // A writes its key, B then writes its own and succeeds, A fails.
+    const beforeA = await writeBridgeKeyFile(file, 'key-a')
+    await writeBridgeKeyFile(file, 'key-b')
+    await restoreBridgeKeyFile(file, beforeA, 'key-a')
+    expect(readFileSync(file, 'utf8').trim()).toBe('key-b')
   })
 
   test('sameOrigin compares scheme, host and port only', () => {

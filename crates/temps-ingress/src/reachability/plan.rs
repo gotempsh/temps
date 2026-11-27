@@ -291,6 +291,8 @@ pub struct PlanFacts {
     /// Every container of the current deployment runs on a worker, whether
     /// or not any of its hostnames is public there.
     pub on_workers: bool,
+    /// At least one container of the current deployment runs on a worker.
+    pub some_on_workers: bool,
     /// Which tunnel would publish each hostname asked about (ADR 058 D9).
     pub intents: HashMap<String, PublicationIntent>,
     /// An IP allow list of only private ranges governing the environment,
@@ -606,8 +608,9 @@ pub struct TunnelRoute<'a> {
 /// so only node 0 can serve it privately (ADR-115 D6). Where it runs, not
 /// which of its hostnames workers publish: a worker deployment whose last
 /// public hostname went private still runs on its worker.
+/// A deployment with replicas on both runs on its workers (ADR-115 D1).
 pub fn runs_on_control_plane(facts: &PlanFacts) -> bool {
-    facts.deployed && !facts.on_workers && !facts.served_by_workers
+    facts.deployed && !facts.on_workers && !facts.some_on_workers && !facts.served_by_workers
 }
 
 /// Whether `tunnel` can carry this environment: ready, running somewhere,
@@ -857,6 +860,15 @@ pub(crate) fn suggested_label(facts: &PlanFacts) -> String {
     }
 }
 
+/// Whether `host` is the console's or the public ingress's own address,
+/// which an app is never served at: never suggested, as it is refused.
+pub(crate) fn is_platform_host(facts: &PlanFacts, host: &str) -> bool {
+    facts
+        .platform_hosts
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(host))
+}
+
 /// An address under a domain the cluster already has, preferring a tunnel's,
 /// that nothing uses yet.
 pub fn suggest_address(facts: &PlanFacts) -> Option<String> {
@@ -875,7 +887,9 @@ pub fn suggest_address(facts: &PlanFacts) -> Option<String> {
         .chain(zones)
         .map(|domain| format!("{label}.{domain}"))
         .find(|candidate| {
-            !facts.taken_elsewhere.contains(candidate) && !facts.attached_here.contains(candidate)
+            !facts.taken_elsewhere.contains(candidate)
+                && !facts.attached_here.contains(candidate)
+                && !is_platform_host(facts, candidate)
         })
 }
 
@@ -5526,6 +5540,47 @@ mod tests {
 
     /// A single server: the environment runs on the control plane, no
     /// worker exists, and this control plane runs connectors.
+    /// Replicas on the control plane and on a worker: the workers serve it,
+    /// so node 0 is not asked to serve it privately.
+    #[test]
+    fn a_mixed_deployment_does_not_run_on_the_control_plane_alone() {
+        let only_here = PlanFacts {
+            deployed: true,
+            ..PlanFacts::default()
+        };
+        assert!(runs_on_control_plane(&only_here));
+        let mixed = PlanFacts {
+            some_on_workers: true,
+            ..only_here
+        };
+        assert!(!runs_on_control_plane(&mixed));
+    }
+
+    /// The console's own address is refused when asked for, so it is never
+    /// suggested either, for a public plan or a private listener.
+    #[test]
+    fn the_console_address_is_never_suggested() {
+        let facts = PlanFacts {
+            zones: vec![zone("example.com", "cloudflare")],
+            requested: None,
+            platform_hosts: vec!["myapp.example.com".into()],
+            ..single_server()
+        };
+        assert_eq!(suggest_address(&facts), None);
+        assert_eq!(
+            crate::providers::tailscale::plan::planned_private_address(&facts),
+            Ok(None)
+        );
+        let other = PlanFacts {
+            platform_hosts: vec!["console.example.com".into()],
+            ..facts
+        };
+        assert_eq!(
+            suggest_address(&other).as_deref(),
+            Some("myapp.example.com")
+        );
+    }
+
     fn single_server() -> PlanFacts {
         PlanFacts {
             served_by_workers: false,

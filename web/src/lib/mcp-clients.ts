@@ -8,6 +8,33 @@
  * `temps mcp add <app>` writes (`apps/temps-cli/src/commands/mcp/clients`).
  */
 
+import { isLoopbackHost, parseIpv4 } from '@/lib/network-address'
+
+/**
+ * Whether an app connecting to this console address itself keeps its key
+ * encrypted on the way: HTTPS, or plain HTTP that never leaves this computer
+ * or travels inside a tailnet (WireGuard). Unlike the Claude extension, such
+ * an app checks nothing when it connects, so a single-label name ("server")
+ * is not assumed to be a tailnet: on ordinary LAN DNS the key would cross
+ * the network in clear. Nor is an address in 100.64.0.0/10: carrier-grade
+ * NAT and other shared networks use that range too. Only what is Tailscale's
+ * alone counts: a MagicDNS name under ts.net, or fd7a:115c:a1e0::/48.
+ */
+export function directClientEncrypts(origin: string): boolean {
+  let url: URL
+  try {
+    url = new URL(origin)
+  } catch {
+    return false
+  }
+  if (url.protocol === 'https:') return true
+  if (url.protocol !== 'http:') return false
+  const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  if (isLoopbackHost(host)) return true
+  if (parseIpv4(host)) return false
+  return host.startsWith('fd7a:115c:a1e0:') || host.endsWith('.ts.net')
+}
+
 /** What a key the console creates for an MCP app may do. */
 export type McpKeyAccess = 'changes' | 'read'
 

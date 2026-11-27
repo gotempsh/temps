@@ -57,7 +57,7 @@ const DEPLOY_TOOL = {
   name: DEPLOY_TOOL_NAME,
   title: 'Deploy a folder',
   description:
-    "Deploy a project folder on the user's computer to a Temps project in one step: it uploads the source and Temps builds and deploys it. The folder must be inside one the user allowed for Temps deploys. It leaves out .git, node_modules, build caches, .env files, keys and whatever .gitignore lists. The project must accept uploaded source (a project created for upload does). Find project_id, and environment_id if the project has several environments, with the temps tool. Returns the deployment id; follow the build with the temps tool.",
+    "Deploy a project folder on the user's computer to a Temps project in one step: it uploads the source and Temps builds and deploys it. The app asks the user before it runs this tool, so tell them what you are about to deploy and where. The folder must be inside one the user allowed for Temps deploys. It leaves out .git, node_modules, build caches, .env files, keys and whatever .gitignore lists. The project must accept uploaded source (a project created for upload does). Find project_id, and environment_id if the project has several environments, with the temps tool. Returns the deployment id; follow the build with the temps tool.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -176,119 +176,203 @@ function alwaysLeftOut(given, isDirectory) {
   return SECRET_EXTENSIONS.has(path.extname(name))
 }
 
+/**
+ * A name as git compares it: one character per UTF-8 byte, as wildmatch
+ * reads names, so `?` is one byte (`secret-??.txt` matches `secret-é.txt`,
+ * whose é is two). Case is not folded here: with `ignoreCase` the pattern
+ * itself matches either case of an ASCII letter, and nothing else, as git
+ * does, while a range keeps the endpoints it was written with.
+ */
+function gitBytes(name) {
+  return Buffer.from(name, 'utf8').toString('latin1')
+}
+
+/** ASCII letters in lower case, nothing else changed. */
+function foldAscii(text) {
+  return text.replace(/[A-Z]/g, (c) => c.toLowerCase())
+}
+
+/** The other case of an ASCII letter, or `null`. */
+function otherCase(char) {
+  if (char >= 'a' && char <= 'z') return char.toUpperCase()
+  if (char >= 'A' && char <= 'Z') return char.toLowerCase()
+  return null
+}
+
+/** A literal character, matching either case of an ASCII letter with `ignoreCase`. */
+function literalRegex(char, ignoreCase) {
+  const other = ignoreCase ? otherCase(char) : null
+  return other ? `[${char}${other}]` : escapeRegex(char)
+}
+
 function escapeRegex(char) {
   return /[.*+?^${}()|[\]\\/]/.test(char) ? `\\${char}` : char
 }
 
-/** Git's POSIX character classes (`[[:digit:]]`), as regular expression members. */
+const isUpper = (c) => c >= 0x41 && c <= 0x5a
+const isLower = (c) => c >= 0x61 && c <= 0x7a
+const isDigit = (c) => c >= 0x30 && c <= 0x39
+const isAlnum = (c) => isUpper(c) || isLower(c) || isDigit(c)
+
+/** Git's POSIX character classes (`[[:digit:]]`), as its own ctype reads bytes. */
 const POSIX_CLASSES = {
-  alnum: 'A-Za-z0-9',
-  alpha: 'A-Za-z',
-  blank: ' \\t',
-  cntrl: '\\x00-\\x1f\\x7f',
-  digit: '0-9',
-  graph: '\\x21-\\x7e',
-  lower: 'a-z',
-  print: '\\x20-\\x7e',
-  punct: '!-\\/:-@\\[-`{-~',
-  space: ' \\t\\n\\r\\f\\v',
-  upper: 'A-Z',
-  xdigit: '0-9A-Fa-f',
+  alnum: isAlnum,
+  alpha: (c) => isUpper(c) || isLower(c),
+  blank: (c) => c === 0x20 || c === 0x09,
+  cntrl: (c) => c < 0x20 || c === 0x7f,
+  digit: isDigit,
+  graph: (c) => c > 0x20 && c < 0x7f,
+  lower: isLower,
+  print: (c) => c >= 0x20 && c < 0x7f,
+  punct: (c) => c > 0x20 && c < 0x7f && !isAlnum(c),
+  space: (c) => c === 0x20 || (c >= 0x09 && c <= 0x0d),
+  upper: isUpper,
+  xdigit: (c) =>
+    isDigit(c) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66),
 }
 
 /**
- * The bracket expression opening at `glob[start]`, as Git reads it: `!` or `^`
- * negates, a `]` right after the opening is a member, `[:class:]` is a POSIX
- * class, a backslash escapes. No bracket matches `/`. An unknown
- * class matches nothing, as in Git. `null` when the bracket is not closed.
+ * Git's wildmatch on the bracket opening at `glob[start]`, for one byte `t`
+ * of a name (folded to lower case already with `ignoreCase`, as git folds
+ * the name and not the bracket): whether it matches, and where the bracket
+ * ends; `null` where git gives up on the whole pattern (a bracket never
+ * closed, an unknown `[:class:]`). Ported step by step, quirks included: a
+ * range's first character also matches on its own (`[b-a]` matches `b`), a
+ * reversed range matches nothing else, and with `ignoreCase` a member is
+ * compared as written, so `[A]` matches neither case while `[A-Z]` matches
+ * both.
  */
-function bracketToRegex(glob, start) {
+function wildBracket(glob, start, t, ignoreCase) {
   let i = start + 1
-  let negate = false
-  if (glob[i] === '!' || glob[i] === '^') {
-    negate = true
-    i += 1
-  }
-  let members = ''
-  let unknownClass = false
-  let first = true
-  while (i < glob.length) {
-    const char = glob[i]
-    if (char === ']' && !first) {
-      if (unknownClass) return { regex: '(?!)', end: i }
-      // A bracket never matches `/`, positive or negated, whatever its
-      // members (a range, a class such as [:punct:]). The lookahead keeps
-      // the members as written, so a `-` first after `!` stays literal.
-      return {
-        regex: `(?!/)[${negate ? '^' : ''}${members}]`,
-        end: i,
+  let p = glob.charCodeAt(i)
+  if (p === 0x5e) p = 0x21
+  const negated = p === 0x21
+  if (negated) p = glob.charCodeAt(++i)
+  let prev = 0
+  let matched = false
+  do {
+    if (Number.isNaN(p)) return null
+    if (p === 0x5c) {
+      p = glob.charCodeAt(++i)
+      if (Number.isNaN(p)) return null
+      if (t === p) matched = true
+    } else if (
+      p === 0x2d &&
+      prev &&
+      i + 1 < glob.length &&
+      glob[i + 1] !== ']'
+    ) {
+      p = glob.charCodeAt(++i)
+      if (p === 0x5c) {
+        p = glob.charCodeAt(++i)
+        if (Number.isNaN(p)) return null
       }
-    }
-    first = false
-    if (char === '[' && glob[i + 1] === ':') {
-      const close = glob.indexOf(':]', i + 2)
-      if (close !== -1) {
-        const posix = POSIX_CLASSES[glob.slice(i + 2, close)]
-        if (posix === undefined) unknownClass = true
-        else members += posix
-        i = close + 2
-        continue
+      if (t <= p && t >= prev) matched = true
+      else if (ignoreCase && isLower(t) && t - 0x20 <= p && t - 0x20 >= prev)
+        matched = true
+      p = 0
+    } else if (p === 0x5b && glob[i + 1] === ':') {
+      const s = i + 2
+      let j = s
+      while (j < glob.length && glob[j] !== ']') j++
+      if (j >= glob.length) return null
+      if (j - s - 1 < 0 || glob[j - 1] !== ':') {
+        // No `:]`: the `[` is a member like any other.
+        i = s - 2
+        p = 0x5b
+        if (t === p) matched = true
+      } else {
+        const name = glob.slice(s, j - 1)
+        const test = Object.prototype.hasOwnProperty.call(POSIX_CLASSES, name)
+          ? POSIX_CLASSES[name]
+          : null
+        if (!test) return null
+        if (test(t) || (name === 'upper' && ignoreCase && isLower(t)))
+          matched = true
+        i = j
+        p = 0
       }
+    } else if (t === p) {
+      matched = true
     }
-    if (char === '\\' && i + 1 < glob.length) {
-      members += classMember(glob[i + 1])
-      i += 2
-      continue
-    }
-    members += char === '-' ? '-' : classMember(char)
-    i += 1
-  }
-  return null
+    prev = p
+    p = glob.charCodeAt(++i)
+  } while (p !== 0x5d)
+  return { matched: matched !== negated, end: i }
 }
 
-/** One literal character inside a regular expression class. */
-function classMember(char) {
-  return /[\\\][^-]/.test(char) ? `\\${char}` : char
+/** Bytes as a regular expression class of runs, `(?!)` when there are none. */
+function byteClass(member) {
+  const hex = (byte) => `\\x${byte.toString(16).padStart(2, '0')}`
+  let out = ''
+  for (let byte = 0; byte < 256; byte++) {
+    if (!member[byte]) continue
+    let last = byte
+    while (last + 1 < 256 && member[last + 1]) last++
+    out += last === byte ? hex(byte) : `${hex(byte)}-${hex(last)}`
+    byte = last
+  }
+  return out ? `[${out}]` : '(?!)'
+}
+
+/**
+ * The bracket expression opening at `glob[start]` as a class of the bytes
+ * git's wildmatch matches with it (never `/`), and where it ends; `null`
+ * where git matches nothing with the whole pattern.
+ */
+function bracketToRegex(glob, start, ignoreCase = false) {
+  const shape = wildBracket(glob, start, 0, ignoreCase)
+  if (!shape) return null
+  const member = new Array(256).fill(false)
+  for (let byte = 0; byte < 256; byte++) {
+    if (byte === 0x2f) continue
+    const t = ignoreCase && isUpper(byte) ? byte + 0x20 : byte
+    member[byte] = wildBracket(glob, start, t, ignoreCase).matched
+  }
+  return { regex: byteClass(member), end: shape.end }
 }
 
 /** A `.gitignore` glob as a regular expression body. */
-function globToRegex(glob) {
+function globToRegex(glob, ignoreCase = false) {
   let out = ''
   for (let i = 0; i < glob.length; i++) {
     const char = glob[i]
     if (char === '*') {
-      if (glob[i + 1] === '*') {
+      // Git reads any run of two or more stars as `**`: across folders
+      // when it is a whole path segment, else like one star.
+      let stars = 1
+      while (glob[i + stars] === '*') stars += 1
+      if (stars > 1) {
         const atStart = i === 0 || glob[i - 1] === '/'
-        if (atStart && glob[i + 2] === '/') {
+        const after = i + stars
+        if (atStart && glob[after] === '/') {
           out += '(?:.*/)?'
-          i += 2
+          i = after
           continue
         }
-        if (atStart && i + 2 === glob.length) {
+        if (atStart && after === glob.length) {
           out += '.*'
-          i += 1
+          i = after - 1
           continue
         }
         out += '[^/]*'
-        i += 1
+        i = after - 1
         continue
       }
       out += '[^/]*'
     } else if (char === '?') {
       out += '[^/]'
     } else if (char === '[') {
-      const bracket = bracketToRegex(glob, i)
-      if (!bracket) {
-        out += '\\['
-        continue
-      }
+      const bracket = bracketToRegex(glob, i, ignoreCase)
+      // Git gives up on the whole pattern: it matches nothing.
+      if (!bracket) return '(?!)'
       out += bracket.regex
       i = bracket.end
     } else if (char === '\\' && i + 1 < glob.length) {
-      out += escapeRegex(glob[i + 1])
+      out += literalRegex(glob[i + 1], ignoreCase)
       i += 1
     } else {
-      out += escapeRegex(char)
+      out += literalRegex(char, ignoreCase)
     }
   }
   return out
@@ -301,7 +385,9 @@ function globToRegex(glob) {
  */
 function parseIgnore(text, base, ignoreCase = IGNORE_CASE) {
   const rules = []
-  for (const raw of text.split(/\r?\n/)) {
+  // Git skips a UTF-8 byte order mark at the start of the file; kept, it
+  // would become part of the first pattern, which then matches nothing.
+  for (const raw of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
     let line = raw.replace(/(?<!\\)\s+$/, '')
     if (!line || line.startsWith('#')) continue
     let negate = false
@@ -321,15 +407,21 @@ function parseIgnore(text, base, ignoreCase = IGNORE_CASE) {
     if (!line) continue
     let regex
     try {
-      const body = globToRegex(line)
-      regex = new RegExp(
-        anchored ? `^${body}$` : `(?:^|/)${body}$`,
-        ignoreCase ? 'i' : ''
-      )
+      // Compiled over the pattern's bytes, matched against the path's.
+      const body = globToRegex(gitBytes(line), ignoreCase)
+      // `s`: a name can hold a newline, which `**` covers as git's does.
+      regex = new RegExp(anchored ? `^${body}$` : `(?:^|/)${body}$`, 's')
     } catch {
       continue // A pattern git would not understand either.
     }
-    rules.push({ base, negate, directoryOnly, regex })
+    rules.push({
+      base,
+      baseBytes: ignoreCase ? foldAscii(gitBytes(base)) : gitBytes(base),
+      ignoreCase,
+      negate,
+      directoryOnly,
+      regex,
+    })
   }
   return rules
 }
@@ -337,10 +429,13 @@ function parseIgnore(text, base, ignoreCase = IGNORE_CASE) {
 /** Whether `.gitignore` rules leave out a path (relative, '/'-separated). The last match wins. */
 function isIgnored(rules, relative, isDirectory) {
   let ignored = false
+  const name = gitBytes(relative)
+  let folded
   for (const rule of rules) {
     if (rule.directoryOnly && !isDirectory) continue
-    if (!relative.startsWith(rule.base)) continue
-    if (rule.regex.test(relative.slice(rule.base.length))) {
+    const prefix = rule.ignoreCase ? (folded ??= foldAscii(name)) : name
+    if (!prefix.startsWith(rule.baseBytes)) continue
+    if (rule.regex.test(name.slice(rule.baseBytes.length))) {
       ignored = !rule.negate
     }
   }
@@ -839,7 +934,8 @@ async function packZip(collected, limits = LIMITS) {
     }
     read += data.length
     if (
-      REGISTRY_SETTINGS.has(path.basename(file.name)) &&
+      // Whatever the case: on macOS `.NPMRC` is the `.npmrc` npm reads.
+      REGISTRY_SETTINGS.has(path.basename(file.name).toLowerCase()) &&
       REGISTRY_CREDENTIAL.test(data.toString('utf8'))
     ) {
       // Shown first: a credential kept out of the upload is worth seeing.
@@ -934,6 +1030,26 @@ function readArguments(args) {
         ? null
         : positiveId(input.environment_id, 'environment_id'),
   }
+}
+
+/** Collect and pack `root`: what a deployment uploads. */
+async function packFolder(root) {
+  const collected = await collectFiles(root)
+  return { collected, ...(await packZip(collected)) }
+}
+
+/**
+ * Whether the Temps MCP server is on: the operator turning it off stops
+ * this tool too, as it stops every tool the server has. Throws when off.
+ */
+async function requireMcpEnabled(api, config) {
+  const res = await api('GET', '/mcp/tools', { accept: 'application/json' })
+  if (res.status === 404) {
+    throw new Error(
+      `The Temps MCP server is turned off at ${config.origin}, so nothing is deployed. An administrator can turn it on in Settings.`
+    )
+  }
+  apiJson(res, config, 'check that the Temps MCP server is on')
 }
 
 function rejectedKey(origin, host = HOSTS.extension) {
@@ -1031,14 +1147,15 @@ function leftOutLine({ leftOut, leftOutCount }) {
 async function deployFolder(config, args, api) {
   const input = readArguments(args)
   const root = await allowedRoot(input.path, config.folders, config.host)
+  await requireMcpEnabled(api, config)
   const environment = await chooseEnvironment(
     api,
     config,
     input.projectId,
     input.environmentId
   )
-  const collected = await collectFiles(root)
-  const { zip, packed, bytes } = await packZip(collected)
+  const target = `project ${input.projectId}${environment.name ? ` (${environment.name})` : ` (environment ${environment.id})`}`
+  const { collected, zip, packed, bytes } = await packFolder(root)
   if (packed.length === 0) {
     throw new Error(
       `${root} has nothing to deploy once secrets, dependencies and what .gitignore lists are left out. ${leftOutLine(collected)}`
@@ -1053,7 +1170,6 @@ async function deployFolder(config, args, api) {
     zip,
     Buffer.from(`\r\n--${boundary}--\r\n`),
   ])
-  const target = `project ${input.projectId}${environment.name ? ` (${environment.name})` : ` (environment ${environment.id})`}`
   const deployment = apiJson(
     await api(
       'POST',

@@ -94,6 +94,17 @@ pub fn parse_admit(text: &str) -> Result<IpNet, String> {
             }
         },
     };
+    // An IPv4-mapped range (`::ffff:192.168.1.0/120`) is its IPv4 range:
+    // peers are compared in their IPv4 form, which an IPv6 range never holds.
+    let net = match net {
+        IpNet::V6(v6) if v6.prefix_len() >= 96 => match v6.network().to_ipv4_mapped() {
+            Some(v4) => ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96)
+                .map(IpNet::V4)
+                .map_err(|_| format!("{net} is not a range"))?,
+            None => net,
+        },
+        other => other,
+    };
     let network = canonical(net.network());
     let Some(block) = private_block(network) else {
         return Err(format!(
@@ -281,6 +292,17 @@ mod tests {
         assert_eq!(parse_admits(&ranges(MAX_ADMITS)).unwrap().len(), MAX_ADMITS);
         let why = parse_admits(&ranges(MAX_ADMITS + 1)).unwrap_err();
         assert!(why.contains("at most 16"), "{why}");
+    }
+
+    #[test]
+    fn an_ipv4_mapped_range_is_kept_as_its_ipv4_range() {
+        let net = parse_admit("::ffff:192.168.1.0/120").unwrap();
+        assert_eq!(net, "192.168.1.0/24".parse::<IpNet>().unwrap());
+        assert!(net.contains(&"192.168.1.8".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            parse_admit("::ffff:10.0.0.7").unwrap(),
+            "10.0.0.7/32".parse::<IpNet>().unwrap()
+        );
     }
 
     #[test]

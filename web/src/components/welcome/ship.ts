@@ -75,7 +75,10 @@ export function rootPreset<T extends { path: string }>(presets: T[]): T | null {
 
 export type ProjectVariable =
   | { key: string; value: string; is_secret: boolean }
-  | { key: string; generate: { kind: 'secret'; bytes: number } }
+  | {
+      key: string
+      generate: { kind: 'secret'; bytes: number } | { kind: 'laravel_app_key' }
+    }
 
 /**
  * The variables the project is created with: typed and example values as
@@ -87,9 +90,22 @@ export function projectVariables(rows: VarRow[]): ProjectVariable[] {
     ...typedVariables(rows),
     ...generatedKeys(rows).map((key) => ({
       key,
-      generate: { kind: 'secret' as const, bytes: 32 },
+      generate: generateRequest(key),
     })),
   ]
+}
+
+/**
+ * What to ask the server to generate for `key`: Laravel's application key
+ * (`APP_KEY`) in the form its default cipher takes (32 bytes behind
+ * `base64:`), every other secret as 32 random bytes in hex.
+ */
+export function generateRequest(
+  key: string
+): { kind: 'secret'; bytes: number } | { kind: 'laravel_app_key' } {
+  return key === 'APP_KEY'
+    ? { kind: 'laravel_app_key' }
+    : { kind: 'secret', bytes: 32 }
 }
 
 /** The aliases to set on the new database's link, keyed by its id; none when it has none. */

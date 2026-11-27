@@ -51,6 +51,9 @@ export function ShipStep() {
   // meanwhile, so the operator says which is their agent's and the step
   // keeps watching until they do.
   const [before, setBefore] = useState<ProjectsBaseline | null>(null)
+  // When this visit began: a list cached by an earlier visit is no
+  // baseline, or a project created between the two would count as new.
+  const [openedAt] = useState(() => Date.now())
   const projects = useQuery({
     // Its own key: the value carries the response's Date header, the
     // server's clock, which the shared project list does not.
@@ -70,8 +73,8 @@ export function ShipStep() {
   })
   const list = projects.data?.list
   // Recorded once, during render: React's pattern for state derived from
-  // the first value of something else.
-  if (projects.data && before === null)
+  // the first value of something else, fetched during this visit.
+  if (projects.data && projects.dataUpdatedAt >= openedAt && before === null)
     setBefore(projectsBaseline(projects.data.list, projects.data.serverDate))
   const appeared = newProjects(before, list)
 

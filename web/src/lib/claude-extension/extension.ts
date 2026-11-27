@@ -56,7 +56,7 @@ export function claudeExtensionManifest(serverOrigin: string) {
     description:
       'Work with your Temps projects, deployments, logs and errors from Claude.',
     long_description:
-      "Connects Claude to your Temps server through its MCP endpoint. Claude runs the extension on this computer, so it reaches a Temps console on localhost or a tailnet. Changes are proposed first and run only after you approve them, and the API key's role decides which changes are allowed. Claude can also deploy a project folder from this computer, but only from folders you allow, and never .env files, keys or what .gitignore lists. It sends the key only to the server address you set, over HTTPS, or plain HTTP to this computer or a Tailscale address.",
+      "Connects Claude to your Temps server through its MCP endpoint. Claude runs the extension on this computer, so it reaches a Temps console on localhost or a tailnet. Changes are proposed first and run when Claude calls confirm_action, so keep Claude asking you before it runs confirm_action or temps_deploy_folder; the API key's role decides which changes are allowed. Claude can also deploy a project folder from this computer, but only from folders you allow, and never .env files, keys or what .gitignore lists. It sends the key only to the server address you set, over HTTPS, or plain HTTP to this computer or a Tailscale address.",
     author: { name: 'Temps', url: 'https://github.com/gotempsh/temps' },
     homepage: 'https://github.com/gotempsh/temps',
     license: 'MIT OR Apache-2.0',
@@ -117,7 +117,7 @@ export function claudeExtensionManifest(serverOrigin: string) {
       {
         name: 'temps_deploy_folder',
         description:
-          'Deploy a project folder from this computer in one step, from the folders you allow.',
+          'Deploy a project folder from this computer, from the folders you allow.',
       },
     ],
     tools_generated: true,

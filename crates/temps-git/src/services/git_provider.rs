@@ -154,6 +154,54 @@ pub(crate) fn file_not_found(
     })
 }
 
+/// Most bytes a provider's answer to a single file read may have. Files are
+/// read whole into memory (manifests, Compose files, Dockerfiles), so a
+/// repository cannot make the control plane hold an arbitrarily large one.
+/// Base64 in a JSON answer adds about a third: about 6 MiB of file.
+pub(crate) const MAX_FILE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// A provider's answer body, refused once it passes `limit` bytes, before
+/// the rest is read.
+pub(crate) async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, GitProviderError> {
+    let too_large = || {
+        GitProviderError::ApiError(format!(
+            "The file is larger than the {} MiB Temps reads from a repository",
+            limit / (1024 * 1024)
+        ))
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| GitProviderError::ApiError(format!("Failed to read file content: {e}")))?
+    {
+        if body.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// [`read_body_limited`] as JSON.
+pub(crate) async fn read_json_limited<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<T, GitProviderError> {
+    let body = read_body_limited(response, limit).await?;
+    serde_json::from_slice(&body)
+        .map_err(|e| GitProviderError::ApiError(format!("Failed to parse file content: {e}")))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GitProviderType {
     GitHub,
@@ -1290,5 +1338,97 @@ mod file_not_found_tests {
         ] {
             assert!(!failure.is_file_not_found(), "{failure}");
         }
+    }
+}
+
+#[cfg(test)]
+mod limited_body_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server answering every request with `reply`, raw.
+    async fn serve(reply: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream.write_all(&reply).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("http://{address}/file")
+    }
+
+    async fn fetch(url: &str) -> reqwest::Response {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(url)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// A body within the limit is read whole; one past it is refused,
+    /// whether its length is announced or only found while streaming it.
+    #[tokio::test]
+    async fn a_file_past_the_limit_is_refused_before_it_is_read_whole() {
+        let limit = 1024;
+        let within = vec![b'a'; limit];
+        let mut announced =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {limit}\r\n\r\n").into_bytes();
+        announced.extend_from_slice(&within);
+        let url = serve(announced).await;
+        assert_eq!(
+            read_body_limited(fetch(&url).await, limit).await.unwrap(),
+            within
+        );
+
+        let too_long = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            limit + 1,
+            "a".repeat(limit + 1)
+        );
+        let url = serve(too_long.into_bytes()).await;
+        let refused = read_body_limited(fetch(&url).await, limit).await;
+        assert!(
+            matches!(&refused, Err(GitProviderError::ApiError(m)) if m.contains("larger than")),
+            "{refused:?}"
+        );
+
+        // Chunked: no length up front, so the cap applies while reading.
+        let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..4 {
+            chunked.extend_from_slice(format!("{:x}\r\n", limit / 2).as_bytes());
+            chunked.extend_from_slice(&vec![b'a'; limit / 2]);
+            chunked.extend_from_slice(b"\r\n");
+        }
+        chunked.extend_from_slice(b"0\r\n\r\n");
+        let url = serve(chunked).await;
+        let refused = read_body_limited(fetch(&url).await, limit).await;
+        assert!(
+            matches!(&refused, Err(GitProviderError::ApiError(m)) if m.contains("larger than")),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_is_parsed_from_a_body_within_the_limit() {
+        let body = r#"{"content":"aGk="}"#;
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let url = serve(reply.into_bytes()).await;
+        let parsed: serde_json::Value = read_json_limited(fetch(&url).await, 1024).await.unwrap();
+        assert_eq!(parsed["content"], "aGk=");
     }
 }

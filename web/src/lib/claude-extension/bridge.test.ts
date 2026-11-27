@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { EventEmitter } from 'node:events'
-import { PassThrough } from 'node:stream'
+import { PassThrough, Writable } from 'node:stream'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -61,6 +61,21 @@ interface Bridge {
     folders: string[]
   }
   parseSse(text: string): unknown[]
+  sendTo(
+    config: {
+      endpoint: URL
+      key: string
+      origin: string
+      requestTimeoutMs?: number
+    },
+    hostname: string,
+    request: {
+      method: string
+      path: string
+      headers: Record<string, string>
+      body?: string
+    }
+  ): Promise<{ status: number; text: string }>
   serialQueue(maxWaiting: number): {
     <T>(task: () => Promise<T>, token?: object): Promise<T | null>
     withdraw(token: object): boolean
@@ -267,6 +282,8 @@ afterEach(() => {
 /** Run the bridge, send it messages, and collect what it writes back. */
 async function exchange(
   env: Record<string, string>,
+  // A function is called with the replies so far, for a message that
+  // answers one (the second call of a folder deployment).
   messages: unknown[],
   expectedReplies: number,
   entry = ENTRY_PATH,
@@ -295,7 +312,11 @@ async function exchange(
     }
   })()
   // One at a time, so a session header from the first reply is in place.
-  for (const message of messages) {
+  for (const next of messages) {
+    const message =
+      typeof next === 'function'
+        ? (next as (r: unknown[]) => unknown)(replies)
+        : next
     const before = replies.length
     child.stdin.write(`${JSON.stringify(message)}\n`)
     child.stdin.flush()
@@ -312,6 +333,46 @@ async function exchange(
   const stderr = await new Response(child.stderr).text()
   return { replies, stderr }
 }
+
+describe('a request to Temps', () => {
+  test('ends at its limit even while the answer keeps sending keepalives', async () => {
+    let timer: ReturnType<typeof setInterval> | undefined
+    const server = serve(
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              const beat = new TextEncoder().encode(': keepalive\n\n')
+              timer = setInterval(() => controller.enqueue(beat), 20)
+            },
+            cancel() {
+              clearInterval(timer)
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } }
+        )
+    )
+    const endpoint = new URL(`http://127.0.0.1:${server.port}/mcp`)
+    const started = Date.now()
+    try {
+      await expect(
+        bridge.sendTo(
+          {
+            endpoint,
+            key: KEY,
+            origin: endpoint.origin,
+            requestTimeoutMs: 300,
+          },
+          '127.0.0.1',
+          { method: 'POST', path: '/mcp', headers: {}, body: '{}' }
+        )
+      ).rejects.toThrow('did not answer within 0.3 seconds')
+    } finally {
+      clearInterval(timer)
+    }
+    expect(Date.now() - started).toBeLessThan(5_000)
+  })
+})
 
 describe('bridge over stdio', () => {
   test('forwards messages with the key and answers with what Temps returns', async () => {
@@ -659,6 +720,154 @@ describe('cancelling a folder deployment', () => {
     }
   })
 
+  test('while the app reads no replies, no more requests are read than are in flight', async () => {
+    let received = 0
+    const server = serve(async (req) => {
+      const body = await req.json()
+      received++
+      return Response.json({
+        jsonrpc: '2.0',
+        id: body.id,
+        result: { tools: [] },
+      })
+    })
+    try {
+      const input = new PassThrough()
+      let stalled = true
+      const held: (() => void)[] = []
+      let written = ''
+      // A reader that has stopped reading: nothing written drains.
+      const output = new Writable({
+        highWaterMark: 1,
+        write(chunk, _encoding, callback) {
+          written += String(chunk)
+          if (stalled) held.push(callback)
+          else callback()
+        },
+      })
+      const config = bridge.readConfig({
+        TEMPS_URL: `http://127.0.0.1:${server.port}`,
+        TEMPS_API_KEY: KEY,
+      })
+      bridge.run(config, input, output, () => {})
+      const total = bridge.MAX_IN_FLIGHT * 4
+      input.write(
+        Array.from(
+          { length: total },
+          (_, i) =>
+            `${JSON.stringify({ jsonrpc: '2.0', id: i + 1, method: 'tools/list' })}\n`
+        ).join('')
+      )
+      await Bun.sleep(300)
+      expect(received).toBe(bridge.MAX_IN_FLIGHT)
+      // Reading again, every request is answered.
+      stalled = false
+      held.splice(0).forEach((callback) => callback())
+      const answered = () => written.split('\n').filter(Boolean).length
+      const deadline = Date.now() + 10000
+      while (answered() < total && Date.now() < deadline) await Bun.sleep(5)
+      expect(answered()).toBe(total)
+      expect(received).toBe(total)
+      input.end()
+    } finally {
+      server.stop(true)
+    }
+  })
+
+  test('requests named like a cancellation queue no more replies than are in flight, on one drain listener', async () => {
+    const input = new PassThrough()
+    const held: (() => void)[] = []
+    // A reader that has stopped reading: nothing written drains.
+    const output = new Writable({
+      highWaterMark: 1,
+      write(_chunk, _encoding, callback) {
+        held.push(callback)
+      },
+    })
+    let replies = 0
+    const realWrite = output.write.bind(output)
+    output.write = ((chunk: unknown, ...rest: unknown[]) => {
+      replies++
+      return (realWrite as (...args: unknown[]) => boolean)(chunk, ...rest)
+    }) as typeof output.write
+    const warnings: string[] = []
+    const onWarning = (warning: Error) => warnings.push(warning.name)
+    process.on('warning', onWarning)
+    try {
+      // Unconfigured: every request is answered with that explanation.
+      bridge.run(new Error('not configured'), input, output, () => {})
+      const total = bridge.MAX_IN_FLIGHT * 4
+      input.write(
+        Array.from(
+          { length: total },
+          (_, i) =>
+            `${JSON.stringify({ jsonrpc: '2.0', id: i + 1, method: 'notifications/cancelled', params: { requestId: 999 } })}\n`
+        ).join('')
+      )
+      await Bun.sleep(100)
+      expect(replies).toBe(bridge.MAX_IN_FLIGHT)
+      expect(output.listenerCount('drain')).toBe(1)
+      expect(output.listenerCount('close')).toBe(1)
+      expect(output.listenerCount('error')).toBe(1)
+      // Reading again, all are answered and the listeners are gone.
+      const deadline = Date.now() + 10000
+      while (replies < total && Date.now() < deadline) {
+        held.splice(0).forEach((callback) => callback())
+        await Bun.sleep(5)
+      }
+      expect(replies).toBe(total)
+      while (output.writableLength > 0 && Date.now() < deadline) {
+        held.splice(0).forEach((callback) => callback())
+        await Bun.sleep(5)
+      }
+      expect(output.listenerCount('drain')).toBe(0)
+      expect(warnings).not.toContain('MaxListenersExceededWarning')
+      input.end()
+    } finally {
+      process.off('warning', onWarning)
+    }
+  })
+
+  test('while busy, cancellations read ahead are themselves limited to the in-flight count', async () => {
+    let received = 0
+    const release: (() => void)[] = []
+    const server = serve(async () => {
+      received++
+      await new Promise<void>((resolve) => release.push(resolve))
+      return new Response(null, { status: 202 })
+    })
+    try {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      const config = bridge.readConfig({
+        TEMPS_URL: `http://127.0.0.1:${server.port}`,
+        TEMPS_API_KEY: KEY,
+      })
+      bridge.run(config, input, output, () => {})
+      input.write(
+        Array.from(
+          { length: bridge.MAX_IN_FLIGHT },
+          (_, i) =>
+            `${JSON.stringify({ jsonrpc: '2.0', id: i + 1, method: 'tools/list' })}\n`
+        ).join('')
+      )
+      await Bun.sleep(50)
+      input.write(
+        Array.from(
+          { length: bridge.MAX_IN_FLIGHT * 4 },
+          (_, i) =>
+            `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 1000 + i } })}\n`
+        ).join('')
+      )
+      await Bun.sleep(200)
+      expect(received).toBe(bridge.MAX_IN_FLIGHT * 2)
+      input.end()
+    } finally {
+      while (release.length > 0) release.shift()?.()
+      server.stop(true)
+    }
+  })
+
   test('calls past the in-flight limit wait unread, and all are answered in turn', async () => {
     let running = 0
     let most = 0
@@ -798,6 +1007,9 @@ describe('deploying a folder', () => {
           result: { tools: [{ name: 'temps' }] },
         })
       }
+      if (url.pathname === '/mcp/tools') {
+        return Response.json({ groups: [] })
+      }
       if (url.pathname === '/api/projects/4/environments') {
         return Response.json(environments)
       }
@@ -844,11 +1056,12 @@ describe('deploying a folder', () => {
     result: { content: { text: string }[]; isError: boolean }
   }
 
-  test('one call uploads the folder to production and starts the deployment', async () => {
+  test('one call uploads the folder to production', async () => {
     const { server, calls, uploads } = temps()
+    const args = { path: project, project_id: 4 }
     const { replies, stderr } = await exchange(
       { TEMPS_URL: `http://127.0.0.1:${server.port}`, TEMPS_API_KEY: KEY },
-      [call(1, { path: project, project_id: 4 })],
+      [call(1, args)],
       1,
       ENTRY_PATH,
       [allowed]
@@ -860,8 +1073,8 @@ describe('deploying a folder', () => {
     expect(text).toContain('Deployment 42 of project 4 (Production) started')
     expect(text).toContain('Uploaded 2 files')
     expect(text).toContain('Left out: .env.')
-    // The tool never goes through the MCP endpoint, only these two routes.
     expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /mcp/tools',
       'GET /api/projects/4/environments',
       'POST /api/projects/4/environments/7/deploy/source',
     ])
@@ -878,15 +1091,17 @@ describe('deploying a folder', () => {
 
   test('an environment named in the call is used as given', async () => {
     const { server, calls } = temps()
+    const args = { path: project, project_id: '4', environment_id: 9 }
     const { replies } = await exchange(
       { TEMPS_URL: `http://127.0.0.1:${server.port}`, TEMPS_API_KEY: KEY },
-      [call(1, { path: project, project_id: '4', environment_id: 9 })],
+      [call(1, args)],
       1,
       ENTRY_PATH,
       [allowed]
     )
     expect((replies[0] as ToolReply).result.isError).toBe(false)
     expect(calls.map((c) => c.path)).toEqual([
+      '/mcp/tools',
       '/api/projects/4/environments/9/deploy/source',
     ])
   })
@@ -918,9 +1133,10 @@ describe('deploying a folder', () => {
 
   test('a key that may not deploy is refused by Temps, and the reason is shown', async () => {
     const { server } = temps(403)
+    const args = { path: project, project_id: 4 }
     const { replies } = await exchange(
       { TEMPS_URL: `http://127.0.0.1:${server.port}`, TEMPS_API_KEY: KEY },
-      [call(1, { path: project, project_id: 4 })],
+      [call(1, args)],
       1,
       ENTRY_PATH,
       [allowed]
@@ -950,7 +1166,7 @@ describe('deploying a folder', () => {
     expect(reply.result.content[0].text).toContain(
       'Pass environment_id: staging (9), qa (10).'
     )
-    expect(calls).toHaveLength(1)
+    expect(calls).toHaveLength(2)
 
     // An unknown project lists no environments.
     const none = temps(202, [])

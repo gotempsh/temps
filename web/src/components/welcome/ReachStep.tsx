@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { createDnsProvider, putPrivateIngress } from '@/api/client'
+import {
+  createDnsProvider,
+  listDnsProviders,
+  getPrivateIngress,
+  putPrivateIngress,
+} from '@/api/client'
 import { requireDeliveryData } from '@/components/domains/delivery-errors'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -31,7 +36,12 @@ import {
 } from './access'
 import { ChoiceList } from './ChoiceList'
 import { LATER_REASONS } from './onboarding'
-import { saveReach, type ReachSaveProgress } from './reach-save'
+import {
+  hasDnsProvider,
+  saveReach,
+  sessionAttemptRef,
+  type ReachSaveProgress,
+} from './reach-save'
 import { useUpdateOnboarding } from './useOnboarding'
 
 const STAGE_TITLE: Record<AccessStage, string> = {
@@ -81,15 +91,26 @@ export function ReachStep({
         {
           setPreviewDomain: (domain) =>
             updateSettings.mutateAsync({ preview_domain: domain }),
+          attemptRef: (key) => sessionAttemptRef(key),
+          findDnsProvider: async (description) => {
+            const { data } = await listDnsProviders({ throwOnError: true })
+            return hasDnsProvider(data, description)
+          },
           createDnsProvider: async (body) => {
             requireDeliveryData(await createDnsProvider({ body }))
             await queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
           },
-          servePrivately: (listen) =>
-            putPrivateIngress({
-              body: { listen, tailscale_serve: false },
+          servePrivately: async (listen) => {
+            const { data } = await putPrivateIngress({
+              body: { listen, tailscale_serve: false, create_only: true },
               throwOnError: true,
-            }),
+            })
+            return { updated_at: data.updated_at }
+          },
+          currentPrivateConsent: async () => {
+            const { data } = await getPrivateIngress({ throwOnError: true })
+            return data.consent ? { updated_at: data.consent.updated_at } : null
+          },
           recordReach: (reach) =>
             updateOnboarding.mutateAsync({
               default_reach: reach,
@@ -326,7 +347,15 @@ export function ReachStep({
             busy={save.isPending}
             busyLabel="Saving…"
             disabled={later.isPending}
-            onClick={() => save.mutate()}
+            onClick={() => {
+              // What changed since the plan was shown (a network gone) is
+              // said here, and nothing is saved.
+              if (problems.length > 0) {
+                setTouched(true)
+                return
+              }
+              save.mutate()
+            }}
           >
             {choice.way === 'tunnel'
               ? 'Save and set up the tunnel'

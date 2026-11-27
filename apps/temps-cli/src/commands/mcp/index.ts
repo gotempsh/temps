@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
-import { createApiKey, deleteApiKey, getSettings, updateSettings } from '../../api/sdk.gen.js'
+import { createApiKey, deleteApiKey, getApiKey, getSettings, updateSettings } from '../../api/sdk.gen.js'
 import type { AppSettings } from '../../api/types.gen.js'
 import { loginWithDevice } from '../auth/login.js'
 import { getActiveContext, getContext, listContexts } from '../../config/contexts.js'
@@ -21,6 +21,17 @@ import { bridgeAction, bridgePackageSpec, checkBridgeAddress, resolveFolder } fr
 import * as fs from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { addCredentialSources } from '../../lib/value-source.js'
+import {
+  forgetMintedKey,
+  installScope,
+  isRecordedKey,
+  keyDigest,
+  mintedKeyFor,
+  mintedKeysFor,
+  recordedDigests,
+  recordMintedKey,
+  type MintedKey,
+} from './minted-keys.js'
 
 /**
  * The scheme+host+port a URL resolves to, for comparing whether two URLs
@@ -189,7 +200,11 @@ async function selectMcpTarget(options: { url?: string; yes?: boolean }): Promis
         value: c.name,
         description: c.url,
       })),
-      { name: 'Enter a different URL...', value: CUSTOM_TARGET, alwaysShow: true },
+      {
+        name: 'Enter a different URL...',
+        value: CUSTOM_TARGET,
+        alwaysShow: true,
+      },
     ],
   })
 
@@ -258,7 +273,10 @@ export function registerMcpCommands(program: Command): void {
     .option('-w, --write', 'Enable write tools (deploy, delete, restart, etc). Default: read-only')
     .option('-k, --api-key <key>', 'Use this API key instead of creating or prompting for one')
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
-    .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; creates a key for the app: read-only, or with --write one that can make changes)')
+    .option(
+      '-y, --yes',
+      'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; creates a key for the app: read-only, or with --write one that can make changes)',
+    )
     .option(
       '-d, --deploy-folder <dir>',
       'Let the agent deploy project folders from this computer, from inside this folder (repeatable). The app then runs the Temps bridge locally (temps mcp bridge) instead of connecting over HTTP. Implies --write',
@@ -296,12 +314,16 @@ async function setMcpServerEnabled(enabled: boolean, urlOverride?: string): Prom
     // PUT /settings replaces every field not present in the body with its
     // Rust default, so this must send the full current settings with only
     // mcp_server changed -- same rule as apps/temps-cli/src/commands/settings/index.ts.
-    const { data: currentSettings, error: getError } = await getSettings({ client })
+    const { data: currentSettings, error: getError } = await getSettings({
+      client,
+    })
     if (getError) throw new Error(getErrorMessage(getError))
 
     const { error } = await updateSettings({
       client,
-      body: settingsWriteBody(currentSettings, { mcp_server: { enabled } }) as AppSettings,
+      body: settingsWriteBody(currentSettings, {
+        mcp_server: { enabled },
+      }) as AppSettings,
     })
     if (error) throw new Error(settingsWriteError(error))
   })
@@ -326,7 +348,10 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   // The credential ensureMcpAuth resolves here is guaranteed bound to
   // target.url (or the process exits) -- never an ambient key for a
   // different server. Reused below instead of re-deriving via requireAuth().
-  const authenticatedApiKey = await ensureMcpAuth({ yes: options.yes, urlOverride: target.url })
+  const authenticatedApiKey = await ensureMcpAuth({
+    yes: options.yes,
+    urlOverride: target.url,
+  })
   await setupClient(target.url, target.apiKey ?? authenticatedApiKey)
 
   const clientId =
@@ -397,7 +422,9 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   }
   for (const folder of deployFolders) {
     if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
-      warning(`${folder} is not a folder on this computer. Pass the folder that holds your projects to --deploy-folder.`)
+      warning(
+        `${folder} is not a folder on this computer. Pass the folder that holds your projects to --deploy-folder.`,
+      )
       // Nothing was installed: a script must not carry on as if it were.
       process.exitCode = 1
       return
@@ -433,6 +460,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   // The key this command minted, deleted again if the app is not configured
   // with it, so a failed or retried install leaves no unused credential.
   let mintedKeyId: number | undefined
+  let mintedKeyNameUsed = ''
   if (!apiKey) {
     // -y always mints a key for the app, as the prompt's default does: a
     // reader key without --write, which must not install this login's
@@ -465,6 +493,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
       apiKey = created.api_key
       mintedKey = true
       mintedKeyId = created.id
+      mintedKeyNameUsed = created.name
       newline()
       success(`Created API key "${created.name}" (${created.key_prefix}...)`)
     } else {
@@ -483,7 +512,8 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
 
   newline()
   header(`Configure ${adapter.label}`)
-  keyValue('Target', await adapter.describeTarget())
+  const installTarget = await adapter.describeTarget()
+  keyValue('Target', installTarget)
   keyValue('URL', url)
   if (bridge) {
     keyValue('Runs locally', `npx ${bridge.packageSpec} mcp bridge`)
@@ -502,26 +532,95 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   newline()
 
   if (!options.yes) {
-    const proceed = await promptConfirm({ message: 'Apply this configuration?', default: true })
+    const proceed = await promptConfirm({
+      message: 'Apply this configuration?',
+      default: true,
+    })
     if (!proceed) {
       info('Cancelled -- no changes made.')
       return
     }
   }
 
+  // The key the entry sends now, and its record when `mcp add` minted it
+  // for this very install: read before the entry is replaced.
+  const scope = installScope(adapter.id, installTarget)
+  // The keys recorded already: any recorded from now on is another install
+  // running at the same time.
+  // `null` when the ledger cannot be listed: then no key recorded by
+  // another install is deleted, as none can be told from an older one.
+  const earlier = await recordedDigests(scope).catch(() => null)
+  const before = await adapter.installedApiKey().catch(() => undefined)
+  const recorded = await mintedKeyFor(scope, before)
+
   const result = await adapter.addServer({ url, apiKey, bridge })
   if (!result.success) {
     warning(`Failed to configure ${adapter.label}: ${result.reason}`)
     if (mintedKeyId !== undefined) await deleteMintedKey(mintedKeyId)
+    // The app was not configured as asked: a script must not carry on as
+    // if it were.
+    process.exitCode = 1
     return
   }
 
   if (result.alreadyInstalled) {
     info(`${adapter.label} is already configured with this exact setup.`)
-    // The existing entry kept its own key, so the one minted above is unused.
+    // The existing entry kept its own key, so the one minted above is unused
+    // and goes: it is never shown below as the one to use.
     if (mintedKeyId !== undefined) await deleteMintedKey(mintedKeyId)
+    mintedKey = false
   } else {
     success(`${adapter.label} configured.`)
+    const origin = originOf(mcpBaseUrl)
+    // The login this command works with, for keys on this same instance.
+    const current: Login = { url: target.url, apiKey: target.apiKey ?? authenticatedApiKey, origin }
+    const sent = apiKey ? keyDigest(apiKey) : undefined
+    const minted =
+      mintedKeyId !== undefined && origin && sent
+        ? { origin, id: mintedKeyId, name: mintedKeyNameUsed, sha256: sent }
+        : undefined
+    // Recorded before anything else, so a removal finds it whatever happens next.
+    if (minted) await rememberMintedKey(scope, minted)
+    // Another mcp add for the same settings may have written its entry
+    // since this one did: only the key the entry sends now is in use. Read
+    // once before the record is settled and once after, so an install that
+    // replaces this entry later sees it settled and deletes its key.
+    // An entry that cannot be read back (Codex keeps an HTTP entry's key in
+    // the user's shell) leaves the record unsettled: no other install takes
+    // its key for one replaced.
+    let entry = await entrySends(adapter, sent)
+    if (minted && entry === 'sent') {
+      await rememberMintedKey(scope, { ...minted, settled: true })
+      entry = await entrySends(adapter, sent)
+    }
+    if (minted && entry === 'replaced') {
+      warning(
+        `Another temps mcp add changed ${adapter.label} at the same time and its setup is the one kept; the API key created here is unused.`,
+      )
+      await deleteMintedKey(minted.id)
+      await forgetRecordedKey(scope, minted.sha256)
+      mintedKey = false
+    } else if (recorded) {
+      // The entry sent a key `mcp add` minted for it. The new entry still
+      // sends it (passed again with --api-key) to the same instance: kept
+      // and recorded. To another instance: kept, and forgotten here, so
+      // removing this entry never deletes it on the first one. Otherwise
+      // nothing sends it any more: deleted on its own instance.
+      const stillSent = recorded.sha256 === sent
+      if (!stillSent && isRecordedKey(recorded, before, recorded.origin)) {
+        await retireOnItsInstance(recorded, before, current)
+        await forgetRecordedKey(scope, recorded.sha256)
+      } else if (stillSent && recorded.origin !== origin) {
+        await forgetRecordedKey(scope, recorded.sha256)
+      }
+    } else if (before && before !== apiKey) {
+      // Another profile's, another computer's, one the user supplied or
+      // named by hand: never touched.
+      info(
+        `The API key ${adapter.label} used before was not created for it by mcp add on this computer, so it was kept. Delete it under Settings > API keys if nothing else uses it.`,
+      )
+    }
+    if (entry === 'sent' && earlier) await retireReplaced(adapter, scope, earlier, current)
   }
   info(`Restart ${adapter.label} to pick up the change.`)
   if (!bridge) {
@@ -544,6 +643,14 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
       `Codex reads its bearer token from the ${CODEX_TOKEN_ENV_VAR} environment variable at connect time -- export it in your shell profile, or every codex session will fail to authenticate to Temps:`,
     )
     info(codexTokenExportLine(apiKey, mintedKey))
+    // The key an earlier install exported is in the user's shell, not in
+    // Codex's config, so it is never deleted here: sessions still running
+    // with it keep working until the user replaces it.
+    if (mintedKey) {
+      info(
+        'A key an earlier install of Codex exported stays valid: once your shell exports this one, delete the old one under Settings > API keys.',
+      )
+    }
   }
 }
 
@@ -566,6 +673,135 @@ export function codexTokenExportLine(apiKey: string, minted: boolean): string {
  */
 export function mintedKeyName(clientId: string, now: Date = new Date()): string {
   return `mcp-${clientId}-${now.toISOString().slice(0, 10)}-${randomBytes(3).toString('hex')}`
+}
+
+/** Record a key `mcp add` minted for an install; says so if it cannot. */
+async function rememberMintedKey(scope: string, key: MintedKey): Promise<void> {
+  try {
+    await recordMintedKey(scope, key)
+  } catch (error) {
+    warning(
+      `Could not record the API key this install uses: ${error instanceof Error ? error.message : String(error)}. A later mcp add or mcp remove will not delete it; delete it under Settings > API keys once it is unused.`,
+    )
+  }
+}
+
+/** Forget a recorded key; a record left behind only names a key that is gone. */
+async function forgetRecordedKey(scope: string, sha256: string): Promise<void> {
+  await forgetMintedKey(scope, sha256).catch(() => undefined)
+}
+
+/** The login `mcp add` works with: `setupClient`'s arguments, and its instance's origin. */
+interface Login {
+  url?: string
+  apiKey: string
+  origin: string | null
+}
+
+/**
+ * Delete `recorded` on the instance it belongs to: with `current` when that
+ * is the instance, or else the login saved there, then point the API client
+ * back at `current`. Without a login for it, the user is told which key to
+ * delete.
+ */
+
+async function retireOnItsInstance(
+  recorded: MintedKey,
+  installed: string | undefined,
+  current: Login | null,
+): Promise<void> {
+  // A key on the instance this command already works with is deleted with
+  // its login, saved or not (TEMPS_API_KEY in CI).
+  if (current?.origin && current.origin === recorded.origin) {
+    await retireRecordedKey(recorded, installed)
+    return
+  }
+  const context = await findContextByUrl(recorded.origin)
+  if (!context) {
+    warning(
+      `The API key ${recorded.name} on ${recorded.origin} is unused now. Delete it under Settings > API keys (no login for that instance is saved here).`,
+    )
+    return
+  }
+  await setupClient(context.url, context.apiKey)
+  try {
+    await retireRecordedKey(recorded, installed)
+  } finally {
+    if (current) await setupClient(current.url, current.apiKey)
+  }
+}
+
+/**
+ * What the entry sends now: the key with digest `sent`, another one (an
+ * install that replaced it), or nothing that can be read.
+ */
+async function entrySends(
+  adapter: { installedApiKey(): Promise<string | undefined> },
+  sent: string | undefined,
+): Promise<'sent' | 'replaced' | 'unknown'> {
+  const now = await adapter.installedApiKey().catch(() => undefined)
+  if (sent === undefined || now === undefined) return 'unknown'
+  return keyDigest(now) === sent ? 'sent' : 'replaced'
+}
+
+/**
+ * Delete the keys of installs into the same settings that ran at the same
+ * time as this one and whose entries this one replaced: recorded since this
+ * command started (`earlier` are the ones it found), and settled, so their
+ * install had written its entry and will not write it again. The entry is
+ * read again before each, so a key it sends is never taken for unused; one
+ * that cannot be read stops this. An install still writing its entry has
+ * not settled its record yet, and finds out itself that it lost.
+ */
+async function retireReplaced(
+  adapter: { installedApiKey(): Promise<string | undefined> },
+  scope: string,
+  earlier: Set<string>,
+  current: Login,
+): Promise<void> {
+  for (const other of await mintedKeysFor(scope).catch(() => [])) {
+    if (earlier.has(other.sha256) || !other.settled) continue
+    const sending = await adapter.installedApiKey().catch(() => undefined)
+    if (sending === undefined) return
+    if (keyDigest(sending) === other.sha256) continue
+    await retireOnItsInstance(other, undefined, current)
+    await forgetRecordedKey(scope, other.sha256)
+  }
+}
+
+/**
+ * Delete the key `mcp add` recorded for an install whose entry sent it
+ * (`installed`) and no longer does. It is first read back by its ID: a key
+ * with another name, or whose prefix `installed` does not start with, is
+ * another one (an instance set up again under the same address) and is kept.
+ * Best effort: when it cannot be deleted, the user is told which to delete.
+ */
+export async function retireRecordedKey(recorded: MintedKey, installed: string | undefined): Promise<void> {
+  try {
+    const { data, error, response } = await getApiKey({
+      client,
+      path: { id: recorded.id },
+    })
+    // Already deleted, by hand or by another install: nothing left to do.
+    if (response?.status === 404) return
+    if (error) throw new Error(getErrorMessage(error))
+    // Without the key itself (one only recorded), its name, unique to it,
+    // is what tells it is still the same key.
+    const prefixDiffers = installed !== undefined && (!data?.key_prefix || !installed.startsWith(data.key_prefix))
+    if (!data || data.name !== recorded.name || prefixDiffers) {
+      warning(
+        `The API key with ID ${recorded.id} is not the ${recorded.name} this computer recorded, so it was kept. Delete ${recorded.name} under Settings > API keys if it still exists.`,
+      )
+      return
+    }
+    const deleted = await deleteApiKey({ client, path: { id: recorded.id } })
+    if (deleted.error) throw new Error(getErrorMessage(deleted.error))
+    info(`Deleted the API key ${recorded.name}, which nothing uses any more.`)
+  } catch (error) {
+    warning(
+      `The API key ${recorded.name} (ID ${recorded.id}) was not deleted: ${error instanceof Error ? error.message : String(error)}. Delete it under Settings > API keys.`,
+    )
+  }
 }
 
 /** Delete a key this command created for an install that did not happen; says so if it cannot. */
@@ -595,16 +831,33 @@ async function removeAction(clientArg: string | undefined): Promise<void> {
     return
   }
 
+  // Read before the entry goes: the key it sends, and the one `mcp add`
+  // minted for this install.
+  const scope = installScope(adapter.id, await adapter.describeTarget())
+  const before = await adapter.installedApiKey().catch(() => undefined)
+  const recorded = await mintedKeyFor(scope, before)
+
   const result = await adapter.removeServer()
   if (!result.success) {
     warning(`Failed to remove from ${adapter.label}: ${result.reason}`)
+    process.exitCode = 1
     return
   }
 
   if (result.alreadyInstalled) {
     info(`${adapter.label} had no Temps MCP server configured.`)
-  } else {
-    success(`Removed the Temps MCP server from ${adapter.label}.`)
+    return
+  }
+  success(`Removed the Temps MCP server from ${adapter.label}.`)
+  if (recorded && isRecordedKey(recorded, before, recorded.origin)) {
+    // The key was minted for this entry alone and nothing sends it now: it
+    // is deleted with the login saved for its instance.
+    await retireOnItsInstance(recorded, before, null)
+    await forgetRecordedKey(scope, recorded.sha256)
+  } else if (before) {
+    info(
+      `The API key ${adapter.label} used was not created for it by mcp add on this computer, so it was kept. Delete it under Settings > API keys if nothing else uses it.`,
+    )
   }
 }
 

@@ -6,7 +6,9 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {
   bridgeKeyFilePath,
+  bridgeUrlFromArgs,
   bridgeUrlFromText,
+  readKeyFile,
   localBridgeCommand,
   MCP_SERVER_NAME,
   redactSecrets,
@@ -46,6 +48,91 @@ export function parseCodexMcpGetOutput(output: string): string | null {
 }
 
 const CODEX_ID = 'codex'
+
+/** What `codex mcp get --json` says of an entry, as far as Temps reads it. */
+export interface CodexJsonEntry {
+  transport?: {
+    type?: string
+    args?: unknown
+    env?: Record<string, unknown> | null
+    cwd?: unknown
+  }
+}
+
+/** Longest a `codex` command may run before the CLI gives up on it. */
+const CODEX_TIMEOUT_MS = 30_000
+
+/** `codex mcp get --json`'s answer, or null where this Codex has none (an older one) or it is not JSON. */
+export function parseCodexJsonEntry(text: string | null): CodexJsonEntry | null {
+  if (!text) return null
+  try {
+    const value: unknown = JSON.parse(text)
+    return value && typeof value === 'object' && !Array.isArray(value) ? (value as CodexJsonEntry) : null
+  } catch {
+    return null
+  }
+}
+
+/** A bridge entry's arguments as Codex stores them, one by one; null for any other entry. */
+function codexBridgeArgs(json: CodexJsonEntry): string[] | null {
+  const args = json.transport?.args
+  if (!Array.isArray(args) || !args.every((a): a is string => typeof a === 'string')) return null
+  return bridgeUrlFromArgs(args) === null ? null : args
+}
+
+/**
+ * The key a bridge entry sends, from what Codex stores for it: the file its
+ * TEMPS_API_KEY_FILE names (as the bridge reads it, wherever the user
+ * pointed it), else an inline TEMPS_API_KEY. A relative file is read from
+ * the entry's working folder, where the bridge runs; without one it cannot
+ * be told which file the bridge reads. `undefined` for anything else.
+ */
+export function codexBridgeKey(json: CodexJsonEntry): string | undefined {
+  if (!codexBridgeArgs(json)) return undefined
+  const env = json.transport?.env ?? {}
+  const file = typeof env.TEMPS_API_KEY_FILE === 'string' ? env.TEMPS_API_KEY_FILE.trim() : ''
+  if (file) {
+    if (path.isAbsolute(file)) return readKeyFile(file)
+    const cwd = json.transport?.cwd
+    return typeof cwd === 'string' && path.isAbsolute(cwd) ? readKeyFile(path.join(cwd, file)) : undefined
+  }
+  const inline = env.TEMPS_API_KEY
+  return typeof inline === 'string' && inline.trim() ? inline.trim() : undefined
+}
+
+/**
+ * Whether the entry `codex mcp get` printed is exactly the one asked for:
+ * the same transport and endpoint, and for a bridge the same command (CLI
+ * version, URL, folders, write mode). Only then is a refused duplicate
+ * already installed; a bridge allowing other folders is not.
+ */
+export function codexEntryMatches(installed: string, entry: McpServerEntry, json?: CodexJsonEntry | null): boolean {
+  // Its arguments one by one, where Codex gives them: exact, whatever a
+  // folder's name holds.
+  if (json && entry.bridge) {
+    const args = codexBridgeArgs(json)
+    if (!args) return false
+    const command = localBridgeCommand(entry, entry.bridge).args
+    const wanted = command.slice(command.indexOf(entry.bridge.packageSpec))
+    const at = args.indexOf(entry.bridge.packageSpec)
+    return at !== -1 && JSON.stringify(args.slice(at)) === JSON.stringify(wanted)
+  }
+  const bridgeUrl = bridgeUrlFromText(installed)
+  if (!entry.bridge) return bridgeUrl === null && parseCodexMcpGetOutput(installed) === entry.url
+  if (bridgeUrl === null) return false
+  const command = localBridgeCommand(entry, entry.bridge).args
+  // Codex prints the arguments on one line, joined by spaces: from the
+  // package on, that line holds exactly these, so a folder with a space
+  // in it compares whole, and another folder or option is no match.
+  // A folder whose own name reads as another --folder would make two
+  // setups print the same line: never taken for the one installed.
+  if (entry.bridge.folders.some((folder) => /(^|\s)--folder(\s|$)/.test(folder))) return false
+  const wanted = command.slice(command.indexOf(entry.bridge.packageSpec)).join(' ')
+  return installed.split('\n').some((line) => {
+    const at = line.indexOf(entry.bridge?.packageSpec ?? '')
+    return at !== -1 && line.slice(at).trimEnd() === wanted
+  })
+}
 
 /**
  * The `codex mcp add` arguments for an entry. Over HTTP, config.toml names
@@ -125,11 +212,27 @@ export class CodexAdapter implements McpClientAdapter {
   // absent, instead of grepping `mcp list` output for MCP_SERVER_NAME, which
   // false-positives on any unrelated server whose URL merely contains
   // "temps" (e.g. a server hosted at some-app.temps.example.com).
+  /** The entry as `codex mcp get --json` gives it; null from a Codex without it. */
+  private getServerJson(binary: string): CodexJsonEntry | null {
+    try {
+      return parseCodexJsonEntry(
+        execFileSync(binary, ['mcp', 'get', MCP_SERVER_NAME, '--json'], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: this.env,
+          timeout: CODEX_TIMEOUT_MS,
+        }).toString(),
+      )
+    } catch {
+      return null
+    }
+  }
+
   private getServerEntry(binary: string): string | null {
     try {
       return execFileSync(binary, ['mcp', 'get', MCP_SERVER_NAME], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: this.env,
+        timeout: CODEX_TIMEOUT_MS,
       }).toString()
     } catch {
       return null
@@ -140,6 +243,21 @@ export class CodexAdapter implements McpClientAdapter {
     const binary = this.findBinary()
     if (!binary) return false
     return this.getServerEntry(binary) !== null
+  }
+
+  /**
+   * The key a bridge entry reads from its key file. An HTTP entry's token
+   * is in the user's environment (TEMPS_MCP_AUTH_HEADER), not here, so
+   * none is known: an old key file left beside it is not what it sends.
+   */
+  async installedApiKey(): Promise<string | undefined> {
+    const binary = this.findBinary()
+    // The file the entry names, which the user may have pointed elsewhere:
+    // the key in the file Temps wrote is then no longer the one sent. An
+    // older Codex without --json masks the entry's settings, so which file
+    // it reads, and the key it sends, is not known.
+    const json = binary ? this.getServerJson(binary) : null
+    return json ? codexBridgeKey(json) : undefined
   }
 
   async getServerUrl(): Promise<string | null> {
@@ -169,20 +287,25 @@ export class CodexAdapter implements McpClientAdapter {
       execFileSync(binary, codexAddArgs(entry, keyFile), {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...this.env, [TOKEN_ENV_VAR]: `Bearer ${entry.apiKey}` },
+        timeout: CODEX_TIMEOUT_MS,
       })
       return { success: true }
     } catch (error) {
       const reason = redactSecrets(execErrorMessage(error))
       // Codex kept whatever it had, so the key file goes back to what that
       // entry reads: a refused install never changes the key it sends.
-      if (keyFile) await restoreBridgeKeyFile(keyFile, previousKey).catch(() => undefined)
+      if (keyFile) await restoreBridgeKeyFile(keyFile, previousKey, entry.apiKey).catch(() => undefined)
       if (/already (installed|exists|added|registered)/i.test(reason)) {
-        const installed = await this.getServerUrl()
-        if (sameOrigin(installed, entry.url)) return { success: true, alreadyInstalled: true }
-        const where = installed ? ` for ${new URL(installed).origin}` : ''
+        const text = this.getServerEntry(binary)
+        if (text && codexEntryMatches(text, entry, this.getServerJson(binary))) {
+          return { success: true, alreadyInstalled: true }
+        }
+        const installed = text ? parseCodexMcpGetOutput(text) : null
+        const where = installed && URL.canParse(installed) ? ` for ${new URL(installed).origin}` : ''
+        const other = sameOrigin(installed, entry.url) ? ', set up differently (other folders or transport)' : ''
         return {
           success: false,
-          reason: `Codex already has a ${MCP_SERVER_NAME} server${where}. Run temps mcp remove codex, then add it again.`,
+          reason: `Codex already has a ${MCP_SERVER_NAME} server${where}${other}. Run temps mcp remove codex, then add it again.`,
         }
       }
       return { success: false, reason }
@@ -193,7 +316,11 @@ export class CodexAdapter implements McpClientAdapter {
     const binary = this.findBinary()
     if (!binary) return { success: false, reason: 'The codex CLI was not found on PATH.' }
     try {
-      execFileSync(binary, ['mcp', 'remove', MCP_SERVER_NAME], { stdio: ['ignore', 'pipe', 'pipe'], env: this.env })
+      execFileSync(binary, ['mcp', 'remove', MCP_SERVER_NAME], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: this.env,
+        timeout: CODEX_TIMEOUT_MS,
+      })
       await removeBridgeKeyFiles(CODEX_ID, this.profile(), this.home)
       return { success: true }
     } catch (error) {

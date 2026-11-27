@@ -775,9 +775,11 @@ impl GitProviderService for GiteaProvider {
             )));
         }
 
-        let file: GiteaFileContent = response.json().await.map_err(|e| {
-            GitProviderError::ApiError(format!("Failed to parse file content: {}", e))
-        })?;
+        let file: GiteaFileContent = super::git_provider::read_json_limited(
+            response,
+            super::git_provider::MAX_FILE_RESPONSE_BYTES,
+        )
+        .await?;
 
         Ok(FileContent {
             path: file.path,

@@ -217,7 +217,7 @@ fn suggested_service_address(facts: &PlanFacts) -> Option<String> {
         .filter(|w| service_host_problem(w).is_none())
         .filter_map(|w| w.report.tailnet.as_deref())
         .map(|tailnet| format!("{label}.{tailnet}"))
-        .find(|c| !facts.taken_elsewhere.contains(c))
+        .find(|c| !facts.taken_elsewhere.contains(c) && !is_platform_host(facts, c))
 }
 
 /// The address a private plan is for: as asked, else in ADR 065 D1's
@@ -233,7 +233,7 @@ pub fn planned_private_address(facts: &PlanFacts) -> Result<Option<String>, Stri
     {
         return planned_address(facts);
     }
-    let free = |c: &String| !facts.taken_elsewhere.contains(c);
+    let free = |c: &String| !facts.taken_elsewhere.contains(c) && !is_platform_host(facts, c);
     // A Service or a machine name is a worker's to serve, and a worker
     // carries only what workers serve: for what runs on the control plane,
     // suggesting one would hide this machine's own private listener behind

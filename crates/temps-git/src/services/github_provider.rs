@@ -1492,10 +1492,11 @@ impl GitProviderService for GitHubProvider {
             encoding: String,
         }
 
-        let file: GitHubFile = response
-            .json()
-            .await
-            .map_err(|e| GitProviderError::ApiError(e.to_string()))?;
+        let file: GitHubFile = super::git_provider::read_json_limited(
+            response,
+            super::git_provider::MAX_FILE_RESPONSE_BYTES,
+        )
+        .await?;
 
         Ok(FileContent {
             path: file.path,

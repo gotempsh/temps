@@ -2726,16 +2726,7 @@ impl AgentExecutor {
         // Report deliverable: store the AI output as the report and complete.
         // No branch, no PR, no deployment.
         if config.deliverable == "report" {
-            // The report is what the model wrote. A run that ended without
-            // any text (a last turn that only called tools) has none: it
-            // fails, rather than completing with its raw transcript as the
-            // report.
-            let Some(report_text) = assistant_report_text(&ai_result.output) else {
-                return Err(AgentError::AgentWroteNoReport {
-                    run_id,
-                    turns: outcome.turns,
-                });
-            };
+            let report_text = finished_report(&ai_result, run_id, outcome.turns)?;
 
             self.run_service
                 .update_status(
@@ -3889,6 +3880,18 @@ pub fn extract_report_text(output: &str) -> String {
 /// What the model wrote in `output`, joined: the agent loop's text, a
 /// coding CLI's assistant messages, or its result summary. `None` when it
 /// wrote nothing, so a caller never takes the raw transcript for a report.
+/// The report a report run stores: what the model wrote once it was done.
+/// A run out of turns is not done (the loop ends that way only after a turn
+/// that called tools, whose results the model never read: its text then is
+/// progress, "I'll inspect the configuration"), and one that wrote no text
+/// has no report; both fail rather than complete with them.
+fn finished_report(result: &AiRunResult, run_id: i32, turns: u32) -> Result<String, AgentError> {
+    if result.is_max_turns_error {
+        return Err(AgentError::AgentReportUnfinished { run_id, turns });
+    }
+    assistant_report_text(&result.output).ok_or(AgentError::AgentWroteNoReport { run_id, turns })
+}
+
 pub fn assistant_report_text(output: &str) -> Option<String> {
     let mut assistant_texts: Vec<String> = Vec::new();
 
@@ -4281,6 +4284,48 @@ pub(crate) mod tests {
             assistant_report_text(&with_text).as_deref(),
             Some("Found the cause.")
         );
+    }
+
+    #[test]
+    fn a_report_run_out_of_turns_is_not_completed_with_its_progress_text() {
+        // max_turns = 1: the model said what it would do and called a tool,
+        // then the turns ran out before it read the result.
+        let transcript = [
+            r#"{"type":"temps.text","text":"I'll inspect the configuration."}"#,
+            r#"{"type":"temps.tool_call","id":"c1","name":"sandbox_read_file","input":{"path":"app.toml"}}"#,
+            r#"{"type":"temps.tool_result","id":"c1","output":"port = 3000","is_error":false}"#,
+            r#"{"type":"temps.finish","reason":"max_turns","turns":1}"#,
+        ]
+        .join("\n");
+        let result = |output: &str, exhausted: bool| AiRunResult {
+            output: output.to_string(),
+            exit_code: 0,
+            tokens_input: None,
+            tokens_output: None,
+            model: None,
+            changed_files: None,
+            session_id: None,
+            is_max_turns_error: exhausted,
+        };
+        let unfinished = finished_report(&result(&transcript, true), 7, 1).unwrap_err();
+        assert!(matches!(
+            unfinished,
+            AgentError::AgentReportUnfinished {
+                run_id: 7,
+                turns: 1
+            }
+        ));
+        assert!(unfinished.to_string().contains("max turns"));
+
+        let done = r#"{"type":"temps.text","text":"The port is 3000."}"#;
+        assert_eq!(
+            finished_report(&result(done, false), 7, 2).unwrap(),
+            "The port is 3000."
+        );
+        assert!(matches!(
+            finished_report(&result("", false), 7, 2),
+            Err(AgentError::AgentWroteNoReport { .. })
+        ));
     }
 
     #[test]
