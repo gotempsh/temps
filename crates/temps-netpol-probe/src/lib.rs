@@ -177,29 +177,30 @@ impl HttpRecordSink {
     }
 }
 
-/// What the control plane's ingest says it did with a batch.
-#[derive(Debug, Default, serde::Deserialize)]
+/// What the control plane's ingest says it did with a batch: how many it
+/// stored. Whatever it did not store (the workload stopped recording, is not
+/// placed on this node, its project is over its quota or the quota could
+/// not be checked) is discarded, whatever the reason.
+#[derive(Debug, serde::Deserialize)]
 struct IngestAnswer {
-    #[serde(default)]
-    not_recording: u64,
-    #[serde(default)]
-    not_placed: u64,
-    #[serde(default)]
-    over_quota: u64,
+    stored: u64,
 }
 
 /// The [`Delivered`](temps_workload_netpol::Delivered) of a batch of
-/// `records` ingest accepted with `answer`: what it took but did not store
-/// (the workload stopped recording, or is not placed on this node) is
-/// discarded, not delivered. An answer it cannot read counts nothing as
-/// discarded.
-fn delivered_from(records: usize, answer: &str) -> temps_workload_netpol::Delivered {
-    let answer: IngestAnswer = serde_json::from_str(answer.trim()).unwrap_or_default();
-    temps_workload_netpol::Delivered {
-        discarded: (answer.not_recording + answer.not_placed + answer.over_quota)
-            .min(records as u64),
+/// `records` ingest accepted with `answer`: only what it says it stored is
+/// delivered, the rest is discarded. An answer that does not say what was
+/// stored is an error, never a full delivery.
+fn delivered_from(
+    records: usize,
+    answer: &str,
+) -> Result<temps_workload_netpol::Delivered, String> {
+    let answer: IngestAnswer = serde_json::from_str(answer.trim())
+        .map_err(|e| format!("its answer does not say what was stored: {e}"))?;
+    let records = records as u64;
+    Ok(temps_workload_netpol::Delivered {
+        discarded: records - answer.stored.min(records),
         ..Default::default()
-    }
+    })
 }
 
 #[async_trait::async_trait]
@@ -217,7 +218,7 @@ impl EgressRecordSink for HttpRecordSink {
         let body = serde_json::to_vec(&batch).map_err(|e| failed(e.to_string()))?;
         match self.post(&body).await {
             Ok((status, answer)) if (200..300).contains(&status) => {
-                let delivered = delivered_from(records, &answer);
+                let delivered = delivered_from(records, &answer).map_err(failed)?;
                 println!(
                     "records delivered {} discarded {}",
                     records as u64 - delivered.discarded,
@@ -396,6 +397,50 @@ pub async fn sink(udp_port: Option<u16>, tcp_ports: Vec<u16>) -> Result<(), Prob
     Ok(())
 }
 
+/// How many requests the stand-in record sink reads at once; past it a
+/// connection is answered busy and closed.
+const RECORD_SINK_CONNECTIONS: usize = 16;
+/// How long one request may take to arrive whole.
+const RECORD_SINK_DEADLINE: Duration = Duration::from_secs(30);
+/// The largest request head the stand-in reads.
+const MAX_SINK_HEAD: usize = 16 * 1024;
+/// The largest batch body it reads: what the control plane's endpoint takes.
+const MAX_SINK_BODY: usize = 1024 * 1024;
+const SINK_BUSY: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Reads one request's body, refusing (with the status to answer) a head
+/// or body over its bound before buffering it.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, &'static str> {
+    let mut seen = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = stream.read(&mut buf).await.map_err(|_| "400 Bad Request")?;
+        if n == 0 {
+            return Err("400 Bad Request");
+        }
+        seen.extend_from_slice(&buf[..n]);
+        let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if seen.len() > MAX_SINK_HEAD {
+                return Err("431 Request Header Fields Too Large");
+            }
+            continue;
+        };
+        let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if length > MAX_SINK_BODY {
+            return Err("413 Content Too Large");
+        }
+        if seen.len() >= end + 4 + length {
+            return Ok(seen[end + 4..end + 4 + length].to_vec());
+        }
+    }
+}
+
 /// A stand-in for the control plane's record endpoint: accepts one batch
 /// per `POST`, answers `200`, and prints `records received <n> dropped <d>
 /// total <t>` for each, so the proofs can count what a recording proxy
@@ -409,35 +454,34 @@ pub async fn record_sink(port: u16) -> Result<(), ProbeError> {
             reason: e.to_string(),
         })?;
     let total = Arc::new(AtomicU64::new(0));
+    // Bounded like the endpoint it stands in for: a few requests at once,
+    // each at most a batch, each read whole within a deadline.
+    let slots = Arc::new(tokio::sync::Semaphore::new(RECORD_SINK_CONNECTIONS));
     while let Ok((mut stream, _)) = listener.accept().await {
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            let _ = stream.write_all(SINK_BUSY).await;
+            continue;
+        };
         let total = total.clone();
         tokio::spawn(async move {
-            let mut seen = Vec::new();
-            let mut buf = vec![0u8; 64 * 1024];
-            let body = loop {
-                let Ok(Ok(n)) =
-                    tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await
-                else {
-                    return;
-                };
-                if n == 0 {
+            let _slot = slot;
+            let read = tokio::time::timeout(RECORD_SINK_DEADLINE, read_request(&mut stream)).await;
+            let body = match read {
+                Ok(Ok(body)) => body,
+                Ok(Err(status)) => {
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
                     return;
                 }
-                seen.extend_from_slice(&buf[..n]);
-                let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") else {
-                    continue;
-                };
-                let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
-                let length = head
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length:"))
-                    .and_then(|v| v.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
-                if seen.len() >= end + 4 + length {
-                    break seen[end + 4..end + 4 + length].to_vec();
-                }
+                Err(_) => return,
             };
-            let (status, line) = match serde_json::from_slice::<EgressRecordBatch>(&body) {
+            let (status, line, answer) = match serde_json::from_slice::<EgressRecordBatch>(&body) {
                 Ok(batch) => {
                     let n = batch.records.len() as u64;
                     let t = total.fetch_add(n, Ordering::Relaxed) + n;
@@ -448,14 +492,24 @@ pub async fn record_sink(port: u16) -> Result<(), ProbeError> {
                             "records received {n} connections {repeats} dropped {} total {t}",
                             batch.dropped
                         ),
+                        // What ingest answers: what it stored (all of it),
+                        // which the recording proxy counts as delivered.
+                        format!("{{\"stored\":{n}}}"),
                     )
                 }
-                Err(e) => ("400 Bad Request", format!("records unreadable: {e}")),
+                Err(e) => (
+                    "400 Bad Request",
+                    format!("records unreadable: {e}"),
+                    String::new(),
+                ),
             };
             println!("{line}");
             let _ = stream
                 .write_all(
-                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    )
                         .as_bytes(),
                 )
                 .await;
@@ -519,20 +573,26 @@ pub async fn public_dns(port: u16) -> Result<(), ProbeError> {
 mod tests {
     use super::*;
 
-    /// Ingest's 200 for a batch whose workload stopped recording stores
-    /// nothing: those records are discarded, not delivered.
+    /// Only what ingest says it stored is delivered: records it dropped
+    /// for any reason (a quota it could not check included) are discarded,
+    /// and an answer that does not say what was stored is an error, never
+    /// a full delivery.
     #[test]
     fn records_ingest_did_not_store_are_discarded() {
+        let discarded = |records, answer| delivered_from(records, answer).map(|d| d.discarded);
         assert_eq!(
-            delivered_from(3, r#"{"stored":0,"not_recording":3,"not_placed":0}"#).discarded,
-            3
+            discarded(3, r#"{"stored":0,"not_recording":3,"not_placed":0}"#),
+            Ok(3)
         );
         assert_eq!(
-            delivered_from(5, r#"{"stored":2,"not_recording":1,"not_placed":2}"#).discarded,
-            3
+            discarded(5, r#"{"stored":2,"not_recording":1,"not_placed":2}"#),
+            Ok(3)
         );
-        assert_eq!(delivered_from(2, "not json").discarded, 0);
-        assert_eq!(delivered_from(1, r#"{"not_recording":9}"#).discarded, 1);
+        assert_eq!(discarded(1, r#"{"stored":0,"quota_unchecked":1}"#), Ok(1));
+        assert_eq!(discarded(2, r#"{"stored":9}"#), Ok(0));
+        for unreadable in ["not json", "", r#"{"not_recording":9}"#] {
+            assert!(discarded(1, unreadable).is_err(), "{unreadable:?}");
+        }
     }
 
     #[test]
@@ -601,8 +661,16 @@ mod tests {
                         }
                     }
                 }
+                // Ingest answers what it stored.
+                let answer = r#"{"stored":0}"#;
                 stream
-                    .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{answer}",
+                            answer.len()
+                        )
+                        .as_bytes(),
+                    )
                     .await
                     .unwrap();
                 requests.push(String::from_utf8(seen).unwrap());

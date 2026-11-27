@@ -21,7 +21,6 @@ use utoipa::ToSchema;
 use crate::adapter::{RecordedWorkload, WorkloadEgressAdapter};
 use crate::error::EgressRecordingError;
 use crate::local::LocalServing;
-use crate::records;
 
 /// The node id the control plane uses for itself.
 pub const CONTROL_PLANE_NODE_ID: i32 = 0;
@@ -185,6 +184,8 @@ pub struct EgressRecordingService {
     adapters: RwLock<HashMap<WorkloadKind, Arc<dyn WorkloadEgressAdapter>>>,
     /// Which kinds this host's recorder serves, once one runs here.
     local: OnceLock<Arc<LocalServing>>,
+    /// Record counts the activity pages reuse for a short while.
+    pub(crate) totals: crate::activity::RecentTotals,
 }
 
 impl EgressRecordingService {
@@ -199,6 +200,7 @@ impl EgressRecordingService {
             store,
             adapters: RwLock::new(HashMap::new()),
             local: OnceLock::new(),
+            totals: Default::default(),
         }
     }
 
@@ -391,9 +393,7 @@ impl EgressRecordingService {
                 .await
                 .map_err(EgressRecordingError::db("looking up a workload's project"))?
                 .filter(|project| project.deleted_at.is_none())
-                .map(|project| {
-                    logs_path(&project.slug, workload.workload.kind, &workload.public_id)
-                }),
+                .map(|project| logs_path(&project.slug, workload.workload)),
             None => None,
         };
         let blocker = self.blocker(workload, &nodes);
@@ -484,17 +484,13 @@ impl EgressRecordingService {
 }
 
 /// The console path of a project's logs filtered to one workload's
-/// recorded connections: by [`records::PLATFORM_WORKLOAD_ATTRIBUTE`], which
-/// only the platform writes, so a log the project sent carrying the
-/// workload's id is never among them.
-pub fn logs_path(
-    project_slug: &str,
-    kind: temps_workload::WorkloadKind,
-    public_id: &str,
-) -> String {
+/// recorded connections: by the workload columns, which only the platform
+/// fills, so no log the project sent (before or after an upgrade, whatever
+/// attributes it carried) is ever among them.
+pub fn logs_path(project_slug: &str, workload: temps_workload::WorkloadRef) -> String {
     format!(
-        "/projects/{project_slug}/telemetry-logs?attribute_key={}&attribute_value={}",
-        records::PLATFORM_WORKLOAD_ATTRIBUTE,
-        records::platform_workload(kind, public_id)
+        "/projects/{project_slug}/telemetry-logs?workload_kind={}&workload_id={}",
+        workload.kind.as_str(),
+        workload.id
     )
 }

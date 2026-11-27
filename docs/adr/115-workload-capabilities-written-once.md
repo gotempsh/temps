@@ -124,9 +124,10 @@ How traffic reaches the proxy is the one part that really differs:
     calls its siblings by names only its Docker network resolves, often
     named only in its code, and no bypass list can exempt "every name
     without a dot" for every client;
-  - a deployment or image that already routes HTTPS through a proxy of its
-    own (`HTTPS_PROXY`, or `ALL_PROXY`, which a scheme-specific variable
-    would override) keeps it and is not recorded;
+  - a deployment or image that already goes through a proxy of its own
+    (`HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY`) keeps it and is not
+    recorded: a steered `HTTPS_PROXY` would override its HTTPS route, and
+    the `NO_PROXY` steering writes applies to plain HTTP too;
   - it applies to containers started after it is turned on, and turning it
     off stops recording at once without touching running containers;
   - only clients that honour the proxy variables are recorded;

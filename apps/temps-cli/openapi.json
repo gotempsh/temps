@@ -147715,6 +147715,25 @@
             }
           },
           {
+            "description": "Only what the platform recorded about one workload of the project (sandbox, deployment, ...); pair with workload_id. Its own logs never match",
+            "in": "query",
+            "name": "workload_kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The workload's numeric id; pair with workload_kind",
+            "in": "query",
+            "name": "workload_id",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
             "description": "Start time (RFC 3339)",
             "in": "query",
             "name": "start_time",
@@ -147774,7 +147793,7 @@
                 }
               }
             },
-            "description": "Invalid log attribute filter"
+            "description": "Invalid log attribute or workload filter"
           },
           "401": {
             "content": {
@@ -169041,7 +169060,7 @@
         ]
       },
       "put": {
-        "description": "With recording on, containers of the environment's deployments are\nstarted with the per-node egress proxy as their HTTPS proxy, and every\nconnection they make through it produces one OpenTelemetry log record\nwhen it ends, allowed or refused: destination (`server.address`,\n`server.port`), outcome and refusal reason, bytes each way and duration.\nNever headers, bodies or query strings. Off by default.\n\nIt applies to containers started after it is turned on: redeploy the\nenvironment to start recording. Turning it off stops recording at once.\nOnly clients that honour the proxy variables are recorded, and only\nHTTPS to public destinations goes through the proxy: plain HTTP,\ninternal addresses and names stay direct, and a deployment (or image)\nthat sets its own `HTTPS_PROXY` or `ALL_PROXY` keeps it and is not\nrecorded. While it is on, the environment's outbound HTTPS depends on\nthe node's egress proxy being up. Turning it on fails with 422 when\nno node the environment runs on can record, naming the environment, the\nnode and what is missing, or when it is a Docker Compose environment,\nwhose containers are never sent through the proxy (`reason_code` is then\n`not_recordable`).",
+        "description": "With recording on, containers of the environment's deployments are\nstarted with the per-node egress proxy as their HTTPS proxy, and every\nconnection they make through it produces one OpenTelemetry log record\nwhen it ends, allowed or refused: destination (`server.address`,\n`server.port`), outcome and refusal reason, bytes each way and duration.\nNever headers, bodies or query strings. Off by default.\n\nIt applies to containers started after it is turned on: redeploy the\nenvironment to start recording. Turning it off stops recording at once.\nOnly clients that honour the proxy variables are recorded, and only\nHTTPS to public destinations goes through the proxy: plain HTTP,\ninternal addresses and names stay direct, and a deployment (or image)\nthat sets its own `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` keeps it\nand is not recorded. While it is on, the environment's outbound HTTPS depends on\nthe node's egress proxy being up. Turning it on fails with 422 when\nno node the environment runs on can record, naming the environment, the\nnode and what is missing, or when it is a Docker Compose environment,\nwhose containers are never sent through the proxy (`reason_code` is then\n`not_recordable`).",
         "operationId": "set_environment_egress_recording",
         "parameters": [
           {

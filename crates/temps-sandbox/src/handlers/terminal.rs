@@ -361,23 +361,34 @@ fn wrap_shell(cmd: &str, environ: Option<&str>) -> String {
     let quoted = cmd.replace('\'', r"'\''");
     let import = match environ {
         // Entries in `environ` end with NUL and a value may hold newlines
-        // (a PEM certificate). Newlines become \001 and NULs newlines, so
-        // each line is one whole entry; \001 is turned back into newlines
-        // in the few values that had any. The trailing `x` keeps a value's
+        // (a PEM certificate), which a shell line cannot. Each entry is read
+        // twice, one line per entry: with its newlines as \001 (fd 3) and as
+        // \002 (fd 4). A value with no literal \001 is decoded from the
+        // first, one with a literal \001 but no \002 from the second, so
+        // every value arrives exactly as it was; one holding both is left
+        // out rather than imported changed. The trailing `x` keeps a value's
         // own trailing newline through the command substitution.
         Some(path) => format!(
             "if [ -r {path} ]; then __temps_import_soh=$(printf '\\001'); \
-             while IFS= read -r __temps_import_kv; do \
+             __temps_import_stx=$(printf '\\002'); \
+             while IFS= read -r __temps_import_kv <&3 && IFS= read -r __temps_import_kvs <&4; do \
              case \"${{__temps_import_kv%%=*}}\" in \
              {KEEP_SHELL_VARS}|__temps_import_*|\"\"|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; \
              eval \"__temps_import_set=\\${{${{__temps_import_kv%%=*}}+x}}\"; \
              [ -n \"$__temps_import_set\" ] && continue; \
-             case \"$__temps_import_kv\" in *\"$__temps_import_soh\"*) \
+             case \"$__temps_import_kvs\" in \
+             *\"$__temps_import_soh\"*) \
+             case \"$__temps_import_kv\" in *\"$__temps_import_stx\"*) continue ;; esac; \
+             __temps_import_kv=$(printf '%sx' \"$__temps_import_kvs\" | tr '\\002' '\\n'); \
+             __temps_import_kv=${{__temps_import_kv%x}} ;; \
+             *) case \"$__temps_import_kv\" in *\"$__temps_import_soh\"*) \
              __temps_import_kv=$(printf '%sx' \"$__temps_import_kv\" | tr '\\001' '\\n'); \
-             __temps_import_kv=${{__temps_import_kv%x}} ;; esac; \
+             __temps_import_kv=${{__temps_import_kv%x}} ;; esac ;; esac; \
              export \"$__temps_import_kv\" 2>/dev/null; \
-             done <<TEMPS_ENVIRON\n$(tr '\\n\\000' '\\001\\n' < {path})\nTEMPS_ENVIRON\n\
-             unset __temps_import_kv __temps_import_soh __temps_import_set; fi; "
+             done 3<<TEMPS_ENVIRON 4<<TEMPS_ENVIRON_STX\n$(tr '\\n\\000' '\\001\\n' < {path})\nTEMPS_ENVIRON\n\
+             $(tr '\\n\\000' '\\002\\n' < {path})\nTEMPS_ENVIRON_STX\n\
+             unset __temps_import_kv __temps_import_kvs __temps_import_soh __temps_import_stx \
+             __temps_import_set; fi; "
         ),
         None => String::new(),
     };
@@ -1191,9 +1202,9 @@ mod tests {
     }
 
     /// A variable the shell already has (a newer agent passes the
-    /// environment on) is left as it is: the import cannot tell a value's
-    /// own SOH byte from an encoded newline, so it must never replace a
-    /// value that arrived whole. One the shell lacks is still imported.
+    /// environment on) is left as it is: a value that arrived whole is
+    /// never replaced by one decoded from `environ`. One the shell lacks is
+    /// still imported.
     #[test]
     fn an_inherited_value_is_never_replaced() {
         let value = "a\u{1}b";
@@ -1203,6 +1214,29 @@ mod tests {
             &[("SAMPLE", value)],
         );
         assert_eq!(out, format!("[{value}][imported]"));
+    }
+
+    /// A value's own control bytes survive the import when the shell lacks
+    /// it: a literal SOH is never turned into a newline, with or without
+    /// real newlines beside it. A value holding both SOH and STX cannot be
+    /// told apart from its encodings and is left out, never imported
+    /// changed; its neighbours are untouched.
+    #[test]
+    fn literal_control_bytes_are_imported_exactly() {
+        let soh = "a\u{1}b";
+        let soh_and_newlines = "line one\n\u{1}tagged\nline three\n";
+        let ambiguous = "x\u{1}y\u{2}z\n";
+        let out = shell_output_after_import(
+            &[
+                ("SOH", soh),
+                ("MIXED", soh_and_newlines),
+                ("AMBIGUOUS", ambiguous),
+                ("AFTER", "kept"),
+            ],
+            "printf '[%s][%s][%s][%s]' \"$SOH\" \"$MIXED\" \"${AMBIGUOUS-unset}\" \"$AFTER\"",
+            &[],
+        );
+        assert_eq!(out, format!("[{soh}][{soh_and_newlines}][unset][kept]"));
     }
 
     /// A name a process environment can hold but a shell cannot export

@@ -892,11 +892,20 @@ impl NodeEnforcer {
     /// snapshot (an older control plane) nothing is observed, as before.
     /// A failed observation leaves the table empty and the pass succeeds:
     /// observing must never make a node that does not filter fail.
+    ///
+    /// In `off` the table serves only recording (nothing is filtered), and
+    /// what is observed is reported to no one who reads it: with no policy
+    /// that records, the containers are not listed at all, so an idle node
+    /// costs nothing per pass whatever it runs.
     async fn observe_only(&mut self) -> Result<(), EnforcerError> {
         let Some(snapshot) = self.policies.off_snapshot().await? else {
             self.egress.store(Arc::new(EgressTable::default()));
             return Ok(());
         };
+        if !snapshot.egress.iter().any(|policy| policy.record) {
+            self.egress.store(Arc::new(EgressTable::default()));
+            return Ok(());
+        }
         match self.observe(&snapshot).await {
             Ok(observed) => {
                 self.publish_egress(&snapshot, &observed.local, &observed.identities);
@@ -2140,6 +2149,28 @@ mod tests {
                 .any(|a| a == "10.237.1.2".parse::<IpAddr>().unwrap()),
             "the observation is reported in off too"
         );
+    }
+
+    /// In `off` with no policy that records, the egress table would serve
+    /// nothing and the observation is read by no one: the containers are
+    /// not listed at all, so an idle node costs nothing per pass.
+    #[tokio::test]
+    async fn off_without_recording_lists_no_containers() {
+        let mut h = harness(NodeMode::Off);
+        let mut snapshot = harness_snapshot();
+        for policy in &mut snapshot.egress {
+            policy.record = false;
+        }
+        assert!(!snapshot.egress.is_empty(), "rules, but none records");
+        h.policies.set_snapshot(snapshot);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Off);
+        assert_eq!(
+            h.instances.observed.load(Ordering::Relaxed),
+            0,
+            "no Docker call"
+        );
+        assert!(h.egress.load().is_empty());
     }
 
     /// A source with no snapshot in `off`: an older control plane.

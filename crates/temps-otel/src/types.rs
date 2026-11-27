@@ -1465,10 +1465,11 @@ pub struct MetricQuery {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogQuery {
     pub project_id: i32,
-    /// Only the records the platform stored about this workload, whatever
-    /// project owns them (`project_id` is then not applied: a workload's
-    /// records are its own, with or without a project). Never read from a
-    /// request: the caller sets it after authorizing access to the workload.
+    /// Only the records the platform stored about this workload. With
+    /// `project_id` 0 whatever project owns them (a workload's records are
+    /// its own, with or without a project): only a caller that authorized
+    /// access to the workload itself may ask that. With a project, within
+    /// that project too, which is what a project-scoped request may ask.
     #[serde(skip)]
     pub workload: Option<WorkloadRef>,
     pub severity: Option<LogSeverity>,

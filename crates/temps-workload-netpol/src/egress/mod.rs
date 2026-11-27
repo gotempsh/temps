@@ -1063,11 +1063,7 @@ impl EgressProxy {
                         return Ended::failed(Some(request));
                     }
                 };
-                let authority = if port == 80 {
-                    host.clone()
-                } else {
-                    format!("{host}:{port}")
-                };
+                let authority = host_authority(host, port);
                 let head = rewrite_head(&request, path, &authority, &mut down_buf);
                 let Some(head_len_out) = head else {
                     self.stats.malformed.fetch_add(1, Ordering::Relaxed);
@@ -1655,6 +1651,21 @@ pub fn relay_target(method: &str, target: &str) -> Option<String> {
 
 /// Writes `METHOD path HTTP/1.1`, the kept headers, `Host` and
 /// `Connection: close` into `out`. `None` when it does not fit.
+/// The `Host` value for `host`:`port` (RFC 9110 §7.2): the port only when
+/// it is not 80, and an IPv6 literal in brackets, as the request named it
+/// before parsing took the brackets off.
+fn host_authority(host: &str, port: u16) -> String {
+    let host = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => format!("[{v6}]"),
+        _ => host.to_string(),
+    };
+    if port == 80 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn rewrite_head(request: &ParsedRequest, path: &str, host: &str, out: &mut [u8]) -> Option<usize> {
     let mut len = 0;
     let mut push = |bytes: &[u8]| -> Option<()> {

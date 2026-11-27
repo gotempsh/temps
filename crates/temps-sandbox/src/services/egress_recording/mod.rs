@@ -84,11 +84,22 @@ impl crate::services::sandbox_service::EgressPolicyObserver for RecorderPolicyRe
     async fn policy_changed(&self, row: &sandboxes::Model) {
         // Only this host's recorder decides for this host's sandboxes.
         if row.node_id.is_none() {
+            let Some(recorder) = self.recorder.upgrade() else {
+                return;
+            };
+            // The stored policy first, from the row in hand: in force even
+            // if the refresh below cannot read the rows or list the
+            // sidecars, so an update that answered done is never refused
+            // by a recorder still holding the old rules.
+            if row.egress_recording {
+                let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(row.id));
+                recorder
+                    .amend_policy(policy::proxy_policy(subject, &row.egress_policy.0))
+                    .await;
+            }
             // A policy change does not move the revision the rows are
             // cached at: read them again.
-            if let Some(recorder) = self.recorder.upgrade() {
-                recorder.rediscover().await;
-            }
+            recorder.rediscover().await;
         }
     }
 }

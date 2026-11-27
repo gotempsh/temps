@@ -221,12 +221,33 @@ pub struct EgressRecordingNodeState {
     pub service: Arc<EgressRecordingService>,
 }
 
+/// How long a node's batch body may take to arrive once the request holds
+/// an ingest slot. A batch is at most [`MAX_BATCH_BODY`]; past this the
+/// request is refused and its slot freed, so stalled uploads cannot keep
+/// the telemetry ingest limit taken from everything else.
+pub const BATCH_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The worker endpoint: `POST /internal/nodes/{node_id}/egress-records`.
 pub fn node_routes(state: Arc<EgressRecordingNodeState>) -> Router {
+    node_routes_with(state, BATCH_BODY_TIMEOUT)
+}
+
+/// [`node_routes`] with the body read deadline `body_timeout`.
+pub fn node_routes_with(
+    state: Arc<EgressRecordingNodeState>,
+    body_timeout: std::time::Duration,
+) -> Router {
     Router::new()
         .route(
             "/internal/nodes/{node_id}/egress-records",
-            post(ingest_node_records),
+            post(
+                move |state: State<Arc<EgressRecordingNodeState>>,
+                      node: Path<i32>,
+                      headers: HeaderMap,
+                      body: Body| {
+                    ingest_node_records(state, node, headers, body, body_timeout)
+                },
+            ),
         )
         .layer(DefaultBodyLimit::max(MAX_BATCH_BODY))
         .with_state(state)
@@ -237,6 +258,7 @@ async fn ingest_node_records(
     Path(node_id): Path<i32>,
     headers: HeaderMap,
     body: Body,
+    body_timeout: std::time::Duration,
 ) -> Result<Json<EgressIngestOutcome>, Problem> {
     // Authenticated, and a slot of the telemetry ingest limit taken, before
     // the body is read: neither a stranger nor a burst of batches makes the
@@ -251,16 +273,25 @@ async fn ingest_node_records(
                 .with_detail(detail)
         })?;
     let _permit = state.service.try_acquire_ingest_permit(node_id)?;
-    let body = axum::body::to_bytes(body, MAX_BATCH_BODY)
+    let read = tokio::time::timeout(body_timeout, axum::body::to_bytes(body, MAX_BATCH_BODY))
         .await
-        .map_err(|e| {
-            problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
-                .with_title("Egress Record Batch Too Large")
+        .map_err(|_| {
+            problemdetails::new(StatusCode::REQUEST_TIMEOUT)
+                .with_title("Egress Record Batch Not Received In Time")
                 .with_detail(format!(
-                    "egress record batch from node {node_id} was not read: over \
-                     {MAX_BATCH_BODY} bytes or cut short: {e}"
+                    "egress record batch from node {node_id} did not arrive within {}s; \
+                     its telemetry ingest slot is freed",
+                    body_timeout.as_secs()
                 ))
         })?;
+    let body = read.map_err(|e| {
+        problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+            .with_title("Egress Record Batch Too Large")
+            .with_detail(format!(
+                "egress record batch from node {node_id} was not read: over \
+                     {MAX_BATCH_BODY} bytes or cut short: {e}"
+            ))
+    })?;
     let batch: EgressRecordBatch = serde_json::from_slice(&body).map_err(|e| {
         problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Egress Record Batch")

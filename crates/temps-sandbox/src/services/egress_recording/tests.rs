@@ -369,9 +369,7 @@ async fn an_owner_turns_recording_on_and_off_for_a_sandbox_with_or_without_a_pro
     assert_eq!(status.nodes[0].node_name, "worker-a");
     assert_eq!(
         status.logs_path.as_deref(),
-        Some(
-            "/projects/sample-agent/telemetry-logs?attribute_key=temps.platform.workload&attribute_value=sandbox/sbx_00000000000a4101"
-        )
+        Some("/projects/sample-agent/telemetry-logs?workload_kind=sandbox&workload_id=4101")
     );
 
     let (previous, status) = sandboxes

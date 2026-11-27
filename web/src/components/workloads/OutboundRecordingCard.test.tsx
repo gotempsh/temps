@@ -46,7 +46,7 @@ function status(over: Partial<EgressRecordingStatus>): EgressRecordingStatus {
     nodes: [node({})],
     project_id: 7,
     logs_path:
-      '/projects/agent/telemetry-logs?attribute_key=temps.platform.workload&attribute_value=sandbox/sbx_1',
+      '/projects/agent/telemetry-logs?workload_kind=sandbox&workload_id=1',
     ...over,
   }
 }
@@ -80,7 +80,7 @@ test('turning recording on sends the switch and links to the records', async () 
   expect(body).toEqual({ enabled: true })
   const link = card.getByRole('link', { name: 'Open recorded connections' })
   expect(link.getAttribute('href')).toContain(
-    'attribute_key=temps.platform.workload&attribute_value=sandbox/sbx_1'
+    'workload_kind=sandbox&workload_id=1'
   )
   api.restore()
 })

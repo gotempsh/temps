@@ -592,7 +592,7 @@ impl DeployImageJob {
                     context,
                     format!(
                         "Outbound connection recording is on for this environment, but the \
-                         deployment or its image routes HTTPS through a proxy of its own ({}), \
+                         deployment or its image goes through a proxy of its own ({}), \
                          which is kept: its connections are not recorded",
                         steering.kept.join(", ")
                     ),
@@ -2139,13 +2139,13 @@ mod tests {
                 ImageWithEnv(Some(vec![
                     "HTTPS_PROXY=http://image-proxy.example.com:8080".to_string(),
                 ])),
-                "routes HTTPS through a proxy of its own (HTTPS_PROXY)",
+                "goes through a proxy of its own (HTTPS_PROXY)",
             ),
             (
                 ImageWithEnv(Some(vec![
                     "ALL_PROXY=socks5://image-proxy.example.com:1080".to_string(),
                 ])),
-                "routes HTTPS through a proxy of its own (ALL_PROXY)",
+                "goes through a proxy of its own (ALL_PROXY)",
             ),
             (
                 ImageWithEnv(None),

@@ -270,6 +270,9 @@ impl NetworkPolicyService {
             _ => "unknown".to_string(),
         };
         let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        // Expired reports are never read again: dropped, so worker churn
+        // leaves nothing behind.
+        reports.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
         reports.insert(
             node_id,
             EnforcerReport {
@@ -284,6 +287,16 @@ impl NetworkPolicyService {
     /// `node_id`'s compute subnet, see [`Self::node_snapshot`]). A report
     /// over [`MAX_REPORTED_ADDRESSES`] is refused with a warning, so one
     /// broken node cannot grow every other node's maps.
+    /// Drops what `node_id` last reported observing: it is switched `off`,
+    /// so no other node may keep taking its workloads' addresses (which it
+    /// may hand to another workload) as peers until the report expires.
+    pub fn forget_observed(&self, node_id: i32) {
+        self.observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node_id);
+    }
+
     pub fn record_observed(&self, node_id: i32, identities: IdentityMap, mode: NodeMode) {
         let count = identities.address_count();
         if count > MAX_REPORTED_ADDRESSES {
@@ -851,6 +864,9 @@ impl NetworkPolicyService {
                 .map_err(NetworkPolicyError::db(
                     "set the control plane's network policy mode",
                 ))?;
+            if mode == NodeMode::Off {
+                self.forget_observed(node_id);
+            }
             let entry = self
                 .node_modes()
                 .await?
@@ -880,6 +896,9 @@ impl NetworkPolicyService {
             .await
             .map_err(NetworkPolicyError::db("set a node's network policy mode"))?;
         let stored = parse_mode(node.id, &node.network_policy_mode)?;
+        if stored == NodeMode::Off {
+            self.forget_observed(node.id);
+        }
         Ok((
             previous,
             self.mode_entry(node.id, node.name, node.role, node.status, stored),
@@ -1514,6 +1533,10 @@ mod remote_tests {
             },
         );
         assert!(!service.supports_enforcement(3));
+        // The next report sweeps the stale one: worker churn leaves nothing.
+        service.record_enforcer_report(4, "ebpf");
+        let kept: Vec<i32> = service.reports.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, [4]);
     }
 
     fn function_rule(id: i64) -> NewRule {
@@ -2040,8 +2063,20 @@ mod tests {
         );
 
         // The snapshot a node enforces.
+        // What node 0 advertised in another mode is dropped once its source
+        // reads `off`: no worker keeps it as a peer until the report expires.
+        service.record_observed(
+            CONTROL_PLANE_NODE_ID,
+            IdentityMap::new().with(sandbox_ref, "10.202.0.9".parse().unwrap()),
+            NodeMode::Enforce,
+        );
+        assert!(!service.observed_elsewhere(7).is_empty());
         let source = DbPolicySource::new(service.clone(), CONTROL_PLANE_NODE_ID);
         assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert!(
+            service.observed_elsewhere(7).is_empty(),
+            "switched off, node 0's last report is forgotten"
+        );
         assert!(
             source.off_snapshot().await.unwrap().is_none(),
             "in off nothing reads what the control plane would observe"
@@ -2100,7 +2135,19 @@ mod tests {
             );
         }
         assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Off);
+        service.record_observed(
+            worker,
+            IdentityMap::new().with(sandbox_ref, "10.202.0.10".parse().unwrap()),
+            NodeMode::Shadow,
+        );
         service.set_node_mode(worker, NodeMode::Off).await.unwrap();
+        assert!(
+            service
+                .observed_elsewhere(CONTROL_PLANE_NODE_ID)
+                .iter()
+                .all(|(id, _)| *id != worker),
+            "switching a worker off forgets what it observed"
+        );
         // A worker `enforce` stored before the refusal is never reported
         // as enforcing; the control plane is.
         c.execute_unprepared(&format!(

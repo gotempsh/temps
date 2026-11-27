@@ -204,6 +204,10 @@ pub struct LogQueryParams {
     pub attribute_value: Option<String>,
     pub attribute_type: Option<LogAttributeType>,
     pub attribute_op: Option<LogAttributeOperator>,
+    /// Only what the platform recorded about this workload (its kind and
+    /// numeric id), within the project. Pair with `workload_id`.
+    pub workload_kind: Option<String>,
+    pub workload_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1231,6 +1235,8 @@ pub async fn get_trace(
         ("attribute_type" = Option<LogAttributeType>, Query, description = "Optional native declared type; older records without type metadata do not match"),
         ("attribute_op" = Option<LogAttributeOperator>, Query, description = "Default eq; numeric types also support lt/lte/gt/gte"),
         ("trace_id" = Option<String>, Query, description = "Filter by correlated trace ID"),
+        ("workload_kind" = Option<String>, Query, description = "Only what the platform recorded about one workload of the project (sandbox, deployment, ...); pair with workload_id. Its own logs never match"),
+        ("workload_id" = Option<i64>, Query, description = "The workload's numeric id; pair with workload_kind"),
         ("start_time" = Option<String>, Query, description = "Start time (RFC 3339)"),
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("limit" = Option<u64>, Query, description = "Max logs to return (default: 100, max: 1000)"),
@@ -1238,7 +1244,7 @@ pub async fn get_trace(
     ),
     responses(
         (status = 200, description = "Log records", body = LogsResponse),
-        (status = 400, description = "Invalid log attribute filter", body = ProblemDetails),
+        (status = 400, description = "Invalid log attribute or workload filter", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails),
@@ -1284,8 +1290,25 @@ pub async fn query_logs(
     } else {
         None
     };
+    let workload = match (params.workload_kind.as_deref(), params.workload_id) {
+        (None, None) => None,
+        (Some(kind), Some(id)) => Some(temps_workload::WorkloadRef::new(
+            kind.parse().map_err(|_| OtelError::Validation {
+                message: format!("Unknown workload_kind '{kind}'"),
+            })?,
+            id,
+        )),
+        _ => {
+            return Err(OtelError::Validation {
+                message: "Provide both workload_kind and workload_id for a workload filter".into(),
+            }
+            .into())
+        }
+    };
+    // A workload filter never reaches past the project: with a project
+    // set, the store applies both.
     let query = LogQuery {
-        workload: None,
+        workload,
         project_id: params.project_id,
         attribute_filter,
         severity,

@@ -76051,6 +76051,14 @@ export type QueryLogsData = {
          */
         trace_id?: string;
         /**
+         * Only what the platform recorded about one workload of the project (sandbox, deployment, ...); pair with workload_id. Its own logs never match
+         */
+        workload_kind?: string;
+        /**
+         * The workload's numeric id; pair with workload_kind
+         */
+        workload_id?: number;
+        /**
          * Start time (RFC 3339)
          */
         start_time?: string;
@@ -76072,7 +76080,7 @@ export type QueryLogsData = {
 
 export type QueryLogsErrors = {
     /**
-     * Invalid log attribute filter
+     * Invalid log attribute or workload filter
      */
     400: ProblemDetails;
     /**

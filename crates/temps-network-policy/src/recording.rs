@@ -97,6 +97,10 @@ impl NetworkPolicyService {
         capability: Option<EgressRecordingCapability>,
     ) {
         let mut reports = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+        // A report past its TTL is never read again (a removed worker's,
+        // one that stopped polling): dropped here, so worker churn leaves
+        // nothing behind. O(nodes) per poll.
+        reports.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
         reports.insert(
             node_id,
             RecordingReport {
@@ -154,6 +158,19 @@ mod tests {
         NetworkPolicyService::new(Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
         ))
+    }
+
+    /// A removed worker's report is dropped by the next one any node
+    /// sends, so worker churn leaves nothing behind; a fresh one stays.
+    #[test]
+    fn expired_reports_are_swept() {
+        let service = service();
+        service.record_egress_recording(3, Some(EgressRecordingCapability::Available));
+        service.recording.lock().unwrap().get_mut(&3).unwrap().seen =
+            Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.record_egress_recording(4, Some(EgressRecordingCapability::Available));
+        let kept: Vec<i32> = service.recording.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, [4]);
     }
 
     #[test]

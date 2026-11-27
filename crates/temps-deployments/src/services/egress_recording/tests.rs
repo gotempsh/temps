@@ -384,9 +384,7 @@ async fn an_environment_records_where_one_of_its_nodes_can() {
     assert_eq!(status.project_id, Some(PROJECT));
     assert_eq!(
         status.logs_path.as_deref(),
-        Some(
-            "/projects/shop/telemetry-logs?attribute_key=temps.platform.workload&attribute_value=deployment/6101"
-        )
+        Some("/projects/shop/telemetry-logs?workload_kind=deployment&workload_id=6101")
     );
     let nodes: Vec<(&str, bool, Option<&str>)> = status
         .nodes

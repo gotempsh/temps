@@ -16110,6 +16110,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "futures",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",

@@ -70,6 +70,12 @@ impl PolicySource for DbPolicySource {
                 reason: e.to_string(),
             })?;
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = (mode, revision);
+        if mode == NodeMode::Off {
+            // In `off` nothing is observed (`off_snapshot` is None), so what
+            // this node advertised in another mode is dropped now, however
+            // the mode changed, rather than left to its TTL.
+            self.service.forget_observed(self.node_id);
+        }
         Ok(mode)
     }
 

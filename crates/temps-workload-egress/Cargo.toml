@@ -36,6 +36,8 @@ utoipa = { workspace = true, features = ["chrono"] }
 temps-test-utils = { path = "../temps-test-utils" }
 # Handler tests send requests through the router.
 tower = { workspace = true }
+# A request body that stalls, for the body read deadline.
+futures = { workspace = true }
 
 [lints]
 workspace = true

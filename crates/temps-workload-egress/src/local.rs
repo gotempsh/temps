@@ -608,6 +608,43 @@ impl LocalEgressRecorder {
         self.refresh_in_turn(true).await;
     }
 
+    /// Puts `policy` in force for its workload at once, in the table the
+    /// recorder holds, without reading any source: what a policy update
+    /// stored must apply even if the refresh that follows cannot read the
+    /// rows or list the containers (that refresh keeps the last answer it
+    /// had, which now holds this policy). Nothing changes for a workload
+    /// the recorder does not hold.
+    pub async fn amend_policy(&self, policy: EgressPolicy) {
+        let _turn = self.refreshing.lock().await;
+        {
+            let mut last = lock(&self.last);
+            let Some(slot) = last.get_mut(&policy.subject.kind).and_then(|traffic| {
+                traffic
+                    .policies
+                    .iter_mut()
+                    .find(|held| held.subject == policy.subject)
+            }) else {
+                return;
+            };
+            *slot = policy;
+        }
+        let (policies, identities) = {
+            let last = lock(&self.last);
+            let mut policies = Vec::new();
+            let mut identities = IdentityMap::new();
+            for (kind, traffic) in last.iter() {
+                if self.serving.address(*kind).is_none() {
+                    continue;
+                }
+                identities.extend(&traffic.identities);
+                policies.extend(traffic.policies.iter().cloned());
+            }
+            (policies, identities)
+        };
+        self.table
+            .store(Arc::new(EgressTable::build(&policies, &identities)));
+    }
+
     /// Returns once a refresh that started after `since` has finished (one
     /// that discovered, with `discover`), running one if none has. Never
     /// more than one per [`ASKED_REFRESH_SPACING`]: callers in between wait
@@ -1114,6 +1151,66 @@ mod tests {
             *capability.0.lock().unwrap(),
             vec![true, false],
             "node 0 can record exactly while something is served"
+        );
+    }
+
+    /// A policy update puts its new rules in force at once: amended, the
+    /// table holds them even when the refresh that follows fails and keeps
+    /// the last answer. A workload the recorder does not hold is ignored.
+    #[tokio::test]
+    async fn an_amended_policy_holds_through_a_failed_refresh() {
+        let Some(f) = fixture().await else { return };
+        let (recorder, _) = recorder(&f);
+        let sandboxes = Source::new(WorkloadKind::Sandbox, "172.30.0.5");
+        lock(&recorder.sources).push(sandboxes.clone() as Arc<dyn LocalTraffic>);
+        recorder.set_serving(
+            WorkloadKind::Sandbox,
+            Ok("127.0.0.1:13128".parse().unwrap()),
+        );
+        recorder.refresh().await;
+        let admits = |host: &str| {
+            recorder
+                .table
+                .load()
+                .lookup("172.30.0.5".parse().unwrap())
+                .is_some_and(|rules| rules.check_host(host, 443).is_ok())
+        };
+        assert!(admits("api.example.com"), "the source allows everything");
+
+        let subject = WorkloadRef::new(WorkloadKind::Sandbox, 1);
+        let narrowed = EgressPolicy {
+            subject,
+            rules: vec![EgressRule {
+                id: 1,
+                target: EgressTarget::Host(HostPattern::parse("api.example.com").unwrap()),
+                ports: None,
+                action: Action::Allow,
+            }],
+            record: true,
+            public_only: true,
+        };
+        sandboxes.fail.store(true, Ordering::SeqCst);
+        recorder.amend_policy(narrowed.clone()).await;
+        recorder.rediscover().await;
+        assert!(admits("api.example.com"));
+        assert!(
+            !admits("other.example.com"),
+            "the stored policy holds though the refresh failed"
+        );
+
+        recorder
+            .amend_policy(EgressPolicy {
+                subject: WorkloadRef::new(WorkloadKind::Sandbox, 99),
+                ..narrowed
+            })
+            .await;
+        assert!(
+            recorder
+                .table
+                .load()
+                .lookup("172.30.0.5".parse().unwrap())
+                .is_some_and(|rules| rules.workload == subject),
+            "a workload it does not hold changes nothing"
         );
     }
 

@@ -9,11 +9,16 @@
 //! activity never needs its project's logs filtered by attribute, and a
 //! workload without a project still has its activity.
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use temps_otel::log_attributes::{LogAttributeFilter, LogAttributeOperator};
 use temps_otel::types::{LogQuery, LogRecord};
 use utoipa::ToSchema;
+
+use temps_workload::WorkloadRef;
 
 use crate::adapter::RecordedWorkload;
 use crate::error::EgressRecordingError;
@@ -25,7 +30,7 @@ pub const DEFAULT_PER_PAGE: u64 = 20;
 pub const MAX_PER_PAGE: u64 = 100;
 
 /// Only the connections that ended this way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressOutcomeFilter {
     Allowed,
@@ -134,6 +139,52 @@ pub struct EgressActivityPage {
     pub has_more: bool,
 }
 
+/// How long a workload's record count is reused. The count is an exact
+/// scan of everything the workload recorded; the console asks for the first
+/// page every 10 seconds while recording is on, from every tab. The records
+/// on a page are always read fresh: only "of N" can lag, by this much.
+pub const TOTAL_REUSE: Duration = Duration::from_secs(30);
+
+/// The most counts kept; past it the expired ones are dropped, and all of
+/// them if none has expired. One per workload and filter being viewed.
+const MAX_CACHED_TOTALS: usize = 1024;
+
+/// What a count is kept for: a workload and an outcome filter.
+type TotalKey = (WorkloadRef, Option<EgressOutcomeFilter>);
+
+/// Recent record counts, with when each was counted.
+#[derive(Default)]
+pub(crate) struct RecentTotals(std::sync::Mutex<HashMap<TotalKey, (u64, Instant)>>);
+
+impl RecentTotals {
+    fn get(&self, workload: WorkloadRef, outcome: Option<EgressOutcomeFilter>) -> Option<u64> {
+        let totals = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        totals
+            .get(&(workload, outcome))
+            .filter(|(_, at)| at.elapsed() < TOTAL_REUSE)
+            .map(|(total, _)| *total)
+    }
+
+    fn put(&self, workload: WorkloadRef, outcome: Option<EgressOutcomeFilter>, total: u64) {
+        let mut totals = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if totals.len() >= MAX_CACHED_TOTALS {
+            totals.retain(|_, (_, at)| at.elapsed() < TOTAL_REUSE);
+            if totals.len() >= MAX_CACHED_TOTALS {
+                totals.clear();
+            }
+        }
+        totals.insert((workload, outcome), (total, Instant::now()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire(&self) {
+        let mut totals = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, at) in totals.values_mut() {
+            *at = Instant::now() - TOTAL_REUSE;
+        }
+    }
+}
+
 impl EgressRecordingService {
     /// A page of `workload`'s recorded outbound connections, newest first.
     /// The caller has resolved the workload and checked the user may see
@@ -181,7 +232,14 @@ impl EgressRecordingService {
             id: workload.public_id.clone(),
             source,
         };
-        let total = store.count(query.clone()).await.map_err(unreadable)?;
+        let total = match self.totals.get(workload.workload, outcome) {
+            Some(total) => total,
+            None => {
+                let total = store.count(query.clone()).await.map_err(unreadable)?;
+                self.totals.put(workload.workload, outcome, total);
+                total
+            }
+        };
         if offset.is_none() {
             return Ok(EgressActivityPage {
                 workload_kind: workload.workload.kind.as_str().to_string(),

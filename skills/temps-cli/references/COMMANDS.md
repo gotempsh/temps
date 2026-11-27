@@ -11821,6 +11821,8 @@ Query log records with optional filters
 | `--attribute-type <value>` | Optional native declared type; older records without type metadata do not match (one of: string, boolean, integer, double, array, object, bytes) | - | No |
 | `--attribute-op <value>` | Default eq; numeric types also support lt/lte/gt/gte (one of: eq, ne, lt, lte, gt, gte) | - | No |
 | `--trace-id <value>` | Filter by correlated trace ID | - | No |
+| `--workload-kind <value>` | Only what the platform recorded about one workload of the project (sandbox, deployment, ...); pair with workload_id | - | No |
+| `--workload-id <n>` | The workload's numeric id; pair with workload_kind | - | No |
 | `--start-time <value>` | Start time (RFC 3339) | - | No |
 | `--end-time <value>` | End time (RFC 3339) | - | No |
 | `--limit <n>` | Max logs to return (default: 100, max: 1000) | - | No |

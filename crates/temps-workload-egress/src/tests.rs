@@ -339,9 +339,7 @@ async fn recording_is_off_by_default_and_reports_whether_it_can_work() {
     assert!(status.nodes[0].recording);
     assert_eq!(
         status.logs_path.as_deref(),
-        Some(
-            "/projects/sample-agent/telemetry-logs?attribute_key=temps.platform.workload&attribute_value=sandbox/box_4101"
-        )
+        Some("/projects/sample-agent/telemetry-logs?workload_kind=sandbox&workload_id=4101")
     );
 
     let mac = service.status(&f.row(ON_OTHER_WORKER)).await.unwrap();
@@ -1252,4 +1250,105 @@ async fn the_node_endpoint_refuses_batches_while_telemetry_ingest_is_saturated()
     assert_eq!(accepted.status(), StatusCode::OK);
     assert_eq!(store.inner.0.lock().unwrap().len(), 1);
     assert_eq!(permits.available_permits(), 1, "the slot is given back");
+}
+
+/// A node upload that stalls mid-body is refused once the read deadline
+/// passes, and gives its telemetry ingest slot back, so stalled uploads
+/// cannot keep ordinary telemetry refused as saturated.
+#[tokio::test]
+async fn a_stalled_node_upload_frees_its_ingest_slot() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use tower::ServiceExt;
+
+    let Some(f) = fixture().await else { return };
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let store = Arc::new(OverQuota {
+        inner: CollectStore::default(),
+        over: -1,
+        unchecked: false,
+        permits: Some(permits.clone()),
+    });
+    let service = f.with_store(Some(store.clone()));
+    let app = crate::handlers::node_routes_with(
+        Arc::new(crate::handlers::EgressRecordingNodeState { service }),
+        std::time::Duration::from_millis(300),
+    );
+    let stalled = futures::stream::once(async {
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"{\"records\":["))
+    })
+    .chain(futures::stream::pending());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/internal/nodes/{}/egress-records", f.worker_a))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {NODE_TOKEN}"))
+                .body(Body::from_stream(stalled))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(permits.available_permits(), 1, "the slot is given back");
+    assert!(store.inner.0.lock().unwrap().is_empty());
+}
+
+/// The first page is polled every 10 seconds: its records are read fresh
+/// every time, but the exact count across the workload's history is reused
+/// for a short while, per workload and filter, then counted again.
+#[tokio::test]
+async fn a_polled_first_page_reuses_its_count_for_a_while() {
+    let Some(f) = fixture().await else { return };
+    let service = f.service_with_otel();
+    service
+        .set_enabled(&f.row(PROJECTLESS), true)
+        .await
+        .unwrap();
+    let ingest = |host: &'static str| {
+        let service = service.clone();
+        let worker = f.worker_a;
+        async move {
+            service
+                .ingest(
+                    worker,
+                    batch(vec![record(PROJECTLESS, host, ConnectionOutcome::Allowed)]),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    ingest("first.example.com").await;
+    let page = service
+        .activity(&f.row(PROJECTLESS), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!((page.total, page.records.len()), (1, 1));
+
+    ingest("second.example.com").await;
+    let page = service
+        .activity(&f.row(PROJECTLESS), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.records.len(), 2, "the records are read fresh");
+    assert_eq!(page.total, 1, "the count is reused");
+    let refused = service
+        .activity(
+            &f.row(PROJECTLESS),
+            None,
+            None,
+            Some(EgressOutcomeFilter::Refused),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.total, 0, "each filter has its own count");
+
+    service.totals.expire();
+    let page = service
+        .activity(&f.row(PROJECTLESS), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 2, "counted again once it is stale");
 }

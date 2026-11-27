@@ -1425,3 +1425,17 @@ async fn an_admitted_address_from_a_workload_without_a_sidecar_is_ignored() {
         .unwrap();
     assert_eq!(status_line(&mut client).await, "HTTP/1.1 403 Forbidden");
 }
+
+/// The `Host` sent upstream keeps an IPv6 literal's brackets (an origin
+/// that checks the authority rejects a bare one), and names the port only
+/// when it is not 80.
+#[test]
+fn the_upstream_host_brackets_an_ipv6_literal() {
+    assert_eq!(host_authority("2001:db8::1", 80), "[2001:db8::1]");
+    assert_eq!(host_authority("2001:db8::1", 8080), "[2001:db8::1]:8080");
+    assert_eq!(host_authority("203.0.113.5", 80), "203.0.113.5");
+    assert_eq!(
+        host_authority("api.example.com", 8443),
+        "api.example.com:8443"
+    );
+}

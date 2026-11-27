@@ -4401,10 +4401,25 @@ fn parse_span_row(row: &sea_orm::QueryResult) -> Result<SpanRecord, OtelError> {
 /// parameter index. Shared by the query and its count so both always apply
 /// exactly the same filters.
 fn log_filter(query: &LogQuery) -> StorageResult<(String, Vec<sea_orm::Value>, u32)> {
-    // A workload's records are read by the workload alone: they are its
-    // own whether or not a project owns them. Everything else is read by
-    // project.
+    // A workload's records are read by the workload: they are its own
+    // whether or not a project owns them, and only the platform fills those
+    // columns. With a project (> 0) they are read within it as well, so a
+    // project-scoped request naming a workload never reaches past its
+    // project. Everything else is read by project.
     let (mut where_clauses, mut values, mut param_idx) = match query.workload {
+        Some(workload) if query.project_id > 0 => (
+            vec![
+                "workload_kind = $1".to_string(),
+                "workload_id = $2".to_string(),
+                "project_id = $3".to_string(),
+            ],
+            vec![
+                sea_orm::Value::from(workload.kind.as_str().to_string()),
+                workload.id.into(),
+                sea_orm::Value::from(query.project_id),
+            ],
+            4u32,
+        ),
         Some(workload) => (
             vec![
                 "workload_kind = $1".to_string(),
@@ -4630,6 +4645,35 @@ mod tests {
     };
     use chrono::TimeZone;
     use std::collections::BTreeMap;
+
+    /// A workload filter from a project-scoped request reads that
+    /// workload's records within the project only; without a project (a
+    /// caller that authorized the workload itself) by the workload alone.
+    #[test]
+    fn a_workload_filter_stays_inside_its_project() {
+        let workload = temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 42);
+        let (sql, values, next) = log_filter(&LogQuery {
+            project_id: 7,
+            workload: Some(workload),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            sql.starts_with("workload_kind = $1 AND workload_id = $2 AND project_id = $3"),
+            "{sql}"
+        );
+        assert_eq!(values.len(), 3);
+        assert_eq!(next, 4);
+
+        let (sql, values, _) = log_filter(&LogQuery {
+            project_id: 0,
+            workload: Some(workload),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!sql.contains("project_id"), "{sql}");
+        assert_eq!(values.len(), 2);
+    }
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()

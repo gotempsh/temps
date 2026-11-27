@@ -22219,8 +22219,8 @@ export const getEnvironmentEgressRecordingOptions = (options: Options<GetEnviron
  * Only clients that honour the proxy variables are recorded, and only
  * HTTPS to public destinations goes through the proxy: plain HTTP,
  * internal addresses and names stay direct, and a deployment (or image)
- * that sets its own `HTTPS_PROXY` or `ALL_PROXY` keeps it and is not
- * recorded. While it is on, the environment's outbound HTTPS depends on
+ * that sets its own `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` keeps it
+ * and is not recorded. While it is on, the environment's outbound HTTPS depends on
  * the node's egress proxy being up. Turning it on fails with 422 when
  * no node the environment runs on can record, naming the environment, the
  * node and what is missing, or when it is a Docker Compose environment,

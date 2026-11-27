@@ -29,10 +29,13 @@
 //! in the workload's variables stays direct through `NO_PROXY`.
 //!
 //! **A workload's own proxy settings win.** When the workload, or the
-//! image it runs, already routes HTTPS through a proxy (`HTTPS_PROXY`, or
-//! `ALL_PROXY`, which clients use when no scheme-specific variable is set)
-//! nothing is steered: setting `HTTPS_PROXY` would take precedence over its
-//! route. Its `NO_PROXY` entries are kept in the merged list.
+//! image it runs, already goes through a proxy of its own (`HTTPS_PROXY`,
+//! `HTTP_PROXY`, or `ALL_PROXY`, which clients use when no scheme-specific
+//! variable is set) nothing is steered: a steered `HTTPS_PROXY` would take
+//! precedence over its HTTPS route, and the `NO_PROXY` steering writes
+//! applies to every scheme, so it would send plain HTTP its proxy carried
+//! (to a private service only that proxy reaches) direct. Its own
+//! `NO_PROXY` entries are kept in the merged list when it is steered.
 //!
 //! Any workload kind whose containers reach the network directly uses
 //! this; it is not specific to one.
@@ -92,10 +95,13 @@ pub fn steered_by(label: &str, installation: InstallationId) -> bool {
 /// they read.
 pub const STEERED_VARIABLES: (&str, &str) = ("HTTPS_PROXY", "https_proxy");
 
-/// Variables that already route a workload's HTTPS through a proxy of its
-/// own, in both cases: with any of them set nothing is steered.
-pub const OWN_HTTPS_ROUTE: [(&str, &str); 2] =
-    [("HTTPS_PROXY", "https_proxy"), ("ALL_PROXY", "all_proxy")];
+/// Variables that already route a workload through a proxy of its own, in
+/// both cases: with any of them set nothing is steered.
+pub const OWN_PROXY_ROUTE: [(&str, &str); 3] = [
+    ("HTTPS_PROXY", "https_proxy"),
+    ("HTTP_PROXY", "http_proxy"),
+    ("ALL_PROXY", "all_proxy"),
+];
 
 /// What [`proxy_variables`] reads from an image's own environment: what
 /// routes it, and what it keeps direct. Nothing else of an image's `ENV` is
@@ -148,8 +154,8 @@ pub struct ProxyVariables {
     /// Variables to set, replacing the workload's `NO_PROXY`/`no_proxy`
     /// with a merged list. Empty when nothing is steered.
     pub variables: BTreeMap<String, String>,
-    /// The variables that already route the workload's HTTPS through a
-    /// proxy of its own, left alone: nothing is steered then.
+    /// The variables that already route the workload through a proxy of
+    /// its own, left alone: nothing is steered then.
     pub kept: Vec<String>,
 }
 
@@ -172,7 +178,7 @@ pub fn proxy_variables(
 ) -> ProxyVariables {
     let set = |name: &str| existing.get(name).is_some_and(|value| !value.is_empty());
     let mut steering = ProxyVariables::default();
-    for (upper, lower) in OWN_HTTPS_ROUTE {
+    for (upper, lower) in OWN_PROXY_ROUTE {
         if set(upper) || set(lower) {
             steering.kept.push(upper.to_string());
         }
@@ -471,6 +477,10 @@ mod tests {
             ("HTTPS_PROXY", "HTTPS_PROXY"),
             ("ALL_PROXY", "ALL_PROXY"),
             ("all_proxy", "ALL_PROXY"),
+            // NO_PROXY applies to every scheme: steering would send plain
+            // HTTP this proxy carries direct.
+            ("http_proxy", "HTTP_PROXY"),
+            ("HTTP_PROXY", "HTTP_PROXY"),
         ] {
             let existing = variables(&[(name, "http://corp-proxy.example.com:8080")]);
             let steering = proxy_variables(proxy(), &existing, &[]);
@@ -479,15 +489,10 @@ mod tests {
             assert!(steering.variables.is_empty(), "{name}: {steering:?}");
         }
 
-        // An HTTP-only proxy says nothing about HTTPS: HTTPS is steered,
-        // and the HTTP proxy is left to the workload.
-        let existing = variables(&[
-            ("HTTP_PROXY", "http://corp-proxy.example.com:8080"),
-            ("NO_PROXY", "metrics.example.com, LOCALHOST"),
-        ]);
+        // Steered, the workload's own NO_PROXY entries survive the merge.
+        let existing = variables(&[("NO_PROXY", "metrics.example.com, LOCALHOST")]);
         let steering = proxy_variables(proxy(), &existing, &[]);
         assert!(steering.steers() && steering.kept.is_empty());
-        assert!(!steering.variables.contains_key("HTTP_PROXY"));
         let direct = no_proxy(&steering);
         assert_eq!(&direct[..2], ["metrics.example.com", "localhost"]);
         assert_eq!(
