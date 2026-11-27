@@ -378,7 +378,9 @@ mod tests {
         use super::*;
         use temps_core::async_trait::async_trait;
         use temps_git::services::git_provider::FileContent;
-        use temps_git::services::public_repo::{PublicBranch, PublicRepoInfo, PublicRepoProvider};
+        use temps_git::services::public_repo::{
+            PublicBranch, PublicBranchList, PublicRepoInfo, PublicRepoProvider,
+        };
 
         const BRANCH_TIP: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         const TAG_COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -406,8 +408,8 @@ mod tests {
                 &self,
                 _owner: &str,
                 _repo: &str,
-            ) -> Result<Vec<PublicBranch>, PublicRepoError> {
-                Ok(Vec::new())
+            ) -> Result<PublicBranchList, PublicRepoError> {
+                Ok(PublicBranchList::complete(Vec::new()))
             }
 
             async fn get_branch(

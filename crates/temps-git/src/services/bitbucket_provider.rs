@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
+    AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError, GitProviderService,
+    GitProviderTag, GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User,
+    WebhookConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -30,6 +31,8 @@ use tracing::{debug, info};
 ///   return `NotImplemented`.
 pub struct BitbucketProvider {
     auth_method: AuthMethod,
+    /// Always [`API_BASE`] in production; only tests point it elsewhere.
+    api_base: String,
 }
 
 /// Bitbucket Cloud API base URL — always HTTPS, never user-supplied.
@@ -38,6 +41,10 @@ const API_BASE: &str = "https://api.bitbucket.org/2.0";
 /// Bitbucket Cloud web base URL.
 const BASE_URL: &str = "https://bitbucket.org";
 
+/// Memory bound on one branch listing. A repository with more branches than
+/// this yields a truncated [`BranchList`], never a list that looks exhaustive.
+const MAX_BITBUCKET_BRANCHES: usize = 1_000;
+
 impl BitbucketProvider {
     /// Create a new Bitbucket Cloud provider.
     ///
@@ -45,7 +52,20 @@ impl BitbucketProvider {
     /// * `auth_method` — either `PersonalAccessToken` (RAT/WAT) or `BasicAuth`
     ///   (App Password). Other auth methods return `AuthenticationFailed`.
     pub fn new(auth_method: AuthMethod) -> Self {
-        Self { auth_method }
+        Self {
+            auth_method,
+            api_base: API_BASE.to_string(),
+        }
+    }
+
+    /// A provider talking to a local mock server instead of Bitbucket Cloud.
+    /// Test-only, so production keeps the fixed HTTPS base above.
+    #[cfg(test)]
+    fn with_api_base(auth_method: AuthMethod, api_base: impl Into<String>) -> Self {
+        Self {
+            auth_method,
+            api_base: api_base.into(),
+        }
     }
 
     /// Standard API client: 30-second timeout, no redirects (SSRF defense).
@@ -161,7 +181,7 @@ impl BitbucketProvider {
     /// Validate the access token by calling `GET /2.0/user`.
     async fn validate_token_internal(&self, _access_token: &str) -> Result<bool, GitProviderError> {
         let client = self.get_client()?;
-        let url = format!("{}/user", API_BASE);
+        let url = format!("{}/user", self.api_base);
 
         let response = self
             .send_with_retry(|| self.apply_auth(client.get(&url)))
@@ -465,7 +485,7 @@ impl GitProviderService for BitbucketProvider {
 
     async fn get_user(&self, _access_token: &str) -> Result<User, GitProviderError> {
         let client = self.get_client()?;
-        let url = format!("{}/user", API_BASE);
+        let url = format!("{}/user", self.api_base);
 
         let response = self
             .send_with_retry(|| self.apply_auth(client.get(&url)))
@@ -539,7 +559,7 @@ impl GitProviderService for BitbucketProvider {
             Some(org) => org.to_string(),
             None => {
                 // Resolve workspace from /user.account_id or nickname.
-                let url = format!("{}/user", API_BASE);
+                let url = format!("{}/user", self.api_base);
                 let resp = self
                     .send_with_retry(|| self.apply_auth(client.get(&url)))
                     .await?;
@@ -561,7 +581,7 @@ impl GitProviderService for BitbucketProvider {
 
         let url = format!(
             "{}/repositories/{}?pagelen={}&page={}",
-            API_BASE, workspace, PAGE_LEN, page
+            self.api_base, workspace, PAGE_LEN, page
         );
 
         let response = self
@@ -608,7 +628,7 @@ impl GitProviderService for BitbucketProvider {
         repo: &str,
     ) -> Result<Repository, GitProviderError> {
         let client = self.get_client()?;
-        let url = format!("{}/repositories/{}/{}", API_BASE, owner, repo);
+        let url = format!("{}/repositories/{}/{}", self.api_base, owner, repo);
 
         let response = self
             .send_with_retry(|| self.apply_auth(client.get(&url)))
@@ -635,7 +655,7 @@ impl GitProviderService for BitbucketProvider {
         _access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
         let client = self.get_client()?;
         let mut all_branches: Vec<Branch> = Vec::new();
         let per_page: u32 = 50;
@@ -644,7 +664,7 @@ impl GitProviderService for BitbucketProvider {
         loop {
             let url = format!(
                 "{}/repositories/{}/{}/refs/branches?pagelen={}&page={}",
-                API_BASE, owner, repo, per_page, page
+                self.api_base, owner, repo, per_page, page
             );
 
             let response = self
@@ -666,19 +686,91 @@ impl GitProviderService for BitbucketProvider {
             })?;
 
             let has_next = page_data.next.is_some();
-            all_branches.extend(page_data.values.into_iter().map(|b| Branch {
-                name: b.name,
-                commit_sha: b.target.hash,
-                protected: false,
-            }));
+            let count = page_data.values.len();
+            // Keep the cap a real memory bound whatever the page size
+            // Bitbucket actually answers with.
+            let remaining = MAX_BITBUCKET_BRANCHES.saturating_sub(all_branches.len());
+            let dropped_by_cap = count > remaining;
+            all_branches.extend(
+                page_data
+                    .values
+                    .into_iter()
+                    .take(remaining)
+                    .map(|b| Branch {
+                        name: b.name,
+                        commit_sha: b.target.hash,
+                        protected: false,
+                    }),
+            );
 
-            if !has_next || all_branches.len() >= 1000 {
+            // The cap dropped part of this page, so the repository certainly
+            // has branches this listing never saw.
+            if dropped_by_cap {
+                return Ok(BranchList::truncated(all_branches));
+            }
+            // No next link means the list is complete.
+            if !has_next {
                 break;
+            }
+            // Another page waits but the budget is spent: say branches were
+            // left unread rather than letting a caller read the list as
+            // exhaustive.
+            if all_branches.len() >= MAX_BITBUCKET_BRANCHES {
+                return Ok(BranchList::truncated(all_branches));
             }
             page += 1;
         }
 
-        Ok(all_branches)
+        Ok(BranchList::complete(all_branches))
+    }
+
+    /// One request to `GET /repositories/{owner}/{repo}/refs/branches/{name}`,
+    /// so it is exact however many branches the repository has.
+    async fn get_branch(
+        &self,
+        _access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        let client = self.get_client()?;
+
+        let url = format!(
+            "{}/repositories/{}/{}/refs/branches/{}",
+            self.api_base,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+
+        let response = self
+            .send_with_retry(|| self.apply_auth(client.get(&url)))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to read branch '{}' of {}/{}: {}",
+                branch,
+                owner,
+                repo,
+                response.status()
+            )));
+        }
+
+        let found: BitbucketBranch = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse branch '{branch}' of {owner}/{repo}: {e}"
+            ))
+        })?;
+
+        Ok(Some(Branch {
+            name: found.name,
+            commit_sha: found.target.hash,
+            protected: false,
+        }))
     }
 
     async fn list_tags(
@@ -695,7 +787,7 @@ impl GitProviderService for BitbucketProvider {
         loop {
             let url = format!(
                 "{}/repositories/{}/{}/refs/tags?pagelen={}&page={}",
-                API_BASE, owner, repo, per_page, page
+                self.api_base, owner, repo, per_page, page
             );
 
             let response = self
@@ -747,7 +839,7 @@ impl GitProviderService for BitbucketProvider {
         let commit_spec = branch.unwrap_or("HEAD");
         let url = format!(
             "{}/repositories/{}/{}/src/{}/{}",
-            API_BASE,
+            self.api_base,
             owner,
             repo,
             urlencoding::encode(commit_spec),
@@ -820,7 +912,7 @@ impl GitProviderService for BitbucketProvider {
         // GET {api}/repositories/{owner}/{repo}/src/{node}/{path} — paginated.
         let mut next_url = Some(format!(
             "{}/repositories/{}/{}/src/{}/{}?pagelen=100",
-            API_BASE,
+            self.api_base,
             owner,
             repo,
             urlencoding::encode(&node),
@@ -900,7 +992,7 @@ impl GitProviderService for BitbucketProvider {
         let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commits/{}?pagelen=1",
-            API_BASE,
+            self.api_base,
             owner,
             repo,
             urlencoding::encode(branch)
@@ -948,7 +1040,7 @@ impl GitProviderService for BitbucketProvider {
         let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commit/{}",
-            API_BASE,
+            self.api_base,
             owner,
             repo,
             urlencoding::encode(reference)
@@ -992,7 +1084,7 @@ impl GitProviderService for BitbucketProvider {
         let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commit/{}",
-            API_BASE, owner, repo, commit_sha
+            self.api_base, owner, repo, commit_sha
         );
 
         let response = self
@@ -1023,7 +1115,7 @@ impl GitProviderService for BitbucketProvider {
         let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/commits/{}?pagelen={}",
-            API_BASE,
+            self.api_base,
             owner,
             repo,
             urlencoding::encode(branch),
@@ -1073,7 +1165,7 @@ impl GitProviderService for BitbucketProvider {
         config: WebhookConfig,
     ) -> Result<String, GitProviderError> {
         let client = self.get_client()?;
-        let url = format!("{}/repositories/{}/{}/hooks", API_BASE, owner, repo);
+        let url = format!("{}/repositories/{}/{}/hooks", self.api_base, owner, repo);
 
         #[derive(serde::Serialize)]
         struct CreateBitbucketHookRequest<'a> {
@@ -1144,7 +1236,7 @@ impl GitProviderService for BitbucketProvider {
         let client = self.get_client()?;
         let url = format!(
             "{}/repositories/{}/{}/hooks/{}",
-            API_BASE, owner, repo, webhook_id
+            self.api_base, owner, repo, webhook_id
         );
 
         let response = self
@@ -1191,7 +1283,7 @@ impl GitProviderService for BitbucketProvider {
         repo: &str,
     ) -> Result<bool, GitProviderError> {
         let client = self.get_client()?;
-        let url = format!("{}/repositories/{}/{}", API_BASE, owner, repo);
+        let url = format!("{}/repositories/{}/{}", self.api_base, owner, repo);
         let response = self
             .send_with_retry(|| self.apply_auth(client.get(&url)))
             .await?;
@@ -1282,7 +1374,7 @@ impl GitProviderService for BitbucketProvider {
         let encoded_ref = urlencoding::encode(ref_spec);
         let url = format!(
             "{}/repositories/{}/{}/get/{}.tar.gz",
-            API_BASE, owner, repo, encoded_ref
+            self.api_base, owner, repo, encoded_ref
         );
 
         let client = self.get_archive_client()?;
@@ -1455,7 +1547,7 @@ impl GitProviderService for BitbucketProvider {
         let workspace = match owner {
             Some(o) => o.to_string(),
             None => {
-                let url = format!("{}/user", API_BASE);
+                let url = format!("{}/user", self.api_base);
                 let resp = self
                     .send_with_retry(|| self.apply_auth(client.get(&url)))
                     .await?;
@@ -1466,7 +1558,7 @@ impl GitProviderService for BitbucketProvider {
             }
         };
 
-        let url = format!("{}/repositories/{}/{}", API_BASE, workspace, name);
+        let url = format!("{}/repositories/{}/{}", self.api_base, workspace, name);
 
         #[derive(Serialize)]
         struct CreateBitbucketRepoRequest<'a> {
@@ -1536,7 +1628,10 @@ impl GitProviderService for BitbucketProvider {
         base_branch: &str,
     ) -> Result<PullRequest, GitProviderError> {
         let client = self.get_client()?;
-        let url = format!("{}/repositories/{}/{}/pullrequests", API_BASE, owner, repo);
+        let url = format!(
+            "{}/repositories/{}/{}/pullrequests",
+            self.api_base, owner, repo
+        );
 
         #[derive(Serialize)]
         struct CreateBitbucketPrRequest<'a> {
@@ -1727,6 +1822,9 @@ where
 
     matches
 }
+
+#[cfg(test)]
+mod branch_tests;
 
 #[cfg(test)]
 mod tests {

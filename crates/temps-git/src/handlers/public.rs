@@ -11,7 +11,7 @@ use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{BranchInfo, BranchListResponse};
 use super::types::GitAppState as AppState;
 use crate::services::cache::{CachedPresetInfo, PublicBranchCacheKey, PublicPresetCacheKey};
-use crate::services::git_provider::Branch;
+use crate::services::git_provider::{Branch, BranchList};
 use crate::services::public_repo::{
     detect_presets_from_files, PublicRepoError, PublicRepoProvider, PublicRepoProviderFactory,
 };
@@ -254,6 +254,19 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
         PublicRepoError::BranchNotFound { branch } => problem_new(StatusCode::NOT_FOUND)
             .with_title("Branch Not Found")
             .with_detail(format!("Branch '{}' not found in repository", branch)),
+        // Not a 404: the branch was neither confirmed nor ruled out, and a
+        // 404 here would be read as "this branch does not exist".
+        PublicRepoError::BranchLookupUnavailable {
+            repository,
+            branch,
+            listed,
+        } => problem_new(StatusCode::BAD_GATEWAY)
+            .with_title("Branch Could Not Be Verified")
+            .with_detail(format!(
+                "Branch '{branch}' of {repository} is absent from a branch list capped at {listed} branches, and this provider offers no single-branch lookup, so it could not be verified."
+            ))
+            .with_value("branch", branch)
+            .with_value("listed_branches", listed),
         PublicRepoError::ProviderNotSupported { subject } => problem_new(StatusCode::BAD_REQUEST)
             .with_title("Provider Not Supported")
             .with_detail(format!(
@@ -520,19 +533,11 @@ pub async fn get_public_branches(
 
     // Try cache first (unless fresh=true)
     if !params.fresh {
-        if let Some(cached_branches) = state.cache_manager.public_branches.get(&cache_key).await {
-            let branch_infos: Vec<BranchInfo> = cached_branches
-                .into_iter()
-                .map(|branch| BranchInfo {
-                    is_default: branch.name == default_branch,
-                    name: branch.name,
-                    commit_sha: branch.commit_sha,
-                    protected: branch.protected,
-                })
-                .collect();
-            return Ok(Json(BranchListResponse {
-                branches: branch_infos,
-            }));
+        if let Some(cached) = state.cache_manager.public_branches.get(&cache_key).await {
+            return Ok(Json(BranchListResponse::from_branch_list(
+                cached,
+                &default_branch,
+            )));
         }
     }
 
@@ -542,15 +547,20 @@ pub async fn get_public_branches(
         .await
         .map_err(|e| map_error(e, &owner, &repo))?;
 
-    // Convert to our branch format
-    let branches: Vec<Branch> = provider_branches
-        .into_iter()
-        .map(|b| Branch {
-            name: b.name,
-            commit_sha: b.commit_sha,
-            protected: b.protected,
-        })
-        .collect();
+    // Convert to our branch format, keeping the provider's truncation flag:
+    // a capped list must not be read as the repository's whole branch set.
+    let branches = BranchList {
+        branches: provider_branches
+            .branches
+            .into_iter()
+            .map(|b| Branch {
+                name: b.name,
+                commit_sha: b.commit_sha,
+                protected: b.protected,
+            })
+            .collect(),
+        truncated: provider_branches.truncated,
+    };
 
     // Cache the result
     state
@@ -559,19 +569,106 @@ pub async fn get_public_branches(
         .set(cache_key, branches.clone())
         .await;
 
-    let branch_infos: Vec<BranchInfo> = branches
-        .into_iter()
-        .map(|branch| BranchInfo {
+    Ok(Json(BranchListResponse::from_branch_list(
+        branches,
+        &default_branch,
+    )))
+}
+
+/// Query parameters for the public single-branch lookup.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct PublicBranchQueryParams {
+    /// HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+    pub base_url: Option<String>,
+    /// Exact branch name to look up
+    pub name: String,
+}
+
+/// Look up one branch of a public repository by exact name
+///
+/// Reads the branch by name (after the visibility check every public route
+/// makes), so it is exact for repositories with more branches than
+/// `.../branches` returns. A 404 here is the only sound basis for telling a
+/// user a branch does not exist.
+#[utoipa::path(
+    get,
+    path = "/git/public/{provider}/{owner}/{repo}/branch",
+    params(
+        ("provider" = String, Path, description = "Git provider (github or gitlab)"),
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        PublicBranchQueryParams
+    ),
+    responses(
+        (status = 200, description = "The branch", body = BranchInfo),
+        (status = 400, description = "Provider not supported, or empty branch name"),
+        (status = 401, description = "Authentication required for custom GitLab origins"),
+        (status = 403, description = "Git provider permission required"),
+        (status = 404, description = "Repository or branch not found"),
+        (status = 429, description = "API rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 502, description = "The provider could not answer for this branch (its listing was capped and it has no single-branch endpoint)")
+    ),
+    tag = "Public Repositories"
+)]
+pub async fn get_public_branch(
+    State(state): State<Arc<AppState>>,
+    auth: Option<Extension<AuthContext>>,
+    Path((provider, owner, repo)): Path<(String, String, String)>,
+    Query(params): Query<PublicBranchQueryParams>,
+) -> Result<Json<BranchInfo>, Problem> {
+    // Look up exactly the name asked for. Git allows non-ASCII whitespace
+    // such as U+00A0 in a ref, and trimming it would answer for a different
+    // branch; only a name no ref can have is rejected.
+    let branch_name = params.name.clone();
+    if super::is_impossible_branch_name(&branch_name) {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Branch Name")
+            .with_detail("The branch name to look up must not be empty."));
+    }
+
+    let (repo_provider, info, _cache_scope) = provider_for_public_request(
+        state.as_ref(),
+        auth.as_ref().map(|Extension(auth)| auth),
+        &provider,
+        &owner,
+        &repo,
+        params.base_url.as_deref(),
+    )
+    .await?;
+
+    let found = repo_provider
+        .get_branch(&owner, &repo, &branch_name)
+        .await
+        .map_err(|e| map_error(e, &owner, &repo))?;
+
+    public_branch_response(found, &info.default_branch, &owner, &repo, &branch_name).map(Json)
+}
+
+/// The provider's answer as the endpoint's response: the branch with
+/// `is_default` from the repository's default, or a 404 Problem naming the
+/// repository and the branch.
+fn public_branch_response(
+    found: Option<crate::services::public_repo::PublicBranch>,
+    default_branch: &str,
+    owner: &str,
+    repo: &str,
+    branch_name: &str,
+) -> Result<BranchInfo, Problem> {
+    match found {
+        Some(branch) => Ok(BranchInfo {
             is_default: branch.name == default_branch,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
-        })
-        .collect();
-
-    Ok(Json(BranchListResponse {
-        branches: branch_infos,
-    }))
+        }),
+        None => Err(problem_new(StatusCode::NOT_FOUND)
+            .with_title("Branch Not Found")
+            .with_detail(format!(
+                "Repository {}/{} has no branch named '{}'.",
+                owner, repo, branch_name
+            ))),
+    }
 }
 
 /// Detect presets for a public repository (supports GitHub and GitLab)
@@ -1074,6 +1171,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             axum::routing::get(get_public_branches),
         )
         .route(
+            "/git/public/{provider}/{owner}/{repo}/branch",
+            axum::routing::get(get_public_branch),
+        )
+        .route(
             "/git/public/{provider}/{owner}/{repo}/presets",
             axum::routing::get(detect_public_presets),
         )
@@ -1092,6 +1193,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
     paths(
         get_public_repository,
         get_public_branches,
+        get_public_branch,
         detect_public_presets,
         detect_public_env_example,
         get_public_compose_services,
@@ -1121,12 +1223,15 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 pub struct PublicRepositoriesApiDoc;
 
 #[cfg(test)]
+mod branch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::cache::GitProviderCacheManager;
     use crate::services::git_provider::FileContent;
     use crate::services::public_repo::{
-        GitHubPublicProvider, GitLabPublicProvider, PublicBranch, PublicRepoInfo,
+        GitHubPublicProvider, GitLabPublicProvider, PublicBranchList, PublicRepoInfo,
         PublicRepoProvider,
     };
 
@@ -1152,7 +1257,7 @@ mod tests {
             &self,
             _owner: &str,
             _repo: &str,
-        ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+        ) -> Result<PublicBranchList, PublicRepoError> {
             panic!("branch listing is not needed for this test")
         }
 
@@ -1324,6 +1429,7 @@ mod tests {
             .expect("serialize the public repository OpenAPI document");
         for (path, method) in [
             ("/git/public/{provider}/{owner}/{repo}", "get"),
+            ("/git/public/{provider}/{owner}/{repo}/branch", "get"),
             ("/git/public/{provider}/{owner}/{repo}/branches", "get"),
             ("/git/public/{provider}/{owner}/{repo}/compose-file", "get"),
             ("/git/public/{provider}/{owner}/{repo}/compose-file", "post"),
@@ -1452,7 +1558,7 @@ mod tests {
         // Set cache
         cache_manager
             .public_branches
-            .set(cache_key.clone(), branches.clone())
+            .set(cache_key.clone(), BranchList::complete(branches.clone()))
             .await;
 
         // Get from cache
@@ -1460,8 +1566,9 @@ mod tests {
         assert!(cached.is_some());
         let cached_branches = cached.unwrap();
         assert_eq!(cached_branches.len(), 2);
-        assert_eq!(cached_branches[0].name, "master");
-        assert_eq!(cached_branches[1].name, "beta");
+        assert!(!cached_branches.truncated);
+        assert_eq!(cached_branches.branches[0].name, "master");
+        assert_eq!(cached_branches.branches[1].name, "beta");
     }
 
     #[tokio::test]
@@ -1515,7 +1622,10 @@ mod tests {
             protected: false,
         }];
 
-        cache_manager.public_branches.set(cache_key, branches).await;
+        cache_manager
+            .public_branches
+            .set(cache_key, BranchList::complete(branches))
+            .await;
 
         // Try to get with a different key
         let different_key = PublicBranchCacheKey::new(
@@ -1544,7 +1654,7 @@ mod tests {
 
         cache_manager
             .public_branches
-            .set(cache_key.clone(), branches)
+            .set(cache_key.clone(), BranchList::complete(branches))
             .await;
 
         // Invalidate
@@ -1842,8 +1952,8 @@ mod tests {
 
         match provider.list_branches("expressjs", "express").await {
             Ok(branches) => {
-                assert!(!branches.is_empty());
-                let has_master = branches.iter().any(|b| b.name == "master");
+                assert!(!branches.branches.is_empty());
+                let has_master = branches.branches.iter().any(|b| b.name == "master");
                 assert!(has_master, "Express should have a master branch");
             }
             Err(PublicRepoError::RateLimitExceeded) => {
@@ -1922,9 +2032,12 @@ mod tests {
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
             Ok(branches) => {
-                assert!(!branches.is_empty(), "GitLab Runner should have branches");
+                assert!(
+                    !branches.branches.is_empty(),
+                    "GitLab Runner should have branches"
+                );
                 // Verify branch structure - GitLab runner uses stable branches
-                let first_branch = &branches[0];
+                let first_branch = &branches.branches[0];
                 assert!(
                     !first_branch.name.is_empty(),
                     "Branch name should not be empty"
@@ -1995,6 +2108,7 @@ mod tests {
         match provider.list_branches("expressjs", "express").await {
             Ok(provider_branches) => {
                 let branches: Vec<Branch> = provider_branches
+                    .branches
                     .into_iter()
                     .map(|b| Branch {
                         name: b.name,
@@ -2012,7 +2126,7 @@ mod tests {
                 // Cache the branches
                 cache_manager
                     .public_branches
-                    .set(cache_key.clone(), branches.clone())
+                    .set(cache_key.clone(), BranchList::complete(branches.clone()))
                     .await;
 
                 // Verify cache retrieval
@@ -2023,7 +2137,7 @@ mod tests {
                 assert_eq!(cached_branches.len(), branches.len());
 
                 // Verify master branch is in cache
-                let has_master = cached_branches.iter().any(|b| b.name == "master");
+                let has_master = cached_branches.branches.iter().any(|b| b.name == "master");
                 assert!(has_master, "Cache should contain master branch");
             }
             Err(PublicRepoError::RateLimitExceeded) => {

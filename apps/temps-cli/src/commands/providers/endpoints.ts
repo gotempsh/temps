@@ -17,10 +17,12 @@ import {
   detectPublicEnvExample,
   getAllRepositoriesByName,
   getBranchesByRepositoryId,
+  getPublicBranch,
   getPublicBranches,
   getPublicComposePreview,
   getPublicComposeServices,
   getPublicRepository,
+  getRepositoryBranch,
   getRepositoryBranches,
   getRepositoryById,
   getRepositoryComposePreview,
@@ -181,6 +183,16 @@ export function registerProvidersEndpoints(program: Command): void {
     },
   })
 
+  endpoint(group, getPublicBranch, {
+    name: "public-repos get-branch",
+    description: "Look up one branch of a public repository exactly, even past the branch listing's cap (404 if it does not exist)",
+    path: { provider: 'string', owner: 'string', repo: 'string' },
+    query: {
+      base_url: { kind: 'string', help: "HTTPS/443 origin of a self-hosted GitLab instance" },
+      name: { kind: 'string!', help: "Branch name to look up" },
+    },
+  })
+
   endpoint(group, getPublicComposeServices, {
     name: "public-repos get-compose-services",
     description: "Parse a compose file's services for a public repository (supports GitHub and GitLab)",
@@ -241,6 +253,16 @@ export function registerProvidersEndpoints(program: Command): void {
     query: {
       connection_id: { kind: 'int!', help: "Git provider connection ID (required when multiple connections have the same repo)" },
       fresh: { kind: 'bool', help: "Force fetch fresh data, bypassing cache (default: false)" },
+    },
+  })
+
+  endpoint(group, getRepositoryBranch, {
+    name: "repos get-repository-branch",
+    description: "Look up one branch of a repository exactly, even past the branch listing's cap (404 if it does not exist)",
+    path: { owner: 'string', repo: 'string' },
+    query: {
+      connection_id: { kind: 'int!', help: "Git provider connection ID" },
+      name: { kind: 'string!', help: "Branch name to look up" },
     },
   })
 

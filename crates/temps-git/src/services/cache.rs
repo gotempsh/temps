@@ -310,8 +310,10 @@ pub struct CachedPresetInfo {
 
 /// Aggregated cache manager for all Git provider caches
 pub struct GitProviderCacheManager {
-    /// Cache for repository branches (60 minutes TTL)
-    pub branches: GitProviderCache<BranchCacheKey, Vec<crate::services::git_provider::Branch>>,
+    /// Cache for repository branches (60 minutes TTL). Stores the listing
+    /// whole, truncation flag included, so a cache hit cannot look more
+    /// complete than the provider call that filled it.
+    pub branches: GitProviderCache<BranchCacheKey, crate::services::git_provider::BranchList>,
 
     /// Cache for repository tags (60 minutes TTL)
     pub tags: GitProviderCache<TagCacheKey, Vec<crate::services::git_provider::GitProviderTag>>,
@@ -327,9 +329,11 @@ pub struct GitProviderCacheManager {
     /// intentionally stricter than the immutable commit lookup limiter.
     pub tag_refresh_rate_limiter: ProviderLookupRateLimiter,
 
-    /// Cache for public repository branches (15 minutes TTL - shorter due to rate limits)
+    /// Cache for public repository branches (15 minutes TTL - shorter due to
+    /// rate limits), truncation flag included for the same reason as
+    /// [`Self::branches`].
     pub public_branches:
-        GitProviderCache<PublicBranchCacheKey, Vec<crate::services::git_provider::Branch>>,
+        GitProviderCache<PublicBranchCacheKey, crate::services::git_provider::BranchList>,
 
     /// Cache for public repository presets (30 minutes TTL)
     pub public_presets: GitProviderCache<PublicPresetCacheKey, Vec<CachedPresetInfo>>,
@@ -529,7 +533,13 @@ mod tests {
 
         // Test clear_all
         let key = BranchCacheKey::new(1, "owner".to_string(), "repo".to_string());
-        manager.branches.set(key.clone(), vec![]).await;
+        manager
+            .branches
+            .set(
+                key.clone(),
+                crate::services::git_provider::BranchList::complete(vec![]),
+            )
+            .await;
         manager.clear_all().await;
         assert!(manager.branches.is_empty().await);
     }

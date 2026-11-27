@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
+    AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError, GitProviderService,
+    GitProviderTag, GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User,
+    WebhookConfig,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
+
+/// Memory bound on one branch listing. A repository with more branches than
+/// this yields a truncated [`BranchList`], never a list that looks exhaustive.
+const MAX_GITEA_BRANCHES: usize = 1_000;
 
 /// Gitea (and Forgejo) REST API provider.
 ///
@@ -625,7 +630,7 @@ impl GitProviderService for GiteaProvider {
         access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
         let client = self.get_client()?;
         let headers = self.get_headers(access_token)?;
 
@@ -657,24 +662,102 @@ impl GitProviderService for GiteaProvider {
                 )));
             }
 
+            // How many branches the repository has. Gitea clamps `limit` to
+            // the instance's `[api] MAX_RESPONSE_ITEMS`, so a page shorter
+            // than we asked for is not proof it is the last one.
+            let total = response
+                .headers()
+                .get("x-total-count")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<usize>().ok());
+
             let branches: Vec<GiteaBranch> = response.json().await.map_err(|e| {
                 GitProviderError::ApiError(format!("Failed to parse branches: {}", e))
             })?;
 
             let count = branches.len();
-            all_branches.extend(branches.into_iter().map(|b| Branch {
+            // Keep the cap a real memory bound whatever the page size the
+            // instance actually answers with.
+            let remaining = MAX_GITEA_BRANCHES.saturating_sub(all_branches.len());
+            let dropped_by_cap = count > remaining;
+            all_branches.extend(branches.into_iter().take(remaining).map(|b| Branch {
                 name: b.name,
                 commit_sha: b.commit.id,
                 protected: false, // Gitea branch API doesn't return protection status inline
             }));
 
-            if count < per_page || all_branches.len() >= 1000 {
+            // The cap dropped part of this page, so the repository certainly
+            // has branches this listing never saw.
+            if dropped_by_cap {
+                return Ok(BranchList::truncated(all_branches));
+            }
+            // An empty page, or as many branches as the instance says it has,
+            // ends the listing. Without the total a short page proves
+            // nothing (the instance may cap pages below `per_page`), so ask
+            // for the next one and let an empty page end it.
+            if count == 0 || total.is_some_and(|total| all_branches.len() >= total) {
                 break;
+            }
+            // A full page with no budget left: more may follow, and saying so
+            // costs one exact lookup where claiming completeness would cost a
+            // false "branch not found".
+            if all_branches.len() >= MAX_GITEA_BRANCHES {
+                return Ok(BranchList::truncated(all_branches));
             }
             page += 1;
         }
 
-        Ok(all_branches)
+        Ok(BranchList::complete(all_branches))
+    }
+
+    /// One request to `GET /repos/{owner}/{repo}/branches/{branch}`, so it is
+    /// exact however many branches the repository has.
+    async fn get_branch(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
+
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api_base(),
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+
+        let response = self
+            .send_with_retry(|| client.get(&url).headers(headers.clone()))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to read branch '{}' of {}/{}: {}",
+                branch,
+                owner,
+                repo,
+                response.status()
+            )));
+        }
+
+        let found: GiteaBranch = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse branch '{branch}' of {owner}/{repo}: {e}"
+            ))
+        })?;
+
+        Ok(Some(Branch {
+            name: found.name,
+            commit_sha: found.commit.id,
+            protected: false, // Gitea's branch API doesn't report protection inline
+        }))
     }
 
     async fn list_tags(
@@ -2020,3 +2103,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod branch_lookup_tests;
