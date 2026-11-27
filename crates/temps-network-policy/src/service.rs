@@ -18,8 +18,9 @@ use temps_entities::{
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_netpol::dns::NamedWorkload;
 use temps_workload_netpol::{
-    Action, Cidr, Direction, IdentityMap, L4Protocol, NodeMode, NodePolicy, NodePolicyReport,
-    PolicySnapshot, PortRange, Profile, SystemContainer,
+    Action, Cidr, Direction, EgressPolicy, IdentityMap, L4Protocol, NodeMode, NodePolicy,
+    NodePolicyReport, PolicySnapshot, PortRange, Profile, SystemContainer,
+    PROTOCOL_SNAPSHOT_IN_EVERY_MODE,
 };
 
 use crate::error::NetworkPolicyError;
@@ -81,7 +82,7 @@ pub struct NodeModeEntry {
     pub role: String,
     pub status: String,
     /// The stored mode. On a node without a live enforcer anything but
-    /// `legacy` is stale and is never counted as enforcing.
+    /// `off` is stale and is never counted as enforcing.
     pub mode: NodeMode,
     /// Whether the node runs an enforcer: always on node 0, on a worker
     /// when its agent reported one within [`ENFORCER_REPORT_TTL`].
@@ -109,6 +110,9 @@ pub struct EnforcerReport {
 struct SandboxRow {
     id: i32,
     public_id: String,
+    /// The sandbox opted in to recording its outbound connections (and has
+    /// a project to record them in).
+    egress_recording: bool,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -167,11 +171,19 @@ struct ComputeSubnetRow {
 /// `max_workloads` (110 by default) containers, each with a few addresses.
 pub const MAX_REPORTED_ADDRESSES: usize = 4096;
 
-/// The workloads a node observed on its last pass outside `legacy`.
+/// The workloads a node observed on its last pass outside `off`.
 #[derive(Debug, Clone)]
 struct ObservedReport {
     identities: IdentityMap,
+    /// A hash of `identities`, taken once when the report is recorded:
+    /// what an unchanged `off` node's poll compares, instead of copying and
+    /// hashing every other node's map on every poll.
+    digest: u64,
     seen: std::time::Instant,
+    /// The node's mode when it reported. Only a node outside `off` has
+    /// its workloads handed to other nodes as remote peers, as before
+    /// `off` nodes reported anything.
+    mode: NodeMode,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -210,7 +222,7 @@ impl NameRow {
 }
 
 pub struct NetworkPolicyService {
-    db: Arc<DatabaseConnection>,
+    pub(crate) db: Arc<DatabaseConnection>,
     /// Worker id → its agent's last enforcer report. In memory: agents
     /// report on every pass, so a restarted control plane relearns them
     /// within one.
@@ -220,14 +232,65 @@ pub struct NetworkPolicyService {
     /// reports again after a control plane restart, other nodes treat its
     /// workloads' addresses as unknown.
     observed: std::sync::Mutex<HashMap<i32, ObservedReport>>,
+    /// Worker id → what its agent said about recording outbound
+    /// connections ([`crate::recording`]).
+    pub(crate) recording: crate::recording::RecordingReports,
+    /// When each report map was last swept of expired entries (see
+    /// [`SweepClock`]).
+    pub(crate) swept: SweepClocks,
+    /// Whether node 0 (this process) can record.
+    pub(crate) local_recording: std::sync::Mutex<temps_workload_netpol::EgressRecordingCapability>,
+    /// Built snapshots of `off` nodes ([`crate::idle`]).
+    pub(crate) snapshots: crate::idle::SnapshotCache,
 }
 
-fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkPolicyError> {
+pub(crate) fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkPolicyError> {
     value
         .parse::<NodeMode>()
         .map_err(|e| NetworkPolicyError::Validation {
             message: format!("node {node_id} has a stored mode the server does not know: {e}"),
         })
+}
+
+/// When a report map was last swept of entries past
+/// [`ENFORCER_REPORT_TTL`]. A map is swept when a node it does not hold yet
+/// reports (worker churn) and otherwise at most once per TTL, so a steady
+/// heartbeat costs O(1) amortized while a worker that left (no new node
+/// needed) is released within two TTLs.
+pub(crate) struct SweepClock(std::sync::Mutex<std::time::Instant>);
+
+impl Default for SweepClock {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(std::time::Instant::now()))
+    }
+}
+
+impl SweepClock {
+    /// Whether a sweep is due now: `new_node` reports, or the last sweep is
+    /// a TTL old. Restarts the clock when it is.
+    pub(crate) fn due(&self, new_node: bool) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if new_node || last.elapsed() >= ENFORCER_REPORT_TTL {
+            *last = std::time::Instant::now();
+            return true;
+        }
+        false
+    }
+
+    /// Makes the next [`Self::due`] true, for tests.
+    #[cfg(test)]
+    pub(crate) fn expire(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+    }
+}
+
+/// One [`SweepClock`] per report map.
+#[derive(Default)]
+pub(crate) struct SweepClocks {
+    pub(crate) reports: SweepClock,
+    pub(crate) observed: SweepClock,
+    pub(crate) recording: SweepClock,
 }
 
 impl NetworkPolicyService {
@@ -236,6 +299,12 @@ impl NetworkPolicyService {
             db,
             reports: std::sync::Mutex::new(HashMap::new()),
             observed: std::sync::Mutex::new(HashMap::new()),
+            recording: std::sync::Mutex::new(HashMap::new()),
+            swept: SweepClocks::default(),
+            local_recording: std::sync::Mutex::new(
+                temps_workload_netpol::EgressRecordingCapability::detect(false),
+            ),
+            snapshots: std::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -246,6 +315,11 @@ impl NetworkPolicyService {
             _ => "unknown".to_string(),
         };
         let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        // Expired reports are never read again: swept when a node not yet
+        // in the map reports, and at least once per TTL (SweepClock).
+        if self.swept.reports.due(!reports.contains_key(&node_id)) {
+            reports.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+        }
         reports.insert(
             node_id,
             EnforcerReport {
@@ -260,7 +334,30 @@ impl NetworkPolicyService {
     /// `node_id`'s compute subnet, see [`Self::node_snapshot`]). A report
     /// over [`MAX_REPORTED_ADDRESSES`] is refused with a warning, so one
     /// broken node cannot grow every other node's maps.
-    pub fn record_observed(&self, node_id: i32, identities: IdentityMap) {
+    /// Drops what `node_id` last reported observing: it is switched `off`,
+    /// so no other node may keep taking its workloads' addresses (which it
+    /// may hand to another workload) as peers until the report expires.
+    pub fn forget_observed(&self, node_id: i32) {
+        self.observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&node_id);
+    }
+
+    pub fn record_observed(&self, node_id: i32, identities: IdentityMap, mode: NodeMode) {
+        if mode == NodeMode::Off {
+            // Nothing reads an `off` node's workloads: other nodes take
+            // only workloads of nodes outside `off` as peers. Dropped before
+            // anything is counted or hashed, so an idle node's report costs
+            // nothing; it still sweeps when a sweep is due, so retired
+            // nodes are released when only `off` nodes are left reporting.
+            let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+            observed.remove(&node_id);
+            if self.swept.observed.due(false) {
+                observed.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+            }
+            return;
+        }
         let count = identities.address_count();
         if count > MAX_REPORTED_ADDRESSES {
             tracing::warn!(
@@ -271,23 +368,59 @@ impl NetworkPolicyService {
             );
             return;
         }
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            identities.hash(&mut hasher);
+            hasher.finish()
+        };
         let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+        // Reports from nodes that stopped reporting are never read again
+        // (readers skip anything older than ENFORCER_REPORT_TTL): swept when
+        // a node not yet in the map reports, and at least once per TTL
+        // (SweepClock), so a retired node's map is released even when no
+        // new node ever reports.
+        if self.swept.observed.due(!observed.contains_key(&node_id)) {
+            observed.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+        }
         observed.insert(
             node_id,
             ObservedReport {
                 identities,
+                digest,
                 seen: std::time::Instant::now(),
+                mode,
             },
         );
     }
 
     /// What every node but `node_id` observed within
     /// [`ENFORCER_REPORT_TTL`], by node.
-    fn observed_elsewhere(&self, node_id: i32) -> Vec<(i32, IdentityMap)> {
+    /// The digests of what every node but `node_id` observed and shares
+    /// (as [`Self::observed_elsewhere`] selects them), by node. No map is
+    /// copied: what an `off` node's poll compares.
+    pub(crate) fn observed_digests_elsewhere(&self, node_id: i32) -> Vec<(i32, u64)> {
         let observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
         observed
             .iter()
-            .filter(|(id, report)| **id != node_id && report.seen.elapsed() <= ENFORCER_REPORT_TTL)
+            .filter(|(id, report)| {
+                **id != node_id
+                    && report.mode != NodeMode::Off
+                    && report.seen.elapsed() <= ENFORCER_REPORT_TTL
+            })
+            .map(|(id, report)| (*id, report.digest))
+            .collect()
+    }
+
+    pub(crate) fn observed_elsewhere(&self, node_id: i32) -> Vec<(i32, IdentityMap)> {
+        let observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+        observed
+            .iter()
+            .filter(|(id, report)| {
+                **id != node_id
+                    && report.mode != NodeMode::Off
+                    && report.seen.elapsed() <= ENFORCER_REPORT_TTL
+            })
             .map(|(id, report)| (*id, report.identities.clone()))
             .collect()
     }
@@ -725,7 +858,7 @@ impl NetworkPolicyService {
         // with the default.
         control_plane_node_settings::ActiveModel {
             id: Set(0),
-            network_policy_mode: Set(NodeMode::Legacy.as_str().to_string()),
+            network_policy_mode: Set(NodeMode::Off.stored_str().to_string()),
             updated_at: Set(Utc::now()),
         }
         .insert(self.db.as_ref())
@@ -781,7 +914,7 @@ impl NetworkPolicyService {
             let control = self.control_plane_mode().await?;
             let previous = parse_mode(node_id, &control.network_policy_mode)?;
             let mut active: control_plane_node_settings::ActiveModel = control.into();
-            active.network_policy_mode = Set(mode.as_str().to_string());
+            active.network_policy_mode = Set(mode.stored_str().to_string());
             active.updated_at = Set(now);
             active
                 .update(self.db.as_ref())
@@ -789,6 +922,9 @@ impl NetworkPolicyService {
                 .map_err(NetworkPolicyError::db(
                     "set the control plane's network policy mode",
                 ))?;
+            if mode == NodeMode::Off {
+                self.forget_observed(node_id);
+            }
             let entry = self
                 .node_modes()
                 .await?
@@ -802,8 +938,8 @@ impl NetworkPolicyService {
             .await
             .map_err(NetworkPolicyError::db("read a node's network policy mode"))?
             .ok_or(NetworkPolicyError::NodeNotFound { node_id })?;
-        // `legacy` stays accepted so a stale stored mode can be cleared.
-        if mode != NodeMode::Legacy && !self.supports_enforcement(node_id) {
+        // `off` stays accepted so a stale stored mode can be cleared.
+        if mode != NodeMode::Off && !self.supports_enforcement(node_id) {
             return Err(NetworkPolicyError::WorkerEnforcementUnavailable {
                 node_id,
                 mode: mode.as_str().to_string(),
@@ -811,13 +947,16 @@ impl NetworkPolicyService {
         }
         let previous = parse_mode(node_id, &node.network_policy_mode)?;
         let mut active: node_network_policy_modes::ActiveModel = node.into();
-        active.network_policy_mode = Set(mode.as_str().to_string());
+        active.network_policy_mode = Set(mode.stored_str().to_string());
         active.updated_at = Set(now);
         let node = active
             .update(self.db.as_ref())
             .await
             .map_err(NetworkPolicyError::db("set a node's network policy mode"))?;
         let stored = parse_mode(node.id, &node.network_policy_mode)?;
+        if stored == NodeMode::Off {
+            self.forget_observed(node.id);
+        }
         Ok((
             previous,
             self.mode_entry(node.id, node.name, node.role, node.status, stored),
@@ -850,21 +989,79 @@ impl NetworkPolicyService {
         self.node_snapshot(CONTROL_PLANE_NODE_ID).await
     }
 
-    /// What `node_id` returns to its agent: its mode, and outside `legacy`
-    /// its snapshot. Calling it is the agent's enforcer report.
+    /// What `node_id` returns to its agent: its mode and its snapshot.
+    /// Calling it is the agent's enforcer report.
+    ///
+    /// Outside `off` the snapshot is built fresh every pass, as it
+    /// always was. In `off` it goes only to an agent that takes one
+    /// ([`PROTOCOL_SNAPSHOT_IN_EVERY_MODE`]); an older agent gets the mode
+    /// alone, as before. It comes from the per-node cache, and an agent
+    /// that already holds it gets `unchanged` instead ([`crate::idle`]).
     pub async fn node_policy(
         &self,
         node_id: i32,
         report: NodePolicyReport,
     ) -> Result<NodePolicy, NetworkPolicyError> {
-        let mode = self.node_mode(node_id).await?;
+        let (mode, revision) = self.mode_and_revision(node_id).await?;
         self.record_enforcer_report(node_id, &report.backend);
-        self.record_observed(node_id, report.identities);
-        let snapshot = match mode {
-            NodeMode::Legacy => None,
-            NodeMode::Shadow | NodeMode::Enforce => Some(self.node_snapshot(node_id).await?),
-        };
-        Ok(NodePolicy { mode, snapshot })
+        self.record_egress_recording(node_id, report.egress_recording);
+        self.record_observed(node_id, report.identities, mode);
+        // The answer names the mode for the agent: `legacy` for `off` to an
+        // agent older than PROTOCOL_OFF_MODE.
+        let protocol = report.protocol;
+        match mode {
+            NodeMode::Shadow | NodeMode::Enforce => Ok(NodePolicy {
+                mode,
+                snapshot: Some(self.node_snapshot(node_id).await?),
+                protocol,
+                ..Default::default()
+            }),
+            NodeMode::Off if protocol < PROTOCOL_SNAPSHOT_IN_EVERY_MODE => Ok(NodePolicy {
+                mode,
+                protocol,
+                ..Default::default()
+            }),
+            NodeMode::Off => {
+                // The mode is known whatever happens to the snapshot: an
+                // agent leaving enforcement must hear `off` and remove its
+                // rules even when a row its snapshot reads cannot be read.
+                let answer = match self
+                    .off_snapshot(node_id, revision, report.held_snapshot.as_deref())
+                    .await
+                {
+                    Ok(answer) => answer,
+                    Err(error) => {
+                        tracing::warn!(
+                            node_id,
+                            %error,
+                            "network policy: could not build the snapshot of an off node; \
+                             answering its mode alone until it can be built"
+                        );
+                        return Ok(NodePolicy {
+                            mode,
+                            protocol,
+                            ..Default::default()
+                        });
+                    }
+                };
+                Ok(match answer {
+                    crate::idle::OffSnapshot::Held(digest) => NodePolicy {
+                        mode,
+                        snapshot: None,
+                        snapshot_digest: Some(digest),
+                        unchanged: true,
+                        protocol,
+                    },
+                    crate::idle::OffSnapshot::Fresh(snapshot, digest) => NodePolicy {
+                        mode,
+                        snapshot: Some((*snapshot).clone()),
+                        snapshot_digest: Some(digest),
+                        unchanged: false,
+                        protocol,
+                    },
+                })
+            }
+        }
     }
 
     /// Everything `node_id` needs to enforce, for every workload. A node
@@ -889,7 +1086,8 @@ impl NetworkPolicyService {
         let sandboxes: Vec<SandboxRow> = self
             .query(
                 "list live sandboxes",
-                "SELECT id, public_id FROM sandboxes WHERE status <> 'destroyed'",
+                "SELECT id, public_id, egress_recording \
+                 FROM sandboxes WHERE status <> 'destroyed'",
             )
             .await?;
         let services: Vec<ServiceRow> = self
@@ -982,9 +1180,16 @@ impl NetworkPolicyService {
                 .iter()
                 .map(|s| WorkloadRef::new(WorkloadKind::Sandbox, i64::from(s.id))),
         )?;
+        let egress = mark_recorded(
+            compiled.egress,
+            sandboxes
+                .iter()
+                .filter(|s| s.egress_recording)
+                .map(|s| WorkloadRef::new(WorkloadKind::Sandbox, i64::from(s.id))),
+        );
         Ok(PolicySnapshot {
             policies: compiled.policies,
-            egress: compiled.egress,
+            egress,
             names: named,
             container_names,
             remote,
@@ -1211,6 +1416,38 @@ const OTHER_NODE_ADDRESSES_SQL: &str = "\
 /// ever name addresses it allocates: a compromised worker cannot claim
 /// another node's workloads. A node without a known subnet contributes
 /// nothing.
+/// Marks the egress policies of `recorded` workloads so the node's proxy
+/// records their connections, adding an empty policy for a recorded
+/// workload that has no proxy rules (so the flag reaches the node).
+///
+/// One pass over each list, indexed by subject: N recorded workloads cost
+/// O(N), not a scan of the list per workload.
+fn mark_recorded(
+    mut egress: Vec<EgressPolicy>,
+    recorded: impl IntoIterator<Item = WorkloadRef>,
+) -> Vec<EgressPolicy> {
+    let mut index: HashMap<WorkloadRef, usize> = egress
+        .iter()
+        .enumerate()
+        .map(|(i, policy)| (policy.subject, i))
+        .collect();
+    for subject in recorded {
+        match index.get(&subject) {
+            Some(&i) => egress[i].record = true,
+            None => {
+                index.insert(subject, egress.len());
+                egress.push(EgressPolicy {
+                    subject,
+                    rules: Vec::new(),
+                    record: true,
+                    public_only: false,
+                });
+            }
+        }
+    }
+    egress
+}
+
 fn merge_observed(
     remote: &mut IdentityMap,
     observed: Vec<(i32, IdentityMap)>,
@@ -1262,6 +1499,33 @@ fn remote_identities(rows: Vec<RemoteAddressRow>) -> IdentityMap {
 #[cfg(test)]
 mod remote_tests {
     use super::*;
+
+    #[test]
+    fn recorded_workloads_are_marked_and_get_a_policy_when_they_have_none() {
+        let sandbox = |id| WorkloadRef::new(WorkloadKind::Sandbox, id);
+        let egress = vec![
+            EgressPolicy {
+                subject: sandbox(1),
+                rules: Vec::new(),
+                record: false,
+                public_only: false,
+            },
+            EgressPolicy {
+                subject: sandbox(2),
+                rules: Vec::new(),
+                record: false,
+                public_only: false,
+            },
+        ];
+        let marked = mark_recorded(egress, [sandbox(2), sandbox(3)]);
+        let flags: Vec<(WorkloadRef, bool)> =
+            marked.iter().map(|p| (p.subject, p.record)).collect();
+        assert_eq!(
+            flags,
+            vec![(sandbox(1), false), (sandbox(2), true), (sandbox(3), true)],
+            "only opted-in sandboxes are recorded"
+        );
+    }
 
     fn row(kind: &str, owner_id: i64, ip: &str) -> RemoteAddressRow {
         RemoteAddressRow {
@@ -1327,6 +1591,10 @@ mod remote_tests {
             },
         );
         assert!(!service.supports_enforcement(3));
+        // The next report sweeps the stale one: worker churn leaves nothing.
+        service.record_enforcer_report(4, "ebpf");
+        let kept: Vec<i32> = service.reports.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, [4]);
     }
 
     fn function_rule(id: i64) -> NewRule {
@@ -1401,7 +1669,11 @@ mod remote_tests {
         let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = NetworkPolicyService::new(Arc::new(db));
         let alpha = WorkloadRef::new(WorkloadKind::Deployment, 1);
-        service.record_observed(3, IdentityMap::new().with(alpha, ip("10.202.0.2")));
+        service.record_observed(
+            3,
+            IdentityMap::new().with(alpha, ip("10.202.0.2")),
+            NodeMode::Enforce,
+        );
 
         let seen_by = |node| {
             service
@@ -1421,8 +1693,61 @@ mod remote_tests {
         for n in 0..=MAX_REPORTED_ADDRESSES as u32 {
             flood.insert(alpha, std::net::IpAddr::V4(std::net::Ipv4Addr::from(n)));
         }
-        service.record_observed(4, flood);
+        service.record_observed(4, flood, NodeMode::Enforce);
         assert!(seen_by(3).is_empty(), "an oversized report is ignored");
+    }
+
+    /// Nothing reads an `off` node's workloads, so its report is not kept
+    /// (and replaces what it reported before), and a report from a node
+    /// that stopped reporting is dropped by the next one.
+    #[test]
+    fn off_reports_and_expired_reports_hold_no_memory() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = NetworkPolicyService::new(Arc::new(db));
+        let alpha = WorkloadRef::new(WorkloadKind::Deployment, 1);
+        let report = || IdentityMap::new().with(alpha, ip("10.202.0.2"));
+        service.record_observed(3, report(), NodeMode::Enforce);
+        service.record_observed(3, report(), NodeMode::Off);
+        assert!(
+            !service.observed.lock().unwrap().contains_key(&3),
+            "an off report replaces the node's earlier one and is not kept"
+        );
+
+        service.record_observed(5, report(), NodeMode::Shadow);
+        service.observed.lock().unwrap().get_mut(&5).unwrap().seen =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.record_observed(6, report(), NodeMode::Enforce);
+        let kept: Vec<i32> = service.observed.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, [6], "the expired report of node 5 is swept");
+
+        // A scale-down: node 6 is the only one left reporting. Its own
+        // heartbeat releases node 7's expired map once a sweep is due.
+        service.record_observed(7, report(), NodeMode::Enforce);
+        service.observed.lock().unwrap().get_mut(&7).unwrap().seen =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.record_observed(6, report(), NodeMode::Enforce);
+        assert!(
+            service.observed.lock().unwrap().contains_key(&7),
+            "not swept on every heartbeat"
+        );
+        service.swept.observed.expire();
+        service.record_observed(6, report(), NodeMode::Enforce);
+        let kept: Vec<i32> = service.observed.lock().unwrap().keys().copied().collect();
+        assert_eq!(
+            kept,
+            [6],
+            "a known node's heartbeat sweeps once a TTL has passed"
+        );
+
+        // Only an `off` node left reporting: its heartbeats sweep too.
+        service.observed.lock().unwrap().get_mut(&6).unwrap().seen =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.swept.observed.expire();
+        service.record_observed(8, report(), NodeMode::Off);
+        assert!(
+            service.observed.lock().unwrap().is_empty(),
+            "the expired map of node 6 is released by an off heartbeat"
+        );
     }
 
     /// Only addresses inside the reporting node's own compute subnet are
@@ -1650,10 +1975,10 @@ mod tests {
         let service = Arc::new(NetworkPolicyService::new(conn.clone()));
         let c = conn.as_ref();
 
-        // Today's defaults: every node legacy.
+        // Today's defaults: every node off.
         let modes = service.node_modes().await.unwrap();
         assert_eq!(modes[0].node_id, 0);
-        assert!(modes.iter().all(|n| n.mode == NodeMode::Legacy));
+        assert!(modes.iter().all(|n| n.mode == NodeMode::Off));
 
         let project = exec(
             c,
@@ -1825,8 +2150,24 @@ mod tests {
         );
 
         // The snapshot a node enforces.
+        // What node 0 advertised in another mode is dropped once its source
+        // reads `off`: no worker keeps it as a peer until the report expires.
+        service.record_observed(
+            CONTROL_PLANE_NODE_ID,
+            IdentityMap::new().with(sandbox_ref, "10.202.0.9".parse().unwrap()),
+            NodeMode::Enforce,
+        );
+        assert!(!service.observed_elsewhere(7).is_empty());
         let source = DbPolicySource::new(service.clone(), CONTROL_PLANE_NODE_ID);
-        assert_eq!(source.mode().await.unwrap(), NodeMode::Legacy);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert!(
+            service.observed_elsewhere(7).is_empty(),
+            "switched off, node 0's last report is forgotten"
+        );
+        assert!(
+            source.off_snapshot().await.unwrap().is_none(),
+            "in off nothing reads what the control plane would observe"
+        );
         let snapshot = source.snapshot().await.unwrap();
         let sandbox_policy = snapshot
             .policies
@@ -1858,7 +2199,7 @@ mod tests {
 
         // Modes: node 0 and a worker row; an unknown node is refused.
         let (previous, now) = service.set_node_mode(0, NodeMode::Shadow).await.unwrap();
-        assert_eq!((previous, now.mode), (NodeMode::Legacy, NodeMode::Shadow));
+        assert_eq!((previous, now.mode), (NodeMode::Off, NodeMode::Shadow));
         assert_eq!(source.mode().await.unwrap(), NodeMode::Shadow);
         let worker = exec(
             c,
@@ -1866,9 +2207,9 @@ mod tests {
              VALUES ('worker-1', 'x', 'https://10.201.0.9:3100', '10.201.0.9') RETURNING id",
         )
         .await as i32;
-        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Legacy);
+        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Off);
         // No enforcer runs on workers: shadow and enforce are refused, and
-        // legacy stays settable so a stale mode can be cleared.
+        // off stays settable so a stale mode can be cleared.
         for mode in [NodeMode::Enforce, NodeMode::Shadow] {
             let refused = service.set_node_mode(worker, mode).await;
             assert!(
@@ -1880,11 +2221,20 @@ mod tests {
                 "{refused:?}"
             );
         }
-        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Legacy);
-        service
-            .set_node_mode(worker, NodeMode::Legacy)
-            .await
-            .unwrap();
+        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Off);
+        service.record_observed(
+            worker,
+            IdentityMap::new().with(sandbox_ref, "10.202.0.10".parse().unwrap()),
+            NodeMode::Shadow,
+        );
+        service.set_node_mode(worker, NodeMode::Off).await.unwrap();
+        assert!(
+            service
+                .observed_elsewhere(CONTROL_PLANE_NODE_ID)
+                .iter()
+                .all(|(id, _)| *id != worker),
+            "switching a worker off forgets what it observed"
+        );
         // A worker `enforce` stored before the refusal is never reported
         // as enforcing; the control plane is.
         c.execute_unprepared(&format!(

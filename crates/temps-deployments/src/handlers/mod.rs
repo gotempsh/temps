@@ -12,6 +12,7 @@ pub mod crons;
 pub use temps_ci_tokens::handlers::deployment_tokens;
 pub mod deployments;
 pub(crate) mod docker_socket;
+pub mod egress_recording;
 pub mod external_images;
 pub mod failure_report;
 pub use temps_nodes::handlers::network;

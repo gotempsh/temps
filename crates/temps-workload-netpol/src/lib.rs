@@ -46,13 +46,17 @@ pub use ebpf::{
     available_datapath, CgroupDatapath, CgroupTarget, DatapathConfig, DatapathError, DatapathOpener,
 };
 pub use egress::{
-    EgressPolicy, EgressProxy, EgressProxyConfig, EgressRule, EgressStats, EgressTable,
-    EgressTarget, HostPattern, RelayUpstream,
+    recording_channel, ConnectionKind, ConnectionOutcome, ConnectionRecord, Delivered,
+    EgressBatcher, EgressPolicy, EgressProxy, EgressProxyConfig, EgressReason, EgressRecordBatch,
+    EgressRecordSink, EgressRecorder, EgressRecordingCapability, EgressRule, EgressStats,
+    EgressStatsSnapshot, EgressTable, EgressTarget, HostPattern, RecordSinkError,
+    RecordingUnavailable, RelayKind, RelayUpstream, UnknownSource,
 };
 pub use enforcer::{
-    identify, spawn_container_wake, with_best_datapath, DockerInstanceSource, EnforcerError,
-    InstanceSource, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PassSummary,
-    PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer, SystemPeer,
+    identify, snapshot_digest, spawn_container_wake, with_best_datapath, DockerInstanceSource,
+    EnforcerError, InstanceSource, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport,
+    PassOutcome, PassSummary, PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer,
+    SystemPeer, POLICY_PROTOCOL, PROTOCOL_SNAPSHOT_IN_EVERY_MODE,
 };
 pub use executor::{choose_executor, DockerVmNft, HostNft, NftError, NftExecutor};
 pub use identity::{IdentityEntry, IdentityMap};

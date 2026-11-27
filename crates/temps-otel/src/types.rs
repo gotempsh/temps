@@ -10,6 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use temps_workload::WorkloadRef;
 use utoipa::ToSchema;
 
 pub use crate::log_attributes::{LogAttributeFilter, LogAttributeOperator, LogAttributeType};
@@ -519,8 +520,20 @@ pub struct LogRecord {
     #[serde(skip)]
     #[schema(ignore)]
     pub ingest_identity: Option<IngestIdentity>,
-    pub project_id: i32,
+    /// The project that owns the record. `None` only for a record the
+    /// platform observed about a workload that belongs to no project (see
+    /// `workload`); everything a workload sends about itself has a project.
+    pub project_id: Option<i32>,
     pub deployment_id: Option<i32>,
+    /// The workload the platform observed this record about (a sandbox, an
+    /// environment's deployment), stored in its own indexed columns so one
+    /// workload's records are read without scanning its project's, and can
+    /// be read when it has no project at all. Only the platform sets it
+    /// ([`crate::OtelService::ingest_platform_logs`]); it never comes from a
+    /// request body, so no workload can file records under another.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub workload: Option<WorkloadRef>,
     pub resource: ResourceInfo,
     #[schema(value_type = String, format = DateTime)]
     pub timestamp: DateTime<Utc>,
@@ -1452,6 +1465,17 @@ pub struct MetricQuery {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogQuery {
     pub project_id: i32,
+    /// Only the records the platform stored about this workload, within
+    /// `project_id` (what a project-scoped request may ask), unless
+    /// [`Self::workload_in_any_project`] is set.
+    #[serde(skip)]
+    pub workload: Option<WorkloadRef>,
+    /// Read [`Self::workload`]'s records whatever project owns them, or none
+    /// (a workload's records are its own): `project_id` is then not applied.
+    /// Only a caller that authorized access to the workload itself sets it;
+    /// never read from a request, so no request can lift the project.
+    #[serde(skip)]
+    pub workload_in_any_project: bool,
     pub severity: Option<LogSeverity>,
     pub service_name: Option<String>,
     pub search: Option<String>,

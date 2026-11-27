@@ -107,6 +107,14 @@ pub struct Model {
     #[sea_orm(column_type = "JsonBinary")]
     pub egress_policy: StoredEgressPolicy,
 
+    /// Record every outbound connection the sandbox makes through the
+    /// per-node egress proxy, as OpenTelemetry log records owned by the
+    /// sandbox, and by its project when it has one.
+    /// Off by default (the column default); set by the sandbox's owner and
+    /// re-checked by the control plane on every record it ingests.
+    #[serde(default)]
+    pub egress_recording: bool,
+
     pub created_at: DBDateTime,
     pub last_activity_at: DBDateTime,
     pub expires_at: DBDateTime,
@@ -181,6 +189,7 @@ mod tests {
             backend: None,
             node_id: None,
             egress_policy: StoredEgressPolicy::default(),
+            egress_recording: false,
             created_at: now,
             last_activity_at: now,
             expires_at: now,

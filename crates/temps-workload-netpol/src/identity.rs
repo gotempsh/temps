@@ -14,7 +14,7 @@ use temps_workload::WorkloadRef;
 ///
 /// On the wire (a worker's policy snapshot) it is a list of
 /// `{workload, addresses}`, since a workload is not a JSON object key.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(into = "Vec<IdentityEntry>", from = "Vec<IdentityEntry>")]
 pub struct IdentityMap {
     addresses: BTreeMap<WorkloadRef, BTreeSet<IpAddr>>,

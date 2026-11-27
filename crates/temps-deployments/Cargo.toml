@@ -43,6 +43,8 @@ temps-traefik-discovery = { path = "../temps-traefik-discovery" }
 temps-otel = { path = "../temps-otel" }
 temps-workload = { path = "../temps-workload", features = ["openapi"] }
 temps-workload-docker = { path = "../temps-workload-docker" }
+temps-workload-egress = { path = "../temps-workload-egress" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-plane = { path = "../temps-workload-plane" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
@@ -87,6 +89,8 @@ rustls-pemfile = { workspace = true }
 [dev-dependencies]
 temps-nodes = { path = "../temps-nodes", features = ["test-support"] }
 temps-test-utils = { path = "../temps-test-utils" }
+# The recording capability a node reports, faked in the egress recording tests.
+temps-network-policy = { path = "../temps-network-policy" }
 sea-orm-migration = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 tokio-test = { workspace = true }

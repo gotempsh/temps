@@ -321,8 +321,9 @@ pub fn nel(
         }
     }
     Ok(Some(LogRecord {
+        workload: None,
         ingest_identity: None,
-        project_id: auth.project_id,
+        project_id: Some(auth.project_id),
         deployment_id: auth.deployment_id,
         resource,
         timestamp: now - chrono::Duration::milliseconds(report.age as i64),
@@ -401,7 +402,7 @@ mod tests {
     fn nel_preserves_typed_attributes_and_uses_logs_without_invented_trace_ids() {
         let report=br#"{"type":"network-error","age":1000,"url":"https://synthetic.example/api","user_agent":"SyntheticAgent/1","body":{"type":"dns.name_not_resolved","phase":"dns","status_code":0,"elapsed_time":12,"sampling_fraction":0.1234567890123456789,"server_ip":"192.0.2.1","protocol":"http/2","method":"GET"}}"#;
         let log = nel(&header("nel"), report, &auth()).unwrap().unwrap();
-        assert_eq!(log.project_id, 7);
+        assert_eq!(log.project_id, Some(7));
         assert_eq!(log.deployment_id, Some(9));
         assert_eq!(log.attributes["temps.sentry.environment_id"], "8");
         assert_eq!(

@@ -733,6 +733,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: IngressMode::Enforce,
+            egress_recording: false,
             workload_mode: Default::default(),
         }
     }
@@ -857,6 +858,7 @@ mod tests {
             preview_access: SandboxPreviewAccess::TempsLogin,
             preview_allowed_cidrs: Vec::new(),
             egress_policy: Default::default(),
+            egress_recording: false,
         }
     }
 

@@ -111,6 +111,11 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         // Changing a sandbox's egress policy after it was created (temps
         // extension, ADR-055).
         "/v1/sandboxes/{id}/egress-policy",
+        // Recording every outbound connection as OpenTelemetry logs owned
+        // by the sandbox, opt-in, with its capability, and the recorded
+        // connections themselves (temps extensions, ADR-118).
+        "/v1/sandboxes/{id}/egress-recording",
+        "/v1/sandboxes/{id}/egress-records",
         // Directory listing and preview access checks (temps extensions).
         "/v1/sandboxes/{id}/fs/list",
         "/v1/sandboxes/{id}/preview-access",
@@ -404,6 +409,7 @@ fn sandbox_response_matches_sdk_envelope() {
             node_id: None,
             node_name: "control-plane".into(),
             egress_policy: Default::default(),
+            egress_recording: false,
             memory: 2048,
             vcpus: 2.0,
             region: "local".into(),
@@ -488,6 +494,7 @@ fn sandbox_status_uses_sdk_enum_values() {
                 node_id: None,
                 node_name: "control-plane".into(),
                 egress_policy: Default::default(),
+                egress_recording: false,
                 memory: 0,
                 vcpus: 0.0,
                 region: "local".into(),

@@ -206,6 +206,11 @@ pub struct DeploymentService {
     /// through it; unset, those replicas are left for a later sweep rather
     /// than removed behind the plane's back.
     workload_plane: std::sync::OnceLock<Arc<temps_workload_plane::WorkloadPlane>>,
+    /// This host's egress recorder, shared with the workflow path.
+    /// Promotion and rollback build deploy jobs inline, so without it their
+    /// replacement replicas would start unrecorded in an environment that
+    /// records its outbound connections.
+    egress_recorder: std::sync::OnceLock<Arc<temps_workload_egress::local::LocalEgressRecorder>>,
 }
 
 impl DeploymentService {
@@ -239,7 +244,16 @@ impl DeploymentService {
             node_scheduler: std::sync::OnceLock::new(),
             workflow_planner: std::sync::OnceLock::new(),
             workload_plane: std::sync::OnceLock::new(),
+            egress_recorder: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Set this host's egress recorder (see the field docs).
+    pub fn set_egress_recorder(
+        &self,
+        recorder: Arc<temps_workload_egress::local::LocalEgressRecorder>,
+    ) {
+        let _ = self.egress_recorder.set(recorder);
     }
 
     /// Late-bind the environment-variable resolver (see the field docs). Called

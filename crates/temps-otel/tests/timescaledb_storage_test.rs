@@ -134,9 +134,10 @@ fn sample_log(
     trace_id: Option<&str>,
 ) -> LogRecord {
     LogRecord {
+        workload: None,
         ingest_identity: None,
         attribute_types: Default::default(),
-        project_id,
+        project_id: Some(project_id),
         deployment_id: None,
         resource: test_resource(),
         timestamp: Utc::now(),
@@ -1005,6 +1006,138 @@ async fn duplicate_metric_batch_insert_duplicates_rows() {
     );
 }
 
+/// Records the platform observed about a workload are stored with its kind
+/// and id and read back by them alone: another workload's, another kind's
+/// with the same id, and the project's own logs are not returned. A
+/// workload without a project keeps its records, which no project sees.
+#[tokio::test]
+async fn log_records_are_stored_and_read_per_workload() {
+    use temps_workload::{WorkloadKind, WorkloadRef};
+
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let sandbox = |id| WorkloadRef::new(WorkloadKind::Sandbox, id);
+    let observed = |workload: Option<WorkloadRef>, body: &str| LogRecord {
+        workload,
+        ..sample_log(1, LogSeverity::Info, body, None)
+    };
+    storage
+        .store_logs(vec![
+            observed(None, "workload line"),
+            observed(Some(sandbox(42)), "sandbox 42 connection"),
+            observed(Some(sandbox(43)), "sandbox 43 connection"),
+            observed(
+                Some(WorkloadRef::new(WorkloadKind::Deployment, 42)),
+                "environment 42 connection",
+            ),
+            LogRecord {
+                project_id: None,
+                ..observed(Some(sandbox(44)), "projectless sandbox connection")
+            },
+        ])
+        .await
+        .expect("store");
+
+    let of = |workload: WorkloadRef, project_id: i32| LogQuery {
+        project_id,
+        workload: Some(workload),
+        ..Default::default()
+    };
+    let found = storage
+        .query_logs(of(sandbox(42), 1))
+        .await
+        .expect("workload query");
+    assert_eq!(
+        found
+            .iter()
+            .map(|r| (r.body.as_str(), r.workload, r.project_id))
+            .collect::<Vec<_>>(),
+        vec![("sandbox 42 connection", Some(sandbox(42)), Some(1))]
+    );
+    let environment = storage
+        .query_logs(of(WorkloadRef::new(WorkloadKind::Deployment, 42), 1))
+        .await
+        .expect("query");
+    assert_eq!(
+        environment
+            .iter()
+            .map(|r| r.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["environment 42 connection"],
+        "the same id of another kind is another workload"
+    );
+
+    // Project 0 names no project: nothing, never everything.
+    let none = storage.query_logs(of(sandbox(44), 0)).await.expect("query");
+    assert!(none.is_empty(), "{none:?}");
+    // Only a caller that authorized the workload itself reads it in any
+    // project, or none.
+    let unowned = storage
+        .query_logs(LogQuery {
+            workload_in_any_project: true,
+            ..of(sandbox(44), 0)
+        })
+        .await
+        .expect("query");
+    assert_eq!(
+        unowned
+            .iter()
+            .map(|r| (r.body.as_str(), r.project_id))
+            .collect::<Vec<_>>(),
+        vec![("projectless sandbox connection", None)],
+        "a workload without a project keeps its records"
+    );
+
+    let count = |workload| {
+        storage.count_logs(LogQuery {
+            project_id: 1,
+            workload,
+            limit: Some(1),
+            ..Default::default()
+        })
+    };
+    assert_eq!(count(Some(sandbox(42))).await.expect("count"), 1);
+    assert_eq!(
+        count(None).await.expect("count"),
+        4,
+        "the count ignores the limit, and the project does not see the projectless record"
+    );
+
+    let all = storage
+        .query_logs(LogQuery {
+            project_id: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("project query");
+    assert_eq!(all.len(), 4);
+}
+
+/// More rows than one statement can bind (PostgreSQL's 65,535 parameters,
+/// 16 per row) are stored, in several statements of one transaction.
+#[tokio::test]
+async fn a_log_batch_larger_than_one_statement_is_stored_whole() {
+    let Some((db, storage)) = setup_storage().await else {
+        return;
+    };
+    let logs: Vec<LogRecord> = (0..4_200)
+        .map(|i| sample_log(31, LogSeverity::Warn, &format!("line {i}"), None))
+        .collect();
+    assert_eq!(storage.store_logs(logs).await.unwrap(), 4_200);
+    use sea_orm::ConnectionTrait;
+    let row = db
+        .db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*)::BIGINT AS n FROM otel_log_events WHERE project_id = 31",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<i64>("", "n").unwrap(), 4_200);
+}
+
 #[tokio::test]
 async fn duplicate_log_batch_insert_duplicates_rows() {
     let Some((_db, storage)) = setup_storage().await else {
@@ -1262,6 +1395,104 @@ async fn test_archive_logs_without_s3() {
     // No S3 configured => returns 0
     let archived = storage.archive_logs(vec![log]).await.unwrap();
     assert_eq!(archived, 0);
+}
+
+/// An S3 endpoint on loopback that accepts every upload and counts them.
+async fn s3_stub() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let uploads = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = uploads.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let counted = counted.clone();
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                loop {
+                    // One request: its head, then a body of Content-Length.
+                    let head_end = loop {
+                        if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                        let mut chunk = [0u8; 8192];
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if head.contains("expect: 100-continue") {
+                        let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                    }
+                    while buffer.len() < head_end + length {
+                        let mut chunk = [0u8; 8192];
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    buffer.drain(..head_end + length);
+                    if head.starts_with("put ") {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let answer = b"HTTP/1.1 200 OK\r\nETag: \"stub\"\r\nContent-Length: 0\r\n\r\n";
+                    if stream.write_all(answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{address}"), uploads)
+}
+
+/// With S3 configured, the count returned is what was archived: records of
+/// a workload without a project stay out of the archive and its count.
+#[tokio::test]
+async fn archived_logs_are_counted_without_the_projectless_ones() {
+    // Archiving touches no database: a mock connection, so the test always
+    // runs, with or without one.
+    let db = std::sync::Arc::new(
+        sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+    );
+    let (endpoint, uploads) = s3_stub().await;
+    let archiver = temps_otel::storage::timescaledb::S3LogArchiver::new(
+        "us-east-1",
+        Some(&endpoint),
+        "test-access-key",
+        "test-secret-key",
+        "logs".to_string(),
+        "archive".to_string(),
+    )
+    .await
+    .unwrap();
+    let storage = TimescaleDbStorage::new(db, Some(std::sync::Arc::new(archiver)));
+    let projectless = LogRecord {
+        project_id: None,
+        ..sample_log(1, LogSeverity::Info, "a projectless workload's line", None)
+    };
+    let archived = storage
+        .archive_logs(vec![
+            sample_log(1, LogSeverity::Info, "one", None),
+            projectless,
+            sample_log(1, LogSeverity::Info, "two", None),
+            sample_log(2, LogSeverity::Info, "three", None),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(archived, 3);
+    assert_eq!(
+        uploads.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one object per project"
+    );
 }
 
 // ── Storage quota ───────────────────────────────────────────────────

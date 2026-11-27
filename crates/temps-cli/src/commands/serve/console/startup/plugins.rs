@@ -407,6 +407,12 @@ async fn register_builtin_plugins<R: PluginRegistrar>(
         // to `legacy`, where the enforcer only reads the mode: no Docker call,
         // no nftables.
         || Box::new(temps_network_policy::NetworkPolicyPlugin::new()),
+        // Recording outbound connections, once for every workload kind:
+        // the service and the node-0 recorder that sandboxes and
+        // environments register with in their second phase. Builds on
+        // OtelPlugin (where records are stored) and NetworkPolicyPlugin
+        // (which nodes can record), both optional to it.
+        || Box::new(temps_workload_egress::WorkloadEgressPlugin::new()),
     ]);
 
     Ok(skipped_plugins)
@@ -566,6 +572,7 @@ mod tests {
         "static-files",
         "external-plugins",
         "network-policy",
+        "workload-egress",
     ];
 
     /// One `{ present: false }` row: the stateless identity table is absent.
@@ -715,6 +722,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         }
     }

@@ -81,6 +81,14 @@ impl SandboxService {
                 return Err(error);
             }
         };
+        // A recorded sandbox's connections are decided by the egress
+        // recorder, not its sidecar: it must hold the new policy before the
+        // change is reported done, not on its next pass.
+        if updated.egress_recording {
+            if let Some(observer) = self.egress_observer.get() {
+                observer.policy_changed(&updated).await;
+            }
+        }
         tracing::info!(
             sandbox_id = %public_id_value,
             internal_id = row.id,

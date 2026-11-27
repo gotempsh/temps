@@ -14,7 +14,7 @@ use std::sync::{
 use std::time::Duration;
 use temps_core::retry::RetryConfig;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::{OtelError, StorageErrorKind};
 use crate::ingest::auth::{IngestAuth, OtelAuthService, ProjectAuth};
@@ -1003,14 +1003,42 @@ impl OtelService {
     /// Stores all severities in queryable storage and attempts S3 archival.
     /// The legacy native transport acknowledges receipt even if the DB fails;
     /// adapters requiring durable confirmation use `ingest_logs_confirmed`.
-    pub async fn ingest_logs(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
+    ///
+    /// Records come from workloads: any attribute in the platform-only
+    /// namespace ([`crate::platform_logs`]) is removed first, so a workload
+    /// cannot pass its own records off as platform-observed.
+    pub async fn ingest_logs(&self, mut records: Vec<LogRecord>) -> Result<u64, OtelError> {
+        Self::strip_workload_claims(&mut records);
         self.ingest_logs_inner(records, false).await
+    }
+
+    /// Ingest records the platform itself observed (the egress proxy's
+    /// connection records), keeping their platform-only attributes. Storage
+    /// must confirm the batch, so the caller can tell its source that it
+    /// was not stored. Never call this with records a workload supplied.
+    pub async fn ingest_platform_logs(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
+        self.ingest_logs_inner(records, true).await
+    }
+
+    fn strip_workload_claims(records: &mut [LogRecord]) {
+        let removed = crate::platform_logs::strip_platform_attributes(records);
+        if removed > 0 {
+            debug!(
+                removed,
+                prefix = crate::platform_logs::PLATFORM_ATTRIBUTE_PREFIX,
+                "removed platform-only attributes from workload log records"
+            );
+        }
     }
 
     /// Require queryable storage confirmation, using the same retry, archival,
     /// routing and diagnostics as native ingestion. Compatibility transports must
     /// not acknowledge a dropped batch as stored. Archival is still attempted.
-    pub async fn ingest_logs_confirmed(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
+    pub async fn ingest_logs_confirmed(
+        &self,
+        mut records: Vec<LogRecord>,
+    ) -> Result<u64, OtelError> {
+        Self::strip_workload_claims(&mut records);
         self.ingest_logs_inner(records, true).await
     }
 
@@ -1277,14 +1305,25 @@ impl OtelService {
         if let Some(filter) = &query.attribute_filter {
             filter.validate()?;
             // Attribute comparisons are control-plane queries. Default to a
-            // bounded window unless correlation already selects one trace.
-            if query.start_time.is_none() && query.trace_id.is_none() {
+            // bounded window unless correlation already selects one trace
+            // or the query is one sandbox's records, which its own index
+            // bounds.
+            if query.start_time.is_none() && query.trace_id.is_none() && query.workload.is_none() {
                 query.start_time = Some(
                     query.end_time.unwrap_or_else(chrono::Utc::now) - chrono::Duration::hours(24),
                 );
             }
         }
         self.storage.query_logs(query).await
+    }
+
+    /// How many records [`Self::query_logs`] would match, ignoring its
+    /// limit and offset.
+    pub async fn count_logs(&self, query: LogQuery) -> Result<u64, OtelError> {
+        if let Some(filter) = &query.attribute_filter {
+            filter.validate()?;
+        }
+        self.storage.count_logs(query).await
     }
 
     pub async fn query_genai_trace_summaries(
@@ -1419,9 +1458,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn confirmed_logs_use_native_retries_archival_and_failure_accounting() {
         let log = LogRecord {
+            workload: None,
             ingest_identity: None,
             attribute_types: Default::default(),
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource: ResourceInfo::default(),
             timestamp: chrono::Utc::now(),
@@ -2165,6 +2205,83 @@ mod tests {
         assert_eq!(recorded[0].error_class, "clickhouse_network");
     }
 
+    // ── Platform-observed logs ──────────────────────────────────────────
+
+    fn platform_log(body: &str) -> LogRecord {
+        let now = chrono::Utc::now();
+        let mut resource = ResourceInfo::default();
+        resource.attributes.insert(
+            crate::platform_logs::PLATFORM_SOURCE_ATTRIBUTE.into(),
+            crate::types::AttributeValue::String("egress-proxy".into()),
+        );
+        LogRecord {
+            workload: None,
+            ingest_identity: None,
+            attribute_types: Default::default(),
+            project_id: Some(1),
+            deployment_id: None,
+            resource,
+            timestamp: now,
+            observed_timestamp: now,
+            severity: LogSeverity::Info,
+            severity_text: "INFO".into(),
+            body: body.to_string(),
+            trace_id: None,
+            span_id: None,
+            attributes: [(
+                crate::platform_logs::PLATFORM_SOURCE_ATTRIBUTE.to_string(),
+                "egress-proxy".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_logs_lose_platform_only_attributes() {
+        let (svc, storage) = make_service(MockOtelStorage::new());
+        svc.ingest_logs(vec![platform_log("forged")]).await.unwrap();
+        svc.ingest_logs_confirmed(vec![platform_log("forged too")])
+            .await
+            .unwrap();
+        let stored = storage.stored_logs();
+        assert_eq!(stored.len(), 2);
+        for record in stored {
+            assert!(record.attributes.is_empty(), "{:?}", record.attributes);
+            assert!(record.resource.attributes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_logs_keep_their_marker() {
+        let (svc, storage) = make_service(MockOtelStorage::new());
+        assert_eq!(
+            svc.ingest_platform_logs(vec![platform_log("observed")])
+                .await
+                .unwrap(),
+            1
+        );
+        let stored = storage.stored_logs();
+        assert_eq!(
+            stored[0]
+                .attributes
+                .get(crate::platform_logs::PLATFORM_SOURCE_ATTRIBUTE)
+                .map(String::as_str),
+            Some("egress-proxy")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn platform_logs_report_a_failed_store() {
+        let mock = MockOtelStorage::new();
+        mock.fail_store_logs_fatally("schema mismatch");
+        let (svc, _storage) = make_service(mock);
+        assert!(svc
+            .ingest_platform_logs(vec![platform_log("observed")])
+            .await
+            .is_err());
+    }
+
     // ── Logs ingest: the DB write is non-fatal to the overall result ────
 
     /// `ingest_logs` deliberately diverges from `ingest_spans`/`ingest_metrics`:
@@ -2181,9 +2298,10 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            workload: None,
             ingest_identity: None,
             attribute_types: Default::default(),
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource: ResourceInfo::default(),
             timestamp: now,
@@ -2725,9 +2843,10 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            workload: None,
             ingest_identity: None,
             attribute_types: Default::default(),
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource: ResourceInfo::default(),
             timestamp: now,

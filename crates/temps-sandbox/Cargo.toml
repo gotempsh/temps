@@ -22,6 +22,15 @@ temps-git = { path = "../temps-git" }
 # Frame codec for the in-sandbox PTY agent (ADR-008). Library half only —
 # the binary is built into the sandbox image, not linked here.
 temps-pty-agent = { path = "../temps-pty-agent" }
+# Egress recording: node capabilities and the snapshot flag (network
+# policy), the record wire types (netpol), node-token auth (routes) and the
+# OTel log store.
+temps-network-policy = { path = "../temps-network-policy" }
+temps-otel = { path = "../temps-otel" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-egress = { path = "../temps-workload-egress" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
+bollard = { workspace = true }
 base64 = { workspace = true }
 sea-orm = { workspace = true }
 tokio = { workspace = true }
@@ -49,6 +58,10 @@ sysinfo = { workspace = true }
 tar = { workspace = true }
 
 [dev-dependencies]
+# The egress recording e2e drives the per-node proxy (the probe binary) in
+# Docker; it skips without Docker or the cross-built binary.
+temps-netpol-probe = { path = "../temps-netpol-probe" }
+temps-test-utils = { path = "../temps-test-utils" }
 bytes = { workspace = true }
 mockito = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

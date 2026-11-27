@@ -83,6 +83,7 @@ function sandbox(id: string, extra: Partial<SandboxInner> = {}): SandboxInner {
     node_name: 'worker-1',
     image: 'node:22',
     egress_policy: { mode: 'internet', rules: [] },
+    egress_recording: false,
     preview_access: 'temps_login',
     preview_allowed_cidrs: [],
     ...extra,

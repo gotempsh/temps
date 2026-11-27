@@ -208,6 +208,13 @@ impl FromJobRecord for DeployImageJob {
         .cross_node_service_blockers(crate::services::workflow_planner::read_cross_node_blockers(
             config,
         ))
+        // The environment's own opt-in, read now so it applies to this
+        // deployment's replicas.
+        .recorded_egress(crate::services::egress_recording::RecordedEgress::plan(
+            environment,
+            service.egress_recorder.get().map(std::sync::Arc::as_ref),
+        ))
+        .egress_recorder(service.egress_recorder.get().cloned())
         .secrets(secrets)
         .resources(resources)
         .log_id(db_job.log_id.clone())

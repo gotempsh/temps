@@ -488,6 +488,9 @@ pub struct WorkflowExecutionService {
     container_teardown_timeout: std::time::Duration,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
+    /// This host's egress recorder, when it has one: a deployment of an
+    /// environment that records starts its local replicas through it.
+    pub(crate) egress_recorder: OnceCell<Arc<temps_workload_egress::local::LocalEgressRecorder>>,
     /// ADR-055 Phase 5: the unified scheduler's inputs, for `shadow` and
     /// `enforce` environments.
     workload_placement: OnceCell<Arc<crate::services::WorkloadPlacementService>>,
@@ -556,6 +559,7 @@ impl WorkflowExecutionService {
             ),
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
+            egress_recorder: OnceCell::new(),
             workload_placement: OnceCell::new(),
             workload_plane: OnceCell::new(),
             encryption_service: OnceCell::new(),
@@ -602,6 +606,15 @@ impl WorkflowExecutionService {
     /// Set the node scheduler for multi-node deployments
     pub fn set_node_scheduler(&self, scheduler: Arc<crate::services::NodeScheduler>) {
         let _ = self.node_scheduler.set(scheduler);
+    }
+
+    /// Set this host's egress recorder, through which the local replicas of
+    /// environments that record are started.
+    pub fn set_egress_recorder(
+        &self,
+        recorder: Arc<temps_workload_egress::local::LocalEgressRecorder>,
+    ) {
+        let _ = self.egress_recorder.set(recorder);
     }
 
     /// Set the placement service `shadow`/`enforce` deployments use.

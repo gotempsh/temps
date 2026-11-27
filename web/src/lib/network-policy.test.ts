@@ -8,7 +8,9 @@ import {
   describeSubject,
   effectivePolicyEnforcementText,
   HOST_RULES_UNAVAILABLE,
+  isNodeNetworkPolicyMode,
   networkPolicyModeUnavailableReason,
+  normalizeNodeNetworkPolicyMode,
   profileUpdate,
   nodeNetworkPolicyMode,
   ruleDeleteBlockedReason,
@@ -180,6 +182,14 @@ describe('display helpers', () => {
     expect(nodeNetworkPolicyMode(list, 5)).toBeUndefined()
   })
 
+  test('a mode named legacy, by an older server, reads as off', () => {
+    expect(normalizeNodeNetworkPolicyMode('legacy')).toBe('off')
+    expect(normalizeNodeNetworkPolicyMode('enforce')).toBe('enforce')
+    expect(isNodeNetworkPolicyMode('legacy')).toBe(true)
+    expect(isNodeNetworkPolicyMode('off')).toBe(true)
+    expect(isNodeNetworkPolicyMode('paused')).toBe(false)
+  })
+
   test('stored hostname rules are flagged as not enforced', () => {
     expect(ruleNotEnforcedReason(rule({}))).toBeNull()
     expect(
@@ -187,7 +197,7 @@ describe('display helpers', () => {
     ).toContain('egress proxy')
   })
 
-  test('workers offer only Legacy, with the reason', () => {
+  test('workers offer only Off, with the reason', () => {
     const worker = {
       node_id: 3,
       name: 'worker-3',
@@ -197,7 +207,7 @@ describe('display helpers', () => {
       supports_enforcement: false,
       enforcement_unavailable_reason: 'No enforcer runs on worker nodes yet.',
     }
-    expect(networkPolicyModeUnavailableReason(worker, 'legacy')).toBeNull()
+    expect(networkPolicyModeUnavailableReason(worker, 'off')).toBeNull()
     expect(networkPolicyModeUnavailableReason(worker, 'shadow')).toBe(
       'No enforcer runs on worker nodes yet.'
     )

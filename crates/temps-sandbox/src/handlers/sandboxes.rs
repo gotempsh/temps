@@ -76,6 +76,12 @@ pub(crate) fn require_sandbox_read(auth: &temps_auth::context::AuthContext) -> R
     sandbox_permission_guard(auth, Permission::SandboxesRead, Permission::ProjectsRead)
 }
 
+pub(crate) fn require_sandbox_write(
+    auth: &temps_auth::context::AuthContext,
+) -> Result<(), Problem> {
+    sandbox_permission_guard(auth, Permission::SandboxesWrite, Permission::ProjectsWrite)
+}
+
 pub(crate) fn sandbox_permission_guard(
     auth: &temps_auth::context::AuthContext,
     primary: Permission,
@@ -894,6 +900,10 @@ pub struct SandboxInner {
     pub node_name: String,
     /// Which outside destinations the sandbox may reach (temps-native).
     pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
+    /// Whether every outbound connection is recorded as an OpenTelemetry
+    /// log record of the sandbox's project. See
+    /// `GET /v1/sandboxes/{id}/egress-recording` for whether it can be.
+    pub egress_recording: bool,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -963,6 +973,7 @@ impl SandboxResponse {
                 node_id: s.node_id,
                 node_name: s.node_name,
                 egress_policy: s.egress_policy,
+                egress_recording: s.egress_recording,
             },
             routes,
         }
@@ -3637,6 +3648,7 @@ mod tests {
             node_id: None,
             node_name: "control-plane".into(),
             egress_policy: Default::default(),
+            egress_recording: false,
             name: "name".into(),
             status: "running".into(),
             image: None,
@@ -3673,6 +3685,7 @@ mod tests {
             node_id: None,
             node_name: "control-plane".into(),
             egress_policy: Default::default(),
+            egress_recording: false,
             name: "name".into(),
             status: "running".into(),
             image: None,

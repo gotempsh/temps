@@ -1298,7 +1298,8 @@ jobs:
               package(temps-pty-agent) or package(temps-sandbox) or
               package(temps-vm-agent) or package(temps-wireguard) or
               package(temps-workload) or package(temps-workload-activator) or
-              package(temps-workload-docker) or package(temps-workload-env) or
+              package(temps-workload-docker) or package(temps-workload-egress) or
+              package(temps-workload-env) or
               package(temps-workload-ingress) or package(temps-workload-netpol) or
               package(temps-workload-node) or package(temps-workload-plane) or
               package(temps-workload-volumes)) and kind(=lib)
