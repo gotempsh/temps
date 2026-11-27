@@ -10,11 +10,49 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+usage() {
+    cat <<'EOF'
+Usage: scripts/release.sh [VERSION]
+       scripts/release.sh --libraries [VERSION]
+       scripts/release.sh --help
+
+Server release (default): bump Cargo.toml to VERSION, regenerate CHANGELOG.md,
+commit, and tag vVERSION. release.yml then builds and publishes the server and
+the SDK releases prepared for the tag (gh workflow run sdk-release-prep.yml
+-f tag=vVERSION, or push release/vVERSION, prepares them).
+
+Libraries-only release (--libraries): tag libraries/vVERSION on main.
+release.yml publishes only the SDKs and the CLI prepared for that tag and
+builds nothing of the server. It reserves the server beta number: after
+libraries/v0.1.0-beta.64 the next server release is v0.1.0-beta.65. VERSION
+defaults to the next free number. `scripts/release.sh --libraries --help`
+lists the steps.
+
+Both modes refuse a number the other already took (a server tag and a
+libraries tag of one version), and the next free beta number is
+`python3 scripts/sdk_release.py next-beta`.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --libraries) shift; exec "$(dirname "$0")/release-libraries.sh" "$@" ;;
+    -*) echo -e "${RED}Error: unknown option $1${NC}" >&2; usage >&2; exit 2 ;;
+esac
+
+# Every release tag, so the version cannot reuse a number a libraries-only
+# release reserved (libraries/vX) and the next free number is known.
+if ! git fetch --quiet --tags origin; then
+    echo -e "${RED}Error: could not fetch the release tags from origin${NC}"
+    exit 1
+fi
+
 # Get the version from argument or prompt
 VERSION=$1
 
 if [ -z "$VERSION" ]; then
-    echo -e "${YELLOW}Enter version (e.g., 1.0.0):${NC}"
+    NEXT=$(python3 scripts/sdk_release.py next-beta 2>/dev/null || true)
+    echo -e "${YELLOW}Enter version (e.g., 1.0.0${NEXT:+; next free beta: ${NEXT#v}}):${NC}"
     read -r VERSION
 fi
 
@@ -27,6 +65,9 @@ if [ -z "$VERSION" ]; then
 fi
 
 echo -e "${GREEN}Creating release for version v${VERSION}${NC}"
+
+# A libraries-only release may have reserved this number, or a later one.
+python3 scripts/sdk_release.py check-release-tag --tag "v${VERSION}" || exit 1
 
 # Check if we're on main branch
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)

@@ -5,7 +5,8 @@
 
 SDKs follow the server: every catalog package releases with every beta and stable
 server tag, at the tag's version (`v0.1.0-beta.64` releases `0.1.0-beta.64`, or
-`0.1.0b64` on PyPI). A package whose catalog entry sets `versioning` keeps its own
+`0.1.0b64` on PyPI). A libraries-only tag (`libraries/v0.1.0-beta.64`) prepares
+the same selection at the server beta number it reserves (`sdk_release.LIBRARIES_TAG`). A package whose catalog entry sets `versioning` keeps its own
 version line instead, derived from the Conventional Commits that touched it since
 its last package tag (see `sdk_release.VERSIONING`). Preparation bumps the manifests, the
 lockfiles and `.github/releases/prepared.json`, and leaves publication to `release.yml`.
@@ -30,8 +31,8 @@ PRE_1_0 = {'major': 'minor', 'minor': 'patch', 'patch': 'patch'}
 SUBJECT = re.compile(r'(?P<type>[A-Za-z]+)(?:\([^()\r\n]*\))?(?P<breaking>!)?: \S')
 BREAKING_FOOTER = re.compile(r'^BREAKING[ -]CHANGE: ', re.M)
 BUMPS = {'feat': 'minor', 'fix': 'patch', 'perf': 'patch'}
-SERVER_TAG = r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?'
-NIGHTLY_TAG = r'v\d+\.\d+\.\d+-nightly\.[\w.-]+'
+SERVER_TAG = release.SERVER_TAG
+NIGHTLY_TAG = release.NIGHTLY_TAG
 MANIFEST = {'npm': 'package.json', 'pypi': 'pyproject.toml', 'crate': 'Cargo.toml', 'go': 'VERSION'}
 PRE_RANK = {'alpha': 0, 'beta': 1, 'rc': 2, None: 3}
 PEP440_LABEL = {'alpha': 'a', 'beta': 'b', 'rc': 'rc'}
@@ -781,8 +782,10 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
     """
     if re.fullmatch(NIGHTLY_TAG, tag):
         raise ValueError('Nightly server releases never prepare SDK releases')
-    if not re.fullmatch(SERVER_TAG, tag):
-        raise ValueError(f'Not a server release tag: {tag}')
+    if tag.startswith(release.LIBRARIES_PREFIX) and not release.is_libraries_tag(tag):
+        raise ValueError(f'{tag}: a libraries-only release tag is libraries/vX.Y.Z-beta.N')
+    if not (re.fullmatch(SERVER_TAG, tag) or release.is_libraries_tag(tag)):
+        raise ValueError(f'Not a server or libraries release tag: {tag}')
     root = Path(root)
     if history is None:
         history = GitHistory(root)
@@ -796,8 +799,13 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
             raise ValueError(f'{tag} is not the checked-out commit; check out the tag to verify its SDK selection')
     elif history.tag_exists(tag):
         raise ValueError(f'{tag} is already tagged; prepare SDK releases for the next server tag')
+    # A libraries-only release reserves a server beta number; neither mode may reuse
+    # or (before the tag exists) fall behind the other's numbers.
+    existing = [*history.tags('v'), *history.tags(release.LIBRARIES_PREFIX + 'v')]
+    if problems := release.release_tag_problems(tag, existing, ordering=not at_tag):
+        raise ValueError('; '.join(problems))
     target = 'beta' if '-' in tag else 'stable'
-    server = server_version(tag)
+    server = server_version(release.server_tag_of(tag))
     catalog = release.catalog_packages(root)
     by_key = {package['key']: package for package in catalog}
     states = {package['key']: assess(package, catalog, history, published) for package in catalog}
@@ -987,6 +995,16 @@ def summary(tag, report):
         'version line, bumped from its commits: before 1.0.0 a breaking change bumps the minor version and '
         'a feature bumps the patch.',
         '',
+    ]
+    if release.is_libraries_tag(tag):
+        reserved = release.server_tag_of(tag)
+        lines += [
+            f'This is a libraries-only release: it publishes these packages without building or releasing the '
+            f'server, and reserves the server number {inline(reserved)}, so the next server release is '
+            f'{inline(release.next_beta_tag([tag]))} or later.',
+            '',
+        ]
+    lines += [
         '| Package | Registry | Previous | Next | Why |',
         '| --- | --- | --- | --- | --- |',
     ]

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    oauth_token_expiry, AuthMethod, Branch, Commit, FileContent, GitProviderError,
+    oauth_token_expiry, AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError,
     GitProviderService, GitProviderTag, GitProviderType, PullRequest, RefreshedOAuthToken,
     RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User, WebhookConfig,
 };
@@ -206,6 +206,13 @@ fn github_pagination_route(api_url: &str, next_url: &str) -> Result<String, GitP
     Ok(route)
 }
 
+/// Items read from a guarded page walk, and whether `max_items` ended it with
+/// more still on the server.
+struct GuardedGitHubPages<T> {
+    items: Vec<T>,
+    truncated: bool,
+}
+
 async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
     octocrab: &Octocrab,
     api_url: &str,
@@ -214,7 +221,7 @@ async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
     max_pages: usize,
     resource: &str,
     repository: (&str, &str),
-) -> Result<Vec<T>, GitProviderError> {
+) -> Result<GuardedGitHubPages<T>, GitProviderError> {
     let (owner, repo) = repository;
     let mut items = Vec::new();
     let mut pages_fetched = 1usize;
@@ -222,14 +229,27 @@ async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
 
     loop {
         let remaining = max_items.saturating_sub(items.len());
-        items.extend(page.take_items().into_iter().take(remaining));
-        if items.len() >= max_items {
-            break;
+        let page_items = page.take_items();
+        let page_len = page_items.len();
+        items.extend(page_items.into_iter().take(remaining));
+        // The cap dropped part of this page, so the server certainly has more.
+        if page_len > remaining {
+            return Ok(GuardedGitHubPages {
+                items,
+                truncated: true,
+            });
         }
 
         let Some(next_url) = page.next.as_ref() else {
             break;
         };
+        // Exactly at the cap with another page behind it.
+        if items.len() >= max_items {
+            return Ok(GuardedGitHubPages {
+                items,
+                truncated: true,
+            });
+        }
         if pages_fetched >= max_pages {
             return Err(GitProviderError::ApiError(format!(
                 "GitHub {resource} pagination for {owner}/{repo} exceeded the {max_pages}-page safety limit"
@@ -254,7 +274,10 @@ async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
         pages_fetched += 1;
     }
 
-    Ok(items)
+    Ok(GuardedGitHubPages {
+        items,
+        truncated: false,
+    })
 }
 
 // Response structs for API calls
@@ -1356,7 +1379,7 @@ impl GitProviderService for GitHubProvider {
         access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
         let octocrab = self.get_octocrab_client(access_token).await?;
 
         // Fetch the first page with the maximum page size, then walk bounded,
@@ -1388,6 +1411,7 @@ impl GitProviderService for GitHubProvider {
         .await?;
 
         let branches = all
+            .items
             .into_iter()
             .map(|b| Branch {
                 name: b.name,
@@ -1396,7 +1420,72 @@ impl GitProviderService for GitHubProvider {
             })
             .collect();
 
-        Ok(branches)
+        Ok(BranchList {
+            branches,
+            truncated: all.truncated,
+        })
+    }
+
+    /// One request to `GET /repos/{owner}/{repo}/branches/{branch}`, so it is
+    /// exact however many branches the repository has.
+    async fn get_branch(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
+
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+
+        let response = self
+            .send_with_retry(|| client.get(&url).headers(headers.clone()))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(github_response_error(
+                response,
+                format!("read branch {branch} of {owner}/{repo}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
+        }
+
+        #[derive(Deserialize)]
+        struct GitHubBranch {
+            name: String,
+            commit: GitHubBranchCommit,
+            #[serde(default)]
+            protected: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct GitHubBranchCommit {
+            sha: String,
+        }
+
+        let found: GitHubBranch = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse branch {branch} of {owner}/{repo}: {e}"
+            ))
+        })?;
+
+        Ok(Some(Branch {
+            name: found.name,
+            commit_sha: found.commit.sha,
+            protected: found.protected,
+        }))
     }
 
     async fn list_tags(
@@ -1434,8 +1523,8 @@ impl GitProviderService for GitHubProvider {
             (owner, repo),
         )
         .await?;
-        let mut tags = Vec::with_capacity(raw_tags.len());
-        append_github_tags(&mut tags, raw_tags);
+        let mut tags = Vec::with_capacity(raw_tags.items.len());
+        append_github_tags(&mut tags, raw_tags.items);
 
         Ok(tags)
     }
@@ -3871,3 +3960,6 @@ mod token_permission_tests {
         assert!(!valid);
     }
 }
+
+#[cfg(test)]
+mod branch_lookup_tests;

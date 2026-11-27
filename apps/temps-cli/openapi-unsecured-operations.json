@@ -40,6 +40,7 @@
   "GET /external-services/{id}/wal-health",
   "GET /git-providers/{provider_id}/callback",
   "GET /git/public/{provider}/{owner}/{repo}",
+  "GET /git/public/{provider}/{owner}/{repo}/branch",
   "GET /git/public/{provider}/{owner}/{repo}/branches",
   "GET /git/public/{provider}/{owner}/{repo}/compose-file",
   "GET /git/public/{provider}/{owner}/{repo}/env-example",

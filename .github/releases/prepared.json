@@ -1,23 +1,23 @@
 {
-  "v0.1.0-beta.63": {
-    "analytics-core": "0.0.7-beta.1",
-    "temps-plugin-protocol": "0.1.0-beta.62",
-    "analytics-browser": "0.0.9-beta.1",
-    "api": "0.1.0-beta.1",
-    "blob": "0.0.5-beta.1",
-    "cli": "0.2.0-beta.1",
-    "go-workflows": "0.1.0-beta.1",
-    "kv": "0.0.5-beta.1",
-    "node-sdk": "0.0.8-beta.1",
-    "plugin": "0.1.0-beta.3",
-    "python-plugin": "0.1.0b1",
-    "python-workflows": "0.1.0b1",
-    "react-analytics": "0.0.10-beta.1",
-    "sandbox": "0.0.1-beta.1",
-    "svelte-analytics": "0.0.7-beta.1",
-    "temps-plugin-sdk": "0.1.0-beta.62",
-    "temps-workflows-sdk": "0.1.0-beta.1",
-    "vue-analytics": "0.0.7-beta.1",
-    "workflows": "0.1.0-beta.1"
+  "libraries/v0.1.0-beta.64": {
+    "analytics-core": "0.1.0-beta.64",
+    "temps-plugin-protocol": "0.1.0-beta.64",
+    "analytics-browser": "0.1.0-beta.64",
+    "api": "0.1.0-beta.64",
+    "blob": "0.1.0-beta.64",
+    "cli": "0.2.0-beta.2",
+    "go-workflows": "0.1.0-beta.64",
+    "kv": "0.1.0-beta.64",
+    "node-sdk": "0.1.0-beta.64",
+    "plugin": "0.1.0-beta.64",
+    "python-plugin": "0.1.0b64",
+    "python-workflows": "0.1.0b64",
+    "react-analytics": "0.1.0-beta.64",
+    "sandbox": "0.1.0-beta.64",
+    "svelte-analytics": "0.1.0-beta.64",
+    "temps-plugin-sdk": "0.1.0-beta.64",
+    "temps-workflows-sdk": "0.1.0-beta.64",
+    "vue-analytics": "0.1.0-beta.64",
+    "workflows": "0.1.0-beta.64"
   }
 }

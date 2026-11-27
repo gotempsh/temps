@@ -407,6 +407,11 @@ fn public_error_reason(error: PublicRepoError) -> String {
             "the provider's rate limit for anonymous requests was reached; try again later"
         }
         PublicRepoError::BranchNotFound { .. } => "the branch does not exist",
+        // The branch was neither confirmed nor ruled out, so this must not
+        // read as "the branch does not exist".
+        PublicRepoError::BranchLookupUnavailable { .. } => {
+            "the provider's branch listing was capped before this branch, so it could not be verified; deploy by commit or try again later"
+        }
         PublicRepoError::ProviderNotSupported { .. } => "this provider is not supported",
         PublicRepoError::ResponseTooLarge { .. } => "the provider's response was too large",
         PublicRepoError::ApiError(_) | PublicRepoError::Internal(_) => {
@@ -1314,7 +1319,7 @@ pub(crate) mod tests {
     }
 
     use temps_git::services::git_provider::FileContent;
-    use temps_git::services::public_repo::{PublicBranch, PublicRepoInfo};
+    use temps_git::services::public_repo::{PublicBranch, PublicBranchList, PublicRepoInfo};
 
     /// A public provider whose branches, and the tags and commits its lookups
     /// resolve, are fixed, counting the tag lookups made.
@@ -1357,8 +1362,8 @@ pub(crate) mod tests {
             &self,
             _owner: &str,
             _repo: &str,
-        ) -> Result<Vec<PublicBranch>, PublicRepoError> {
-            Ok(Vec::new())
+        ) -> Result<PublicBranchList, PublicRepoError> {
+            Ok(PublicBranchList::complete(Vec::new()))
         }
 
         async fn get_branch(

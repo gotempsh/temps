@@ -1197,6 +1197,52 @@ dependencies can be verified together. No registry credentials are given to
 these build/check jobs. The only extra release runner isolates publication
 permissions (`id-token: write`, package-tag `contents: write`) from builds.
 
+### Libraries-only releases
+
+A libraries-only release publishes the SDKs and the CLI without building or
+releasing the server: no web or server build, no daemon, sandbox,
+preview-gateway, database or server images, no GitHub Release. It exists to ship
+a CLI or SDK beta in the time the SDK tests and packaging take.
+
+- **Tag.** `libraries/vX.Y.Z-beta.N`. GitHub tag filters' `*` never matches
+  `/`, so none of the server patterns (`v*.*.*`, `v*.*.*-*`) and none of the
+  server tag validators match it, and `cliff.toml`'s anchored `^v[0-9]` keeps it
+  (and the `sdk/*` package tags) out of `CHANGELOG.md`.
+- **Number.** It reserves a server beta number: `libraries/v0.1.0-beta.64`
+  publishes every server-versioned package at `0.1.0-beta.64` (Python
+  `0.1.0b64`), and the next server release is `v0.1.0-beta.65`. Packages on
+  their own line keep it (the CLI's `until-server-passes` line, so a CLI fix
+  ships as `0.2.0-beta.N+1`). `python3 scripts/sdk_release.py next-beta` prints
+  the next free number across both kinds of tag. `prepare`, `release.sh` and
+  `check-release-tag` refuse a server tag and a libraries tag of the same
+  version, and, before a tag is created, a libraries tag at or below any
+  release or a server tag at or below a libraries release. `release.yml`
+  repeats the same-number check at the tag (`check-release-tag --at-tag`).
+  Only betas can be reserved; the rules live in `release_tag_problems` and
+  `LIBRARIES_TAG` in `scripts/sdk_release.py`.
+- **Workflow.** It runs in `release.yml`, because each registry's trusted
+  publisher names that file and its `sdk` environment; a second workflow would
+  need a second trusted publisher on every package. The mode comes from the
+  tag alone (`validate-release-ref.sh` sets `server=false`): every server job
+  carries `if: needs.validate-release-ref.outputs.server == 'true'` or depends
+  on one that does, the web steps of the web-assets job are skipped, and that
+  job still tests and packages the selected SDKs. `publish-sdks` accepts the
+  skipped `create-release` only in this mode. The `rust-tests.yml` gate and the
+  at-tag re-derivation of the selection still run.
+- **Cutting one** (a CLI beta, say):
+
+  ```sh
+  python3 scripts/sdk_release.py next-beta            # e.g. v0.1.0-beta.64
+  gh workflow run sdk-release-prep.yml -f tag=libraries/v0.1.0-beta.64
+  # review and merge the "chore(release): prepare SDKs for libraries/v0.1.0-beta.64" PR
+  git switch main && git pull
+  scripts/release.sh --libraries                     # checks, tags, offers to push
+  ```
+
+  Then approve the staged npm versions and rerun `publish-sdks`, as below.
+  Nothing is committed: there is no `Cargo.toml` bump and no changelog
+  section, and the commits appear in the next server release's notes.
+
 ### Approving staged npm versions
 
 The npm trusted publishers allow only `npm stage publish`, so the workflow never
@@ -1252,7 +1298,7 @@ package verification; it never invokes a publication command. A manual
 `release.yml` dispatch with `dry_run=true` on a branch validates every catalog
 package; on a release tag it validates that tag's explicit selection. Neither
 creates tags nor requests registry credentials. A non-dry dispatch still requires
-an existing server version tag and the normal release test gate.
+an existing server version (or libraries-only) tag and the normal release test gate.
 
 On an interrupted publication, rerun the **failed job**, retaining the successful
 build's `sdk-packages` artifact (30-day retention). Do not rebuild to recover a

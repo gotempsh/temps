@@ -115,11 +115,13 @@ abort "public release can precede required daemon images" unless
 %w[daemon-images build-and-push-sandbox-images build-and-push-preview-gateway].each do |name|
   abort "#{name} publishes before tests" unless Array(release.dig("jobs", name, "needs")).include?("require-tests")
 end
+# The only condition a server job may carry skips it for a libraries-only tag.
+server_gate = "needs.validate-release-ref.outputs.server == 'true'"
 database_call = release.dig("jobs", "database-images")
 abort "a release can publish without its managed-database images being pullable" unless
   database_call && database_call["uses"] == "./.github/workflows/database-images.yml" &&
   database_call["needs"].sort == %w[validate-release-ref require-tests].sort &&
-  database_call.dig("with", "ensure") == true && !database_call.key?("if") &&
+  database_call.dig("with", "ensure") == true && database_call["if"] == server_gate &&
   !database_call.key?("continue-on-error") && publish.fetch("needs").include?("database-images")
 daemon_call = release.dig("jobs", "daemon-images")
 abort "daemon staging must follow ref validation without moving channel tags" unless
@@ -158,6 +160,47 @@ abort "the test gate bypass must be an explicit, default-off dispatch input" unl
 end
 abort "the server image can be pushed before the test gate passes" unless
   Array(release.dig("jobs", "build-and-push-docker", "needs")).include?("create-release")
+
+# Libraries-only tags (libraries/v*) publish SDKs and nothing of the server.
+release_on = release["on"] || release[true]
+abort "release.yml must run for libraries-only tags next to the server tags" unless
+  release_on.dig("push", "tags") == ["v*.*.*", "v*.*.*-*", "libraries/v*.*.*-beta.*"]
+abort "libraries-only mode must come from the validated ref, not an input" unless
+  release.dig("jobs", "validate-release-ref", "outputs", "server") == "${{ steps.ref.outputs.server }}" &&
+  release.dig("jobs", "validate-release-ref", "steps").any? { |step| step["id"] == "ref" && step.fetch("run", "").include?("validate-release-ref.sh") } &&
+  !release_on.dig("workflow_dispatch", "inputs").keys.any? { |name| name.include?("librar") }
+number_check = release.dig("jobs", "validate-release-ref", "steps").find { |step| step["name"] == "Refuse a release number another release already took" }
+abort "a server and a libraries release can share a number" unless
+  number_check && number_check["run"].include?("sdk_release.py check-release-tag --tag \"$RELEASE_TAG\" --at-tag") &&
+  !number_check.key?("continue-on-error")
+sdk_jobs = %w[validate-release-ref require-tests build-web-assets publish-sdks]
+jobs = release.fetch("jobs")
+gated = %w[daemon-images database-images prepare-sandbox-context build-and-push-sandbox-images build-and-push-preview-gateway]
+gated.each { |name| abort "#{name} runs for libraries-only tags" unless jobs.dig(name, "if") == server_gate }
+# Every other server job must be skipped through a gated dependency: no
+# status function (always(), !cancelled()) may let it run past a skipped one.
+skipped = lambda do |name, seen = []|
+  job = jobs.fetch(name)
+  next true if job["if"] == server_gate
+  next false if seen.include?(name) || job["if"].to_s.match?(/always\(\)|cancelled\(\)|failure\(\)/)
+  Array(job["needs"]).any? { |need| skipped.call(need, seen + [name]) }
+end
+(jobs.keys - sdk_jobs).each { |name| abort "#{name} can run for a libraries-only tag" unless skipped.call(name) }
+sdk_jobs.each { |name| abort "#{name} would be skipped for a libraries-only tag" if skipped.call(name) }
+web = jobs.fetch("build-web-assets").fetch("steps")
+first_sdk_step = web.index { |step| step["name"] == "Install pinned SDK Bun" }
+web[0...first_sdk_step].each do |step|
+  next if step["uses"].to_s.start_with?("actions/checkout@", "dtolnay/rust-toolchain@")
+  abort "web build step '#{step["name"]}' runs for libraries-only tags" unless step["if"] == server_gate
+end
+abort "SDK packaging must run in both modes" if web[first_sdk_step..].any? { |step| step["if"].to_s.include?("outputs.server") }
+publish_if = jobs.dig("publish-sdks", "if")
+["!cancelled()", "inputs.dry_run != true", "needs.validate-release-ref.result == 'success'",
+ "needs.require-tests.result == 'success'", "needs.build-web-assets.result == 'success'",
+ "needs.validate-release-ref.outputs.sdk_selected == 'true'", "needs.create-release.result == 'success' ||",
+ "(needs.validate-release-ref.outputs.server == 'false' && needs.create-release.result == 'skipped')"].each do |clause|
+  abort "publish-sdks does not require: #{clause}" unless publish_if.include?(clause)
+end
 
 # Mutable package repositories must be refreshed even if the pinned base and
 # Dockerfile haven't changed. Scan each published candidate by digest before
@@ -606,6 +649,31 @@ grep -Fq '.github/scripts/release-channel.sh "$DRY_RUN" "$RELEASE_TAG"' "$releas
 "$validation_script" false tag v0.1.0 >/dev/null
 "$validation_script" false tag v0.1.0-beta.55 >/dev/null
 "$validation_script" false tag v0.1.0-nightly.20260729.abc12345 >/dev/null
+"$validation_script" false tag libraries/v0.1.0-beta.64 >/dev/null
+
+expect_server_output() {
+  local expected="$1" output
+  shift
+  output="$(mktemp)"
+  GITHUB_OUTPUT="$output" "$validation_script" "$@" >/dev/null
+  if [[ "$(cat "$output")" != "server=$expected" ]]; then
+    rm -f "$output"
+    fail "ref '$*' must set server=$expected"
+  fi
+  rm -f "$output"
+}
+expect_server_output true false tag v0.1.0-beta.64
+expect_server_output false false tag libraries/v0.1.0-beta.64
+expect_server_output false true tag libraries/v0.1.0-beta.64
+expect_server_output true true branch libraries/v0.1.0-beta.64
+
+for malformed in libraries/v0.1.0 libraries/v0.1.0-rc.1 libraries/v0.1.0-beta.01 libraries/0.1.0-beta.1 libraries/v0.1.0-beta.1/x; do
+  for dry_run in true false; do
+    if "$validation_script" "$dry_run" tag "$malformed" >/dev/null 2>&1; then
+      fail "a malformed libraries-only tag was accepted: $malformed (dry run: $dry_run)"
+    fi
+  done
+done
 
 if "$validation_script" false branch main >/dev/null 2>&1; then
   fail "a non-dry branch dispatch was accepted for publishing"

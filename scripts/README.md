@@ -14,7 +14,16 @@ Helper scripts for Temps development and operations.
 
 # With version argument
 ./scripts/release.sh 1.0.0
+
+# Libraries-only release: publish the SDKs and the CLI, build no server
+./scripts/release.sh --libraries
+
+# Both modes and their steps
+./scripts/release.sh --help
 ```
+
+A libraries-only release tags `libraries/vX.Y.Z-beta.N`, reserving that server
+beta number; `./scripts/release.sh --libraries --help` lists its steps.
 
 ### What it does
 

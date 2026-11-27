@@ -57,9 +57,13 @@ impl GitRepositoryApi for GitRepositoryApiImpl {
     }
 
     async fn get_branches(&self) -> Result<Vec<Branch>, GitProviderError> {
-        self.provider_service
+        // This consumer only names branches; truncation is the branch-list
+        // endpoint's concern.
+        Ok(self
+            .provider_service
             .list_branches(&self.access_token, &self.owner, &self.repo)
-            .await
+            .await?
+            .branches)
     }
 
     async fn get_latest_commit(&self, branch: &str) -> Result<Commit, GitProviderError> {

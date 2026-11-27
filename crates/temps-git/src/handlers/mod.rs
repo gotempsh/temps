@@ -29,6 +29,15 @@ pub use public::PublicRepositoriesApiDoc;
 /// so no delivery that worked is refused; the other providers set their own.
 pub(crate) const PROVIDER_EVENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+/// Whether `name` cannot name any branch, so a lookup for it is rejected
+/// before the provider is asked: it is empty, or holds nothing but ASCII
+/// spaces and control characters, which `git check-ref-format` forbids in
+/// every ref. Unicode whitespace such as U+00A0 or U+2003 is allowed in a
+/// ref, so a name made only of it is a real, if unusual, branch.
+pub(crate) fn is_impossible_branch_name(name: &str) -> bool {
+    name.bytes().all(|byte| byte <= b' ' || byte == 0x7f)
+}
+
 /// Extract a branch without changing occurrences of the prefix inside its name.
 fn branch_from_ref(git_ref: &str, allow_bare: bool) -> Option<String> {
     git_ref
@@ -67,7 +76,7 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
-mod public_route_tests {
+pub(crate) mod public_route_tests {
     //! ADR-051 D3: provider webhook receivers live on the public router, the
     //! browser-driven callbacks stay on the admin router, and every receiver
     //! bounds its request body.
@@ -124,16 +133,16 @@ mod public_route_tests {
     /// Handler state over a database that has nothing queued: any query a
     /// handler issues fails, so a response that needed no data proves the
     /// request was turned away before any database work.
-    pub(super) fn state() -> Arc<AppState> {
+    pub(crate) fn state() -> Arc<AppState> {
         state_over(MockDatabase::new(DatabaseBackend::Postgres))
     }
 
     /// Like [`state`], over a database the test has queued results on.
-    pub(super) fn state_over(database: MockDatabase) -> Arc<AppState> {
+    pub(crate) fn state_over(database: MockDatabase) -> Arc<AppState> {
         state_with_db(Arc::new(database.into_connection()))
     }
 
-    pub(super) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
+    pub(crate) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
         let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(
                 temps_config::ServerConfig::new(
@@ -325,6 +334,32 @@ mod public_route_tests {
                 status(configure_public_routes(), post(path, oversized.clone())).await,
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "{path} must bound its request body"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod branch_name_tests {
+    use super::is_impossible_branch_name;
+
+    #[test]
+    fn only_names_no_ref_can_have_are_impossible() {
+        for impossible in ["", " ", "  ", "\t", "\n", " \u{7f} "] {
+            assert!(
+                is_impossible_branch_name(impossible),
+                "{impossible:?} cannot be a branch"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_whitespace_is_a_branch_name_git_accepts() {
+        // `git check-ref-format refs/heads/<name>` accepts each of these.
+        for possible in ["\u{a0}", "\u{2003}", "\u{a0}\u{2003}", "main", " main"] {
+            assert!(
+                !is_impossible_branch_name(possible),
+                "{possible:?} can name a branch"
             );
         }
     }

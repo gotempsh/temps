@@ -102,8 +102,11 @@ commit_parsers = [
 protect_breaking_commits = false
 # filter out the commits that are not matched by commit parsers
 filter_commits = false
-# regex for matching git tags
-tag_pattern = "v[0-9].*"
+# regex for matching git tags. Anchored: git-cliff searches the whole name, so
+# package tags (sdk/cli/v0.2.0-beta.1) and libraries-only releases
+# (libraries/v0.1.0-beta.64) would otherwise become changelog sections; their
+# commits belong to the next server release.
+tag_pattern = "^v[0-9].*"
 # regex for skipping tags (bogus/test tags that should not appear as releases)
 skip_tags = "v0.1.0-beta.1|0.1.0-test"
 # regex for ignoring tags

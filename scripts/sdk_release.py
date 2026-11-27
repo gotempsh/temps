@@ -92,6 +92,87 @@ def catalog_packages(root=ROOT):
     return sorted(packages, key=lambda p: publish_order(p['key']))
 
 
+# A libraries-only release publishes the SDKs and the CLI without a server
+# build. It reserves a server beta number: `libraries/v0.1.0-beta.64` takes
+# 0.1.0-beta.64, so the next server release is v0.1.0-beta.65. The `libraries/`
+# prefix keeps it out of every server tag pattern (`v*` in release.yml's tag
+# filters, validate-release-ref.sh, install.sh, cliff.toml). Only betas can be
+# reserved; to change which numbers this mode reserves, change this prefix and
+# pattern and `release_tag_problems`.
+LIBRARIES_PREFIX = 'libraries/'
+LIBRARIES_TAG = LIBRARIES_PREFIX + r'(v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-beta\.(0|[1-9]\d*))'
+SERVER_TAG = r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?'
+NIGHTLY_TAG = r'v\d+\.\d+\.\d+-nightly\.[\w.-]+'
+
+
+def is_libraries_tag(tag):
+    return bool(re.fullmatch(LIBRARIES_TAG, tag))
+
+
+def server_tag_of(tag):
+    """The server version tag a release tag stands for (`libraries/vX` reserves `vX`)."""
+    match = re.fullmatch(LIBRARIES_TAG, tag)
+    return match[1] if match else tag
+
+
+def tag_version(tag):
+    """Precedence of a server or libraries release tag, or None (nightly, `v0.1.0-test`, other tags)."""
+    tag = server_tag_of(tag)
+    if re.fullmatch(NIGHTLY_TAG, tag) or not re.fullmatch(SEMVER, tag.removeprefix('v')):
+        return None
+    return version_order(tag.removeprefix('v'))
+
+
+def release_tag_problems(tag, existing, *, ordering=True):
+    """Why `tag` cannot be released next given the `existing` repository tags ([] when it can).
+
+    A server tag and a libraries tag of the same version would publish the SDKs
+    twice under one number, so each refuses the other. With `ordering` (when the
+    tag is about to be created, not when an existing tag is re-checked), a
+    libraries tag must be above every server and libraries release, and a server
+    tag above every libraries release, so no registry version goes backwards.
+    """
+    if not (is_libraries_tag(tag) or re.fullmatch(SERVER_TAG, tag)) or re.fullmatch(NIGHTLY_TAG, tag):
+        return []
+    version = server_tag_of(tag)
+    counterpart = version if is_libraries_tag(tag) else LIBRARIES_PREFIX + version
+    problems = []
+    if counterpart in existing:
+        problems.append(f'{version} is already taken by {counterpart}; '
+                        f'release the next free number ({next_beta_tag(existing)}) instead')
+    if ordering and (order := tag_version(tag)) is not None:
+        rivals = [other for other in existing if other != tag and other != counterpart
+                  and (is_libraries_tag(other) or is_libraries_tag(tag))
+                  and (other_order := tag_version(other)) is not None and other_order >= order]
+        if rivals:
+            newest = max(rivals, key=tag_version)
+            problems.append(f'{tag} would go backwards: {newest} is already released at or above it; '
+                            f'release {next_beta_tag(existing)} or later')
+    return problems
+
+
+def next_beta_tag(existing):
+    """`vX.Y.Z-beta.N` one above the newest server or libraries release tag.
+
+    Both modes number from the same line, so a libraries-only release's number
+    is never reused by the server and the reverse.
+    """
+    releases = [tag for tag in existing if tag_version(tag) is not None]
+    if not releases:
+        raise ValueError('No server or libraries release tag exists to number from; pass the version explicitly')
+    newest = server_tag_of(max(releases, key=tag_version))
+    match = re.fullmatch(SEMVER, newest.removeprefix('v'))
+    if match[4] != 'beta':
+        raise ValueError(f'The newest release {newest} is not a beta, so there is no next beta number; '
+                         f'pass the version explicitly')
+    return f'v{match[1]}.{match[2]}.{match[3]}-beta.{int(match[5]) + 1}'
+
+
+def release_tags(root=ROOT):
+    """Every server and libraries release tag in the local repository (fetch tags first)."""
+    return run('git', 'tag', '--list', 'v*', LIBRARIES_PREFIX + 'v*', cwd=root, capture=True).split()
+
+
 def validate(root=ROOT):
     catalog_packages(root)
     for tag in read_json(root / '.github/releases/prepared.json'):
@@ -101,11 +182,16 @@ def validate(root=ROOT):
 def plan(tag, root=ROOT):
     catalog = read_json(root / '.github/releases/packages.json')
     prepared = read_json(root / '.github/releases/prepared.json')
-    if re.fullmatch(r'v\d+\.\d+\.\d+-nightly\.[\w.-]+', tag):
+    if re.fullmatch(NIGHTLY_TAG, tag):
         if tag in prepared:
             raise ValueError('Nightly server releases cannot prepare SDK releases')
         return []
-    elif re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?', tag):
+    elif is_libraries_tag(tag):
+        selected = prepared.get(tag, {})
+        expected_channel = 'beta'
+    elif tag.startswith(LIBRARIES_PREFIX):
+        raise ValueError(f'{tag}: a libraries-only release tag is libraries/vX.Y.Z-beta.N')
+    elif re.fullmatch(SERVER_TAG, tag):
         # Preserve the server's existing validate-release-ref.sh grammar.
         selected = prepared.get(tag, {})
         expected_channel = 'beta' if '-' in tag else 'stable'
@@ -146,7 +232,7 @@ def notes(packages):
              'Publication is tracked by the Publish prepared SDK releases job; this table records intent, not registry success.\n',
              '| Package | Version | Channel | Package tag |', '| --- | --- | --- | --- |']
     lines += [f"| `{p['name']}` | `{p['version']}` | {p['channel']} | `{p['tag']}` |" for p in packages]
-    return '\n'.join(lines) + '\n' if packages else '\nNo SDK releases are prepared for this server tag.\n'
+    return '\n'.join(lines) + '\n' if packages else '\nNo SDK releases are prepared for this release tag.\n'
 
 
 def check_npm_archive(path, package):
@@ -593,7 +679,10 @@ def run_prepare(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['plan', 'notes', 'build', 'check', 'publish', 'publish-tags', 'check-tags', 'validate', 'verify', 'prepare'])
+    parser.add_argument('command', choices=['plan', 'notes', 'build', 'check', 'publish', 'publish-tags', 'check-tags',
+                                            'validate', 'verify', 'prepare', 'check-release-tag', 'next-beta'],
+                        help='check-release-tag: refuse a server or libraries tag whose number another release '
+                             'took or passed; next-beta: print the next free vX.Y.Z-beta.N for either mode')
     parser.add_argument('--tag')
     parser.add_argument('--all', action='store_true', help='Build all current SDKs for validation only')
     parser.add_argument('--output', type=Path, default=Path('sdk-artifacts'))
@@ -604,8 +693,22 @@ def main():
     parser.add_argument('--changed-files', type=Path, help='prepare: write the changed paths here, one per line')
     parser.add_argument('--candidate', help='prepare: fail when this release branch has SDK commits that main lacks')
     parser.add_argument('--at-tag', action='store_true',
-                        help='prepare --check: re-derive the selection on the checked-out, already tagged commit')
+                        help='prepare --check: re-derive the selection on the checked-out, already tagged commit; '
+                             'check-release-tag: the tag exists, so only refuse a number taken twice')
     args = parser.parse_args()
+    if args.command == 'next-beta':
+        try:
+            print(next_beta_tag(release_tags()))
+        except ValueError as error:
+            parser.exit(1, f'error: {error}\n')
+        return
+    if args.command == 'check-release-tag':
+        if not args.tag:
+            parser.error('--tag is required for check-release-tag')
+        if problems := release_tag_problems(args.tag, release_tags(), ordering=not args.at_tag):
+            parser.exit(1, ''.join(f'error: {problem}\n' for problem in problems))
+        print(f'{args.tag}: the release number is free')
+        return
     if args.command == 'validate':
         validate()
         return

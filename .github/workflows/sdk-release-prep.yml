@@ -19,6 +19,11 @@ name: SDK Release Prep
 # release.sh stops on a stale selection and asks before releasing without one.
 # Nightly tags never publish SDKs, so nightly-release.yml does not run this.
 #
+# Libraries-only releases (SDKs and the CLI, no server build) dispatch this
+# with `-f tag=libraries/vX.Y.Z-beta.N`, the next free server beta number
+# (`python3 scripts/sdk_release.py next-beta`). Merge the PR, then tag the merge
+# commit with `scripts/release.sh --libraries`; release.yml publishes it.
+#
 # Least privilege: `prepare` installs and builds the SDKs (third-party code)
 # with a read-only token; `pull-request` pushes and opens the PR without
 # running any package code. Neither job has registry credentials or an OIDC
@@ -28,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Server tag to prepare SDK releases for (vX.Y.Z or vX.Y.Z-beta.N)"
+        description: "Release tag to prepare SDK releases for (vX.Y.Z, vX.Y.Z-beta.N, or libraries/vX.Y.Z-beta.N for a libraries-only release)"
         required: true
         type: string
   push:
@@ -67,8 +72,10 @@ jobs:
           else
             tag="$INPUT_TAG"
           fi
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-            echo "::error::The target is not a server release tag (vX.Y.Z or vX.Y.Z-beta.N)."
+          server='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+          libraries='^libraries/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-beta\.(0|[1-9][0-9]*)$'
+          if [[ ! "$tag" =~ $server && ! ( "$EVENT" != "push" && "$tag" =~ $libraries ) ]]; then
+            echo "::error::The target is not a server release tag (vX.Y.Z or vX.Y.Z-beta.N) or a libraries-only tag (libraries/vX.Y.Z-beta.N)."
             exit 1
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
@@ -241,7 +248,11 @@ jobs:
           {
             cat "$RUNNER_TEMP/sdk-prep.md"
             echo
-            echo "Opened by the [SDK Release Prep](${RUN_URL}) workflow. Merge it before the release PR for \`${TARGET}\` so the tag contains it."
+            if [[ "$TARGET" == libraries/* ]]; then
+              echo "Opened by the [SDK Release Prep](${RUN_URL}) workflow for a libraries-only release: no server is built or released. Merge it, then tag the merge commit on main with \`scripts/release.sh --libraries ${TARGET#libraries/}\`."
+            else
+              echo "Opened by the [SDK Release Prep](${RUN_URL}) workflow. Merge it before the release PR for \`${TARGET}\` so the tag contains it."
+            fi
             echo
             echo "CI for a PR the workflow token opens or pushes to waits for approval: select **Approve workflows to run** in the merge box before merging."
           } > "$body"

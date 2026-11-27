@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    oauth_token_expiry, AuthMethod, Branch, Commit, FileContent, GitProviderError,
+    oauth_token_expiry, AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError,
     GitProviderService, GitProviderTag, GitProviderType, PullRequest, RefreshedOAuthToken,
     RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
 };
@@ -11,6 +11,10 @@ use futures::StreamExt;
 use reqwest;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
+
+/// Memory bound on one branch listing. A project with more branches than this
+/// yields a truncated [`BranchList`], never a list that looks exhaustive.
+const MAX_GITLAB_BRANCHES: usize = 1_000;
 
 // Response structs for API calls
 
@@ -876,7 +880,7 @@ impl GitProviderService for GitLabProvider {
         access_token: &str,
         owner: &str,
         repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
         #[derive(Deserialize)]
         struct GitLabBranch {
             name: String,
@@ -898,7 +902,7 @@ impl GitProviderService for GitLabProvider {
         // GitLab defaults to 20 results per page; without an explicit pager the
         // selected branch may fall outside the first page on busy repos and the
         // UI then can't show it. Mirror the public-repo pattern: per_page=100,
-        // walk pages until short or we hit the 1000-branch safety cap.
+        // walk pages until short or we hit the branch safety cap.
         let mut all_branches: Vec<Branch> = Vec::new();
         let mut page: u32 = 1;
         let per_page: usize = 100;
@@ -929,19 +933,98 @@ impl GitProviderService for GitLabProvider {
                 .map_err(|e| GitProviderError::ApiError(e.to_string()))?;
 
             let count = gitlab_branches.len();
-            all_branches.extend(gitlab_branches.into_iter().map(|b| Branch {
+            // Keep the cap a real memory bound whatever the page size GitLab
+            // actually answers with.
+            let remaining = MAX_GITLAB_BRANCHES.saturating_sub(all_branches.len());
+            let dropped_by_cap = count > remaining;
+            all_branches.extend(gitlab_branches.into_iter().take(remaining).map(|b| Branch {
                 name: b.name,
                 commit_sha: b.commit.id,
                 protected: b.protected,
             }));
 
-            if count < per_page || all_branches.len() >= 1000 {
+            // The cap dropped part of this page, so the project certainly has
+            // branches this listing never saw.
+            if dropped_by_cap {
+                return Ok(BranchList::truncated(all_branches));
+            }
+            // A short page is the last one, so the list is complete.
+            if count < per_page {
                 break;
+            }
+            // A full page with no budget left: more may follow, and saying so
+            // costs one exact lookup where claiming completeness would cost a
+            // false "branch not found".
+            if all_branches.len() >= MAX_GITLAB_BRANCHES {
+                return Ok(BranchList::truncated(all_branches));
             }
             page += 1;
         }
 
-        Ok(all_branches)
+        Ok(BranchList::complete(all_branches))
+    }
+
+    /// One request to `GET /projects/{path}/repository/branches/{branch}`, so
+    /// it is exact however many branches the project has.
+    async fn get_branch(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
+        #[derive(Deserialize)]
+        struct GitLabBranch {
+            name: String,
+            commit: GitLabCommit,
+            #[serde(default)]
+            protected: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct GitLabCommit {
+            id: String,
+        }
+
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
+        let project_path = format!("{}/{}", owner, repo);
+
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/branches/{}",
+            self.base_url,
+            urlencoding::encode(&project_path),
+            urlencoding::encode(branch)
+        );
+
+        let response = self
+            .send_with_retry(|| client.get(&url).headers(headers.clone()))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(GitProviderError::ApiError(format!(
+                "Failed to read branch '{}' of {}/{}: {}",
+                branch,
+                owner,
+                repo,
+                response.status()
+            )));
+        }
+
+        let found: GitLabBranch = response.json().await.map_err(|e| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse branch '{branch}' of {owner}/{repo}: {e}"
+            ))
+        })?;
+
+        Ok(Some(Branch {
+            name: found.name,
+            commit_sha: found.commit.id,
+            protected: found.protected,
+        }))
     }
 
     async fn list_tags(
@@ -2749,3 +2832,6 @@ mod repository_file_tree_tests {
         token.assert_async().await;
     }
 }
+
+#[cfg(test)]
+mod branch_lookup_tests;

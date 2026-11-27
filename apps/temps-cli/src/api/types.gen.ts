@@ -4523,6 +4523,15 @@ export type BranchInfo = {
 
 export type BranchListResponse = {
     branches: Array<BranchInfo>;
+    /**
+     * Whether the git provider's safety cap stopped the listing before the
+     * repository ran out of branches. When `true`, `branches` is a prefix of
+     * the repository's branches and a name missing from it may still exist:
+     * clients must verify such a name with the single-branch lookup
+     * (`GET repositories/{owner}/{repo}/branch`) instead of reporting it
+     * missing.
+     */
+    truncated: boolean;
 };
 
 /**
@@ -67021,6 +67030,75 @@ export type GetPublicRepositoryResponses = {
 
 export type GetPublicRepositoryResponse = GetPublicRepositoryResponses[keyof GetPublicRepositoryResponses];
 
+export type GetPublicBranchData = {
+    body?: never;
+    path: {
+        /**
+         * Git provider (github or gitlab)
+         */
+        provider: string;
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query: {
+        /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
+         * Exact branch name to look up
+         */
+        name: string;
+    };
+    url: '/git/public/{provider}/{owner}/{repo}/branch';
+};
+
+export type GetPublicBranchErrors = {
+    /**
+     * Provider not supported, or empty branch name
+     */
+    400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
+     * Repository or branch not found
+     */
+    404: unknown;
+    /**
+     * API rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The provider could not answer for this branch (its listing was capped and it has no single-branch endpoint)
+     */
+    502: unknown;
+};
+
+export type GetPublicBranchResponses = {
+    /**
+     * The branch
+     */
+    200: BranchInfo;
+};
+
+export type GetPublicBranchResponse = GetPublicBranchResponses[keyof GetPublicBranchResponses];
+
 export type GetPublicBranchesData = {
     body?: never;
     path: {
@@ -102049,6 +102127,75 @@ export type GetRepositoryPresetByNameResponses = {
 };
 
 export type GetRepositoryPresetByNameResponse = GetRepositoryPresetByNameResponses[keyof GetRepositoryPresetByNameResponses];
+
+export type GetRepositoryBranchData = {
+    body?: never;
+    path: {
+        /**
+         * Repository owner
+         */
+        owner: string;
+        /**
+         * Repository name
+         */
+        repo: string;
+    };
+    query: {
+        /**
+         * Git provider connection ID (required when multiple connections have the same repo)
+         */
+        connection_id: number;
+        /**
+         * Exact branch name to look up
+         */
+        name: string;
+    };
+    url: '/repositories/{owner}/{repo}/branch';
+};
+
+export type GetRepositoryBranchErrors = {
+    /**
+     * Empty branch name
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
+    /**
+     * Repository or branch not found
+     */
+    404: unknown;
+    /**
+     * The connection must be reauthorized
+     */
+    409: unknown;
+    /**
+     * Branch lookup rate limit exceeded
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Git provider request failed, or the repository could not be read to confirm a missing branch
+     */
+    502: unknown;
+};
+
+export type GetRepositoryBranchResponses = {
+    /**
+     * The branch
+     */
+    200: BranchInfo;
+};
+
+export type GetRepositoryBranchResponse = GetRepositoryBranchResponses[keyof GetRepositoryBranchResponses];
 
 export type GetRepositoryBranchesData = {
     body?: never;

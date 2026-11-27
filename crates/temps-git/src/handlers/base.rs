@@ -7,8 +7,9 @@ use super::audit::{
 };
 use super::compose_preview_problem::ComposePreviewProblemResponse;
 use super::repositories::{
-    check_commit_exists, get_branches_by_repository_id, get_repository_branches,
-    get_repository_tags, get_tags_by_repository_id, list_commits_by_repository_id,
+    check_commit_exists, get_branches_by_repository_id, get_repository_branch,
+    get_repository_branches, get_repository_tags, get_tags_by_repository_id,
+    list_commits_by_repository_id,
 };
 use super::types::GitAppState as AppState;
 use super::types::GitAppState;
@@ -222,6 +223,7 @@ impl From<GitProviderManagerError> for Problem {
                 | GitProviderError::PermissionDenied { .. }
                 | GitProviderError::ApiError(_)
                 | GitProviderError::CommitNotFound { .. }
+                | GitProviderError::BranchLookupUnavailable { .. }
                 | GitProviderError::FileNotFound { .. }
                 | GitProviderError::NotImplemented
                 | GitProviderError::InvalidConfiguration(_)
@@ -406,6 +408,16 @@ impl From<GitProviderError> for Problem {
                 .with_type("https://docs.temps.sh/errors/file_not_found")
                 .with_title("File Not Found")
                 .with_detail(error.to_string()),
+            // Deliberately not a 404: the lookup could not be completed, and a
+            // 404 here would be read as "this branch does not exist".
+            GitProviderError::BranchLookupUnavailable { ref branch, listed, .. } => {
+                problem_new(StatusCode::BAD_GATEWAY)
+                    .with_type("https://docs.temps.sh/errors/branch_lookup_unavailable")
+                    .with_title("Branch Could Not Be Verified")
+                    .with_detail(error.to_string())
+                    .with_value("branch", branch.clone())
+                    .with_value("listed_branches", listed)
+            }
             GitProviderError::NotImplemented => problem_new(StatusCode::NOT_IMPLEMENTED)
                 .with_type("https://docs.temps.sh/errors/not_implemented")
                 .with_title("Not Implemented")
@@ -2400,6 +2412,10 @@ pub fn configure_routes() -> axum::Router<Arc<AppState>> {
         .route(
             "/repositories/{owner}/{repo}/branches",
             get(get_repository_branches),
+        )
+        .route(
+            "/repositories/{owner}/{repo}/branch",
+            get(get_repository_branch),
         )
         .route(
             "/repositories/{owner}/{repo}/tags",
