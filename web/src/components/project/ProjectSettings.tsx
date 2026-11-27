@@ -126,6 +126,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
               <ProjectSecuritySettings project={project} refetch={refetch} />
               <ProjectIpAccessCard
                 projectId={project.id}
+                projectSlug={project.slug}
                 scopeName={project.name}
               />
               <InternalAccessCard

@@ -18,6 +18,9 @@ import {
   entriesToSave,
   policySummary,
   withPresets,
+  withMonitorEntries,
+  monitorBlockSettingsPath,
+  fixesOwnList,
 } from './ip-access'
 
 describe('cidrSyntaxError', () => {
@@ -288,5 +291,53 @@ describe('helpers', () => {
     expect(policySummary('allow', 1)).toBe('Only 1 range can reach this')
     expect(policySummary('deny', 3)).toBe('3 ranges blocked')
     expect(policySummary('disabled', 0)).toBe('Open to everyone')
+  })
+})
+
+describe('uptime monitor block fix', () => {
+  const block = {
+    policy_scope: 'project' as const,
+    environment_id: 9,
+    suggested_cidrs: ['127.0.0.1/32', '203.0.113.10/32'],
+    suggested_description: 'Temps uptime monitor',
+  }
+
+  test('appends the monitor entries and keeps every existing one', () => {
+    const current = [
+      { cidr: '198.51.100.7/32', description: 'Operator' },
+      { cidr: '100.64.0.0/10', description: 'Tailscale (IPv4)' },
+    ]
+    expect(withMonitorEntries(current, block)).toEqual([
+      ...current,
+      { cidr: '127.0.0.1/32', description: 'Temps uptime monitor' },
+      { cidr: '203.0.113.10/32', description: 'Temps uptime monitor' },
+    ])
+  })
+
+  test('does not list an entry twice', () => {
+    const current = [{ cidr: '127.0.0.1/32', description: 'Loopback' }]
+    expect(withMonitorEntries(current, block)).toEqual([
+      ...current,
+      { cidr: '203.0.113.10/32', description: 'Temps uptime monitor' },
+    ])
+  })
+
+  test('links to the list that refuses the monitor', () => {
+    expect(monitorBlockSettingsPath('web app', block)).toBe(
+      '/projects/web%20app/settings/security#ip-access'
+    )
+    expect(
+      monitorBlockSettingsPath('web', {
+        policy_scope: 'environment',
+        environment_id: 9,
+      })
+    ).toBe('/projects/web/environments/9?view=settings#ip-access')
+  })
+
+  test('a card fixes only its own list', () => {
+    expect(fixesOwnList({ policy_scope: 'project' }, false)).toBe(true)
+    expect(fixesOwnList({ policy_scope: 'project' }, true)).toBe(false)
+    expect(fixesOwnList({ policy_scope: 'environment' }, true)).toBe(true)
+    expect(fixesOwnList({ policy_scope: 'environment' }, false)).toBe(false)
   })
 })

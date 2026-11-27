@@ -14,10 +14,10 @@ import {
   testEnvironmentIpAccess,
   testProjectIpAccess,
 } from '../../api/sdk.gen.js'
-import type { IpAccessCidrEntry } from '../../api/types.gen.js'
+import type { IpAccessCidrEntry, UptimeMonitorIpBlock } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
-import { newline, header, icons, json, colors, success, info, keyValue } from '../../ui/output.js'
+import { newline, header, icons, json, colors, success, info, keyValue, warning } from '../../ui/output.js'
 
 const MODES = ['disabled', 'allow', 'deny'] as const
 type Mode = (typeof MODES)[number]
@@ -98,6 +98,50 @@ function scopeLabel(scope: { projectId: number; environmentId?: number }): strin
     : `environment ${scope.environmentId} of project ${scope.projectId}`
 }
 
+/**
+ * What to print when a list refuses Temps' own uptime monitor: the server's
+ * explanation, then, when the list shown is the one that refuses it, the
+ * command that applies the suggested fix. `set` replaces the whole list, so
+ * the command repeats every entry already saved.
+ */
+export function monitorBlockLines(
+  block: UptimeMonitorIpBlock,
+  shown: { mode: Mode; cidrs: IpAccessCidrEntry[]; isEnvironment: boolean },
+): string[] {
+  const lines = [block.message]
+  const ownList = block.policy_scope === (shown.isEnvironment ? 'environment' : 'project')
+  if (block.suggested_cidrs.length === 0) return lines
+  if (!ownList) {
+    lines.push(`Fix it on the project list: temps ip-access project show --project-id ${block.project_id}`)
+    return lines
+  }
+  const scope =
+    shown.isEnvironment && block.environment_id != null
+      ? `--project-id ${block.project_id} --environment-id ${block.environment_id}`
+      : `--project-id ${block.project_id}`
+  const listed = new Set(shown.cidrs.map((entry) => entry.cidr))
+  const cidrs = [
+    ...shown.cidrs.map((entry) => entry.cidr),
+    ...block.suggested_cidrs.filter((cidr) => !listed.has(cidr)),
+  ]
+  lines.push(
+    `To allow it: temps ip-access project set ${scope} --mode ${shown.mode} ${cidrs.map((cidr) => `--cidr ${cidr}`).join(' ')}`,
+  )
+  return lines
+}
+
+function printMonitorBlock(
+  policy: { mode: Mode; cidrs: IpAccessCidrEntry[]; uptime_monitor_block?: UptimeMonitorIpBlock | null },
+  scope: { environmentId?: number },
+): void {
+  if (!policy.uptime_monitor_block) return
+  monitorBlockLines(policy.uptime_monitor_block, {
+    mode: policy.mode,
+    cidrs: policy.cidrs,
+    isEnvironment: scope.environmentId !== undefined,
+  }).forEach((line) => warning(line))
+}
+
 function collect(value: string, previous: string[]): string[] {
   return [...previous, value]
 }
@@ -169,6 +213,7 @@ async function showAction(options: ShowOptions): Promise<void> {
     info(`${colors.bold(entry.cidr)}${entry.description ? colors.muted(`  ${entry.description}`) : ''}`)
   })
   if (policy.your_ip) keyValue('Your address', policy.your_ip)
+  printMonitorBlock(policy, scope)
   newline()
 }
 
@@ -219,6 +264,7 @@ async function setAction(options: SetOptions): Promise<void> {
   }
   success(`IP access list saved for ${scopeLabel(scope)} (${saved.mode}, ${saved.cidrs.length} entries)`)
   if (saved.mode !== 'disabled') info('Changes reach the proxy within a few seconds')
+  printMonitorBlock(saved, scope)
 }
 
 async function clearAction(options: ClearOptions): Promise<void> {

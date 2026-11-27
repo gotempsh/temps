@@ -3,7 +3,14 @@
 
 import { describe, expect, test } from 'bun:test'
 import { Command } from 'commander'
-import { buildCidrList, parseId, parseMode, registerProjectIpAccessCommands, resolveSetInput } from './project.js'
+import {
+  buildCidrList,
+  monitorBlockLines,
+  parseId,
+  parseMode,
+  registerProjectIpAccessCommands,
+  resolveSetInput,
+} from './project.js'
 
 describe('parseMode', () => {
   test('accepts the three modes', () => {
@@ -88,5 +95,46 @@ describe('registration', () => {
     registerProjectIpAccessCommands(ipAccess)
     const project = ipAccess.commands.find((c) => c.name() === 'project')
     expect(project?.commands.map((c) => c.name()).sort()).toEqual(['clear', 'set', 'show', 'test'])
+  })
+})
+
+describe('monitorBlockLines', () => {
+  const block = {
+    project_id: 4,
+    environment_id: 9,
+    policy_scope: 'project' as const,
+    mode: 'allow' as const,
+    reason: 'not_allow_listed' as const,
+    monitor_addresses: ['127.0.0.1', '203.0.113.10'],
+    blocked_addresses: ['203.0.113.10'],
+    matched_cidrs: [],
+    suggested_cidrs: ['203.0.113.10/32'],
+    suggested_description: 'Temps uptime monitor',
+    message: 'Blocked by this project\'s IP access list: ...',
+  }
+
+  test('prints the reason and a set command that keeps the saved entries', () => {
+    const lines = monitorBlockLines(block, {
+      mode: 'allow',
+      cidrs: [{ cidr: '198.51.100.7/32' }, { cidr: '127.0.0.1/32' }],
+      isEnvironment: false,
+    })
+    expect(lines).toEqual([
+      block.message,
+      'To allow it: temps ip-access project set --project-id 4 --mode allow --cidr 198.51.100.7/32 --cidr 127.0.0.1/32 --cidr 203.0.113.10/32',
+    ])
+  })
+
+  test('points an inheriting environment at the project list', () => {
+    const lines = monitorBlockLines(block, { mode: 'disabled', cidrs: [], isEnvironment: true })
+    expect(lines[1]).toBe('Fix it on the project list: temps ip-access project show --project-id 4')
+  })
+
+  test('a deny-list block has nothing to add', () => {
+    const lines = monitorBlockLines(
+      { ...block, mode: 'deny', reason: 'deny_listed', suggested_cidrs: [], matched_cidrs: ['127.0.0.0/8'] },
+      { mode: 'deny', cidrs: [{ cidr: '127.0.0.0/8' }], isEnvironment: false },
+    )
+    expect(lines).toEqual([block.message])
   })
 })

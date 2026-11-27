@@ -309,3 +309,53 @@ export function policySummary(mode: IpAccessMode, count: number): string {
       return 'Open to everyone'
   }
 }
+
+/** What the monitor-block fix needs from `UptimeMonitorIpBlock`. */
+export interface MonitorBlockFix {
+  policy_scope: 'project' | 'environment'
+  environment_id?: number | null
+  suggested_cidrs: string[]
+  suggested_description: string
+}
+
+/**
+ * The list with the entries that let Temps' uptime monitor through appended,
+ * keeping every entry the operator has. Entries already listed are not
+ * added twice.
+ */
+export function withMonitorEntries(
+  current: CidrEntry[],
+  block: Pick<MonitorBlockFix, 'suggested_cidrs' | 'suggested_description'>
+): CidrEntry[] {
+  return withPresets(
+    current,
+    block.suggested_cidrs.map((cidr) => ({
+      cidr,
+      description: block.suggested_description,
+    }))
+  )
+}
+
+/** Where the list that refuses the monitor is edited. */
+export function monitorBlockSettingsPath(
+  projectSlug: string,
+  block: Pick<MonitorBlockFix, 'policy_scope' | 'environment_id'>
+): string {
+  const slug = encodeURIComponent(projectSlug)
+  if (block.policy_scope === 'environment' && block.environment_id != null) {
+    return `/projects/${slug}/environments/${block.environment_id}?view=settings#ip-access`
+  }
+  return `/projects/${slug}/settings/security#ip-access`
+}
+
+/**
+ * Whether a card for one scope can apply the fix itself: only when the list
+ * that refuses the monitor is the one the card edits. An environment that
+ * follows the project list is fixed on the project list.
+ */
+export function fixesOwnList(
+  block: Pick<MonitorBlockFix, 'policy_scope'>,
+  isEnvironment: boolean
+): boolean {
+  return block.policy_scope === (isEnvironment ? 'environment' : 'project')
+}

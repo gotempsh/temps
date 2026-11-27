@@ -52,6 +52,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CircleAlert,
+  Loader2,
   Network,
   Plus,
   Search,
@@ -59,6 +60,7 @@ import {
   UserRound,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router'
 import { Controller, useFieldArray, useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import {
@@ -77,6 +79,9 @@ import {
   probeScope,
   showsEntries,
   entriesToSave,
+  fixesOwnList,
+  monitorBlockSettingsPath,
+  withMonitorEntries,
   type IpAccessFormValues,
   type IpAccessFormMode,
   type IpAccessMode,
@@ -84,6 +89,11 @@ import {
 
 interface ProjectIpAccessCardProps {
   projectId: number
+  /**
+   * Slug of the project, for the link to the project list when that list,
+   * not this environment's, is what refuses the uptime monitor.
+   */
+  projectSlug?: string
   /** Set to manage one environment's list instead of the project-wide one. */
   environmentId?: number
   /**
@@ -121,6 +131,7 @@ const IP_ACCESS_SECTION_ID = 'ip-access'
 
 export function ProjectIpAccessCard({
   projectId,
+  projectSlug,
   environmentId,
   scopeName,
 }: ProjectIpAccessCardProps) {
@@ -402,9 +413,36 @@ export function ProjectIpAccessCard({
     )
   }
 
+  // The saved list (for an environment that follows the project, the
+  // project's) refuses Temps' own uptime monitor. Allowing it here saves the
+  // saved list plus the monitor's entries, so it waits for a clean form.
+  const monitorBlock = policy?.uptime_monitor_block ?? null
+  const allowMonitorHere =
+    monitorBlock !== null &&
+    fixesOwnList(monitorBlock, isEnvironment) &&
+    monitorBlock.suggested_cidrs.length > 0
+  const allowMonitor = () => {
+    if (!policy || !monitorBlock || isDirty) return
+    save.mutate(
+      toRequest(
+        {
+          mode: policy.mode,
+          cidrs: withMonitorEntries(policy.cidrs, monitorBlock).map(
+            (entry) => ({
+              cidr: entry.cidr,
+              description: entry.description ?? '',
+            })
+          ),
+        },
+        false
+      )
+    )
+  }
+
   const title = isEnvironment ? 'IP access for this environment' : 'IP access'
-  // The project list is what other sections link to (Shield entries).
-  const sectionId = isEnvironment ? undefined : IP_ACCESS_SECTION_ID
+  // Other sections and the uptime monitor link here (Shield entries, a
+  // monitor the list refuses). Each settings page shows one such card.
+  const sectionId = IP_ACCESS_SECTION_ID
   const description = isEnvironment
     ? 'Limit which client addresses can reach this environment. Overrides the project list.'
     : 'Allow only, or block, specific IP addresses and ranges for every environment of this project.'
@@ -486,6 +524,42 @@ export function ProjectIpAccessCard({
               Someone else (or the CLI) saved a different list for this{' '}
               {scopeNoun} while you were editing. Your edits are kept; saving
               replaces the newer list. Use Discard changes to load it instead.
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {monitorBlock && (
+          <Alert>
+            <CircleAlert className="h-4 w-4" />
+            <AlertTitle>This list blocks the uptime monitor</AlertTitle>
+            <AlertDescription className="space-y-3">
+              <p className="[overflow-wrap:anywhere]">{monitorBlock.message}</p>
+              {allowMonitorHere ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={allowMonitor}
+                  disabled={isDirty || save.isPending}
+                  title={
+                    isDirty
+                      ? 'Save or discard your changes first'
+                      : `Add ${monitorBlock.suggested_cidrs.join(', ')} as "${monitorBlock.suggested_description}"`
+                  }
+                >
+                  {save.isPending && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  Allow monitor
+                </Button>
+              ) : !fixesOwnList(monitorBlock, isEnvironment) && projectSlug ? (
+                <Button asChild type="button" size="sm" variant="outline">
+                  <Link
+                    to={monitorBlockSettingsPath(projectSlug, monitorBlock)}
+                  >
+                    Project list
+                  </Link>
+                </Button>
+              ) : null}
             </AlertDescription>
           </Alert>
         )}
