@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/sandbox",
-  "version": "0.0.1-beta.1",
+  "version": "0.1.0-beta.64",
   "description": "Sandbox SDK for the Temps platform",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
