@@ -1953,12 +1953,15 @@ mod real_server_tests {
 
     const API_KEY: &str = "integration-test-key";
 
-    /// Whether a Docker daemon answers. Only an unreachable daemon is a reason
-    /// to skip: once Docker is up, every setup failure (image pull, readiness
-    /// message, startup timeout, port mapping) fails the test instead of
-    /// silently passing it.
+    /// Whether the Docker daemon the container runner will use answers. The
+    /// client comes from testcontainers itself, so the probe resolves the same
+    /// endpoint as `start()` (`~/.testcontainers.properties`, `DOCKER_HOST`,
+    /// then the default and Docker Desktop/rootless sockets). Only an
+    /// unreachable daemon is a reason to skip: once Docker is up, every setup
+    /// failure (image pull, readiness message, startup timeout, port mapping)
+    /// fails the test instead of silently passing it.
     async fn docker_reachable() -> bool {
-        match bollard::Docker::connect_with_defaults() {
+        match testcontainers::core::client::docker_client_instance().await {
             Ok(docker) => docker.ping().await.is_ok(),
             Err(_) => false,
         }
