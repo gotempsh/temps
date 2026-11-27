@@ -10,7 +10,7 @@
  */
 import { useQuery } from '@tanstack/react-query'
 import { Activity } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import type {
   EgressActivityRecord,
@@ -84,6 +84,14 @@ export function OutboundActivityCard({
   })
   const total = records.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  // Retention can empty a later page while it is open (its last records
+  // expired): go back to the last page that still has records, instead of
+  // showing nothing with no way back.
+  const emptyLaterPage =
+    records.data !== undefined && records.data.records.length === 0 && page > 1
+  useEffect(() => {
+    if (emptyLaterPage) setPage((current) => Math.min(current - 1, totalPages))
+  }, [emptyLaterPage, totalPages])
 
   return (
     <Card>
@@ -131,12 +139,24 @@ export function OutboundActivityCard({
             <Skeleton className="h-8 w-full" />
           </div>
         ) : records.data.records.length === 0 ? (
-          <EmptyActivity
-            noun={workload.noun}
-            status={status.data}
-            filtered={outcome !== 'all'}
-            disabled={disabled}
-          />
+          <>
+            <EmptyActivity
+              noun={workload.noun}
+              status={status.data}
+              filtered={outcome !== 'all'}
+              disabled={disabled}
+            />
+            {page > 1 && (
+              <ResponsivePagination
+                page={page}
+                pageSize={PAGE_SIZE}
+                total={total}
+                totalPages={Math.max(totalPages, page)}
+                onPageChange={setPage}
+                ariaLabel="Outbound activity pagination"
+              />
+            )}
+          </>
         ) : (
           <>
             <ActivityTable records={records.data.records} />

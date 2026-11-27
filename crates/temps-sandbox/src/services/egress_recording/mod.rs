@@ -74,7 +74,9 @@ pub fn recorded(row: &sandboxes::Model) -> RecordedWorkload {
 /// Refreshes the egress recorder when a recorded sandbox's policy changed,
 /// so the recorder holds the new policy before the change is reported done.
 pub struct RecorderPolicyRefresh {
-    pub recorder: Arc<LocalEgressRecorder>,
+    /// Weak: the sandbox service holds this observer, and nothing it
+    /// registers may keep the recorder alive.
+    pub recorder: std::sync::Weak<LocalEgressRecorder>,
 }
 
 #[async_trait]
@@ -84,7 +86,9 @@ impl crate::services::sandbox_service::EgressPolicyObserver for RecorderPolicyRe
         if row.node_id.is_none() {
             // A policy change does not move the revision the rows are
             // cached at: read them again.
-            self.recorder.rediscover().await;
+            if let Some(recorder) = self.recorder.upgrade() {
+                recorder.rediscover().await;
+            }
         }
     }
 }
@@ -92,7 +96,10 @@ impl crate::services::sandbox_service::EgressPolicyObserver for RecorderPolicyRe
 /// What steering a sandbox's traffic on this host needs once its opt-in
 /// changed: the recorder, and the sandboxes' own traffic source.
 pub struct LocalSteering {
-    pub recorder: Arc<LocalEgressRecorder>,
+    /// Weak: the recording service holds this adapter and the recorder
+    /// holds the service, so a strong reference would keep the recorder
+    /// (its tasks and its listener) alive for ever.
+    pub recorder: std::sync::Weak<LocalEgressRecorder>,
     pub traffic: Arc<local::SandboxTraffic>,
 }
 
@@ -178,12 +185,15 @@ impl WorkloadEgressAdapter for SandboxEgressAdapter {
         let Some(local) = self.local.get() else {
             return;
         };
-        local.recorder.rediscover().await;
+        let Some(recorder) = local.recorder.upgrade() else {
+            return;
+        };
+        recorder.rediscover().await;
         let Ok(id) = i32::try_from(workload.workload.id) else {
             return;
         };
         local.traffic.steer(id).await;
-        local.recorder.wake();
+        recorder.wake();
     }
 }
 

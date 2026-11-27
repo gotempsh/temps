@@ -1083,3 +1083,60 @@ async fn a_page_past_any_offset_is_empty_not_an_error() {
         assert_eq!(result.total, 1, "{page}");
     }
 }
+
+/// A store whose project `over` has used up its telemetry quota.
+struct OverQuota {
+    inner: CollectStore,
+    over: i32,
+}
+
+#[async_trait]
+impl EgressLogStore for OverQuota {
+    async fn store(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
+        self.inner.store(records).await
+    }
+
+    async fn admits(&self, project_id: i32) -> Result<bool, OtelError> {
+        Ok(project_id != self.over)
+    }
+
+    async fn query(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {
+        self.inner.query(query).await
+    }
+
+    async fn count(&self, query: LogQuery) -> Result<u64, OtelError> {
+        self.inner.count(query).await
+    }
+}
+
+/// A project over its telemetry quota stores no more recorded connections,
+/// as its own OTLP logs are refused: they are dropped and counted, and a
+/// workload without a project (no quota) still records.
+#[tokio::test]
+async fn a_project_over_its_quota_stores_no_more_records() {
+    let Some(f) = fixture().await else { return };
+    let store = Arc::new(OverQuota {
+        inner: CollectStore::default(),
+        over: PROJECT,
+    });
+    let service = f.with_store(Some(store.clone()));
+    service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
+    service
+        .set_enabled(&f.row(PROJECTLESS), true)
+        .await
+        .unwrap();
+    let outcome = service
+        .ingest(
+            f.worker_a,
+            batch(vec![
+                record(ON_WORKER, "api.example.com", ConnectionOutcome::Allowed),
+                record(PROJECTLESS, "api.example.com", ConnectionOutcome::Allowed),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert_eq!((outcome.stored, outcome.over_quota), (1, 1));
+    let stored = store.inner.0.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].workload, Some(workload(PROJECTLESS)));
+}

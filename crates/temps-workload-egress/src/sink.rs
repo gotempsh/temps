@@ -33,7 +33,7 @@ impl EgressRecordSink for LocalRecordSink {
             // What ingest no longer stores (opted out, deleted, moved) is
             // discarded, not delivered.
             .map(|outcome| Delivered {
-                discarded: outcome.not_recording + outcome.not_placed,
+                discarded: outcome.not_recording + outcome.not_placed + outcome.over_quota,
                 ..Default::default()
             })
             .map_err(|error| RecordSinkError::Delivery {

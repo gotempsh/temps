@@ -229,6 +229,7 @@ async fn recorded(
         .map(|row| {
             let mut placed = nodes.remove(&row.id).unwrap_or_default();
             placed.sort_unstable();
+            let files_only = placed.is_empty();
             RecordedWorkload {
                 workload: workload(row.id),
                 public_id: row.id.to_string(),
@@ -243,11 +244,15 @@ async fn recorded(
                          deployments record"
                             .to_string(),
                     )
-                } else if static_sites.contains(&row.project_id) {
+                } else if static_sites.contains(&row.project_id) && files_only {
+                    // A static project can still be deployed as an image,
+                    // which runs a replica like any other: only one with no
+                    // running replica is files alone.
                     Some(
                         "a static site is published as files and served by the proxy: its \
                          deployments start no container to make outbound connections, so \
-                         there is nothing to record"
+                         there is nothing to record. An environment deployed as a Docker \
+                         image records"
                             .to_string(),
                     )
                 } else {
@@ -270,7 +275,10 @@ pub struct EnvironmentEgressAdapter {
     db: Arc<DatabaseConnection>,
     /// Set once this host records its own deployments; absent, a change is
     /// only stored.
-    recorder: OnceLock<Arc<LocalEgressRecorder>>,
+    /// Held weakly: the recording service holds this adapter and the
+    /// recorder holds the service, so a strong reference would keep the
+    /// recorder (its tasks and its listener) alive for ever.
+    recorder: OnceLock<std::sync::Weak<LocalEgressRecorder>>,
 }
 
 impl EnvironmentEgressAdapter {
@@ -282,8 +290,8 @@ impl EnvironmentEgressAdapter {
     }
 
     /// Wires the recorder a change refreshes. Set once.
-    pub fn set_recorder(&self, recorder: Arc<LocalEgressRecorder>) {
-        let _ = self.recorder.set(recorder);
+    pub fn set_recorder(&self, recorder: &Arc<LocalEgressRecorder>) {
+        let _ = self.recorder.set(Arc::downgrade(recorder));
     }
 }
 
@@ -344,7 +352,7 @@ impl WorkloadEgressAdapter for EnvironmentEgressAdapter {
     /// Containers already going through the recorder start or stop being
     /// recorded at once; the rest follow when they are next deployed.
     async fn changed(&self, _workload: &RecordedWorkload) {
-        if let Some(recorder) = self.recorder.get() {
+        if let Some(recorder) = self.recorder.get().and_then(std::sync::Weak::upgrade) {
             recorder.refresh().await;
         }
     }

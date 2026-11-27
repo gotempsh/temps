@@ -185,16 +185,14 @@ impl NetworkPolicyService {
     /// A digest of what other nodes share with `node_id` (their live
     /// observations outside `off`), which is part of its snapshot but
     /// not of the database revision. In memory.
+    ///
+    /// Built from each report's digest, taken when it was recorded: a poll
+    /// copies and serializes no other node's map.
     fn observed_key(&self, node_id: i32) -> u64 {
-        let mut elsewhere = self.observed_elsewhere(node_id);
-        elsewhere.sort_by_key(|(id, _)| *id);
+        let mut elsewhere = self.observed_digests_elsewhere(node_id);
+        elsewhere.sort_unstable();
         let mut hasher = DefaultHasher::new();
-        for (id, identities) in &elsewhere {
-            id.hash(&mut hasher);
-            serde_json::to_string(identities)
-                .unwrap_or_default()
-                .hash(&mut hasher);
-        }
+        elsewhere.hash(&mut hasher);
         hasher.finish()
     }
 }
@@ -283,6 +281,33 @@ mod tests {
         assert!(
             queries.load(std::sync::atomic::Ordering::Relaxed) <= 1,
             "answered from the digest"
+        );
+    }
+
+    /// The key an `off` node's cache is checked against follows the other
+    /// nodes' observations (a change rebuilds it), never this node's own,
+    /// and a report of the same workloads leaves it as it was.
+    #[tokio::test]
+    async fn the_observed_key_follows_other_nodes_observations() {
+        let Some((db, worker)) = fixture().await else {
+            return;
+        };
+        let (service, _) = counted(&db).await;
+        let other = worker + 1000;
+        let sandbox = |id| WorkloadRef::new(WorkloadKind::Sandbox, id);
+        let map =
+            |id, address: &str| IdentityMap::new().with(sandbox(id), address.parse().unwrap());
+        service.record_observed(other, map(1, "10.202.1.5"), NodeMode::Shadow);
+        let before = service.observed_key(worker);
+        service.record_observed(other, map(1, "10.202.1.5"), NodeMode::Shadow);
+        assert_eq!(service.observed_key(worker), before, "the same report");
+        service.record_observed(worker, map(2, "10.202.9.5"), NodeMode::Shadow);
+        assert_eq!(service.observed_key(worker), before, "its own report");
+        service.record_observed(other, map(1, "10.202.1.6"), NodeMode::Shadow);
+        assert_ne!(
+            service.observed_key(worker),
+            before,
+            "another node's change"
         );
     }
 

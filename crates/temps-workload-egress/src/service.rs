@@ -43,6 +43,11 @@ impl NodeRecordingCapabilities for temps_network_policy::NetworkPolicyService {
 #[async_trait]
 pub trait EgressLogStore: Send + Sync {
     async fn store(&self, records: Vec<LogRecord>) -> Result<u64, OtelError>;
+    /// Whether `project_id` may store more telemetry: false once its storage
+    /// quota is used up, as for its own OTLP logs. Yes by default.
+    async fn admits(&self, _project_id: i32) -> Result<bool, OtelError> {
+        Ok(true)
+    }
     async fn query(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError>;
     async fn count(&self, query: LogQuery) -> Result<u64, OtelError>;
 }
@@ -51,6 +56,15 @@ pub trait EgressLogStore: Send + Sync {
 impl EgressLogStore for temps_otel::OtelService {
     async fn store(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
         self.ingest_platform_logs(records).await
+    }
+
+    /// The same cached quota check OTLP log ingest makes.
+    async fn admits(&self, project_id: i32) -> Result<bool, OtelError> {
+        match self.check_quota(project_id).await {
+            Ok(()) => Ok(true),
+            Err(OtelError::QuotaExceeded { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     async fn query(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {

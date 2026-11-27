@@ -731,11 +731,33 @@ async fn a_stopped_replica_no_longer_places_its_environment() {
 
 /// A static site's deployments publish files and start no container, so
 /// nothing is ever steered: it says it cannot record instead of accepting
-/// the setting and recording nothing.
+/// the setting and recording nothing. The same project deployed as a Docker
+/// image runs a replica, and records like any other.
 #[tokio::test]
 async fn a_static_site_says_it_cannot_record() {
     let Some(f) = fixture().await else { return };
     let wired = f.wired();
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE projects SET preset = 'vite' WHERE id = {PROJECT}"
+        ))
+        .await
+        .unwrap();
+    let with_replica = wired
+        .environments
+        .status(PROJECT, PRODUCTION)
+        .await
+        .unwrap();
+    assert_ne!(
+        with_replica.reason_code.as_deref(),
+        Some("not_recordable"),
+        "an image deployment of a static project runs a replica: {with_replica:?}"
+    );
+    // Files alone: no running replica.
+    f.db.connection()
+        .execute_unprepared("UPDATE deployment_containers SET status = 'stopped'")
+        .await
+        .unwrap();
     // A preset that builds static output: published as files, no replica.
     for preset in ["vite"] {
         f.db.connection()
@@ -770,5 +792,34 @@ async fn a_static_site_says_it_cannot_record() {
     assert!(
         matches!(refused, EgressRecordingError::NotRecordable { .. }),
         "{refused:?}"
+    );
+}
+
+struct NoCapability;
+
+impl temps_workload_egress::local::LocalCapability for NoCapability {
+    fn set(&self, _capability: temps_workload_netpol::EgressRecordingCapability) {}
+}
+
+/// The recording service holds the environment adapter and the recorder
+/// holds the service: the adapter's own reference to the recorder must not
+/// close that loop, or dropping the plugin graph would never drop the
+/// recorder (its tasks, its listener and its port).
+#[tokio::test]
+async fn the_adapter_never_keeps_the_recorder_alive() {
+    let Some(f) = fixture().await else { return };
+    let wired = f.wired();
+    let recorder = temps_workload_egress::local::LocalEgressRecorder::new(
+        wired.recording.clone(),
+        Arc::new(NoCapability),
+        temps_workload_egress::local::LocalServing::new(),
+        temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
+    );
+    wired.adapter.set_recorder(&recorder);
+    let weak = Arc::downgrade(&recorder);
+    drop(recorder);
+    assert!(
+        weak.upgrade().is_none(),
+        "freed with its last outside reference"
     );
 }

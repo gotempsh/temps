@@ -222,3 +222,36 @@ test('destinations read as the workload asked for them', () => {
   expect(formatDuration(1400)).toBe('1.4 s')
   expect(formatDuration(125_000)).toBe('2 min 5 s')
 })
+
+test('a later page emptied by retention goes back to the records left', async () => {
+  // 21 records: page 2 holds the oldest. It expires while page 2 is open,
+  // so page 2 comes back empty with 20 left.
+  let expired = false
+  const asked: string[] = []
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/egress-recording': () =>
+      jsonResponse(status(true)),
+    'GET /v1/sandboxes/sbx_1/egress-records': (request) => {
+      const query = new URL(request.url).searchParams
+      asked.push(query.get('page') ?? '')
+      if (query.get('page') === '2') {
+        expired = true
+        return jsonResponse({ ...page([], 20), page: 2 })
+      }
+      const first = Array.from({ length: 20 }, (_, i) =>
+        record({ host: `h${i}.example.com` })
+      )
+      return jsonResponse(page(first, expired ? 20 : 21))
+    },
+  })
+  const card = view(<OutboundActivityCard workload={sandboxEgress('sbx_1')} />)
+  await settle()
+  const next = card.getAllByRole('button', { name: /next/i })[0]
+  next.click()
+  await settle()
+  await settle()
+  expect(asked).toContain('2')
+  expect(asked[asked.length - 1]).toBe('1')
+  expect(card.getByText('CONNECT h0.example.com:443')).toBeTruthy()
+  api.restore()
+})

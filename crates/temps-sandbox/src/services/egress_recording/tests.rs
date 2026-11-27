@@ -593,3 +593,40 @@ async fn a_sandbox_on_another_backend_cannot_record() {
         "a row from before the column is a Docker sandbox"
     );
 }
+
+struct NoCapability;
+
+impl temps_workload_egress::local::LocalCapability for NoCapability {
+    fn set(&self, _capability: temps_workload_netpol::EgressRecordingCapability) {}
+}
+
+/// The recording service holds the sandbox adapter and the recorder holds
+/// the service: the adapter's steering must not close that loop, or
+/// dropping the plugin graph would never drop the recorder (its tasks, its
+/// listener and its port).
+#[tokio::test]
+async fn the_adapter_never_keeps_the_recorder_alive() {
+    let Some(f) = fixture().await else { return };
+    let (wired, _) = f.collecting();
+    let recorder = temps_workload_egress::local::LocalEgressRecorder::new(
+        wired.recording.clone(),
+        Arc::new(NoCapability),
+        temps_workload_egress::local::LocalServing::new(),
+        temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
+    );
+    let traffic = Arc::new(super::local::SandboxTraffic::new(
+        f.db.connection_arc(),
+        bollard::Docker::connect_with_local_defaults().expect("docker client"),
+        None,
+    ));
+    wired.adapter.set_local(super::LocalSteering {
+        recorder: Arc::downgrade(&recorder),
+        traffic,
+    });
+    let weak = Arc::downgrade(&recorder);
+    drop(recorder);
+    assert!(
+        weak.upgrade().is_none(),
+        "freed with its last outside reference"
+    );
+}

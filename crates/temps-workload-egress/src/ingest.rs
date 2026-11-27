@@ -42,6 +42,9 @@ pub struct EgressIngestOutcome {
     /// Records dropped because their workload is not placed on the node
     /// that sent them (it moved, or the node is wrong about it).
     pub not_placed: u64,
+    /// Records dropped because their project's telemetry storage quota is
+    /// used up, as its own OTLP logs are refused then.
+    pub over_quota: u64,
 }
 
 impl EgressRecordingService {
@@ -171,14 +174,48 @@ impl EgressRecordingService {
         if logs.is_empty() {
             return Ok(outcome);
         }
-        let count = logs.len();
         let store = self
             .store
             .as_ref()
             .ok_or(EgressRecordingError::IngestUnavailable {
                 node_id,
-                records: count,
+                records: logs.len(),
             })?;
+        // A project whose telemetry quota is used up stores no more of
+        // these, as it stores no more of its own logs. One (cached) check
+        // per project in the batch; a workload without a project has none.
+        let mut admitted: HashMap<i32, bool> = HashMap::new();
+        for project_id in logs.iter().filter_map(|log| log.project_id) {
+            if admitted.contains_key(&project_id) {
+                continue;
+            }
+            let admits = match store.admits(project_id).await {
+                Ok(admits) => admits,
+                Err(error) => {
+                    // Degrade to storing: a failed check never loses records.
+                    tracing::warn!(node_id, project_id, %error, "egress recording: could not check the project's telemetry quota; storing");
+                    true
+                }
+            };
+            admitted.insert(project_id, admits);
+        }
+        let before = logs.len();
+        logs.retain(|log| {
+            log.project_id
+                .is_none_or(|project_id| admitted.get(&project_id).copied().unwrap_or(true))
+        });
+        outcome.over_quota = (before - logs.len()) as u64;
+        if outcome.over_quota > 0 {
+            tracing::warn!(
+                node_id,
+                dropped = outcome.over_quota,
+                "dropped egress records of projects over their telemetry storage quota"
+            );
+        }
+        if logs.is_empty() {
+            return Ok(outcome);
+        }
+        let count = logs.len();
         outcome.stored = store
             .store(logs)
             .await

@@ -1720,7 +1720,7 @@ async fn wire_egress_recording(context: &PluginContext) {
         }
     };
     let recorder = context.require_service::<temps_workload_egress::local::LocalEgressRecorder>();
-    adapter.set_recorder(recorder.clone());
+    adapter.set_recorder(&recorder);
     context
         .require_service::<WorkflowExecutionService>()
         .set_egress_recorder(recorder.clone());

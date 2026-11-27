@@ -184,6 +184,8 @@ struct IngestAnswer {
     not_recording: u64,
     #[serde(default)]
     not_placed: u64,
+    #[serde(default)]
+    over_quota: u64,
 }
 
 /// The [`Delivered`](temps_workload_netpol::Delivered) of a batch of
@@ -194,7 +196,8 @@ struct IngestAnswer {
 fn delivered_from(records: usize, answer: &str) -> temps_workload_netpol::Delivered {
     let answer: IngestAnswer = serde_json::from_str(answer.trim()).unwrap_or_default();
     temps_workload_netpol::Delivered {
-        discarded: (answer.not_recording + answer.not_placed).min(records as u64),
+        discarded: (answer.not_recording + answer.not_placed + answer.over_quota)
+            .min(records as u64),
         ..Default::default()
     }
 }

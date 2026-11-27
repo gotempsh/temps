@@ -34,7 +34,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    QueryFilter, Statement,
+    QueryFilter, QuerySelect, Statement,
 };
 use temps_entities::sandboxes;
 use temps_sandbox_providers::docker::EgressProxyEndpoint;
@@ -90,15 +90,42 @@ pub fn container_name(public_id: &str) -> String {
 /// Its sidecar is named after it, so a name built from the wrong one never
 /// matches and the sandbox would record nothing.
 pub fn row_container_name(row: &sandboxes::Model) -> String {
-    match row.agent_run_id {
+    container_of(&row.public_id, row.agent_run_id)
+}
+
+/// [`row_container_name`] from the two columns it reads.
+pub fn container_of(public_id: &str, agent_run_id: Option<i32>) -> String {
+    match agent_run_id {
         Some(run_id) => format!("{SANDBOX_CONTAINER_PREFIX}{run_id}"),
-        None => container_name(&row.public_id),
+        None => container_name(public_id),
     }
 }
 
 /// A sandbox whose sidecar this host manages and can replace now.
 fn steerable(row: &sandboxes::Model) -> bool {
-    row.node_id.is_none() && (row.status == "running" || row.status == "stopped")
+    row.node_id.is_none() && steerable_status(&row.status)
+}
+
+fn steerable_status(status: &str) -> bool {
+    status == "running" || status == "stopped"
+}
+
+/// What the recorder reads of a recorded sandbox of this host: the columns
+/// its table and its sidecars need, never the rest of the row (metadata,
+/// preview credentials) it would otherwise keep cached.
+#[derive(Debug, Clone, PartialEq, sea_orm::FromQueryResult)]
+pub struct RecordedRow {
+    pub id: i32,
+    pub public_id: String,
+    pub agent_run_id: Option<i32>,
+    pub status: String,
+    pub egress_policy: sandboxes::StoredEgressPolicy,
+}
+
+impl RecordedRow {
+    pub fn container_name(&self) -> String {
+        container_of(&self.public_id, self.agent_run_id)
+    }
 }
 
 /// Each sandbox's sidecar addresses on the egress network, by sandbox
@@ -115,6 +142,21 @@ fn endpoints_by_sandbox(endpoints: &[EgressProxyEndpoint]) -> HashMap<&str, Vec<
     by_sandbox
 }
 
+/// The sandboxes among `rows` (which do not record) whose sidecar is listed
+/// handing its traffic to the recorder, and that can be replaced now.
+fn strays_among(rows: &[RecordedRow], endpoints: &[EgressProxyEndpoint]) -> Vec<i32> {
+    let handing_off: HashSet<&str> = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.hands_off)
+        .map(|endpoint| endpoint.sandbox.as_str())
+        .collect();
+    rows.iter()
+        .filter(|row| steerable_status(&row.status))
+        .filter(|row| handing_off.contains(row.container_name().as_str()))
+        .map(|row| row.id)
+        .collect()
+}
+
 /// Who a stray hand-off speaks for in the table: no sandbox (ids start at
 /// 1), and never recorded.
 pub const STRAY: WorkloadRef = WorkloadRef {
@@ -129,14 +171,14 @@ pub const STRAY: WorkloadRef = WorkloadRef {
 /// (the control plane stopped between storing it and replacing the
 /// sidecar) must not leave the sandbox refused as unknown.
 fn traffic_from(
-    rows: &[sandboxes::Model],
+    rows: &[RecordedRow],
     endpoints: &[EgressProxyEndpoint],
 ) -> (RecordedTraffic, bool) {
     let by_sandbox = endpoints_by_sandbox(endpoints);
     let mut traffic = RecordedTraffic::default();
     let mut recorded: HashSet<String> = HashSet::with_capacity(rows.len());
     for row in rows {
-        let name = row_container_name(row);
+        let name = row.container_name();
         let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(row.id));
         for address in by_sandbox.get(name.as_str()).into_iter().flatten() {
             traffic.identities.insert(subject, *address);
@@ -183,7 +225,7 @@ pub struct SandboxTraffic {
     /// at. Reused while the revision is unchanged: it moves whenever a
     /// sandbox is created, removed, or changes status, opt-in, node or id.
     /// A policy change does not move it, so it reloads by discovering.
-    rows: std::sync::Mutex<Option<(i64, Arc<Vec<sandboxes::Model>>)>>,
+    rows: std::sync::Mutex<Option<(i64, Arc<Vec<RecordedRow>>)>>,
     /// Whether the last list found a sidecar handing off for a sandbox that
     /// no longer records. Starts true: a restart does not know.
     strays_seen: std::sync::atomic::AtomicBool,
@@ -218,10 +260,24 @@ impl SandboxTraffic {
         }
     }
 
-    /// This host's opted-in sandboxes the recorder can see (Docker ones).
-    async fn recorded_rows(&self) -> Result<Vec<sandboxes::Model>, sea_orm::DbErr> {
-        Ok(sandboxes::Entity::find()
-            .filter(sandboxes::Column::EgressRecording.eq(true))
+    /// This host's opted-in sandboxes the recorder can see (Docker ones),
+    /// as much of each row as the recorder uses.
+    async fn recorded_rows(&self) -> Result<Vec<RecordedRow>, sea_orm::DbErr> {
+        self.local_rows(true).await
+    }
+
+    /// This host's live Docker sandboxes that record (`recording`) or not.
+    async fn local_rows(&self, recording: bool) -> Result<Vec<RecordedRow>, sea_orm::DbErr> {
+        sandboxes::Entity::find()
+            .select_only()
+            .columns([
+                sandboxes::Column::Id,
+                sandboxes::Column::PublicId,
+                sandboxes::Column::AgentRunId,
+                sandboxes::Column::Status,
+                sandboxes::Column::EgressPolicy,
+            ])
+            .filter(sandboxes::Column::EgressRecording.eq(recording))
             .filter(sandboxes::Column::NodeId.is_null())
             .filter(sandboxes::Column::Status.ne("destroyed"))
             .filter(
@@ -229,11 +285,46 @@ impl SandboxTraffic {
                     .add(sandboxes::Column::Backend.is_null())
                     .add(sandboxes::Column::Backend.eq("docker")),
             )
+            .into_model::<RecordedRow>()
             .all(self.db.as_ref())
-            .await?
-            .into_iter()
-            .filter(|row| super::records_on_backend(row.backend.as_deref()))
-            .collect())
+            .await
+    }
+
+    /// This host's sandboxes that do not record but whose sidecar still
+    /// hands its traffic to the recorder: an opt-out stored, then the
+    /// control plane stopped before the sidecar was replaced. Only read
+    /// when such a sidecar is listed.
+    async fn stray_ids(&self) -> Result<Vec<i32>, String> {
+        let endpoints = temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker)
+            .await
+            .map_err(|e| format!("could not list the sandbox egress proxies: {e}"))?;
+        if !endpoints.iter().any(|endpoint| endpoint.hands_off) {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .local_rows(false)
+            .await
+            .map_err(|e| format!("could not read this host's sandboxes: {e}"))?;
+        Ok(strays_among(&rows, &endpoints))
+    }
+
+    /// Every sidecar to bring to the recorder's state when it starts or
+    /// stops: the recorded sandboxes', and the strays still handing off.
+    /// `None` (and a resync due) when they could not be read.
+    async fn sidecars_to_resync(&self) -> Option<Vec<i32>> {
+        let mut ids = self.steerable_recorded().await?;
+        match self.stray_ids().await {
+            Ok(strays) => ids.extend(strays),
+            Err(error) => {
+                warn!(%error, "egress recording: could not find the sidecars still handing off; they are refreshed once it can");
+                self.resync
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return None;
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
     }
 
     /// The network policy revision: one row.
@@ -260,10 +351,7 @@ impl SandboxTraffic {
     /// leaves none: a policy change the revision does not follow is never
     /// answered from rows read before it, even when the read that should
     /// have followed it failed.
-    async fn current_rows(
-        &self,
-        discover: bool,
-    ) -> Result<Arc<Vec<sandboxes::Model>>, sea_orm::DbErr> {
+    async fn current_rows(&self, discover: bool) -> Result<Arc<Vec<RecordedRow>>, sea_orm::DbErr> {
         if discover {
             self.forget_rows();
         }
@@ -355,7 +443,7 @@ impl SandboxTraffic {
         match self.recorded_rows().await {
             Ok(rows) => Some(
                 rows.iter()
-                    .filter(|row| steerable(row))
+                    .filter(|row| steerable_status(&row.status))
                     .map(|row| row.id)
                     .collect(),
             ),
@@ -376,7 +464,7 @@ impl SandboxTraffic {
         {
             return;
         }
-        if let Some(ids) = self.steerable_recorded().await {
+        if let Some(ids) = self.sidecars_to_resync().await {
             self.refresh_sidecars(ids, "the recorder started or stopped earlier")
                 .await;
         }
@@ -420,7 +508,7 @@ impl LocalTraffic for SandboxTraffic {
                 return Err(format!("could not read the recorded sandboxes: {e}"));
             }
         };
-        let names: HashSet<String> = rows.iter().map(row_container_name).collect();
+        let names: HashSet<String> = rows.iter().map(RecordedRow::container_name).collect();
         temps_sandbox_providers::docker::publish_egress_recording(Some((address, names)));
         self.published
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -454,7 +542,7 @@ impl LocalTraffic for SandboxTraffic {
     /// it matters when recording was turned on while the recorder was down.
     /// Recreation happens only on drift, and a failure is retried.
     async fn started(&self, _address: SocketAddr) {
-        if let Some(ids) = self.steerable_recorded().await {
+        if let Some(ids) = self.sidecars_to_resync().await {
             self.refresh_sidecars(ids, "the recorder started").await;
         }
     }
@@ -468,7 +556,9 @@ impl LocalTraffic for SandboxTraffic {
         // No hand-off for anyone is exactly what the sidecars must read now.
         self.published
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(ids) = self.steerable_recorded().await {
+        // A sidecar a stray opt-out left handing off is released here too:
+        // with the recorder gone, its hand-off reaches nothing.
+        if let Some(ids) = self.sidecars_to_resync().await {
             self.refresh_sidecars(ids, "the recorder stopped").await;
         }
     }
@@ -870,16 +960,51 @@ mod tests {
         assert!(!index.contains_key("temps-sandbox-c"));
     }
 
+    /// The sandboxes a recorder start or stop must also release: those that
+    /// do not record but whose sidecar still hands off, and can be replaced
+    /// now. One that does not hand off, or is not running or stopped, is
+    /// left alone.
+    #[test]
+    fn strays_are_the_non_recording_sandboxes_whose_sidecar_hands_off() {
+        let row = |id: i32, public_id: &str, status: &str| RecordedRow {
+            id,
+            public_id: public_id.into(),
+            agent_run_id: None,
+            status: status.into(),
+            egress_policy: Default::default(),
+        };
+        let endpoint = |sandbox: &str, hands_off: bool| EgressProxyEndpoint {
+            sandbox: sandbox.into(),
+            address: "172.30.0.9".parse().unwrap(),
+            hands_off,
+        };
+        let rows = [
+            row(1, "sbx_aaaa", "running"),
+            row(2, "sbx_bbbb", "running"),
+            row(3, "sbx_cccc", "starting"),
+            row(4, "sbx_dddd", "stopped"),
+        ];
+        let endpoints = [
+            endpoint("temps-sandbox-aaaa", true),
+            endpoint("temps-sandbox-bbbb", false),
+            endpoint("temps-sandbox-cccc", true),
+            endpoint("temps-sandbox-dddd", true),
+        ];
+        assert_eq!(strays_among(&rows, &endpoints), vec![1, 4]);
+    }
+
     /// A sidecar still handing off for a sandbox that no longer records
     /// (its opt-out was stored, then the control plane stopped before the
     /// sidecar was replaced) gets through unrecorded instead of refused as
     /// unknown. One that does not hand off is not in the table at all.
     #[test]
     fn a_stray_hand_off_is_let_through_unrecorded() {
-        let recorded = sandboxes::Model {
+        let recorded = RecordedRow {
             id: 7,
             public_id: "sbx_aaaa".into(),
-            ..sandbox_row()
+            agent_run_id: None,
+            status: "running".into(),
+            egress_policy: Default::default(),
         };
         let endpoints = [
             EgressProxyEndpoint {

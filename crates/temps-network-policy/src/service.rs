@@ -175,6 +175,10 @@ pub const MAX_REPORTED_ADDRESSES: usize = 4096;
 #[derive(Debug, Clone)]
 struct ObservedReport {
     identities: IdentityMap,
+    /// A hash of `identities`, taken once when the report is recorded:
+    /// what an unchanged `off` node's poll compares, instead of copying and
+    /// hashing every other node's map on every poll.
+    digest: u64,
     seen: std::time::Instant,
     /// The node's mode when it reported. Only a node outside `off` has
     /// its workloads handed to other nodes as remote peers, as before
@@ -291,11 +295,18 @@ impl NetworkPolicyService {
             );
             return;
         }
+        let digest = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            identities.hash(&mut hasher);
+            hasher.finish()
+        };
         let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
         observed.insert(
             node_id,
             ObservedReport {
                 identities,
+                digest,
                 seen: std::time::Instant::now(),
                 mode,
             },
@@ -304,6 +315,22 @@ impl NetworkPolicyService {
 
     /// What every node but `node_id` observed within
     /// [`ENFORCER_REPORT_TTL`], by node.
+    /// The digests of what every node but `node_id` observed and shares
+    /// (as [`Self::observed_elsewhere`] selects them), by node. No map is
+    /// copied: what an `off` node's poll compares.
+    pub(crate) fn observed_digests_elsewhere(&self, node_id: i32) -> Vec<(i32, u64)> {
+        let observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+        observed
+            .iter()
+            .filter(|(id, report)| {
+                **id != node_id
+                    && report.mode != NodeMode::Off
+                    && report.seen.elapsed() <= ENFORCER_REPORT_TTL
+            })
+            .map(|(id, report)| (*id, report.digest))
+            .collect()
+    }
+
     pub(crate) fn observed_elsewhere(&self, node_id: i32) -> Vec<(i32, IdentityMap)> {
         let observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
         observed

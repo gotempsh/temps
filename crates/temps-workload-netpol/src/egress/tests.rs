@@ -1291,3 +1291,95 @@ async fn a_side_that_stops_reading_releases_the_pump_at_the_idle_deadline() {
     assert!(task.is_finished(), "still blocked on a write nobody reads");
     drop(source);
 }
+
+/// A policy naming a host on port 80 and its subnet on 443: the host on 443
+/// is not refused for its port, since the subnet's rule may admit what it
+/// resolves to, and only an address inside the subnet is admitted, as the
+/// sandbox sidecar decides it.
+#[test]
+fn a_cidr_rule_on_another_port_still_admits_a_named_host_by_address() {
+    let rules = CompiledRules::new(&EgressPolicy {
+        subject: sandbox(1),
+        rules: vec![
+            EgressRule {
+                id: 1,
+                target: EgressTarget::Host(HostPattern::parse("api.example.com").unwrap()),
+                ports: Some(PortRange::single(80)),
+                action: Action::Allow,
+            },
+            cidr_rule(2, "203.0.113.0/24", Some(443), Action::Allow),
+        ],
+        record: false,
+        // Documentation ranges are not public: this is about ports.
+        public_only: false,
+    });
+    assert_eq!(
+        rules.check_host("api.example.com", 80),
+        Ok(Admission::ByRule)
+    );
+    let admission = rules.check_host("api.example.com", 443);
+    assert_eq!(admission, Ok(Admission::ByAddress));
+    let inside: IpAddr = "203.0.113.5".parse().unwrap();
+    let outside: IpAddr = "198.51.100.7".parse().unwrap();
+    assert_eq!(
+        rules.admissible_addresses(&[outside, inside], 443, Admission::ByAddress),
+        Ok(vec![inside])
+    );
+    assert!(rules
+        .admissible_addresses(&[outside], 443, Admission::ByAddress)
+        .is_err());
+    assert_eq!(rules.check_host("api.example.com", 22), Err(Refusal::Port));
+}
+
+/// A request carrying the address its sender admitted connects there and
+/// nowhere else: a name that cannot resolve on this side still connects to
+/// the admitted address, and an admitted address the rules do not allow is
+/// refused. The header is never passed on.
+#[tokio::test]
+async fn an_admitted_address_is_checked_and_connected_to_instead_of_resolving() {
+    let echo = echo_server().await;
+    let (_proxy, addr) = start(
+        vec![cidr_rule(
+            1,
+            "127.0.0.1/32",
+            Some(echo.port()),
+            Action::Allow,
+        )],
+        4,
+    )
+    .await;
+    let connect = |pin: &str| {
+        format!(
+            "CONNECT unresolvable.invalid:{} HTTP/1.1\r\nX-Temps-Egress-Address: {pin}\r\n\r\n",
+            echo.port()
+        )
+    };
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(connect("127.0.0.1").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        status_line(&mut client).await,
+        "HTTP/1.1 200 Connection Established"
+    );
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(connect("127.0.0.2").as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(status_line(&mut client).await, "HTTP/1.1 403 Forbidden");
+
+    let forward = parse_request(
+        b"GET http://example.com/ HTTP/1.1\r\nX-Temps-Egress-Address: 203.0.113.5\r\nAccept: */*\r\n\r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        forward.admitted_address,
+        Some("203.0.113.5".parse().unwrap())
+    );
+    assert_eq!(
+        forward.headers,
+        vec![("Accept".to_string(), b"*/*".to_vec())]
+    );
+}

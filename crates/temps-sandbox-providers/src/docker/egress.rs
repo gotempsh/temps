@@ -996,11 +996,16 @@ function forwardInternal(request, response, target) {
 
 // Hand a plain-http request this sandbox's policy admitted to the egress
 // recorder, as an absolute-form proxy request: it connects and records.
-function forwardRecorded(request, response, target) {
+// `address` is the one this sandbox's policy admitted: the recorder
+// connects there, never to whatever the name resolves to on its side.
+// A recorder that takes the request and never answers costs its socket for
+// at most a minute, and a client that leaves releases it at once.
+function forwardRecorded(request, response, target, address) {
   const headers = { ...request.headers, host: target.host };
   delete headers["proxy-authorization"];
   delete headers["proxy-connection"];
   delete headers["x-temps-egress-refused"];
+  headers["x-temps-egress-address"] = address;
   const upstream = http.request({
     host: recordingProxy.host,
     port: recordingProxy.port,
@@ -1012,10 +1017,12 @@ function forwardRecorded(request, response, target) {
     response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
     upstreamResponse.pipe(response);
   });
+  upstream.setTimeout(60_000, () => upstream.destroy(new Error("recorder did not answer")));
   upstream.on("error", () => {
     if (!response.headersSent) response.writeHead(502);
     response.end();
   });
+  response.on("close", () => upstream.destroy());
   request.on("error", () => upstream.destroy());
   request.pipe(upstream);
 }
@@ -1089,13 +1096,14 @@ async function handleRequest(request, response) {
       // holds: a recorder whose table has not followed a policy change, or
       // that still names another sandbox's sidecar by this address, must
       // never let more out than this policy does.
+      let address;
       try {
-        await admit(target.hostname, Number(target.port) || 80);
+        address = await admit(target.hostname, Number(target.port) || 80);
       } catch (error) {
         noteRefusal(request.method, target.href, target.host, error);
         throw error;
       }
-      forwardRecorded(request, response, target);
+      forwardRecorded(request, response, target, address);
       return;
     }
     await forward(request, response, target, false);
@@ -1124,8 +1132,9 @@ server.on("connect", async (request, client, head) => {
       // This sandbox's own policy decides first (see handleRequest); then
       // the recorder answers the CONNECT itself and carries the tunnel,
       // and this side only pipes bytes.
+      let address;
       try {
-        await admit(hostname, port);
+        address = await admit(hostname, port);
       } catch (error) {
         noteRefusal("CONNECT", request.url, request.url, error);
         throw error;
@@ -1134,7 +1143,10 @@ server.on("connect", async (request, client, head) => {
       let connected = false;
       upstream = net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {
         connected = true;
-        upstream.write(`CONNECT ${request.url} HTTP/1.1\r\nHost: ${request.url}\r\n\r\n`);
+        upstream.write(
+          `CONNECT ${request.url} HTTP/1.1\r\nHost: ${request.url}\r\n` +
+          `X-Temps-Egress-Address: ${address}\r\n\r\n`
+        );
         if (head.length) upstream.write(head);
         client.pipe(upstream);
         upstream.pipe(client);
@@ -1603,7 +1615,8 @@ mod identity_tests {
     #[test]
     fn the_sidecar_script_hands_recorded_traffic_to_the_recorder() {
         assert!(SANDBOX_EGRESS_PROXY_SCRIPT.contains("TEMPS_EGRESS_RECORDING_PROXY_ADDRESS"));
-        assert!(SANDBOX_EGRESS_PROXY_SCRIPT.contains("forwardRecorded(request, response, target)"));
+        assert!(SANDBOX_EGRESS_PROXY_SCRIPT
+            .contains("forwardRecorded(request, response, target, address)"));
     }
 
     /// With recording on, the sandbox's own policy still decides first:
@@ -1616,10 +1629,10 @@ mod identity_tests {
     fn the_sidecar_admits_under_its_own_policy_before_the_recorder() {
         let script = SANDBOX_EGRESS_PROXY_SCRIPT;
         let forward = script
-            .find("forwardRecorded(request, response, target);\n      return;")
+            .find("forwardRecorded(request, response, target, address);\n      return;")
             .expect("the recorded forward");
         let forward_admit = script[..forward]
-            .rfind("await admit(target.hostname")
+            .rfind("address = await admit(target.hostname")
             .expect("a forward is admitted first");
         assert!(
             !script[forward_admit..forward].contains("forwardRecorded("),
@@ -1629,7 +1642,7 @@ mod identity_tests {
             .find("net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {\n        connected = true;")
             .expect("the recorded tunnel");
         let tunnel_admit = script[..tunnel]
-            .rfind("await admit(hostname, port)")
+            .rfind("address = await admit(hostname, port)")
             .expect("a tunnel is admitted first");
         assert!(
             tunnel_admit > forward,
@@ -1641,6 +1654,15 @@ mod identity_tests {
         // Bounded: a burst of refusals opens a fixed number of sockets.
         assert!(script.contains("if (refusalNotes >= MAX_REFUSAL_NOTES) return;"));
         assert!(script.contains("socket.on(\"close\", () => { refusalNotes -= 1; });"));
+        // The admitted address travels with the hand-off, a client's own
+        // copy of the header never does, and a recorder that never answers
+        // is given up on.
+        assert!(script.contains("headers[\"x-temps-egress-address\"] = address;"));
+        assert!(script.contains("X-Temps-Egress-Address: ${address}"));
+        assert!(script.contains(
+            "upstream.setTimeout(60_000, () => upstream.destroy(new Error(\"recorder did not answer\")));"
+        ));
+        assert!(script.contains("response.on(\"close\", () => upstream.destroy());"));
         assert_eq!(
             temps_workload_netpol::egress::REFUSED_BY_SENDER,
             "x-temps-egress-refused",

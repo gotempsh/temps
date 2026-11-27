@@ -299,6 +299,18 @@ impl CompiledRules {
             return Ok(Admission::ByAddress);
         }
         if !allowed.iter().any(|r| r.port_matches(port)) {
+            // A rule names the host but not on this port. A CIDR rule that
+            // allows this port may still admit what the name resolves to,
+            // decided per address after resolution, as the sandbox sidecar
+            // decides it: recording a sandbox must not refuse what it allows.
+            let cidr_on_port = literal.is_none()
+                && self
+                    .allow
+                    .iter()
+                    .any(|r| matches!(r.target, EgressTarget::Cidr(_)) && r.port_matches(port));
+            if cidr_on_port {
+                return Ok(Admission::ByAddress);
+            }
             return Err(Refusal::Port);
         }
         Ok(Admission::ByRule)
@@ -1005,7 +1017,10 @@ impl EgressProxy {
         }
         match request.kind {
             RequestKind::Connect { ref host, port } => {
-                let (mut upstream, peer) = match self.open(rules, source, host, port).await {
+                let (mut upstream, peer) = match self
+                    .open(rules, source, host, port, request.admitted_address)
+                    .await
+                {
                     Ok(opened) => opened,
                     Err(OpenError::Refused(refusal)) => {
                         let _ = client.write_all(FORBIDDEN).await;
@@ -1033,7 +1048,10 @@ impl EgressProxy {
                 port,
                 ref path,
             } => {
-                let (mut upstream, peer) = match self.open(rules, source, host, port).await {
+                let (mut upstream, peer) = match self
+                    .open(rules, source, host, port, request.admitted_address)
+                    .await
+                {
                     Ok(opened) => opened,
                     Err(OpenError::Refused(refusal)) => {
                         let _ = client.write_all(FORBIDDEN).await;
@@ -1113,12 +1131,18 @@ impl EgressProxy {
 
     /// Checks and connects, returning the stream and the address it
     /// connected to. A refusal is already counted and logged.
+    /// Connects `source` to `host`:`port` under `rules`. With `pinned` (the
+    /// address the sender's own policy admitted, [`ADMITTED_ADDRESS`]) that
+    /// address is the only answer: checked against `rules` like any other,
+    /// and connected to without resolving the name again, which could give
+    /// an answer the sender never admitted.
     async fn open(
         &self,
         rules: &CompiledRules,
         source: IpAddr,
         host: &str,
         port: u16,
+        pinned: Option<IpAddr>,
     ) -> Result<(TcpStream, IpAddr), OpenError> {
         let refuse = |refusal: Refusal| {
             match refusal {
@@ -1136,9 +1160,10 @@ impl EgressProxy {
             OpenError::Refused(refusal)
         };
         let admission = rules.check_host(host, port).map_err(refuse)?;
-        let addrs: Vec<IpAddr> = match host.parse::<IpAddr>() {
-            Ok(ip) => vec![ip],
-            Err(_) => {
+        let addrs: Vec<IpAddr> = match (pinned, host.parse::<IpAddr>()) {
+            (Some(pinned), _) => vec![unmap(pinned)],
+            (None, Ok(ip)) => vec![ip],
+            (None, Err(_)) => {
                 let lookup = tokio::time::timeout(
                     self.config.connect_timeout,
                     tokio::net::lookup_host((host, port)),
@@ -1420,7 +1445,19 @@ struct ParsedRequest {
     /// ([`REFUSED_BY_SENDER`]): it is recorded as refused, for that reason,
     /// and never opened.
     refused_by_sender: Option<EgressReason>,
+    /// The address the sender's own policy admitted
+    /// ([`ADMITTED_ADDRESS`]), connected to instead of resolving the name.
+    admitted_address: Option<IpAddr>,
 }
+
+/// The header a workload's own egress proxy (a sandbox's sidecar) sends
+/// with a request it admitted: the address it admitted the destination at.
+/// The recorder checks that address against its own rules and connects
+/// there, so the two never disagree on where the request goes (split DNS,
+/// or an answer that changed between the two lookups). A sender can only
+/// choose among the addresses the recorder's rules admit anyway, and it is
+/// never passed on.
+pub const ADMITTED_ADDRESS: &str = "x-temps-egress-address";
 
 /// The header a workload's own egress proxy (a sandbox's sidecar) sends
 /// with a request it refused under its own policy, so the refusal is
@@ -1485,6 +1522,12 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(REFUSED_BY_SENDER))
         .map(|h| sender_refusal(h.value));
+    let admitted_address = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(ADMITTED_ADDRESS))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
     let headers = request
         .headers
         .iter()
@@ -1494,6 +1537,7 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
                 name.as_str(),
                 "proxy-authorization" | "proxy-connection" | "connection" | "keep-alive" | "host"
             ) && name != REFUSED_BY_SENDER
+                && name != ADMITTED_ADDRESS
         })
         .map(|h| (h.name.to_string(), h.value.to_vec()))
         .collect();
@@ -1502,6 +1546,7 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
         kind,
         headers,
         refused_by_sender,
+        admitted_address,
     })
 }
 

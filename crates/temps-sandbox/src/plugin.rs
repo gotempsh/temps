@@ -549,7 +549,7 @@ async fn wire_egress_recording(context: &PluginContext) {
     let traffic = Arc::new(SandboxTraffic::new(db, docker, sidecars));
     let recorder = context.require_service::<temps_workload_egress::local::LocalEgressRecorder>();
     adapter.set_local(LocalSteering {
-        recorder: recorder.clone(),
+        recorder: Arc::downgrade(&recorder),
         traffic: traffic.clone(),
     });
     // A recorded sandbox's new policy reaches the recorder before the
@@ -557,7 +557,7 @@ async fn wire_egress_recording(context: &PluginContext) {
     if let Some(service) = context.get_service::<SandboxService>() {
         service.set_egress_observer(Arc::new(
             crate::services::egress_recording::RecorderPolicyRefresh {
-                recorder: recorder.clone(),
+                recorder: Arc::downgrade(&recorder),
             },
         ));
     }

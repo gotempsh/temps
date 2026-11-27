@@ -366,14 +366,18 @@ fn wrap_shell(cmd: &str, environ: Option<&str>) -> String {
         // in the few values that had any. The trailing `x` keeps a value's
         // own trailing newline through the command substitution.
         Some(path) => format!(
-            "if [ -r {path} ]; then temps_soh=$(printf '\\001'); \
-             while IFS= read -r kv; do case \"${{kv%%=*}}\" in \
-             {KEEP_SHELL_VARS}|\"\"|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; \
-             eval \"temps_set=\\${{${{kv%%=*}}+x}}\"; [ -n \"$temps_set\" ] && continue; \
-             case \"$kv\" in *\"$temps_soh\"*) kv=$(printf '%sx' \"$kv\" | tr '\\001' '\\n'); \
-             kv=${{kv%x}} ;; esac; export \"$kv\" 2>/dev/null; \
+            "if [ -r {path} ]; then __temps_import_soh=$(printf '\\001'); \
+             while IFS= read -r __temps_import_kv; do \
+             case \"${{__temps_import_kv%%=*}}\" in \
+             {KEEP_SHELL_VARS}|__temps_import_*|\"\"|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; \
+             eval \"__temps_import_set=\\${{${{__temps_import_kv%%=*}}+x}}\"; \
+             [ -n \"$__temps_import_set\" ] && continue; \
+             case \"$__temps_import_kv\" in *\"$__temps_import_soh\"*) \
+             __temps_import_kv=$(printf '%sx' \"$__temps_import_kv\" | tr '\\001' '\\n'); \
+             __temps_import_kv=${{__temps_import_kv%x}} ;; esac; \
+             export \"$__temps_import_kv\" 2>/dev/null; \
              done <<TEMPS_ENVIRON\n$(tr '\\n\\000' '\\001\\n' < {path})\nTEMPS_ENVIRON\n\
-             unset kv temps_soh temps_set; fi; "
+             unset __temps_import_kv __temps_import_soh __temps_import_set; fi; "
         ),
         None => String::new(),
     };
@@ -1171,6 +1175,19 @@ mod tests {
                 "missing {expected} in:\n{env}"
             );
         }
+    }
+
+    /// The import's own working variables never touch the owner's: a
+    /// variable called `kv`, `temps_set` or `temps_soh`, inherited or
+    /// imported, reaches the shell as it was.
+    #[test]
+    fn the_import_leaves_the_owners_variables_alone() {
+        let out = shell_output_after_import(
+            &[("temps_soh", "imported-soh"), ("OTHER", "x")],
+            "printf '[%s][%s][%s]' \"$kv\" \"$temps_set\" \"$temps_soh\"",
+            &[("kv", "production"), ("temps_set", "kept")],
+        );
+        assert_eq!(out, "[production][kept][imported-soh]");
     }
 
     /// A variable the shell already has (a newer agent passes the
