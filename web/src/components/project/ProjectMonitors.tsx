@@ -87,11 +87,12 @@ import { visibleExternalMonitors } from './runtime-health-display'
 import { locationSummary, targetSummary } from './target-monitor'
 import { TargetMonitorDialog } from './TargetMonitorDialog'
 import {
-  BUCKET_TONE_CLASS,
-  BUCKET_TONE_LABEL,
-  bucketTone,
+  bucketParts,
+  bucketRangeLabel,
+  bucketSummary,
   unknownTimeNote,
 } from '@/lib/monitor-uptime'
+import { StatusBucketBar } from './StatusBucketBar'
 
 interface ProjectMonitorsProps {
   project: ProjectResponse
@@ -301,15 +302,15 @@ function MonitorCard({
                 {/* Mini Status Timeline */}
                 <div className="flex gap-0.5 h-6 w-48">
                   {statusData?.buckets && statusData.buckets.length > 0
-                    ? statusData.buckets
-                        .slice(-48)
-                        .map((bucket, idx) => (
-                          <div
-                            key={idx}
-                            className={`flex-1 rounded-sm ${BUCKET_TONE_CLASS[bucketTone(bucket.status)]}`}
-                            title={`${new Date(bucket.bucket_start).toLocaleString()}\nStatus: ${BUCKET_TONE_LABEL[bucketTone(bucket.status)]}\nAvg: ${bucket.avg_response_time_ms?.toFixed(0) ?? 'N/A'}ms`}
-                          />
-                        ))
+                    ? statusData.buckets.slice(-48).map((bucket, idx) => (
+                        <div
+                          key={idx}
+                          className="min-w-0 flex-1"
+                          title={`${bucketRangeLabel(bucket.bucket_start, 'hourly')}\n${bucketSummary(bucketParts(bucket))}`}
+                        >
+                          <StatusBucketBar bucket={bucket} compact />
+                        </div>
+                      ))
                     : Array.from({ length: 48 }).map((_, idx) => (
                         <div
                           key={idx}

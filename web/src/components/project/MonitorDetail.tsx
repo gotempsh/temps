@@ -49,11 +49,14 @@ import { format, subDays } from 'date-fns'
 import { DateRange } from 'react-day-picker'
 import {
   BUCKET_TONE_CLASS,
-  BUCKET_TONE_LABEL,
-  bucketTone,
+  CHECK_LABEL,
+  bucketParts,
+  bucketRangeLabel,
+  bucketSummary,
   formatUptime,
   unknownTimeNote,
 } from '@/lib/monitor-uptime'
+import { StatusBucketBar } from './StatusBucketBar'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface MonitorDetailProps {
@@ -62,12 +65,22 @@ interface MonitorDetailProps {
 
 interface BucketItemProps {
   bucket: StatusBucket
+  interval: string
   isOpen: boolean
   onOpenChange: (open: boolean) => void
 }
 
-function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
-  const tone = bucketTone(bucket.status)
+const CHECK_TONES = ['operational', 'degraded', 'down'] as const
+
+function BucketItem({
+  bucket,
+  interval,
+  isOpen,
+  onOpenChange,
+}: BucketItemProps) {
+  const parts = bucketParts(bucket)
+  const total = parts.reduce((sum, part) => sum + part.count, 0)
+  const range = bucketRangeLabel(bucket.bucket_start, interval)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   const handleMouseEnter = () => {
@@ -81,18 +94,19 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
   }
 
   return (
-    <Popover
-      open={isOpen}
-      onOpenChange={(open) => !open && onOpenChange(false)}
-    >
+    <Popover open={isOpen} onOpenChange={onOpenChange}>
       <PopoverTrigger
         onMouseEnter={handleMouseEnter}
         onMouseLeave={handleMouseLeave}
         asChild
       >
-        <div
-          className={`flex-1 rounded-sm transition-opacity hover:opacity-80 cursor-pointer ${BUCKET_TONE_CLASS[tone]}`}
-        />
+        <button
+          type="button"
+          aria-label={`${range}: ${bucketSummary(parts)}`}
+          className="h-full min-w-0 flex-1 cursor-pointer rounded-sm transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <StatusBucketBar bucket={bucket} />
+        </button>
       </PopoverTrigger>
       <PopoverContent
         className="w-72 p-3"
@@ -103,72 +117,67 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
         onMouseLeave={handleMouseLeave}
       >
         <div className="space-y-2">
-          <div className="pb-2 border-b">
-            <h4 className="font-semibold text-sm">Status details</h4>
-            <p className="text-xs text-muted-foreground mt-1">
-              {new Date(bucket.bucket_start).toLocaleString()}
+          <div className="border-b pb-2">
+            <h4 className="text-sm font-semibold">{range}</h4>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {bucketSummary(parts)}
             </p>
           </div>
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">Status</span>
-              <Badge
-                variant={
-                  tone === 'operational'
-                    ? 'default'
-                    : tone === 'down'
-                      ? 'destructive'
-                      : 'secondary'
-                }
-                className="text-xs"
-              >
-                {BUCKET_TONE_LABEL[tone]}
-              </Badge>
-            </div>
-            {bucket.total_checks === 0 && (
-              <p className="text-xs text-muted-foreground">
-                No check ran in this interval, so Temps can&apos;t say whether
-                the site was up — e.g. the Temps server was down or the
-                deployment was paused.
-              </p>
-            )}
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">
-                Avg response time
-              </span>
-              <span className="text-xs font-medium">
-                {bucket.avg_response_time_ms?.toFixed(0) ?? 'N/A'}ms
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">
-                Total checks
-              </span>
-              <span className="text-xs font-medium">
-                {bucket.total_checks ?? 0}
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">
-                Successful checks
-              </span>
-              <span className="text-xs font-medium">
-                {bucket.operational_count ?? 0}
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">
-                Failed checks
-              </span>
-              <span className="text-xs font-medium">
-                {bucket.down_count ?? 0}
-              </span>
-            </div>
-          </div>
+          {total === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              No check ran in this interval, so Temps can&apos;t say whether the
+              site was up — e.g. the Temps server was down or the deployment was
+              paused.
+            </p>
+          ) : (
+            <dl className="space-y-1.5">
+              {CHECK_TONES.map((tone) => {
+                const part = parts.find((candidate) => candidate.tone === tone)
+                return (
+                  <div
+                    key={tone}
+                    className={`flex items-center justify-between text-xs ${part ? '' : 'text-muted-foreground'}`}
+                  >
+                    <dt className="flex items-center gap-2 text-muted-foreground">
+                      <span
+                        aria-hidden="true"
+                        className={`h-2.5 w-2.5 rounded-sm ${BUCKET_TONE_CLASS[tone]}`}
+                      />
+                      {CHECK_LABEL[tone]}
+                    </dt>
+                    <dd className="font-medium tabular-nums">
+                      {part
+                        ? `${part.count} · ${Math.round(part.share * 100)}%`
+                        : '0'}
+                    </dd>
+                  </div>
+                )
+              })}
+              <div className="flex items-center justify-between border-t pt-1.5 text-xs">
+                <dt className="text-muted-foreground">Response time</dt>
+                <dd className="font-medium tabular-nums">
+                  {responseTimeLabel(bucket)}
+                </dd>
+              </div>
+            </dl>
+          )}
         </div>
       </PopoverContent>
     </Popover>
   )
+}
+
+/** "6 ms median · 12 ms p95", or the average when percentiles are missing. */
+function responseTimeLabel(bucket: StatusBucket): string {
+  const ms = (value: number) => `${Math.round(value)} ms`
+  if (
+    bucket.p50_response_time_ms != null &&
+    bucket.p95_response_time_ms != null
+  )
+    return `${ms(bucket.p50_response_time_ms)} median · ${ms(bucket.p95_response_time_ms)} p95`
+  if (bucket.avg_response_time_ms != null)
+    return `${ms(bucket.avg_response_time_ms)} average`
+  return '—'
 }
 
 type QuickFilter = '24hours' | '7days' | '30days' | '90days' | 'custom'
@@ -572,9 +581,6 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
         <CardHeader className="flex flex-row items-center justify-between">
           <div>
             <CardTitle>Status timeline</CardTitle>
-            <CardDescription>
-              Historical uptime and performance data
-            </CardDescription>
           </div>
           <Badge variant="outline" className="font-normal">
             {INTERVAL_LABELS[interval]} buckets
@@ -600,38 +606,32 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
           ) : statusData?.buckets && statusData.buckets.length > 0 ? (
             <div className="space-y-4">
               {/* Status bar visualization */}
-              <div className="flex gap-1 h-12">
+              <div className="flex h-12 gap-1">
                 {statusData.buckets.map((bucket, idx) => (
                   <BucketItem
                     key={idx}
                     bucket={bucket}
+                    interval={interval}
                     isOpen={hoveredBucket === idx}
                     onOpenChange={(open) => setHoveredBucket(open ? idx : null)}
                   />
                 ))}
               </div>
 
-              {/* Legend */}
-              <div className="flex items-center gap-4 text-sm">
-                <div className="flex items-center gap-2">
-                  <div className="h-3 w-3 rounded-sm bg-green-500" />
-                  <span>Operational</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className="h-3 w-3 rounded-sm bg-yellow-500" />
-                  <span>Degraded</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className="h-3 w-3 rounded-sm bg-red-500" />
-                  <span>Major Outage</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <div
-                    className={`h-3 w-3 rounded-sm ${BUCKET_TONE_CLASS.unknown}`}
-                  />
-                  <span>No checks</span>
-                </div>
-              </div>
+              {/* Legend: what a check found, as each column splits. */}
+              <ul className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+                {[...CHECK_TONES, 'unknown' as const].map((tone) => (
+                  <li key={tone} className="flex items-center gap-2">
+                    <span
+                      aria-hidden="true"
+                      className={`h-3 w-3 rounded-sm ${BUCKET_TONE_CLASS[tone]}`}
+                    />
+                    <span>
+                      {tone === 'unknown' ? 'No checks' : CHECK_LABEL[tone]}
+                    </span>
+                  </li>
+                ))}
+              </ul>
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center py-8 text-center">
