@@ -3,7 +3,7 @@
 
 [package]
 name = "temps-plugin-sdk"
-version = "0.1.0-beta.64"
+version = "0.1.0-beta.65"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -49,7 +49,7 @@ utoipa = { workspace = true }
 subtle = { workspace = true }
 
 # Wire protocol shared with the platform
-temps-plugin-protocol = { path = "../temps-plugin-protocol", version = "=0.1.0-beta.64" }
+temps-plugin-protocol = { path = "../temps-plugin-protocol", version = "=0.1.0-beta.65" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
