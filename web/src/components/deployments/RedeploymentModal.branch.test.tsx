@@ -112,6 +112,12 @@ function renderModal(options: {
  * nothing. Resolves with the manual-entry input the confirmed 404 shows.
  */
 async function enterManualEntry(view: ReturnType<typeof render>) {
+  await pickStaging(view)
+  return view.findByPlaceholderText('Enter branch name manually')
+}
+
+/** Choose the `staging` environment in the dialog's picker. */
+async function pickStaging(view: ReturnType<typeof render>) {
   const trigger = await waitFor(() => {
     const element = view.baseElement.querySelector<HTMLElement>('#environment')
     if (!element || element.hasAttribute('data-disabled')) {
@@ -125,7 +131,6 @@ async function enterManualEntry(view: ReturnType<typeof render>) {
     pointerType: 'mouse',
   })
   fireEvent.click(await view.findByRole('option', { name: 'staging' }))
-  return view.findByPlaceholderText('Enter branch name manually')
 }
 
 test('a branch the exact lookup finds raises no warning, however capped the list', async () => {
@@ -333,5 +338,60 @@ test('a branch the exact lookup finds in manual entry gets its commit preview', 
   // commit is the one the exact lookup returned.
   await waitFor(() => expect(view.getByText('Commit to deploy')).toBeTruthy())
   expect(view.getByText(/Add the replacement branch/)).toBeTruthy()
+  expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
+})
+
+test('a branch recreated at another commit previews the commit the lookup found now', async () => {
+  // Out of the capped list: found at A, then deleted (404 on refresh, which
+  // switches to manual entry), then recreated at B.
+  const shaA = 'a'.repeat(40)
+  const shaB = 'b'.repeat(40)
+  let head: string | null = shaA
+  const commit = (sha: string, message: string) => () =>
+    jsonResponse({
+      exists: true,
+      commit_sha: sha,
+      commit: {
+        sha,
+        message,
+        author: 'Example Author',
+        author_email: 'author@example.com',
+        date: '2026-01-01T00:00:00Z',
+      },
+    })
+  const { view } = renderModal({
+    truncated: true,
+    extraRoutes: {
+      [`GET /repository/11/commits/${shaA}`]: commit(shaA, 'The first main'),
+      [`GET /repository/11/commits/${shaB}`]: commit(
+        shaB,
+        'The recreated main'
+      ),
+    },
+    lookup: () =>
+      head
+        ? jsonResponse({
+            name: 'main',
+            commit_sha: head,
+            protected: false,
+            is_default: true,
+          })
+        : jsonResponse({ title: 'Branch Not Found' }, 404),
+  })
+
+  await pickStaging(view)
+  await waitFor(() => expect(view.getByText(/The first main/)).toBeTruthy())
+
+  head = null
+  fireEvent.click(view.getByTitle('Refresh branches'))
+  const input = await view.findByPlaceholderText('Enter branch name manually')
+  await waitFor(() => expect(view.getByText(NOT_FOUND)).toBeTruthy())
+  // A deleted branch previews no commit at all.
+  expect(view.queryByText('Commit to deploy')).toBeNull()
+
+  head = shaB
+  fireEvent.click(view.getByRole('button', { name: 'Check again' }))
+  await waitFor(() => expect(view.getByText(/The recreated main/)).toBeTruthy())
+  expect(view.queryByText(/The first main/)).toBeNull()
   expect(view.getByPlaceholderText('Enter branch name manually')).toBe(input)
 })

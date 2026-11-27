@@ -448,18 +448,22 @@ export function RedeploymentModal({
   )
 
   // The head commit comes from the listing when it holds the branch, and from
-  // the exact lookup otherwise: a branch past the listing cap, or one typed in
-  // manual entry (where the listing is not even mounted), still gets its
-  // "Commit to deploy" preview once the provider confirms it.
+  // this dialog's own exact lookup otherwise: a branch past the listing cap,
+  // or one typed in manual entry (where the listing is not even mounted),
+  // gets its "Commit to deploy" preview once the provider confirms it. For a
+  // branch the listing lacks, the details the selector last reported carry
+  // only the SHA of its lookup at the time, and they outlive the selector
+  // when manual entry unmounts it, so they are never consulted: the branch
+  // may have been deleted and recreated at another commit since.
   const verifiedBranchSha =
     !branchEditPending &&
     branchVerification.status === 'found' &&
     branchVerification.branch?.name === effectiveBranch
       ? branchVerification.branch.commit_sha
       : null
-  const selectedBranchCommitSha =
-    branchCommitSha(availableBranchDetails, effectiveBranch) ??
-    verifiedBranchSha
+  const selectedBranchCommitSha = branchMissingFromList
+    ? verifiedBranchSha
+    : branchCommitSha(availableBranchDetails, effectiveBranch)
   const branchCommitQuery = useQuery({
     ...checkCommitExistsOptions({
       path: {
