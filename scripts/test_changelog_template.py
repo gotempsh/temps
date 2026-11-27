@@ -144,6 +144,25 @@ class ChangelogTemplateTests(unittest.TestCase):
         lines = self.render()
         self.assertEqual(lines.count("- **api:** Retry the upload"), 2)
 
+    def test_package_and_libraries_only_tags_are_not_release_sections(self) -> None:
+        self.commit("feat(api): first server release")
+        self.git("tag", "v0.1.0-beta.63")
+        self.commit("fix(cli): ship the login fix")
+        # A libraries-only release and the package tags it creates reserve a
+        # number but are not server releases: their commits stay unreleased.
+        self.git("tag", "libraries/v0.1.0-beta.64")
+        self.git("tag", "sdk/cli/v0.2.0-beta.2")
+        self.commit("fix(api): retry the upload")
+
+        lines = self.render()
+        headings = [line for line in lines if line.startswith("## ")]
+        self.assertEqual(len(headings), 2, headings)
+        self.assertIn("## [Unreleased]", headings)
+        self.assertTrue(headings[1].startswith("## [0.1.0-beta.63]"), headings)
+        unreleased = lines[: lines.index(headings[1])]
+        self.assertIn("- **cli:** Ship the login fix", unreleased)
+        self.assertIn("- **api:** Retry the upload", unreleased)
+
 
 if __name__ == "__main__":
     sys.exit(unittest.main())
