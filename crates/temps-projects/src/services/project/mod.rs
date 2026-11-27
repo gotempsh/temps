@@ -94,6 +94,21 @@ use webhooks::repository_target_changed;
 
 // Placeholder functions - these should be implemented properly or imported from other services
 
+/// How a project list is ordered.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, Serialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectOrder {
+    /// Most recently deployed first; never-deployed projects last, newest
+    /// first among them. The dashboard's order.
+    #[default]
+    LastDeployed,
+    /// Newest first, deployed or not: what a caller watching for a project
+    /// just created reads, since it may not have deployed yet.
+    Created,
+}
+
 /// Optional group membership filter for [`ProjectService::get_projects_paginated_excluding_search`].
 #[derive(Debug, Clone, Copy)]
 pub enum GroupFilter {

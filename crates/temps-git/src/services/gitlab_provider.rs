@@ -1141,10 +1141,11 @@ impl GitProviderService for GitLabProvider {
             encoding: String,
         }
 
-        let file: GitLabFile = response
-            .json()
-            .await
-            .map_err(|e| GitProviderError::ApiError(e.to_string()))?;
+        let file: GitLabFile = super::git_provider::read_json_limited(
+            response,
+            super::git_provider::MAX_FILE_RESPONSE_BYTES,
+        )
+        .await?;
 
         Ok(FileContent {
             path: file.file_path,

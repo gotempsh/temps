@@ -113,7 +113,7 @@ import LogsList from './LogsList'
 import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
 import { ProjectAgentActivity } from './AiGateway'
-import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
+import { ErrorGroupAutofixRedirect } from '@/components/autofix/ErrorGroupAutofixRedirect'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
@@ -1137,7 +1137,7 @@ export function ProjectDetail() {
                 />
                 <Route
                   path="errors/:errorGroupId/autofix"
-                  element={<AutofixRedirect project={project} />}
+                  element={<ErrorGroupAutofixRedirect />}
                 />
                 <Route
                   path="errors/:errorGroupId/event/:eventId"

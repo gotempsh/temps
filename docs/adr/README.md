@@ -56,7 +56,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [033](./033-release-identity-for-symbolication.md) | Release identity invariant for error-tracking symbolication | Proposed |  |
 | [034](./034-feature-flags.md) | Feature Flags | Phase 1 implemented | amended by [110](./110-product-analytics-gaps-against-posthog.md) |
 | [036](./036-persistent-workspace-sandboxes.md) | Persistent Workspace Sandboxes | Proposed |  |
-| [037](./037-subscription-agent-cli-providers.md) | Subscription-Backed Agent CLI Providers for Temps AI Workloads | Accepted |  |
+| [037](./037-subscription-agent-cli-providers.md) | Subscription-Backed Agent CLI Providers for Temps AI Workloads | Accepted | superseded by [116](./116-agents-run-on-the-ai-gateway-only.md) |
 | [038](./038-interactive-tool-bridging-cli-chat.md) | Interactive Tool Bridging for Subscription-CLI AI Chat | Accepted |  |
 | [039](./039-mcp-server-rebuild.md) | MCP Server Rebuild — Axum-Native Endpoint + CLI Installer Wizard | Proposed |  |
 | [040](./040-cloud-telemetry-read-source.md) | Cloud Telemetry Read Source — Serving Console Queries from Temps Cloud | Proposed | amended by [041](./041-cloud-primary-telemetry-writes.md) |
@@ -71,19 +71,19 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [049](./049-automatic-expiry-checks-for-structured-credentials.md) | Automatic expiry checks for structured credentials | Accepted |  |
 | [050](./050-microsandbox-sandbox-backend.md) | microsandbox (libkrun) MicroVM Sandbox Backend | Proposed |  |
 | [051](./051-public-ingress-surface.md) | Public Ingress Surface for Third-Party Callbacks | Accepted |  |
-| [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md); amended by [115](./115-workload-capabilities-written-once.md) |
+| [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md); amended by [118](./118-workload-capabilities-written-once.md) |
 | [053](./053-distributed-runtime-health-and-worker-uptime.md) | Distributed Runtime Health and Worker Uptime | Implemented for process/HTTP/TCP |  |
 | [054](./054-plugin-builds-on-worker-nodes.md) | Plugin builds run on a worker node when the control plane has no Docker | Proposed |  |
 | [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md); amended by [099](./099-worker-backups-run-the-local-engines.md) |
 | [056](./056-compute-pool-that-avoids-collisions.md) | A Compute Pool That Avoids Collisions and Can Be Changed | Accepted |  |
 | [057](./057-removing-a-node-that-is-gone.md) | Removing a worker node that is gone | Accepted |  |
-| [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed | amended by [107](./107-control-plane-tunnel-connectors.md) |
+| [058](./058-ingress-modes-and-a-shared-app-domain.md) | Ingress modes, edge nodes and a shared app domain | Proposed | superseded by [117](./117-ingress-provider-trait.md); amended by [107](./107-control-plane-tunnel-connectors.md) |
 | [059](./059-configurable-overlay-network-name.md) | A configurable overlay network name, and a join that looks first | Accepted |  |
 | [060](./060-rejoining-the-same-control-plane.md) | Re-joining the same control plane, and removing an empty node | Accepted |  |
 | [061](./061-worker-metrics.md) | Worker proxy and host metrics, pulled by the control plane | Accepted |  |
 | [062](./062-one-host-several-clusters-overlays.md) | One host, several clusters' overlays | Accepted |  |
 | [063](./063-sandboxes-on-a-control-plane-without-workloads.md) | Sandboxes on a control plane that runs no workloads | Accepted |  |
-| [064](./064-making-a-project-reachable.md) | Making a project reachable: who first, then how | Proposed |  |
+| [064](./064-making-a-project-reachable.md) | Making a project reachable: who first, then how | Proposed | amended by [115](./115-the-control-plane-serves-private-addresses.md) |
 | [065](./065-tailnet-names-and-signed-in-addresses.md) | Tailnet names, tailnet users and signed-in addresses | Proposed |  |
 | [066](./066-shield-reputation-and-challenges.md) | Shield: reputation, fingerprints and challenges at every ingress | Proposed |  |
 | [068](./068-environment-addresses-without-a-public-preview-domain.md) | Environment addresses without a public preview domain | Proposed | amended by [096](./096-worker-health-for-environments-without-ingress.md) |
@@ -133,7 +133,10 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [112](./112-project-focused-console.md) | A project-focused console | Proposed |  |
 | [113](./113-runtime-model-catalog-and-coding-agent-updates.md) | New models and coding-agent releases without a Temps release | Accepted |  |
 | [114](./114-identical-build-coordination.md) | Coordinating identical builds | Accepted |  |
-| [115](./115-workload-capabilities-written-once.md) | A workload capability is written once; each kind keeps its own entities | Accepted | amends [052](./052-common-workload-model.md) |
+| [115](./115-the-control-plane-serves-private-addresses.md) | The control plane serves private addresses | Proposed | amends [064](./064-making-a-project-reachable.md) |
+| [116](./116-agents-run-on-the-ai-gateway-only.md) | Agents run on the AI gateway only | Proposed | supersedes [037](./037-subscription-agent-cli-providers.md) |
+| [117](./117-ingress-provider-trait.md) | An ingress provider is one trait implementation | Proposed | supersedes [058](./058-ingress-modes-and-a-shared-app-domain.md) |
+| [118](./118-workload-capabilities-written-once.md) | A workload capability is written once; each kind keeps its own entities | Accepted | amends [052](./052-common-workload-model.md) |
 
 ## Supporting documents
 

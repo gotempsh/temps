@@ -26,6 +26,8 @@ impl LoadBalancer {
             .admin_gate
             .as_ref()
             .filter(|_| !self.is_public_ingress_request(&ctx.host))
+            // A private request has its route and never reaches the console.
+            .filter(|_| ctx.private_route.is_none())
         {
             let config = gate.current();
             if Self::should_consult_admin_gate(&config, &ctx.path, ctx.preview_route.is_some()) {

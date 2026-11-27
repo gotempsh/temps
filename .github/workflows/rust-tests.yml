@@ -1291,7 +1291,8 @@ jobs:
               package(temps-import-coolify) or package(temps-import-dokploy) or
               package(temps-import-kamal) or package(temps-import-kubernetes) or
               package(temps-import-portainer) or package(temps-import-types) or
-              package(temps-ingress) or package(temps-netpol-ebpf-common) or
+              package(temps-ingress) or package(temps-connector-pins) or
+              package(temps-netpol-ebpf-common) or
               package(temps-netpol-probe) or package(temps-network-policy) or
               package(temps-node-dns) or package(temps-plugin-sdk) or
               package(temps-pty-agent) or package(temps-sandbox) or

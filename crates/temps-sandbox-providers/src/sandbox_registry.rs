@@ -171,6 +171,20 @@ impl SandboxRegistry {
         self.provider.read_file(&handle, path).await
     }
 
+    /// [`read_file`](Self::read_file), refusing a file larger than
+    /// `max_bytes` (where the provider can, before buffering it).
+    pub async fn read_file_bounded(
+        &self,
+        run_id: i32,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, AgentError> {
+        let handle = self.get(run_id).await?;
+        self.provider
+            .read_file_bounded(&handle, path, max_bytes)
+            .await
+    }
+
     /// Write an entire local directory tree into a run's sandbox.
     pub async fn write_directory(
         &self,

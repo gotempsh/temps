@@ -1,0 +1,503 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! The control plane's private ingress (ADR-115 D3).
+//!
+//! When the operator consents, the control plane serves private addresses
+//! on its proxy's own listener: a connection whose **local** address is the
+//! consented private address, and whose **TCP peer** is inside that
+//! address's range, is matched against node `0`'s private routes only.
+//! Anything else on that address gets the private listener's refusals.
+//!
+//! The proxy reads [`ControlPlanePrivateIngress`] per connection (one
+//! `ArcSwap` load, no lock); the control plane's private-ingress loop sets
+//! the consented address and reads which addresses the proxy listens on.
+//!
+//! A pass of the loop reads the consent, then awaits the machine's networks;
+//! a consent written meanwhile must win. Every consent write bumps a
+//! generation after it commits, and a pass publishes what it decided only if
+//! the generation is still the one it read before the consent
+//! ([`ControlPlanePrivateIngress::set_serving_for`]), so a withdrawn consent
+//! is never served again by a pass that started before the withdrawal.
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+
+use chrono::{DateTime, Utc};
+
+use arc_swap::{ArcSwap, ArcSwapOption};
+use tokio::sync::Notify;
+
+use ipnet::IpNet;
+
+use crate::private_network::PrivateNetworkOption;
+use crate::worker_ingress::{check_private_listen, PRIVATE_HTTPS_PORT, PRIVATE_HTTP_PORT};
+
+/// The address the control plane serves private addresses on, once
+/// consented and found on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateIngressServing {
+    /// The consented private address (`10.8.0.1`, `100.101.102.103`).
+    pub address: IpAddr,
+    /// The ranges a visitor's TCP peer must be in (ADR-115 D8): the
+    /// interface's subnet, Tailscale's ranges, or what the operator named.
+    pub admit: Vec<IpNet>,
+}
+
+impl PrivateIngressServing {
+    /// The serving state for `address` admitting `admit`, or why it cannot
+    /// be one.
+    pub fn new(address: IpAddr, admit: Vec<IpNet>) -> Result<Self, String> {
+        let address = canonical(address);
+        check_private_listen(address)?;
+        if admit.is_empty() {
+            return Err(format!(
+                "{address} would admit nobody: no range is admitted"
+            ));
+        }
+        Ok(Self { address, admit })
+    }
+
+    fn admits(&self, peer: IpAddr) -> bool {
+        let peer = canonical(peer);
+        self.admit.iter().any(|range| range.contains(&peer))
+    }
+}
+
+/// How a connection arrived, for the private path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateArrival {
+    /// Not on the private address: the public path, as always.
+    Public,
+    /// On the private address from inside its ranges: node `0`'s private
+    /// routes only.
+    Admitted,
+    /// On the private address from outside its range: refused.
+    OutsideRange,
+}
+
+/// What the proxy and the private-ingress loop share.
+#[derive(Debug, Default)]
+pub struct ControlPlanePrivateIngress {
+    serving: ArcSwapOption<PrivateIngressServing>,
+    /// This machine's private networks, as the loop last found them, for
+    /// the console to offer (ADR-115 D8).
+    networks: ArcSwap<Vec<PrivateNetworkOption>>,
+    /// Every address the proxy's HTTP and HTTPS listeners bound, set once
+    /// at startup.
+    proxy_listeners: OnceLock<Vec<SocketAddr>>,
+    /// Woken when the consent changes, so the loop applies it at once, and
+    /// when the proxy records its listeners.
+    changed: Notify,
+    /// Bumped by every consent write, after it commits.
+    consent_generation: AtomicU64,
+    /// Held while `serving` is written, so a pass's publication and a
+    /// consent write never interleave. Writers only: the proxy reads
+    /// `serving` without it.
+    serving_write: Mutex<()>,
+}
+
+/// The key a report from the control plane's loop is stamped with in
+/// `node_public_ingress.listening`: when the consent it answers was given.
+pub const REPORT_CONSENT_AT_KEY: &str = "consent_at";
+
+/// Whether row `0`'s report (its `listening` document) answers the consent
+/// given at `consent_at`: it was built from that consent, not from one
+/// before it written late. A report without the stamp answers none.
+pub fn report_answers_consent(
+    listening: Option<&serde_json::Value>,
+    consent_at: DateTime<Utc>,
+) -> bool {
+    listening
+        .and_then(|l| l.get(REPORT_CONSENT_AT_KEY))
+        .and_then(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).ok())
+        == Some(consent_at)
+}
+
+impl ControlPlanePrivateIngress {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Record what the proxy's listeners bound. Only the first call counts:
+    /// Pingora binds listeners once, at startup. It wakes the loop, which
+    /// waits for this before its first pass.
+    pub fn set_proxy_listeners(&self, listeners: Vec<SocketAddr>) {
+        if self.proxy_listeners.set(listeners).is_ok() {
+            self.changed.notify_one();
+        }
+    }
+
+    /// What the proxy's listeners bound, `None` when no proxy runs in this
+    /// process.
+    pub fn proxy_listeners(&self) -> Option<&[SocketAddr]> {
+        self.proxy_listeners.get().map(Vec::as_slice)
+    }
+
+    fn serving_write(&self) -> MutexGuard<'_, ()> {
+        // The guard protects no data, so a panic while held leaves nothing
+        // inconsistent.
+        self.serving_write
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn store_serving(&self, serving: Option<PrivateIngressServing>) {
+        let unchanged = self.serving.load().as_deref() == serving.as_ref();
+        if !unchanged {
+            self.serving.store(serving.map(Arc::new));
+        }
+    }
+
+    /// Serve private addresses on `serving`, or stop with `None`, whatever
+    /// the consent is now.
+    pub fn set_serving(&self, serving: Option<PrivateIngressServing>) {
+        let _write = self.serving_write();
+        self.store_serving(serving);
+    }
+
+    /// The consent generation now; read it before reading the consent.
+    pub fn consent_generation(&self) -> u64 {
+        self.consent_generation.load(Ordering::Acquire)
+    }
+
+    /// Serve `serving`, decided from the consent read at `generation`, only
+    /// if no consent was written since. `false` when one was: nothing is
+    /// published, and the caller decides again from the new consent.
+    pub fn set_serving_for(&self, generation: u64, serving: Option<PrivateIngressServing>) -> bool {
+        let _write = self.serving_write();
+        if self.consent_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        self.store_serving(serving);
+        true
+    }
+
+    /// A consent write committed: serving stops now, a pass that read the
+    /// consent before it can no longer publish, and the loop wakes to
+    /// decide from the new consent. Every write stops serving, not only a
+    /// withdrawal: a consent narrowed to fewer ranges, or moved to another
+    /// address, must not keep admitting what the old one did while the loop
+    /// is busy (it may be in the middle of inside checks). Until the loop
+    /// publishes again the private address is served by nobody, which fails
+    /// closed.
+    pub fn consent_written(&self) {
+        {
+            let _write = self.serving_write();
+            self.consent_generation.fetch_add(1, Ordering::AcqRel);
+            self.store_serving(None);
+        }
+        self.changed.notify_one();
+    }
+
+    /// The address private addresses are served on now.
+    pub fn serving(&self) -> Option<PrivateIngressServing> {
+        self.serving.load().as_deref().cloned()
+    }
+
+    /// Record this machine's private networks.
+    pub fn set_networks(&self, networks: Vec<PrivateNetworkOption>) {
+        if **self.networks.load() != networks {
+            self.networks.store(Arc::new(networks));
+        }
+    }
+
+    /// This machine's private networks, as last found.
+    pub fn networks(&self) -> Vec<PrivateNetworkOption> {
+        self.networks.load().as_ref().clone()
+    }
+
+    /// The consent changed: [`Self::consent_written`].
+    pub fn notify_changed(&self) {
+        self.consent_written();
+    }
+
+    /// Wait until [`Self::notify_changed`] is called.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
+    }
+
+    /// How a connection accepted on `local` from `peer` arrived. The peer is
+    /// the TCP peer, never a forwarded header.
+    pub fn arrival(&self, local: Option<SocketAddr>, peer: Option<IpAddr>) -> PrivateArrival {
+        let guard = self.serving.load();
+        let (Some(serving), Some(local)) = (guard.as_deref(), local) else {
+            return PrivateArrival::Public;
+        };
+        if canonical(local.ip()) != serving.address {
+            return PrivateArrival::Public;
+        }
+        match peer {
+            Some(peer) if serving.admits(peer) => PrivateArrival::Admitted,
+            _ => PrivateArrival::OutsideRange,
+        }
+    }
+
+    /// Why the proxy's listeners do not take connections to `address` on
+    /// ports 443 and 80, or `None` when they do. Pingora binds only at
+    /// startup, so the fix is a restart (ADR-115 D3).
+    pub fn not_covered(&self, address: IpAddr) -> Option<String> {
+        let Some(listeners) = self.proxy_listeners() else {
+            return Some(
+                "No proxy runs in this process, so it cannot serve private addresses. Run \
+                 `temps serve` with the proxy (the default role)."
+                    .to_string(),
+            );
+        };
+        not_covered_by(listeners, address)
+    }
+
+    /// Whether the proxy's listeners take connections to `address` on
+    /// `port`; `false` when no proxy runs in this process.
+    pub fn listens_on(&self, address: IpAddr, port: u16) -> bool {
+        self.proxy_listeners()
+            .is_some_and(|listeners| listens_on(listeners, address, port))
+    }
+}
+
+/// Whether one of `listeners` takes connections to `address` on `port`.
+pub fn listens_on(listeners: &[SocketAddr], address: IpAddr, port: u16) -> bool {
+    let address = canonical(address);
+    listeners
+        .iter()
+        .any(|l| l.port() == port && listener_takes(l.ip(), address))
+}
+
+/// [`ControlPlanePrivateIngress::not_covered`] on an explicit list.
+pub fn not_covered_by(listeners: &[SocketAddr], address: IpAddr) -> Option<String> {
+    let address = canonical(address);
+    if listens_on(listeners, address, PRIVATE_HTTPS_PORT) {
+        // Port 80 only redirects; its absence is not a reason to refuse.
+        return None;
+    }
+    let shown: Vec<String> = listeners.iter().map(ToString::to_string).collect();
+    Some(format!(
+        "The proxy listens on {} only, so it does not take connections to {address}:{PRIVATE_HTTPS_PORT}. \
+         Restart `temps serve` with `--tls-address=0.0.0.0:{PRIVATE_HTTPS_PORT}` (and \
+         `--address=0.0.0.0:{PRIVATE_HTTP_PORT}`), or with `--tls-address={address}:{PRIVATE_HTTPS_PORT}`, \
+         to serve private addresses.",
+        if shown.is_empty() {
+            "no address".to_string()
+        } else {
+            shown.join(", ")
+        }
+    ))
+}
+
+/// Whether a listener bound on `bound` accepts connections to `address`.
+/// `[::]` takes IPv4 too, as Linux binds it dual-stack by default.
+fn listener_takes(bound: IpAddr, address: IpAddr) -> bool {
+    match bound {
+        IpAddr::V4(v4) if v4.is_unspecified() => address.is_ipv4(),
+        IpAddr::V6(v6) if v6.is_unspecified() => true,
+        other => canonical(other) == address,
+    }
+}
+
+/// An IPv4-mapped IPv6 address as IPv4; anything else unchanged.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    fn at(text: &str) -> Option<SocketAddr> {
+        Some(text.parse().unwrap())
+    }
+
+    fn tailscale() -> Vec<IpNet> {
+        vec!["100.64.0.0/10".parse().unwrap()]
+    }
+
+    #[test]
+    fn a_pass_that_read_the_consent_before_a_write_cannot_publish() {
+        let runtime = ControlPlanePrivateIngress::new();
+        let serving = PrivateIngressServing::new(ip("100.101.102.103"), tailscale()).unwrap();
+        let read = runtime.consent_generation();
+        assert!(runtime.set_serving_for(read, Some(serving.clone())));
+        assert_eq!(runtime.serving(), Some(serving.clone()));
+
+        // A pass reads the consent; it is withdrawn while the pass awaits
+        // the machine's networks. The withdrawal stops serving at once, and
+        // the pass's decision, from the old consent, is not published.
+        let read = runtime.consent_generation();
+        runtime.consent_written();
+        assert_eq!(runtime.serving(), None);
+        assert!(!runtime.set_serving_for(read, Some(serving.clone())));
+        assert_eq!(runtime.serving(), None);
+
+        // A narrower consent written meanwhile: the old decision is refused
+        // too, and nothing is served until a pass decides from the new one,
+        // so the ranges it dropped are not admitted in between.
+        assert!(runtime.set_serving_for(runtime.consent_generation(), Some(serving.clone())));
+        let read = runtime.consent_generation();
+        runtime.notify_changed();
+        assert_eq!(runtime.serving(), None);
+        assert_eq!(
+            runtime.arrival(at("100.101.102.103:443"), Some(ip("100.64.0.9"))),
+            PrivateArrival::Public
+        );
+        assert!(!runtime.set_serving_for(read, Some(serving.clone())));
+        assert_eq!(runtime.serving(), None);
+        // The pass that reads the new consent publishes again.
+        assert!(runtime.set_serving_for(runtime.consent_generation(), Some(serving.clone())));
+        assert_eq!(runtime.serving(), Some(serving));
+    }
+
+    #[test]
+    fn a_report_answers_only_the_consent_it_was_stamped_with() {
+        let given: DateTime<Utc> = "2026-11-26T10:00:00.123456Z".parse().unwrap();
+        let earlier: DateTime<Utc> = "2026-11-26T09:00:00Z".parse().unwrap();
+        let report = serde_json::json!({ "https": "10.8.0.2:443", REPORT_CONSENT_AT_KEY: given });
+        assert!(report_answers_consent(Some(&report), given));
+        // A report built from an earlier consent, however late it was
+        // written, answers only that one.
+        assert!(!report_answers_consent(Some(&report), earlier));
+        assert!(!report_answers_consent(
+            Some(&serde_json::json!({ "https": "10.8.0.2:443" })),
+            given
+        ));
+        assert!(!report_answers_consent(None, given));
+    }
+
+    #[test]
+    fn nothing_is_private_until_an_address_is_served() {
+        let ingress = ControlPlanePrivateIngress::new();
+        assert_eq!(
+            ingress.arrival(at("100.101.102.103:443"), Some(ip("100.64.0.9"))),
+            PrivateArrival::Public
+        );
+        ingress.set_serving(Some(
+            PrivateIngressServing::new(ip("100.101.102.103"), tailscale()).unwrap(),
+        ));
+        assert_eq!(
+            ingress.arrival(at("100.101.102.103:443"), Some(ip("100.64.0.9"))),
+            PrivateArrival::Admitted
+        );
+        ingress.set_serving(None);
+        assert_eq!(
+            ingress.arrival(at("100.101.102.103:443"), Some(ip("100.64.0.9"))),
+            PrivateArrival::Public
+        );
+    }
+
+    #[test]
+    fn both_locks_the_local_address_and_the_peer_range() {
+        let ingress = ControlPlanePrivateIngress::new();
+        ingress.set_serving(Some(
+            PrivateIngressServing::new(ip("100.101.102.103"), tailscale()).unwrap(),
+        ));
+        // Another local address: the public path.
+        assert_eq!(
+            ingress.arrival(at("203.0.113.7:443"), Some(ip("100.64.0.9"))),
+            PrivateArrival::Public
+        );
+        // The private address reached from the LAN (the weak host model):
+        // refused, whatever headers say.
+        assert_eq!(
+            ingress.arrival(at("100.101.102.103:443"), Some(ip("192.168.1.30"))),
+            PrivateArrival::OutsideRange
+        );
+        assert_eq!(
+            ingress.arrival(at("100.101.102.103:443"), None),
+            PrivateArrival::OutsideRange
+        );
+        // A dual-stack socket reports IPv4-mapped addresses.
+        assert_eq!(
+            ingress.arrival(
+                at("[::ffff:100.101.102.103]:443"),
+                Some(ip("::ffff:100.64.0.9"))
+            ),
+            PrivateArrival::Admitted
+        );
+    }
+
+    #[test]
+    fn only_a_private_address_can_be_served() {
+        for refused in ["0.0.0.0", "::", "127.0.0.1", "203.0.113.7"] {
+            assert!(
+                PrivateIngressServing::new(ip(refused), tailscale()).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(PrivateIngressServing::new(ip("192.168.1.20"), vec![]).is_err());
+    }
+
+    #[test]
+    fn a_lan_address_admits_its_subnet_not_the_whole_block() {
+        let ingress = ControlPlanePrivateIngress::new();
+        ingress.set_serving(Some(
+            PrivateIngressServing::new(ip("192.168.1.20"), vec!["192.168.1.0/24".parse().unwrap()])
+                .unwrap(),
+        ));
+        assert_eq!(
+            ingress.arrival(at("192.168.1.20:443"), Some(ip("192.168.1.30"))),
+            PrivateArrival::Admitted
+        );
+        // Another network in the same private block is outside.
+        assert_eq!(
+            ingress.arrival(at("192.168.1.20:443"), Some(ip("192.168.64.2"))),
+            PrivateArrival::OutsideRange
+        );
+    }
+
+    #[test]
+    fn the_proxy_must_listen_where_the_private_address_is() {
+        let tailscale = ip("100.101.102.103");
+        let listeners = |list: &[&str]| -> Vec<SocketAddr> {
+            list.iter().map(|l| l.parse().unwrap()).collect()
+        };
+        assert_eq!(
+            not_covered_by(&listeners(&["0.0.0.0:80", "0.0.0.0:443"]), tailscale),
+            None
+        );
+        assert_eq!(not_covered_by(&listeners(&["[::]:443"]), tailscale), None);
+        assert_eq!(
+            not_covered_by(&listeners(&["100.101.102.103:443"]), tailscale),
+            None
+        );
+        let specific = not_covered_by(&listeners(&["203.0.113.7:443"]), tailscale).unwrap();
+        assert!(specific.contains("203.0.113.7:443 only"), "{specific}");
+        assert!(specific.contains("--tls-address=0.0.0.0:443"), "{specific}");
+        let other_port = not_covered_by(&listeners(&["0.0.0.0:8443"]), tailscale).unwrap();
+        assert!(other_port.contains("0.0.0.0:8443"), "{other_port}");
+
+        let ingress = ControlPlanePrivateIngress::new();
+        assert!(ingress
+            .not_covered(tailscale)
+            .unwrap()
+            .contains("No proxy runs"));
+        ingress.set_proxy_listeners(listeners(&["0.0.0.0:443"]));
+        assert_eq!(ingress.not_covered(tailscale), None);
+    }
+
+    #[tokio::test]
+    async fn recording_the_proxy_listeners_wakes_the_loop_once() {
+        let ingress = ControlPlanePrivateIngress::new();
+        ingress.set_proxy_listeners(vec!["0.0.0.0:443".parse().unwrap()]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), ingress.changed())
+            .await
+            .expect("the first record wakes the loop");
+        // Pingora binds once; a later call changes nothing and wakes nobody.
+        ingress.set_proxy_listeners(vec!["0.0.0.0:8443".parse().unwrap()]);
+        assert_eq!(
+            ingress.proxy_listeners(),
+            Some(&["0.0.0.0:443".parse().unwrap()][..])
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), ingress.changed())
+                .await
+                .is_err()
+        );
+    }
+}

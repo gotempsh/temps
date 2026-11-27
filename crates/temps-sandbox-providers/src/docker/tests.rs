@@ -1022,6 +1022,11 @@ fn test_default_config() {
     assert_eq!(config.default_cpu_limit, 4.0);
     assert_eq!(config.default_memory_limit_mb, 8192);
     assert_eq!(config.network_mode, "full");
+    // Every host provider bounds what one exec buffers, as a worker does.
+    assert_eq!(
+        config.exec_output_limit,
+        Some(crate::remote::WORKER_EXEC_OUTPUT_LIMIT)
+    );
 }
 
 #[test]

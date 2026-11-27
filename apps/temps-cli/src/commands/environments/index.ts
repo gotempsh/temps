@@ -48,6 +48,12 @@ Examples:
 
   # A plain, non-secret value can still be passed inline
   $ temps environments vars set LOG_LEVEL debug --environments production
+
+  # Let the server generate a random secret (32 bytes, hex); it is never shown
+  $ temps environments vars set SESSION_SECRET --generate-secret --environments production
+
+  # Laravel's APP_KEY gets the base64: key its cipher needs
+  $ temps environments vars set APP_KEY --generate-secret --environments production
 `
 
 export function registerEnvironmentsCommands(program: Command): void {
@@ -119,6 +125,10 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
     .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
+    .option(
+      '--generate-secret [bytes|laravel]',
+      'Have the server generate a random secret of this many bytes (16 to 64, 32 by default, hex), stored as a secret and never shown; for a new variable, instead of a value. `laravel`, the default for APP_KEY, makes a Laravel application key (base64:, 32 bytes)'
+    )
   addValueSourceOptions(setVar, { what: 'the value' })
   setVar
     .addHelpText('after', SET_VAR_EXAMPLES)
@@ -607,6 +617,35 @@ export interface SetEnvVarOptions {
   valueFile?: string
   valueStdin?: boolean
   trimTrailingNewline?: boolean
+  /** `--generate-secret [bytes|laravel]`: `true` without a byte count. */
+  generateSecret?: boolean | string
+}
+
+/** Laravel reads its application key from this variable, in its own format. */
+const LARAVEL_APP_KEY = 'APP_KEY'
+
+/**
+ * The API's `generate` request for `--generate-secret [bytes|laravel]`, or
+ * `undefined` without the flag. The server makes the value, so it is never
+ * typed, piped or printed. `laravel`, and the bare flag on `APP_KEY`, ask
+ * for a Laravel application key: 32 bytes behind `base64:`, the only form
+ * its default cipher takes (a 64-character hex string it would refuse). A
+ * byte count always asks for hex. Throws when the byte count is not 16 to 64.
+ */
+export function generateSecretRequest(
+  option: boolean | string | undefined,
+  key = ''
+): { kind: 'secret' | 'laravel_app_key'; bytes?: number } | undefined {
+  if (option === undefined || option === false) return undefined
+  if (option === 'laravel' || (option === true && key === LARAVEL_APP_KEY)) {
+    return { kind: 'laravel_app_key' }
+  }
+  if (option === true) return { kind: 'secret' }
+  const bytes = Number(option)
+  if (!Number.isInteger(bytes) || bytes < 16 || bytes > 64) {
+    throw new Error(`--generate-secret takes a byte count from 16 to 64, or laravel, not "${option}"`)
+  }
+  return { kind: 'secret', bytes }
 }
 
 /**
@@ -639,8 +678,17 @@ async function setEnvVar(
 ): Promise<void> {
   // Read the value before anything else, so a bad file or an empty pipe
   // fails fast, and stdin is consumed before any prompt could want it.
-  const sourcedValue = await resolveSetVarValue(key, value, options)
-  if (sourcedValue === undefined && !process.stdin.isTTY) {
+  const generate = generateSecretRequest(options.generateSecret, key)
+  const sourcedValue = generate ? undefined : await resolveSetVarValue(key, value, options)
+  if (generate && (value !== undefined || options.valueFile || options.valueStdin)) {
+    throw new Error(`--generate-secret makes the value for ${key}: do not also pass one`)
+  }
+  if (generate && options.update) {
+    throw new Error(
+      `--generate-secret creates ${key}; to replace an existing variable's value, delete it first or pass the new value with --update`
+    )
+  }
+  if (!generate && sourcedValue === undefined && !process.stdin.isTTY) {
     throw new Error(
       `Missing the value for ${key}: pass --value-file <path>, --value-stdin, or <value> (stdin is not a terminal, so it cannot be prompted for)`
     )
@@ -678,14 +726,21 @@ async function setEnvVar(
 
   if (envs.length === 0) {
     errorOutput('No environments found. Create an environment first.')
+    process.exitCode = 1
     return
   }
 
   // Check if variable already exists
   const existingVar = existingVars.find(v => v.key === key)
+  if (generate && existingVar) {
+    // Nothing was generated: fail, so a script does not go on with the
+    // old value.
+    throw new Error(`${key} already exists; --generate-secret only creates a new variable`)
+  }
 
-  // Prompt only when no source was given; mask the input for a secret.
-  const actualValue = sourcedValue ?? (options.secret
+  // Prompt only when no source was given; mask the input for a secret. A
+  // generated secret has no value here: the server makes it.
+  const actualValue = generate ? '' : sourcedValue ?? (options.secret
     ? await promptPassword({ message: `Value for ${key} (secret)` })
     : await promptText({ message: `Value for ${key}`, required: true }))
 
@@ -757,13 +812,14 @@ async function setEnvVar(
           value: actualValue,
           environment_ids: environmentIds,
           include_in_preview: includeInPreview,
-          ...(options.secret ? { is_secret: true } : {}),
+          ...(options.secret || generate ? { is_secret: true } : {}),
+          ...(generate ? { generate } : {}),
         },
       })
       if (error) throw new Error(getErrorMessage(error))
       saved = data
     })
-    success(`Set ${key}${options.secret ? ' (secret)' : ''}`)
+    success(`Set ${key}${generate ? ' (generated secret)' : options.secret ? ' (secret)' : ''}`)
   }
 
   if (saved?.secret_suggestion) {

@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/workflows",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0-beta.64",
   "description": "Durable workflows on Temps: steps, sleeps and events that survive restarts and deploys",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

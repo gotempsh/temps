@@ -659,6 +659,17 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_platform_features",
     // Server's externally-reachable public IP as detected at startup.
     "get_public_ip",
+    // The control plane's machine for the welcome flow: processor, memory,
+    // disk, Docker, who holds ports 80/443, its addresses and Tailscale
+    // status. Hardware and network facts only, no secrets.
+    "get_host_facts",
+    // The first-run record: which welcome steps are done or left for later
+    // and the default way projects are reached. No secrets.
+    "get_onboarding",
+    // Whether this machine serves private addresses: the consented listen
+    // address, the admitted ranges and what the control plane last made of
+    // it. Addresses and status only, no secrets.
+    "get_private_ingress",
     // Whether an in-place binary update is possible and what version is available.
     "get_update_capability",
     "get_update_status",
@@ -976,7 +987,7 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // The internal hostnames and `curl` lines one of the caller's own
     // sandboxes may use (ADR 105), no credential; scoped to that user.
     "list_sandbox_internal_addresses",
-    // Outbound connection recording (ADR-115), for a sandbox the caller
+    // Outbound connection recording (ADR-118), for a sandbox the caller
     // owns and for an environment of a project the caller can read: whether
     // it is on and which nodes can record, and the recorded connections
     // (destination host and port, outcome, bytes, duration; method and path

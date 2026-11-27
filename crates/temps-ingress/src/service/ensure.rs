@@ -103,7 +103,8 @@ impl IngressConnectorService {
         // called (token holders); keep the stored ones.
         let _guard = self.settings_lock.lock().await;
         let txn = self.db.begin().await?;
-        let current = Self::find_for_update(&txn, connector.id)
+        let current = self
+            .find_for_update(&txn, connector.id)
             .await
             .unwrap_or_else(|_| connector.clone());
         if is_deleting(&current) {

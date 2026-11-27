@@ -8,7 +8,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 How to add something that a sandbox, an environment's deployments, a managed
 service, a function or a job could all have, without building it once per
 product. The decision behind it is
-[ADR-115](../adr/115-workload-capabilities-written-once.md); the workload
+[ADR-118](../adr/118-workload-capabilities-written-once.md); the workload
 model is [ADR-052](../adr/052-common-workload-model.md).
 
 ## The rule

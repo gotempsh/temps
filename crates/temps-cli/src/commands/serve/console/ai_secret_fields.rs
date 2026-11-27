@@ -405,6 +405,18 @@ const REVIEWED_FREE_FORM: &[(&str, &str)] = &[
     ),
     ("create_thread_artifact:payload", "artifact content the model writes itself"),
     ("update_environment_settings:target_labels", "placement labels"),
+    (
+        "create_project:storage_service_env_aliases",
+        "variable names onto variable names; the service refuses anything that is not a variable name and never takes a value",
+    ),
+    (
+        "update_project:storage_service_env_aliases",
+        "shared with create_project's request but ignored on update, which never changes a link's aliases",
+    ),
+    (
+        "link_service_to_project:env_aliases",
+        "variable names onto variable names; the handler refuses anything that is not a variable name and never takes a value",
+    ),
     ("deploy_from_image:metadata", "free-form deployment labels"),
     ("register_external_image:metadata", "free-form image labels"),
     ("send_workflow_event:payload", "application event payload the user's workflow consumes"),

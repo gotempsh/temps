@@ -13,16 +13,34 @@ import {
   deleteOidcProvider,
   deleteOidcRoleMapping,
   getOidcProvider,
+  getOnboarding,
   listOidcProviders,
   listOidcProviderUsers,
   listOidcRoleMappings,
   testOidcProvider,
   updateOidcProvider,
+  updateOnboarding,
 } from '../../api/sdk.gen.js'
 import { endpoint, topGroup } from '../../lib/endpoint.js'
 
 export function registerSettingsEndpoints(program: Command): void {
   const group = topGroup(program, 'settings', "settings")
+
+  endpoint(group, getOnboarding, {
+    name: "onboarding get",
+    description: "Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in",
+  })
+
+  endpoint(group, updateOnboarding, {
+    name: "onboarding update",
+    description: "Change the install's first-run record",
+    body: {
+      completed: { kind: 'bool', help: "Mark the welcome flow finished (true) or reopen it (false)" },
+      default_reach: { kind: 'json', help: 'How new apps are reached by default, e.g. {"audience":"public","way":"tunnel","naming":"wildcard","domain":"apps.example.com"}' },
+      done: { kind: 'strings', help: "Mark these steps done", values: ["host","reach","agents","app"] },
+      later: { kind: 'json', help: 'Leave steps for later with why, e.g. [{"step":"agents","reason":"no provider yet"}]' },
+    },
+  })
 
   endpoint(group, listOidcProviders, {
     name: "oidc list-providers",

@@ -113,7 +113,7 @@ fn expected_sdk_paths() -> Vec<&'static str> {
         "/v1/sandboxes/{id}/egress-policy",
         // Recording every outbound connection as OpenTelemetry logs owned
         // by the sandbox, opt-in, with its capability, and the recorded
-        // connections themselves (temps extensions, ADR-115).
+        // connections themselves (temps extensions, ADR-118).
         "/v1/sandboxes/{id}/egress-recording",
         "/v1/sandboxes/{id}/egress-records",
         // Directory listing and preview access checks (temps extensions).

@@ -33,6 +33,7 @@ tracing = { workspace = true }
 temps-entities = { path = "../temps-entities" }
 temps-test-utils = { path = "../temps-test-utils" }
 tower = { workspace = true }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

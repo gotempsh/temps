@@ -23,6 +23,26 @@ const HARNESS_BRANDS: Record<string, HarnessBrand> = {
     label: 'OpenCode',
     src: '/ai-harnesses/opencode.svg',
   },
+  cursor: {
+    label: 'Cursor',
+    src: '/ai-harnesses/cursor.svg',
+  },
+  github_copilot: {
+    label: 'GitHub Copilot',
+    src: '/ai-harnesses/github-copilot.svg',
+  },
+  windsurf: {
+    label: 'Windsurf',
+    src: '/ai-harnesses/windsurf.svg',
+  },
+  vscode: {
+    label: 'VS Code',
+    src: '/ai-harnesses/vscode.svg',
+  },
+  zed: {
+    label: 'Zed',
+    src: '/ai-harnesses/zed.svg',
+  },
 }
 
 export function AiHarnessLogo({

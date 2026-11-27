@@ -62,55 +62,78 @@ export function Wizard({
         actions={headerActions}
       />
 
-      <ol
-        aria-label="Setup progress"
-        className="flex gap-3 rounded-lg border bg-muted/20 p-4 sm:gap-6"
-      >
-        {steps.map((step, index) => {
-          const isDone = index < currentIndex
-          const isActive = step.id === currentStep
-          return (
-            <li
-              key={step.id}
-              aria-current={isActive ? 'step' : undefined}
-              aria-label={`${step.label}${isDone ? ', completed' : ''}`}
-              className="flex min-w-0 flex-1 flex-col items-start gap-2 sm:flex-row sm:gap-3"
-            >
-              <span
-                aria-hidden="true"
+      {/* Unboxed: the step surface below is the page's one surface. In a
+          narrow column (a phone, or a tablet beside the sidebar) only the
+          current step is named; screen readers still get every step through
+          each item's label. */}
+      <div className="@container">
+        <ol
+          aria-label="Setup progress"
+          className="flex items-center gap-2 sm:gap-3"
+        >
+          {steps.map((step, index) => {
+            const isDone = index < currentIndex
+            const isActive = step.id === currentStep
+            const isLast = index === steps.length - 1
+            return (
+              <li
+                key={step.id}
+                aria-current={isActive ? 'step' : undefined}
+                aria-label={`${step.label}${isDone ? ', completed' : ''}`}
                 className={cn(
-                  'flex size-7 shrink-0 items-center justify-center rounded-full border text-xs font-medium tabular-nums',
-                  isActive &&
-                    'border-primary bg-primary text-primary-foreground',
-                  isDone && 'border-foreground bg-background text-foreground',
-                  !isDone &&
-                    !isActive &&
-                    'border-border bg-background text-muted-foreground'
+                  'flex min-w-0 items-center gap-2 sm:gap-3',
+                  !isLast && 'flex-1',
+                  // The only label shown on a phone takes the room it needs.
+                  isActive && '@max-3xl:shrink-0 @max-3xl:basis-auto'
                 )}
               >
-                {isDone ? <Check className="size-4" /> : index + 1}
-              </span>
-              <div className="min-w-0 pt-0.5">
                 <span
+                  aria-hidden="true"
                   className={cn(
-                    'block text-sm font-medium',
-                    isDone || isActive
-                      ? 'text-foreground'
-                      : 'text-muted-foreground'
+                    'flex size-6 shrink-0 items-center justify-center rounded-full border text-xs font-medium tabular-nums',
+                    isActive &&
+                      'border-primary bg-primary text-primary-foreground',
+                    isDone && 'border-foreground bg-background text-foreground',
+                    !isDone &&
+                      !isActive &&
+                      'border-border bg-background text-muted-foreground'
                   )}
                 >
-                  {step.label}
+                  {isDone ? <Check className="size-3.5" /> : index + 1}
                 </span>
-                {step.description && (
-                  <span className="mt-1 hidden text-xs text-muted-foreground sm:block">
-                    {step.description}
+                <span
+                  className={cn('min-w-0', !isActive && '@max-3xl:sr-only')}
+                >
+                  <span
+                    className={cn(
+                      'block truncate text-sm font-medium',
+                      isDone || isActive
+                        ? 'text-foreground'
+                        : 'text-muted-foreground'
+                    )}
+                  >
+                    {step.label}
                   </span>
+                  {step.description && (
+                    <span className="hidden truncate text-xs text-muted-foreground sm:block">
+                      {step.description}
+                    </span>
+                  )}
+                </span>
+                {!isLast && (
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      'h-px min-w-3 flex-1',
+                      isDone ? 'bg-foreground/60' : 'bg-border'
+                    )}
+                  />
                 )}
-              </div>
-            </li>
-          )
-        })}
-      </ol>
+              </li>
+            )
+          })}
+        </ol>
+      </div>
 
       {footer ? (
         <section className="min-w-0 overflow-hidden rounded-lg border bg-card text-card-foreground">

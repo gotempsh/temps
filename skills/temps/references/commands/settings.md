@@ -20,6 +20,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`settings public-ingress`](#settings-public-ingress)
 - [`settings refresh-routes`](#settings-refresh-routes)
 - [`settings weekly-digest`](#settings-weekly-digest)
+- [`settings onboarding`](#settings-onboarding)
 - [`settings oidc`](#settings-oidc)
 
 ## `settings`
@@ -42,6 +43,7 @@ Manage platform settings
 - `public-ingress` - Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
 - `refresh-routes` - Rebuild the proxy route table now instead of waiting for the next change
 - `weekly-digest` - Generate and send the weekly digest now
+- `onboarding` - Onboarding commands
 - `oidc` - Oidc commands
 
 ### `settings show` (alias: `get`)
@@ -249,6 +251,42 @@ Generate and send the weekly digest now
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings onboarding`
+
+Onboarding commands
+
+**Subcommands:**
+
+- `get` - Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+- `update` - Change the install's first-run record
+
+#### `settings onboarding get`
+
+Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings onboarding update`
+
+Change the install's first-run record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--completed` | Mark the welcome flow finished (true) or reopen it (false) | - | No |
+| `--no-completed` | Set completed to false | - | No |
+| `--default-reach <json>` | How new apps are reached by default, e.g. {"audience":"public","way":"tunnel","naming":"wildcard","domain":"apps.example.com"} (JSON) | - | No |
+| `--done <value>` | Mark these steps done (one of: host, reach, agents, app) (repeatable) | - | No |
+| `--later <json>` | Leave steps for later with why, e.g. [{"step":"agents","reason":"no provider yet"}] (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `settings oidc`

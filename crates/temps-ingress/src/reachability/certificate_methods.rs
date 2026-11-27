@@ -280,8 +280,8 @@ impl CertificateMethodSource for ReachabilityService {
         let mut other_tunnels = Vec::new();
         for tunnel in tunnels
             .into_iter()
-            // A tailnet carries no public name.
-            .filter(|t| t.provider != crate::tailscale::KIND)
+            // A private network carries no public name.
+            .filter(|t| !self.deps.connectors.serves_privately(&t.provider))
         {
             let covers = domain
                 .as_deref()

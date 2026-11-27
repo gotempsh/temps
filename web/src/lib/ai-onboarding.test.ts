@@ -255,6 +255,16 @@ describe('AI harness status', () => {
     expect(line).toContain('tk_ab12c…')
   })
 
+  test('names an MCP client key, such as the Claude app extension, by its prefix only', () => {
+    const line = describeHarnessConnection({
+      ...credential,
+      name: 'mcp-claude-app-2026-11-25T10-00-00Z',
+      kind: 'mcp_client',
+    })
+    expect(line).toContain('MCP client key')
+    expect(line).toContain('tk_ab12c…')
+  })
+
   test('names the dedicated key', () => {
     expect(
       describeHarnessConnection({ ...credential, kind: 'dedicated_key' })

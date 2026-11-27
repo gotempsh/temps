@@ -223,6 +223,51 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(got.get("files_over_3000_lines"), 1)
 
 
+class ProviderBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_naming_a_provider_counts_only_outside_its_module_and_tests(self) -> None:
+        write_crate(
+            self.root,
+            "temps-ingress",
+            {
+                "src/providers/cloudflare.rs": """\
+                    pub const KIND: &str = "cloudflare_tunnel";
+                    fn own() { crate::providers::cloudflare::KIND; }
+                    """,
+                # A provider's old place outside `providers/` is not its module.
+                "src/cloudflare.rs": """\
+                    fn stale() { crate::cloudflare::KIND; }
+                    """,
+                "src/providers/tailscale/mod.rs": """\
+                    pub const KIND: &str = "tailscale";
+                    """,
+                "src/service.rs": """\
+                    // A comment naming crate::tailscale::KIND is not code.
+                    fn engine() {
+                        let a = crate::cloudflare::KIND;
+                        let b = "tailscale";
+                        let c = "tailscale is a word in a sentence";
+                    }
+
+                    #[cfg(test)]
+                    mod tests {
+                        fn fixture() { crate::cloudflare::KIND; }
+                    }
+                    """,
+            },
+        )
+        write_crate(self.root, "temps-other", {"src/lib.rs": 'fn x() { tailscale::KIND; }\n'})
+        found = counts(self.root)
+        self.assertEqual(found["temps-ingress"].get("provider_named_outside_module"), 3)
+        self.assertNotIn("provider_named_outside_module", found.get("temps-other", {}))
+
+
 class BaselineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

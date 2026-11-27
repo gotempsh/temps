@@ -1901,7 +1901,6 @@ mod tests {
         let executor = Arc::new(AgentExecutor::new(
             db.clone(),
             git.clone(),
-            enc.clone(),
             queue.clone(),
             run_service.clone(),
             Arc::new(crate::services::config_service::AgentConfigService::new(

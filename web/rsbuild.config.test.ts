@@ -11,6 +11,7 @@ import {
   isApiHttpRequest,
   isApiWebSocket,
   isLocalTarget,
+  isMcpPath,
   isWebSocketUpgrade,
   rewriteDevServerOrigin,
 } from './rsbuild.config'
@@ -26,6 +27,20 @@ describe('deriveConsoleTarget', () => {
     expect(deriveConsoleTarget('http://localhost:8080')).toBe(
       'http://localhost:8081'
     )
+  })
+})
+
+describe('MCP proxy routing', () => {
+  it('forwards the root MCP endpoint, which lives outside /api', () => {
+    for (const path of ['/mcp', '/mcp/tools']) {
+      expect(isMcpPath(path)).toBe(true)
+    }
+  })
+
+  it('leaves console pages that only start with mcp to the console', () => {
+    for (const path of ['/mcp-servers', '/mcp-servers/github', '/mcpx', '/']) {
+      expect(isMcpPath(path)).toBe(false)
+    }
   })
 })
 

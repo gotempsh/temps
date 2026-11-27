@@ -335,6 +335,19 @@ pub struct HarnessWorkspace {
 pub struct ChatTurnResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// The tokens the turn used, when the provider reports them.
+    pub usage: Option<ChatTurnUsage>,
+    /// The provider stopped the reply at its output-token limit
+    /// (`finish_reason: length`): the text is partial, not a final answer.
+    pub truncated: bool,
+}
+
+/// The tokens one chat turn used: the whole prompt (cached share included)
+/// and the completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChatTurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// A stream of assistant text deltas. Each `Ok(String)` is an incremental chunk

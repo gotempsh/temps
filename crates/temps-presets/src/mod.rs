@@ -18,6 +18,7 @@ mod docker_custom;
 pub mod dockerfile_expose;
 mod docusaurus;
 pub mod env_example;
+pub mod service_needs;
 mod framework_detector;
 mod go_preset;
 mod java_preset;

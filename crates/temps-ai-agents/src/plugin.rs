@@ -945,7 +945,10 @@ impl TempsPlugin for AgentsPlugin {
                         network_mode: global_sandbox.network_mode.clone(),
                         control_plane_url: platform_config_service.resolve_internal_url().await,
                         preview_gateway_container_name: preview_gateway_name.clone(),
-                        exec_output_limit: None,
+                        // The default bounds each exec stream, as a worker
+                        // node does: an agent's command cannot buffer
+                        // unbounded output on the control plane.
+                        ..DockerSandboxConfig::default()
                     };
                     let provider = DockerSandboxProvider::new(docker.clone(), config);
                     // Unix sockets must live on the daemon host, not a Docker
@@ -1102,7 +1105,6 @@ impl TempsPlugin for AgentsPlugin {
             let executor = Arc::new(AgentExecutor::new(
                 db.clone(),
                 git_provider_manager.clone(),
-                encryption_service.clone(),
                 queue.clone(),
                 run_service.clone(),
                 config_service.clone(),
@@ -1229,6 +1231,16 @@ impl TempsPlugin for AgentsPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let executor = context.require_service::<AgentExecutor>();
+
+            // ADR-116 D1: agent turns go through the AI gateway.
+            if let Some(ai) = context.get_service::<dyn temps_ai::AiService>() {
+                executor.attach_ai_service(ai).await;
+            } else {
+                tracing::warn!(
+                    "Agents plugin: the AI gateway is not available; agent runs will fail \
+                     saying no AI provider is configured"
+                );
+            }
 
             if let Some(memory_provider) = context.get_service::<dyn WorkflowMemoryProvider>() {
                 executor.attach_memory_provider(memory_provider).await;

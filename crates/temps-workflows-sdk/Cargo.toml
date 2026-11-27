@@ -3,7 +3,7 @@
 
 [package]
 name = "temps-workflows-sdk"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.64"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true

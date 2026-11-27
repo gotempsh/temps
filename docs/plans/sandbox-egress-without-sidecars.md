@@ -6,7 +6,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 # Sandbox egress without a sidecar per sandbox, and records kept per workload
 
 Status: section 6 is built, for every workload kind
-([ADR-115](../adr/115-workload-capabilities-written-once.md)). Sections 1
+([ADR-118](../adr/118-workload-capabilities-written-once.md)). Sections 1
 to 5 (the egress gateway and its console status) are a proposal and are not
 built yet.
 
@@ -199,7 +199,7 @@ for every workload kind:
    written once.** The flow, ingest, records, activity query, node-0
    recorder, API types and console components are shared
    (`temps-workload-egress`); each kind adds an adapter and thin handlers.
-   *Decided, built: ADR-115 and
+   *Decided, built: ADR-118 and
    `docs/architecture/workload-capabilities.md`.*
 5. **Environments are steered with proxy variables first.** A replica of an
    environment that records starts with the node's proxy as its HTTP(S)

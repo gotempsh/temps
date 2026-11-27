@@ -13131,6 +13131,7 @@ dependencies = [
 name = "temps-config-handlers"
 version = "0.1.0-beta.63"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
  "hex",
@@ -13151,6 +13152,10 @@ dependencies = [
  "url",
  "utoipa",
 ]
+
+[[package]]
+name = "temps-connector-pins"
+version = "0.1.0-beta.63"
 
 [[package]]
 name = "temps-core"
@@ -13715,8 +13720,10 @@ version = "0.1.0-beta.63"
 dependencies = [
  "argon2 0.6.0",
  "axum",
+ "base64 0.23.1",
  "chrono",
  "http 1.5.0",
+ "rand 0.10.3",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
@@ -14255,6 +14262,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "sysinfo",
  "temps-authz",
  "temps-config",
  "temps-core",
@@ -14283,6 +14291,7 @@ dependencies = [
  "sha2 0.11.1",
  "temps-auth",
  "temps-config",
+ "temps-connector-pins",
  "temps-core",
  "temps-dns",
  "temps-domains",
@@ -14637,6 +14646,7 @@ dependencies = [
  "tempfile",
  "temps-agent-core",
  "temps-authz",
+ "temps-connector-pins",
  "temps-core",
  "temps-deployer",
  "temps-docker-capture",
@@ -14856,7 +14866,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-protocol"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.64"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -14868,7 +14878,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-sdk"
-version = "0.1.0-beta.62"
+version = "0.1.0-beta.64"
 dependencies = [
  "axum",
  "chrono",
@@ -16039,7 +16049,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workflows-sdk"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.64"
 dependencies = [
  "async-trait",
  "axum",

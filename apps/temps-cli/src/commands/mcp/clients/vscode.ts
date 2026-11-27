@@ -3,7 +3,7 @@
 
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { JsonConfigMcpClientAdapter, type McpServerEntry } from './base.js'
+import { JsonConfigMcpClientAdapter, type LocalBridgeCommand, type McpServerEntry } from './base.js'
 
 // VS Code's native MCP support (1.102+) reads a dedicated `mcp.json` in the
 // user profile folder, keyed by "servers" (not "mcpServers"), with remote
@@ -30,6 +30,10 @@ export class VsCodeAdapter extends JsonConfigMcpClientAdapter {
 
   protected buildServerConfig(entry: McpServerEntry): Record<string, unknown> {
     return { type: 'http', url: entry.url, headers: { Authorization: `Bearer ${entry.apiKey}` } }
+  }
+
+  protected override buildBridgeConfig(command: LocalBridgeCommand): Record<string, unknown> {
+    return { type: 'stdio', command: command.command, args: command.args, env: command.env }
   }
 
   protected extractUrl(serverConfig: Record<string, unknown>): string | null {

@@ -383,6 +383,7 @@ Create a new service (git-based or manual deployment); add it to a project with 
 | `--no-is-web-app` | Set is_web_app to false | - | No |
 | `--performance-metrics-enabled` | Collect web performance metrics | - | No |
 | `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
 | `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
 | `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
@@ -1176,6 +1177,7 @@ Set an environment variable. For a secret, read the value from a file or stdin (
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
+| `--generate-secret [bytes\|laravel]` | Have the server generate a random secret of this many bytes (16 to 64, 32 by default, hex), stored as a secret and never shown; for a new variable, instead of a value. `laravel`, the default for APP_KEY, makes a Laravel application key (base64:, 32 bytes) | - | No |
 | `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -2738,6 +2740,7 @@ Link a service to a project
 | `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `--database-mode <mode>` | Which database deployments get: project (one per project), project_environment (one per environment) or custom | - | No |
 | `--database-name <name>` | With --database-mode custom: the exact database name | - | No |
+| `--env-alias <APP_NAME=INJECTED_NAME>` | Also inject a variable under the name the app reads, e.g. DATABASE_URL=POSTGRES_URL (repeatable) | - | No |
 
 ### `services unlink`
 
@@ -3363,6 +3366,7 @@ View platform and server information
 
 **Subcommands:**
 
+- `host-facts` - What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
 - `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
 - `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
 - `geo` - Look up the location of an IP address in the server's geolocation database
@@ -3374,6 +3378,16 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform host-facts`
+
+What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `platform operations` (alias: `ops`)
 

@@ -603,6 +603,84 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn('sdk_channel }}', publish.split('    concurrency:')[0])
 
 
+    def test_libraries_tags_plan_their_own_prepared_selection(self):
+        self.write('cli/package.json', {'name': '@temps-sdk/cli', 'version': '9.0.0-beta.4'})
+        self.write('.github/releases/prepared.json', {'libraries/v9.0.0-beta.4': {'cli': '9.0.0-beta.4'}})
+        selected = release.plan('libraries/v9.0.0-beta.4', self.root)
+        self.assertEqual([(p['key'], p['version'], p['channel']) for p in selected], [('cli', '9.0.0-beta.4', 'beta')])
+        release.validate(self.root)
+        # The server tag of the reserved number never picks up the libraries selection.
+        self.assertEqual(release.plan('v9.0.0-beta.4', self.root), [])
+        self.assertEqual(release.plan('libraries/v9.0.0-beta.5', self.root), [])
+        for tag in ('libraries/v9.0.0', 'libraries/v9.0.0-rc.1', 'libraries/v9.0.0-beta.04', 'libraries/9.0.0-beta.4',
+                    'libraries/v9.0.0-beta.4/x', 'libraries/v9.0.0-nightly.1.abc'):
+            with self.subTest(tag=tag), self.assertRaises(ValueError):
+                release.plan(tag, self.root)
+        # Only betas: a stable version cannot ride on a reserved beta number.
+        self.write('cli/package.json', {'name': '@temps-sdk/cli', 'version': '9.0.0'})
+        self.write('.github/releases/prepared.json', {'libraries/v9.0.0-beta.4': {'cli': '9.0.0'}})
+        with self.assertRaisesRegex(ValueError, 'channels disagree'):
+            release.plan('libraries/v9.0.0-beta.4', self.root)
+
+    def test_server_and_libraries_releases_never_share_or_reverse_a_number(self):
+        tags = ['v0.1.0-beta.62', 'v0.1.0-beta.63', 'v0.1.0-nightly.20261120.abc1234', 'v0.1.0-test',
+                'sdk/cli/v0.2.0-beta.1']
+        problems = release.release_tag_problems
+        self.assertEqual(problems('libraries/v0.1.0-beta.64', tags), [])
+        self.assertEqual(problems('v0.1.0-beta.64', tags), [])
+        reserved = tags + ['libraries/v0.1.0-beta.64']
+        # The server cannot take the reserved number, re-checked at the tag or not...
+        for ordering in (True, False):
+            [message] = problems('v0.1.0-beta.64', reserved + ['v0.1.0-beta.64'], ordering=ordering)
+            self.assertIn('v0.1.0-beta.64 is already taken by libraries/v0.1.0-beta.64', message)
+            self.assertIn('(v0.1.0-beta.65)', message)
+        # ...nor fall behind it, and neither can a later libraries release.
+        self.assertRegex(problems('v0.1.0-beta.60', reserved)[0], r'would go backwards: libraries/v0\.1\.0-beta\.64')
+        self.assertRegex(problems('libraries/v0.1.0-beta.63', reserved)[0], 'already taken by v0.1.0-beta.63')
+        self.assertRegex(problems('libraries/v0.1.0-beta.62', tags)[-1], r'would go backwards: v0\.1\.0-beta\.63')
+        self.assertEqual(problems('v0.1.0-beta.65', reserved), [])
+        self.assertEqual(problems('v0.1.0', reserved), [])
+        # A re-check at an existing tag only refuses a shared number: later releases are fine.
+        self.assertEqual(problems('libraries/v0.1.0-beta.64', reserved + ['v0.1.0-beta.70'], ordering=False), [])
+        # Server tags behind other server tags keep today's rules (hotfix lines), and other tags are ignored.
+        self.assertEqual(problems('v0.0.9', tags), [])
+        self.assertEqual(problems('v0.1.0-nightly.20261121.def5678', reserved), [])
+        self.assertEqual(problems('sdk/cli/v0.2.0-beta.2', reserved), [])
+
+    def test_next_beta_number_counts_server_and_libraries_releases(self):
+        tags = ['v0.1.0-beta.9', 'v0.1.0-beta.63', 'v0.1.0-nightly.20261120.abc1234', 'sdk/cli/v0.2.0-beta.1']
+        self.assertEqual(release.next_beta_tag(tags), 'v0.1.0-beta.64')
+        self.assertEqual(release.next_beta_tag(tags + ['libraries/v0.1.0-beta.64']), 'v0.1.0-beta.65')
+        self.assertEqual(release.next_beta_tag(tags + ['libraries/v0.1.0-beta.64', 'v0.1.0-beta.65']), 'v0.1.0-beta.66')
+        with self.assertRaisesRegex(ValueError, 'v0.1.0 is not a beta'):
+            release.next_beta_tag(tags + ['v0.1.0'])
+        with self.assertRaisesRegex(ValueError, 'No server or libraries release tag'):
+            release.next_beta_tag(['sdk/cli/v0.2.0-beta.1', 'v0.1.0-nightly.20261120.abc1234'])
+
+    def test_release_tag_filters_keep_server_and_libraries_tags_apart(self):
+        """GitHub tag filters: `*` matches anything but `/`."""
+        workflow = (release.ROOT / '.github/workflows/release.yml').read_text()
+        triggers = workflow.split('\non:\n')[1].split('  workflow_dispatch:')[0]
+        patterns = re.findall(r'^      - "([^"]+)"$', triggers, re.M)
+        self.assertEqual(patterns, ['v*.*.*', 'v*.*.*-*', 'libraries/v*.*.*-beta.*'])
+
+        def matches(pattern, tag):
+            return re.fullmatch(''.join('[^/]*' if c == '*' else re.escape(c) for c in pattern), tag) is not None
+
+        server, libraries = patterns[:2], patterns[2]
+        for tag in ('v0.1.0', 'v0.1.0-beta.64', 'v0.1.0-nightly.20261120.abc1234'):
+            self.assertTrue(any(matches(p, tag) for p in server), tag)
+            self.assertFalse(matches(libraries, tag), tag)
+        for tag in ('libraries/v0.1.0-beta.64', 'sdk/cli/v0.2.0-beta.2', 'sdks/go/workflows/v0.1.0-beta.64'):
+            self.assertFalse(any(matches(p, tag) for p in server), tag)
+        self.assertTrue(matches(libraries, 'libraries/v0.1.0-beta.64'))
+        # Every tag the pattern admits is still validated before anything runs.
+        script = (release.ROOT / '.github/scripts/validate-release-ref.sh').read_text()
+        self.assertIn("libraries_tag_pattern='^libraries/v", script)
+        prep = (release.ROOT / '.github/workflows/sdk-release-prep.yml').read_text()
+        self.assertIn('"$EVENT" != "push" && "$tag" =~ $libraries', prep)
+
+
 class FakeHistory:
     """In-memory git history: commits oldest first, each touching paths (with contents when known)."""
 
@@ -933,6 +1011,60 @@ class PrepareTests(unittest.TestCase):
         self.release_tag('kv', '0.1.0-beta.64')
         self.history.tag('v0.1.0-beta.64')
         self.assertEqual(self.verify('v0.1.0-beta.64'), ([], ['kv']))
+
+    def test_a_libraries_only_release_reserves_the_next_server_beta_number(self):
+        self.write('skills/cli/SKILL.md', 'Run `bunx @temps-sdk/cli@beta --help`.\n')
+        self.add('cli', 'npm', '0.2.0-beta.1', published={'0.1.38', '0.2.0-beta.1'},
+                 versioning='until-server-passes', channel_pinned=['skills/**/*.md'])
+        self.add('kv', 'npm', '0.1.0-beta.63', published={'0.1.0-beta.63'}, versioning='server')
+        self.add('workflows', 'crate', '0.0.3', published={'0.0.3'})
+        for key in self.catalog:
+            self.release_tag(key, self.version(key))
+        self.history.tag('v0.1.0-beta.63')
+        self.change('cli', 'fix(cli): retry logins')
+        # Server-versioned packages take the reserved number; the CLI keeps its own line
+        # and an independent package without changes is left alone.
+        report, _ = self.prepare('libraries/v0.1.0-beta.64')
+        self.assertEqual({e['key']: e['version'] for e in report}, {'cli': '0.2.0-beta.2', 'kv': '0.1.0-beta.64'})
+        self.assertEqual({e['tag'] for e in report}, {'sdk/cli/v0.2.0-beta.2', 'sdk/kv/v0.1.0-beta.64'})
+        self.assertEqual(json.loads(self.read('.github/releases/prepared.json')),
+                         {'libraries/v0.1.0-beta.64': {'cli': '0.2.0-beta.2', 'kv': '0.1.0-beta.64'}})
+        self.assertEqual([(p['key'], p['version']) for p in release.plan('libraries/v0.1.0-beta.64', self.root)],
+                         [('cli', '0.2.0-beta.2'), ('kv', '0.1.0-beta.64')])
+        text = sdk_prepare.summary('libraries/v0.1.0-beta.64', report)
+        self.assertIn('libraries-only release', text)
+        self.assertIn('reserves the server number `v0.1.0-beta.64`, so the next server release is `v0.1.0-beta.65`', text)
+        # Merged and tagged: the tagged selection verifies before publishing...
+        self.history.commit('chore(release): prepare SDKs for libraries/v0.1.0-beta.64',
+                            {path: self.read(path) for path in ('.github/releases/prepared.json',)})
+        self.history.tag('libraries/v0.1.0-beta.64')
+        self.assertEqual(self.verify('libraries/v0.1.0-beta.64'), ([], []))
+        self.registry['@temps-sdk/kv'].add('0.1.0-beta.64')
+        self.registry['@temps-sdk/cli'].add('0.2.0-beta.2')
+        self.release_tag('kv', '0.1.0-beta.64')
+        self.release_tag('cli', '0.2.0-beta.2')
+        # ...and the server can neither reuse the reserved number nor go behind it.
+        for tag, message in [('v0.1.0-beta.64', 'already taken by libraries/v0.1.0-beta.64'),
+                             ('v0.1.0-beta.60', 'would go backwards')]:
+            with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, message):
+                self.prepare(tag)
+        self.assertEqual(self.selection('v0.1.0-beta.65'), {'kv': '0.1.0-beta.65'})
+
+    def test_a_libraries_only_release_cannot_reuse_or_pass_back_over_a_server_number(self):
+        self.add('kv', 'npm', '0.1.0-beta.63', published={'0.1.0-beta.63'}, versioning='server')
+        self.release_tag('kv', '0.1.0-beta.63')
+        self.history.tag('v0.1.0-beta.63')
+        for tag, message in [('libraries/v0.1.0-beta.63', 'already taken by v0.1.0-beta.63'),
+                             ('libraries/v0.1.0-beta.62', 'would go backwards: v0.1.0-beta.63'),
+                             ('libraries/v0.1.0', 'libraries/vX.Y.Z-beta.N'),
+                             ('libraries/v0.1.0-rc.1', 'libraries/vX.Y.Z-beta.N'),
+                             ('libraries/x', 'libraries/vX.Y.Z-beta.N')]:
+            with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, message):
+                self.prepare(tag)
+            self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
+        self.history.tag('libraries/v0.1.0-beta.64')
+        with self.assertRaisesRegex(ValueError, 'libraries/v0.1.0-beta.64 is already tagged'):
+            self.prepare('libraries/v0.1.0-beta.64')
 
     def test_conventional_commit_levels(self):
         for subject, body, level in [
@@ -1778,6 +1910,138 @@ class PrepareCommandTests(unittest.TestCase):
             self.assertEqual(self.run_command('--check', '--at-tag')[0], 2)
         self.assertEqual(self.run_command('--at-tag')[0], 2)  # re-deriving at a tag is check-only
 
+
+class LibrariesReleaseScriptTests(unittest.TestCase):
+    """scripts/release.sh --libraries in a scratch clone; sdk_release.py is stubbed, git is real."""
+
+    TAG = 'libraries/v0.1.0-beta.64'
+    STUB = """#!/bin/bash
+echo "$*" >> "$STUB_LOG"
+case "$2" in
+  next-beta) [ "${STUB_NEXT:-}" = fail ] && exit 1; echo "${STUB_NEXT:-v0.1.0-beta.64}" ;;
+  check-release-tag) [ "${STUB_CHECK:-0}" = 0 ] || { echo "error: taken" >&2; exit 1; } ;;
+  plan) if [ -n "${STUB_PLAN:-}" ]; then echo "$STUB_PLAN"; else echo '[{"key": "cli"}]'; fi ;;
+  prepare) exit "${STUB_PREPARE:-0}" ;;
+  notes) echo "| @temps-sdk/cli | 0.2.0-beta.2 |" ;;
+  *) echo "unexpected stub call: $*" >&2; exit 9 ;;
+esac
+"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.origin, self.repo, self.bin = base / 'origin.git', base / 'repo', base / 'bin'
+        self.log = base / 'stub.log'
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith(('GIT_', 'STUB_'))}
+        self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1', GIT_AUTHOR_NAME='Release Test',
+                        GIT_AUTHOR_EMAIL='release-test@example.com', GIT_COMMITTER_NAME='Release Test',
+                        GIT_COMMITTER_EMAIL='release-test@example.com', STUB_LOG=str(self.log),
+                        PATH=f"{base / 'bin'}{os.pathsep}{os.environ['PATH']}")
+        self.bin.mkdir()
+        (self.bin / 'python3').write_text(self.STUB)
+        (self.bin / 'python3').chmod(0o755)
+        self.git('init', '-q', '--bare', str(self.origin), cwd=base)
+        self.git('init', '-q', '-b', 'main', str(self.repo), cwd=base)
+        (self.repo / 'scripts').mkdir()
+        for name in ('release.sh', 'release-libraries.sh'):
+            shutil.copy(release.ROOT / 'scripts' / name, self.repo / 'scripts' / name)
+        self.git('add', '.')
+        self.git('commit', '-q', '-m', 'chore: release scripts')
+        self.git('remote', 'add', 'origin', str(self.origin))
+        self.git('push', '-q', 'origin', 'main')
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(['git', *args], cwd=cwd or self.repo, env=self.env, check=True,
+                              text=True, capture_output=True).stdout
+
+    def run_release(self, *args, answer='n', script='release.sh', **stub):
+        env = dict(self.env, **{f'STUB_{key.upper()}': str(value) for key, value in stub.items()})
+        return subprocess.run(['bash', f'scripts/{script}', *args], cwd=self.repo, env=env, input=answer + '\n',
+                              text=True, capture_output=True, timeout=60)
+
+    def tags(self, where=None):
+        return self.git('tag', '--list', cwd=where).split()
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_tags_the_next_free_number_after_checking_the_prepared_selection(self):
+        result = self.run_release('--libraries')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.tags(), [self.TAG])
+        self.assertEqual(self.git('cat-file', '-t', self.TAG).strip(), 'tag')  # annotated
+        self.assertEqual(self.git('rev-parse', self.TAG + '^{commit}'), self.git('rev-parse', 'HEAD'))
+        self.assertEqual(self.tags(self.origin), [])  # declined the push
+        self.assertIn(f'git push origin {self.TAG}', result.stdout)
+        self.assertEqual(self.calls(), [
+            'scripts/sdk_release.py next-beta',
+            f'scripts/sdk_release.py check-release-tag --tag {self.TAG}',
+            f'scripts/sdk_release.py plan --tag {self.TAG}',
+            f'scripts/sdk_release.py prepare --tag {self.TAG} --check',
+            f'scripts/sdk_release.py notes --tag {self.TAG}'])
+        # Nothing is committed: no version bump, no changelog.
+        self.assertEqual(self.git('rev-list', '--count', 'HEAD').strip(), '1')
+
+    def test_an_explicit_version_is_used_as_given_and_pushed_when_confirmed(self):
+        # Through release.sh --libraries and the sibling script itself.
+        for spelling, args, script in [('0.1.0-beta.70', ['--libraries'], 'release.sh'),
+                                       ('v0.1.0-beta.70', [], 'release-libraries.sh'),
+                                       ('libraries/v0.1.0-beta.70', ['--libraries'], 'release.sh')]:
+            with self.subTest(spelling=spelling):
+                for tag in self.tags():
+                    self.git('tag', '-d', tag)
+                    self.git('push', '-q', 'origin', ':refs/tags/' + tag)
+                result = self.run_release(*args, spelling, answer='y', script=script)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertEqual(self.tags(), ['libraries/v0.1.0-beta.70'])
+        self.assertEqual(self.tags(self.origin), ['libraries/v0.1.0-beta.70'])
+        self.assertNotIn('scripts/sdk_release.py next-beta', self.calls())
+
+    def test_refusals_create_no_tag(self):
+        cases = [
+            (dict(check=1), 'error: taken'),
+            (dict(plan='[]'), 'gh workflow run sdk-release-prep.yml -f tag=libraries/v0.1.0-beta.64'),
+            (dict(prepare=1), 'is stale'),
+            (dict(prepare=2), 'could not verify the SDK selection'),
+            (dict(next='fail'), 'could not derive the next free beta number'),
+        ]
+        for stub, message in cases:
+            with self.subTest(stub=stub):
+                result = self.run_release('--libraries', answer='y', **stub)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn(message, result.stdout + result.stderr)
+                self.assertEqual(self.tags(), [])
+                self.assertEqual(self.tags(self.origin), [])
+
+    def test_the_tagged_commit_must_be_on_main_and_clean(self):
+        (self.repo / 'notes.txt').write_text('tracked\n')
+        self.git('add', 'notes.txt')
+        result = self.run_release('--libraries')
+        self.assertEqual((result.returncode, self.tags()), (1, []))
+        self.assertIn('Uncommitted changes', result.stdout)
+        self.git('commit', '-q', '-am', 'chore: local only')
+        result = self.run_release('--libraries')
+        self.assertEqual((result.returncode, self.tags()), (1, []))
+        self.assertIn('is not on origin/main', result.stdout)
+
+    def test_options_and_help(self):
+        for args in (['--help'], ['--libraries', '--help'], ['-h']):
+            result = self.run_release(*args)
+            self.assertEqual(result.returncode, 0, args)
+            self.assertIn('--libraries', result.stdout)
+        self.assertIn('next server release is v0.1.0-beta.65', ' '.join(self.run_release('--libraries', '--help').stdout.split()))
+        self.assertEqual(self.run_release('--bogus').returncode, 2)
+        self.assertEqual(self.run_release('--libraries', '--bogus').returncode, 2)
+        self.assertEqual(self.run_release('--libraries', '1', '2').returncode, 2)
+        self.assertEqual((self.tags(), self.calls()), ([], []))
+
+    def test_a_server_release_cannot_take_a_reserved_number(self):
+        result = self.run_release('0.1.0-beta.64', check=1)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(self.calls(), ['scripts/sdk_release.py check-release-tag --tag v0.1.0-beta.64'])
+        self.assertEqual(self.tags(), [])
+        self.assertEqual(self.git('rev-list', '--count', 'HEAD').strip(), '1')
 
 class SdkReleasePrepWorkflowTests(unittest.TestCase):
     workflow = (release.ROOT / '.github/workflows/sdk-release-prep.yml').read_text()

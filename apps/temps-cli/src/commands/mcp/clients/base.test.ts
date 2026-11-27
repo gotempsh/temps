@@ -1,12 +1,25 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { bridgeApiKey } from '../bridge.js'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as jsonc from 'jsonc-parser'
-import { JsonConfigMcpClientAdapter, type McpServerEntry } from './base.js'
+import {
+  bridgeKeyFilePath,
+  bridgeUrlFromArgs,
+  bridgeUrlFromText,
+  entryApiKey,
+  JsonConfigMcpClientAdapter,
+  localBridgeCommand,
+  removeBridgeKeyFiles,
+  restoreBridgeKeyFile,
+  sameOrigin,
+  writeBridgeKeyFile,
+  type McpServerEntry,
+} from './base.js'
 
 class TestAdapter extends JsonConfigMcpClientAdapter {
   readonly id = 'test-client'
@@ -78,6 +91,38 @@ describe('JsonConfigMcpClientAdapter', () => {
     expect(written.mcpServers.temps.url).toBe('http://localhost:3000/mcp?write=1')
   })
 
+  test('the key an entry sends is read back from it, whatever entry it is', async () => {
+    expect(await adapter.installedApiKey()).toBeUndefined()
+    await adapter.addServer(entry)
+    expect(await adapter.installedApiKey()).toBe('secret-key')
+    const bridge = { folders: ['/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' }
+    await adapter.addServer({ ...entry, apiKey: 'bridge-key', bridge })
+    expect(await adapter.installedApiKey()).toBe('bridge-key')
+    await adapter.removeServer()
+    expect(await adapter.installedApiKey()).toBeUndefined()
+  })
+
+  test('an entry key is read from its bearer header, mcp-remote header, key file or inline key', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'temps-entry-key-'))
+    try {
+      const file = join(dir, 'x.key')
+      writeFileSync(file, 'tk_file\n')
+      expect(entryApiKey({ headers: { authorization: 'Bearer tk_abc' } })).toBe('tk_abc')
+      // Claude Desktop's mcp-remote entry keeps the header in its environment.
+      expect(entryApiKey({ env: { AUTH_HEADER: 'Bearer tk_desk' } })).toBe('tk_desk')
+      expect(entryApiKey({ env: { TEMPS_API_KEY: 'tk_def', TEMPS_API_KEY_FILE: '' } })).toBe('tk_def')
+      expect(entryApiKey({ env: { TEMPS_API_KEY_FILE: file } })).toBe('tk_file')
+      expect(entryApiKey({ env: { TEMPS_API_KEY_FILE: join(dir, 'missing.key') } })).toBeUndefined()
+      // A file far larger than a key is not read as one.
+      writeFileSync(file, 'x'.repeat(5000))
+      expect(entryApiKey({ env: { TEMPS_API_KEY_FILE: file } })).toBeUndefined()
+      expect(entryApiKey({ headers: { Authorization: 'Basic dXNlcg==' } })).toBeUndefined()
+      expect(entryApiKey(null)).toBeUndefined()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('preserves unrelated existing entries and comments', async () => {
     mkdirSync(join(dir, 'nested'), { recursive: true })
     writeFileSync(
@@ -146,5 +191,154 @@ describe('JsonConfigMcpClientAdapter', () => {
     await adapter.removeServer()
 
     expect(statSync(configPath).mode & 0o777).toBe(0o600)
+  })
+})
+
+describe('the local bridge entry', () => {
+  let dir: string
+  const entry: McpServerEntry = {
+    url: 'https://temps.example.test/mcp?write=1',
+    apiKey: 'secret-key',
+    bridge: { folders: ['/Users/me/code', '/srv/apps'], packageSpec: '@temps-sdk/cli@1.2.3' },
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'temps-mcp-bridge-'))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('the app starts the pinned CLI with the folders, and the key only in its environment', () => {
+    const command = localBridgeCommand(entry, entry.bridge!)
+    expect(command).toEqual({
+      command: 'npx',
+      args: [
+        '-y',
+        '@temps-sdk/cli@1.2.3',
+        'mcp',
+        'bridge',
+        '--url',
+        'https://temps.example.test',
+        '--folder',
+        '/Users/me/code',
+        '--folder',
+        '/srv/apps',
+      ],
+      env: { TEMPS_API_KEY: 'secret-key', TEMPS_API_KEY_FILE: '' },
+    })
+    expect(command.args.join(' ')).not.toContain('secret-key')
+  })
+
+  test('an inline-key entry overrides an inherited key file, which would win over its key', () => {
+    const command = localBridgeCommand(entry, entry.bridge!)
+    // What an app such as VS Code does: its own environment, then the entry's.
+    const inherited = { TEMPS_API_KEY_FILE: '/home/me/.temps/mcp/instance-a.key', HOME: '/home/me' }
+    const launched = { ...inherited, ...command.env }
+    expect(bridgeApiKey(launched)).toBe('secret-key')
+  })
+
+  test('with a key file, the environment names the file and holds no key', () => {
+    const command = localBridgeCommand(entry, entry.bridge!, '/home/me/.temps/mcp/codex.key')
+    expect(command.env).toEqual({ TEMPS_API_KEY_FILE: '/home/me/.temps/mcp/codex.key' })
+    expect(JSON.stringify(command)).not.toContain('secret-key')
+  })
+
+  test('the key file is written for this user only, replaced in place, and removed', async () => {
+    const file = bridgeKeyFilePath('codex', 'https://a.example.test/mcp?write=1', '/profile', dir)
+    expect(file.startsWith(join(dir, '.temps', 'mcp', 'codex-'))).toBe(true)
+    expect(await writeBridgeKeyFile(file, 'secret-key')).toBeNull()
+    expect(readFileSync(file, 'utf8').trim()).toBe('secret-key')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expect(statSync(join(dir, '.temps', 'mcp')).mode & 0o777).toBe(0o700)
+    // A file a looser earlier version left behind is replaced at 0600.
+    chmodSync(file, 0o644)
+    expect(await writeBridgeKeyFile(file, 'second-key')).toBe('secret-key\n')
+    expect(readFileSync(file, 'utf8').trim()).toBe('second-key')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    await removeBridgeKeyFiles('codex', '/profile', dir)
+    await removeBridgeKeyFiles('codex', '/profile', dir)
+    expect(() => statSync(file)).toThrow()
+  })
+
+  test('each profile and instance has its own key file, and removing one profile keeps the others', async () => {
+    const a = bridgeKeyFilePath('codex', 'https://a.example.test/mcp', '/profile-1', dir)
+    const b = bridgeKeyFilePath('codex', 'https://b.example.test/mcp', '/profile-1', dir)
+    const other = bridgeKeyFilePath('codex', 'https://a.example.test/mcp', '/profile-2', dir)
+    // Same instance, same profile: the same file, whatever the path or query.
+    expect(bridgeKeyFilePath('codex', 'https://a.example.test/', '/profile-1', dir)).toBe(a)
+    expect(new Set([a, b, other]).size).toBe(3)
+    await writeBridgeKeyFile(a, 'key-a')
+    await writeBridgeKeyFile(b, 'key-b')
+    await writeBridgeKeyFile(other, 'key-other')
+    await removeBridgeKeyFiles('codex', '/profile-1', dir)
+    expect(() => statSync(a)).toThrow()
+    expect(() => statSync(b)).toThrow()
+    expect(readFileSync(other, 'utf8').trim()).toBe('key-other')
+  })
+
+  test('restoring a key file puts back what it held, or removes one that did not exist', async () => {
+    const file = bridgeKeyFilePath('claude-code', 'https://a.example.test', '', dir)
+    const fresh = await writeBridgeKeyFile(file, 'new-key')
+    await restoreBridgeKeyFile(file, fresh, 'new-key')
+    expect(() => statSync(file)).toThrow()
+    await writeBridgeKeyFile(file, 'old-key')
+    const previous = await writeBridgeKeyFile(file, 'new-key')
+    await restoreBridgeKeyFile(file, previous, 'new-key')
+    expect(readFileSync(file, 'utf8').trim()).toBe('old-key')
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
+  test('a failed install never rolls back a key another install wrote since', async () => {
+    const file = bridgeKeyFilePath('codex', 'https://a.example.test', '', dir)
+    // A writes its key, B then writes its own and succeeds, A fails.
+    const beforeA = await writeBridgeKeyFile(file, 'key-a')
+    await writeBridgeKeyFile(file, 'key-b')
+    await restoreBridgeKeyFile(file, beforeA, 'key-a')
+    expect(readFileSync(file, 'utf8').trim()).toBe('key-b')
+  })
+
+  test('sameOrigin compares scheme, host and port only', () => {
+    expect(sameOrigin('https://a.example.test/mcp?write=1', 'https://a.example.test/mcp')).toBe(true)
+    expect(sameOrigin('http://a.example.test/mcp', 'https://a.example.test/mcp')).toBe(false)
+    expect(sameOrigin('https://b.example.test/mcp', 'https://a.example.test/mcp')).toBe(false)
+    expect(sameOrigin(null, 'https://a.example.test/mcp')).toBe(false)
+  })
+
+  test('a JSON-config app gets a stdio entry, and status reads it back as read/write', async () => {
+    const configPath = join(dir, 'config.json')
+    const adapter = new TestAdapter(configPath)
+    expect(await adapter.addServer(entry)).toEqual({ success: true })
+    const written = JSON.parse(readFileSync(configPath, 'utf8'))
+    expect(written.mcpServers.temps).toEqual(localBridgeCommand(entry, entry.bridge!))
+    expect(statSync(configPath).mode & 0o777).toBe(0o600)
+    expect(await adapter.getServerUrl()).toBe('https://temps.example.test/mcp?write=1')
+  })
+
+  test('VS Code marks the entry as stdio', async () => {
+    const { VsCodeAdapter } = await import('./vscode.js')
+    class TempVsCode extends VsCodeAdapter {
+      protected override getConfigPath(): string {
+        return join(dir, 'mcp.json')
+      }
+    }
+    await new TempVsCode().addServer(entry)
+    const written = JSON.parse(readFileSync(join(dir, 'mcp.json'), 'utf8'))
+    expect(written.servers.temps.type).toBe('stdio')
+    expect(written.servers.temps.command).toBe('npx')
+  })
+
+  test('the URL of a bridge entry, from its arguments or from printed text', () => {
+    const args = localBridgeCommand(entry, entry.bridge!).args
+    expect(bridgeUrlFromArgs(args)).toBe('https://temps.example.test/mcp?write=1')
+    expect(bridgeUrlFromArgs(['-y', 'mcp-remote', 'https://temps.example.test/mcp'])).toBeNull()
+    expect(bridgeUrlFromArgs('not a list')).toBeNull()
+    expect(
+      bridgeUrlFromText(
+        'temps:\n  Type: stdio\n  Command: npx\n  Args: -y @temps-sdk/cli@1.2.3 mcp bridge --url https://temps.example.test --folder /srv/apps\n',
+      ),
+    ).toBe('https://temps.example.test/mcp?write=1')
+    expect(bridgeUrlFromText('URL: https://temps.example.test/mcp')).toBeNull()
   })
 })

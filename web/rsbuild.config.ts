@@ -42,6 +42,15 @@ export const isWebSocketUpgrade = (req: ProxyRequest) => {
   const value = Array.isArray(upgrade) ? upgrade[0] : upgrade
   return value?.toLowerCase() === 'websocket'
 }
+/**
+ * The MCP endpoint, mounted at the server root rather than under /api
+ * (`crates/temps-mcp-server`). A production console serves it on its own
+ * origin, and the Claude app extension the console builds defaults to that
+ * origin, so the dev server forwards it too. `/mcp-servers` is a console page
+ * and stays here.
+ */
+export const isMcpPath = (pathname: string) =>
+  pathname === '/mcp' || pathname.startsWith('/mcp/')
 export const isApiWebSocket = (pathname: string, req: ProxyRequest) =>
   isApiPath(pathname) && isWebSocketUpgrade(req)
 export const isApiHttpRequest = (pathname: string, req: ProxyRequest) =>
@@ -180,6 +189,14 @@ export default defineConfig({
             }
           },
         },
+      },
+      {
+        // MCP clients authenticate with a bearer key, not the session cookie,
+        // so the Origin rewrite above does not apply; plain HTTP only.
+        pathFilter: (pathname: string) => isMcpPath(pathname),
+        target: apiTarget,
+        changeOrigin: true,
+        ws: false,
       },
     ],
     headers: {

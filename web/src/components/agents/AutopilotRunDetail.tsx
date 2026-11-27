@@ -47,27 +47,19 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AgentRunLogResponse as AgentRunLog } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
-import { AutofixRunConfigForm } from '@/components/autofixer/AutofixRunConfigForm'
 import { invalidateOperations } from '@/lib/operations'
-import {
-  addContext,
-  createPr,
-  reAnalyze,
-  retryRun,
-  startFix,
-} from '@/api/client/sdk.gen'
+import { retryRun } from '@/api/client/sdk.gen'
 import { CancelRunButton } from './CancelRunButton'
+import { LegacyAutofixNotice } from './LegacyAutofixNotice'
+import {
+  isTempsAgentTranscript,
+  parseTempsAgentTranscript,
+  resultLine,
+} from './agent-transcript'
 import { useCancelRun } from './useCancelRun'
 import { cn } from '@/lib/utils'
 import { toast } from 'sonner'
-import {
-  ChevronDown,
-  ChevronUp,
-  GitBranch,
-  MessageSquare,
-  Send,
-  Sparkles,
-} from 'lucide-react'
+import { MessageSquare } from 'lucide-react'
 import { settingsSectionHref } from '@/lib/project-settings-sections'
 
 const proseClasses =
@@ -536,9 +528,10 @@ function parseClaudeOutput(output: string): ConversationEvent[] {
   return events
 }
 
-/** Parse stream output from any AI provider into conversation events.
- *  Auto-detects OpenCode vs Codex vs Claude format. */
+/** Parse a run's output into conversation events: a Temps agent transcript
+ *  (ADR-116), or the stream of a coding CLI from a run made before it. */
 function parseStreamOutput(output: string): ConversationEvent[] {
+  if (isTempsAgentTranscript(output)) return parseTempsAgentTranscript(output)
   if (isOpenCodeFormat(output)) return parseOpenCodeOutput(output)
   if (isCodexFormat(output)) return parseCodexOutput(output)
   return parseClaudeOutput(output)
@@ -616,19 +609,8 @@ function ConversationViewer({
         summary: e.toolResult.slice(0, 200),
         raw: e,
       })
-    } else if (e.type === 'result') {
-      viewEvents.push({
-        kind: 'result',
-        label: 'Result',
-        summary: [
-          e.numTurns != null ? `${e.numTurns} turns` : null,
-          e.costUsd != null ? `$${e.costUsd.toFixed(4)}` : null,
-          e.tokensInput != null ? `${e.tokensInput.toLocaleString()} in` : null,
-        ]
-          .filter(Boolean)
-          .join(' · '),
-        raw: e,
-      })
+    } else if (e.type === 'result' || e.type === 'notice') {
+      viewEvents.push({ kind: 'result', ...resultLine(e), raw: e })
     }
   }
 
@@ -839,7 +821,7 @@ function ConversationViewer({
                         kindStyle('result')
                       )}
                     >
-                      <span className="font-medium mr-2">Result</span>
+                      <span className="font-medium mr-2">{v.label}</span>
                       <span className="tabular-nums">{v.summary}</span>
                     </div>
                   )
@@ -987,14 +969,6 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   const [streamLogs, setStreamLogs] = useState<AgentRunLog[]>([])
   const [stoppedStreamKey, setStoppedStreamKey] = useState<string | null>(null)
   const [isRetrying, setIsRetrying] = useState(false)
-  const [contextInput, setContextInput] = useState('')
-  const [isSendingContext, setIsSendingContext] = useState(false)
-  const [isStartingFix, setIsStartingFix] = useState(false)
-  const [isCreatingPr, setIsCreatingPr] = useState(false)
-  const [showFeedback, setShowFeedback] = useState(false)
-  // Retry/start-over config dialog: prefilled from the run's stored config
-  // so the user can change harness/model/turns/branch and add retry notes.
-  const [showRetryConfig, setShowRetryConfig] = useState(false)
   // Owned here, not by the button: the button unmounts when the run stops
   // being active, which can happen while a cancel is still in flight.
   const cancelMutation = useCancelRun(project.id, Number(runId), () =>
@@ -1009,9 +983,6 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     ...runQueryOptions,
     enabled: !!runId,
     refetchInterval: (query) => {
-      // Creating a PR is a synchronous push request. Keep observing the run
-      // until it settles, even while the cached phase is still fix_ready.
-      if (isCreatingPr) return 5000
       const run = query.state.data?.run
       if (!run) return false
       const phase = run.phase || ''
@@ -1150,15 +1121,12 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   // a retry would throw away the user's analysis work. Only offer Retry when
   // the run is terminal (completed/failed/cancelled).
   const canRetry =
-    !isActive && !isAutofixerWaiting && run.source !== 'cli_ephemeral'
+    !isAutofixer &&
+    !isActive &&
+    !isAutofixerWaiting &&
+    run.source !== 'cli_ephemeral'
 
   const onRetry = async () => {
-    if (isAutofixer && run.trigger_source_id) {
-      // Autofixer retry = configure + start a fresh analysis on the same
-      // error group. The dialog prefills this run's stored config.
-      setShowRetryConfig(true)
-      return
-    }
     setIsRetrying(true)
     try {
       const { data: newRun } = await retryRun({
@@ -1172,76 +1140,6 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     } finally {
       setIsRetrying(false)
     }
-  }
-
-  const onStartFix = async () => {
-    setIsStartingFix(true)
-    try {
-      await startFix({
-        path: { project_id: project.id, run_id: run.id },
-        throwOnError: true,
-      })
-      setStreamLogs([])
-      queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
-      void invalidateOperations(queryClient)
-      toast.success('Fix generation started')
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to start fix')
-    } finally {
-      setIsStartingFix(false)
-    }
-  }
-
-  const onCreatePr = async () => {
-    setIsCreatingPr(true)
-    try {
-      await createPr({
-        path: { project_id: project.id, run_id: run.id },
-        throwOnError: true,
-      })
-      toast.success('Pull request created')
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to create PR')
-    } finally {
-      // Refresh the run on errors too: the server may have entered pushing
-      // before a failed response, and its persisted state drives polling.
-      void queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
-      void invalidateOperations(queryClient)
-      setIsCreatingPr(false)
-    }
-  }
-
-  const onSendContext = async () => {
-    const message = contextInput.trim()
-    if (!message || isSendingContext) return
-    setContextInput('')
-    setIsSendingContext(true)
-    try {
-      await addContext({
-        path: { project_id: project.id, run_id: run.id },
-        body: { message },
-        throwOnError: true,
-      })
-      if (phase === 'analyzed') {
-        await reAnalyze({
-          path: { project_id: project.id, run_id: run.id },
-          throwOnError: true,
-        })
-      }
-      queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
-      void invalidateOperations(queryClient)
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : 'Failed to send message')
-    } finally {
-      setIsSendingContext(false)
-    }
-  }
-
-  // "Start Over" — for autofixer runs only. Opens the run-config dialog
-  // (prefilled from this run) and kicks off a fresh analysis on submit.
-  const onStartOver = () => {
-    if (!run.trigger_source_id) return
-    setShowRetryConfig(true)
   }
 
   const durationText = formatDuration(run.started_at, run.completed_at)
@@ -1298,7 +1196,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           ) : (
             <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
           )}
-          {isAutofixer ? 'Start over' : 'Retry'}
+          Retry
         </Button>
       )}
       {isActive && (
@@ -1312,144 +1210,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
 
   // ── Autofixer phase action bar + chat ─────────────────────────────────
   const autofixerActionBar = isAutofixer ? (
-    <>
-      {(phase === 'analyzed' ||
-        phase === 'fix_ready' ||
-        phase === 'completed' ||
-        phase === 'no_fix' ||
-        phase === 'pr_created' ||
-        run.status === 'failed' ||
-        run.status === 'cancelled') && (
-        <Card
-          className={cn(
-            phase === 'completed' || phase === 'pr_created'
-              ? 'border-green-500/20 bg-green-500/5'
-              : run.status === 'failed' || run.status === 'cancelled'
-                ? 'border-red-500/20 bg-red-500/5'
-                : 'border-blue-500/20 bg-blue-500/5'
-          )}
-        >
-          <CardContent className="p-4 flex items-center justify-between gap-4 flex-wrap">
-            <div className="text-sm min-w-0">
-              {phase === 'analyzed' &&
-                'Analysis complete. Generate a fix, or open feedback to refine.'}
-              {phase === 'fix_ready' &&
-                'Fix is ready. Review the changes, then create a pull request.'}
-              {(phase === 'completed' || phase === 'pr_created') &&
-                run.pr_url && (
-                  <span className="flex items-center gap-2">
-                    Pull request created —
-                    <a
-                      href={run.pr_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-green-700 dark:text-green-400 hover:underline font-medium inline-flex items-center gap-1"
-                    >
-                      View PR #{run.pr_number}{' '}
-                      <ExternalLink className="h-3 w-3" />
-                    </a>
-                  </span>
-                )}
-              {phase === 'no_fix' && (
-                <span className="text-muted-foreground">
-                  No automatic fix available. Send feedback to retry.
-                </span>
-              )}
-              {(run.status === 'failed' || run.status === 'cancelled') && (
-                <span className="text-red-700 dark:text-red-400">
-                  {run.status === 'failed' ? 'Run failed' : 'Run cancelled'}
-                </span>
-              )}
-            </div>
-            <div className="flex gap-2 flex-shrink-0">
-              {(['completed', 'failed', 'cancelled'] as const).includes(
-                run.status as 'completed' | 'failed' | 'cancelled'
-              ) && (
-                <Button variant="outline" size="sm" onClick={onStartOver}>
-                  <RefreshCw className="h-4 w-4 mr-2" />
-                  Start over
-                </Button>
-              )}
-              {(phase === 'analyzing' || phase === 'analyzed') && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowFeedback((v) => !v)}
-                  aria-expanded={showFeedback}
-                >
-                  <MessageSquare className="h-4 w-4 mr-2" />
-                  Feedback
-                  {showFeedback ? (
-                    <ChevronUp className="h-4 w-4 ml-2" />
-                  ) : (
-                    <ChevronDown className="h-4 w-4 ml-2" />
-                  )}
-                </Button>
-              )}
-              {phase === 'analyzed' && (
-                <Button onClick={onStartFix} disabled={isStartingFix} size="sm">
-                  {isStartingFix ? (
-                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  ) : (
-                    <Sparkles className="h-4 w-4 mr-2" />
-                  )}
-                  Generate fix
-                </Button>
-              )}
-              {phase === 'fix_ready' && (
-                <Button onClick={onCreatePr} disabled={isCreatingPr} size="sm">
-                  {isCreatingPr ? (
-                    <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  ) : (
-                    <GitBranch className="h-4 w-4 mr-2" />
-                  )}
-                  Create PR
-                </Button>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {(phase === 'analyzing' || phase === 'analyzed') && showFeedback && (
-        <div className="flex gap-2 items-end">
-          <textarea
-            placeholder={
-              phase === 'analyzed'
-                ? "Send feedback to re-analyze — e.g. 'Check the auth middleware'"
-                : "Add context — e.g. 'This started after the auth migration'"
-            }
-            value={contextInput}
-            onChange={(e) => {
-              setContextInput(e.target.value)
-              e.target.style.height = 'auto'
-              e.target.style.height = e.target.scrollHeight + 'px'
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                onSendContext()
-              }
-            }}
-            rows={1}
-            className="flex-1 rounded-md border border-border bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary resize-none overflow-hidden"
-            disabled={isSendingContext}
-          />
-          <Button
-            size="sm"
-            aria-label="Send context"
-            onClick={onSendContext}
-            disabled={!contextInput.trim() || isSendingContext}
-          >
-            {isSendingContext ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Send className="h-4 w-4" />
-            )}
-          </Button>
-        </div>
-      )}
-    </>
+    <LegacyAutofixNotice errorGroupId={run.trigger_source_id} />
   ) : null
 
   // ── Tab contents ──────────────────────────────────────────────────────
@@ -1878,34 +1639,6 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           </TabsContent>
         </Tabs>
       </div>
-
-      {/* Retry / start-over config dialog (autofixer runs). Prefilled from
-          this run's stored config; notes become the new run's user context. */}
-      <Dialog open={showRetryConfig} onOpenChange={setShowRetryConfig}>
-        <DialogContent className="sm:max-w-xl">
-          <DialogHeader>
-            <DialogTitle>Start a new autofix run</DialogTitle>
-            <DialogDescription>
-              Adjust the harness, model, turn limit, or branch — and tell the
-              model what to do differently this time.
-            </DialogDescription>
-          </DialogHeader>
-          {run.trigger_source_id != null && (
-            <AutofixRunConfigForm
-              project={project}
-              errorGroupId={run.trigger_source_id}
-              initialConfig={run.run_config}
-              notesPlaceholder="Notes for this retry — e.g. what went wrong last time, or where to focus..."
-              submitLabel="Start New Run"
-              onStarted={(newRunId) => {
-                setShowRetryConfig(false)
-                navigate(`../agents/${newRunId}`)
-              }}
-              onCancel={() => setShowRetryConfig(false)}
-            />
-          )}
-        </DialogContent>
-      </Dialog>
     </div>
   )
 }

@@ -73,6 +73,7 @@ impl IngressConnectorService {
             .into_iter()
             .filter(|id| !also_on_workers.contains(id));
         let stale = live_connectors(
+            &self.registry,
             ingress_connectors::Entity::find()
                 .filter(ingress_connectors::Column::Id.is_in(only_on_control_plane))
                 .filter(ingress_connectors::Column::EdgePort.ne(i32::from(port)))

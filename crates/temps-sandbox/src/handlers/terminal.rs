@@ -967,6 +967,10 @@ fn attach_failure_problem(
         | AgentError::AiCliFailed { .. }
         | AgentError::AiCliReportedError { .. }
         | AgentError::AiCliTimeout { .. }
+        | AgentError::AgentModelFailed { .. }
+        | AgentError::AgentTimedOut { .. }
+        | AgentError::AgentWroteNoReport { .. }
+        | AgentError::AgentReportUnfinished { .. }
         | AgentError::GitError { .. }
         | AgentError::EncryptionError { .. }
         | AgentError::SecretNotFound { .. }

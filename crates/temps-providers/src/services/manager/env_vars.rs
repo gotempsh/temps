@@ -204,11 +204,31 @@ impl ExternalServiceManager {
             })
     }
 
+    /// The variables a deployment of `project_id` in `environment_id` gets
+    /// from linked service `service_id_val`, plus the link's aliases
+    /// (`DATABASE_URL` for `POSTGRES_URL`; see [`super::link_env_aliases`]).
     pub async fn get_runtime_env_vars(
         &self,
         service_id_val: i32,
         project_id: i32,
         environment_id: i32,
+    ) -> Result<HashMap<String, String>, ExternalServiceError> {
+        let mut aliases = std::collections::BTreeMap::new();
+        let mut vars = self
+            .runtime_env_vars_for_link(service_id_val, project_id, environment_id, &mut aliases)
+            .await?;
+        super::link_env_aliases::apply_env_aliases(&mut vars, &aliases, service_id_val, project_id);
+        Ok(vars)
+    }
+
+    /// [`Self::get_runtime_env_vars`] before aliases; fills `aliases` from
+    /// the link it already reads.
+    async fn runtime_env_vars_for_link(
+        &self,
+        service_id_val: i32,
+        project_id: i32,
+        environment_id: i32,
+        aliases: &mut std::collections::BTreeMap<String, String>,
     ) -> Result<HashMap<String, String>, ExternalServiceError> {
         // Get service
         let service = self.get_service(service_id_val).await?;
@@ -233,6 +253,7 @@ impl ExternalServiceManager {
             service_id: service_id_val,
             project_id,
         })?;
+        *aliases = super::link_env_aliases::stored_env_aliases(&link.env_aliases);
         let provisioning = DatabaseProvisioningConfig::from_link(&link)?;
 
         // Resolve the environment inside the authorized project before
@@ -1446,6 +1467,7 @@ mod tests {
             service_id: 11,
             database_provisioning_mode: "project_environment".to_string(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1494,6 +1516,7 @@ mod tests {
             service_id: 71,
             database_provisioning_mode: "project_environment".to_string(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

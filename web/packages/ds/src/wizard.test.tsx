@@ -34,6 +34,9 @@ describe('Wizard', () => {
       'aria-current="step" aria-label="Select repository"'
     )
     expect(markup).toContain('Where code lives')
+    // Unboxed, and in a narrow column only the current step is named on screen.
+    expect(markup).not.toMatch(/<ol[^>]*rounded-lg border/)
+    expect(markup.match(/@max-3xl:sr-only/g)).toHaveLength(steps.length - 1)
     expect(markup).toContain('Help')
     expect(markup).toContain('name="repository"')
   })

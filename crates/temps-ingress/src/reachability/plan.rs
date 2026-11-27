@@ -61,17 +61,17 @@ use temps_core::gate::GateKind;
 
 use super::access::{AccessApp, AccessPolicyAnswer};
 use super::compute::{
-    is_local_only, tailnet_worker_problem, ControlPlaneHost, DirectIngress, INGRESS_SETUP_PATH,
-    PRIVATE_COMMAND, TAILNET_REPORT_STALE_MINUTES,
+    is_local_only, ControlPlaneHost, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND,
+    TAILNET_REPORT_STALE_MINUTES,
 };
 use super::edge_rules::{below_free_certificate, EdgeRulePurpose, HttpPolicy};
 use super::model::{
     ActionKind, AddressAudience, Audience, AudienceChoice, PlanBlocked, PlanOption, PlanOptionKind,
-    PlanStep, PlannedRecord, ReachAction, ReachabilityPlan, StepKind, WayInChoice,
+    PlanStep, PlannedRecord, ReachAction, ReachabilityPlan, ServiceDefinition, StepKind,
+    WayInChoice,
 };
-use crate::registry::{FieldChoice, FieldKind, SetupField};
+use crate::registry::{FieldChoice, FieldKind, ProviderRegistry, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
-use crate::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 
 /// Field keys of the apply request.
 pub const FIELD_ADDRESS: &str = "address";
@@ -178,6 +178,9 @@ pub struct PrivateWorkerFact {
     pub tailscale: bool,
     /// Why the listener is not running, as the worker reported it.
     pub error: Option<String>,
+    /// The ranges the listener admits (ADR-115 D8), `10.8.0.0/24`; `None`
+    /// from agents that predate it.
+    pub admit: Option<String>,
 }
 
 /// A worker's tailscaled as its agent last reported it (ADR 065 D2).
@@ -228,6 +231,15 @@ impl PrivateWorkerFact {
     pub fn ready(&self) -> Option<std::net::IpAddr> {
         self.listener.filter(|_| self.error.is_none())
     }
+
+    /// The range an address served by this listener at `ip` admits: what
+    /// the listener reports, or for an agent that predates it, the
+    /// listener's private block.
+    pub fn range(&self, ip: std::net::IpAddr) -> Option<String> {
+        self.admit
+            .clone()
+            .or_else(|| temps_core::worker_ingress::private_block(ip).map(str::to_string))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -249,6 +261,9 @@ pub struct PlanFacts {
     pub attached_here: Vec<String>,
     /// Custom domains of every other environment.
     pub taken_elsewhere: HashSet<String>,
+    /// The console's host and the public ingress host: never an app's
+    /// address (ADR-115 D5), whatever its audience.
+    pub platform_hosts: Vec<String>,
     pub tunnels: Vec<TunnelFact>,
     pub zones: Vec<ZoneFact>,
     /// Active Cloudflare DNS providers.
@@ -273,6 +288,11 @@ pub struct PlanFacts {
     pub workers_refusing: Vec<String>,
     /// Whether workers serve the environment, so a tunnel can carry it.
     pub served_by_workers: bool,
+    /// Every container of the current deployment runs on a worker, whether
+    /// or not any of its hostnames is public there.
+    pub on_workers: bool,
+    /// At least one container of the current deployment runs on a worker.
+    pub some_on_workers: bool,
     /// Which tunnel would publish each hostname asked about (ADR 058 D9).
     pub intents: HashMap<String, PublicationIntent>,
     /// An IP allow list of only private ranges governing the environment,
@@ -402,6 +422,10 @@ pub fn planned_address(facts: &PlanFacts) -> Result<Option<String>, String> {
                 "{host} only resolves to the computer it is opened on. Use a hostname on a \
                  domain you own."
             )),
+            Ok(host) if facts.platform_hosts.contains(&host) => Err(format!(
+                "{host} is this Temps console's own address, and an app is never served there. \
+                 Use another hostname."
+            )),
             Ok(host) if facts.taken_elsewhere.contains(&host) => Err(format!(
                 "{host} is already attached to another environment. Remove it there first, or \
                  use another hostname."
@@ -418,11 +442,13 @@ type AppIds<'a> = Vec<(&'a str, &'a str)>;
 
 /// The address the plan for `facts.audience` is for: what the stored plan
 /// records and the fingerprint covers.
-pub fn address_for_audience(facts: &PlanFacts) -> Result<Option<String>, String> {
-    if facts.audience.is_private() {
-        planned_private_address(facts)
-    } else {
-        planned_address(facts)
+pub fn address_for_audience(
+    facts: &PlanFacts,
+    providers: &ProviderRegistry,
+) -> Result<Option<String>, String> {
+    match providers.planner(facts.audience) {
+        Some(planner) => planner.address(facts),
+        None => planned_address(facts),
     }
 }
 
@@ -457,10 +483,13 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     let intent = address.map(|a| intent_of(facts, a));
     let mut records = facts.dns_records.clone();
     records.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    // The admitted ranges too: they become the address's range on apply, so
+    // a listener that broadens (or narrows) who it admits since planning
+    // must not apply a range the operator never saw.
     let mut private_workers: Vec<_> = facts
         .private_workers
         .iter()
-        .map(|w| (w.id, w.listener, w.tailscale, w.error.is_some()))
+        .map(|w| (w.id, w.listener, w.tailscale, w.error.is_some(), &w.admit))
         .collect();
     private_workers.sort();
     let mut ranges = facts.private_ranges.clone();
@@ -573,6 +602,15 @@ pub struct TunnelRoute<'a> {
     pub route: bool,
     /// Set with `route`: what the choice changes, for the user to confirm.
     pub confirmation: Option<String>,
+}
+
+/// Whether the environment's current deployment runs on the control plane,
+/// so only node 0 can serve it privately (ADR-115 D6). Where it runs, not
+/// which of its hostnames workers publish: a worker deployment whose last
+/// public hostname went private still runs on its worker.
+/// A deployment with replicas on both runs on its workers (ADR-115 D1).
+pub fn runs_on_control_plane(facts: &PlanFacts) -> bool {
+    facts.deployed && !facts.on_workers && !facts.some_on_workers && !facts.served_by_workers
 }
 
 /// Whether `tunnel` can carry this environment: ready, running somewhere,
@@ -812,7 +850,7 @@ pub fn unique_tunnel_name(domain: &str, taken: &[String]) -> String {
 }
 
 /// The first label of a suggested address.
-fn suggested_label(facts: &PlanFacts) -> String {
+pub(crate) fn suggested_label(facts: &PlanFacts) -> String {
     let project = facts.project_slug.to_ascii_lowercase();
     let env = facts.environment_slug.to_ascii_lowercase();
     if matches!(env.as_str(), "production" | "prod" | "main" | "") {
@@ -820,6 +858,15 @@ fn suggested_label(facts: &PlanFacts) -> String {
     } else {
         format!("{project}-{env}")
     }
+}
+
+/// Whether `host` is the console's or the public ingress's own address,
+/// which an app is never served at: never suggested, as it is refused.
+pub(crate) fn is_platform_host(facts: &PlanFacts, host: &str) -> bool {
+    facts
+        .platform_hosts
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(host))
 }
 
 /// An address under a domain the cluster already has, preferring a tunnel's,
@@ -840,7 +887,9 @@ pub fn suggest_address(facts: &PlanFacts) -> Option<String> {
         .chain(zones)
         .map(|domain| format!("{label}.{domain}"))
         .find(|candidate| {
-            !facts.taken_elsewhere.contains(candidate) && !facts.attached_here.contains(candidate)
+            !facts.taken_elsewhere.contains(candidate)
+                && !facts.attached_here.contains(candidate)
+                && !is_platform_host(facts, candidate)
         })
 }
 
@@ -969,7 +1018,7 @@ fn provider_field() -> SetupField {
     }
 }
 
-fn step(kind: StepKind, label: impl Into<String>) -> PlanStep {
+pub(crate) fn step(kind: StepKind, label: impl Into<String>) -> PlanStep {
     PlanStep {
         kind,
         label: label.into(),
@@ -1256,15 +1305,14 @@ fn tunnel_into_private_rule(
 /// the ways in it offers. Stores nothing. A `tailnet_users` audience is
 /// judged before anyone is listed: on whether any way in can tell who a
 /// visitor is.
-pub fn choice(facts: &PlanFacts) -> AudienceChoice {
+pub fn choice(facts: &PlanFacts, providers: &ProviderRegistry) -> AudienceChoice {
     let unasked = PlanFacts {
         requested: None,
         ..facts.clone()
     };
-    let planned = if unasked.audience == Audience::TailnetUsers && unasked.principals.is_empty() {
-        tailnet_users_ways(&unasked)
-    } else {
-        plan(&unasked)
+    let planned = match providers.planner(unasked.audience) {
+        Some(planner) => planner.choice_plan(&unasked),
+        None => plan(&unasked, providers),
     };
     let available = !planned.options.is_empty();
     // A way in left out while another still fits, said where the user
@@ -1308,8 +1356,27 @@ pub fn choice(facts: &PlanFacts) -> AudienceChoice {
     }
 }
 
+/// A provider's part of planning (ADR-117 D3): the audiences it plans
+/// whole, for the ways in only it offers there. The first registered
+/// provider that plans an audience plans it; offering two providers' ways
+/// in side by side arrives with the second provider that needs it.
+pub trait ProviderPlan: Send + Sync {
+    /// Whether it plans addresses for `audience`.
+    fn plans(&self, audience: Audience) -> bool;
+    /// The address a plan for `facts.audience` is for: as asked, else a
+    /// suggestion. `Err` with why the address asked for cannot be used.
+    fn address(&self, facts: &PlanFacts) -> Result<Option<String>, String>;
+    /// The plan for `facts`.
+    fn plan(&self, facts: &PlanFacts) -> ReachabilityPlan;
+    /// What [`choice`] reduces to the ways in offered, before an address
+    /// is asked for.
+    fn choice_plan(&self, facts: &PlanFacts) -> ReachabilityPlan {
+        self.plan(facts)
+    }
+}
+
 /// The plan for `facts`.
-pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
+pub fn plan(facts: &PlanFacts, providers: &ProviderRegistry) -> ReachabilityPlan {
     let mut blocked_reasons: Vec<PlanBlocked> = Vec::new();
     let gate = (facts.audience == Audience::SignedIn).then_some(facts.gate);
     let empty = |audience, address, address_error, blocked| ReachabilityPlan {
@@ -1333,11 +1400,28 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     {
         return empty(facts.audience, facts.requested.clone(), None, blocked);
     }
-    if facts.audience == Audience::Private {
-        return plan_private(facts);
+    // An audience a provider plans whole (ADR-117 D3).
+    if let Some(planner) = providers.planner(facts.audience) {
+        return planner.plan(facts);
     }
-    if facts.audience == Audience::TailnetUsers {
-        return plan_tailnet_users(facts);
+    // Without one, a private address can still use a worker's own private
+    // listener (ADR 064 D5).
+    if facts.audience == Audience::Private {
+        let ask_address = facts
+            .requested
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty());
+        return match planned_address(facts) {
+            Ok(address) => plan_listener(facts, address, ask_address),
+            Err(error) => private_blocked(
+                facts.requested.clone(),
+                Some(error.clone()),
+                PlanBlocked {
+                    reason: error,
+                    action: None,
+                },
+            ),
+        };
     }
     if !matches!(facts.audience, Audience::Public | Audience::SignedIn) {
         return empty(
@@ -2484,7 +2568,7 @@ pub fn becomes_public(facts: &PlanFacts, host: &str) -> Option<String> {
 }
 
 /// A private plan that offers nothing, and why.
-fn private_blocked(
+pub(crate) fn private_blocked(
     address: Option<String>,
     address_error: Option<String>,
     blocked: PlanBlocked,
@@ -2503,731 +2587,9 @@ fn private_blocked(
     }
 }
 
-/// What a private address is as a tailnet name (ADR 065 D1).
-enum TailnetName<'a> {
-    /// A worker's own name.
-    Machine(&'a TailnetWorkerFact),
-    /// Under a tailnet, and no machine's name: only a Service gives it.
-    UnderTailnet,
-    Other,
-}
-
-fn tailnet_name<'a>(facts: &'a PlanFacts, host: &str) -> TailnetName<'a> {
-    let host = temps_core::tailnet::normalize_name(host);
-    if let Some(worker) = facts
-        .tailnet_workers
-        .iter()
-        .find(|w| w.report.dns_name.as_deref() == Some(host.as_str()))
-    {
-        return TailnetName::Machine(worker);
-    }
-    let under = |suffix: &str| host.ends_with(&format!(".{suffix}"));
-    if under("ts.net")
-        || facts
-            .tailnet_workers
-            .iter()
-            .filter_map(|w| w.report.tailnet.as_deref())
-            .any(under)
-    {
-        TailnetName::UnderTailnet
-    } else {
-        TailnetName::Other
-    }
-}
-
-/// Workers whose owner allowed Tailscale Serve, the one the environment
-/// runs on first.
-fn serve_candidates(facts: &PlanFacts) -> Vec<&TailnetWorkerFact> {
-    let mut workers: Vec<&TailnetWorkerFact> = facts
-        .tailnet_workers
-        .iter()
-        .filter(|w| w.report.consent)
-        .collect();
-    workers.sort_by_key(|w| Some(&w.name) != facts.suggested_private_worker.as_ref());
-    workers
-}
-
-/// Why `worker` cannot serve its machine name for this app now, with what
-/// fixes it (ADR 065 D5's messages), in the order the agent decides them.
-pub fn machine_name_problem(
-    facts: &PlanFacts,
-    worker: &TailnetWorkerFact,
-) -> Option<(String, Option<ReachAction>)> {
-    let node = worker.name.as_str();
-    let report = &worker.report;
-    if let Some(problem) = tailnet_worker_problem(node, report, worker.minutes_ago) {
-        return Some(problem);
-    }
-    let name = report.dns_name.clone().unwrap_or_default();
-    let problem = |message: String| Some((message, None));
-    if let Some(listener) = worker.listener_on_tailscale {
-        return problem(format!(
-            "{}.",
-            tailnet_messages::listener_exclusive(node, &listener.to_string())
-        ));
-    }
-    if let Some(held_by) = &report.port_443_held_by {
-        return problem(tailnet_messages::slot_taken(&name, held_by));
-    }
-    if report.port_443_funnel {
-        return problem(tailnet_messages::funnel(node));
-    }
-    if facts
-        .serve_entries
-        .iter()
-        .any(|e| e.node_id == worker.id && e.hostname == name && e.removing)
-    {
-        return problem(format!(
-            "An earlier setup of `{name}` is still being taken off {node}'s Serve config. Try \
-             again in a minute."
-        ));
-    }
-    None
-}
-
-/// Why `worker` cannot host a Tailscale Service now (ADR 065 D5): what
-/// keeps tailscaled from serving at all, then a device with no tag.
-pub fn service_host_problem(worker: &TailnetWorkerFact) -> Option<(String, Option<ReachAction>)> {
-    let node = worker.name.as_str();
-    let report = &worker.report;
-    if let Some(problem) = tailnet_worker_problem(node, report, worker.minutes_ago) {
-        return Some(problem);
-    }
-    if report.tags.is_empty() {
-        let machine = report.dns_name.clone().unwrap_or_default();
-        return Some((
-            tailnet_messages::not_tagged(
-                node,
-                report.login.as_deref().unwrap_or("a user"),
-                &machine,
-            ),
-            Some(
-                ReachAction::new(ActionKind::RunCommand, format!("On {node}, as root, run"))
-                    .with_command(format!(
-                        "sudo tailscale up --advertise-tags={}",
-                        tailscale::DEFAULT_TAG
-                    )),
-            ),
-        ));
-    }
-    None
-}
-
-/// The tag a Service on `worker` is for: `tag:temps` when the worker has
-/// it, else its first (ADR 065 D4).
-pub fn service_tag(worker: &TailnetWorkerFact) -> String {
-    let tags = &worker.report.tags;
-    tags.iter()
-        .find(|t| t.as_str() == tailscale::DEFAULT_TAG)
-        .or_else(|| tags.first())
-        .cloned()
-        .unwrap_or_else(|| tailscale::DEFAULT_TAG.to_string())
-}
-
-/// The Service `host` names, with its tailnet: one valid label directly
-/// under the MagicDNS suffix of a worker that reports one, and not a
-/// machine's name. `myapp.example.ts.net` → `(svc:myapp, example.ts.net)`.
-pub fn service_of(facts: &PlanFacts, host: &str) -> Option<(String, String)> {
-    let host = temps_core::tailnet::normalize_name(host);
-    if facts
-        .tailnet_workers
-        .iter()
-        .any(|w| w.report.dns_name.as_deref() == Some(host.as_str()))
-    {
-        return None;
-    }
-    facts
-        .tailnet_workers
-        .iter()
-        .filter_map(|w| w.report.tailnet.as_deref())
-        .find_map(|tailnet| {
-            let label = host.strip_suffix(&format!(".{tailnet}"))?;
-            temps_core::tailnet::valid_service_label(label)
-                .then(|| (tailscale::service_name(label), tailnet.to_string()))
-        })
-}
-
-/// The worker that hosts a Service on `tailnet`: one whose owner allowed
-/// Serve and that can host one now, the environment's first.
-pub fn service_worker<'a>(facts: &'a PlanFacts, tailnet: &str) -> Option<&'a TailnetWorkerFact> {
-    serve_candidates(facts)
-        .into_iter()
-        .filter(|w| w.report.tailnet.as_deref() == Some(tailnet))
-        .find(|w| service_host_problem(w).is_none())
-}
-
-/// The cluster's credential, when a run can use it.
-fn usable_credential(facts: &PlanFacts) -> Option<&TailscaleCredentialFact> {
-    facts
-        .tailscale_credential
-        .as_ref()
-        .filter(|c| c.refusal.is_none())
-}
-
-/// A Service address for this app on the first tailnet with a worker that
-/// can host one: `<project>-<environment>.<tailnet>` (ADR 065 D1).
-fn suggested_service_address(facts: &PlanFacts) -> Option<String> {
-    let label = suggested_label(facts);
-    if !temps_core::tailnet::valid_service_label(&label) {
-        return None;
-    }
-    serve_candidates(facts)
-        .into_iter()
-        .filter(|w| service_host_problem(w).is_none())
-        .filter_map(|w| w.report.tailnet.as_deref())
-        .map(|tailnet| format!("{label}.{tailnet}"))
-        .find(|c| !facts.taken_elsewhere.contains(c))
-}
-
-/// The address a private plan is for: as asked, else in ADR 065 D1's
-/// order a Service when the cluster has a usable Tailscale credential, the
-/// name of a worker that can serve it through Tailscale Serve, one under a
-/// zone Temps manages (which a listener needs for its record and its DNS-01
-/// certificate), and last a Service after pasting a credential.
-pub fn planned_private_address(facts: &PlanFacts) -> Result<Option<String>, String> {
-    if facts
-        .requested
-        .as_deref()
-        .is_some_and(|r| !r.trim().is_empty())
-    {
-        return planned_address(facts);
-    }
-    let free = |c: &String| !facts.taken_elsewhere.contains(c);
-    if usable_credential(facts).is_some() {
-        if let Some(address) = suggested_service_address(facts) {
-            return Ok(Some(address));
-        }
-    }
-    if let Some(name) = serve_candidates(facts)
-        .into_iter()
-        .filter(|w| machine_name_problem(facts, w).is_none())
-        .filter_map(|w| w.report.dns_name.clone())
-        .find(free)
-    {
-        return Ok(Some(name));
-    }
-    let label = suggested_label(facts);
-    if let Some(address) = facts
-        .zones
-        .iter()
-        .filter(|z| z.verified)
-        .map(|z| format!("{label}.{}", z.domain.trim_end_matches('.')))
-        .find(|c| free(c) && !facts.attached_here.contains(c))
-    {
-        return Ok(Some(address));
-    }
-    Ok(suggested_service_address(facts))
-}
-
-/// The plan for a private address: a worker's own tailnet name through
-/// Tailscale Serve (ADR 065 D1), or its private listener (ADR 064 D5).
-fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
-    let ask_address = facts
-        .requested
-        .as_deref()
-        .is_none_or(|r| r.trim().is_empty());
-    let address = match planned_private_address(facts) {
-        Ok(address) => address,
-        Err(error) => {
-            return private_blocked(
-                facts.requested.clone(),
-                Some(error.clone()),
-                PlanBlocked {
-                    reason: error,
-                    action: None,
-                },
-            )
-        }
-    };
-    match address.as_deref().map(|a| tailnet_name(facts, a)) {
-        Some(TailnetName::Machine(worker)) => plan_machine_name(facts, worker, address.clone()),
-        Some(TailnetName::UnderTailnet)
-            if address
-                .as_deref()
-                .is_some_and(|a| service_of(facts, a).is_some()) =>
-        {
-            plan_service(facts, address.clone())
-        }
-        Some(TailnetName::UnderTailnet) => {
-            let reason = tailnet_messages::service_only(address.as_deref().unwrap_or_default());
-            private_blocked(
-                address,
-                None,
-                PlanBlocked {
-                    reason,
-                    action: None,
-                },
-            )
-        }
-        Some(TailnetName::Other) | None => {
-            let listener = plan_listener(facts, address, ask_address);
-            // Nothing asked for and no listener fits: a worker that allowed
-            // Serve says what keeps its name from working instead.
-            if listener.options.is_empty() && ask_address {
-                if let Some((reason, action)) = serve_candidates(facts)
-                    .first()
-                    .and_then(|w| machine_name_problem(facts, w))
-                {
-                    return private_blocked(listener.address, None, PlanBlocked { reason, action });
-                }
-            }
-            listener
-        }
-    }
-}
-
-/// The plan for `tailnet_users` (ADR 065 D6): a private plan, kept to the
-/// ways in that can tell who a visitor is, on agents that check it.
-fn plan_tailnet_users(facts: &PlanFacts) -> ReachabilityPlan {
-    if facts.principals.is_empty() {
-        return tailnet_users_blocked(
-            facts,
-            facts.requested.clone(),
-            tailnet_messages::NO_PRINCIPALS.to_string(),
-            None,
-        );
-    }
-    tailnet_users_ways(facts)
-}
-
-fn tailnet_users_blocked(
-    facts: &PlanFacts,
-    address: Option<String>,
-    reason: String,
-    action: Option<ReachAction>,
-) -> ReachabilityPlan {
-    let mut plan = private_blocked(address, None, PlanBlocked { reason, action });
-    plan.audience = Audience::TailnetUsers;
-    plan.principals = facts.principals.clone();
-    plan
-}
-
-/// The ways in a `tailnet_users` plan keeps, whoever is listed: those that
-/// can tell who a visitor is, on agents that check it. [`choice`] calls it
-/// before anyone is listed; a plan to apply goes through
-/// [`plan_tailnet_users`], which refuses an empty list.
-fn tailnet_users_ways(facts: &PlanFacts) -> ReachabilityPlan {
-    let blocked = |address: Option<String>, reason: String, action: Option<ReachAction>| {
-        tailnet_users_blocked(facts, address, reason, action)
-    };
-    let mut planned = plan_private(facts);
-    planned.audience = Audience::TailnetUsers;
-    planned.principals = facts.principals.clone();
-    let who = AddressAudience {
-        audience: Audience::TailnetUsers,
-        principals: facts.principals.clone(),
-        ..AddressAudience::default()
-    }
-    .describe();
-    let listed = facts
-        .principals
-        .iter()
-        .map(|p| p.value.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let shown = planned
-        .address
-        .clone()
-        .unwrap_or_else(|| "the address".to_string());
-    let mut refusals: Vec<(String, Option<ReachAction>)> = Vec::new();
-    planned.options.retain_mut(|option| {
-        let node = option
-            .way_in
-            .strip_prefix("private:")
-            .unwrap_or_default()
-            .to_string();
-        if option.kind == PlanOptionKind::PrivateWorker {
-            let Some((worker, ip)) = private_worker(facts) else {
-                return false;
-            };
-            // D6: whois answers only for Tailscale peers, and asking it
-            // needs the worker owner's consent.
-            if !worker.tailscale {
-                refusals.push((tailnet_messages::users_need_tailnet(&ip.to_string()), None));
-                return false;
-            }
-            let consent = facts
-                .tailnet_workers
-                .iter()
-                .any(|w| w.id == worker.id && w.report.consent);
-            if !consent {
-                refusals.push((
-                    tailnet_messages::users_need_consent(&worker.name),
-                    Some(
-                        ReachAction::new(
-                            ActionKind::RunCommand,
-                            format!("On {}, as root, run", worker.name),
-                        )
-                        .with_command(temps_core::tailnet::TAILSCALE_SERVE_COMMAND),
-                    ),
-                ));
-                return false;
-            }
-        }
-        if !facts.identity_workers.contains(&node) {
-            refusals.push((
-                format!(
-                    "{shown} admits only listed tailnet users, and the agent on `{node}` cannot \
-                     check who they are. Update the agent on `{node}`, then plan again."
-                ),
-                None,
-            ));
-            return false;
-        }
-        for step in &mut option.steps {
-            if step.kind == StepKind::SetAudience {
-                step.label = format!("Make {shown} private to your tailnet, {who}");
-            }
-        }
-        option.warnings.insert(
-            0,
-            format!(
-                "Only {listed} can open {shown}. Anyone else on your tailnet gets a page that \
-                 says it admits only listed tailnet users. Changing who is listed needs a \
-                 recent password or passkey confirmation."
-            ),
-        );
-        true
-    });
-    for (index, option) in planned.options.iter_mut().enumerate() {
-        option.recommended = index == 0;
-    }
-    if planned.options.is_empty() && planned.blocked.is_none() {
-        let (reason, action) = refusals.into_iter().next().unwrap_or_else(|| {
-            (
-                "No way in that can tell who a tailnet visitor is is available.".to_string(),
-                None,
-            )
-        });
-        return blocked(planned.address.clone(), reason, action);
-    }
-    planned
-}
-
-/// The plan for a worker's own tailnet name (ADR 065 D1 option 3):
-/// tailscaled serves it and gets its certificate, so nothing is written to
-/// DNS or `domains`.
-fn plan_machine_name(
-    facts: &PlanFacts,
-    worker: &TailnetWorkerFact,
-    address: Option<String>,
-) -> ReachabilityPlan {
-    let blocked = |reason: String, action: Option<ReachAction>| {
-        private_blocked(address.clone(), None, PlanBlocked { reason, action })
-    };
-    if facts.deployed && !facts.served_by_workers {
-        return blocked(
-            format!(
-                "{} runs on the control plane, and a tailnet name is served by a worker, which \
-                 only carries what workers serve. Deploy it to a worker first.",
-                facts.environment_name
-            ),
-            None,
-        );
-    }
-    if let Some((reason, action)) = machine_name_problem(facts, worker) {
-        return blocked(reason, action);
-    }
-    let node = worker.name.as_str();
-    let name = address.clone().unwrap_or_default();
-    let attached = facts.attached_here.contains(&name);
-    let mut warnings = vec![
-        tailnet_messages::machine_name_cost(&name, node),
-        format!(
-            "Tailscale's certificate for `{name}` is in public certificate logs, so the name is \
-             no longer secret. Only devices on your tailnet can connect to it."
-        ),
-    ];
-    if attached
-        && facts
-            .audiences
-            .iter()
-            .any(|(a, au)| a == &name && *au == Audience::Public)
-    {
-        warnings.push(format!(
-            "{name} is public now. This makes it private: only devices on your tailnet can open \
-             it, and anyone else who uses it loses access. It needs a recent password or \
-             passkey confirmation."
-        ));
-    }
-    if !facts.deployed {
-        warnings.push(format!(
-            "Nothing is deployed to {} yet: it answers once a deployment runs on a worker.",
-            facts.environment_name
-        ));
-    }
-    let option = PlanOption {
-        kind: PlanOptionKind::TailscaleServe,
-        title: format!("Only my tailnet, at {name}"),
-        description: format!(
-            "{node} serves {name}, its own name in your tailnet, with Tailscale Serve: only \
-             devices on your tailnet can open it, Tailscale gives it its certificate, and no DNS \
-             record is added anywhere."
-        ),
-        actions: 1,
-        recommended: true,
-        way_in: format!("private:{node}"),
-        steps: vec![
-            step(
-                StepKind::AttachDomain,
-                if attached {
-                    format!("{name} is already on {}", facts.environment_name)
-                } else {
-                    format!("Attach {name} to {}", facts.environment_name)
-                },
-            ),
-            step(
-                StepKind::SetAudience,
-                format!("Make {name} private to your tailnet on {node}"),
-            ),
-            step(
-                StepKind::ConfigureTailscaleServe,
-                format!("Have {node} serve {name} with Tailscale Serve"),
-            ),
-            step(
-                StepKind::CheckReachability,
-                format!("Check {name} from {node} and from outside"),
-            ),
-        ],
-        fields: Vec::new(),
-        warnings,
-        confirmation: None,
-        required_permissions: permissions_for(PlanOptionKind::TailscaleServe)
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-    };
-    ReachabilityPlan {
-        plan_id: None,
-        fingerprint: None,
-        expires_at: None,
-        audience: Audience::Private,
-        address,
-        address_error: None,
-        options: vec![option],
-        blocked: None,
-        gate: None,
-        principals: Vec::new(),
-    }
-}
-
-/// The plan for the app's own name in the tailnet, a Tailscale Service
-/// (ADR 065 D1 options 1, 2 and 4): tailscaled on a tagged worker serves it
-/// and gets its certificate, the Service is created through the API only
-/// when absent, and the tailnet admin approves the host.
-fn plan_service(facts: &PlanFacts, address: Option<String>) -> ReachabilityPlan {
-    let blocked = |reason: String, action: Option<ReachAction>| {
-        private_blocked(address.clone(), None, PlanBlocked { reason, action })
-    };
-    let name = address.clone().unwrap_or_default();
-    let Some((service, tailnet)) = service_of(facts, &name) else {
-        return blocked(tailnet_messages::service_only(&name), None);
-    };
-    if facts.deployed && !facts.served_by_workers {
-        return blocked(
-            format!(
-                "{} runs on the control plane, and a tailnet name is served by a worker, which \
-                 only carries what workers serve. Deploy it to a worker first.",
-                facts.environment_name
-            ),
-            None,
-        );
-    }
-    let Some(worker) = service_worker(facts, &tailnet) else {
-        // Say what keeps the likeliest worker from hosting it.
-        let on_tailnet: Vec<&TailnetWorkerFact> = serve_candidates(facts)
-            .into_iter()
-            .filter(|w| w.report.tailnet.as_deref() == Some(tailnet.as_str()))
-            .collect();
-        return match on_tailnet.first().and_then(|w| service_host_problem(w)) {
-            Some((reason, action)) => blocked(reason, action),
-            None => blocked(
-                format!(
-                    "No worker on tailnet {tailnet} lets Temps use its Tailscale. Run `{}` on \
-                     the worker that should serve {name}.",
-                    temps_core::tailnet::TAILSCALE_SERVE_COMMAND
-                ),
-                None,
-            ),
-        };
-    };
-    if facts
-        .serve_entries
-        .iter()
-        .any(|e| e.node_id == worker.id && e.hostname == name && e.removing)
-    {
-        return blocked(
-            format!(
-                "An earlier setup of `{name}` is still being taken off {}'s Serve config. Try \
-                 again in a minute.",
-                worker.name
-            ),
-            None,
-        );
-    }
-    let node = worker.name.as_str();
-    let tag = service_tag(worker);
-    let (kind, fields) = match &facts.tailscale_credential {
-        Some(credential) => match &credential.refusal {
-            Some(refusal) => return blocked(refusal.clone(), None),
-            None => (PlanOptionKind::TailscaleService, Vec::new()),
-        },
-        None => (
-            PlanOptionKind::TailscaleServiceWithCredential,
-            TailscaleFactory::fields(),
-        ),
-    };
-    // ADR 065 D4: create only when absent; this install's own is found.
-    let found = match facts.service_seen.as_ref().filter(|(s, _)| *s == service) {
-        Some((_, ServiceSeen::Unreadable(error))) => {
-            return blocked(
-                format!("Temps could not read `{service}` from your tailnet: {error}"),
-                None,
-            )
-        }
-        Some((_, ServiceSeen::Found(definition))) => {
-            match tailscale::ownership(definition, &facts.install_id) {
-                Ownership::Foreign => {
-                    return blocked(tailnet_messages::service_taken(&service), None)
-                }
-                Ownership::Ours { .. } => {
-                    if let Some(why) = definition.differs_from_fixed(&tag) {
-                        return blocked(
-                            format!(
-                                "{why}. Temps never changes a Service, so it cannot use it as it \
-                                 is: put it back, or pick another name."
-                            ),
-                            None,
-                        );
-                    }
-                    true
-                }
-            }
-        }
-        Some((_, ServiceSeen::Absent)) | None => false,
-    };
-    let attached = facts.attached_here.contains(&name);
-    let mut warnings = vec![
-        format!(
-            "The tailnet admin approves {node} as the host of `{service}`, at \
-             login.tailscale.com/admin/services, or once for every setup with this policy entry: \
-             {}. Temps waits for it and never approves hosts itself.",
-            tailscale::auto_approvers_snippet(&service, &tag)
-        ),
-        format!(
-            "Tailscale's certificate for `{name}` is in public certificate logs, so the name is \
-             no longer secret. Only devices on your tailnet can connect to it."
-        ),
-    ];
-    if kind == PlanOptionKind::TailscaleServiceWithCredential {
-        warnings.push(
-            "The OAuth client's `services` scope is tailnet-wide: whoever holds its secret can \
-             create, change and delete every Service in your tailnet. Temps seals it, never shows \
-             it again, and asks for `services` and `devices:core:read` only."
-                .to_string(),
-        );
-    }
-    if attached
-        && facts
-            .audiences
-            .iter()
-            .any(|(a, au)| a == &name && *au == Audience::Public)
-    {
-        warnings.push(format!(
-            "{name} is public now. This makes it private: only devices on your tailnet can open \
-             it, and anyone else who uses it loses access. It needs a recent password or \
-             passkey confirmation."
-        ));
-    }
-    if !facts.deployed {
-        warnings.push(format!(
-            "Nothing is deployed to {} yet: it answers once a deployment runs on a worker.",
-            facts.environment_name
-        ));
-    }
-    let mut steps = Vec::new();
-    if kind == PlanOptionKind::TailscaleServiceWithCredential {
-        steps.push(step(
-            StepKind::SaveTailscaleCredential,
-            "Check the Tailscale OAuth client's scopes and save it",
-        ));
-    }
-    steps.extend([
-        step(
-            StepKind::AttachDomain,
-            if attached {
-                format!("{name} is already on {}", facts.environment_name)
-            } else {
-                format!("Attach {name} to {}", facts.environment_name)
-            },
-        ),
-        step(
-            StepKind::SetAudience,
-            format!("Make {name} private to your tailnet on {node}"),
-        ),
-        step(
-            StepKind::DefineTailscaleService,
-            if found {
-                format!("Use `{service}`, which this Temps install made earlier")
-            } else {
-                format!("Create `{service}` in your tailnet, for hosts tagged {tag}")
-            },
-        ),
-        step(
-            StepKind::ConfigureTailscaleServe,
-            format!("Have {node} serve and advertise `{service}`"),
-        ),
-        step(
-            StepKind::WaitForServiceApproval,
-            format!("Wait for the tailnet admin to approve {node} as its host"),
-        ),
-        step(
-            StepKind::CheckReachability,
-            format!("Check {name} from {node} and from outside"),
-        ),
-    ]);
-    let option = PlanOption {
-        kind,
-        title: format!("Only my tailnet, at {name}"),
-        description: format!(
-            "{node} serves {name}, this app's own name in your tailnet, as the Tailscale Service \
-             `{service}`: only devices on your tailnet can open it, Tailscale gives it its \
-             certificate, the name stays if the app moves to another worker, and no DNS record \
-             is added anywhere."
-        ),
-        actions: if kind == PlanOptionKind::TailscaleServiceWithCredential {
-            3
-        } else {
-            2
-        },
-        recommended: true,
-        way_in: format!("private:{node}"),
-        steps,
-        fields,
-        warnings,
-        confirmation: None,
-        required_permissions: permissions_for(kind)
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-    };
-    ReachabilityPlan {
-        plan_id: None,
-        fingerprint: None,
-        expires_at: None,
-        audience: Audience::Private,
-        address,
-        address_error: None,
-        options: vec![option],
-        blocked: None,
-        gate: None,
-        principals: Vec::new(),
-    }
-}
-
 /// The plan for a private address on a worker's private listener (ADR 064
 /// D5): DNS in a zone Temps manages, a DNS-01 certificate.
-fn plan_listener(
+pub(crate) fn plan_listener(
     facts: &PlanFacts,
     address: Option<String>,
     ask_address: bool,
@@ -3236,18 +2598,27 @@ fn plan_listener(
     let block = |reason: String, action: Option<ReachAction>| PlanBlocked { reason, action };
     let shown = address.clone().unwrap_or_else(|| "the address".to_string());
 
-    if facts.deployed && !facts.served_by_workers {
+    // ADR-115 D6: what the control plane runs, this machine serves, once
+    // the operator lets it.
+    let on_control_plane = runs_on_control_plane(facts);
+    if on_control_plane && facts.private_workers.is_empty() {
         return blocked_plan(
             address,
             None,
             block(
                 format!(
-                    "{} runs on the control plane, and a private address is served by a \
-                     worker's private listener, which only carries what workers serve. Deploy \
-                     it to a worker first.",
+                    "{} runs on this machine, which serves private addresses only once you \
+                     allow it. Serve them from this machine on its private network (Tailscale, \
+                     WireGuard, your LAN…), then plan again.",
                     facts.environment_name
                 ),
-                None,
+                Some(
+                    ReachAction::new(
+                        ActionKind::ServePrivately,
+                        "Serve private addresses from this machine",
+                    )
+                    .with_command(crate::reachability::service::CONTROL_PLANE_PRIVATE_COMMAND),
+                ),
             ),
         );
     }
@@ -3259,6 +2630,15 @@ fn plan_listener(
             facts.private_workers.first(),
             &facts.suggested_private_worker,
         ) {
+            (Some(w), _) if w.id == temps_core::CONTROL_PLANE_NODE_ID => {
+                let reason = format!(
+                    "This machine is allowed to serve private addresses, but does not yet: {}",
+                    w.error
+                        .clone()
+                        .unwrap_or_else(|| "it is not bound on a private address.".to_string())
+                );
+                return blocked_plan(address, None, block(reason, None));
+            }
             (Some(w), _) => (
                 format!(
                     "{} is in private mode, but its private listener is not running: {}",
@@ -3315,11 +2695,14 @@ fn plan_listener(
             );
         }
     }
-    let range = temps_core::worker_ingress::private_block(ip).unwrap_or("its private network");
+    let range = worker
+        .range(ip)
+        .map(|r| r.replace(',', ", "))
+        .unwrap_or_else(|| "its private network".to_string());
     let network = if worker.tailscale {
         "Tailscale".to_string()
     } else {
-        range.to_string()
+        range.clone()
     };
 
     let Some(zone) = address
@@ -3498,6 +2881,23 @@ fn plan_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::tailscale::{self, TailscaleFactory};
+
+    /// [`super::plan`] with the providers that ship with Temps.
+    fn plan(facts: &PlanFacts) -> ReachabilityPlan {
+        super::plan(facts, &ProviderRegistry::builtin())
+    }
+
+    /// [`super::choice`] with the providers that ship with Temps.
+    fn choice(facts: &PlanFacts) -> AudienceChoice {
+        super::choice(facts, &ProviderRegistry::builtin())
+    }
+
+    /// [`super::address_for_audience`] with the providers that ship with
+    /// Temps.
+    fn address_for_audience(facts: &PlanFacts) -> Result<Option<String>, String> {
+        super::address_for_audience(facts, &ProviderRegistry::builtin())
+    }
 
     fn tunnel(name: &str, domain: &str, zone: &str) -> TunnelFact {
         TunnelFact {
@@ -3669,7 +3069,7 @@ mod tests {
             service_addresses: vec![],
             ..facts
         };
-        let plan = super::plan(&alone);
+        let plan = super::plan(&alone, &ProviderRegistry::builtin());
         let option = plan.options.first().expect("an option");
         assert!(
             !option.warnings.iter().any(|w| w.contains("stays open")),
@@ -4901,6 +4301,28 @@ mod tests {
         );
     }
 
+    /// A listener that broadens who it admits after planning (10.8.0.0/24 to
+    /// 10.0.0.0/8, same address) must not let `apply` store the broader
+    /// range the operator never saw: the admitted ranges are fingerprinted.
+    #[test]
+    fn a_listener_admitting_other_ranges_changes_the_fingerprint() {
+        let host = Some("myapp.example.com");
+        let narrow = PlanFacts {
+            private_workers: vec![PrivateWorkerFact {
+                admit: Some("10.8.0.0/24".into()),
+                ..private_worker_fact(None)
+            }],
+            ..base()
+        };
+        let mut broad = narrow.clone();
+        broad.private_workers[0].admit = Some("10.0.0.0/8".into());
+        assert_ne!(fingerprint(&narrow, host), fingerprint(&broad, host));
+        assert_eq!(
+            fingerprint(&narrow, host),
+            fingerprint(&narrow.clone(), host)
+        );
+    }
+
     fn seen(content: &str, modified: &str, managed: bool) -> PlannedRecord {
         PlannedRecord::Present {
             record: crate::reachability::model::DnsRecordState {
@@ -4989,6 +4411,7 @@ mod tests {
             listener: Some("100.101.102.103".parse().expect("ip")),
             tailscale: true,
             error: error.map(str::to_string),
+            admit: None,
         }
     }
 
@@ -5090,12 +4513,27 @@ mod tests {
         )];
         assert!(plan_of(&taken).options.is_empty());
 
-        // Where the environment runs on the control plane, no worker can.
+        // Where the environment runs on the control plane and the operator
+        // has not let it serve privately (ADR-115 D2), the plan asks for that
+        // consent, in one click or one command.
         let on_cp = plan_of(&PlanFacts {
             served_by_workers: false,
+            private_workers: Vec::new(),
             ..private_facts()
         });
         assert!(on_cp.options.is_empty());
+        let blocked = on_cp.blocked.expect("blocked");
+        assert!(
+            blocked.reason.contains("runs on this machine"),
+            "{}",
+            blocked.reason
+        );
+        let action = blocked.action.expect("action");
+        assert_eq!(action.kind, ActionKind::ServePrivately);
+        assert_eq!(
+            action.command.as_deref(),
+            Some(crate::reachability::service::CONTROL_PLANE_PRIVATE_COMMAND)
+        );
 
         // The fingerprint follows the listener.
         let mut moved = private_facts();
@@ -5103,6 +4541,136 @@ mod tests {
         assert_ne!(
             fingerprint(&facts, Some("internal.example.com")),
             fingerprint(&moved, Some("internal.example.com"))
+        );
+    }
+
+    fn control_plane_fact(error: Option<&str>) -> PrivateWorkerFact {
+        PrivateWorkerFact {
+            id: temps_core::CONTROL_PLANE_NODE_ID,
+            name: "this machine".into(),
+            listener: error
+                .is_none()
+                .then(|| "100.101.102.103".parse().expect("ip")),
+            tailscale: error.is_none(),
+            error: error.map(str::to_string),
+            admit: error
+                .is_none()
+                .then(|| "100.64.0.0/10,fd7a:115c:a1e0::/48".to_string()),
+        }
+    }
+
+    /// ADR-115 D5: the console's own host is never planned as an app's.
+    #[test]
+    fn the_console_host_is_never_an_apps_address() {
+        for audience in [Audience::Private, Audience::Public] {
+            let plan = plan_of(&PlanFacts {
+                audience,
+                requested: Some("Temps.Example.com".into()),
+                platform_hosts: vec!["temps.example.com".into()],
+                ..private_facts()
+            });
+            assert!(plan.options.is_empty(), "{audience:?}");
+            assert!(
+                plan.address_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("console's own address")),
+                "{audience:?}: {:?}",
+                plan.address_error
+            );
+        }
+    }
+
+    /// ADR-115 D6: an environment placed on workers that none serves yet is
+    /// still a worker's to serve, never this machine's.
+    #[test]
+    fn a_worker_placed_environment_is_never_planned_on_this_machine() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            on_workers: true,
+            ..private_facts()
+        };
+        assert!(!runs_on_control_plane(&facts));
+        let plan = plan_of(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert_eq!(plan.options[0].way_in, "private:homelab");
+
+        // Without a private worker the plan asks for one, not for this
+        // machine to serve privately.
+        let none = plan_of(&PlanFacts {
+            private_workers: Vec::new(),
+            ..facts
+        });
+        let blocked = none.blocked.expect("blocked");
+        assert!(
+            !blocked.reason.contains("runs on this machine"),
+            "{}",
+            blocked.reason
+        );
+        assert!(blocked
+            .action
+            .as_ref()
+            .is_none_or(|a| a.kind != ActionKind::ServePrivately));
+    }
+
+    /// ADR-115 D6: an environment on the control plane is served privately
+    /// by this machine, through the same DNS-01 plan as a worker's.
+    #[test]
+    fn the_control_plane_serves_privately_what_it_runs() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            private_workers: vec![control_plane_fact(None)],
+            ..private_facts()
+        };
+        let plan = plan_of(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        let option = &plan.options[0];
+        assert_eq!(option.kind, PlanOptionKind::PrivateWorker);
+        assert_eq!(option.way_in, "private:this machine");
+        assert!(
+            option.title.contains("through this machine"),
+            "{}",
+            option.title
+        );
+        assert!(option.description.contains("100.101.102.103"));
+        assert!(
+            !option.description.contains("worker"),
+            "{}",
+            option.description
+        );
+
+        // Allowed, but the proxy does not cover the address: the plan says
+        // why, without a worker command.
+        let refused = plan_of(&PlanFacts {
+            private_workers: vec![control_plane_fact(Some(
+                "The proxy listens on 203.0.113.7:443 only.",
+            ))],
+            ..facts.clone()
+        });
+        assert!(refused.options.is_empty());
+        let blocked = refused.blocked.expect("blocked");
+        assert!(
+            blocked.reason.contains("203.0.113.7:443"),
+            "{}",
+            blocked.reason
+        );
+        assert!(blocked.action.is_none());
+
+        // ADR-115 D7: chosen tailnet users are not served from here yet.
+        let users = plan_of(&PlanFacts {
+            audience: Audience::TailnetUsers,
+            principals: vec![
+                temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").expect("a login"),
+            ],
+            ..facts
+        });
+        assert!(users.options.is_empty());
+        let blocked = users.blocked.expect("blocked");
+        assert!(
+            blocked
+                .reason
+                .contains("cannot yet limit one to chosen people"),
+            "{}",
+            blocked.reason
         );
     }
 
@@ -5380,6 +4948,43 @@ mod tests {
         }
     }
 
+    /// ADR-117 D3: an audience no provider plans is the engine's. Private
+    /// addresses still get a worker's own listener, never a tailnet way in;
+    /// anything else private is not offered.
+    #[test]
+    fn without_a_provider_that_plans_private_addresses_only_the_listener_is_offered() {
+        let none = ProviderRegistry::of(Vec::new());
+        let listener = super::plan(&private_facts(), &none);
+        assert_eq!(kinds(&listener), vec![PlanOptionKind::PrivateWorker]);
+        assert_eq!(
+            super::address_for_audience(&private_facts(), &none),
+            Ok(Some("internal.example.com".into()))
+        );
+
+        let machine_name = super::plan(
+            &PlanFacts {
+                requested: Some("homelab.example.ts.net".into()),
+                ..serve_facts()
+            },
+            &none,
+        );
+        assert!(!kinds(&machine_name).contains(&PlanOptionKind::TailscaleServe));
+
+        let tailnet_users = super::plan(
+            &PlanFacts {
+                audience: Audience::TailnetUsers,
+                ..serve_facts()
+            },
+            &none,
+        );
+        assert!(tailnet_users.options.is_empty());
+        assert!(tailnet_users
+            .blocked
+            .expect("blocked")
+            .reason
+            .starts_with("Temps cannot plan an address"));
+    }
+
     fn tailnet_worker() -> TailnetWorkerFact {
         TailnetWorkerFact {
             id: 2,
@@ -5433,6 +5038,35 @@ mod tests {
             ..serve_facts()
         });
         assert_eq!(kinds(&asked), vec![PlanOptionKind::TailscaleServe]);
+    }
+
+    /// ADR-115 D6: what runs on the control plane is never suggested an
+    /// idle worker's tailnet name, which that worker cannot serve; this
+    /// machine's own private listener is planned instead.
+    #[test]
+    fn a_control_plane_app_is_not_offered_an_idle_workers_machine_name() {
+        let facts = PlanFacts {
+            served_by_workers: false,
+            zones: vec![zone("example.com", "cloudflare")],
+            private_workers: vec![control_plane_fact(None)],
+            ..serve_facts()
+        };
+        assert_eq!(
+            address_for_audience(&facts),
+            Ok(Some("myapp.example.com".into()))
+        );
+        let plan = plan_of(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert_eq!(plan.options[0].kind, PlanOptionKind::PrivateWorker);
+        assert_eq!(plan.options[0].way_in, "private:this machine");
+
+        // With no zone to put a listener's record in, nothing a worker
+        // would serve is suggested either.
+        let no_zone = PlanFacts {
+            zones: Vec::new(),
+            ..facts
+        };
+        assert_eq!(address_for_audience(&no_zone), Ok(None));
     }
 
     /// ADR 065 D1/D5: a name under the tailnet that is no machine's needs
@@ -5906,6 +5540,47 @@ mod tests {
 
     /// A single server: the environment runs on the control plane, no
     /// worker exists, and this control plane runs connectors.
+    /// Replicas on the control plane and on a worker: the workers serve it,
+    /// so node 0 is not asked to serve it privately.
+    #[test]
+    fn a_mixed_deployment_does_not_run_on_the_control_plane_alone() {
+        let only_here = PlanFacts {
+            deployed: true,
+            ..PlanFacts::default()
+        };
+        assert!(runs_on_control_plane(&only_here));
+        let mixed = PlanFacts {
+            some_on_workers: true,
+            ..only_here
+        };
+        assert!(!runs_on_control_plane(&mixed));
+    }
+
+    /// The console's own address is refused when asked for, so it is never
+    /// suggested either, for a public plan or a private listener.
+    #[test]
+    fn the_console_address_is_never_suggested() {
+        let facts = PlanFacts {
+            zones: vec![zone("example.com", "cloudflare")],
+            requested: None,
+            platform_hosts: vec!["myapp.example.com".into()],
+            ..single_server()
+        };
+        assert_eq!(suggest_address(&facts), None);
+        assert_eq!(
+            crate::providers::tailscale::plan::planned_private_address(&facts),
+            Ok(None)
+        );
+        let other = PlanFacts {
+            platform_hosts: vec!["console.example.com".into()],
+            ..facts
+        };
+        assert_eq!(
+            suggest_address(&other).as_deref(),
+            Some("myapp.example.com")
+        );
+    }
+
     fn single_server() -> PlanFacts {
         PlanFacts {
             served_by_workers: false,
@@ -6075,10 +5750,13 @@ mod tests {
             "{reason}"
         );
         // Without the rule a tunnel is offered and nothing is left out.
-        let choice = super::choice(&PlanFacts {
-            private_rule: None,
-            ..facts
-        });
+        let choice = super::choice(
+            &PlanFacts {
+                private_rule: None,
+                ..facts
+            },
+            &ProviderRegistry::builtin(),
+        );
         assert!(choice
             .ways_in
             .iter()
@@ -6148,7 +5826,7 @@ mod tests {
             identity_workers: Vec::new(),
             ..unlisted
         };
-        let choice = super::choice(&unchecked);
+        let choice = super::choice(&unchecked, &ProviderRegistry::builtin());
         assert!(!choice.available);
         assert!(choice.blocked.is_some());
     }

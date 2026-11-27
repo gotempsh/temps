@@ -1,0 +1,233 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { afterEach, expect, test } from 'bun:test'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { act, cleanup, fireEvent, render } from '@testing-library/react'
+import { MemoryRouter, Route, Routes } from 'react-router'
+import { ShipStep } from './ShipStep'
+
+installBrowserWindow()
+afterEach(cleanup)
+
+// The server's clock when the step first lists projects.
+const OPENED = 'Thu, 26 Nov 2026 10:00:00 GMT'
+const BEFORE = '2026-11-01T00:00:00Z'
+const AFTER = '2026-11-26T10:00:05Z'
+const project = (id: number, name: string, created_at = BEFORE) => ({
+  id,
+  name,
+  slug: name,
+  created_at,
+})
+
+function renderStep(
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+) {
+  const view = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={['/welcome']}>
+        <Routes>
+          <Route path="/welcome" element={<ShipStep />} />
+          <Route path="/projects/new" element={<p>New project page</p>} />
+          <Route path="/projects/:slug" element={<p>Project page</p>} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  return { view, client }
+}
+
+function mock(
+  status: 'connected' | 'missing',
+  projects: () => unknown[],
+  /** Each environment's current (live) deployment, by project. */
+  current: Record<number, (number | null)[]> = { 2: [1], 3: [1] }
+) {
+  const patches: unknown[] = []
+  const listed: (string | null)[] = []
+  const environmentsOf = (id: number) => () =>
+    jsonResponse(
+      (current[id] ?? []).map((deployment, i) => ({
+        id: i + 1,
+        project_id: id,
+        name: i === 0 ? 'production' : `preview-${i}`,
+        current_deployment_id: deployment,
+      }))
+    )
+  const api = mockApi({
+    'GET /projects/2/environments': environmentsOf(2),
+    'GET /projects/3/environments': environmentsOf(3),
+    'GET /api-keys/ai-harness/status': () =>
+      jsonResponse({ status, reason: null, connected_via: null }),
+    'GET /projects': (request) => {
+      listed.push(new URL(request.url).searchParams.get('sort'))
+      const response = jsonResponse({
+        projects: projects(),
+        page: 1,
+        per_page: 20,
+        total: 0,
+      })
+      response.headers.set('Date', OPENED)
+      return response
+    },
+    'PATCH /settings/onboarding': async (request) => {
+      patches.push(await request.json())
+      return jsonResponse({ done: [], later: [] })
+    },
+  })
+  return { api, patches, listed }
+}
+
+test('with an agent connected, it leads, and the operator opens the new project their agent made', async () => {
+  let list = [project(1, 'existing')]
+  const { api, patches, listed } = mock('connected', () => list)
+  const { view, client } = renderStep()
+
+  const agent = await view.findByRole('radio', { name: /Ask your agent/ })
+  // Newest first: a never-deployed project would sort past the first page.
+  expect(listed[0]).toBe('created')
+  await view.findByText('Recommended')
+  expect(agent.getAttribute('aria-checked')).toBe('true')
+  expect(
+    view.getByRole('region', { name: 'Prompt for your agent' }).textContent
+  ).toContain(
+    `Help me put my first app live on my Temps server at ${window.location.origin}.`
+  )
+  await view.findByText('Waiting for a new project…')
+  const open = view.getByRole('button', { name: 'Open the project' })
+  expect(open.getAttribute('aria-disabled')).toBe('true')
+  fireEvent.click(open)
+  expect(patches).toEqual([])
+
+  // A project that was already there is not offered; a new one is, without
+  // claiming the agent made it.
+  list = [project(2, 'my-app', AFTER), ...list]
+  await act(() => client.refetchQueries())
+  await view.findByText(/New since this step opened/)
+  expect(view.queryByText(/Your agent created/)).toBeNull()
+  expect(view.queryByRole('button', { name: 'Open existing' })).toBeNull()
+  // The label stays short; the project's name is beside it and in its name.
+  const openNew = view.getByRole('button', { name: 'Open my-app' })
+  expect(openNew.textContent).toBe('Open')
+  fireEvent.click(openNew)
+  await view.findByText('Project page')
+  expect(patches).toEqual([{ done: ['app'], completed: true }])
+  api.restore()
+})
+
+test('returning to the step, a project created while away is not new: the list from the last visit is no baseline', async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  // What the last visit listed, still cached.
+  client.setQueryData(
+    ['welcome', 'ship', 'projects'],
+    {
+      list: [project(1, 'existing')],
+      serverDate: 'Thu, 26 Nov 2026 09:00:00 GMT',
+    },
+    { updatedAt: Date.now() - 60_000 }
+  )
+  // Created while the operator was on another step.
+  const list = [project(2, 'made-while-away', AFTER), project(1, 'existing')]
+  const { api } = mock('connected', () => list)
+  const { view } = renderStep(client)
+  await view.findByText('Waiting for a new project…')
+  await act(() => client.refetchQueries())
+  expect(
+    view.queryByRole('button', { name: 'Open made-while-away' })
+  ).toBeNull()
+  expect(view.getByText('Waiting for a new project…')).toBeTruthy()
+  api.restore()
+})
+
+test('a project another operator creates meanwhile is offered, not credited, and the step keeps watching', async () => {
+  let list = [project(1, 'existing')]
+  const { api, patches } = mock('connected', () => list)
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  list = [project(2, 'someone-elses', AFTER), ...list]
+  await act(() => client.refetchQueries())
+  await view.findByRole('button', { name: 'Open someone-elses' })
+  // Nothing is completed until the operator opens one.
+  expect(patches).toEqual([])
+
+  // A later project still appears beside it, so the agent's is reachable.
+  list = [project(3, 'agents-app', AFTER), ...list]
+  await act(() => client.refetchQueries())
+  fireEvent.click(await view.findByRole('button', { name: 'Open agents-app' }))
+  await view.findByText('Project page')
+  expect(patches).toEqual([{ done: ['app'], completed: true }])
+  api.restore()
+})
+
+test('opening a new project whose deployment failed leaves the app step open', async () => {
+  let list = [project(1, 'existing')]
+  const { api, patches } = mock('connected', () => list, { 2: [null] })
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  list = [project(2, 'broken-app', AFTER), ...list]
+  await act(() => client.refetchQueries())
+  fireEvent.click(await view.findByRole('button', { name: 'Open broken-app' }))
+  await view.findByText('Project page')
+  // The wizard closes, but nothing is live, so the step is not done.
+  expect(patches).toEqual([{ completed: true }])
+  api.restore()
+})
+
+test('a project live in one environment marks the step done, however many deployments failed since', async () => {
+  let list = [project(1, 'existing')]
+  // Its production deployment is live; a preview has none. How many
+  // failures came after it does not matter: the environment says what is live.
+  const { api, patches } = mock('connected', () => list, { 2: [null, 3] })
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  list = [project(2, 'retried-app', AFTER), ...list]
+  await act(() => client.refetchQueries())
+  fireEvent.click(await view.findByRole('button', { name: 'Open retried-app' }))
+  await view.findByText('Project page')
+  expect(patches).toEqual([{ done: ['app'], completed: true }])
+  api.restore()
+})
+
+test('an older project redeployed onto the first page is not offered as new', async () => {
+  let list = [project(1, 'existing')]
+  const { api, patches } = mock('connected', () => list)
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  // Project 21 was on page two; a redeploy moves it to the top of the list.
+  list = [project(21, 'old-app', '2026-10-01T00:00:00Z'), ...list]
+  await act(() => client.refetchQueries())
+  expect(view.queryByRole('button', { name: 'Open old-app' })).toBeNull()
+  expect(view.getByText('Waiting for a new project…')).toBeTruthy()
+  expect(patches).toEqual([])
+  api.restore()
+})
+
+test('without an agent, New project leads and goes to its page', async () => {
+  const { api, patches } = mock('missing', () => [])
+  const { view } = renderStep()
+
+  await view.findByText(/No agent is connected yet/)
+  // Two ways only: the agent, or the New project page.
+  expect(view.getAllByRole('radio')).toHaveLength(2)
+  expect(
+    view
+      .getByRole('radio', { name: /A new project/ })
+      .getAttribute('aria-checked')
+  ).toBe('true')
+  fireEvent.click(view.getByRole('button', { name: 'Go to New project' }))
+  await view.findByText('New project page')
+  // The wizard closes, but nothing is live yet, so the step stays open.
+  expect(patches).toEqual([{ completed: true }])
+  api.restore()
+})

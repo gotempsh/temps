@@ -20,6 +20,46 @@ pub(super) fn initial_deployment_config(
     }
 }
 
+/// The storage services a new project links, as the create request gives them.
+struct StorageLinks {
+    service_ids: Vec<i32>,
+    /// Per service, the variable names to expose under another name.
+    env_aliases: BTreeMap<i32, BTreeMap<String, String>>,
+    claim_ids: Vec<i32>,
+    claim_user_id: Option<i32>,
+}
+
+/// A create request's storage variable aliases, checked before anything is
+/// written: each names a service the project links, with valid variable
+/// names. A bad alias is the caller's mistake (400), never a failure to link
+/// after the project exists.
+fn validate_storage_aliases(request: &CreateProjectRequest) -> Result<(), ProjectError> {
+    for (service_id, aliases) in &request.storage_service_env_aliases {
+        if !request.storage_service_ids.contains(service_id) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Variable aliases were sent for service {service_id}, which project '{}' does not link",
+                request.name
+            )));
+        }
+        temps_providers::services::validate_env_aliases(*service_id, 0, aliases).map_err(
+            |error| match error {
+                temps_providers::ExternalServiceError::InvalidDatabaseProvisioning {
+                    reason,
+                    ..
+                } => ProjectError::InvalidInput(format!(
+                    "Storage service {service_id} for project '{}': {reason}",
+                    request.name
+                )),
+                other => ProjectError::InvalidInput(format!(
+                    "Storage service {service_id} for project '{}': {other}",
+                    request.name
+                )),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 impl ProjectService {
     pub async fn create_project(
         &self,
@@ -147,6 +187,7 @@ impl ProjectService {
         defer_initial_deployment: bool,
         instantiation_token: Option<String>,
     ) -> Result<Project, ProjectError> {
+        validate_storage_aliases(&request)?;
         let mut request = request;
         if request.source_type == temps_entities::source_type::SourceType::External {
             if request.repo_name.is_some()
@@ -476,9 +517,12 @@ impl ProjectService {
             .finalize_project_creation(
                 &project_found_db,
                 request.environment_variables,
-                request.storage_service_ids,
-                request.storage_service_claim_ids,
-                request.storage_service_claim_user_id,
+                StorageLinks {
+                    service_ids: request.storage_service_ids,
+                    env_aliases: request.storage_service_env_aliases,
+                    claim_ids: request.storage_service_claim_ids,
+                    claim_user_id: request.storage_service_claim_user_id,
+                },
                 delivery_profile_id,
             )
             .await
@@ -935,11 +979,24 @@ impl ProjectService {
         &self,
         project: &projects::Model,
         environment_variables: Option<Vec<CreateProjectEnvVar>>,
-        storage_service_ids: Vec<i32>,
-        storage_service_claim_ids: Vec<i32>,
-        storage_service_claim_user_id: Option<i32>,
+        storage: StorageLinks,
         delivery_profile_id: Option<i32>,
     ) -> Result<temps_entities::environments::Model, ProjectError> {
+        let StorageLinks {
+            service_ids: storage_service_ids,
+            env_aliases: storage_service_env_aliases,
+            claim_ids: storage_service_claim_ids,
+            claim_user_id: storage_service_claim_user_id,
+        } = storage;
+        if let Some(service_id) = storage_service_env_aliases
+            .keys()
+            .find(|id| !storage_service_ids.contains(id))
+        {
+            return Err(ProjectError::InvalidInput(format!(
+                "Variable aliases were sent for service {service_id}, which project {} does not link",
+                project.id
+            )));
+        }
         let project_config = project.deployment_config.as_ref();
         let default_environment = self
             .environment_service
@@ -1010,8 +1067,15 @@ impl ProjectService {
                         .collect::<BTreeMap<_, _>>()
                 })
                 .unwrap_or_default();
+            // Aliases are stored with the links, before the first deployment
+            // is queued, so it already sees DATABASE_URL for POSTGRES_URL.
             self.external_service_manager
-                .link_services_to_project_with_claims(&storage_service_ids, project.id, &claims)
+                .link_services_to_project_with_claims(
+                    &storage_service_ids,
+                    project.id,
+                    &claims,
+                    &storage_service_env_aliases,
+                )
                 .await
                 .map_err(|e| ProjectError::StorageLinksFailed {
                     project_id: project.id,

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useState } from 'react'
+import type { StepKey } from '@/components/welcome/onboarding'
+import { useOnboarding } from '@/components/welcome/useOnboarding'
 import { useActivationSignals } from './useActivationSignals'
 import { useManualHarnessCompletion } from './useManualHarnessCompletion'
 
@@ -14,6 +16,15 @@ export interface GettingStartedItem {
   done: boolean
   href: string
   cta: string
+  /** Why the welcome flow's matching step was left for later, if it was. */
+  laterReason?: string
+}
+
+/** The welcome flow's step each checklist item continues. */
+const WELCOME_STEP: Partial<Record<string, StepKey>> = {
+  deploy: 'app',
+  ai: 'agents',
+  domain: 'reach',
 }
 
 export function useGettingStarted() {
@@ -23,6 +34,13 @@ export function useGettingStarted() {
 
   const signals = useActivationSignals()
   const manualHarness = useManualHarnessCompletion()
+  const onboarding = useOnboarding()
+  const laterReason = (key: string) => {
+    const step = WELCOME_STEP[key]
+    return step
+      ? onboarding.data?.later?.find((l) => l.step === step)?.reason
+      : undefined
+  }
 
   const allItems: GettingStartedItem[] = [
     // Reuse project creation: template configuration and deployment progress
@@ -117,11 +135,16 @@ export function useGettingStarted() {
 
   // A step this role cannot read is left out rather than shown as "to do":
   // nothing was checked, so neither answer would be true.
-  const items = allItems.filter(
-    (item) =>
-      !(item.key === 'dns' && signals.unreadable.dnsProviders) &&
-      !(item.key === 'team' && signals.unreadable.team)
-  )
+  const items = allItems
+    .filter(
+      (item) =>
+        !(item.key === 'dns' && signals.unreadable.dnsProviders) &&
+        !(item.key === 'team' && signals.unreadable.team)
+    )
+    .map((item) => {
+      const reason = item.done ? undefined : laterReason(item.key)
+      return reason ? { ...item, laterReason: reason } : item
+    })
 
   const completedCount = items.filter((i) => i.done).length
   const totalCount = items.length
@@ -147,5 +170,7 @@ export function useGettingStarted() {
     visible,
     isLoaded: signals.isLoaded,
     markHarnessCompleted: manualHarness.markCompleted,
+    /** The welcome flow has not been finished or skipped. */
+    welcomeOpen: onboarding.isSuccess && !onboarding.data.completed_at,
   }
 }

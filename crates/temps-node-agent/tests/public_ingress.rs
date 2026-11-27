@@ -1618,6 +1618,9 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
         shield_routes: Vec::new(),
         shield: None,
     });
+    // ADR-115 D8: the worker's own consent decides who its private listener
+    // admits, on top of each route's range; here it admits loopback.
+    store.set_private_admit(vec!["127.0.0.0/8".parse().expect("a range")]);
     let shutdown = Arc::new(Notify::new());
     let private = public_ingress::spawn(
         PublicIngressConfig {
@@ -1657,6 +1660,19 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
 
     let unknown = raw_request(private.http_address(), "app.example.test").await;
     assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+
+    // Once the worker's consent stops admitting loopback, a route applied
+    // before the change refuses it too, without a new snapshot.
+    store.set_private_admit(vec!["10.8.0.0/24".parse().expect("a range")]);
+    let narrowed = raw_request(private.http_address(), "inside.example.test").await;
+    assert!(narrowed.starts_with("HTTP/1.1 403"), "{narrowed}");
+    assert!(
+        narrowed
+            .to_ascii_lowercase()
+            .contains("x-temps-private-ingress: outside-range"),
+        "{narrowed}"
+    );
+    store.set_private_admit(vec!["127.0.0.0/8".parse().expect("a range")]);
 
     // The direct (public) listener on the same store never serves them.
     let public = spawn_public_http(

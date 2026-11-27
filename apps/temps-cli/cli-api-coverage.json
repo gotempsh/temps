@@ -192,6 +192,12 @@
         "PUT /settings/mcp-servers/{slug}",
         "PUT /settings/skills/{slug}"
       ]
+    },
+    {
+      "reason": "`create_only` on the private-ingress consent is for the console's welcome step, which shows a plan made from the consent it read and must not replace one given meanwhile. `temps ingress private` gives the consent the operator types, replacing the current one by design.",
+      "entries": [
+        "PUT /settings/private-ingress body.create_only"
+      ]
     }
   ]
 }

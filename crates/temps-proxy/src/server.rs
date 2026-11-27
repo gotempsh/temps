@@ -759,6 +759,14 @@ pub fn setup_proxy_server(
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?)
     .with_tunnel_origin(proxy_config.tunnel_origin.clone())
+    // ADR-115 D3: node 0's private addresses, from their own view of the
+    // route table, only on the consented private address.
+    .with_private_ingress(proxy_config.private_ingress.clone().map(|runtime| {
+        Arc::new(crate::proxy::PrivateIngressPath::new(
+            runtime,
+            route_table.private_view(),
+        ))
+    }))
     // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
     // process, so it needs the database and the gate key's sealing key; in
     // split topology both are available here as they are to the console.
@@ -950,6 +958,17 @@ pub fn setup_proxy_server(
         debug!(
             "TLS listener configured on {} with HTTP/2 support",
             tls_address
+        );
+    }
+
+    // ADR-115 D3: what the listeners bound decides whether a private
+    // address can be served here; Pingora binds them only now.
+    if let Some(private) = proxy_config.private_ingress.as_deref() {
+        private.set_proxy_listeners(
+            std::iter::once(proxy_config.address.as_str())
+                .chain(proxy_config.tls_address.as_deref())
+                .filter_map(|address| address.parse().ok())
+                .collect(),
         );
     }
 

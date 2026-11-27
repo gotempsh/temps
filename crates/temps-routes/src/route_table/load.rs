@@ -355,6 +355,7 @@ impl CachedPeerTable {
         }
 
         self.route_snapshot.store(new_snapshot);
+        self.publish_private_view();
 
         if !sleeping_environments.is_empty() {
             info!(

@@ -795,7 +795,8 @@
           "open_ingress",
           "open_worker",
           "wait",
-          "run_command"
+          "run_command",
+          "serve_privately"
         ],
         "type": "string"
       },
@@ -3476,7 +3477,8 @@
         "description": "Which credential proved the harness connected.",
         "enum": [
           "dedicated_key",
-          "cli_login"
+          "cli_login",
+          "mcp_client"
         ],
         "type": "string"
       },
@@ -19209,6 +19211,17 @@
             },
             "type": "array"
           },
+          "generate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GenerateValueRequest",
+                "description": "Generate the value on the server instead of sending one. The value is\nstored write-only and is never returned, so it is never in the\nbrowser's form state or a request log."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "include_in_preview": {
             "default": false,
             "description": "Include this environment variable in preview environments (default: false)",
@@ -19222,12 +19235,15 @@
             "type": "string"
           },
           "value": {
-            "type": "string"
+            "description": "The value; an empty string is stored as one. Required unless\n`generate` asks the server to make the value instead.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "key",
-          "value",
           "environment_ids"
         ],
         "type": "object"
@@ -20861,6 +20877,23 @@
           "source_type": {
             "$ref": "#/components/schemas/SourceType",
             "description": "Source type for deployments\n\nDetermines how the project is deployed:\n- **git** (default): Traditional Git-based deployments - source code is pulled, built, and deployed\n- **docker_image**: Deploy pre-built Docker images from external registries (DockerHub, GHCR, etc.)\n- **static_files**: Deploy pre-built static files uploaded as tar.gz or zip bundles\n\nFor `docker_image` and `static_files` source types, `repo_name` and `repo_owner` are optional."
+          },
+          "storage_service_env_aliases": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Variable aliases for each linked storage service, keyed by service id\n(as a string, JSON object keys being strings): app name → injected\nname, such as `{\"12\": {\"DATABASE_URL\": \"POSTGRES_URL\"}}`. Set before\nthe first deployment is queued.",
+            "propertyNames": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "object"
           },
           "storage_service_ids": {
             "items": {
@@ -23528,6 +23561,61 @@
         ],
         "type": "object"
       },
+      "DatabaseOptionResponse": {
+        "description": "A managed database the app could get, with what it would fill.",
+        "properties": {
+          "envAliases": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "App name → injected name for the keys it fills under another name\n(`DATABASE_URL` → `POSTGRES_URL`); set on the link as `env_aliases`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "evidence": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "label": {
+            "type": "string"
+          },
+          "provides": {
+            "description": "Env-example keys a linked database of this type fills.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "One line naming the evidence, when suggested.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serviceType": {
+            "description": "The service type to create: `postgres`, `mariadb`, `mongodb`, `redis`.",
+            "type": "string"
+          },
+          "suggested": {
+            "description": "The repository points at this database.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "serviceType",
+          "label",
+          "suggested",
+          "evidence",
+          "provides",
+          "envAliases"
+        ],
+        "type": "object"
+      },
       "DatabaseProvisioningMode": {
         "description": "Controls which logical database a deployment receives through a\nproject-to-service link.",
         "enum": [
@@ -23595,6 +23683,41 @@
           "overwrite"
         ],
         "type": "string"
+      },
+      "DefaultReach": {
+        "description": "The install's default way in, which a new project's \"Make it reachable\"\nstarts from so the answer is not asked again.",
+        "properties": {
+          "audience": {
+            "$ref": "#/components/schemas/ReachAudience"
+          },
+          "connector_id": {
+            "description": "The tunnel connector, when the way is a tunnel and one exists.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "domain": {
+            "description": "Base domain for a wildcard; `null` per app and for the tailnet name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "naming": {
+            "$ref": "#/components/schemas/ReachNaming"
+          },
+          "way": {
+            "$ref": "#/components/schemas/ReachWay"
+          }
+        },
+        "required": [
+          "audience",
+          "way",
+          "naming"
+        ],
+        "type": "object"
       },
       "DeferredWalGeneration": {
         "properties": {
@@ -26101,6 +26224,30 @@
         ],
         "type": "object"
       },
+      "DiskFact": {
+        "properties": {
+          "available_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mount_point": {
+            "description": "The mount point holding Temps' data directory.",
+            "type": "string"
+          },
+          "total_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mount_point",
+          "total_bytes",
+          "available_bytes"
+        ],
+        "type": "object"
+      },
       "DiskInfo": {
         "description": "Disk space information for a single disk/partition",
         "properties": {
@@ -28433,6 +28580,30 @@
           "total_count",
           "active_count",
           "size_bytes"
+        ],
+        "type": "object"
+      },
+      "DockerFact": {
+        "properties": {
+          "error": {
+            "description": "Why Docker could not be read, when it could not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "running"
         ],
         "type": "object"
       },
@@ -31637,6 +31808,10 @@
       },
       "EnvExampleVariableResponse": {
         "properties": {
+          "canGenerate": {
+            "description": "Temps can generate a value for it server-side (a session secret, not\na credential for another service).",
+            "type": "boolean"
+          },
           "defaultValue": {
             "description": "Placeholder/default value as written in the file (may be empty)",
             "type": "string"
@@ -31651,6 +31826,10 @@
           "key": {
             "description": "Variable name (e.g. \"DATABASE_URL\")",
             "type": "string"
+          },
+          "looksSecret": {
+            "description": "The key looks like it holds a secret (`*_SECRET`, `*_KEY`,\n`*_TOKEN`, ...); public client keys (`NEXT_PUBLIC_*`) never do.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -38269,6 +38448,34 @@
         ],
         "type": "object"
       },
+      "GenerateValueRequest": {
+        "description": "Ask the server to generate the value instead of sending one.",
+        "properties": {
+          "bytes": {
+            "default": 32,
+            "description": "Random bytes, from 16 to 64; 32 when omitted.",
+            "format": "int32",
+            "maximum": 64,
+            "minimum": 16,
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/GeneratedValueKind"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      "GeneratedValueKind": {
+        "description": "What to generate.",
+        "enum": [
+          "secret",
+          "laravel_app_key"
+        ],
+        "type": "string"
+      },
       "GeoDatabaseStatusResponse": {
         "description": "Freshness of the geolocation database backing this instance",
         "properties": {
@@ -41976,6 +42183,79 @@
         ],
         "type": "object"
       },
+      "HostFacts": {
+        "description": "The control plane's machine, as the welcome flow's first screen shows it.",
+        "properties": {
+          "cpu_cores": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "disk": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DiskFact"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "docker": {
+            "$ref": "#/components/schemas/DockerFact"
+          },
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inbound": {
+            "$ref": "#/components/schemas/InboundCheck"
+          },
+          "lan_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory": {
+            "$ref": "#/components/schemas/MemoryFact"
+          },
+          "ports": {
+            "description": "Ports 80 and 443 on this machine.",
+            "items": {
+              "$ref": "#/components/schemas/PortFact"
+            },
+            "type": "array"
+          },
+          "public_ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "swap_total_bytes": {
+            "description": "Swap configured; `0` when there is none.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tailscale": {
+            "$ref": "#/components/schemas/TailscaleFact"
+          }
+        },
+        "required": [
+          "cpu_cores",
+          "memory",
+          "swap_total_bytes",
+          "docker",
+          "ports",
+          "tailscale",
+          "inbound"
+        ],
+        "type": "object"
+      },
       "HostImagePreparation": {
         "description": "One host's sandbox image preparation, as the API reports it.",
         "properties": {
@@ -43908,6 +44188,30 @@
           "host",
           "success",
           "sans"
+        ],
+        "type": "object"
+      },
+      "InboundCheck": {
+        "properties": {
+          "checked": {
+            "description": "Whether ports 80 and 443 were checked from outside the box.",
+            "type": "boolean"
+          },
+          "note": {
+            "description": "Why it was not checked, or what was found.",
+            "type": "string"
+          },
+          "reachable": {
+            "description": "The answer, when checked.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "checked",
+          "note"
         ],
         "type": "object"
       },
@@ -47072,6 +47376,16 @@
             "$ref": "#/components/schemas/DatabaseProvisioningMode",
             "description": "How deployments linked through this service select a logical database."
           },
+          "env_aliases": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Extra names for injected variables: app name → injected name, such as\n`{\"DATABASE_URL\": \"POSTGRES_URL\"}`. The link injects both.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -49627,6 +49941,26 @@
           "project_id",
           "name",
           "slug"
+        ],
+        "type": "object"
+      },
+      "MemoryFact": {
+        "properties": {
+          "available_bytes": {
+            "description": "Memory the OS reports as available for new work now.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total_bytes",
+          "available_bytes"
         ],
         "type": "object"
       },
@@ -55295,6 +55629,140 @@
         },
         "type": "object"
       },
+      "OnboardingLaterInput": {
+        "description": "A step to leave for later, as sent by a client.",
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "step": {
+            "$ref": "#/components/schemas/OnboardingStep"
+          }
+        },
+        "required": [
+          "step",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "OnboardingLaterStep": {
+        "description": "A step the operator chose to leave for later, and why.",
+        "properties": {
+          "at": {
+            "description": "When it was left for later.",
+            "example": "2026-11-24T10:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "reason": {
+            "description": "What the operator said, or the screen's own words (\"No domain yet\").",
+            "type": "string"
+          },
+          "step": {
+            "$ref": "#/components/schemas/OnboardingStep"
+          }
+        },
+        "required": [
+          "step",
+          "reason",
+          "at"
+        ],
+        "type": "object"
+      },
+      "OnboardingPatch": {
+        "description": "A partial update. Absent fields are left as they are.",
+        "properties": {
+          "completed": {
+            "description": "`true` marks the flow finished (keeping the first time it was);\n`false` reopens it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "default_reach": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DefaultReach",
+                "description": "Set the default way in."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "done": {
+            "description": "Mark these steps done. A step done is no longer \"later\".",
+            "items": {
+              "$ref": "#/components/schemas/OnboardingStep"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "later": {
+            "description": "Leave these steps for later, replacing an earlier reason for the same\nstep.",
+            "items": {
+              "$ref": "#/components/schemas/OnboardingLaterInput"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "OnboardingState": {
+        "description": "The stored onboarding record.",
+        "properties": {
+          "completed_at": {
+            "description": "When the welcome flow was finished or skipped as a whole. `null` until\nthen: an instance admin with no projects is sent to `/welcome`.",
+            "example": "2026-11-24T10:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_reach": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DefaultReach",
+                "description": "The default way in, once chosen."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "done": {
+            "description": "Steps the operator finished in the welcome flow.",
+            "items": {
+              "$ref": "#/components/schemas/OnboardingStep"
+            },
+            "type": "array"
+          },
+          "later": {
+            "description": "Steps left for later, with why. The Setup page lists them.",
+            "items": {
+              "$ref": "#/components/schemas/OnboardingLaterStep"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "OnboardingStep": {
+        "description": "A step of the welcome flow.",
+        "enum": [
+          "host",
+          "reach",
+          "agents",
+          "app"
+        ],
+        "type": "string"
+      },
       "OpenAiError": {
         "properties": {
           "code": {
@@ -60180,6 +60648,32 @@
         ],
         "type": "string"
       },
+      "PortFact": {
+        "properties": {
+          "holder": {
+            "$ref": "#/components/schemas/PortHolder"
+          },
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "port",
+          "holder"
+        ],
+        "type": "object"
+      },
+      "PortHolder": {
+        "description": "Who holds a port on this machine.",
+        "enum": [
+          "free",
+          "temps",
+          "other"
+        ],
+        "type": "string"
+      },
       "PortMapping": {
         "description": "Port mapping",
         "properties": {
@@ -60891,6 +61385,127 @@
         ],
         "type": "string"
       },
+      "PrivateIngressConsent": {
+        "description": "The stored consent.",
+        "properties": {
+          "admit": {
+            "description": "Who counts as inside (ADR-115 D8): private ranges such as\n`10.8.0.0/24`. Empty means the listen address's own network (the\ninterface's subnet, or Tailscale's ranges).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "listen": {
+            "description": "`tailscale`, or the private address to serve on.",
+            "type": "string"
+          },
+          "tailscale_serve": {
+            "description": "Temps may write its own entries in tailscaled's Serve configuration\n(ADR 065 D2). Without it Temps never opens the LocalAPI for writing.",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "description": "When the consent was last given or changed.",
+            "example": "2026-11-24T10:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "listen",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "PrivateIngressRequest": {
+        "description": "What a client sends to give or change the consent.",
+        "properties": {
+          "admit": {
+            "description": "Who counts as inside: private ranges such as `10.8.0.0/24`. Leave\nempty to admit the listen address's own network.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "create_only": {
+            "description": "Only give consent where none exists: refused with a 409, changing\nnothing, when one does. For a client that showed a plan made when\nthere was no consent, so it never replaces one given meanwhile (with\nits own ranges) or recreates one withdrawn under a plan built on it.",
+            "type": "boolean"
+          },
+          "listen": {
+            "description": "`tailscale`, or a private address of this machine: one in\n`100.64.0.0/10`, RFC 1918 or `fd00::/8`.",
+            "type": "string"
+          },
+          "tailscale_serve": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "listen"
+        ],
+        "type": "object"
+      },
+      "PrivateIngressStatus": {
+        "description": "The consent and what the control plane made of it, as it last reported\nin `node_public_ingress` row `0`.",
+        "properties": {
+          "admit": {
+            "description": "The ranges admitted now (`10.8.0.0/24`), empty when nothing is\nserved.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "available": {
+            "description": "Whether a process of this control plane applies a consent here.\n`false` where the console runs without the proxy (split roles): no\nprivate address is served, a consent cannot be given, and `error`\nsays why and what to run instead.",
+            "type": "boolean"
+          },
+          "consent": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PrivateIngressConsent",
+                "description": "`null` until the operator consents."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "description": "Why nothing is served although consent was given, with the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "networks": {
+            "description": "This machine's private networks, with what serving on each would\nadmit, for choosing one (ADR-115 D8). Empty where no private-ingress\nloop runs in this process.",
+            "items": {
+              "$ref": "#/components/schemas/PrivateNetworkOption"
+            },
+            "type": "array"
+          },
+          "reported_at": {
+            "description": "When the control plane last applied the consent.",
+            "example": "2026-11-24T10:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serving": {
+            "description": "The private address served on now (`100.101.102.103`), `null` when\nnone is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "available",
+          "admit",
+          "networks"
+        ],
+        "type": "object"
+      },
       "PrivateIpInfo": {
         "description": "Information about private/local IP addresses",
         "properties": {
@@ -60919,6 +61534,41 @@
         "required": [
           "ipv4_addresses",
           "ipv6_addresses"
+        ],
+        "type": "object"
+      },
+      "PrivateNetworkOption": {
+        "description": "A network the console can offer: what serving on it would admit, or why\nit cannot be used.",
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "admit": {
+            "description": "The ranges it would admit by default.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "interface": {
+            "type": "string"
+          },
+          "problem": {
+            "description": "Why it cannot be served on without naming ranges, if it cannot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tailscale": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "interface",
+          "address",
+          "tailscale",
+          "admit"
         ],
         "type": "object"
       },
@@ -61493,6 +62143,17 @@
       "ProjectEnvVarInput": {
         "description": "Documentation-only schema for a project-creation environment variable.\n\nThe wire format is deserialized by [`CreateProjectEnvVar`], which also\naccepts the legacy `[\"KEY\", \"value\"]` tuple form. This struct exists so the\nOpenAPI spec (and the generated clients) describe the preferred object form\nwith its `is_secret` flag.",
         "properties": {
+          "generate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GenerateValueRequest",
+                "description": "Ask the server to generate the value (always stored as a secret)\ninstead of sending one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "is_secret": {
             "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
             "type": "boolean"
@@ -61502,13 +62163,12 @@
             "type": "string"
           },
           "value": {
-            "description": "Variable value",
+            "description": "Variable value. Leave empty when `generate` is set.",
             "type": "string"
           }
         },
         "required": [
-          "key",
-          "value"
+          "key"
         ],
         "type": "object"
       },
@@ -62016,6 +62676,14 @@
           "status"
         ],
         "type": "object"
+      },
+      "ProjectOrder": {
+        "description": "How a project list is ordered.",
+        "enum": [
+          "last_deployed",
+          "created"
+        ],
+        "type": "string"
       },
       "ProjectPresetResponse": {
         "properties": {
@@ -65896,6 +66564,14 @@
         ],
         "type": "object"
       },
+      "ReachAudience": {
+        "description": "Who should reach the apps on this install.",
+        "enum": [
+          "public",
+          "private"
+        ],
+        "type": "string"
+      },
       "ReachFinding": {
         "description": "Something about an address that visitors can still reach.",
         "properties": {
@@ -65926,12 +66602,30 @@
         ],
         "type": "object"
       },
+      "ReachNaming": {
+        "description": "How apps are named under a domain.",
+        "enum": [
+          "wildcard",
+          "per_app"
+        ],
+        "type": "string"
+      },
       "ReachState": {
         "enum": [
           "reachable",
           "not_reachable",
           "checking",
           "unknown"
+        ],
+        "type": "string"
+      },
+      "ReachWay": {
+        "description": "How traffic gets in.",
+        "enum": [
+          "tunnel",
+          "direct",
+          "tailnet_domain",
+          "tailnet_name"
         ],
         "type": "string"
       },
@@ -67754,6 +68448,13 @@
       },
       "RepositoryEnvExampleResponse": {
         "properties": {
+          "databases": {
+            "description": "Every database Temps can create, the suggested ones first (strongest\nevidence first), each with the keys it would fill.",
+            "items": {
+              "$ref": "#/components/schemas/DatabaseOptionResponse"
+            },
+            "type": "array"
+          },
           "path": {
             "description": "Path of the detected env-example file (e.g. \".env.example\"), `null`\nif the repository has none",
             "type": [
@@ -83037,6 +83738,50 @@
         "required": [
           "kind",
           "value"
+        ],
+        "type": "object"
+      },
+      "TailscaleFact": {
+        "properties": {
+          "ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "machine": {
+            "description": "The machine's name on the tailnet, from MagicDNS.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "magic_dns": {
+            "description": "MagicDNS answered for this machine.",
+            "type": "boolean"
+          },
+          "note": {
+            "description": "What was not read, and why. HTTPS certificates are only known through\ntailscaled's LocalAPI, which Temps opens only with consent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "running": {
+            "description": "An interface holds a tailnet address.",
+            "type": "boolean"
+          },
+          "tailnet": {
+            "description": "The tailnet's MagicDNS suffix, such as `example.ts.net`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "running",
+          "magic_dns"
         ],
         "type": "object"
       },
@@ -151145,6 +151890,39 @@
         ]
       }
     },
+    "/platform/host-facts": {
+      "get": {
+        "description": "Read-only. Whether ports 80 and 443 answer from the internet is reported\nas not checked: the machine cannot test itself from outside.",
+        "operationId": "get_host_facts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostFacts"
+                }
+              }
+            },
+            "description": "Facts about the control plane's machine"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "What Temps reads about the control plane's machine: processor, memory,\nswap, disk, Docker, ports 80 and 443, its addresses and Tailscale.",
+        "tags": [
+          "Platform"
+        ]
+      }
+    },
     "/platform/private-ip": {
       "get": {
         "operationId": "get_private_ip",
@@ -152737,6 +153515,15 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "last_deployed (the default): most recently deployed first, never-deployed last. created: newest first, deployed or not.",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectOrder"
+            }
           }
         ],
         "responses": {
@@ -153136,6 +153923,9 @@
               }
             },
             "description": "Project updated successfully"
+          },
+          "400": {
+            "description": "Invalid update, such as storage variable aliases, which are set on the service link"
           },
           "401": {
             "description": "Unauthorized"
@@ -194636,6 +195426,88 @@
         ]
       }
     },
+    "/settings/onboarding": {
+      "get": {
+        "description": "`completed_at` is `null` until the welcome flow is finished or skipped; the\nconsole sends an instance admin with no projects to `/welcome` until then.",
+        "operationId": "get_onboarding",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OnboardingState"
+                }
+              }
+            },
+            "description": "The onboarding record"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "The record could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The install's first-run record.",
+        "tags": [
+          "Settings"
+        ]
+      },
+      "patch": {
+        "operationId": "update_onboarding",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OnboardingPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OnboardingState"
+                }
+              }
+            },
+            "description": "The updated record"
+          },
+          "400": {
+            "description": "The update is invalid; the detail says which field and why"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "The record could not be written"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update the first-run record: finish or reopen the flow, mark steps done,\nleave steps for later with a reason, set the default way in.",
+        "tags": [
+          "Settings"
+        ]
+      }
+    },
     "/settings/preview-domain/status": {
       "get": {
         "description": "`local_only` (`localhost`, `localho.st`), `unresolved` (a name under it\ndoes not resolve), `no_way_in` (it resolves, but to nothing this install\nserves publicly) or `usable`. Recomputed when the setting, the tunnels or\nthe nodes' public ingress change, and every 30 minutes.",
@@ -194668,6 +195540,117 @@
         "summary": "Whether the preview domain can be reached.",
         "tags": [
           "Reachability"
+        ]
+      }
+    },
+    "/settings/private-ingress": {
+      "delete": {
+        "operationId": "delete_private_ingress",
+        "responses": {
+          "204": {
+            "description": "The consent is withdrawn"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "The consent could not be written"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Stop serving private addresses from this machine. Addresses made private\nhere stop answering until consent is given again.",
+        "tags": [
+          "Settings"
+        ]
+      },
+      "get": {
+        "operationId": "get_private_ingress",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivateIngressStatus"
+                }
+              }
+            },
+            "description": "The consent and its status"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "The consent could not be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether this machine serves private addresses: the consent, and what the\ncontrol plane last made of it (the address it serves on, or why not).",
+        "tags": [
+          "Settings"
+        ]
+      },
+      "put": {
+        "description": "`listen` is `tailscale` (the Tailscale interface's address) or one of the\nmachine's private addresses. The proxy then serves an address made\nprivate on this machine only to connections that arrive on that address\nfrom inside its range. `tailscale_serve` must be false: the control\nplane does not write Tailscale Serve entries (a worker's agent does).\nWhere the console and proxy run as separate processes nothing here\napplies a consent, and saving one is a 409.",
+        "operationId": "put_private_ingress",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrivateIngressRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivateIngressConsent"
+                }
+              }
+            },
+            "description": "The stored consent"
+          },
+          "400": {
+            "description": "The address is not one a private listener may use; the detail says why"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The console and proxy run as separate processes, so nothing here serves private addresses; or `create_only` was asked and a consent exists, which is kept"
+          },
+          "500": {
+            "description": "The consent could not be written"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Serve private addresses from this machine.",
+        "tags": [
+          "Settings"
         ]
       }
     },

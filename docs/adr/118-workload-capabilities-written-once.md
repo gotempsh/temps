@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-115: A workload capability is written once; each kind keeps its own entities
+# ADR-118: A workload capability is written once; each kind keeps its own entities
 
 **Status:** Accepted — 2026-11-25
 

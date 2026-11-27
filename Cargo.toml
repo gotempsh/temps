@@ -107,6 +107,7 @@ members = [
     "crates/temps-service-access",
     "crates/temps-service-access-runtime",
     "crates/temps-ingress",
+    "crates/temps-connector-pins",
     "crates/temps-edge-rules",
     "crates/temps-blob",
     "crates/temps-log-aggregator",

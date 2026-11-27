@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { createHash } from 'node:crypto'
 import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as path from 'node:path'
 // jsonc-parser's package.json `main` points at a UMD build whose dynamic
 // require() of sibling files (e.g. `./impl/format`) doesn't survive Bun's
@@ -13,12 +15,218 @@ import * as jsonc from 'jsonc-parser/lib/esm/main.js'
 export interface McpServerEntry {
   url: string
   apiKey: string
+  /**
+   * Run the Temps bridge on this computer (`temps mcp bridge`) instead of
+   * connecting to `url`: the app starts it over stdio, and it adds the
+   * `temps_deploy_folder` tool for these folders.
+   */
+  bridge?: LocalBridge
+}
+
+export interface LocalBridge {
+  /** Full paths of the folders the agent may deploy from. */
+  folders: string[]
+  /** The npm package that provides `temps mcp bridge`, pinned to a version. */
+  packageSpec: string
+}
+
+/**
+ * How an app starts the bridge. The key is in `env`, never in `args`, so it
+ * stays out of the process list of the running bridge. With `keyFile`, `env`
+ * names that file instead of holding the key: for apps whose installer is a
+ * CLI that takes the environment as arguments (`codex mcp add --env`), so the
+ * key never appears on the installer's command line either.
+ */
+export interface LocalBridgeCommand {
+  command: string
+  args: string[]
+  env: Record<string, string>
+}
+
+export function localBridgeCommand(entry: McpServerEntry, bridge: LocalBridge, keyFile?: string): LocalBridgeCommand {
+  return {
+    command: 'npx',
+    args: [
+      '-y',
+      bridge.packageSpec,
+      'mcp',
+      'bridge',
+      '--url',
+      new URL(entry.url).origin,
+      ...bridge.folders.flatMap((folder) => ['--folder', folder]),
+    ],
+    // The key file wins over TEMPS_API_KEY, so an entry that holds its key
+    // inline clears TEMPS_API_KEY_FILE: one inherited from wherever the app
+    // was started, for another instance, would otherwise be read and its key
+    // sent to this entry's URL.
+    env: keyFile ? { TEMPS_API_KEY_FILE: keyFile } : { TEMPS_API_KEY: entry.apiKey, TEMPS_API_KEY_FILE: '' },
+  }
+}
+
+function shortHash(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 16)
+}
+
+function keyFilePrefix(clientId: string, profile: string): string {
+  return `${clientId}-${shortHash(profile)}-`
+}
+
+/**
+ * Where the bridge key for one entry of an app installed through its own CLI
+ * is kept, readable by this user only. One file per app profile (`profile`:
+ * the app's config directory, empty when it has one per user) and Temps
+ * instance, so installing for another instance, or in another profile, never
+ * replaces the key an existing entry reads and sends to its own address.
+ */
+export function bridgeKeyFilePath(clientId: string, url: string, profile = '', home: string = os.homedir()): string {
+  const name = `${keyFilePrefix(clientId, profile)}${shortHash(new URL(url).origin)}.key`
+  return path.join(home, '.temps', 'mcp', name)
+}
+
+/**
+ * Write a bridge key to `file`, created at 0600 in a 0700 directory and moved
+ * into place, so it is never readable by another user, even for an instant.
+ * Returns what the file held before (null when it did not exist), for
+ * `restoreBridgeKeyFile` when the app then refuses the entry.
+ */
+export async function writeBridgeKeyFile(file: string, apiKey: string): Promise<string | null> {
+  const dir = path.dirname(file)
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 })
+  await fs.promises.chmod(dir, 0o700)
+  const previous = await fs.promises.readFile(file, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw error
+  })
+  await replaceKeyFile(file, `${apiKey}\n`)
+  return previous
+}
+
+/**
+ * Put a key file back as `writeBridgeKeyFile` found it (removed when it did
+ * not exist), but only while it still holds `written`, the key this install
+ * wrote: one another install wrote since, which its entry now reads, is
+ * left as it is.
+ */
+export async function restoreBridgeKeyFile(file: string, previous: string | null, written: string): Promise<void> {
+  if (readKeyFile(file) !== written.trim()) return
+  if (previous === null) await fs.promises.rm(file, { force: true })
+  else await replaceKeyFile(file, previous)
+}
+
+async function replaceKeyFile(file: string, content: string): Promise<void> {
+  const temporary = `${file}.${process.pid}.tmp`
+  await fs.promises.rm(temporary, { force: true })
+  await fs.promises.writeFile(temporary, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+  try {
+    await fs.promises.rename(temporary, file)
+  } catch (error) {
+    await fs.promises.rm(temporary, { force: true })
+    throw error
+  }
+}
+
+/** Delete the bridge key files of one app profile, whatever instance they are for; other profiles keep theirs. */
+export async function removeBridgeKeyFiles(clientId: string, profile = '', home: string = os.homedir()): Promise<void> {
+  const dir = path.join(home, '.temps', 'mcp')
+  const prefix = keyFilePrefix(clientId, profile)
+  const names = await fs.promises.readdir(dir).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return [] as string[]
+    throw error
+  })
+  await Promise.all(
+    names
+      .filter((name) => name.startsWith(prefix) && name.endsWith('.key'))
+      .map((name) => fs.promises.rm(path.join(dir, name), { force: true })),
+  )
+}
+
+/** Whether two URLs point at the same Temps instance (scheme, host and port). */
+export function sameOrigin(a: string | null, b: string): boolean {
+  if (!a) return false
+  try {
+    return new URL(a).origin === new URL(b).origin
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The MCP URL a bridge entry connects to, from its command line: the bridge
+ * always asks for the write tools. Null when the arguments are not a bridge.
+ */
+export function bridgeUrlFromArgs(args: unknown): string | null {
+  if (!Array.isArray(args)) return null
+  const bridgeAt = args.findIndex((arg, i) => arg === 'bridge' && args[i - 1] === 'mcp')
+  const urlAt = args.indexOf('--url')
+  const url = urlAt === -1 ? undefined : args[urlAt + 1]
+  if (bridgeAt === -1 || typeof url !== 'string') return null
+  try {
+    const mcp = new URL('/mcp', new URL(url).origin)
+    mcp.searchParams.set('write', '1')
+    return mcp.toString()
+  } catch {
+    return null
+  }
+}
+
+/** The same, from the text an app's `mcp get` prints for a bridge entry. */
+export function bridgeUrlFromText(text: string): string | null {
+  const match = text.match(/\bmcp\s+bridge\b[\s\S]*?--url\s+(\S+)/)
+  return match?.[1] ? bridgeUrlFromArgs(['mcp', 'bridge', '--url', match[1]]) : null
+}
+
+/** For adapters that drive an app's own CLI: where it is and what it sees. Defaults are this process's. */
+export interface CliAdapterOptions {
+  /** The app's CLI, instead of finding it on PATH. */
+  binary?: string
+  /** The user's home directory, where key files are kept. */
+  home?: string
+  /** The environment the app's CLI runs with, which also picks its profile. */
+  env?: NodeJS.ProcessEnv
 }
 
 export interface InstallResult {
   success: boolean
   alreadyInstalled?: boolean
   reason?: string
+}
+
+/** Most bytes read from a key file: an API key is far shorter. */
+const MAX_KEY_FILE_BYTES = 4096
+
+/** The key in a bridge key file, or undefined when it cannot be read or is not one. */
+export function readKeyFile(file: string): string | undefined {
+  let handle: number | undefined
+  try {
+    handle = fs.openSync(file, 'r')
+    const buffer = Buffer.alloc(MAX_KEY_FILE_BYTES + 1)
+    const read = fs.readSync(handle, buffer, 0, buffer.length, 0)
+    if (read > MAX_KEY_FILE_BYTES) return undefined
+    return buffer.subarray(0, read).toString('utf8').trim() || undefined
+  } catch {
+    return undefined
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle)
+  }
+}
+
+function bearerOf(value: unknown): string | undefined {
+  return typeof value === 'string' ? /^Bearer\s+(\S+)$/i.exec(value.trim())?.[1] : undefined
+}
+
+/**
+ * The API key an app's entry sends, from every place an entry this CLI
+ * writes keeps it: an `Authorization` header, `mcp-remote`'s `AUTH_HEADER`,
+ * the bridge's key file or its inline key. Undefined when it holds none
+ * (Codex's HTTP entry reads its token from the user's environment).
+ */
+export function entryApiKey(entry: unknown): string | undefined {
+  if (!entry || typeof entry !== 'object') return undefined
+  const { headers, env } = entry as { headers?: Record<string, unknown>; env?: Record<string, unknown> }
+  const header = Object.entries(headers ?? {}).find(([name]) => name.toLowerCase() === 'authorization')?.[1]
+  const file = typeof env?.TEMPS_API_KEY_FILE === 'string' ? env.TEMPS_API_KEY_FILE.trim() : ''
+  const inline = typeof env?.TEMPS_API_KEY === 'string' ? env.TEMPS_API_KEY.trim() : ''
+  return bearerOf(header) || bearerOf(env?.AUTH_HEADER) || (file ? readKeyFile(file) : undefined) || inline || undefined
 }
 
 /** The server name written into every client's config file/registry. */
@@ -44,6 +252,13 @@ export interface McpClientAdapter {
   getServerUrl(): Promise<string | null>
   addServer(entry: McpServerEntry): Promise<InstallResult>
   removeServer(): Promise<InstallResult>
+  /**
+   * The API key the configured Temps entry sends now, when this adapter can
+   * read it from the entry (undefined when there is none, or it is kept
+   * elsewhere). Read before an entry is replaced or removed, to tell
+   * whether it still held the key `mcp add` minted for it.
+   */
+  installedApiKey(): Promise<string | undefined>
   /** Human-readable description of what `addServer`/`removeServer` will change, for the pre-write confirmation prompt. */
   describeTarget(): Promise<string>
 }
@@ -62,6 +277,10 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
   protected abstract getConfigPath(): string
   protected abstract getServerPropertyName(): string
   protected abstract buildServerConfig(entry: McpServerEntry): Record<string, unknown>
+  /** The entry that starts the bridge over stdio. Most apps take a command, its arguments and environment. */
+  protected buildBridgeConfig(command: LocalBridgeCommand): Record<string, unknown> {
+    return { command: command.command, args: command.args, env: command.env }
+  }
   /** Pulls the connection URL back out of a config entry previously built by buildServerConfig. */
   protected abstract extractUrl(serverConfig: Record<string, unknown>): string | null
 
@@ -86,9 +305,14 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
     return (await this.readServerConfig()) !== null
   }
 
+  async installedApiKey(): Promise<string | undefined> {
+    return entryApiKey(await this.readServerConfig())
+  }
+
   async getServerUrl(): Promise<string | null> {
     const serverConfig = await this.readServerConfig()
-    return serverConfig ? this.extractUrl(serverConfig) : null
+    if (!serverConfig) return null
+    return bridgeUrlFromArgs(serverConfig.args) ?? this.extractUrl(serverConfig)
   }
 
   async addServer(entry: McpServerEntry): Promise<InstallResult> {
@@ -110,7 +334,9 @@ export abstract class JsonConfigMcpClientAdapter implements McpClientAdapter {
 
       const prop = this.getServerPropertyName()
       const existing = (jsonc.parse(content || '{}') ?? {}) as Record<string, any>
-      const newEntry = this.buildServerConfig(entry)
+      const newEntry = entry.bridge
+        ? this.buildBridgeConfig(localBridgeCommand(entry, entry.bridge))
+        : this.buildServerConfig(entry)
       const currentEntry = existing?.[prop]?.[MCP_SERVER_NAME]
 
       if (currentEntry !== undefined && JSON.stringify(currentEntry) === JSON.stringify(newEntry)) {

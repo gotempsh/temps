@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 
 use crate::error::IngressError;
+use crate::registry::DnsHandling;
 use crate::wire::NodeConnectorSpec;
 
 /// The provider-side tunnel, as stored on the connector row.
@@ -47,6 +48,51 @@ pub enum DnsIntent {
     Cname { target: String, proxied: bool },
     /// The provider owns the name (for example an ngrok-assigned domain).
     None,
+}
+
+/// What the rest of Temps must know about a way in, beyond its own steps
+/// (ADR-117 D2). A provider answers per connector, so two connectors of one
+/// provider may differ. A value is added to these types only together with
+/// the provider that needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capabilities {
+    pub reach: Reach,
+    pub origin: Origin,
+    /// Who makes a published name resolve.
+    pub dns: DnsHandling,
+}
+
+/// Who can reach what a way in serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The internet.
+    Public,
+    /// Only people on this private network (ADR-115).
+    Private { network: &'static str },
+}
+
+/// Where a node hands a way in's traffic to Temps, and what is trusted there
+/// and only there (ADR-117 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// ADR-107 D3's plain-HTTP tunnel origin on loopback. The connector's
+    /// client-address header, and its JA4 header if any, are trusted on it.
+    LoopbackHttp {
+        client_address_header: &'static str,
+        ja4: Option<Ja4Header>,
+    },
+    /// ADR-065 D3's per-address Serve socket, which only the network's own
+    /// daemon can reach. These identity headers are trusted on it.
+    ServeSocket {
+        identity_headers: &'static [&'static str],
+    },
+}
+
+/// A JA4 fingerprint a connector forwards, and whose fingerprint it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ja4Header {
+    pub header: &'static str,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone)]

@@ -27,10 +27,7 @@ impl LoadBalancer {
                 &ctx.method,
                 &ctx.path,
                 ctx.query_string.as_deref(),
-                |path| {
-                    self.project_context_resolver
-                        .match_path_route(&ctx.host, path)
-                },
+                |path| self.project_contexts(ctx).match_path_route(&ctx.host, path),
             );
         }
     }
