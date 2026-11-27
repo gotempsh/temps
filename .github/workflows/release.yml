@@ -423,8 +423,12 @@ jobs:
         id: crates-auth
       - name: Publish verified Rust packages
         if: steps.registries.outputs.crate_pending == 'true'
+        # Cargo reads the crates.io token only from `registry.token`, i.e.
+        # CARGO_REGISTRY_TOKEN. `CARGO_REGISTRIES_<NAME>_TOKEN` is for other
+        # registries: CARGO_REGISTRIES_CRATES_IO_TOKEN is ignored, and
+        # `cargo publish` fails with "no token found".
         env:
-          CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates-auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
         run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind crate
       - name: Create immutable package tags once every registry shows the release
         env:
