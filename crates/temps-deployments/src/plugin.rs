@@ -271,6 +271,24 @@ fn docker_volume_provider(
     )))
 }
 
+/// Reads back the token a service's containers were deployed with, for
+/// components that authenticate to those containers.
+struct DeployedServiceToken(Arc<crate::services::deployment_token_service::DeploymentTokenService>);
+
+#[async_trait::async_trait]
+impl temps_core::DeploymentTokenSource for DeployedServiceToken {
+    async fn deployment_token(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<String, String> {
+        self.0
+            .get_or_create_deployment_token(project_id, Some(environment_id), None)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl Default for DeploymentsPlugin {
     fn default() -> Self {
         Self::new()
@@ -460,6 +478,11 @@ impl TempsPlugin for DeploymentsPlugin {
             );
             // Register so other plugins (e.g. workspace) can resolve it via the service registry.
             context.register_service(deployment_token_service.clone());
+            // The plugin host authenticates to a plugin's container with the
+            // token that container was deployed with.
+            let deployment_token_source: Arc<dyn temps_core::DeploymentTokenSource> =
+                Arc::new(DeployedServiceToken(deployment_token_service.clone()));
+            context.register_service(deployment_token_source);
 
             // Create DatabaseCronConfigService to manage cron jobs
             let database_cron_service = Arc::new(

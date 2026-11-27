@@ -23,6 +23,7 @@ pub mod config;
 pub mod console_startup;
 pub mod crypto;
 pub mod deployment;
+pub mod deployment_token;
 pub mod dns_automation;
 pub mod env_vars_provider;
 pub mod environment_address;
@@ -158,6 +159,7 @@ pub use cloud_telemetry_activation::{
 pub use config::*;
 pub use constants::*;
 pub use deployment::*;
+pub use deployment_token::DeploymentTokenSource;
 pub use dns_automation::{
     DnsAutomationDecision, DnsAutomationError, DnsAutomationGate, DnsAutomationGateSlot,
     DnsAutomationMutation, DnsAutomationPurpose, DnsAutomationRequest,

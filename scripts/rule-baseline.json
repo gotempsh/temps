@@ -262,8 +262,7 @@
       "functions_over_300_lines": 2
     },
     "temps-plugin-sdk": {
-      "lazy_error_variants": 1,
-      "functions_over_300_lines": 1
+      "lazy_error_variants": 1
     },
     "temps-presets": {
       "lazy_error_variants": 3,

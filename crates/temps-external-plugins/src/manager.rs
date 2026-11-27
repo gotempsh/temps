@@ -26,6 +26,7 @@ use sea_orm::DatabaseConnection;
 use utoipa::openapi::OpenApi;
 
 use crate::channel::PluginChannel;
+use crate::endpoint::PluginEndpoint;
 use crate::install::open_verified_executable;
 use crate::proxy::PluginProxy;
 use crate::sandbox::{
@@ -51,8 +52,9 @@ pub struct ExternalPluginProcess {
     pub binary_path: PathBuf,
     /// Signed digest verified against the descriptor used for execution.
     pub sha256: String,
-    /// Unix socket path for communication
-    pub socket_path: PathBuf,
+    /// Where the plugin answers: its private socket, or the address of the
+    /// Temps service it runs as.
+    pub endpoint: PluginEndpoint,
     /// Per-process secret used to bind internal requests to this staged
     /// plugin launch. This is protocol integrity, not shared-UID isolation.
     auth_secret: String,
@@ -151,7 +153,8 @@ pub struct PluginReloadResult {
     pub failures: Vec<PluginLoadFailure>,
 }
 
-/// What runs a plugin: a child process of Temps, or a container.
+/// What runs a plugin: a child process of Temps, a container Temps started
+/// for it, or the Temps service the plugin is deployed as.
 enum PluginRuntime {
     Process {
         /// The child process handle
@@ -161,6 +164,9 @@ enum PluginRuntime {
         launcher: Option<crate::launcher::PluginLauncher>,
     },
     Container(SandboxedPlugin),
+    /// The plugin is the container of a Temps deployment. The deployment
+    /// owns it: this host starts, stops and removes nothing.
+    Service(services::AttachedService),
 }
 
 /// A plugin container and the two host directories that exist only for it.
@@ -215,6 +221,8 @@ impl PluginRuntime {
                 debug!(plugin = %plugin, container = %sandboxed.container.name(), "Removing plugin container");
                 sandboxed.container.remove_in_background();
             }
+            // Detaching from a service leaves the service running.
+            Self::Service(_) => {}
         }
     }
 
@@ -226,6 +234,7 @@ impl PluginRuntime {
                 let _ = child.start_kill();
             }
             Self::Container(sandboxed) => sandboxed.container.remove_in_background(),
+            Self::Service(_) => {}
         }
     }
 
@@ -233,7 +242,7 @@ impl PluginRuntime {
     fn pid(&self) -> Option<u32> {
         match self {
             Self::Process { child, .. } => child.id(),
-            Self::Container(_) => None,
+            Self::Container(_) | Self::Service(_) => None,
         }
     }
 }
@@ -262,13 +271,20 @@ impl ExternalPluginProcess {
                 }
             }
             PluginRuntime::Container(sandboxed) => sandboxed.container.remove().await,
+            PluginRuntime::Service(_) => {}
         }
     }
 
     /// Clean up socket and PID files on disk. A container's own directories
     /// are removed when its [`SandboxedPlugin`] is dropped.
     fn cleanup_files(&self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        // A plugin that runs as a Temps service owns no files on this host.
+        if matches!(self.runtime, PluginRuntime::Service(_)) {
+            return;
+        }
+        if let Some(socket_path) = self.endpoint.socket_path() {
+            let _ = std::fs::remove_file(socket_path);
+        }
         let _ = std::fs::remove_file(&self.pid_file_path);
     }
 }
@@ -658,6 +674,9 @@ pub struct ExternalPluginManager {
     /// Why each installed plugin that is not running failed its last start,
     /// in words an administrator can be shown. Cleared when it starts.
     start_failures: Arc<RwLock<HashMap<String, String>>>,
+    /// Plugins that run as Temps services: what attaching needs, and the
+    /// ones this host is not attached to right now.
+    services: services::ServicePlugins,
 }
 
 impl ExternalPluginManager {
@@ -673,6 +692,7 @@ impl ExternalPluginManager {
             audit_service: Arc::new(RwLock::new(None)),
             isolation: tokio::sync::OnceCell::new(),
             start_failures: Arc::new(RwLock::new(HashMap::new())),
+            services: services::ServicePlugins::default(),
         }
     }
 
@@ -789,7 +809,19 @@ impl ExternalPluginManager {
         self.discover_and_start_report().await.manifests
     }
 
+    /// Start every plugin this instance has: the ones installed as
+    /// executables, and the ones that run as Temps services.
     async fn discover_and_start_report(&self) -> PluginReloadResult {
+        let mut report = self.discover_and_start_installed().await;
+        // A plugin that runs as a service needs nothing on this host's disk,
+        // so it also runs on a control plane without persistent storage.
+        let services = self.start_service_plugins().await;
+        report.manifests.extend(services.manifests);
+        report.failures.extend(services.failures);
+        report
+    }
+
+    async fn discover_and_start_installed(&self) -> PluginReloadResult {
         if !self.config.persistent_installations {
             return PluginReloadResult {
                 manifests: Vec::new(),
@@ -1236,8 +1268,18 @@ impl ExternalPluginManager {
         // Under a launcher, nothing starts until the plugin user is proven
         // unable to read this process's secrets. A launcher is this host's
         // sandbox, so it takes the place of a container.
+        // A plugin that runs as a Temps service is attached to, never started:
+        // it has no executable on this host.
+        let no_executable = || -> StartFailure {
+            format!("Plugin {binary_name} runs as a Temps service and has no executable to start")
+                .into()
+        };
+        if !isolation.runs_an_executable() {
+            return Err(no_executable());
+        }
         let launcher = self.verified_isolation().await?.cloned();
         let mode = match (&launcher, isolation) {
+            (_, PluginIsolation::Service) => return Err(no_executable()),
             (Some(_), _) => IsolationMode::SeparateUser,
             (None, PluginIsolation::Container) => IsolationMode::Container,
             (None, PluginIsolation::Process) => IsolationMode::Process,
@@ -1254,6 +1296,7 @@ impl ExternalPluginManager {
                 .config
                 .sockets_dir
                 .join(format!("{}.sock", instance_name)),
+            IsolationMode::Service => return Err(no_executable()),
         };
 
         // Validate that the socket path fits within the OS limit.
@@ -1308,6 +1351,7 @@ impl ExternalPluginManager {
                 )
                 .await?
             }
+            IsolationMode::Service => return Err(no_executable()),
         };
         let PluginIo {
             mut runtime,
@@ -1600,8 +1644,9 @@ impl ExternalPluginManager {
         // Open the platform channel (WebSocket to plugin for queries + events).
         // This is non-fatal: older plugins that don't serve /_temps/channel
         // will simply not get a channel (they can still use POST /_events).
+        let endpoint = PluginEndpoint::Unix(socket_path);
         let channel = PluginChannel::connect(
-            &socket_path,
+            &endpoint,
             manifest.name.clone(),
             self.db.clone(),
             self.host_api.clone(),
@@ -1635,7 +1680,7 @@ impl ExternalPluginManager {
             manifest,
             binary_path: binary_path.to_path_buf(),
             sha256: expected_sha256.to_string(),
-            socket_path,
+            endpoint,
             auth_secret,
             pid_file_path,
             has_ui,
@@ -1799,14 +1844,19 @@ impl ExternalPluginManager {
         pending.process.shutdown().await;
     }
 
-    /// Get all running plugin manifests.
+    /// Get the manifests of every plugin that can serve a request: the
+    /// running ones, and the ones whose service is stopped or reconnecting
+    /// and is attached to again by the next request.
     pub async fn manifests(&self) -> Vec<PluginManifest> {
-        self.plugins
+        let mut manifests: Vec<PluginManifest> = self
+            .plugins
             .read()
             .await
             .values()
             .map(|p| p.manifest.clone())
-            .collect()
+            .collect();
+        manifests.extend(self.services.dormant_manifests().await);
+        manifests
     }
 
     /// Get OpenAPI schemas from all running plugins.
@@ -1859,10 +1909,13 @@ impl ExternalPluginManager {
 
     /// Create a PluginProxy for a given plugin name.
     pub async fn proxy_for(&self, plugin_name: &str) -> Option<PluginProxy> {
+        if let Some(proxy) = self.service_proxy_for(plugin_name).await {
+            return Some(proxy);
+        }
         let plugins = self.plugins.read().await;
         plugins.get(plugin_name).map(|process| {
             PluginProxy::new(
-                process.socket_path.clone(),
+                process.endpoint.clone(),
                 process.manifest.name.clone(),
                 process.auth_secret.clone(),
             )
@@ -1874,13 +1927,22 @@ impl ExternalPluginManager {
         })
     }
 
-    /// Get the socket path for a plugin.
+    /// Get the socket path of a plugin Temps started itself.
     pub async fn socket_path_for(&self, plugin_name: &str) -> Option<PathBuf> {
         self.plugins
             .read()
             .await
             .get(plugin_name)
-            .map(|p| p.socket_path.clone())
+            .and_then(|p| p.endpoint.socket_path().map(Path::to_path_buf))
+    }
+
+    /// Where a running plugin answers.
+    pub async fn endpoint_for(&self, plugin_name: &str) -> Option<PluginEndpoint> {
+        self.plugins
+            .read()
+            .await
+            .get(plugin_name)
+            .map(|p| p.endpoint.clone())
     }
 
     /// Per-process assertion secret for internal event delivery.
@@ -1987,6 +2049,7 @@ impl ExternalPluginManager {
 
     /// Shut down all plugins gracefully.
     pub async fn shutdown_all(&self) {
+        self.services.forget_all().await;
         let mut plugins = self.plugins.write().await;
         for (name, mut process) in plugins.drain() {
             info!(plugin = %name, "Shutting down external plugin");
@@ -1998,6 +2061,7 @@ impl ExternalPluginManager {
     /// Shut down a specific plugin.
     pub async fn shutdown_plugin(&self, plugin_name: &str) {
         self.start_failures.write().await.remove(plugin_name);
+        self.services.forget(plugin_name).await;
         let mut plugins = self.plugins.write().await;
         if let Some(mut process) = plugins.remove(plugin_name) {
             info!(plugin = %plugin_name, "Shutting down external plugin");
@@ -2027,6 +2091,12 @@ impl ExternalPluginManager {
     ///
     /// Returns the new manifest on success, or an error string on failure.
     pub async fn reload_plugin(&self, plugin_name: &str) -> Result<PluginManifest, String> {
+        if let Some(binding) = self.service_binding_of(plugin_name).await {
+            return self
+                .attach_service(binding, Some(plugin_name))
+                .await
+                .map_err(|error| error.public_reason());
+        }
         if !self.plugins.read().await.contains_key(plugin_name) {
             return Err(format!(
                 "Plugin '{plugin_name}' is not running; cannot reload"
@@ -2079,6 +2149,9 @@ impl ExternalPluginManager {
         &self.config
     }
 }
+
+pub(crate) mod services;
+pub use services::ServicePluginState;
 
 #[cfg(test)]
 mod tests {
@@ -2182,7 +2255,7 @@ mod tests {
                 manifest: PluginManifest::builder(name, version).build(),
                 binary_path: root.join(format!("{name}-{version}")),
                 sha256: "00".repeat(32),
-                socket_path: root.join(format!("{name}-{version}.sock")),
+                endpoint: root.join(format!("{name}-{version}.sock")).into(),
                 auth_secret: "fixture-auth".to_string(),
                 pid_file_path: root.join(format!("{name}-{version}.pid")),
                 runtime: PluginRuntime::Process {

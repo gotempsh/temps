@@ -8,6 +8,8 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 **Status:** Proposed
 **Date:** 2026-11-27
 
+**Superseded in part by:** [ADR-119](./119-a-plugin-is-a-temps-service.md)
+
 Related: ADR-054 (plugin builds on worker nodes), ADR-092 (plugin AI tools), ADR-055 (workload plane and runtime drivers).
 
 ## Context

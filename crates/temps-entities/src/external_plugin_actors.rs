@@ -15,9 +15,19 @@ pub struct Model {
     pub active: bool,
     /// Administrator consent for marked AI tools; false for existing and new actors.
     pub ai_tools_enabled: bool,
-    /// How the plugin is isolated: `container` (the default for a new actor)
+    /// How the plugin is isolated: `service` when it runs as a Temps service,
+    /// `container` (the default for a new actor installed as an executable)
     /// or `process`. Actors that existed before the column keep `process`.
     pub isolation: String,
+    /// The service a `service` plugin runs as. NULL for other plugins, and
+    /// once that service has been deleted.
+    pub project_id: Option<i32>,
+    /// The environment of that service the plugin runs in.
+    pub environment_id: Option<i32>,
+    /// The manifest a `service` plugin last answered with, so it can be
+    /// listed and routed to while its service is stopped.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub manifest: Option<Json>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

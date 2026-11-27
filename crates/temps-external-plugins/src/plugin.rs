@@ -137,6 +137,31 @@ impl TempsPlugin for ExternalPluginsPlugin {
                 .manager()
                 .set_audit_service(context.require_service::<dyn temps_core::AuditLogger>())
                 .await;
+            // What attaching to a plugin that runs as a Temps service needs:
+            // the token its containers were deployed with (registered by the
+            // deployments plugin, which runs earlier) and where this process
+            // runs, to reach those containers. Absent in an embedding that
+            // deploys nothing; adding a service as a plugin then says so.
+            match (
+                context.get_service::<dyn temps_core::DeploymentTokenSource>(),
+                context.get_service::<temps_core::RuntimeContext>(),
+            ) {
+                (Some(tokens), Some(runtime)) => {
+                    let mut services = crate::service_runtime::ServiceRuntime::new(
+                        tokens,
+                        runtime.as_ref().clone(),
+                    );
+                    // Starts an environment that stopped for being idle. Only
+                    // a process that runs the proxy owns that lifecycle.
+                    if let Some(waker) = context.get_service::<dyn temps_core::OnDemandWaker>() {
+                        services = services.with_waker(waker);
+                    }
+                    service.manager().set_service_runtime(services).await;
+                }
+                _ => debug!(
+                    "No deployments in this process; plugins cannot be added from services here"
+                ),
+            }
             // Kick off discovery + start in the background. When it
             // completes, the shared proxy router is swapped in and
             // `/x/<plugin>/...` routes start working.

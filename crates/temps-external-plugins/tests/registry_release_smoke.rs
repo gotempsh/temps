@@ -61,7 +61,13 @@ async fn published_deployment_pulse_installs_and_serves_overview() {
         .await
         .expect("running plugin");
     let client = reqwest::Client::builder()
-        .unix_socket(proxy.socket_path)
+        .unix_socket(
+            proxy
+                .endpoint
+                .socket_path()
+                .expect("a plugin started from an executable listens on a socket")
+                .to_path_buf(),
+        )
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .expect("socket client");

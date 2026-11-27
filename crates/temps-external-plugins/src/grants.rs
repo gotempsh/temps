@@ -9,6 +9,7 @@ use std::sync::Arc;
 use temps_plugin_protocol::channel::{PluginActorInfo, PluginHostPermission};
 
 use crate::sandbox::PluginIsolation;
+use crate::service_runtime::ServiceBinding;
 use thiserror::Error;
 
 pub const MAX_PROMPT_BYTES: u32 = 65_536;
@@ -36,6 +37,17 @@ impl Default for PluginGrantConfig {
 pub struct PluginGrants {
     pub actor: PluginActorInfo,
     pub config: PluginGrantConfig,
+}
+
+/// A plugin that runs as a Temps service, as its actor row records it.
+#[derive(Debug, Clone)]
+pub struct StoredServicePlugin {
+    pub name: String,
+    /// The service and environment it runs as; `None` once either has been
+    /// deleted.
+    pub binding: Option<ServiceBinding>,
+    /// The manifest it last answered with.
+    pub manifest: Option<temps_plugin_protocol::PluginManifest>,
 }
 
 #[derive(Debug, Error)]
@@ -336,6 +348,111 @@ impl PluginGrantService {
             });
         }
         Ok(())
+    }
+
+    /// Where the active actor of `plugin_name` was installed from, or `None`
+    /// when the plugin has no active actor.
+    pub async fn active_source(&self, plugin_name: &str) -> Result<Option<String>, GrantError> {
+        let database = |operation| {
+            move |source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation,
+                source,
+            }
+        };
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT source_identity FROM external_plugin_actors WHERE plugin_name=$1 AND active=TRUE",
+                [plugin_name.into()],
+            ))
+            .await
+            .map_err(database("read actor source"))?;
+        match row {
+            None => Ok(None),
+            Some(row) => row
+                .try_get("", "source_identity")
+                .map(Some)
+                .map_err(database("decode actor source")),
+        }
+    }
+
+    /// Record that the active actor of `plugin_name` runs as a Temps service,
+    /// and the manifest it answered with.
+    pub async fn bind_service(
+        &self,
+        plugin_name: &str,
+        binding: ServiceBinding,
+        manifest: &temps_plugin_protocol::PluginManifest,
+    ) -> Result<(), GrantError> {
+        let manifest = serde_json::to_value(manifest).map_err(|error| GrantError::Invalid {
+            plugin_name: plugin_name.into(),
+            reason: format!("its manifest cannot be stored: {error}"),
+        })?;
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE external_plugin_actors SET isolation='service',project_id=$2,environment_id=$3,manifest=$4,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
+                [
+                    plugin_name.into(),
+                    binding.project_id.into(),
+                    binding.environment_id.into(),
+                    manifest.into(),
+                ],
+            ))
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "bind service",
+                source,
+            })?;
+        if result.rows_affected() != 1 {
+            return Err(GrantError::NotFound {
+                plugin_name: plugin_name.into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Every active plugin that runs as a Temps service, in one query.
+    pub async fn service_plugins(&self) -> Result<Vec<StoredServicePlugin>, GrantError> {
+        let database = |source| GrantError::Database {
+            plugin_name: "*".into(),
+            operation: "list service plugins",
+            source,
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT plugin_name, project_id, environment_id, manifest FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
+            ))
+            .await
+            .map_err(database)?;
+        let mut plugins = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("", "plugin_name").map_err(database)?;
+            let project_id: Option<i32> = row.try_get("", "project_id").map_err(database)?;
+            let environment_id: Option<i32> =
+                row.try_get("", "environment_id").map_err(database)?;
+            let manifest: Option<serde_json::Value> =
+                row.try_get("", "manifest").map_err(database)?;
+            plugins.push(StoredServicePlugin {
+                binding: project_id
+                    .zip(environment_id)
+                    .map(|(project_id, environment_id)| ServiceBinding {
+                        project_id,
+                        environment_id,
+                    }),
+                // A manifest this build cannot read is the same as none: the
+                // plugin answers a current one when it is next attached to.
+                manifest: manifest.and_then(|value| serde_json::from_value(value).ok()),
+                name,
+            });
+        }
+        Ok(plugins)
     }
 
     /// Commit a candidate's actor. `isolation` is what a newly created actor

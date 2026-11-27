@@ -5041,6 +5041,8 @@ Create and build TypeScript plugins, or install and manage external plugins
 - `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
 - `install-local` - Upload and activate a trusted native plugin on the configured Temps host
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
+- `services` - List the plugins that run as Temps services and whether each is running
+- `add-service` - Make a deployed service a plugin; it starts with no permissions
 - `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 - `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
@@ -5112,6 +5114,21 @@ Replace all host grants; --clear revokes all permissions immediately
 | `--ai-daily-calls <count>` | Daily AI call limit (0–10000) | - | No |
 | `--ai-max-tokens <count>` | Maximum AI output tokens per call (1–4096) | - | No |
 | `--clear` | Revoke all host permissions | - | No |
+
+### `plugin services`
+
+List the plugins that run as Temps services and whether each is running
+
+### `plugin add-service`
+
+Make a deployed service a plugin; it starts with no permissions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <id>` | Id of the service the plugin runs as | - | Yes |
+| `--environment <id>` | Id of the environment whose deployment is the plugin | - | Yes |
 
 ### `plugin dev [binary] [args...]`
 

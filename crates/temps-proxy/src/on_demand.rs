@@ -1186,6 +1186,10 @@ impl OnDemandWaker for OnDemandManager {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
+
+    fn record_activity(&self, environment_id: i32) {
+        OnDemandManager::record_activity(self, environment_id);
+    }
 }
 
 /// What waking and sleeping an `enforce` environment mean to the

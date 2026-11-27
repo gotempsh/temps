@@ -83,10 +83,15 @@ const STDOUT_PIPE_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginIsolation {
-    /// In a hardened container with storage of its own. The default.
+    /// In a hardened container with storage of its own. The default for a
+    /// plugin installed as an executable.
     Container,
     /// As a host process, with the access of the account that starts it.
     Process,
+    /// As a Temps service: the container of an ordinary deployment. Never
+    /// chosen for an executable; a plugin gets it by being added from the
+    /// service it runs as.
+    Service,
 }
 
 impl PluginIsolation {
@@ -94,6 +99,7 @@ impl PluginIsolation {
         match self {
             Self::Container => "container",
             Self::Process => "process",
+            Self::Service => "service",
         }
     }
 
@@ -101,8 +107,15 @@ impl PluginIsolation {
         match value {
             "container" => Some(Self::Container),
             "process" => Some(Self::Process),
+            "service" => Some(Self::Service),
             _ => None,
         }
+    }
+
+    /// Whether this is a way to run an installed executable, which is what
+    /// an installation or an isolation change may ask for.
+    pub fn runs_an_executable(self) -> bool {
+        !matches!(self, Self::Service)
     }
 }
 
@@ -116,6 +129,9 @@ pub enum IsolationMode {
     SeparateUser,
     /// Nothing: the plugin is a process of the Temps account.
     Process,
+    /// The hardened container of a Temps deployment, reached over the
+    /// network.
+    Service,
 }
 
 impl IsolationMode {

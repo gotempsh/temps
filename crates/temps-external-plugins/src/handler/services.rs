@@ -1,0 +1,646 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! Plugins that run as Temps services: list them with how each is doing,
+//! and make a deployed service a plugin.
+use super::*;
+use crate::manager::ServicePluginState;
+use crate::service::ServicePluginView;
+use crate::service_runtime::ServiceBinding;
+
+/// Where the console lists plugins and adds one from a service.
+const SETUP_PATH: &str = "/settings/plugins";
+
+/// One plugin that runs as a Temps service.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ServicePluginResponse {
+    /// The plugin's name, as its manifest declares it.
+    pub name: String,
+    /// Whether Temps is attached to the service's running container.
+    pub state: ServicePluginState,
+    /// Why the plugin is not running, when it is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The service the plugin runs as. Absent once the service was deleted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_name: Option<String>,
+    /// Whether the service stops when idle and starts on the next request,
+    /// so an unused plugin holds no memory.
+    pub stops_when_idle: bool,
+    /// The deployment Temps is attached to, while the plugin is running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<i32>,
+}
+
+impl From<ServicePluginView> for ServicePluginResponse {
+    fn from(view: ServicePluginView) -> Self {
+        Self {
+            name: view.name,
+            state: view.state,
+            detail: view.detail,
+            project_id: view.binding.map(|binding| binding.project_id),
+            environment_id: view.binding.map(|binding| binding.environment_id),
+            service_name: view.service_name,
+            service_slug: view.service_slug,
+            environment_name: view.environment_name,
+            stops_when_idle: view.stops_when_idle,
+            deployment_id: view.deployment_id,
+        }
+    }
+}
+
+/// Whether this server can run plugins as services, and the ones it runs.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PluginServicesResponse {
+    /// Whether a service can be added as a plugin on this server.
+    pub configured: bool,
+    /// Why not, when it cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where the console explains what is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_path: Option<String>,
+    pub plugins: Vec<ServicePluginResponse>,
+}
+
+/// The deployed service to add as a plugin.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AddServicePlugin {
+    /// The service (project) the plugin runs as.
+    pub project_id: i32,
+    /// The environment of that service whose deployment is the plugin.
+    pub environment_id: i32,
+}
+
+/// The plugin a service was added as.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AddedServicePluginResponse {
+    pub name: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub project_id: i32,
+    pub environment_id: i32,
+}
+
+#[derive(Serialize)]
+struct ServicePluginAudit {
+    context: temps_core::audit::AuditContext,
+    #[serde(skip)]
+    operation: &'static str,
+    project_id: i32,
+    environment_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plugin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
+}
+
+impl temps_core::audit::AuditOperation for ServicePluginAudit {
+    fn operation_type(&self) -> String {
+        self.operation.into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// The plugins that run as services, and whether one can be added here.
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/services",
+    operation_id = "get_plugin_services",
+    responses(
+        (status = 200, description = "Plugins that run as Temps services", body = PluginServicesResponse),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 500, description = "The services plugins run as could not be read", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(super) async fn get_plugin_services(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+) -> Result<Json<PluginServicesResponse>, Problem> {
+    permission_guard!(auth, SystemAdmin);
+    let configured = state.service.manager().can_run_services().await;
+    let plugins = state
+        .service
+        .service_plugins()
+        .await
+        .map_err(|error| service_problem(&error))?
+        .into_iter()
+        .map(ServicePluginResponse::from)
+        .collect();
+    Ok(Json(PluginServicesResponse {
+        configured,
+        reason: (!configured)
+            .then(|| crate::service_runtime::ServiceAttachError::Unavailable.public_reason()),
+        setup_path: (!configured).then(|| SETUP_PATH.to_string()),
+        plugins,
+    }))
+}
+
+/// Make a deployed service a plugin: Temps attaches to its running
+/// container, reads its manifest and routes requests to it. The plugin
+/// starts with no grants, and the service itself is not changed.
+#[utoipa::path(
+    tag = "External Plugins",
+    post,
+    path = "/x/plugins/services",
+    operation_id = "add_service_plugin",
+    request_body = AddServicePlugin,
+    responses(
+        (status = 201, description = "The service is now a plugin", body = AddedServicePluginResponse),
+        (status = 400, description = "Invalid request body, or the service is not a plugin Temps accepts", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 404, description = "The service or environment does not exist", body = temps_core::ProblemDetails),
+        (status = 409, description = "The service is stopped or not deployed, or its plugin name is already installed", body = temps_core::ProblemDetails),
+        (status = 415, description = "Request body is not JSON", body = temps_core::ProblemDetails),
+        (status = 422, description = "Request body does not name a service and an environment", body = temps_core::ProblemDetails),
+        (status = 428, description = "Recent sensitive-action verification required", body = temps_core::ProblemDetails),
+        (status = 500, description = "The plugin could not be recorded", body = temps_core::ProblemDetails),
+        (status = 502, description = "The service did not answer as a plugin", body = temps_core::ProblemDetails),
+        (status = 503, description = "Audit unavailable, or this server runs no services", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(super) async fn add_service_plugin(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<ExternalPluginsAppState>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    request: Result<Json<AddServicePlugin>, JsonRejection>,
+) -> Result<(StatusCode, Json<AddedServicePluginResponse>), Problem> {
+    permission_guard!(auth, SystemAdmin);
+    let Json(request) = request.map_err(|rejection| {
+        temps_core::problemdetails::new(rejection.status())
+            .with_title("Invalid Service Plugin Request")
+            .with_detail(
+                "Adding a service as a plugin requires an application/json body with the \
+                 project_id of the service and the environment_id of the environment it runs in",
+            )
+    })?;
+    let binding = ServiceBinding {
+        project_id: request.project_id,
+        environment_id: request.environment_id,
+    };
+    temps_auth::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::InstallExternalPlugin {
+            name: binding.source_identity(),
+        },
+    )
+    .await?;
+    let context = audit_context(&auth, &metadata);
+    let audit = |operation: &'static str,
+                 plugin: Option<&PluginManifest>,
+                 failure: Option<String>| ServicePluginAudit {
+        context: context.clone(),
+        operation,
+        project_id: binding.project_id,
+        environment_id: binding.environment_id,
+        plugin: plugin.map(|manifest| manifest.name.clone()),
+        version: plugin.map(|manifest| manifest.version.clone()),
+        failure,
+    };
+    // Attaching lets the service's code act as a plugin, so the attempt is on
+    // record before Temps connects to it.
+    record_required_audit(
+        &state,
+        &audit("EXTERNAL_PLUGIN_SERVICE_ADD_REQUESTED", None, None),
+    )
+    .await?;
+    let manifest = match state.service.add_service_plugin(binding).await {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            record_audit(
+                &state,
+                &audit(
+                    "EXTERNAL_PLUGIN_SERVICE_ADD_FAILED",
+                    None,
+                    Some(public_error_detail(&error)),
+                ),
+            )
+            .await;
+            return Err(service_problem(&error));
+        }
+    };
+    record_audit(
+        &state,
+        &audit("EXTERNAL_PLUGIN_SERVICE_ADDED", Some(&manifest), None),
+    )
+    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(AddedServicePluginResponse {
+            name: manifest.name,
+            version: manifest.version,
+            display_name: manifest.display_name,
+            project_id: binding.project_id,
+            environment_id: binding.environment_id,
+        }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{
+        metadata, test_state, test_state_with_audit, user_auth, AllowSensitiveActions,
+        RecordingAuditLogger, RequireSensitiveVerification,
+    };
+    use super::*;
+    use crate::manager::services::tests::{platform, serve_plugin, Platform, TOKEN};
+    use axum::response::IntoResponse;
+    use temps_auth::permissions::Role;
+    use tower::ServiceExt;
+
+    fn add(binding: ServiceBinding) -> Result<Json<AddServicePlugin>, JsonRejection> {
+        Ok(Json(AddServicePlugin {
+            project_id: binding.project_id,
+            environment_id: binding.environment_id,
+        }))
+    }
+
+    /// A state on a real database whose plugin host can attach to services.
+    async fn state_on(
+        platform: &Platform,
+        audit: Arc<RecordingAuditLogger>,
+    ) -> ExternalPluginsAppState {
+        let service = Arc::new(ExternalPluginsService::new_empty(
+            platform.config(),
+            None,
+            platform.db(),
+        ));
+        service
+            .manager()
+            .set_service_runtime(platform.runtime())
+            .await;
+        ExternalPluginsAppState {
+            service,
+            audit_service: audit,
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        }
+    }
+
+    fn operations(audit: &RecordingAuditLogger) -> Vec<String> {
+        audit.operations.lock().expect("audit lock").clone()
+    }
+
+    #[test]
+    fn service_plugin_routes_and_schemas_are_in_the_openapi_document() {
+        let spec = serde_json::to_value(ExternalPluginsApiDoc::openapi()).expect("spec");
+        let route = &spec["paths"]["/x/plugins/services"];
+        for status in ["200", "401", "403", "500"] {
+            assert!(
+                route["get"]["responses"][status].is_object(),
+                "GET service plugins must document {status}"
+            );
+        }
+        for status in [
+            "201", "400", "401", "403", "404", "409", "428", "500", "502", "503",
+        ] {
+            assert!(
+                route["post"]["responses"][status].is_object(),
+                "POST service plugins must document {status}"
+            );
+        }
+        let schemas = &spec["components"]["schemas"];
+        assert_eq!(
+            schemas["ServicePluginState"]["enum"],
+            serde_json::json!(["running", "asleep", "unavailable"])
+        );
+        for schema in [
+            "PluginServicesResponse",
+            "ServicePluginResponse",
+            "AddServicePlugin",
+            "AddedServicePluginResponse",
+        ] {
+            assert!(schemas[schema].is_object(), "{schema}");
+        }
+    }
+
+    #[tokio::test]
+    async fn service_plugin_routes_require_a_caller() {
+        let state = test_state();
+        for (method, body) in [
+            ("GET", ""),
+            ("POST", r#"{"project_id":1,"environment_id":1}"#),
+        ] {
+            let response = configure_routes()
+                .with_state(state.clone())
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/x/plugins/services")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn service_plugins_are_for_system_administrators_only() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = test_state_with_audit(audit.clone());
+        let binding = ServiceBinding {
+            project_id: 1,
+            environment_id: 1,
+        };
+
+        let listed = get_plugin_services(user_auth(Role::User), State(state.clone()))
+            .await
+            .expect_err("a member cannot list service plugins")
+            .into_response();
+        assert_eq!(listed.status(), StatusCode::FORBIDDEN);
+
+        let added = add_service_plugin(
+            user_auth(Role::User),
+            State(state),
+            metadata(),
+            add(binding),
+        )
+        .await
+        .expect_err("a member cannot add a service plugin")
+        .into_response();
+        assert_eq!(added.status(), StatusCode::FORBIDDEN);
+        assert!(operations(&audit).is_empty(), "nothing was attempted");
+    }
+
+    #[tokio::test]
+    async fn adding_a_service_needs_recent_verification_before_anything_is_attempted() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let mut state = test_state_with_audit(audit.clone());
+        state.sensitive_action_authorizer = Arc::new(RequireSensitiveVerification);
+
+        let error = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            add(ServiceBinding {
+                project_id: 1,
+                environment_id: 1,
+            }),
+        )
+        .await
+        .expect_err("verification is required");
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert!(operations(&audit).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_runs_no_services_says_so_instead_of_listing_nothing() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = test_state_with_audit(audit.clone());
+
+        let Json(listed) =
+            get_plugin_services(user_auth(Role::PlatformAdmin), State(state.clone()))
+                .await
+                .expect("the capability is readable");
+        assert!(!listed.configured);
+        assert!(
+            listed
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cannot run plugins as services")),
+            "{listed:?}"
+        );
+        assert_eq!(listed.setup_path.as_deref(), Some("/settings/plugins"));
+        assert!(listed.plugins.is_empty());
+
+        let error = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state),
+            metadata(),
+            add(ServiceBinding {
+                project_id: 1,
+                environment_id: 1,
+            }),
+        )
+        .await
+        .expect_err("nothing to attach to");
+        assert_eq!(error.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            operations(&audit),
+            [
+                "EXTERNAL_PLUGIN_SERVICE_ADD_REQUESTED",
+                "EXTERNAL_PLUGIN_SERVICE_ADD_FAILED"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_request_is_explained_as_problem_details() {
+        let state = test_state();
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/x/plugins/services")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"project_id":"reports"}"#))
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(user_auth(Role::PlatformAdmin).0);
+        request.extensions_mut().insert(metadata().0);
+
+        let response = configure_routes()
+            .with_state(state)
+            .oneshot(request)
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/problem+json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert_eq!(problem["title"], "Invalid Service Plugin Request");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("project_id")),
+            "{problem}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_administrator_adds_a_service_sees_it_running_and_removes_it() {
+        let Some(platform) = platform("adding a service as a plugin over the API").await else {
+            return;
+        };
+        let plugin = serve_plugin("reports", TOKEN);
+        let binding = platform.service("reports-service").await;
+        let deployment_id = platform.deploy(binding, plugin.port).await;
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = state_on(&platform, audit.clone()).await;
+
+        let (status, Json(added)) = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            add(binding),
+        )
+        .await
+        .expect("a deployed plugin service is added");
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(added.name, "reports");
+        assert_eq!(added.version, "1.0.0");
+        assert_eq!(added.display_name.as_deref(), Some("Reports"));
+        assert_eq!(
+            operations(&audit),
+            [
+                "EXTERNAL_PLUGIN_SERVICE_ADD_REQUESTED",
+                "EXTERNAL_PLUGIN_SERVICE_ADDED"
+            ]
+        );
+
+        let Json(listed) =
+            get_plugin_services(user_auth(Role::PlatformAdmin), State(state.clone()))
+                .await
+                .expect("list");
+        assert!(listed.configured);
+        assert_eq!(listed.reason, None);
+        assert_eq!(listed.plugins.len(), 1);
+        let listed = &listed.plugins[0];
+        assert_eq!(listed.name, "reports");
+        assert_eq!(listed.state, ServicePluginState::Running);
+        assert_eq!(listed.project_id, Some(binding.project_id));
+        assert_eq!(listed.environment_id, Some(binding.environment_id));
+        assert_eq!(listed.service_name.as_deref(), Some("reports-service"));
+        assert_eq!(listed.environment_name.as_deref(), Some("production"));
+        assert_eq!(listed.deployment_id, Some(deployment_id));
+        assert!(!listed.stops_when_idle);
+
+        // A service plugin's isolation is its service; it cannot be moved.
+        let error = state
+            .service
+            .set_plugin_isolation("reports", crate::sandbox::PluginIsolation::Process)
+            .await
+            .expect_err("a service plugin is not moved");
+        assert_eq!(
+            service_problem(&error).status_code,
+            StatusCode::CONFLICT,
+            "{error}"
+        );
+
+        // Removing the plugin revokes it and leaves the service alone.
+        state
+            .service
+            .uninstall_plugin("reports")
+            .await
+            .expect("remove the plugin");
+        assert_eq!(
+            platform.stored("reports").await.map(|row| row.4),
+            Some(false),
+            "the plugin's actor is revoked"
+        );
+        let Json(after) = get_plugin_services(user_auth(Role::PlatformAdmin), State(state.clone()))
+            .await
+            .expect("list");
+        assert!(after.plugins.is_empty());
+        let response = reqwest::get(format!(
+            "http://127.0.0.1:{}{}",
+            plugin.port,
+            temps_plugin_protocol::PLUGIN_HELLO_PATH
+        ))
+        .await
+        .expect("the service still answers");
+        assert_eq!(
+            response.status().as_u16(),
+            401,
+            "the service keeps running and still asks for the instance's secret"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_that_is_not_a_plugin_is_refused_with_a_reason_and_an_audit_entry() {
+        let Some(platform) = platform("refusing a service over the API").await else {
+            return;
+        };
+        let binding = platform.service("reports-service").await;
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = state_on(&platform, audit.clone()).await;
+
+        // Not deployed yet.
+        let error = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            add(binding),
+        )
+        .await
+        .expect_err("nothing is deployed");
+        assert_eq!(error.status_code, StatusCode::CONFLICT);
+
+        // A service that does not exist: the detail names the id.
+        let error = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            add(ServiceBinding {
+                project_id: 987_654,
+                environment_id: 1,
+            }),
+        )
+        .await
+        .expect_err("no such service");
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(error.into_response().into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert_eq!(problem["title"], "Service Not Found");
+        assert!(
+            problem["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("987654")),
+            "{problem}"
+        );
+
+        assert_eq!(
+            operations(&audit),
+            [
+                "EXTERNAL_PLUGIN_SERVICE_ADD_REQUESTED",
+                "EXTERNAL_PLUGIN_SERVICE_ADD_FAILED",
+                "EXTERNAL_PLUGIN_SERVICE_ADD_REQUESTED",
+                "EXTERNAL_PLUGIN_SERVICE_ADD_FAILED"
+            ]
+        );
+        assert_eq!(platform.stored("reports").await, None);
+    }
+}

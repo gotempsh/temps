@@ -3,9 +3,8 @@
 
 //! HTTP reverse proxy from Temps to external plugin processes over Unix socket.
 
-use std::path::PathBuf;
-
 use crate::actor::ActorPrincipal;
+use crate::endpoint::PluginEndpoint;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -14,14 +13,14 @@ use axum::Router;
 use temps_auth::context::{AuthContext, AuthSource};
 use temps_core::problemdetails;
 use temps_plugin_protocol::headers;
-use temps_plugin_protocol::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
+use temps_plugin_protocol::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH, PLUGIN_HELLO_PATH};
 use tracing::{debug, error, warn};
 
 /// Proxy configuration for a single external plugin.
 #[derive(Debug, Clone)]
 pub struct PluginProxy {
-    /// Unix socket path to the plugin
-    pub socket_path: PathBuf,
+    /// Where the plugin answers
+    pub endpoint: PluginEndpoint,
     /// Plugin name for header injection
     pub plugin_name: String,
     /// Per-process assertion secret for authenticating proxied requests.
@@ -47,17 +46,67 @@ pub struct PluginProxy {
     /// plugin that declares no capability is never handed an actor token —
     /// there is nothing it could legitimately do with one.
     pub wants_api: bool,
+    /// Set for a plugin that runs as a Temps service. Its address and secret
+    /// change with every deployment and it may be stopped for being idle, so
+    /// both are looked up for each request instead of being fixed when the
+    /// router is built; `endpoint` and `auth_secret` are then unused.
+    pub service: Option<ServiceRoute>,
+}
+
+/// Looks up where a plugin's service answers right now, starting it again
+/// when it was stopped for being idle.
+#[derive(Clone)]
+pub struct ServiceRoute(std::sync::Weak<crate::manager::ExternalPluginManager>);
+
+impl ServiceRoute {
+    pub(crate) fn new(manager: std::sync::Weak<crate::manager::ExternalPluginManager>) -> Self {
+        Self(manager)
+    }
+
+    /// The address and secret to use for one request to `plugin_name`, or
+    /// why the plugin cannot serve it, in words a caller may be shown.
+    async fn target(&self, plugin_name: &str) -> Result<(PluginEndpoint, String), String> {
+        let Some(manager) = self.0.upgrade() else {
+            return Err("The plugin host is shutting down.".to_string());
+        };
+        manager.service_request_target(plugin_name).await
+    }
+}
+
+impl std::fmt::Debug for ServiceRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServiceRoute")
+    }
 }
 
 impl PluginProxy {
-    pub fn new(socket_path: PathBuf, plugin_name: String, auth_secret: String) -> Self {
+    pub fn new(
+        endpoint: impl Into<PluginEndpoint>,
+        plugin_name: String,
+        auth_secret: String,
+    ) -> Self {
         Self {
-            socket_path,
+            endpoint: endpoint.into(),
             plugin_name,
             auth_secret,
             public_paths: Vec::new(),
             actor_crypto: ActorCryptoSlot::default(),
             wants_api: false,
+            service: None,
+        }
+    }
+
+    /// A proxy for a plugin that runs as a Temps service.
+    pub(crate) fn for_service(route: ServiceRoute, plugin_name: String) -> Self {
+        Self {
+            // Never dialled: `service` resolves the address per request.
+            endpoint: PluginEndpoint::Tcp(String::new()),
+            plugin_name,
+            auth_secret: String::new(),
+            public_paths: Vec::new(),
+            actor_crypto: ActorCryptoSlot::default(),
+            wants_api: false,
+            service: Some(route),
         }
     }
 
@@ -280,6 +329,32 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
         None => path.to_string(),
     };
 
+    // A plugin that runs as a Temps service is looked up now: the caller is
+    // authenticated (or the route is one the plugin gates itself), so this
+    // is also the point at which an idle plugin may be started again.
+    let proxy = match proxy.service.clone() {
+        None => proxy,
+        Some(route) => match route.target(&proxy.plugin_name).await {
+            Ok((endpoint, auth_secret)) => PluginProxy {
+                endpoint,
+                auth_secret,
+                ..proxy
+            },
+            Err(reason) => {
+                warn!(
+                    plugin = %proxy.plugin_name,
+                    path = %path,
+                    reason = %reason,
+                    "The plugin's service cannot serve the request"
+                );
+                return problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Plugin Unavailable")
+                    .with_detail(reason)
+                    .into_response();
+            }
+        },
+    };
+
     match forward_to_unix_socket(&proxy, auth.as_ref(), request, &path_and_query).await {
         Ok(response) => response,
         Err(e) => {
@@ -302,7 +377,7 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
 /// not become reachable accidentally. Segment-boundary matching keeps benign
 /// routes such as `/_events-calendar` available to plugins.
 fn is_reserved_internal_path(path: &str) -> bool {
-    [PLUGIN_EVENTS_PATH, PLUGIN_CHANNEL_PATH]
+    [PLUGIN_EVENTS_PATH, PLUGIN_CHANNEL_PATH, PLUGIN_HELLO_PATH]
         .into_iter()
         .any(|reserved| {
             path == reserved
@@ -312,7 +387,7 @@ fn is_reserved_internal_path(path: &str) -> bool {
         })
 }
 
-/// Forward an HTTP request to a plugin over its Unix domain socket.
+/// Forward an HTTP request to a plugin over its socket or service address.
 async fn forward_to_unix_socket(
     proxy: &PluginProxy,
     auth: Option<&AuthContext>,
@@ -320,15 +395,12 @@ async fn forward_to_unix_socket(
     path_and_query: &str,
 ) -> Result<Response, String> {
     use hyper_util::rt::TokioIo;
-    use tokio::net::UnixStream;
 
-    let stream = UnixStream::connect(&proxy.socket_path).await.map_err(|e| {
-        format!(
-            "Cannot connect to plugin socket {}: {}",
-            proxy.socket_path.display(),
-            e
-        )
-    })?;
+    let stream = proxy
+        .endpoint
+        .connect()
+        .await
+        .map_err(|e| format!("Cannot connect to plugin {}: {}", proxy.endpoint, e))?;
 
     let io = TokioIo::new(stream);
 
@@ -385,7 +457,8 @@ async fn forward_to_unix_socket(
 
     parts.headers.insert(
         hyper::header::HOST,
-        hyper::header::HeaderValue::from_static("localhost"),
+        hyper::header::HeaderValue::from_str(proxy.endpoint.host_header())
+            .unwrap_or_else(|_| hyper::header::HeaderValue::from_static("localhost")),
     );
 
     let forwarded_request = Request::from_parts(parts, body);
@@ -638,8 +711,9 @@ impl ActorCryptoSlot {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::path::PathBuf;
     use temps_auth::permissions::Role;
     use tower::ServiceExt;
 
@@ -651,7 +725,7 @@ mod tests {
         )
     }
 
-    fn test_user(id: i32, email: &str) -> temps_entities::users::Model {
+    pub(crate) fn test_user(id: i32, email: &str) -> temps_entities::users::Model {
         let now = chrono::Utc::now();
         temps_entities::users::Model {
             id,
@@ -1045,7 +1119,10 @@ mod tests {
             "secret".to_string(),
         );
         assert_eq!(proxy.plugin_name, "test-plugin");
-        assert_eq!(proxy.socket_path, PathBuf::from("/tmp/test.sock"));
+        assert_eq!(
+            proxy.endpoint,
+            PluginEndpoint::Unix(PathBuf::from("/tmp/test.sock"))
+        );
     }
 
     #[test]
@@ -1163,7 +1240,7 @@ mod tests {
         });
 
         let mut proxy = test_proxy();
-        proxy.socket_path = socket_path.clone();
+        proxy.endpoint = socket_path.clone().into();
         let request = Request::builder()
             .uri(PLUGIN_EVENTS_PATH)
             .body(Body::empty())

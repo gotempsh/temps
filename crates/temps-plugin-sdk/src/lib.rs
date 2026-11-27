@@ -23,6 +23,33 @@
 //!   └── Registers nav entries in the shell
 //! ```
 //!
+//! ## Running as a Temps service
+//!
+//! The same binary also runs as an ordinary Temps service, which is how a
+//! plugin written by anyone is deployed: push the repository, let Temps build
+//! and run it like any app, then add the service under Settings > Plugins.
+//! Started without the arguments Temps passes a child process, the SDK
+//! listens on `PORT` and waits for the platform to connect:
+//!
+//! ```text
+//! Plugin service (a deployment's container)
+//!   │
+//!   ├── Listens on PORT (8080 when unset)
+//!   ├── Answers GET /_temps/plugin/hello with its manifest
+//!   ├── Accepts the platform channel on /_temps/channel, again after every
+//!   │   Temps restart
+//!   └── Serves its routes once the platform has connected
+//! ```
+//!
+//! Every request from Temps carries a secret derived from the deployment
+//! token Temps gives each deployment as `TEMPS_API_TOKEN`
+//! ([`runtime::service_auth_secret`]); nothing has to be configured. A plugin
+//! service keeps its files in `TEMPS_PLUGIN_DATA_DIR` (`/data` when unset:
+//! mount the service's volume there) and is never given the control-plane
+//! database or the instance data directory, so a manifest that asks for
+//! either does not start. [`runtime::serve_service`] runs a plugin on a
+//! listener of your own, for tests.
+//!
 //! ## Usage
 //!
 //! ```rust,no_run

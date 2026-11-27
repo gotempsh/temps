@@ -432,6 +432,9 @@ mod tests {
             active: true,
             ai_tools_enabled: true,
             isolation: "process".into(),
+            project_id: None,
+            environment_id: None,
+            manifest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -504,6 +507,9 @@ mod tests {
             active: true,
             ai_tools_enabled: false,
             isolation: "process".into(),
+            project_id: None,
+            environment_id: None,
+            manifest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -526,6 +532,9 @@ mod tests {
             active: true,
             ai_tools_enabled: false,
             isolation: "process".into(),
+            project_id: None,
+            environment_id: None,
+            manifest: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

@@ -753,6 +753,20 @@ export type AddProviderModelRequest = {
     model_id: string;
 };
 
+/**
+ * The deployed service to add as a plugin.
+ */
+export type AddServicePlugin = {
+    /**
+     * The environment of that service whose deployment is the plugin.
+     */
+    environment_id: number;
+    /**
+     * The service (project) the plugin runs as.
+     */
+    project_id: number;
+};
+
 export type AddStatusPageDomainRequest = {
     /**
      * Hostname to serve the page on, e.g. `status.example.com`. Unicode names
@@ -763,6 +777,17 @@ export type AddStatusPageDomainRequest = {
      * Defaults to `http-01`.
      */
     verification_method?: VerificationMethod;
+};
+
+/**
+ * The plugin a service was added as.
+ */
+export type AddedServicePluginResponse = {
+    display_name?: string | null;
+    environment_id: number;
+    name: string;
+    project_id: number;
+    version: string;
 };
 
 /**
@@ -21589,7 +21614,7 @@ export type IpAccessMode = 'disabled' | 'allow' | 'deny';
 /**
  * What actually separates a running plugin from Temps.
  */
-export type IsolationMode = 'container' | 'separate_user' | 'process';
+export type IsolationMode = 'container' | 'separate_user' | 'process' | 'service';
 
 /**
  * The issues of a group.
@@ -28273,7 +28298,7 @@ export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environmen
  * How an administrator asked for one plugin to be isolated. Stored on the
  * plugin's actor row.
  */
-export type PluginIsolation = 'container' | 'process';
+export type PluginIsolation = 'container' | 'process' | 'service';
 
 /**
  * How one installed plugin is separated from Temps.
@@ -28424,6 +28449,25 @@ export type PluginSandboxResponse = {
     plugins: Array<PluginIsolationResponse>;
     /**
      * Why plugins cannot run in containers here, when they cannot.
+     */
+    reason?: string | null;
+    /**
+     * Where the console explains what is missing.
+     */
+    setup_path?: string | null;
+};
+
+/**
+ * Whether this server can run plugins as services, and the ones it runs.
+ */
+export type PluginServicesResponse = {
+    /**
+     * Whether a service can be added as a plugin on this server.
+     */
+    configured: boolean;
+    plugins: Array<ServicePluginResponse>;
+    /**
+     * Why not, when it cannot.
      */
     reason?: string | null;
     /**
@@ -35988,6 +36032,46 @@ export type ServicePlan = {
      */
     version?: string | null;
 };
+
+/**
+ * One plugin that runs as a Temps service.
+ */
+export type ServicePluginResponse = {
+    /**
+     * The deployment Temps is attached to, while the plugin is running.
+     */
+    deployment_id?: number | null;
+    /**
+     * Why the plugin is not running, when it is not.
+     */
+    detail?: string | null;
+    environment_id?: number | null;
+    environment_name?: string | null;
+    /**
+     * The plugin's name, as its manifest declares it.
+     */
+    name: string;
+    /**
+     * The service the plugin runs as. Absent once the service was deleted.
+     */
+    project_id?: number | null;
+    service_name?: string | null;
+    service_slug?: string | null;
+    /**
+     * Whether Temps is attached to the service's running container.
+     */
+    state: ServicePluginState;
+    /**
+     * Whether the service stops when idle and starts on the next request,
+     * so an unused plugin holds no memory.
+     */
+    stops_when_idle: boolean;
+};
+
+/**
+ * Whether a plugin that runs as a service can serve a request right now.
+ */
+export type ServicePluginState = 'running' | 'asleep' | 'unavailable';
 
 /**
  * A public URL of a compose service and the container port it routes to.
@@ -112483,6 +112567,104 @@ export type GetPluginSandboxResponses = {
 };
 
 export type GetPluginSandboxResponse = GetPluginSandboxResponses[keyof GetPluginSandboxResponses];
+
+export type GetPluginServicesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/services';
+};
+
+export type GetPluginServicesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The services plugins run as could not be read
+     */
+    500: ProblemDetails;
+};
+
+export type GetPluginServicesError = GetPluginServicesErrors[keyof GetPluginServicesErrors];
+
+export type GetPluginServicesResponses = {
+    /**
+     * Plugins that run as Temps services
+     */
+    200: PluginServicesResponse;
+};
+
+export type GetPluginServicesResponse = GetPluginServicesResponses[keyof GetPluginServicesResponses];
+
+export type AddServicePluginData = {
+    body: AddServicePlugin;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/services';
+};
+
+export type AddServicePluginErrors = {
+    /**
+     * Invalid request body, or the service is not a plugin Temps accepts
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The service or environment does not exist
+     */
+    404: ProblemDetails;
+    /**
+     * The service is stopped or not deployed, or its plugin name is already installed
+     */
+    409: ProblemDetails;
+    /**
+     * Request body is not JSON
+     */
+    415: ProblemDetails;
+    /**
+     * Request body does not name a service and an environment
+     */
+    422: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * The plugin could not be recorded
+     */
+    500: ProblemDetails;
+    /**
+     * The service did not answer as a plugin
+     */
+    502: ProblemDetails;
+    /**
+     * Audit unavailable, or this server runs no services
+     */
+    503: ProblemDetails;
+};
+
+export type AddServicePluginError = AddServicePluginErrors[keyof AddServicePluginErrors];
+
+export type AddServicePluginResponses = {
+    /**
+     * The service is now a plugin
+     */
+    201: AddedServicePluginResponse;
+};
+
+export type AddServicePluginResponse = AddServicePluginResponses[keyof AddServicePluginResponses];
 
 export type GetPluginAiToolsData = {
     body?: never;

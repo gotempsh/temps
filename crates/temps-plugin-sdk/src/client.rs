@@ -49,14 +49,60 @@ pub struct TempsClient {
 }
 
 struct TempsClientInner {
-    /// Sender for outgoing channel messages (requests). Every request has a
-    /// caller awaiting its response, so the queue only holds what the
-    /// plugin's own concurrency puts in flight; the bound adds back-pressure.
-    tx: mpsc::Sender<ChannelMessage>,
-    /// Pending request waiters, keyed by request id.
-    pending: RwLock<HashMap<u64, oneshot::Sender<ChannelResponse>>>,
+    /// Sender for outgoing channel messages (requests) on the current
+    /// connection, or `None` while the platform is not connected. Every
+    /// request has a caller awaiting its response, so the queue only holds
+    /// what the plugin's own concurrency puts in flight; the bound adds
+    /// back-pressure.
+    connection: std::sync::RwLock<Option<Connection>>,
+    /// Pending request waiters, keyed by request id, each with the
+    /// connection it was sent on.
+    pending: RwLock<HashMap<u64, (u64, oneshot::Sender<ChannelResponse>)>>,
     /// Monotonic request ID counter.
     next_id: AtomicU64,
+    /// Counts connections, so a connection that ends only fails the requests
+    /// that were sent on it.
+    next_connection: AtomicU64,
+    /// Where platform events go, whichever connection delivers them.
+    events: EventSender,
+}
+
+/// The sending half of one platform connection.
+#[derive(Clone)]
+struct Connection {
+    id: u64,
+    tx: mpsc::Sender<ChannelMessage>,
+}
+
+impl TempsClientInner {
+    /// A connection is gone: forget it unless a newer one already took its
+    /// place, and fail only the requests that were sent on it.
+    async fn connection_ended(&self, connection_id: u64) {
+        {
+            let mut current = match self.connection.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if current.as_ref().is_some_and(|c| c.id == connection_id) {
+                *current = None;
+            }
+        }
+        let mut pending = self.pending.write().await;
+        let lost: Vec<u64> = pending
+            .iter()
+            .filter(|(_, (connection, _))| *connection == connection_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in lost {
+            if let Some((_, waiter)) = pending.remove(&id) {
+                let _ = waiter.send(ChannelResponse::err(
+                    id,
+                    ChannelErrorCode::Internal,
+                    "Channel closed",
+                ));
+            }
+        }
+    }
 }
 
 /// Requests queued for the platform before `call` waits for room.
@@ -74,15 +120,65 @@ pub type EventSender = mpsc::Sender<temps_plugin_protocol::PluginEvent>;
 pub type EventReceiver = mpsc::Receiver<temps_plugin_protocol::PluginEvent>;
 
 impl TempsClient {
-    /// Create a new client wired to a WebSocket connection.
+    /// Create a client that is not connected to the platform yet.
     ///
-    /// This is called by the plugin runtime after accepting the platform's
-    /// incoming WebSocket on `/_temps/channel`.  It spawns a background task
-    /// that reads responses/events and dispatches them.
+    /// Calls fail with [`PluginSdkError::ChannelClosed`] until
+    /// [`Self::attach`] is given a connection. Returns
+    /// `(client, event_receiver)`; the receiver yields the platform events of
+    /// every connection the client is attached to over its lifetime.
+    pub(crate) fn detached() -> (Self, EventReceiver) {
+        let (events, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let inner = Arc::new(TempsClientInner {
+            connection: std::sync::RwLock::new(None),
+            pending: RwLock::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            next_connection: AtomicU64::new(1),
+            events,
+        });
+        (Self { inner }, event_rx)
+    }
+
+    /// Create a new client wired to a WebSocket connection.
     ///
     /// Returns `(client, event_receiver)`.  The event receiver yields
     /// platform events pushed over the channel.
+    #[cfg(test)]
     pub(crate) fn from_ws<S>(ws_stream: S) -> (Self, EventReceiver)
+    where
+        S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+            + Send
+            + Unpin
+            + 'static,
+    {
+        let (client, event_rx) = Self::detached();
+        client.attach(ws_stream);
+        (client, event_rx)
+    }
+
+    /// Whether the platform is connected right now.
+    pub fn is_connected(&self) -> bool {
+        self.connection().is_some()
+    }
+
+    fn connection(&self) -> Option<Connection> {
+        match self.inner.connection.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Use `ws_stream` as the platform connection from now on.
+    ///
+    /// This is called by the plugin runtime after accepting the platform's
+    /// authenticated WebSocket on `/_temps/channel`. A plugin that runs as a
+    /// service outlives the platform process, so the platform connects again
+    /// after it restarts: the new connection replaces the previous one, and
+    /// requests still waiting on the previous one fail with "Channel closed".
+    ///
+    /// It spawns background tasks that write requests and dispatch responses
+    /// and events.
+    pub(crate) fn attach<S>(&self, ws_stream: S)
     where
         S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
             + futures::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
@@ -94,17 +190,20 @@ impl TempsClient {
 
         // Outgoing message sender (requests from client methods)
         let (msg_tx, mut msg_rx) = mpsc::channel::<ChannelMessage>(REQUEST_CHANNEL_CAPACITY);
-
-        let inner = Arc::new(TempsClientInner {
-            tx: msg_tx.clone(),
-            pending: RwLock::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-        });
-
-        // Event channel — events received from the platform are forwarded here
-        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let connection_id = self.inner.next_connection.fetch_add(1, Ordering::Relaxed);
+        let connection = Connection {
+            id: connection_id,
+            tx: msg_tx,
+        };
+        // Replacing the stored sender drops the previous one, which ends the
+        // previous connection's writer and closes its socket.
+        match self.inner.connection.write() {
+            Ok(mut guard) => *guard = Some(connection),
+            Err(poisoned) => *poisoned.into_inner() = Some(connection),
+        }
 
         // Writer task: forwards queued messages to the WebSocket
+        let writer_inner = self.inner.clone();
         tokio::spawn(async move {
             while let Some(msg) = msg_rx.recv().await {
                 let json = match serde_json::to_string(&msg) {
@@ -119,10 +218,15 @@ impl TempsClient {
                     break;
                 }
             }
+            let _ = ws_tx.close().await;
+            // Stop accepting requests before failing the ones in flight, so
+            // none can be queued behind a writer that no longer writes.
+            drop(msg_rx);
+            writer_inner.connection_ended(connection_id).await;
         });
 
         // Reader task: dispatches incoming responses and events
-        let reader_inner = inner.clone();
+        let reader_inner = self.inner.clone();
         tokio::spawn(async move {
             while let Some(frame) = ws_rx.next().await {
                 let text = match frame {
@@ -150,7 +254,7 @@ impl TempsClient {
                 match msg {
                     ChannelMessage::Response(resp) => {
                         let mut pending = reader_inner.pending.write().await;
-                        if let Some(waiter) = pending.remove(&resp.id) {
+                        if let Some((_, waiter)) = pending.remove(&resp.id) {
                             let _ = waiter.send(resp);
                         } else {
                             warn!("Received response for unknown request id {}", resp.id);
@@ -158,7 +262,7 @@ impl TempsClient {
                     }
                     ChannelMessage::Event(evt) => {
                         if let Err(mpsc::error::TrySendError::Full(_)) =
-                            event_tx.try_send(evt.event)
+                            reader_inner.events.try_send(evt.event)
                         {
                             warn!(
                                 "Plugin event handler is {} events behind; dropping an event",
@@ -172,19 +276,8 @@ impl TempsClient {
                 }
             }
 
-            // Channel closed — wake all pending waiters with errors
-            let mut pending = reader_inner.pending.write().await;
-            for (id, waiter) in pending.drain() {
-                let _ = waiter.send(ChannelResponse::err(
-                    id,
-                    ChannelErrorCode::Internal,
-                    "Channel closed",
-                ));
-            }
+            reader_inner.connection_ended(connection_id).await;
         });
-
-        let client = Self { inner };
-        (client, event_rx)
     }
 
     // ── Low-level request/response ─────────────────────────────────────
@@ -195,21 +288,25 @@ impl TempsClient {
     /// drift apart: pairing them is the [`PlatformCall`] impl's job, and
     /// that impl is generated alongside both wire enums.
     pub async fn call<C: PlatformCall>(&self, call: C) -> Result<C::Output, PluginSdkError> {
+        let connection = self.connection().ok_or(PluginSdkError::ChannelClosed)?;
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
 
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.write().await.insert(id, tx);
+        self.inner
+            .pending
+            .write()
+            .await
+            .insert(id, (connection.id, tx));
 
         let msg = ChannelMessage::Request(ChannelRequest {
             id,
             call: call.into_request(),
         });
 
-        self.inner
-            .tx
-            .send(msg)
-            .await
-            .map_err(|_| PluginSdkError::ChannelClosed)?;
+        if connection.tx.send(msg).await.is_err() {
+            self.inner.pending.write().await.remove(&id);
+            return Err(PluginSdkError::ChannelClosed);
+        }
 
         let resp = rx.await.map_err(|_| PluginSdkError::ChannelClosed)?;
 

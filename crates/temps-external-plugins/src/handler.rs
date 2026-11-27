@@ -6,6 +6,7 @@
 mod ai_tools;
 mod isolation;
 mod local_file;
+mod services;
 mod watches;
 use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
 
@@ -915,10 +916,76 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             StatusCode::BAD_GATEWAY,
             "Plugin Did Not Start With Its New Isolation",
         ),
+        ExternalPluginsError::IsolationManagedByService { .. } => {
+            (StatusCode::CONFLICT, "Plugin Runs As A Service")
+        }
+        ExternalPluginsError::ServiceIsolationNotSelectable { .. } => {
+            (StatusCode::BAD_REQUEST, "A Service Is Added, Not Selected")
+        }
+        ExternalPluginsError::ServiceLookup { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Plugin Services Could Not Be Read",
+        ),
+        ExternalPluginsError::Service(attach) => service_attach_status(attach),
     };
     temps_core::problemdetails::new(status)
         .with_title(title)
         .with_detail(public_error_detail(error))
+}
+
+/// The status and title for a failure to attach to the service a plugin runs
+/// as. Every variant is named: a new one has to be placed deliberately.
+fn service_attach_status(
+    error: &crate::service_runtime::ServiceAttachError,
+) -> (StatusCode, &'static str) {
+    use crate::service_runtime::ServiceAttachError as Attach;
+    match error {
+        Attach::ServiceNotFound { .. } => (StatusCode::NOT_FOUND, "Service Not Found"),
+        Attach::EnvironmentNotFound { .. } => (StatusCode::NOT_FOUND, "Environment Not Found"),
+        Attach::Asleep { .. } => (StatusCode::CONFLICT, "Plugin Service Is Stopped"),
+        Attach::NotDeployed { .. } => (StatusCode::CONFLICT, "Service Is Not Deployed"),
+        Attach::NoReachableContainer { .. } => {
+            (StatusCode::CONFLICT, "Service Has No Running Container")
+        }
+        Attach::NameChanged { .. } => (StatusCode::CONFLICT, "Plugin Name Changed"),
+        Attach::NameTaken { .. } => (StatusCode::CONFLICT, "Plugin Name Already Installed"),
+        Attach::NotAPlugin { .. } => (StatusCode::BAD_REQUEST, "Service Is Not A Plugin"),
+        Attach::InvalidHello { .. } => (StatusCode::BAD_REQUEST, "Plugin Hello Is Invalid"),
+        Attach::ProtocolMismatch { .. } => {
+            (StatusCode::BAD_REQUEST, "Plugin Protocol Not Supported")
+        }
+        Attach::InvalidName { .. } => (StatusCode::BAD_REQUEST, "Plugin Name Is Invalid"),
+        Attach::PrivilegedAccess { .. } => (
+            StatusCode::BAD_REQUEST,
+            "Plugin Asks For Access A Service Is Not Given",
+        ),
+        Attach::Unreachable { .. } => (StatusCode::BAD_GATEWAY, "Plugin Service Unreachable"),
+        Attach::Refused { .. } => (StatusCode::BAD_GATEWAY, "Plugin Service Refused Temps"),
+        Attach::UnexpectedStatus { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Service Answered Unexpectedly",
+        ),
+        Attach::ChannelRefused { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Refused The Platform Channel",
+        ),
+        Attach::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Plugins Cannot Run As Services Here",
+        ),
+        Attach::Token { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Deployment Token Unavailable",
+        ),
+        Attach::Record { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Plugin Could Not Be Recorded",
+        ),
+        Attach::Database(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Plugin Service Could Not Be Read",
+        ),
+    }
 }
 
 /// Render an operator-facing error without exposing local paths, transport
@@ -1018,7 +1085,14 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::Sandbox(error) => error.public_detail(),
         // Both carry only the plugin name and an already public reason.
         ExternalPluginsError::IsolationManagedByLauncher { .. }
-        | ExternalPluginsError::IsolationChangeFailed { .. } => error.to_string(),
+        | ExternalPluginsError::IsolationChangeFailed { .. }
+        | ExternalPluginsError::IsolationManagedByService { .. }
+        | ExternalPluginsError::ServiceIsolationNotSelectable { .. } => error.to_string(),
+        ExternalPluginsError::Service(error) => error.public_reason(),
+        ExternalPluginsError::ServiceLookup { .. } => {
+            "Temps could not read the services plugins run as from its database. See the server log."
+                .to_string()
+        }
     }
 }
 
@@ -1750,6 +1824,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         )
         .route("/x/plugins/sandbox", get(isolation::get_plugin_sandbox))
         .route(
+            "/x/plugins/services",
+            get(services::get_plugin_services).post(services::add_service_plugin),
+        )
+        .route(
             "/x/plugins/{name}/isolation",
             get(isolation::get_plugin_isolation).put(isolation::put_plugin_isolation),
         )
@@ -1777,6 +1855,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         get_plugin_grants,
         put_plugin_grants,
         isolation::get_plugin_sandbox,
+        services::get_plugin_services,
+        services::add_service_plugin,
         isolation::get_plugin_isolation,
         isolation::put_plugin_isolation,
     ),
@@ -1814,6 +1894,11 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             isolation::UpdatePluginIsolation,
             crate::sandbox::PluginIsolation,
             crate::sandbox::IsolationMode,
+            services::PluginServicesResponse,
+            services::ServicePluginResponse,
+            services::AddServicePlugin,
+            services::AddedServicePluginResponse,
+            crate::manager::ServicePluginState,
             crate::grants::PluginGrantConfig,
             PluginActorInfo,
             PluginAiCapability,
@@ -3028,6 +3113,9 @@ mod tests {
             active: true,
             ai_tools_enabled: enabled,
             isolation: "container".into(),
+            project_id: None,
+            environment_id: None,
+            manifest: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

@@ -121,7 +121,8 @@ fn isolation_response(
         requested: status.requested,
         effective: status.effective,
         sandboxed: status.effective.is_some_and(IsolationMode::is_sandboxed),
-        changeable: !status.launcher,
+        // A plugin that runs as a Temps service is isolated by that service.
+        changeable: !status.launcher && status.requested != Some(PluginIsolation::Service),
         start_failure,
     }
 }
@@ -585,11 +586,11 @@ mod tests {
         let schemas = &spec["components"]["schemas"];
         assert_eq!(
             schemas["PluginIsolation"]["enum"],
-            serde_json::json!(["container", "process"])
+            serde_json::json!(["container", "process", "service"])
         );
         assert_eq!(
             schemas["IsolationMode"]["enum"],
-            serde_json::json!(["container", "separate_user", "process"])
+            serde_json::json!(["container", "separate_user", "process", "service"])
         );
         for schema in [
             "PluginSandboxResponse",

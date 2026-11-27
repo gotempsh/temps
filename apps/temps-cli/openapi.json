@@ -60348,7 +60348,8 @@
         "description": "How an administrator asked for one plugin to be isolated. Stored on the\nplugin's actor row.",
         "enum": [
           "container",
-          "process"
+          "process",
+          "service"
         ],
         "type": "string"
       },

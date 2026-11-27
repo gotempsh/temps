@@ -29,4 +29,11 @@ pub trait OnDemandWaker: Send + Sync {
         &self,
         environment_id: i32,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Record that an environment was just used by something other than a
+    /// proxied request, so it is not stopped for being idle while in use.
+    /// Must be cheap: it is called once per request to the environment.
+    ///
+    /// The default does nothing, for implementations that track no idleness.
+    fn record_activity(&self, _environment_id: i32) {}
 }

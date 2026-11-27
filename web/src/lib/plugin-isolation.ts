@@ -29,6 +29,13 @@ export function isolationSummary(mode: IsolationMode | undefined): {
         detail:
           'Runs as another operating-system user through the plugin launcher, without access to Temps files.',
       }
+    case 'service':
+      return {
+        tone: 'ok',
+        label: 'Runs as a service',
+        detail:
+          'Runs as an ordinary Temps service, in the container of its own deployment. It reaches Temps only through the permissions you granted.',
+      }
     case 'process':
       return {
         tone: 'warn',

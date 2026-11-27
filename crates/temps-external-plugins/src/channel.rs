@@ -16,9 +16,9 @@
 //! Each plugin gets its own [`PluginChannel`] which tracks the WebSocket
 //! sender half and the background reader task.
 
-use std::path::Path;
 use std::sync::Arc;
 
+use crate::endpoint::PluginEndpoint;
 use crate::grants::{PluginGrantService, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES};
 use futures::stream::StreamExt;
 use futures::SinkExt;
@@ -52,6 +52,8 @@ pub struct PluginChannel {
     tx: mpsc::Sender<ChannelMessage>,
     /// Background task reading from the WebSocket.
     reader_task: JoinHandle<()>,
+    /// Becomes `true` when the plugin's side of the channel is gone.
+    closed: tokio::sync::watch::Receiver<bool>,
     grant_service: PluginGrantService,
     actor_id: String,
     source_identity: String,
@@ -59,13 +61,13 @@ pub struct PluginChannel {
 }
 
 impl PluginChannel {
-    /// Open a WebSocket channel to a plugin's Unix socket.
+    /// Open a WebSocket channel to a plugin, on its socket or service address.
     ///
     /// Returns `None` if the connection fails (the plugin may not support
     /// the channel yet — this is not fatal).
     #[allow(clippy::too_many_arguments)] // Explicit security dependencies stay visible at the process boundary.
     pub async fn connect(
-        socket_path: &Path,
+        endpoint: &PluginEndpoint,
         plugin_name: String,
         db: Arc<DatabaseConnection>,
         host_api: Arc<HostApiSlot>,
@@ -80,7 +82,7 @@ impl PluginChannel {
         audit_service: Arc<tokio::sync::RwLock<Option<Arc<dyn temps_core::AuditLogger>>>>,
         auth_secret: &str,
     ) -> Option<Self> {
-        let socket_path_str = socket_path.to_string_lossy().to_string();
+        let endpoint_text = endpoint.to_string();
         let grant_service = PluginGrantService::new(db.clone());
         let actor_result = if defer_actor_commit {
             grant_service
@@ -103,34 +105,34 @@ impl PluginChannel {
         let channel_grants = grant_service.clone();
         let channel_permissions = host_permissions.clone();
 
-        // Connect to the plugin's Unix socket and upgrade to WebSocket.
-        // tokio-tungstenite doesn't support Unix sockets directly, so we
-        // perform the WebSocket handshake over a raw UnixStream.
+        // Connect to the plugin and upgrade to WebSocket. tokio-tungstenite
+        // only dials TCP itself, so the handshake runs over the stream this
+        // host opened, whichever kind it is.
         info!(
             plugin = %plugin_name,
-            socket = %socket_path_str,
+            endpoint = %endpoint_text,
             "Opening platform channel to plugin"
         );
 
-        let stream = match tokio::net::UnixStream::connect(socket_path).await {
+        let stream = match endpoint.connect().await {
             Ok(s) => {
                 debug!(
                     plugin = %plugin_name,
-                    "Unix socket connected for channel"
+                    "Connected to plugin for channel"
                 );
                 s
             }
             Err(e) => {
                 warn!(
                     plugin = %plugin_name,
-                    "Cannot connect to plugin socket for channel: {} ({})",
-                    socket_path_str, e
+                    "Cannot connect to plugin for channel: {} ({})",
+                    endpoint_text, e
                 );
                 return None;
             }
         };
 
-        let uri = format!("ws://localhost{}", PLUGIN_CHANNEL_PATH);
+        let uri = format!("ws://{}{}", endpoint.host_header(), PLUGIN_CHANNEL_PATH);
         let mut request = match uri.into_client_request() {
             Ok(request) => request,
             Err(error) => {
@@ -160,7 +162,7 @@ impl PluginChannel {
                 warn!(
                     plugin = %plugin_name,
                     "WebSocket handshake failed for channel: {} ({})",
-                    socket_path_str, e
+                    endpoint_text, e
                 );
                 return None;
             }
@@ -200,6 +202,7 @@ impl PluginChannel {
         // them, and sends responses through msg_tx.
         let reader_tx = msg_tx.clone();
         let reader_plugin_name = plugin_name.clone();
+        let (closed_tx, closed) = tokio::sync::watch::channel(false);
         let reader_task = tokio::spawn(async move {
             while let Some(frame) = ws_rx.next().await {
                 let text = match frame {
@@ -284,6 +287,7 @@ impl PluginChannel {
             }
 
             debug!(plugin = %reader_plugin_name, "Channel reader task exiting");
+            let _ = closed_tx.send(true);
         });
 
         info!(
@@ -295,11 +299,18 @@ impl PluginChannel {
             plugin_name,
             tx: msg_tx,
             reader_task,
+            closed,
             grant_service: channel_grants,
             actor_id: channel_actor_id,
             source_identity,
             host_permissions: channel_permissions,
         })
+    }
+
+    /// A signal that turns `true` once the plugin's side of the channel is
+    /// gone: its process exited, or the container of its service stopped.
+    pub(crate) fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.closed.clone()
     }
 
     pub(crate) fn actor_binding(&self) -> (&str, &str) {
@@ -1327,6 +1338,7 @@ mod tests {
             actor_id: "actor".to_string(),
             source_identity: "sha256:test".to_string(),
             host_permissions: vec![PluginHostPermission::EventsRead],
+            closed: tokio::sync::watch::channel(false).1,
         }
     }
 

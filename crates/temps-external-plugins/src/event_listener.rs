@@ -8,7 +8,6 @@
 //! subscribe to the broadcast `JobQueue`, map `Job` variants to `PluginEvent`
 //! structs, and POST them to each plugin's `/_events` endpoint.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -16,11 +15,11 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use temps_core::{Job, JobQueue};
 use temps_plugin_protocol::{PluginEvent, PluginManifest, PLUGIN_EVENTS_PATH};
-use tokio::net::UnixStream;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::endpoint::PluginEndpoint;
 use crate::manager::ExternalPluginManager;
 
 /// Listener that subscribes to the platform job queue and delivers events
@@ -36,7 +35,7 @@ pub struct PluginEventListener {
 /// A resolved plugin target: the info needed to deliver an event.
 struct PluginTarget {
     name: String,
-    socket_path: PathBuf,
+    endpoint: PluginEndpoint,
     auth_secret: String,
 }
 
@@ -251,8 +250,11 @@ impl PluginEventListener {
     /// Prefers the WebSocket channel for delivery (lower latency, already
     /// connected).  Falls back to `POST /_events` over HTTP if the channel
     /// is unavailable or dead.
-    async fn deliver_to_plugins(manager: &ExternalPluginManager, event: &PluginEvent) {
-        let targets = Self::resolve_targets(manager, &event.event_type).await;
+    pub(crate) async fn deliver_to_plugins(
+        manager: &Arc<ExternalPluginManager>,
+        event: &PluginEvent,
+    ) {
+        let targets = Self::resolve_targets(manager, event).await;
 
         if targets.is_empty() {
             debug!(
@@ -275,8 +277,7 @@ impl PluginEventListener {
             }
 
             // Fall back to HTTP POST /_events
-            if let Err(e) =
-                Self::deliver_event(&target.socket_path, &target.auth_secret, event).await
+            if let Err(e) = Self::deliver_event(&target.endpoint, &target.auth_secret, event).await
             {
                 warn!(
                     plugin = %target.name,
@@ -298,25 +299,40 @@ impl PluginEventListener {
     /// Resolve which plugins subscribe to a given event type and gather
     /// their socket paths.
     async fn resolve_targets(
-        manager: &ExternalPluginManager,
-        event_type: &str,
+        manager: &Arc<ExternalPluginManager>,
+        event: &PluginEvent,
     ) -> Vec<PluginTarget> {
+        let event_type = event.event_type.as_str();
         let manifests = manager.manifests().await;
         let mut targets = Vec::new();
 
         for manifest in manifests {
             if Self::manifest_subscribes_to(&manifest, event_type) {
+                // A plugin whose service stopped for being idle is started
+                // for the event instead of missing it. That can take as long
+                // as the service takes to start, so it happens off this loop;
+                // other plugins get the event without waiting for it.
+                if !manager.is_running(&manifest.name).await {
+                    if manager.stopped_service_takes_events(&manifest.name).await {
+                        tokio::spawn(Self::deliver_after_start(
+                            manager.clone(),
+                            manifest.name.clone(),
+                            event.clone(),
+                        ));
+                    }
+                    continue;
+                }
                 if !manager.event_delivery_allowed(&manifest.name).await {
                     warn!(plugin = %manifest.name, event_type = %event_type, "Plugin event delivery denied by current host grant");
                     continue;
                 }
-                if let (Some(socket_path), Some(auth_secret)) = (
-                    manager.socket_path_for(&manifest.name).await,
+                if let (Some(endpoint), Some(auth_secret)) = (
+                    manager.endpoint_for(&manifest.name).await,
                     manager.auth_secret_for(&manifest.name).await,
                 ) {
                     targets.push(PluginTarget {
                         name: manifest.name.clone(),
-                        socket_path,
+                        endpoint,
                         auth_secret,
                     });
                 }
@@ -324,6 +340,51 @@ impl PluginEventListener {
         }
 
         targets
+    }
+
+    /// Start a plugin whose service is stopped for being idle, then deliver
+    /// `event` to it. Returns whether the event was delivered.
+    ///
+    /// An event that cannot be delivered is dropped with a warning naming the
+    /// plugin and the reason. A start that just failed is not repeated for
+    /// every event of a burst: the manager refuses again at once for a short
+    /// while, so these tasks end quickly instead of piling up.
+    pub(crate) async fn deliver_after_start(
+        manager: Arc<ExternalPluginManager>,
+        plugin: String,
+        event: PluginEvent,
+    ) -> bool {
+        if let Err(reason) = manager.revive_service(&plugin).await {
+            warn!(
+                plugin = %plugin,
+                event_type = %event.event_type,
+                event_id = %event.id,
+                reason = %reason,
+                "Event dropped: the plugin's service could not be started for it"
+            );
+            return false;
+        }
+        if !manager.event_delivery_allowed(&plugin).await {
+            warn!(plugin = %plugin, event_type = %event.event_type, "Plugin event delivery denied by current host grant");
+            return false;
+        }
+        let delivered = manager.send_event_via_channel(&plugin, &event).await;
+        if delivered {
+            debug!(
+                plugin = %plugin,
+                event_type = %event.event_type,
+                event_id = %event.id,
+                "Event delivered to a plugin that was started for it"
+            );
+        } else {
+            warn!(
+                plugin = %plugin,
+                event_type = %event.event_type,
+                event_id = %event.id,
+                "Event dropped: the plugin stopped again before it could be delivered"
+            );
+        }
+        delivered
     }
 
     /// Check whether a plugin manifest subscribes to a given event type.
@@ -351,22 +412,19 @@ impl PluginEventListener {
         false
     }
 
-    /// POST a `PluginEvent` to a plugin's `/_events` endpoint over Unix socket.
+    /// POST a `PluginEvent` to a plugin's `/_events` endpoint.
     async fn deliver_event(
-        socket_path: &PathBuf,
+        endpoint: &PluginEndpoint,
         auth_secret: &str,
         event: &PluginEvent,
     ) -> Result<(), String> {
         let body =
             serde_json::to_vec(event).map_err(|e| format!("Failed to serialize event: {}", e))?;
 
-        let stream = UnixStream::connect(socket_path).await.map_err(|e| {
-            format!(
-                "Cannot connect to plugin socket {}: {}",
-                socket_path.display(),
-                e
-            )
-        })?;
+        let stream = endpoint
+            .connect()
+            .await
+            .map_err(|e| format!("Cannot connect to plugin {}: {}", endpoint, e))?;
 
         let io = TokioIo::new(stream);
 
@@ -384,7 +442,7 @@ impl PluginEventListener {
             .method(hyper::Method::POST)
             .uri(PLUGIN_EVENTS_PATH)
             .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::HOST, "localhost")
+            .header(hyper::header::HOST, endpoint.host_header())
             .header(temps_plugin_protocol::headers::AUTH_SIGNATURE, auth_secret)
             .header("x-temps-request-id", uuid::Uuid::new_v4().to_string())
             .body(Body::from(body))

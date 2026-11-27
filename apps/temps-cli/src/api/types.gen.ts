@@ -28158,7 +28158,7 @@ export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environmen
  * How an administrator asked for one plugin to be isolated. Stored on the
  * plugin's actor row.
  */
-export type PluginIsolation = 'container' | 'process';
+export type PluginIsolation = 'container' | 'process' | 'service';
 
 /**
  * Which policy decided a test.

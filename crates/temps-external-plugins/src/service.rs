@@ -96,6 +96,15 @@ pub enum ExternalPluginsError {
     Sandbox(#[from] SandboxError),
     #[error("Plugin '{name}' is not isolated per plugin on this server: every plugin runs as a separate operating-system user through the plugin launcher")]
     IsolationManagedByLauncher { name: String },
+    /// Attaching to the service a plugin runs as failed.
+    #[error(transparent)]
+    Service(#[from] crate::service_runtime::ServiceAttachError),
+    #[error("Plugin '{name}' runs as a Temps service, which is its isolation: the service's own settings limit it, and it cannot be moved into a plugin container or run as a process")]
+    IsolationManagedByService { name: String },
+    #[error("A plugin is run as a Temps service by adding that service under Settings > Plugins, not by choosing it for plugin '{name}', which is installed as an executable")]
+    ServiceIsolationNotSelectable { name: String },
+    #[error("Could not read the services plugins run as: {source}")]
+    ServiceLookup { source: sea_orm::DbErr },
     #[error("Plugin '{name}' could not be restarted with {isolation} isolation and was returned to its previous isolation: {reason}", isolation = isolation.as_str())]
     IsolationChangeFailed {
         name: String,
@@ -646,6 +655,11 @@ impl ExternalPluginsService {
         let isolation = inherited
             .or(requested)
             .unwrap_or(PluginIsolation::Container);
+        if !isolation.runs_an_executable() {
+            return Err(ExternalPluginsError::ServiceIsolationNotSelectable {
+                name: name.to_string(),
+            });
+        }
         let config = self.manager.config();
         if isolation == PluginIsolation::Container && config.launcher.is_none() {
             config
@@ -733,6 +747,12 @@ impl ExternalPluginsService {
         isolation: PluginIsolation,
     ) -> Result<PluginIsolationStatus, ExternalPluginsError> {
         validate_plugin_name(name)?;
+        if self.manager.is_service_plugin(name).await {
+            return Err(ExternalPluginsError::IsolationManagedByService { name: name.into() });
+        }
+        if !isolation.runs_an_executable() {
+            return Err(ExternalPluginsError::ServiceIsolationNotSelectable { name: name.into() });
+        }
         let config = self.manager.config();
         if !config.persistent_installations {
             return Err(ExternalPluginsError::PersistentStorageRequired);
@@ -880,7 +900,7 @@ impl ExternalPluginsService {
         queue: Option<Arc<dyn JobQueue>>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
-        let manager = Arc::new(ExternalPluginManager::new(config, db.clone()));
+        let manager = ExternalPluginManager::new(config, db.clone()).shared();
         Self {
             manager,
             db,
@@ -913,6 +933,7 @@ impl ExternalPluginsService {
     /// then swaps the resulting proxy router in. Safe to call once on a
     /// freshly-constructed shell from [`new_empty`](Self::new_empty).
     pub fn start_background_discovery(self: Arc<Self>) {
+        self.follow_service_plugins();
         tokio::spawn(async move {
             let _lifecycle = self.lifecycle.lock().await;
             if self.closing.load(Ordering::Acquire) {
@@ -963,7 +984,7 @@ impl ExternalPluginsService {
         queue: Option<Arc<dyn JobQueue>>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
-        let manager = Arc::new(ExternalPluginManager::new(config, db.clone()));
+        let manager = ExternalPluginManager::new(config, db.clone()).shared();
         let manifests = manager.discover_and_start().await;
 
         if !manifests.is_empty() {
@@ -1363,6 +1384,9 @@ impl ExternalPluginsService {
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
+        if self.manager.is_service_plugin(name).await {
+            return self.remove_service_plugin(name).await;
+        }
         let active_path = self
             .manager
             .config()
@@ -1414,6 +1438,7 @@ impl ExternalPluginsService {
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         self.closing.store(true, Ordering::Release);
+        self.manager.stop_supervising_services();
         self.manager.watch_ready.notify_one();
         self.ai_recovery.cancel();
         self.ai_tools
@@ -1574,6 +1599,9 @@ fn retain_platform_plugins(registry: &mut VerifiedRegistry, platform: &str) {
         .plugins
         .retain(|plugin| plugin.platforms.contains_key(platform));
 }
+
+mod plugin_services;
+pub use plugin_services::ServicePluginView;
 
 #[cfg(test)]
 mod tests {

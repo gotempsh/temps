@@ -59,6 +59,7 @@ tokio = { workspace = true, features = ["test-util"] }
 temps-test-utils = { path = "../temps-test-utils" }
 tracing-subscriber = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
+temps-plugin-sdk = { path = "../temps-plugin-sdk" }
 
 [lints]
 workspace = true

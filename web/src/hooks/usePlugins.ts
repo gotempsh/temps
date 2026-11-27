@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  addServicePlugin,
   getPluginInstallationReporting,
   getPluginSandbox,
+  getPluginServices,
   listExternalPlugins,
   listPluginCatalog,
   putPluginIsolation,
@@ -12,6 +14,7 @@ import {
   uninstallPlugin,
 } from '@/api/client/sdk.gen'
 import type {
+  AddServicePlugin,
   PluginCatalogResponse,
   PluginIsolation,
   ReloadResponse,
@@ -31,6 +34,36 @@ export const PLUGIN_REPORTING_QUERY_KEY = [
   'installation-reporting',
 ]
 export const PLUGIN_SANDBOX_QUERY_KEY = ['external-plugins', 'sandbox']
+export const PLUGIN_SERVICES_QUERY_KEY = ['external-plugins', 'services']
+
+/**
+ * The plugins that run as Temps services, how each is doing, and whether a
+ * service can be added as a plugin on this server. Administrators only: pass
+ * `enabled` from the caller's permission.
+ */
+export function usePluginServices(enabled = true) {
+  return useQuery({
+    queryKey: PLUGIN_SERVICES_QUERY_KEY,
+    queryFn: async () => (await getPluginServices({ throwOnError: true })).data,
+    enabled,
+    retry: false,
+    refetchOnWindowFocus: 'always',
+  })
+}
+
+/** Make a deployed service a plugin. It starts with no permissions. */
+export function useAddServicePlugin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (body: AddServicePlugin) =>
+      (await addServicePlugin({ body, throwOnError: true })).data,
+    retry: false,
+    // The plugin list, its navigation and each plugin's state all change.
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
 
 /**
  * Whether this server runs plugins in containers, and how each installed

@@ -8332,10 +8332,7 @@ async fn plugin_isolation_keeps_installed_plugins_as_processes_and_is_reversible
         "postgresql://postgres:postgres@localhost:{port}/postgres"
     ))
     .await?;
-    async fn isolation_of(
-        db: &sea_orm::DatabaseConnection,
-        name: &str,
-    ) -> anyhow::Result<String> {
+    async fn isolation_of(db: &sea_orm::DatabaseConnection, name: &str) -> anyhow::Result<String> {
         let row = db
             .query_one(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,

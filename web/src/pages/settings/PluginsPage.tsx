@@ -4,6 +4,7 @@
 import type {
   PluginIsolation,
   ReloadFailureResponse,
+  ServicePluginResponse,
 } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -31,6 +32,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import {
   usePluginSandbox,
+  usePluginServices,
   usePlugins,
   useReloadPlugins,
   useSetPluginIsolation,
@@ -74,6 +76,12 @@ import {
 } from '@/components/plugins/PluginIsolation'
 import { isolationActionLabel, oppositeIsolation } from '@/lib/plugin-isolation'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
+import {
+  AddServicePluginDialog,
+  ServicePluginNotice,
+  ServicePluginOrigin,
+  ServicePluginStatus,
+} from '@/components/plugins/ServicePlugins'
 
 export function PluginsPage() {
   const navigate = useNavigate()
@@ -96,6 +104,11 @@ export function PluginsPage() {
   } | null>(null)
   const isolationOf = (name: string) =>
     sandbox.data?.plugins.find((plugin) => plugin.name === name)
+  // Plugins that run as Temps services, and how each is doing.
+  const services = usePluginServices(canManagePlugins)
+  const serviceOf = (name: string) =>
+    services.data?.plugins.find((plugin) => plugin.name === name)
+  const [addingService, setAddingService] = useState(false)
   const [fileName, setFileName] = useState<string | null>(null)
   const [uninstallName, setUninstallName] = useState<string | null>(null)
   const [updateName, setUpdateName] = useState<string | null>(null)
@@ -118,6 +131,8 @@ export function PluginsPage() {
     setIsolation.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
+  const uninstallsService =
+    uninstallName !== null && serviceOf(uninstallName) !== undefined
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Plugins' }])
@@ -227,6 +242,12 @@ export function PluginsPage() {
         onOpenChange={() => setFileName(null)}
         onSensitiveError={handleSensitiveActionError}
       />
+      <AddServicePluginDialog
+        open={canManagePlugins && addingService}
+        onOpenChange={setAddingService}
+        services={services.data}
+        onSensitiveError={handleSensitiveActionError}
+      />
       {canManagePlugins && verificationDialog}
       <PluginIsolationDialog
         name={isolationChange?.name ?? ''}
@@ -248,11 +269,15 @@ export function PluginsPage() {
         onOpenChange={(open) => {
           if (!open) setUninstallName(null)
         }}
-        verb="Uninstall"
+        verb={uninstallsService ? 'Remove' : 'Uninstall'}
         resourceType="plugin"
         resourceName={uninstallName ?? ''}
         irreversible={false}
-        consequences="This stops the plugin and removes it from navigation. Its data is preserved so you can reinstall it later."
+        consequences={
+          uninstallsService
+            ? 'This removes the plugin from navigation and revokes its permissions. The service it runs as keeps running; stop or delete it from its own page.'
+            : 'This stops the plugin and removes it from navigation. Its data is preserved so you can reinstall it later.'
+        }
         isPending={uninstallPlugin.isPending}
         onConfirm={() => {
           if (uninstallName) void handleUninstall(uninstallName)
@@ -264,6 +289,13 @@ export function PluginsPage() {
         actions={
           canManagePlugins && (
             <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                disabled={managementPending}
+                onClick={() => setAddingService(true)}
+              >
+                Add from service
+              </Button>
               <Button
                 variant="outline"
                 disabled={managementPending}
@@ -363,6 +395,14 @@ export function PluginsPage() {
                 unavailable={sandbox.isError}
               />
             )}
+            {canManagePlugins && (
+              <ServicePluginNotice
+                services={services.data}
+                unavailable={services.isError}
+                disabled={managementPending}
+                onRemove={setUninstallName}
+              />
+            )}
 
             {pluginsLoading ? (
               <RunningPluginsSkeleton />
@@ -408,7 +448,7 @@ export function PluginsPage() {
                           <span className="flex items-center gap-1 text-xs text-muted-foreground">
                             <Tag className="size-3" /> v{plugin.version}
                           </span>
-                          <Status tone="ok" label="Running" />
+                          <PluginRunState service={serviceOf(plugin.name)} />
                           <PluginIsolationStatus
                             isolation={isolationOf(plugin.name)}
                           />
@@ -418,6 +458,7 @@ export function PluginsPage() {
                             {plugin.description}
                           </p>
                         )}
+                        <PluginServiceOrigin service={serviceOf(plugin.name)} />
                         <PluginNavigationHint nav={plugin.nav} />
                       </div>
                     </div>
@@ -431,7 +472,7 @@ export function PluginsPage() {
                           </Link>
                         </Button>
                       )}
-                      {canManagePlugins && (
+                      {canManagePlugins && !serviceOf(plugin.name) && (
                         <RepositoryUpdateButton
                           name={plugin.name}
                           onClick={() => setUpdateName(plugin.name)}
@@ -479,7 +520,8 @@ export function PluginsPage() {
                               className="text-destructive focus:text-destructive"
                               onSelect={() => setUninstallName(plugin.name)}
                             >
-                              <Trash2 className="mr-2 size-4" /> Uninstall
+                              <Trash2 className="mr-2 size-4" />{' '}
+                              {serviceOf(plugin.name) ? 'Remove' : 'Uninstall'}
                             </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
@@ -494,6 +536,26 @@ export function PluginsPage() {
       </Tabs>
     </div>
   )
+}
+
+/** Running, unless the plugin runs as a service that is stopped or unreachable. */
+function PluginRunState({
+  service,
+}: {
+  service: ServicePluginResponse | undefined
+}) {
+  if (!service) return <Status tone="ok" label="Running" />
+  return <ServicePluginStatus plugin={service} />
+}
+
+/** The service a plugin runs as, for a plugin that runs as one. */
+function PluginServiceOrigin({
+  service,
+}: {
+  service: ServicePluginResponse | undefined
+}) {
+  if (!service) return null
+  return <ServicePluginOrigin plugin={service} />
 }
 
 function RunningPluginsSkeleton() {

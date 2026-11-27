@@ -15,6 +15,7 @@
 pub mod actor;
 pub mod catalog;
 pub mod channel;
+pub mod endpoint;
 pub mod event_listener;
 pub mod grants;
 pub mod handler;
@@ -29,6 +30,7 @@ pub mod reporting;
 pub mod repository;
 pub mod sandbox;
 pub mod service;
+pub mod service_runtime;
 pub mod source_catalog;
 pub mod trust;
 
