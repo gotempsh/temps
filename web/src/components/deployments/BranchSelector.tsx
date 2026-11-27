@@ -37,6 +37,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import { useMemo, useState, useEffect } from 'react'
+import { useBranchVerification } from '@/hooks/useBranchVerification'
 import { isExpiredTokenError } from '@/utils/errorHandling'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
@@ -47,10 +48,24 @@ export interface ResolvedBranch {
   name: string
   commit_sha?: string
   protected?: boolean
-  /** This branch is the repo's default. */
+  /** This branch is the repo's default, as the server marked it. */
   isDefault: boolean
   /** Synthetic entry for a selected ref the API didn't return. */
   isCurrentOutOfList?: boolean
+}
+
+/**
+ * What the branch listing covered.
+ *
+ * `truncated` is the provider's own safety cap having stopped the listing, so
+ * `names` is a prefix of the repository's branches: a name missing from it is
+ * unverified, never known-absent. Callers that warn about a branch must
+ * confirm it with `useBranchVerification` first.
+ */
+export interface BranchListing {
+  names: string[]
+  branches: ResolvedBranch[]
+  truncated: boolean
 }
 
 interface BranchSelectorProps {
@@ -63,6 +78,8 @@ interface BranchSelectorProps {
   onError?: (error: string | null) => void
   onBranchesLoaded?: (branches: string[]) => void
   onBranchDetailsLoaded?: (branches: ResolvedBranch[]) => void
+  /** The listing as a whole, including whether the provider's cap capped it. */
+  onBranchListingLoaded?: (listing: BranchListing) => void
   disabled?: boolean
   /** Pre-loaded branches (for public repos or when already fetched) */
   branches?: Array<{
@@ -85,6 +102,7 @@ export function BranchSelector({
   onError,
   onBranchesLoaded,
   onBranchDetailsLoaded,
+  onBranchListingLoaded,
   disabled = false,
   branches: providedBranches,
   gitUrl,
@@ -193,6 +211,11 @@ export function BranchSelector({
             }).queryKey,
           })
         }
+        // A selected branch past the listing cap is answered by the exact
+        // lookup, whose query key the listing refresh above never touches.
+        // Ask again too, or the dialog keeps the head SHA from before the
+        // push the user is refreshing for (or a failure it cannot retry).
+        await verification.refresh()
       })
     } catch (error) {
       toast.error(
@@ -211,30 +234,63 @@ export function BranchSelector({
     [branchesQuery.error]
   )
 
-  // The repo's default branch. The live `is_default` marker on fetched
-  // branches is authoritative (it reflects the provider's current default,
-  // e.g. after a `master` -> `main` rename); the `defaultBranch` prop is
-  // often sourced from stored repository metadata that can lag behind, so
-  // it's only a fallback for before that data has loaded.
-  const effectiveDefaultName = useMemo(() => {
-    const liveDefault =
-      effectiveQuery.data?.branches.find((b) => b.is_default)?.name ??
-      providedBranches?.find((b) => b.is_default)?.name
-    return liveDefault ?? defaultBranch
-  }, [defaultBranch, providedBranches, effectiveQuery.data])
+  const listedBranches = providedBranches ?? effectiveQuery.data?.branches
+
+  // The repo's default branch, as the *server* marked it. Only a branch the
+  // server flagged `is_default` wears the badge: the `defaultBranch` prop is
+  // whatever the caller happens to hold (an environment's branch, stored
+  // repository metadata), and inferring the default from it labelled the
+  // current branch "default" when it was nothing of the kind.
+  const serverDefaultName = useMemo(
+    () => listedBranches?.find((b) => b.is_default)?.name,
+    [listedBranches]
+  )
+
+  const effectiveBranch = value ?? ''
+
+  // Whether the listing is a prefix of the repository's branches. When it is,
+  // a name it lacks is unverified rather than missing -- including the
+  // repository's real default, which may itself be past the cap.
+  const listingTruncated = providedBranches
+    ? false
+    : (effectiveQuery.data?.truncated ?? false)
+
+  // A selected branch the listing never covered: ask the server for it by
+  // name, so its commit SHA and `is_default` come from the provider rather
+  // than from a guess.
+  const missingFromListing =
+    !!effectiveBranch &&
+    !!listedBranches &&
+    !listedBranches.some((b) => b.name === effectiveBranch)
+  const verification = useBranchVerification({
+    repoOwner,
+    repoName,
+    connectionId,
+    publicProvider,
+    publicInstanceUrl: publicRepository?.instanceUrl,
+    branch: effectiveBranch,
+    enabled: missingFromListing,
+  })
+  const verifiedBranch =
+    verification.status === 'found' ? verification.branch : undefined
+
+  // The exact lookup is as authoritative as the listing, and it reaches
+  // branches the listing cannot.
+  const defaultName = verifiedBranch?.is_default
+    ? verifiedBranch.name
+    : serverDefaultName
 
   // Sort branches: default first, then common main branches, then alphabetical.
   const sortedBranches = useMemo<ResolvedBranch[]>(() => {
-    const raw = providedBranches ?? effectiveQuery.data?.branches
-    if (!raw) return []
+    if (!listedBranches) return []
 
     const mainBranches = ['main', 'master', 'develop']
-    return raw
+    return listedBranches
       .map<ResolvedBranch>((b) => ({
         name: b.name,
         commit_sha: 'commit_sha' in b ? b.commit_sha : undefined,
         protected: 'protected' in b ? b.protected : undefined,
-        isDefault: b.name === effectiveDefaultName,
+        isDefault: b.name === defaultName,
       }))
       .sort((a, b) => {
         if (a.isDefault) return -1
@@ -245,9 +301,7 @@ export function BranchSelector({
         if (!aIsMain && bIsMain) return 1
         return a.name.localeCompare(b.name)
       })
-  }, [providedBranches, effectiveQuery.data, effectiveDefaultName])
-
-  const effectiveBranch = value ?? ''
+  }, [listedBranches, defaultName])
 
   // Always include the currently-selected branch, even when the API didn't
   // return it (huge branch counts hitting the safety cap, a branch renamed or
@@ -262,20 +316,29 @@ export function BranchSelector({
     return [
       {
         name: effectiveBranch,
-        isDefault: effectiveBranch === effectiveDefaultName,
+        commit_sha: verifiedBranch?.commit_sha,
+        protected: verifiedBranch?.protected,
+        isDefault: verifiedBranch?.is_default ?? false,
         isCurrentOutOfList: true,
       },
       ...sortedBranches,
     ]
-  }, [sortedBranches, effectiveBranch, effectiveDefaultName])
+  }, [sortedBranches, effectiveBranch, verifiedBranch])
 
-  // Notify parent when branches are loaded
+  // Notify parent when branches are loaded. The out-of-list entry travels
+  // with them so a consumer that needs the selected branch's commit SHA
+  // (to verify its head commit, say) gets the verified one.
   useEffect(() => {
-    if (sortedBranches.length === 0) return
+    if (displayBranches.length === 0) return
     onBranchesLoaded?.(sortedBranches.map((b) => b.name))
-    onBranchDetailsLoaded?.(sortedBranches)
+    onBranchDetailsLoaded?.(displayBranches)
+    onBranchListingLoaded?.({
+      names: sortedBranches.map((b) => b.name),
+      branches: displayBranches,
+      truncated: listingTruncated,
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sortedBranches])
+  }, [displayBranches, sortedBranches, listingTruncated])
 
   if (hasExpiredToken) {
     return (
@@ -334,7 +397,7 @@ export function BranchSelector({
           onChange(e.target.value)
           onError?.(null)
         }}
-        placeholder={`Enter branch name${effectiveDefaultName ? ` (default: ${effectiveDefaultName})` : ''}`}
+        placeholder={`Enter branch name${defaultBranch ? ` (default: ${defaultBranch})` : ''}`}
         disabled={disabled}
       />
     )
@@ -345,7 +408,7 @@ export function BranchSelector({
       <BranchCombobox
         branches={displayBranches}
         value={effectiveBranch}
-        defaultName={effectiveDefaultName}
+        defaultName={defaultName}
         disabled={disabled}
         onSelect={(branch) => {
           onChange(branch)

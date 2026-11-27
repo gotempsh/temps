@@ -16,7 +16,8 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::services::{
     cache::CommitCacheKey,
-    git_provider::{Commit, GitProviderError},
+    git_provider::{BranchList, Commit, GitProviderError},
+    git_provider_manager::{BranchLookupError, BranchLookupOutcome, BranchLookupStep},
 };
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -49,6 +50,33 @@ pub struct BranchInfo {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BranchListResponse {
     pub branches: Vec<BranchInfo>,
+    /// Whether the git provider's safety cap stopped the listing before the
+    /// repository ran out of branches. When `true`, `branches` is a prefix of
+    /// the repository's branches and a name missing from it may still exist:
+    /// clients must verify such a name with the single-branch lookup
+    /// (`GET repositories/{owner}/{repo}/branch`) instead of reporting it
+    /// missing.
+    pub truncated: bool,
+}
+
+impl BranchListResponse {
+    /// Build the response from a provider listing, marking the repository's
+    /// default branch as the provider reports it.
+    pub(super) fn from_branch_list(list: BranchList, default_branch: &str) -> Self {
+        Self {
+            branches: list
+                .branches
+                .into_iter()
+                .map(|branch| BranchInfo {
+                    is_default: branch.name == default_branch,
+                    name: branch.name,
+                    commit_sha: branch.commit_sha,
+                    protected: branch.protected,
+                })
+                .collect(),
+            truncated: list.truncated,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -191,19 +219,11 @@ pub async fn get_repository_branches(
     // paying for a live provider round-trip (with its own retry/backoff)
     // just to compute is_default on data we're about to return anyway.
     if !params.fresh {
-        if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
-            let branch_infos: Vec<BranchInfo> = cached_branches
-                .into_iter()
-                .map(|branch| BranchInfo {
-                    is_default: branch.name == repository.default_branch,
-                    name: branch.name,
-                    commit_sha: branch.commit_sha,
-                    protected: branch.protected,
-                })
-                .collect();
-            return Ok(Json(BranchListResponse {
-                branches: branch_infos,
-            }));
+        if let Some(cached) = state.cache_manager.branches.get(&cache_key).await {
+            return Ok(Json(BranchListResponse::from_branch_list(
+                cached,
+                &repository.default_branch,
+            )));
         }
     }
 
@@ -237,26 +257,182 @@ pub async fn get_repository_branches(
         .list_branches(&access_token, &owner, &repo)
         .await?;
 
-    // Cache the result
+    // Cache the result, truncation flag included: a cache hit must not look
+    // more complete than the listing it stored.
     state
         .cache_manager
         .branches
         .set(cache_key, branches.clone())
         .await;
 
-    let branch_infos: Vec<BranchInfo> = branches
-        .into_iter()
-        .map(|branch| BranchInfo {
-            is_default: branch.name == default_branch,
+    Ok(Json(BranchListResponse::from_branch_list(
+        branches,
+        &default_branch,
+    )))
+}
+
+/// A branch name to look up exactly. Query rather than path, because branch
+/// names contain `/` (`release/2026-01`) and a path segment cannot.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct BranchLookupQueryParams {
+    /// Git provider connection ID (required when multiple connections have the same repo)
+    pub connection_id: i32,
+    /// Exact branch name to look up
+    pub name: String,
+}
+
+/// Look up one branch of a repository by exact name
+///
+/// Reads the branch by name, so it is exact for repositories with more
+/// branches than `GET repositories/{owner}/{repo}/branches` returns. A 404
+/// is only returned once the repository itself has been read through the
+/// same connection: a provider answers 404 for every branch of a private
+/// repository the credential can no longer see, and that is reported as a
+/// failed lookup, not a missing branch. A 404 here is the only sound basis
+/// for telling a user a branch does not exist.
+#[utoipa::path(
+    get,
+    path = "repositories/{owner}/{repo}/branch",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("repo" = String, Path, description = "Repository name"),
+        BranchLookupQueryParams
+    ),
+    responses(
+        (status = 200, description = "The branch", body = BranchInfo),
+        (status = 400, description = "Empty branch name"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Git provider permission required"),
+        (status = 404, description = "Repository or branch not found"),
+        (status = 409, description = "The connection must be reauthorized"),
+        (status = 429, description = "Branch lookup rate limit exceeded"),
+        (status = 500, description = "Internal server error"),
+        (status = 502, description = "Git provider request failed, or the repository could not be read to confirm a missing branch")
+    ),
+    tag = "Repositories",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_repository_branch(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo)): Path<(String, String)>,
+    Query(params): Query<BranchLookupQueryParams>,
+) -> Result<Json<BranchInfo>, Problem> {
+    permission_check!(auth, Permission::GitRepositoriesRead);
+
+    // Look up exactly the name asked for. Git allows non-ASCII whitespace
+    // such as U+00A0 in a ref, and trimming it would answer for a different
+    // branch; only a name no ref can have is rejected.
+    let branch_name = params.name.clone();
+    if super::is_impossible_branch_name(&branch_name) {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Branch Name")
+            .detail("The branch name to look up must not be empty.")
+            .build());
+    }
+
+    // The budget is spent before any other work: fetching the connection's
+    // token can itself call the provider (a PAT is validated, an expiring
+    // OAuth or App token refreshed), so a principal over its budget must be
+    // turned away before that, not after.
+    let principal = provider_lookup_principal(&auth);
+    state
+        .cache_manager
+        .commit_lookup_rate_limiter
+        .check(&principal)
+        .await
+        .map_err(|retry_after_seconds| {
+            ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Branch Lookup Rate Limit Exceeded")
+                .detail("Too many branch lookups. Please retry later.")
+                .value("retry_after_seconds", retry_after_seconds)
+                .build()
+        })?;
+
+    match state
+        .git_provider_manager
+        .look_up_branch(params.connection_id, &owner, &repo, &branch_name)
+        .await
+    {
+        Ok(BranchLookupOutcome::Found { branch, is_default }) => Ok(Json(BranchInfo {
+            is_default,
             name: branch.name,
             commit_sha: branch.commit_sha,
             protected: branch.protected,
-        })
-        .collect();
+        })),
+        Ok(BranchLookupOutcome::Missing) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Branch Not Found")
+            .detail(format!(
+                "Repository {}/{} has no branch named '{}'.",
+                owner, repo, branch_name
+            ))
+            .value("branch", branch_name)
+            .build()),
+        Err(BranchLookupError::Connection { source, .. }) => Err((*source).into()),
+        Err(BranchLookupError::Provider { step, source, .. }) => Err(branch_lookup_problem(
+            *source,
+            step,
+            &owner,
+            &repo,
+            &branch_name,
+        )),
+    }
+}
 
-    Ok(Json(BranchListResponse {
-        branches: branch_infos,
-    }))
+/// The response for a branch lookup the provider did not answer.
+///
+/// Never a 404, whatever the variant: a client reads 404 from this endpoint
+/// as "the branch does not exist", and a failed lookup says nothing about
+/// that. Every variant is listed so that a new one forces a decision here.
+fn branch_lookup_problem(
+    error: GitProviderError,
+    step: BranchLookupStep,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Problem {
+    match &error {
+        // Already a status and detail the caller can act on, and none of
+        // them is a 404.
+        GitProviderError::RateLimitExceeded
+        | GitProviderError::PermissionDenied { .. }
+        | GitProviderError::AuthenticationFailed(_)
+        | GitProviderError::RefreshTokenRejected { .. }
+        | GitProviderError::BranchLookupUnavailable { .. }
+        | GitProviderError::DatabaseError(_)
+        | GitProviderError::HttpClientBuild { .. } => error.into(),
+        // The provider failed or answered unexpectedly. The not-found
+        // variants among these map to 404 elsewhere, which here would claim
+        // the branch is missing.
+        GitProviderError::ApiError(_)
+        | GitProviderError::NotImplemented
+        | GitProviderError::InvalidConfiguration(_)
+        | GitProviderError::Other(_)
+        | GitProviderError::ProviderNotFound(_)
+        | GitProviderError::ConnectionNotFound(_)
+        | GitProviderError::CommitNotFound { .. }
+        | GitProviderError::FileNotFound { .. }
+        | GitProviderError::RepositoryAlreadyExists { .. } => match step {
+            BranchLookupStep::ReadBranch => ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Failed to look up branch")
+                .detail(format!(
+                    "The git provider could not complete the lookup of branch '{}' in {}/{}.",
+                    branch, owner, repo
+                ))
+                .value("branch", branch.to_string())
+                .build(),
+            BranchLookupStep::ConfirmRepository => ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                .title("Branch Could Not Be Verified")
+                .detail(format!(
+                    "The git provider returned no branch '{}' for {}/{}, but the repository itself could not be read through this connection, so the branch may still exist. Check that the connection's credential still has access to {}/{}.",
+                    branch, owner, repo, owner, repo
+                ))
+                .value("branch", branch.to_string())
+                .build(),
+        },
+    }
 }
 
 /// Get repository tags
@@ -471,19 +647,11 @@ pub async fn get_branches_by_repository_id(
     // paying for a live provider round-trip (with its own retry/backoff)
     // just to compute is_default on data we're about to return anyway.
     if !params.fresh {
-        if let Some(cached_branches) = state.cache_manager.branches.get(&cache_key).await {
-            let branch_infos: Vec<BranchInfo> = cached_branches
-                .into_iter()
-                .map(|branch| BranchInfo {
-                    is_default: branch.name == repository.default_branch,
-                    name: branch.name,
-                    commit_sha: branch.commit_sha,
-                    protected: branch.protected,
-                })
-                .collect();
-            return Ok(Json(BranchListResponse {
-                branches: branch_infos,
-            }));
+        if let Some(cached) = state.cache_manager.branches.get(&cache_key).await {
+            return Ok(Json(BranchListResponse::from_branch_list(
+                cached,
+                &repository.default_branch,
+            )));
         }
     }
 
@@ -518,26 +686,18 @@ pub async fn get_branches_by_repository_id(
         .await
         .map_err(Problem::from)?;
 
-    // Cache the result
+    // Cache the result, truncation flag included: a cache hit must not look
+    // more complete than the listing it stored.
     state
         .cache_manager
         .branches
         .set(cache_key, branches.clone())
         .await;
 
-    let branch_infos: Vec<BranchInfo> = branches
-        .into_iter()
-        .map(|branch| BranchInfo {
-            is_default: branch.name == default_branch,
-            name: branch.name,
-            commit_sha: branch.commit_sha,
-            protected: branch.protected,
-        })
-        .collect();
-
-    Ok(Json(BranchListResponse {
-        branches: branch_infos,
-    }))
+    Ok(Json(BranchListResponse::from_branch_list(
+        branches,
+        &default_branch,
+    )))
 }
 
 /// Get repository tags by repository ID
@@ -965,6 +1125,7 @@ pub async fn list_commits_by_repository_id(
 #[openapi(
     paths(
         get_repository_branches,
+        get_repository_branch,
         get_repository_tags,
         get_branches_by_repository_id,
         get_tags_by_repository_id,
@@ -989,75 +1150,4 @@ pub async fn list_commits_by_repository_id(
 pub struct RepositoriesApiDoc;
 
 #[cfg(test)]
-mod tests {
-    use super::{normalize_commit_sha, CommitExistsResponse, CommitShaValidationError};
-    use crate::services::git_provider::Commit;
-
-    #[test]
-    fn missing_commit_response_has_no_commit_metadata() {
-        let response = CommitExistsResponse::missing();
-
-        assert!(!response.exists);
-        assert!(response.commit_sha.is_none());
-        assert!(response.commit.is_none());
-    }
-
-    #[test]
-    fn found_commit_response_includes_provider_metadata() {
-        let response = CommitExistsResponse::found(Commit {
-            sha: "0123456789abcdef".to_string(),
-            message: "Show commit details".to_string(),
-            author: "Temps Contributor".to_string(),
-            author_email: "contributor@example.com".to_string(),
-            date: chrono::DateTime::UNIX_EPOCH,
-        });
-
-        assert!(response.exists);
-        assert_eq!(response.commit_sha.as_deref(), Some("0123456789abcdef"));
-        let commit = response.commit.as_ref();
-        assert_eq!(
-            commit.map(|value| value.sha.as_str()),
-            Some("0123456789abcdef")
-        );
-        assert_eq!(
-            commit.map(|value| value.message.as_str()),
-            Some("Show commit details")
-        );
-        assert_eq!(
-            commit.map(|value| value.author.as_str()),
-            Some("Temps Contributor")
-        );
-        assert_eq!(
-            commit.map(|value| value.date),
-            Some(chrono::DateTime::UNIX_EPOCH)
-        );
-    }
-
-    #[test]
-    fn commit_sha_validation_normalizes_hex_case() {
-        assert_eq!(
-            normalize_commit_sha("ABCDEF1234567"),
-            Ok("abcdef1234567".to_string())
-        );
-    }
-
-    #[test]
-    fn commit_sha_validation_rejects_short_long_and_non_hex_values() {
-        assert_eq!(
-            normalize_commit_sha("abcdef"),
-            Err(CommitShaValidationError::InvalidLength)
-        );
-        assert_eq!(
-            normalize_commit_sha("01234567890123456789012345678901234567890"),
-            Err(CommitShaValidationError::InvalidLength)
-        );
-        assert_eq!(
-            normalize_commit_sha("abcdefg"),
-            Err(CommitShaValidationError::NonHexadecimal)
-        );
-        assert_eq!(
-            normalize_commit_sha("abcdef/123456"),
-            Err(CommitShaValidationError::NonHexadecimal)
-        );
-    }
-}
+mod tests;

@@ -3653,6 +3653,7 @@ Public repos commands
 
 - `get-repository` - Get information about a public repository (supports GitHub and GitLab)
 - `get-branches` - Get branches for a public repository (supports GitHub and GitLab)
+- `get-branch` - Look up one branch of a public repository exactly, even past the branch listing's cap (404 if it does not exist)
 - `get-compose-services` - Parse a compose file's services for a public repository (supports GitHub and GitLab)
 - `get-compose-preview` - Render a redacted effective Compose preview for a public repository
 - `detect-env-example` - Detect and parse a '.env.example'-style file for a public repository (supports GitHub and GitLab)
@@ -3683,6 +3684,20 @@ Get branches for a public repository (supports GitHub and GitLab)
 | `--base-url <value>` | HTTPS/443 origin of a self-hosted GitLab instance | - | No |
 | `--fresh` | Force fetch fresh data, bypassing cache (default: false) | - | No |
 | `--no-fresh` | Set fresh to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers public-repos get-branch`
+
+Look up one branch of a public repository exactly, even past the branch listing's cap (404 if it does not exist)
+
+**Usage:** `providers public-repos get-branch <provider> <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--base-url <value>` | HTTPS/443 origin of a self-hosted GitLab instance | - | No |
+| `--name <value>` | Branch name to look up [required] | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `providers public-repos get-compose-services`
@@ -3742,6 +3757,7 @@ Repos commands
 **Subcommands:**
 
 - `get-repository-branches` - Get repository branches
+- `get-repository-branch` - Look up one branch of a repository exactly, even past the branch listing's cap (404 if it does not exist)
 - `get-repository-tags` - Get repository tags
 - `get-branches-by-repository-id` - Get repository branches by repository ID
 - `check-commit-exists` - Check if a commit exists in a repository
@@ -3760,6 +3776,20 @@ Get repository branches
 | `--connection-id <n>` | Git provider connection ID (required when multiple connections have the same repo) [required] | - | No |
 | `--fresh` | Force fetch fresh data, bypassing cache (default: false) | - | No |
 | `--no-fresh` | Set fresh to false | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers repos get-repository-branch`
+
+Look up one branch of a repository exactly, even past the branch listing's cap (404 if it does not exist)
+
+**Usage:** `providers repos get-repository-branch <owner> <repo> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--connection-id <n>` | Git provider connection ID [required] | - | No |
+| `--name <value>` | Branch name to look up [required] | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `providers repos get-repository-tags`

@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User, WebhookConfig,
+    AuthMethod, Branch, BranchList, Commit, FileContent, GitProviderError, GitProviderService,
+    GitProviderTag, GitProviderType, PullRequest, RepoDirEntry, Repository, RepositoryPage, User,
+    WebhookConfig,
 };
 use async_trait::async_trait;
 
@@ -166,7 +167,18 @@ impl GitProviderService for GenericProvider {
         _access_token: &str,
         _owner: &str,
         _repo: &str,
-    ) -> Result<Vec<Branch>, GitProviderError> {
+    ) -> Result<BranchList, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
+
+    /// Not implemented — Generic providers have no REST API.
+    async fn get_branch(
+        &self,
+        _access_token: &str,
+        _owner: &str,
+        _repo: &str,
+        _branch: &str,
+    ) -> Result<Option<Branch>, GitProviderError> {
         Err(GitProviderError::NotImplemented)
     }
 

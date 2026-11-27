@@ -585,7 +585,7 @@ async fn gitea_provider_e2e() {
         .list_branches(&token, ADMIN_USER, REPO_NAME)
         .await
         .expect("list_branches should succeed");
-    let branch_names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+    let branch_names: Vec<&str> = branches.branches.iter().map(|b| b.name.as_str()).collect();
     assert!(
         branch_names.contains(&default_branch.as_str()),
         "list_branches should contain default branch '{}', got: {:?}",
