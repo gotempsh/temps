@@ -108,9 +108,9 @@ export function mcpAppSnippet(
 
 /**
  * The same through the Temps CLI, which writes the file itself instead of
- * using the key shown here: read-only creates a reader key (the CLI's `-y`
- * never installs its login for an app without `--write`), and changes use
- * the CLI's own login. With `deployFolder`, the app
+ * using the key shown here: its `-y` creates a key named for the app
+ * (`mcp-<app>-…`), read-only or, with `--write`, one that can make changes,
+ * and never installs the CLI's own login. With `deployFolder`, the app
  * runs the Temps bridge on this computer instead, which can also deploy
  * project folders from inside that folder (and needs write access).
  */

@@ -60,6 +60,7 @@ macro_rules! stage {
 mod access;
 mod admin_gate;
 mod hostname;
+mod identity;
 mod inbound;
 #[cfg(test)]
 mod order_tests;
@@ -107,6 +108,10 @@ impl LoadBalancer {
     ) -> Result<Flow> {
         stage!(self.read_request_facts(session, ctx));
         Self::strip_inbound_trust_headers(session);
+
+        // This machine asking its own proxy who it is (host facts): answered
+        // only to a signed probe, before any route can match.
+        stage!(self.proxy_identity_stage(session, ctx));
 
         // ADR-115 D3: a connection on the control plane's private address is
         // answered from node 0's private routes only, before anything else

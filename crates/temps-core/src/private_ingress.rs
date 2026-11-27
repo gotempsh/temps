@@ -174,16 +174,19 @@ impl ControlPlanePrivateIngress {
         true
     }
 
-    /// A consent write committed: a pass that read the consent before it
-    /// can no longer publish, a withdrawal stops serving now, and the loop
-    /// wakes to apply it.
-    pub fn consent_written(&self, withdrawn: bool) {
+    /// A consent write committed: serving stops now, a pass that read the
+    /// consent before it can no longer publish, and the loop wakes to
+    /// decide from the new consent. Every write stops serving, not only a
+    /// withdrawal: a consent narrowed to fewer ranges, or moved to another
+    /// address, must not keep admitting what the old one did while the loop
+    /// is busy (it may be in the middle of inside checks). Until the loop
+    /// publishes again the private address is served by nobody, which fails
+    /// closed.
+    pub fn consent_written(&self) {
         {
             let _write = self.serving_write();
             self.consent_generation.fetch_add(1, Ordering::AcqRel);
-            if withdrawn {
-                self.store_serving(None);
-            }
+            self.store_serving(None);
         }
         self.changed.notify_one();
     }
@@ -205,9 +208,9 @@ impl ControlPlanePrivateIngress {
         self.networks.load().as_ref().clone()
     }
 
-    /// The consent changed (and was not withdrawn): [`Self::consent_written`].
+    /// The consent changed: [`Self::consent_written`].
     pub fn notify_changed(&self) {
-        self.consent_written(false);
+        self.consent_written();
     }
 
     /// Wait until [`Self::notify_changed`] is called.
@@ -244,17 +247,27 @@ impl ControlPlanePrivateIngress {
         };
         not_covered_by(listeners, address)
     }
+
+    /// Whether the proxy's listeners take connections to `address` on
+    /// `port`; `false` when no proxy runs in this process.
+    pub fn listens_on(&self, address: IpAddr, port: u16) -> bool {
+        self.proxy_listeners()
+            .is_some_and(|listeners| listens_on(listeners, address, port))
+    }
+}
+
+/// Whether one of `listeners` takes connections to `address` on `port`.
+pub fn listens_on(listeners: &[SocketAddr], address: IpAddr, port: u16) -> bool {
+    let address = canonical(address);
+    listeners
+        .iter()
+        .any(|l| l.port() == port && listener_takes(l.ip(), address))
 }
 
 /// [`ControlPlanePrivateIngress::not_covered`] on an explicit list.
 pub fn not_covered_by(listeners: &[SocketAddr], address: IpAddr) -> Option<String> {
     let address = canonical(address);
-    let covers = |port: u16| {
-        listeners
-            .iter()
-            .any(|l| l.port() == port && listener_takes(l.ip(), address))
-    };
-    if covers(PRIVATE_HTTPS_PORT) {
+    if listens_on(listeners, address, PRIVATE_HTTPS_PORT) {
         // Port 80 only redirects; its absence is not a reason to refuse.
         return None;
     }
@@ -318,17 +331,26 @@ mod tests {
         // the machine's networks. The withdrawal stops serving at once, and
         // the pass's decision, from the old consent, is not published.
         let read = runtime.consent_generation();
-        runtime.consent_written(true);
+        runtime.consent_written();
         assert_eq!(runtime.serving(), None);
         assert!(!runtime.set_serving_for(read, Some(serving.clone())));
         assert_eq!(runtime.serving(), None);
 
         // A narrower consent written meanwhile: the old decision is refused
-        // too, and what is served stays as it was until the next pass.
+        // too, and nothing is served until a pass decides from the new one,
+        // so the ranges it dropped are not admitted in between.
         assert!(runtime.set_serving_for(runtime.consent_generation(), Some(serving.clone())));
         let read = runtime.consent_generation();
         runtime.notify_changed();
-        assert!(!runtime.set_serving_for(read, None));
+        assert_eq!(runtime.serving(), None);
+        assert_eq!(
+            runtime.arrival(at("100.101.102.103:443"), Some(ip("100.64.0.9"))),
+            PrivateArrival::Public
+        );
+        assert!(!runtime.set_serving_for(read, Some(serving.clone())));
+        assert_eq!(runtime.serving(), None);
+        // The pass that reads the new consent publishes again.
+        assert!(runtime.set_serving_for(runtime.consent_generation(), Some(serving.clone())));
         assert_eq!(runtime.serving(), Some(serving));
     }
 

@@ -34,7 +34,7 @@ interface Collected {
 }
 interface Deploy {
   alwaysLeftOut(name: string, isDirectory: boolean): boolean
-  parseIgnore(text: string, base: string): Rule[]
+  parseIgnore(text: string, base: string, ignoreCase?: boolean): Rule[]
   isIgnored(rules: Rule[], relative: string, isDirectory: boolean): boolean
   allowedRoot(input: string, folders: string[], host?: Host): Promise<string>
   HOSTS: { extension: Host; cli: Host }
@@ -47,6 +47,18 @@ interface Deploy {
       entries?: number
     }
   ): Promise<Collected>
+  deployFolder(
+    config: { folders: string[]; origin: string },
+    args: Record<string, unknown>,
+    api: (
+      method: string,
+      path: string
+    ) => Promise<{
+      status: number
+      headers: Record<string, string>
+      text: string
+    }>
+  ): Promise<string>
   packZip(
     collected: Collected,
     limits?: { files?: number; bytes?: number }
@@ -105,6 +117,15 @@ describe('what is never uploaded', () => {
     }
     expect(deploy.alwaysLeftOut('dist', true)).toBe(false)
     // Credential stores kept in a project for a mounted configuration.
+    // Whatever the case: on macOS and Windows `.ENV` is the file `.env`.
+    for (const name of ['.ENV', '.Env.Local', 'Credentials.JSON', 'ID_RSA']) {
+      expect(deploy.alwaysLeftOut(name, false)).toBe(true)
+    }
+    for (const name of ['.GIT', 'Node_Modules']) {
+      expect(deploy.alwaysLeftOut(name, true)).toBe(true)
+    }
+    // A linked worktree's or submodule's `.git` is a file naming its repository.
+    expect(deploy.alwaysLeftOut('.git', false)).toBe(true)
     for (const store of [
       '.aws',
       '.azure',
@@ -146,7 +167,9 @@ describe('.gitignore', () => {
         'raw[]x]',
         'odd[[:nosuch:]]',
       ].join('\n'),
-      ''
+      '',
+      // Case matters to [:upper:], as where file names have case.
+      false
     )
     const hit = (p: string) => deploy.isIgnored(classes, p, false)
     expect(hit('credential-1.json')).toBe(true)
@@ -204,6 +227,20 @@ describe('.gitignore', () => {
     expect(ignored('secret12.txt')).toBe(false)
     expect(ignored('#notes')).toBe(true)
     expect(ignored('src/index.ts')).toBe(false)
+  })
+
+  test('where file names have no case, a pattern matches whatever the case', () => {
+    const blind = deploy.parseIgnore(
+      'secrets.json\nbuild/\n!Keep.JSON\n',
+      '',
+      true
+    )
+    expect(deploy.isIgnored(blind, 'Secrets.JSON', false)).toBe(true)
+    expect(deploy.isIgnored(blind, 'BUILD', true)).toBe(true)
+    expect(deploy.isIgnored(blind, 'keep.json', false)).toBe(false)
+    const exact = deploy.parseIgnore('secrets.json\n', '', false)
+    expect(deploy.isIgnored(exact, 'Secrets.JSON', false)).toBe(false)
+    expect(deploy.isIgnored(exact, 'secrets.json', false)).toBe(true)
   })
 
   test('a nested .gitignore applies under its own folder only', () => {
@@ -547,6 +584,45 @@ describe('a folder that changes while it is packed', () => {
     await expect(
       deploy.collectFiles(root, { ignoreBytes: 1024 })
     ).rejects.toThrow('a .gitignore may be here')
+  })
+})
+
+describe('a linked worktree', () => {
+  const worktree = join(SCRATCH, 'worktree')
+  tree(worktree, {
+    '.git': 'gitdir: /somewhere/else/.git/worktrees/feature\n',
+    'package.json': '{}',
+  })
+
+  test('its .git file, naming the repository, is never uploaded', async () => {
+    const collected = await deploy.collectFiles(worktree)
+    expect(collected.files.map((f) => f.name)).toEqual(['package.json'])
+    expect(collected.leftOut).toEqual(['.git'])
+  })
+})
+
+describe('starting the deployment', () => {
+  const root = join(SCRATCH, 'deployable')
+  tree(root, { 'package.json': '{}' })
+  const answering = (text: string) => async () => ({
+    status: 202,
+    headers: { 'content-type': 'application/json' },
+    text,
+  })
+  const config = { folders: [root], origin: 'https://temps.example' }
+  const args = { path: root, project_id: 4, environment_id: 7 }
+
+  test('an answer naming no deployment is a failure, not a started build', async () => {
+    for (const text of ['{}', '{"id":null}', '{"state":"pending"}']) {
+      await expect(
+        deploy.deployFolder(config, args, answering(text))
+      ).rejects.toThrow('did not say which deployment it started')
+    }
+  })
+
+  test('an answer naming the deployment says how to follow it', async () => {
+    const text = await deploy.deployFolder(config, args, answering('{"id":42}'))
+    expect(text).toContain('Deployment 42 of project 4')
   })
 })
 

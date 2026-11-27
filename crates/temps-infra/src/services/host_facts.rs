@@ -71,9 +71,10 @@ pub struct DockerFact {
 pub enum PortHolder {
     /// Nothing answers on it.
     Free,
-    /// Temps' own proxy is configured to listen on it, and it answers.
-    /// Configured but not answering (a separate proxy process stopped) is
-    /// `Free`: nothing serves it.
+    /// Temps' own proxy answers on it: one of its configured listeners is
+    /// on the port, answers, and the proxy proved who it is. Configured but
+    /// not answering (a separate proxy process stopped) is `Free`: nothing
+    /// serves it; answering without the proof is `Other`.
     Temps,
     /// Something else answers on it.
     Other,
@@ -177,15 +178,67 @@ pub fn listener_probe_address(address: &str) -> Option<SocketAddr> {
 }
 
 /// Who holds a port: Temps when one of its configured listeners on the port
-/// answered at its own address, someone else when only local loopback
-/// answered, and nobody when nothing did (a configured proxy that is stopped
-/// serves nothing).
-pub fn port_holder(temps_answered: bool, loopback_answered: bool) -> PortHolder {
-    match (temps_answered, loopback_answered) {
-        (true, _) => PortHolder::Temps,
-        (false, true) => PortHolder::Other,
-        (false, false) => PortHolder::Free,
+/// answered at its own address and Temps' proxy proved it is running
+/// (`proxy_identified`), someone else when something answered without that
+/// proof (another server took the stopped proxy's address) or only local
+/// loopback answered, and nobody when nothing did (a configured proxy that
+/// is stopped serves nothing).
+pub fn port_holder(
+    temps_answered: bool,
+    proxy_identified: bool,
+    loopback_answered: bool,
+) -> PortHolder {
+    match (temps_answered, proxy_identified, loopback_answered) {
+        (true, true, _) => PortHolder::Temps,
+        (true, false, _) | (false, _, true) => PortHolder::Other,
+        (false, _, false) => PortHolder::Free,
     }
+}
+
+/// How host facts find Temps' own proxy on this machine.
+#[derive(Debug, Clone)]
+pub struct TempsProxy {
+    /// Where its HTTP and HTTPS listeners answer (`listener_probe_address`).
+    pub listeners: Vec<SocketAddr>,
+    /// Where its HTTP listener answers, asked who it is.
+    pub http: Option<SocketAddr>,
+    /// The installation key the proxy proves it holds.
+    pub key: String,
+}
+
+/// Whether the server answering at `http` is Temps' proxy: it answers a
+/// fresh challenge with a MAC under the installation key, which nothing
+/// else on the port can. A TCP connection alone proves nothing, as another
+/// server may have taken the address of a proxy that stopped.
+async fn proxy_identifies(http: SocketAddr, key: &str) -> bool {
+    use temps_core::probe_auth;
+    let nonce = probe_auth::identity_nonce();
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(PORT_PROBE_TIMEOUT * 2)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client
+        .get(format!("http://{http}{}", probe_auth::PROXY_IDENTITY_PATH))
+        .header(reqwest::header::HOST, probe_auth::PROXY_IDENTITY_HOST)
+        .header(
+            probe_auth::HEADER,
+            probe_auth::sign(key, probe_auth::PROXY_IDENTITY_HOST, probe_auth::now()),
+        )
+        .header(probe_auth::PROXY_IDENTITY_NONCE_HEADER, &nonce)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    response
+        .headers()
+        .get(probe_auth::PROXY_IDENTITY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|answer| probe_auth::verify_identity(key, &nonce, answer))
 }
 
 /// Whether something accepts a TCP connection at `address`, within the
@@ -198,8 +251,13 @@ async fn answers(address: SocketAddr) -> bool {
         .unwrap_or(false)
 }
 
-/// Who holds `port`, given the probe addresses of Temps' own listeners.
-async fn probe_port(port: u16, temps_listeners: &[SocketAddr]) -> PortHolder {
+/// Who holds `port`, given the probe addresses of Temps' own listeners and
+/// whether its proxy proved it is running.
+async fn probe_port(
+    port: u16,
+    temps_listeners: &[SocketAddr],
+    proxy_identified: bool,
+) -> PortHolder {
     let mut temps_answered = false;
     for listener in temps_listeners.iter().filter(|l| l.port() == port) {
         if answers(*listener).await {
@@ -209,7 +267,7 @@ async fn probe_port(port: u16, temps_listeners: &[SocketAddr]) -> PortHolder {
     }
     let loopback_answered =
         !temps_answered && answers(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await;
-    port_holder(temps_answered, loopback_answered)
+    port_holder(temps_answered, proxy_identified, loopback_answered)
 }
 
 /// The first address on Tailscale's own interface among `interfaces`
@@ -240,8 +298,8 @@ fn not_checked_inbound() -> InboundCheck {
 pub struct HostFactsService {
     platform_info: Arc<PlatformInfoService>,
     docker: Arc<DockerHandle>,
-    /// Where Temps' proxy listeners answer (`listener_probe_address`).
-    temps_listeners: Vec<SocketAddr>,
+    /// Where Temps' proxy answers, and how it proves who it is.
+    proxy: TempsProxy,
     /// Temps' data directory, whose disk is reported.
     data_dir: std::path::PathBuf,
 }
@@ -250,13 +308,13 @@ impl HostFactsService {
     pub fn new(
         platform_info: Arc<PlatformInfoService>,
         docker: Arc<DockerHandle>,
-        temps_listeners: Vec<SocketAddr>,
+        proxy: TempsProxy,
         data_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             platform_info,
             docker,
-            temps_listeners,
+            proxy,
             data_dir,
         }
     }
@@ -376,11 +434,17 @@ impl HostFactsService {
     }
 
     async fn ports(&self) -> Vec<PortFact> {
+        // Pingora binds every listener at startup or not at all, so a proxy
+        // that proves itself on its HTTP listener holds its HTTPS one too.
+        let identified = match self.proxy.http {
+            Some(http) => proxy_identifies(http, &self.proxy.key).await,
+            None => false,
+        };
         let mut facts = Vec::with_capacity(2);
         for port in [80u16, 443] {
             facts.push(PortFact {
                 port,
-                holder: probe_port(port, &self.temps_listeners).await,
+                holder: probe_port(port, &self.proxy.listeners, identified).await,
             });
         }
         facts
@@ -511,12 +575,111 @@ mod tests {
 
     #[test]
     fn a_port_is_temps_only_while_temps_answers_on_it() {
-        assert_eq!(port_holder(true, false), PortHolder::Temps);
-        assert_eq!(port_holder(true, true), PortHolder::Temps);
-        assert_eq!(port_holder(false, true), PortHolder::Other);
+        assert_eq!(port_holder(true, true, false), PortHolder::Temps);
+        assert_eq!(port_holder(true, true, true), PortHolder::Temps);
+        // Something answers at the proxy's address, but the proxy did not
+        // prove it is running: another server took the port.
+        assert_eq!(port_holder(true, false, false), PortHolder::Other);
+        assert_eq!(port_holder(false, true, true), PortHolder::Other);
         // Configured, but its separate proxy process is stopped: nothing
         // serves the port, so it is not reported as Temps listening.
-        assert_eq!(port_holder(false, false), PortHolder::Free);
+        assert_eq!(port_holder(false, false, false), PortHolder::Free);
+    }
+
+    /// A minimal HTTP server on loopback that answers every request with
+    /// `answer`, for the identity probe.
+    async fn http_server(answer: &'static str) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        address
+    }
+
+    /// A server holding the installation key answers the challenge, as
+    /// Temps' proxy does, so its port is Temps'. It checks the probe was
+    /// signed for the identity host, as the proxy does.
+    #[tokio::test]
+    async fn the_proxy_that_answers_the_challenge_is_temps() {
+        use temps_core::probe_auth;
+        const KEY: &str = "test-installation-key";
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = vec![0u8; 8192];
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let header = |name: &str| {
+                    request.lines().find_map(|line| {
+                        let (n, v) = line.split_once(':')?;
+                        n.trim()
+                            .eq_ignore_ascii_case(name)
+                            .then(|| v.trim().to_string())
+                    })
+                };
+                let signed = header(probe_auth::HEADER).is_some_and(|token| {
+                    probe_auth::verify(
+                        KEY,
+                        probe_auth::PROXY_IDENTITY_HOST,
+                        &token,
+                        probe_auth::now(),
+                    )
+                }) && header("host").as_deref()
+                    == Some(probe_auth::PROXY_IDENTITY_HOST);
+                let answer = header(probe_auth::PROXY_IDENTITY_NONCE_HEADER)
+                    .filter(|_| signed)
+                    .and_then(|nonce| probe_auth::identity_answer(KEY, &nonce));
+                let reply = match answer {
+                    Some(answer) => format!(
+                        "HTTP/1.1 204 No Content\r\n{}: {answer}\r\n\r\n",
+                        probe_auth::PROXY_IDENTITY_HEADER
+                    ),
+                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".into(),
+                };
+                let _ = stream.write_all(reply.as_bytes()).await;
+            }
+        });
+        assert!(proxy_identifies(address, KEY).await);
+        // Asked with another installation's key, the answer does not verify.
+        assert!(!proxy_identifies(address, "another-installation-key").await);
+    }
+
+    /// Another server on the stopped proxy's address answers the
+    /// connection, and even a made-up identity header, but cannot answer the
+    /// challenge: its port is someone else's.
+    #[tokio::test]
+    async fn a_server_on_the_proxys_address_is_not_taken_for_temps() {
+        for answer in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 204 No Content\r\nx-temps-proxy-identity: 00ff\r\n\r\n",
+        ] {
+            let other = http_server(answer).await;
+            assert!(!proxy_identifies(other, "test-installation-key").await);
+            assert_eq!(
+                probe_port(other.port(), &[other], false).await,
+                PortHolder::Other
+            );
+        }
+        // Nothing listening at all.
+        let closed = {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            listener.local_addr().unwrap()
+        };
+        assert!(!proxy_identifies(closed, "test-installation-key").await);
     }
 
     /// A proxy bound to one address answers there, not on loopback; probing
@@ -538,13 +701,22 @@ mod tests {
         // Nothing on loopback answers for that port.
         assert!(!answers(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await);
         let configured = listener_probe_address(&bound.to_string()).unwrap();
-        assert_eq!(probe_port(port, &[configured]).await, PortHolder::Temps);
+        assert_eq!(
+            probe_port(port, &[configured], true).await,
+            PortHolder::Temps
+        );
         // Someone else's listener: not Temps'.
-        assert_eq!(probe_port(port, &[]).await, PortHolder::Free);
+        assert_eq!(probe_port(port, &[], true).await, PortHolder::Free);
         let unspecified = listener_probe_address(&format!("0.0.0.0:{port}")).unwrap();
-        assert_eq!(probe_port(port, &[unspecified]).await, PortHolder::Free);
+        assert_eq!(
+            probe_port(port, &[unspecified], true).await,
+            PortHolder::Free
+        );
         drop(listener);
-        assert_eq!(probe_port(port, &[configured]).await, PortHolder::Free);
+        assert_eq!(
+            probe_port(port, &[configured], true).await,
+            PortHolder::Free
+        );
     }
 
     #[tokio::test]
@@ -554,8 +726,9 @@ mod tests {
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let all = listener_probe_address(&format!("0.0.0.0:{port}")).unwrap();
-        assert_eq!(probe_port(port, &[all]).await, PortHolder::Temps);
-        assert_eq!(probe_port(port, &[]).await, PortHolder::Other);
+        assert_eq!(probe_port(port, &[all], true).await, PortHolder::Temps);
+        assert_eq!(probe_port(port, &[all], false).await, PortHolder::Other);
+        assert_eq!(probe_port(port, &[], true).await, PortHolder::Other);
     }
 
     #[test]
@@ -599,7 +772,11 @@ mod tests {
                 "control-plane",
                 "this process runs without Docker",
             )),
-            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))],
+            TempsProxy {
+                listeners: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))],
+                http: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))),
+                key: "test-installation-key".into(),
+            },
             std::env::temp_dir(),
         );
         let docker = service.docker().await;

@@ -398,11 +398,12 @@ impl PrivateIngressService {
         }
         txn.commit().await?;
         if let Some(runtime) = &self.runtime {
-            // A withdrawn consent stops serving now, not when the loop next
-            // gets to it (it may be in the middle of inside checks), and a
-            // pass that read the consent before this write can no longer
-            // publish what it decided from it.
-            runtime.consent_written(consent.is_none());
+            // Any consent write stops serving now, not when the loop next
+            // gets to it (it may be in the middle of inside checks): a
+            // withdrawn or narrowed consent admits nothing it no longer
+            // names. A pass that read the consent before this write can no
+            // longer publish what it decided from it.
+            runtime.consent_written();
         }
         Ok(before)
     }

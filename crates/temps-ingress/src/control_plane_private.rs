@@ -30,6 +30,7 @@ use temps_core::worker_ingress::{
     PRIVATE_HTTP_PORT,
 };
 use temps_core::CONTROL_PLANE_NODE_ID;
+use temps_routes::public_ingress_store::MAX_PRIVATE_CHECKS;
 use temps_routes::route_table::PrivateAddress;
 use temps_routes::CachedPeerTable;
 use tokio::sync::Notify;
@@ -232,7 +233,15 @@ pub fn decide(
     let interfaces = reported_interfaces(own);
     match bound {
         Ok(serving) => {
-            let at = |port: u16| Some(std::net::SocketAddr::new(serving.address, port).to_string());
+            // Only a port the proxy takes on this address: HTTPS always is
+            // (not_covered checked it), HTTP only when its listener covers
+            // the address too, so a worker is never pointed at a port 80
+            // nobody answers on.
+            let at = |port: u16| {
+                runtime
+                    .listens_on(serving.address, port)
+                    .then(|| std::net::SocketAddr::new(serving.address, port).to_string())
+            };
             PrivateIngressDecision {
                 report: Some(ListenerReport {
                     interfaces,
@@ -359,17 +368,23 @@ impl CheckRotation {
         }
     }
 
-    /// Every hostname's latest result, the most recently checked first. The
-    /// store keeps a bounded number of them, so past that bound it is the
-    /// oldest results that are dropped, never one just checked.
+    /// The latest results the store keeps, the most recently checked first.
+    /// The store keeps at most [`MAX_PRIVATE_CHECKS`] of them, so past that
+    /// bound it is the oldest results that are left out, never one just
+    /// checked, and only the kept ones are copied.
     fn report(&self) -> Vec<PrivateCheck> {
         let mut results: Vec<&PrivateCheck> = self.results.values().collect();
-        results.sort_by(|a, b| {
+        let newest_first = |a: &&PrivateCheck, b: &&PrivateCheck| {
             self.checked_at
                 .get(&b.hostname)
                 .cmp(&self.checked_at.get(&a.hostname))
                 .then_with(|| a.hostname.cmp(&b.hostname))
-        });
+        };
+        if results.len() > MAX_PRIVATE_CHECKS {
+            results.select_nth_unstable_by(MAX_PRIVATE_CHECKS, newest_first);
+            results.truncate(MAX_PRIVATE_CHECKS);
+        }
+        results.sort_by(newest_first);
         results.into_iter().cloned().collect()
     }
 
@@ -441,6 +456,33 @@ impl ControlPlanePrivateIngressLoop {
         })
     }
 
+    /// With the consent unreadable, stop serving what this machine no
+    /// longer allows; never start serving anything.
+    async fn recheck_without_consent(&self, generation: u64) {
+        let Some(serving) = self.runtime.serving() else {
+            return;
+        };
+        let own = self.addresses.addresses();
+        let why = if !own.iter().any(|n| n.address == serving.address) {
+            Some(format!(
+                "{} is no longer an address of this machine",
+                serving.address
+            ))
+        } else {
+            match self.containers.networks().await {
+                None => Some(CONTAINER_NETWORKS_UNKNOWN.to_string()),
+                Some(docker) => {
+                    container_overlap(&serving.admit, &all_container_networks(&own, docker))
+                }
+            }
+        };
+        if let Some(why) = why {
+            if self.runtime.set_serving_for(generation, None) {
+                warn!(reason = %why, "stopped serving private addresses");
+            }
+        }
+    }
+
     async fn sync(&self, state: &mut LoopState) -> Pass {
         // Read before the consent: a consent written after this, while the
         // pass awaits the machine's networks or its checks, outdates every
@@ -449,9 +491,13 @@ impl ControlPlanePrivateIngressLoop {
         let consent = match self.consent.get().await {
             Ok(consent) => consent,
             Err(error) => {
-                // Keep serving what was consented; the database may be
-                // briefly unavailable.
-                warn!(%error, "could not read the private ingress consent; keeping the last state");
+                // Keep serving what was consented, since the database may be
+                // briefly unavailable, but only while this machine still
+                // allows it: a container network that now overlaps an
+                // admitted range, Docker that cannot be listed, or an
+                // address the machine no longer has stops serving.
+                warn!(%error, "could not read the private ingress consent; keeping the last state while it is safe");
+                self.recheck_without_consent(generation).await;
                 return Pass::Done;
             }
         };
@@ -649,7 +695,7 @@ mod tests {
     impl ContainerNetworks for Containers {
         async fn networks(&self) -> Option<Vec<(String, IpNet)>> {
             if let Some(runtime) = &self.0 {
-                runtime.consent_written(true);
+                runtime.consent_written();
             }
             Some(Vec::new())
         }
@@ -719,6 +765,76 @@ mod tests {
             Arc::new(containers),
             Arc::new(Hanging(checks_started)),
         )
+    }
+
+    /// Docker's networks as given: `None` when it cannot be listed.
+    struct Listed(Option<Vec<(String, IpNet)>>);
+    #[async_trait]
+    impl ContainerNetworks for Listed {
+        async fn networks(&self) -> Option<Vec<(String, IpNet)>> {
+            self.0.clone()
+        }
+    }
+
+    /// A consent the database cannot read keeps the last serving only while
+    /// this machine still allows it, and never starts serving.
+    #[tokio::test]
+    async fn an_unreadable_consent_keeps_serving_only_what_is_still_safe() {
+        let overlapping = vec![("new-net".to_string(), "10.8.0.0/16".parse().unwrap())];
+        let apart = vec![("app-net".to_string(), "10.20.0.0/16".parse().unwrap())];
+        for (listed, address, kept) in [
+            (Some(apart.clone()), "10.8.0.1", true),
+            (Some(overlapping), "10.8.0.1", false),
+            (None, "10.8.0.1", false),
+            // An address this machine no longer has.
+            (Some(apart), "10.9.0.1", false),
+        ] {
+            let runtime = wildcard();
+            let serving = PrivateIngressServing::new(
+                address.parse().unwrap(),
+                vec!["10.8.0.0/24".parse().unwrap()],
+            )
+            .unwrap();
+            runtime.set_serving(Some(serving.clone()));
+            let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
+                .into_connection();
+            let pass_loop = ControlPlanePrivateIngressLoop::new(
+                Arc::new(db),
+                Arc::clone(&runtime),
+                Arc::new(CachedPeerTable::new(Arc::new(
+                    DatabaseConnection::Disconnected,
+                ))),
+                Arc::new(Machine),
+                Arc::new(Listed(listed.clone())),
+                Arc::new(Hanging(Arc::new(Notify::new()))),
+            );
+            let mut state = LoopState::default();
+            assert_eq!(pass_loop.sync(&mut state).await, Pass::Done);
+            assert_eq!(
+                runtime.serving(),
+                kept.then_some(serving),
+                "{listed:?} at {address}"
+            );
+        }
+
+        // Nothing served before: an unreadable consent starts nothing.
+        let runtime = wildcard();
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
+            .into_connection();
+        let pass_loop = ControlPlanePrivateIngressLoop::new(
+            Arc::new(db),
+            Arc::clone(&runtime),
+            Arc::new(CachedPeerTable::new(Arc::new(
+                DatabaseConnection::Disconnected,
+            ))),
+            Arc::new(Machine),
+            Arc::new(Listed(Some(Vec::new()))),
+            Arc::new(Hanging(Arc::new(Notify::new()))),
+        );
+        pass_loop.sync(&mut LoopState::default()).await;
+        assert_eq!(runtime.serving(), None);
     }
 
     /// A consent change while the inside checks are pending ends the pass
@@ -845,6 +961,27 @@ mod tests {
             .interfaces
             .iter()
             .any(|i| i.name == "docker0" || i.name == "lo"));
+    }
+
+    #[test]
+    fn http_is_reported_only_where_its_listener_takes_the_address() {
+        let tailscale = consent(PrivateListen::Tailscale, &[]);
+        // HTTPS on every address, HTTP on loopback only: workers are told
+        // of the HTTPS port alone.
+        let decision = decide(
+            tailscale.clone(),
+            &own(),
+            Some(&containers()),
+            &runtime(&["127.0.0.1:80", "0.0.0.0:443"]),
+        );
+        let report = decision.report.unwrap();
+        assert_eq!(report.https.as_deref(), Some("100.101.102.103:443"));
+        assert_eq!(report.http, None);
+        // Both on every address: both are reported.
+        let report = decide(tailscale, &own(), Some(&containers()), &wildcard())
+            .report
+            .unwrap();
+        assert_eq!(report.http.as_deref(), Some("100.101.102.103:80"));
     }
 
     #[test]
@@ -1091,6 +1228,29 @@ mod tests {
         // A hostname no longer served drops out of the report.
         rotation.retain(&hosts[..10]);
         assert_eq!(rotation.report().len(), 10);
+    }
+
+    #[test]
+    fn the_report_holds_only_as_many_results_as_the_store_keeps() {
+        let hosts: Vec<(String, PrivateAddress)> =
+            (0..MAX_PRIVATE_CHECKS + 40).map(address).collect();
+        let mut rotation = CheckRotation::default();
+        let start = Instant::now();
+        // The first 40 are checked first, so they are the oldest.
+        let (old, new) = hosts.split_at(40);
+        rotation.record(old, old.iter().map(|(h, _)| passed(h)).collect(), start);
+        rotation.record(
+            new,
+            new.iter().map(|(h, _)| passed(h)).collect(),
+            start + Duration::from_secs(1),
+        );
+        let report = rotation.report();
+        assert_eq!(report.len(), MAX_PRIVATE_CHECKS);
+        assert!(report
+            .iter()
+            .all(|c| new.iter().any(|(h, _)| *h == c.hostname)));
+        // Still sorted, newest first then by name.
+        assert_eq!(report[0].hostname, new[0].0);
     }
 
     #[test]

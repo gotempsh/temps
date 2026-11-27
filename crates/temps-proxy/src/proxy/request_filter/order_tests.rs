@@ -2359,3 +2359,78 @@ async fn without_a_served_private_address_the_public_path_is_unchanged() {
     assert_ne!(reply.status(), "routed", "{}", reply.head);
     assert!(reply.ctx.private_route.is_none());
 }
+
+// ── Proxy identity (host facts) ─────────────────────────────────────────────
+
+/// This machine asks its proxy who it is with a signed challenge; only the
+/// proxy holding the installation key can answer it, and to anyone else the
+/// path is an ordinary request.
+#[tokio::test]
+async fn the_proxy_proves_who_it_is_only_to_a_signed_identity_probe() {
+    use temps_core::probe_auth;
+    let f = fixture();
+    f.lb.expose_platform_identity
+        .store(false, Ordering::Relaxed);
+    let key =
+        f.lb.config_service
+            .get_server_config()
+            .encryption_key
+            .clone();
+    let nonce = probe_auth::identity_nonce();
+    let request = |host: &str, token: Option<String>, nonce: &str| {
+        let token = token
+            .map(|t| format!("{}: {t}\r\n", probe_auth::HEADER))
+            .unwrap_or_default();
+        format!(
+            "GET {} HTTP/1.1\r\nHost: {host}\r\n{token}{}: {nonce}\r\n\r\n",
+            probe_auth::PROXY_IDENTITY_PATH,
+            probe_auth::PROXY_IDENTITY_NONCE_HEADER,
+        )
+    };
+    let signed = |host: &str| Some(probe_auth::sign(&key, host, probe_auth::now()));
+
+    let reply = send(
+        &f.lb,
+        &request(
+            probe_auth::PROXY_IDENTITY_HOST,
+            signed(probe_auth::PROXY_IDENTITY_HOST),
+            &nonce,
+        ),
+        CLEAN_IP,
+    )
+    .await;
+    reply.assert_answered("proxy_identity", "204");
+    let answer = reply
+        .head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(": ")?;
+            name.eq_ignore_ascii_case(probe_auth::PROXY_IDENTITY_HEADER)
+                .then(|| value.trim().to_string())
+        })
+        .expect("the identity answer");
+    assert!(probe_auth::verify_identity(&key, &nonce, &answer));
+
+    // Unsigned, signed for another host, or with no real challenge: an
+    // ordinary request, which says nothing about the proxy.
+    for request in [
+        request(probe_auth::PROXY_IDENTITY_HOST, None, &nonce),
+        request(probe_auth::PROXY_IDENTITY_HOST, signed(HOST), &nonce),
+        request(
+            probe_auth::PROXY_IDENTITY_HOST,
+            signed(probe_auth::PROXY_IDENTITY_HOST),
+            "short",
+        ),
+    ] {
+        let reply = send(&f.lb, &request, CLEAN_IP).await;
+        assert_ne!(reply.status(), "proxy_identity", "{request}");
+        assert!(
+            !reply
+                .head
+                .to_ascii_lowercase()
+                .contains(probe_auth::PROXY_IDENTITY_HEADER),
+            "{}",
+            reply.head
+        );
+    }
+}

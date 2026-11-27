@@ -22,6 +22,11 @@ use super::{CachedPeerTable, LegacyRouteTable, PrivateAddress, PrivateRoute, Rou
 /// a snapshot of their own. The console's and the public ingress hostname
 /// stay reserved here too (D5), so a private address equal to either is
 /// never served.
+///
+/// Only range-only `private` addresses are served: node `0`'s listener
+/// admits a connection by its source range and never reads who is behind
+/// it, so a `tailnet_users` address (one with a principal list, empty or
+/// not) would admit everyone in the range. It is left out, failing closed.
 fn control_plane_private_snapshot(snapshot: &RouteTableSnapshot) -> RouteTableSnapshot {
     let private: HashMap<String, PrivateRoute> = snapshot
         .private
@@ -30,6 +35,7 @@ fn control_plane_private_snapshot(snapshot: &RouteTableSnapshot) -> RouteTableSn
             private.address.node_id == Some(temps_core::CONTROL_PLANE_NODE_ID)
                 && private.address.on_listener()
                 && private.address.range.is_some()
+                && private.address.principals.is_none()
         })
         // Keyed by the normalized host, so the request path finds one with
         // a single hash lookup, an unknown host included.
@@ -200,6 +206,25 @@ mod tests {
             ),
             ("nobody.internal.example.com", address(None, "listener")),
             ("console.example.com", address(Some(0), "listener")),
+            // A tailnet_users address: the listener cannot check who it
+            // admits, so it serves none, whoever is listed.
+            (
+                "users.internal.example.com",
+                PrivateAddress {
+                    principals: Some(Vec::new()),
+                    ..address(Some(0), "listener")
+                },
+            ),
+            (
+                "listed.internal.example.com",
+                PrivateAddress {
+                    principals: Some(vec![temps_core::tailnet::TailnetPrincipal::parse(
+                        "someone@example.com",
+                    )
+                    .expect("a login")]),
+                    ..address(Some(0), "listener")
+                },
+            ),
         ] {
             table.insert_private_route_for_test(
                 host,
@@ -234,13 +259,17 @@ mod tests {
             "serve.internal.example.com",
             "nobody.internal.example.com",
             "console.example.com",
+            "users.internal.example.com",
+            "listed.internal.example.com",
         ] {
             assert!(view.get_route(host).is_none(), "{host}");
             assert!(view.get_route_by_host(host).is_none(), "{host}");
         }
         // Nothing public leaks into the view.
         assert!(view.get_route("www.example.com").is_none());
-        assert_eq!(table.control_plane_private_hosts().len(), 2);
+        // The inside checks still look at the tailnet_users addresses, so
+        // they report them as not reachable rather than leaving them out.
+        assert_eq!(table.control_plane_private_hosts().len(), 4);
     }
 
     #[test]

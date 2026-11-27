@@ -21,6 +21,12 @@ describe('bridge settings', () => {
     expect(resolveFolder('/srv/apps/')).toBe('/srv/apps')
   })
 
+  test('a blank folder is refused, never read as the current one', () => {
+    for (const blank of ['', '   ', '\t']) {
+      expect(() => resolveFolder(blank)).toThrow('left blank')
+    }
+  })
+
   test('the package is pinned to this CLI', () => {
     expect(bridgePackageSpec('1.2.3')).toBe('@temps-sdk/cli@1.2.3')
   })

@@ -171,7 +171,14 @@ impl TempsPlugin for InfraPlugin {
             let host_facts_service = Arc::new(crate::services::HostFactsService::new(
                 platform_info_service.clone(),
                 docker_handle_for_facts,
-                temps_listeners,
+                crate::services::host_facts::TempsProxy {
+                    listeners: temps_listeners,
+                    // The proxy proves who it is on its HTTP listener.
+                    http: crate::services::host_facts::listener_probe_address(
+                        &server_config.address,
+                    ),
+                    key: server_config.encryption_key.clone(),
+                },
                 config_service.data_dir(),
             ));
             context.register_service(host_facts_service);

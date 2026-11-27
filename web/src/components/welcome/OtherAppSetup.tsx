@@ -132,7 +132,7 @@ export function OtherAppSetup({
           <p className="text-muted-foreground">
             {mcp.access === 'read'
               ? 'Or let the Temps CLI write it, with a new read-only key it creates:'
-              : 'Or let the Temps CLI write it, with its own login:'}
+              : 'Or let the Temps CLI write it, with a new key it creates:'}
           </p>
           <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
             <code className="min-w-0 flex-1 font-mono text-xs [overflow-wrap:anywhere]">

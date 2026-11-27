@@ -15,9 +15,16 @@ export function bridgePackageSpec(version: string): string {
   return `@temps-sdk/cli@${version}`
 }
 
-/** A folder from the command line as a full path: `~` is this user's home, a relative path is from here. */
+/**
+ * A folder from the command line as a full path: `~` is this user's home, a
+ * relative path is from here. A blank one is refused: it would otherwise be
+ * the current folder, which the user never named.
+ */
 export function resolveFolder(folder: string): string {
   const trimmed = folder.trim()
+  if (!trimmed) {
+    throw new Error('A deploy folder was left blank. Name the folder that holds your projects.')
+  }
   const expanded = trimmed === '~' || trimmed.startsWith('~/') ? path.join(os.homedir(), trimmed.slice(1)) : trimmed
   return path.resolve(expanded)
 }
@@ -75,7 +82,15 @@ export function bridgeApiKey(env: NodeJS.ProcessEnv): string {
  * list. Writes only MCP messages to stdout; everything else goes to stderr.
  */
 export function bridgeAction(options: BridgeOptions): void {
-  const folders = (options.folder ?? []).map(resolveFolder)
+  // A blank --folder allows nothing, rather than the folder the app started in.
+  const folders = (options.folder ?? []).flatMap((folder) => {
+    try {
+      return [resolveFolder(folder)]
+    } catch (error) {
+      process.stderr.write(`temps: ${error instanceof Error ? error.message : String(error)}\n`)
+      return []
+    }
+  })
   let key = ''
   try {
     key = bridgeApiKey(process.env)

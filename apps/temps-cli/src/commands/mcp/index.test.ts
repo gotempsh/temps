@@ -101,8 +101,8 @@ describe('mcp add wizard', () => {
 describe('mcp add -y', () => {
   test.each([
     [false, 'reader'],
-    [true, null],
-  ] as const)('read-only installs a new reader key, never the login (write=%s)', async (write, minted) => {
+    [true, 'user'],
+  ] as const)('installs a new key named for the app, never the login (write=%s)', async (write, minted) => {
     const { Command } = await import('commander')
     const contexts = await import('../../config/contexts.js')
     const api = await import('../../lib/api-client.js')
@@ -134,14 +134,11 @@ describe('mcp add -y', () => {
         { from: 'user' },
       )
       const installed = (add.mock.calls[0]?.[0] as { apiKey: string }).apiKey
-      if (minted) {
-        expect(created).toHaveLength(1)
-        expect((created[0] as { role_type: string }).role_type).toBe(minted)
-        expect(installed).toBe('tk_reader')
-      } else {
-        expect(created).toEqual([])
-        expect(installed).toBe('login-key')
-      }
+      expect(created).toHaveLength(1)
+      expect((created[0] as { role_type: string }).role_type).toBe(minted)
+      // Named for the app, so the console's welcome step sees it connect.
+      expect((created[0] as { name: string }).name).toMatch(/^mcp-cursor-/)
+      expect(installed).toBe('tk_reader')
     } finally {
       add.mockRestore()
       spies.forEach((spy) => spy.mockRestore())
@@ -284,20 +281,24 @@ describe('mcp add --deploy-folder', () => {
     ]
     const add = spyOn(adapter, 'addServer').mockResolvedValue({ success: true })
     try {
-      for (const [url, folder] of [
+      for (const [url, folder, ...extra] of [
         ['https://temps.example.test', '/definitely/not/a/folder'],
         ['http://192.168.1.10:8080', process.cwd()],
+        ['https://temps.example.test', '  '],
+        ['https://temps.example.test', process.cwd(), '--groups', 'platform'],
       ] as const) {
         const program = new Command().exitOverride()
         registerMcpCommands(program)
         await program.parseAsync(
-          ['mcp', 'add', 'cursor', '--url', url, '--api-key', 'test-key', '--deploy-folder', folder, '-y'],
+          ['mcp', 'add', 'cursor', '--url', url, '--api-key', 'test-key', '--deploy-folder', folder, '-y', ...extra],
           { from: 'user' },
         )
       }
       expect(add).not.toHaveBeenCalled()
       expect(warnings[0]).toContain('is not a folder on this computer')
       expect(warnings[1]).toContain('plain HTTP')
+      expect(warnings[2]).toContain('left blank')
+      expect(warnings[3]).toContain('--groups cannot be combined with --deploy-folder')
       // Nothing was installed, so the command fails for a script.
       expect(process.exitCode).toBe(1)
     } finally {

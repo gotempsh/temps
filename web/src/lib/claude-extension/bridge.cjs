@@ -500,6 +500,14 @@ function withDeployTool(message, replies) {
 const MAX_WAITING_DEPLOYS = 4
 
 /**
+ * Messages the bridge works on at once. Past it the bridge stops reading:
+ * the rest waits in the pipe, not in memory, and each forwarded call holds
+ * its request and the server's answer only while it is one of these. A
+ * cancellation is still read, so a call can always be withdrawn.
+ */
+const MAX_IN_FLIGHT = 16
+
+/**
  * One task at a time, with at most `maxWaiting` waiting behind it. A folder
  * deployment holds its archive (up to the packing limit) and an upload
  * connection until the server answers, so running them one by one bounds
@@ -550,6 +558,16 @@ function serialQueue(maxWaiting) {
   return queue
 }
 
+/** Whether a line is an MCP cancellation, read even when the bridge is busy. */
+function isCancellation(line) {
+  if (!line.includes('notifications/cancelled')) return false
+  try {
+    return JSON.parse(line).method === 'notifications/cancelled'
+  } catch {
+    return false
+  }
+}
+
 /**
  * Run the bridge over the given streams. `config` is either the settings or
  * the Error that explains why they are unusable; then every request is
@@ -568,7 +586,9 @@ function run(config, input, output, log) {
 
   const write = (message) => output.write(`${JSON.stringify(message)}\n`)
   const maybeExit = () => {
-    if (ended && pending === 0 && output !== process.stdout) output.end()
+    if (ended && pending === 0 && !buffer.includes('\n')) {
+      if (output !== process.stdout) output.end()
+    }
   }
 
   const handle = async (line) => {
@@ -656,29 +676,56 @@ function run(config, input, output, log) {
     }
   }
 
-  input.setEncoding('utf8')
-  input.on('data', (chunk) => {
-    buffer += chunk
+  // Start the messages read so far, up to MAX_IN_FLIGHT at once; reading
+  // stops while that many are running and starts again as they finish.
+  const start = (line) => {
+    pending++
+    handle(line).finally(() => {
+      pending--
+      pump()
+      maybeExit()
+    })
+  }
+  const pump = () => {
     let newline
-    while ((newline = buffer.indexOf('\n')) !== -1) {
+    while (pending < MAX_IN_FLIGHT && (newline = buffer.indexOf('\n')) !== -1) {
       const line = buffer.slice(0, newline).trim()
       buffer = buffer.slice(newline + 1)
       if (discarding) {
         discarding = false
         continue
       }
-      if (!line) continue
-      pending++
-      handle(line).finally(() => {
-        pending--
-        maybeExit()
-      })
+      if (line) start(line)
     }
-    if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) {
+    if (pending >= MAX_IN_FLIGHT && buffer.includes('\n')) {
+      // Busy: take out the cancellations waiting behind, so a call can still
+      // be withdrawn; the rest keep their order.
+      const lines = buffer.split('\n')
+      const partial = lines.pop()
+      const kept = lines.filter((line, at) => {
+        // The rest of a message too large to read is not a message.
+        if ((discarding && at === 0) || !isCancellation(line.trim())) {
+          return true
+        }
+        start(line.trim())
+        return false
+      })
+      buffer = kept.length > 0 ? `${kept.join('\n')}\n${partial}` : partial
+    }
+    const full = buffer.includes('\n')
+    if (full && !input.isPaused()) input.pause()
+    if (!full && input.isPaused() && !ended) input.resume()
+    if (!full && Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) {
       log(`temps: dropped a message larger than ${MAX_MESSAGE_BYTES} bytes`)
       buffer = ''
       discarding = true
     }
+  }
+
+  input.setEncoding('utf8')
+  input.on('data', (chunk) => {
+    buffer += chunk
+    pump()
   })
   input.on('end', () => {
     ended = true
@@ -714,6 +761,7 @@ function main(env = process.env, argv = process.argv.slice(2)) {
 module.exports = {
   serialQueue,
   MAX_WAITING_DEPLOYS,
+  MAX_IN_FLIGHT,
   plainHttpAllowed,
   tailnetLocalAddresses,
   plainHttpSource,

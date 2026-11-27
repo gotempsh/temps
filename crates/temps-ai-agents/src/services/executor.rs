@@ -2691,18 +2691,7 @@ impl AgentExecutor {
         };
         // Step 13: Save AI output immediately (so it's preserved even if push fails later)
         self.run_service
-            .update_status(
-                run_id,
-                UpdateRunFields {
-                    ai_output: Some(ai_result.output.clone()),
-                    ai_model: ai_result.model.clone(),
-                    ai_provider: Some(config.ai_provider.clone()),
-                    tokens_input: ai_result.tokens_input,
-                    tokens_output: ai_result.tokens_output,
-                    ai_session_id: ai_result.session_id.clone(),
-                    ..Default::default()
-                },
-            )
+            .update_status(run_id, agent_output_fields(&ai_result))
             .await?;
         if ai_result.is_max_turns_error {
             self.run_service
@@ -2737,9 +2726,16 @@ impl AgentExecutor {
         // Report deliverable: store the AI output as the report and complete.
         // No branch, no PR, no deployment.
         if config.deliverable == "report" {
-            // Extract all assistant text blocks from the AI output to build the full report.
-            // Supports both Claude stream-json and Codex --json formats.
-            let report_text = extract_report_text(&ai_result.output);
+            // The report is what the model wrote. A run that ended without
+            // any text (a last turn that only called tools) has none: it
+            // fails, rather than completing with its raw transcript as the
+            // report.
+            let Some(report_text) = assistant_report_text(&ai_result.output) else {
+                return Err(AgentError::AgentWroteNoReport {
+                    run_id,
+                    turns: outcome.turns,
+                });
+            };
 
             self.run_service
                 .update_status(
@@ -3702,6 +3698,22 @@ pub fn is_retired_harness(ai_provider: &str) -> bool {
     RETIRED_HARNESSES.contains(&ai_provider)
 }
 
+/// What a finished agent loop saves on its run. The provider is the AI
+/// gateway's, whatever the agent was saved with: every run goes through the
+/// gateway now (ADR-116), so an agent set up for a retired coding CLI is not
+/// recorded as having run on it.
+fn agent_output_fields(ai_result: &AiRunResult) -> UpdateRunFields {
+    UpdateRunFields {
+        ai_output: Some(ai_result.output.clone()),
+        ai_model: ai_result.model.clone(),
+        ai_provider: Some(crate::services::agent_loop::GATEWAY_PROVIDER.to_string()),
+        tokens_input: ai_result.tokens_input,
+        tokens_output: ai_result.tokens_output,
+        ai_session_id: ai_result.session_id.clone(),
+        ..Default::default()
+    }
+}
+
 /// The gateway model an agent runs on: none (the gateway's default) for an
 /// agent saved with a coding CLI, whose model ids the gateway does not know;
 /// otherwise the model it names, if any (ADR-116 D5).
@@ -3870,6 +3882,14 @@ pub fn normalize_markdown(raw: &str) -> String {
 /// `--json` (`type: "item.completed"` with `item.type: "agent_message"`).
 /// Falls back to a Claude `type: "result"` summary, then raw output.
 pub fn extract_report_text(output: &str) -> String {
+    // Last resort: raw output
+    assistant_report_text(output).unwrap_or_else(|| output.to_string())
+}
+
+/// What the model wrote in `output`, joined: the agent loop's text, a
+/// coding CLI's assistant messages, or its result summary. `None` when it
+/// wrote nothing, so a caller never takes the raw transcript for a report.
+pub fn assistant_report_text(output: &str) -> Option<String> {
     let mut assistant_texts: Vec<String> = Vec::new();
 
     for line in output.lines() {
@@ -3944,7 +3964,7 @@ pub fn extract_report_text(output: &str) -> String {
     }
 
     if !assistant_texts.is_empty() {
-        return assistant_texts.join("\n\n");
+        return Some(assistant_texts.join("\n\n"));
     }
 
     // Fallback: try the Claude "result" summary
@@ -3956,14 +3976,12 @@ pub fn extract_report_text(output: &str) -> String {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                 if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
-                    return result.to_string();
+                    return Some(result.to_string());
                 }
             }
         }
     }
-
-    // Last resort: raw output
-    output.to_string()
+    None
 }
 
 /// Most skipped entries named individually in a run-log warning; the rest
@@ -4242,6 +4260,44 @@ pub(crate) mod tests {
         );
         assert_eq!(gateway_model("gateway", Some("  ")), None);
         assert_eq!(gateway_model("gateway", None), None);
+    }
+
+    #[test]
+    fn a_transcript_with_no_model_text_has_no_report() {
+        // The last turns only called tools, then the turns ran out.
+        let transcript = [
+            r#"{"type":"temps.tool_call","id":"c1","name":"sandbox_exec","input":{"command":"ls"}}"#,
+            r#"{"type":"temps.tool_result","id":"c1","output":"src
+","is_error":false}"#,
+            r#"{"type":"temps.finish","reason":"max_turns","turns":3}"#,
+        ]
+        .join("\n");
+        assert_eq!(assistant_report_text(&transcript), None);
+        let with_text = format!(
+            "{}\n{transcript}",
+            r#"{"type":"temps.text","text":"Found the cause."}"#
+        );
+        assert_eq!(
+            assistant_report_text(&with_text).as_deref(),
+            Some("Found the cause.")
+        );
+    }
+
+    #[test]
+    fn a_run_records_the_gateway_as_its_provider() {
+        let fields = agent_output_fields(&AiRunResult {
+            output: String::new(),
+            exit_code: 0,
+            tokens_input: Some(10),
+            tokens_output: Some(5),
+            model: Some("gpt-test".into()),
+            changed_files: None,
+            session_id: None,
+            is_max_turns_error: false,
+        });
+        assert_eq!(fields.ai_provider.as_deref(), Some("gateway"));
+        assert_eq!(fields.ai_model.as_deref(), Some("gpt-test"));
+        assert_eq!(fields.tokens_input, Some(10));
     }
 
     #[test]

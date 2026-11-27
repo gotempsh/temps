@@ -100,7 +100,11 @@ mod tests {
                 "control-plane",
                 "no Docker in this test",
             )),
-            vec![std::net::SocketAddr::from(([127, 0, 0, 1], 8080))],
+            crate::services::host_facts::TempsProxy {
+                listeners: vec![std::net::SocketAddr::from(([127, 0, 0, 1], 8080))],
+                http: None,
+                key: String::new(),
+            },
             std::env::temp_dir(),
         ));
         configure_host_facts_routes().with_state(service)

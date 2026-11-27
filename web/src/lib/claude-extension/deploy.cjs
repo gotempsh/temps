@@ -131,7 +131,7 @@ const SECRET_FILE_NAMES = new Set([
   '.git-credentials',
   '.htpasswd',
   'credentials.json',
-  '.DS_Store',
+  '.ds_store',
 ])
 const SECRET_EXTENSIONS = new Set([
   '.pem',
@@ -146,8 +146,22 @@ const SECRET_EXTENSIONS = new Set([
 const REGISTRY_SETTINGS = new Set(['.npmrc', '.yarnrc', '.yarnrc.yml'])
 const REGISTRY_CREDENTIAL = /_auth|_password|npmAuthToken|npmAuthIdent/i
 
-/** Whether a file or directory is left out whatever `.gitignore` says. */
-function alwaysLeftOut(name, isDirectory) {
+/**
+ * Whether file names are compared without case here, as git does on macOS and
+ * Windows (`core.ignoreCase`): there `.ENV` is the same file as `.env`.
+ */
+const IGNORE_CASE =
+  process.platform === 'darwin' || process.platform === 'win32'
+
+/**
+ * Whether a file or directory is left out whatever `.gitignore` says. Names
+ * are compared without case, so a secret is left out on every file system.
+ */
+function alwaysLeftOut(given, isDirectory) {
+  const name = given.toLowerCase()
+  // A linked worktree's or submodule's `.git` is a file that names the
+  // repository it belongs to.
+  if (name === '.git') return true
   if (isDirectory) {
     return LEFT_OUT_DIRECTORIES.has(name) || CREDENTIAL_DIRECTORIES.has(name)
   }
@@ -159,7 +173,7 @@ function alwaysLeftOut(name, isDirectory) {
   }
   if (/^id_(rsa|dsa|ecdsa|ed25519)/.test(name)) return true
   if (/^terraform\.tfstate/.test(name)) return true
-  return SECRET_EXTENSIONS.has(path.extname(name).toLowerCase())
+  return SECRET_EXTENSIONS.has(path.extname(name))
 }
 
 function escapeRegex(char) {
@@ -282,9 +296,10 @@ function globToRegex(glob) {
 
 /**
  * The rules of one `.gitignore`. `base` is the folder it is in, relative to
- * the project, with a trailing slash ('' at the top).
+ * the project, with a trailing slash ('' at the top). With `ignoreCase`, a
+ * pattern matches whatever the case, as git does where file names have none.
  */
-function parseIgnore(text, base) {
+function parseIgnore(text, base, ignoreCase = IGNORE_CASE) {
   const rules = []
   for (const raw of text.split(/\r?\n/)) {
     let line = raw.replace(/(?<!\\)\s+$/, '')
@@ -307,7 +322,10 @@ function parseIgnore(text, base) {
     let regex
     try {
       const body = globToRegex(line)
-      regex = new RegExp(anchored ? `^${body}$` : `(?:^|/)${body}$`)
+      regex = new RegExp(
+        anchored ? `^${body}$` : `(?:^|/)${body}$`,
+        ignoreCase ? 'i' : ''
+      )
     } catch {
       continue // A pattern git would not understand either.
     }
@@ -1049,7 +1067,13 @@ async function deployFolder(config, args, api) {
     config,
     `deploy ${target}`
   )
-  const id = deployment && deployment.id !== undefined ? deployment.id : '?'
+  const id = deployment && deployment.id
+  if (id === undefined || id === null || id === '') {
+    // Temps answered without saying what it started: no build to follow.
+    throw new Error(
+      `Temps took the upload for ${target} but did not say which deployment it started, so the deploy may not have begun. Check the project in Temps before you try again.`
+    )
+  }
   return [
     `Deployment ${id} of ${target} started: Temps is building it now.`,
     `Uploaded ${packed.length} file${packed.length === 1 ? '' : 's'} (${megabytes(bytes)}, ${megabytes(zip.length)} zipped) from ${root}.`,

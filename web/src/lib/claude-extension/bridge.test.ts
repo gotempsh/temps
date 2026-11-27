@@ -66,6 +66,7 @@ interface Bridge {
     withdraw(token: object): boolean
   }
   MAX_WAITING_DEPLOYS: number
+  MAX_IN_FLIGHT: number
   run(
     config: unknown,
     input: NodeJS.ReadableStream,
@@ -654,6 +655,51 @@ describe('cancelling a folder deployment', () => {
       input.end()
     } finally {
       deployModule.deployFolder = original
+      server.stop(true)
+    }
+  })
+
+  test('calls past the in-flight limit wait unread, and all are answered in turn', async () => {
+    let running = 0
+    let most = 0
+    const release: (() => void)[] = []
+    const server = serve(async (req) => {
+      const body = await req.json()
+      running++
+      most = Math.max(most, running)
+      await new Promise<void>((resolve) => release.push(resolve))
+      running--
+      return Response.json({ jsonrpc: '2.0', id: body.id, result: {} })
+    })
+    try {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      let written = ''
+      output.on('data', (chunk) => (written += String(chunk)))
+      const config = bridge.readConfig({
+        TEMPS_URL: `http://127.0.0.1:${server.port}`,
+        TEMPS_API_KEY: KEY,
+      })
+      bridge.run(config, input, output, () => {})
+      const total = bridge.MAX_IN_FLIGHT * 3
+      input.write(
+        Array.from(
+          { length: total },
+          (_, i) =>
+            `${JSON.stringify({ jsonrpc: '2.0', id: i + 1, method: 'tools/list' })}\n`
+        ).join('')
+      )
+      const answered = () => written.split('\n').filter(Boolean).length
+      const deadline = Date.now() + 10000
+      while (answered() < total && Date.now() < deadline) {
+        while (release.length > 0) release.shift()?.()
+        await Bun.sleep(5)
+        expect(running).toBeLessThanOrEqual(bridge.MAX_IN_FLIGHT)
+      }
+      expect(answered()).toBe(total)
+      expect(most).toBe(bridge.MAX_IN_FLIGHT)
+      input.end()
+    } finally {
       server.stop(true)
     }
   })

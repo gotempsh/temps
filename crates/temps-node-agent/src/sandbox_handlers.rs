@@ -310,6 +310,7 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::AiCliTimeout { .. }
         | AgentError::AgentModelFailed { .. }
         | AgentError::AgentTimedOut { .. }
+        | AgentError::AgentWroteNoReport { .. }
         | AgentError::GitError { .. }
         | AgentError::EncryptionError { .. }
         | AgentError::SecretNotFound { .. }

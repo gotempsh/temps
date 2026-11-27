@@ -18699,7 +18699,7 @@ Configure an AI client to connect to this Temps instance over MCP. Clients: clau
 | `-w, --write` | Enable write tools (deploy, delete, restart, etc). Default: read-only | - | No |
 | `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
 | `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
-| `-y, --yes` | Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; without --write, creates a read-only key) | - | No |
+| `-y, --yes` | Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; creates a key for the app: read-only, or with --write one that can make changes) | - | No |
 | `-d, --deploy-folder <dir>` | Let the agent deploy project folders from this computer, from inside this folder (repeatable). The app then runs the Temps bridge locally (temps mcp bridge) instead of connecting over HTTP. Implies --write | - | No |
 | `--api-key-file <path>` | Read the API key from a file (- reads stdin) instead of --api-key | - | No |
 | `--api-key-stdin` | Read the API key from stdin instead of --api-key | - | No |

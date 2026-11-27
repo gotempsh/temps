@@ -57,6 +57,12 @@ pub enum AgentError {
         reason: String,
     },
 
+    /// ADR-116 D2: a report run ended without the model writing any text,
+    /// for instance on a last turn that only called tools, so there is no
+    /// report to store.
+    #[error("Agent run {run_id} wrote no report: its {turns} turns ended without any text from the model")]
+    AgentWroteNoReport { run_id: i32, turns: u32 },
+
     /// ADR-116 D2: an agent run used its whole time budget before the model
     /// gave its final answer.
     #[error("Agent run {run_id} did not finish within {timeout_secs} seconds ({turns} turns)")]
@@ -595,6 +601,9 @@ impl From<AgentError> for Problem {
                 .with_detail(error.to_string()),
             AgentError::AgentTimedOut { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("Agent Run Timed Out")
+                .with_detail(error.to_string()),
+            AgentError::AgentWroteNoReport { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
+                .with_title("Agent Wrote No Report")
                 .with_detail(error.to_string()),
             AgentError::GitError { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Git Error")

@@ -18,7 +18,7 @@ use temps_entities::{node_public_ingress, nodes, tailnet_serve_entries};
 /// the console only needs the plausible candidates.
 const MAX_INTERFACES: usize = 64;
 /// Most inside checks kept from one report.
-const MAX_PRIVATE_CHECKS: usize = 256;
+pub const MAX_PRIVATE_CHECKS: usize = 256;
 /// Most Serve entry reports and tailnet checks kept from one report (ADR 065).
 const MAX_SERVE_ENTRIES: usize = 256;
 /// Most capabilities one report may name (ADR 065 D6).

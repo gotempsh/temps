@@ -258,7 +258,7 @@ export function registerMcpCommands(program: Command): void {
     .option('-w, --write', 'Enable write tools (deploy, delete, restart, etc). Default: read-only')
     .option('-k, --api-key <key>', 'Use this API key instead of creating or prompting for one')
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
-    .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; without --write, creates a read-only key)')
+    .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; creates a key for the app: read-only, or with --write one that can make changes)')
     .option(
       '-d, --deploy-folder <dir>',
       'Let the agent deploy project folders from this computer, from inside this folder (repeatable). The app then runs the Temps bridge locally (temps mcp bridge) instead of connecting over HTTP. Implies --write',
@@ -378,7 +378,23 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     groups = []
   }
 
-  const deployFolders = (options.deployFolder ?? []).map(resolveFolder)
+  let deployFolders: string[]
+  try {
+    deployFolders = (options.deployFolder ?? []).map(resolveFolder)
+  } catch (error) {
+    warning(error instanceof Error ? error.message : String(error))
+    process.exitCode = 1
+    return
+  }
+  if (deployFolders.length > 0 && groups.length > 0) {
+    // The bridge connects with write access and no group filter; installing
+    // it would silently drop the groups asked for.
+    warning(
+      '--groups cannot be combined with --deploy-folder: the local bridge serves every tool group. Run it again without --groups.',
+    )
+    process.exitCode = 1
+    return
+  }
   for (const folder of deployFolders) {
     if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
       warning(`${folder} is not a folder on this computer. Pass the folder that holds your projects to --deploy-folder.`)
@@ -418,11 +434,14 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   // with it, so a failed or retried install leaves no unused credential.
   let mintedKeyId: number | undefined
   if (!apiKey) {
-    // Read-only must not install this login's credential, which may be able
-    // to write: without --write, -y mints a reader key. With --write, -y
-    // reuses the login, which already has whatever the operator can do.
+    // -y always mints a key for the app, as the prompt's default does: a
+    // reader key without --write, which must not install this login's
+    // credential (it may be able to write), and a user key with it. The
+    // login never lands in an app's settings file, the key can be revoked
+    // for that app alone, and its name (mcp-<app>-...) is how the console
+    // tells that the app connected.
     const wantsNewKey = options.yes
-      ? !write
+      ? true
       : await promptConfirm({
           message: 'Create a new dedicated API key scoped for MCP access? (recommended over reusing an existing key)',
           default: true,
