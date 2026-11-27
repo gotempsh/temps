@@ -381,7 +381,8 @@ function globToRegex(glob, ignoreCase = false) {
 /**
  * The rules of one `.gitignore`. `base` is the folder it is in, relative to
  * the project, with a trailing slash ('' at the top). With `ignoreCase`, a
- * pattern matches whatever the case, as git does where file names have none.
+ * pattern that leaves files out matches whatever the case, as git does where
+ * file names have none; a `!` pattern still matches only its own case.
  */
 function parseIgnore(text, base, ignoreCase = IGNORE_CASE) {
   const rules = []
@@ -405,10 +406,14 @@ function parseIgnore(text, base, ignoreCase = IGNORE_CASE) {
     const anchored = line.includes('/')
     if (line.startsWith('/')) line = line.slice(1)
     if (!line) continue
+    // A rule that brings a file back matches its case exactly: whether the
+    // volume folds case is not known (macOS can be either), and folding
+    // only ever leaves out more, never uploads what git ignores.
+    const folds = ignoreCase && !negate
     let regex
     try {
       // Compiled over the pattern's bytes, matched against the path's.
-      const body = globToRegex(gitBytes(line), ignoreCase)
+      const body = globToRegex(gitBytes(line), folds)
       // `s`: a name can hold a newline, which `**` covers as git's does.
       regex = new RegExp(anchored ? `^${body}$` : `(?:^|/)${body}$`, 's')
     } catch {
@@ -416,8 +421,8 @@ function parseIgnore(text, base, ignoreCase = IGNORE_CASE) {
     }
     rules.push({
       base,
-      baseBytes: ignoreCase ? foldAscii(gitBytes(base)) : gitBytes(base),
-      ignoreCase,
+      baseBytes: folds ? foldAscii(gitBytes(base)) : gitBytes(base),
+      ignoreCase: folds,
       negate,
       directoryOnly,
       regex,

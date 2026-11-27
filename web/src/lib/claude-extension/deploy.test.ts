@@ -281,6 +281,16 @@ describe('.gitignore', () => {
     }
   })
 
+  test('a ! rule brings back only its own case, even where case is folded', () => {
+    // On a case-sensitive macOS volume git keeps public.json out: only
+    // PUBLIC.json is brought back. Folding the ! rule would upload it.
+    const rules = deploy.parseIgnore('*.json\n!PUBLIC.json', '', true)
+    expect(deploy.isIgnored(rules, 'PUBLIC.json', false)).toBe(false)
+    expect(deploy.isIgnored(rules, 'public.json', false)).toBe(true)
+    // Leaving a file out still folds case: .ENV is .env on such a volume.
+    expect(deploy.isIgnored(rules, 'SECRET.JSON', false)).toBe(true)
+  })
+
   test('a negated bracket stays a short class, however many there are', () => {
     const pattern = '[!a]'.repeat(128)
     const [rule] = deploy.parseIgnore(pattern, '', true)
