@@ -71,10 +71,13 @@ pub fn is_deleting(connector: &ingress_connectors::Model) -> bool {
 
 /// The connectors sync and reconcile act on: every tunnel not being
 /// removed. Credential rows (ADR 065's `tailscale`) are never tunnels.
-pub fn live_connectors(models: Vec<ingress_connectors::Model>) -> Vec<ingress_connectors::Model> {
+pub fn live_connectors(
+    registry: &ProviderRegistry,
+    models: Vec<ingress_connectors::Model>,
+) -> Vec<ingress_connectors::Model> {
     models
         .into_iter()
-        .filter(|m| !is_deleting(m) && !crate::registry::is_credential_kind(&m.provider))
+        .filter(|m| !is_deleting(m) && !registry.is_credential(&m.provider))
         .collect()
 }
 /// `values` with the `secrets` answers added, after checking each names a
@@ -609,6 +612,15 @@ impl IngressConnectorService {
         reject_plain_secret_answers(&info, &request.values)
     }
 
+    /// Whether `kind` serves only a private network (ADR-117 D2). An
+    /// unknown kind does not.
+    pub fn serves_privately(&self, kind: &str) -> bool {
+        matches!(
+            self.registry.reach(kind),
+            Some(crate::provider::Reach::Private { .. })
+        )
+    }
+
     /// The credential providers this control plane offers (ADR 065 D2).
     pub fn credential_providers(&self) -> Vec<ProviderInfo> {
         self.registry.credential_infos()
@@ -713,7 +725,7 @@ impl IngressConnectorService {
         Ok(ingress_connectors::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .filter(|m| crate::registry::is_credential_kind(&m.provider)))
+            .filter(|m| self.registry.is_credential(&m.provider)))
     }
 
     /// Remove the credential row `id`; one that is not a credential, or is
@@ -731,17 +743,15 @@ impl IngressConnectorService {
         &self,
         connector: &ingress_connectors::Model,
     ) -> Result<Box<dyn TunnelProvider>, IngressError> {
-        let factory = self.registry.get(&connector.provider)?;
         let secrets = self.setup_secrets(connector)?;
-        factory.build(&self.deps(), connector, &secrets).await
+        self.registry
+            .build(&connector.provider, &self.deps(), connector, &secrets)
+            .await
     }
 
     /// A provider good enough to build node specs, which need no credential.
     fn spec_provider(&self, kind: &str) -> Option<Box<dyn TunnelProvider>> {
-        self.registry
-            .get(kind)
-            .ok()
-            .map(|factory| factory.spec_provider(&self.http))
+        self.registry.spec_provider(kind, &self.http)
     }
 
     /// The connector's `secret` setup answers, decrypted.
@@ -916,6 +926,7 @@ impl IngressConnectorService {
     /// is what keeps their token-holder and status updates from overwriting
     /// each other.
     async fn find_for_update(
+        &self,
         txn: &DatabaseTransaction,
         id: i32,
     ) -> Result<ingress_connectors::Model, IngressError> {
@@ -923,7 +934,7 @@ impl IngressConnectorService {
             .lock_exclusive()
             .one(txn)
             .await?
-            .filter(|m| !crate::registry::is_credential_kind(&m.provider))
+            .filter(|m| !self.registry.is_credential(&m.provider))
             .ok_or(IngressError::NotFound(id))
     }
 
@@ -931,7 +942,7 @@ impl IngressConnectorService {
         ingress_connectors::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .filter(|m| !crate::registry::is_credential_kind(&m.provider))
+            .filter(|m| !self.registry.is_credential(&m.provider))
             .ok_or(IngressError::NotFound(id))
     }
 
@@ -946,7 +957,9 @@ impl IngressConnectorService {
     ) -> Result<ConnectorList, IngressError> {
         let (page, page_size) = page_bounds(page, page_size);
         let paginator = ingress_connectors::Entity::find()
-            .filter(ingress_connectors::Column::Provider.ne(crate::tailscale::KIND))
+            .filter(
+                ingress_connectors::Column::Provider.is_not_in(self.registry.credential_kinds()),
+            )
             .order_by_desc(ingress_connectors::Column::CreatedAt)
             .order_by_desc(ingress_connectors::Column::Id)
             .paginate(self.db.as_ref(), page_size);
@@ -1498,7 +1511,7 @@ impl IngressConnectorService {
         // with, so neither can put back a status read before this.
         let _guard = self.settings_lock.lock().await;
         let txn = self.db.begin().await?;
-        let connector = Self::find_for_update(&txn, id).await?;
+        let connector = self.find_for_update(&txn, id).await?;
         if connector.name != name {
             return Err(IngressError::Validation(format!(
                 "Connector {id} is `{}` now, not `{name}`; nothing was removed.",
@@ -1702,7 +1715,7 @@ impl IngressConnectorService {
         // union, or trip the unique constraint). The tunnel's row lock is held
         // for this read-diff-write only, never across a provider call.
         let txn = self.db.begin().await?;
-        Self::find_for_update(&txn, connector_id).await?;
+        self.find_for_update(&txn, connector_id).await?;
         let existing = ingress_connector_nodes::Entity::find()
             .filter(ingress_connector_nodes::Column::ConnectorId.eq(connector_id))
             .all(&txn)
@@ -1766,7 +1779,7 @@ impl IngressConnectorService {
     ) -> Result<(), IngressError> {
         let _guard = self.settings_lock.lock().await;
         let txn = self.db.begin().await?;
-        let connector = Self::find_for_update(&txn, connector_id).await?;
+        let connector = self.find_for_update(&txn, connector_id).await?;
         let stored = token_holders(&connector.settings);
         let holders = change(stored.clone());
         if secret.is_none() && stored.as_ref() == Some(&holders) {
@@ -1806,6 +1819,7 @@ impl IngressConnectorService {
     /// stop counting as holders only once both have happened.
     async fn revoke_departed(&self) -> Result<(), IngressError> {
         let connectors = live_connectors(
+            &self.registry,
             ingress_connectors::Entity::find()
                 .order_by_asc(ingress_connectors::Column::Id)
                 .all(self.db.as_ref())
@@ -1958,6 +1972,7 @@ impl IngressConnectorService {
     /// operator's choices and what workers serve.
     async fn plan(&self) -> Result<Plan, IngressError> {
         let models = live_connectors(
+            &self.registry,
             ingress_connectors::Entity::find()
                 .order_by_asc(ingress_connectors::Column::Id)
                 .all(self.db.as_ref())
@@ -1977,6 +1992,7 @@ impl IngressConnectorService {
         let connectors: Vec<PlannedConnector> = models
             .into_iter()
             .map(|model| PlannedConnector {
+                writes_dns: self.registry.writes_dns(&model),
                 placement: placements.remove(&model.id).unwrap_or_default(),
                 zone: zones.remove(&model.id).flatten(),
                 model,
@@ -2308,6 +2324,7 @@ impl IngressConnectorService {
             .map(|row| row.connector_id)
             .collect();
         let connectors = live_connectors(
+            &self.registry,
             ingress_connectors::Entity::find()
                 .filter(ingress_connectors::Column::Id.is_in(assigned))
                 .all(self.db.as_ref())
@@ -2625,6 +2642,8 @@ fn assign_generated<'a>(
 
 struct PlannedConnector {
     model: ingress_connectors::Model,
+    /// Temps writes the DNS of what it publishes (ADR-117 D2).
+    writes_dns: bool,
     /// `None` when its domain is no longer managed; it then covers nothing.
     zone: Option<String>,
     placement: Placement,
@@ -3088,7 +3107,7 @@ mod tests {
     #[test]
     fn a_new_tunnels_host_suffix_is_checked() {
         use crate::registry::ProviderFactory;
-        let info = crate::cloudflare::CloudflareTunnelFactory.info();
+        let info = crate::providers::cloudflare::CloudflareTunnelFactory.info();
         let zone = setup_with_domain(Some("example.com"));
         assert_eq!(host_suffix_for(&info, &zone, None).unwrap(), None);
         assert_eq!(host_suffix_for(&info, &zone, Some("  ")).unwrap(), None);
@@ -3174,6 +3193,7 @@ mod tests {
         let mut plan = Plan {
             connectors: vec![
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(1, "example.com", false),
                     zone: Some("example.com".into()),
                     placement: Placement {
@@ -3182,6 +3202,7 @@ mod tests {
                     },
                 },
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(2, "apps.example.com", true),
                     zone: Some("example.com".into()),
                     placement: Placement {
@@ -3218,6 +3239,7 @@ mod tests {
         let mut plan = Plan {
             connectors: vec![
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(1, "example.com", false),
                     zone: Some("example.com".into()),
                     placement: Placement {
@@ -3226,6 +3248,7 @@ mod tests {
                     },
                 },
                 PlannedConnector {
+                    writes_dns: true,
                     model: connector_model(2, "other.example.org", true),
                     zone: Some("example.org".into()),
                     placement: Placement {
@@ -3332,6 +3355,7 @@ mod tests {
     fn placement_plan(placement: Placement) -> Plan {
         Plan {
             connectors: vec![PlannedConnector {
+                writes_dns: true,
                 model: connector_model(1, "example.com", true),
                 zone: Some("example.com".into()),
                 placement,
@@ -3346,8 +3370,21 @@ mod tests {
         }
     }
 
+    /// Only a connector whose provider has Temps write its DNS is retried
+    /// for DNS: Cloudflare's, not a credential's or an unknown kind's.
     #[test]
-    fn retry_dns_requires_a_failed_publication_on_the_planned_cloudflare_tunnel() {
+    fn the_registry_says_which_connectors_temps_writes_dns_for() {
+        let registry = ProviderRegistry::builtin();
+        let mut model = connector_model(1, "example.com", true);
+        assert!(registry.writes_dns(&model));
+        model.provider = crate::providers::tailscale::KIND.into();
+        assert!(!registry.writes_dns(&model));
+        model.provider = "another_provider".into();
+        assert!(!registry.writes_dns(&model));
+    }
+
+    #[test]
+    fn retry_dns_requires_a_failed_publication_on_a_planned_tunnel_whose_dns_temps_writes() {
         let mut plan = placement_plan(Placement {
             workers: true,
             control_plane: false,
@@ -3382,7 +3419,9 @@ mod tests {
         plan.choices.insert(host.into(), None);
         assert_eq!(retry(&plan, &row), None);
         plan.choices.clear();
-        plan.connectors[0].model.provider = "another_provider".into();
+        // A connector whose DNS Temps does not write (the registry says
+        // which, by its provider's capabilities).
+        plan.connectors[0].writes_dns = false;
         assert_eq!(retry(&plan, &row), None);
     }
 
@@ -3508,7 +3547,7 @@ mod tests {
         #[async_trait::async_trait]
         impl TunnelProvider for FakeTunnels {
             fn kind(&self) -> &'static str {
-                crate::cloudflare::KIND
+                crate::providers::cloudflare::KIND
             }
             async fn ensure(&self, ctx: &TunnelContext<'_>) -> Result<TunnelHandle, IngressError> {
                 // A real provider recreates a tunnel deleted at the provider.
@@ -3530,7 +3569,7 @@ mod tests {
             fn connector_spec(&self, id: i32, _h: &TunnelHandle, port: u16) -> NodeConnectorSpec {
                 NodeConnectorSpec {
                     id,
-                    provider: crate::cloudflare::KIND.into(),
+                    provider: crate::providers::cloudflare::KIND.into(),
                     revision: String::new(),
                     edge_port: port,
                     client_address_header: None,
@@ -3577,7 +3616,7 @@ mod tests {
         impl crate::registry::ProviderFactory for FakeFactory {
             fn info(&self) -> ProviderInfo {
                 ProviderInfo {
-                    kind: crate::cloudflare::KIND.into(),
+                    kind: crate::providers::cloudflare::KIND.into(),
                     name: "Fake".into(),
                     summary: String::new(),
                     requirements: Vec::new(),
@@ -3588,6 +3627,12 @@ mod tests {
                     docs_url: None,
                 }
             }
+            fn capabilities(
+                &self,
+                _connector: Option<&ingress_connectors::Model>,
+            ) -> crate::provider::Capabilities {
+                crate::providers::cloudflare::capabilities()
+            }
             async fn validate(
                 &self,
                 _deps: &ProviderDeps<'_>,
@@ -3595,6 +3640,13 @@ mod tests {
             ) -> Result<(), IngressError> {
                 Ok(())
             }
+            fn tunnels(&self) -> Option<&dyn crate::registry::TunnelFactory> {
+                Some(self)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::registry::TunnelFactory for FakeFactory {
             async fn build(
                 &self,
                 _deps: &ProviderDeps<'_>,
@@ -3665,7 +3717,7 @@ mod tests {
             let now = Utc::now();
             let connector = ingress_connectors::ActiveModel {
                 name: Set("homelab".into()),
-                provider: Set(crate::cloudflare::KIND.into()),
+                provider: Set(crate::providers::cloudflare::KIND.into()),
                 dns_provider_id: Set(None),
                 domain: Set("example.com".into()),
                 external_id: Set(Some("tunnel-1".into())),

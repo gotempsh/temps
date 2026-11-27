@@ -321,6 +321,11 @@ pub struct RouteStore {
     public_enabled: AtomicBool,
     public_routes: ArcSwap<HashMap<String, RouteEntry>>,
     private_routes: ArcSwap<HashMap<String, PrivateRouteEntry>>,
+    /// Who the private listener admits now, from this worker's own consent
+    /// (ADR-115 D8). Checked on every private request beside the address's
+    /// stored range, so narrowing consent (or an overlap error, which admits
+    /// nobody) applies to routes already in the snapshot at once.
+    private_admit: ArcSwap<Vec<temps_core::private_network::IpNet>>,
     /// Serve entries with a route, by address id (ADR 065 D3).
     serve_routes: ArcSwap<HashMap<String, ServeEntry>>,
     public_certificates: RwLock<Option<(String, HashMap<String, PublicIngressCertBundle>)>>,
@@ -343,6 +348,7 @@ impl RouteStore {
             public_enabled: AtomicBool::new(false),
             public_routes: ArcSwap::from_pointee(HashMap::new()),
             private_routes: ArcSwap::from_pointee(HashMap::new()),
+            private_admit: ArcSwap::from_pointee(Vec::new()),
             serve_routes: ArcSwap::from_pointee(HashMap::new()),
             public_certificates: RwLock::new(None),
             public_tls_private_key: RwLock::new(None),
@@ -479,6 +485,26 @@ impl RouteStore {
     }
 
     /// The private addresses currently served, for the inside checks.
+    /// Replace who the private listener admits; empty admits nobody.
+    pub fn set_private_admit(&self, admit: Vec<temps_core::private_network::IpNet>) {
+        if **self.private_admit.load() != admit {
+            self.private_admit.store(Arc::new(admit));
+        }
+    }
+
+    /// Whether the private listener's current consent admits `ip` (an
+    /// IPv4-mapped IPv6 peer counts as its IPv4 address).
+    pub fn private_admits(&self, ip: std::net::IpAddr) -> bool {
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+            v4 => v4,
+        };
+        self.private_admit
+            .load()
+            .iter()
+            .any(|net| net.contains(&ip))
+    }
+
     pub fn private_routes(&self) -> Vec<PrivateRouteEntry> {
         if !self.public_enabled.load(Ordering::Acquire) || !self.public_ingress_authorized() {
             return Vec::new();

@@ -492,6 +492,7 @@ mod tests {
             service_id: 7,
             database_provisioning_mode: "shared".into(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

@@ -505,6 +505,7 @@ impl AgentCommand {
                     ingress: config.local_ingress(),
                     pinned: self.public_ingress_address.is_some(),
                     config_path: agent_data_dir().join("agent.json"),
+                    docker: Some(docker.clone()),
                 },
                 route_store.clone(),
                 route_sync_shutdown.clone(),

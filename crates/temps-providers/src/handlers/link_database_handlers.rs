@@ -245,6 +245,7 @@ mod tests {
             service_id: 7,
             database_provisioning_mode: mode.to_string(),
             custom_database_name: custom.map(str::to_string),
+            env_aliases: serde_json::json!({}),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

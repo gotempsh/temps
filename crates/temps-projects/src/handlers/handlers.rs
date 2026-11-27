@@ -34,7 +34,7 @@ use super::types::{
     UpdateDeploymentConfigRequest, UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
     UpdateServiceTemplateRuntimeRequest, UpgradeServiceTemplateRequest,
 };
-use crate::services::project::GroupFilter;
+use crate::services::project::{GroupFilter, ProjectOrder};
 use crate::template_creation::{
     canonicalize_template_upgrade_environment_variables, missing_required_template_configuration,
     require_template_creation_permissions, resolve_image_template_runtime,
@@ -563,6 +563,7 @@ async fn canonical_template_app_url(
             super::types::CloudflareProjectCapability,
             temps_core::docker_socket_grant::DockerSocketCapability,
             PaginatedProjectList,
+            ProjectOrder,
             PaginationParams,
             UpdateProjectSettingsRequest,
             UpdateGitSettingsRequest,
@@ -1160,6 +1161,7 @@ pub async fn create_project(
         automatic_deploy: project.hosting == temps_entities::types::Hosting::Hosted
             && project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids,
+        storage_service_env_aliases: project.storage_service_env_aliases,
         storage_service_claim_ids,
         storage_service_claim_user_id: Some(auth.user_id()),
         is_public_repo: project.is_public_repo,
@@ -1325,7 +1327,8 @@ fn build_group_filter(
         ("per_page" = Option<i64>, Query, description = "Number of items per page (1-100)"),
         ("search" = Option<String>, Query, description = "Case-insensitive project name or slug filter"),
         ("ungrouped" = Option<bool>, Query, description = "When true, return only services that are not a member of any project group. Mutually exclusive with project_group_id."),
-        ("project_group_id" = Option<i32>, Query, description = "Return only services that are members of this project group. Mutually exclusive with ungrouped.")
+        ("project_group_id" = Option<i32>, Query, description = "Return only services that are members of this project group. Mutually exclusive with ungrouped."),
+        ("sort" = Option<ProjectOrder>, Query, description = "last_deployed (the default): most recently deployed first, never-deployed last. created: newest first, deployed or not.")
     ),
     responses(
         (status = 200, description = "List of projects", body = PaginatedProjectList),
@@ -1361,7 +1364,14 @@ pub async fn get_projects(
 
     let (projects, total) = state
         .project_service
-        .get_projects_paginated_filtered(page, per_page, &hidden, search, group_filter)
+        .get_projects_paginated_filtered(
+            page,
+            per_page,
+            &hidden,
+            search,
+            group_filter,
+            params.sort.unwrap_or_default(),
+        )
         .await
         .map_err(Problem::from)?;
 
@@ -1486,6 +1496,7 @@ pub async fn get_project_by_slug(
     request_body = CreateProjectRequest,
     responses(
         (status = 200, description = "Project updated successfully", body = ProjectResponse),
+        (status = 400, description = "Invalid update, such as storage variable aliases, which are set on the service link"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Project not found"),
@@ -1521,6 +1532,8 @@ pub async fn update_project(
         environment_variables: project.environment_variables.clone(),
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids.clone(),
+        // Refused by the service when set: an update keeps the links.
+        storage_service_env_aliases: project.storage_service_env_aliases.clone(),
         storage_service_claim_ids: Vec::new(),
         storage_service_claim_user_id: None,
         is_public_repo: None,               // Keep existing setting
@@ -3966,6 +3979,27 @@ mod tests {
     use axum::http::StatusCode;
     use chrono::Utc;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// An update cannot set a link's aliases: the service refuses them, and
+    /// the client reads a 400 naming where they are set.
+    #[test]
+    fn a_refused_storage_alias_is_a_bad_request_naming_the_link() {
+        let problem: temps_core::problemdetails::Problem =
+            crate::services::types::ProjectError::StorageAliasesOnUpdate {
+                project_id: 4,
+                service_ids: vec![12],
+            }
+            .into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("[12]"), "{detail}");
+        assert!(detail.contains("temps services link"), "{detail}");
+    }
     use temps_auth::{AuthContext, Permission};
     use temps_entities::users;
     use temps_providers::ExternalServiceProjectScope;

@@ -41,6 +41,7 @@ pub(super) async fn create_starter_project(
             environment_variables: None,
             automatic_deploy: false,
             storage_service_ids: Vec::new(),
+            storage_service_env_aliases: Default::default(),
             storage_service_claim_ids: Vec::new(),
             storage_service_claim_user_id: None,
             is_public_repo: Some(false),

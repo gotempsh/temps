@@ -29,11 +29,7 @@ impl LoadBalancer {
             });
         match path_target_context {
             Some(context) => Some(context),
-            None => {
-                self.project_context_resolver
-                    .resolve_context(&ctx.host)
-                    .await
-            }
+            None => self.project_contexts(ctx).resolve_context(&ctx.host).await,
         }
     }
 

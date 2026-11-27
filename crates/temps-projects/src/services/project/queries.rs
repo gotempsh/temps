@@ -201,8 +201,15 @@ impl ProjectService {
         hidden: &[i32],
         search: Option<&str>,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
-        self.get_projects_paginated_filtered(page, per_page, hidden, search, None)
-            .await
+        self.get_projects_paginated_filtered(
+            page,
+            per_page,
+            hidden,
+            search,
+            None,
+            super::ProjectOrder::default(),
+        )
+        .await
     }
 
     /// Paginated project list with an optional group-membership filter.
@@ -219,6 +226,7 @@ impl ProjectService {
         hidden: &[i32],
         search: Option<&str>,
         group_filter: Option<GroupFilter>,
+        order: super::ProjectOrder,
     ) -> Result<(Vec<Project>, i64), ProjectError> {
         use sea_orm::sea_query::extension::postgres::PgExpr;
         use sea_orm::sea_query::LikeExpr;
@@ -320,13 +328,20 @@ impl ProjectService {
         // as the most-recently-deployed project).
         // The count query above stays join-free: it counts projects, and the
         // provider join exists only to carry an extra column.
-        let projects = Self::with_git_provider_type(filtered())
-            .order_by_with_nulls(
-                projects::Column::LastDeployment,
-                sea_orm::Order::Desc,
-                sea_orm::sea_query::NullOrdering::Last,
-            )
-            .order_by_desc(projects::Column::CreatedAt)
+        let page_query = Self::with_git_provider_type(filtered());
+        let page_query = match order {
+            super::ProjectOrder::LastDeployed => page_query
+                .order_by_with_nulls(
+                    projects::Column::LastDeployment,
+                    sea_orm::Order::Desc,
+                    sea_orm::sea_query::NullOrdering::Last,
+                )
+                .order_by_desc(projects::Column::CreatedAt),
+            super::ProjectOrder::Created => page_query.order_by_desc(projects::Column::CreatedAt),
+        };
+        // The id breaks ties, so pages never repeat or skip a project.
+        let projects = page_query
+            .order_by_desc(projects::Column::Id)
             .offset(offset)
             .limit(per_page as u64)
             .into_model::<ProjectWithGitProviderType>()

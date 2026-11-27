@@ -133,7 +133,7 @@ export function alarmQuickAction(
     return groupId && projectSlug
       ? {
           kind: 'autofix',
-          href: `/projects/${projectSlug}/errors/${groupId}/autofix`,
+          href: `/projects/${projectSlug}/errors/${groupId}`,
         }
       : null
   }

@@ -65,7 +65,10 @@ pub fn create_environment_app_state(
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateEnvironmentVariableRequest {
     pub key: String,
-    pub value: String,
+    /// The value; an empty string is stored as one. Required unless
+    /// `generate` asks the server to make the value instead.
+    #[serde(default)]
+    pub value: Option<String>,
     pub environment_ids: Vec<i32>,
     /// Include this environment variable in preview environments (default: false)
     #[serde(default = "default_include_in_preview")]
@@ -77,6 +80,11 @@ pub struct CreateEnvironmentVariableRequest {
     /// one-way — secret vars cannot be demoted to regular vars.
     #[serde(default)]
     pub is_secret: bool,
+    /// Generate the value on the server instead of sending one. The value is
+    /// stored write-only and is never returned, so it is never in the
+    /// browser's form state or a request log.
+    #[serde(default)]
+    pub generate: Option<crate::services::generated_value::GenerateValueRequest>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

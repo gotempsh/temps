@@ -23,6 +23,11 @@
 //! answer is read. Anything else
 //! is [`TailscaleApiError::NotUnderstood`]: the run stops rather than guess.
 
+pub mod live;
+pub mod plan;
+pub mod run;
+pub(crate) mod service;
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
@@ -30,11 +35,14 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use temps_core::tailnet::{messages, valid_service_label};
+use temps_core::tailnet::messages;
 use thiserror::Error;
 use utoipa::ToSchema;
 
 use crate::error::IngressError;
+use crate::provider::{Capabilities, Origin, Reach};
+pub use crate::reachability::model::{ServiceDefinition, ServiceHost};
+pub use crate::reachability::run::TailscaleCredential;
 use crate::registry::{
     DnsHandling, FieldKind, ProviderDeps, ProviderInfo, ProviderSetup, SetupField,
 };
@@ -67,25 +75,6 @@ const TOKEN_MARGIN: Duration = Duration::from_secs(60);
 /// Largest answer read: a Service, a token or an error is a few hundred
 /// bytes; a device list of a large tailnet stays well under this.
 const MAX_BODY: usize = 8 * 1024 * 1024;
-
-/// A Tailscale OAuth client, decrypted for the length of a call.
-#[derive(Clone, PartialEq, Eq)]
-pub struct TailscaleCredential {
-    pub client_id: String,
-    pub client_secret: String,
-    /// The tailnet's API name, or `-` for the client's own.
-    pub tailnet: String,
-}
-
-impl std::fmt::Debug for TailscaleCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TailscaleCredential")
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"***")
-            .field("tailnet", &self.tailnet)
-            .finish()
-    }
-}
 
 impl TailscaleCredential {
     /// The credential from a setup form's answers.
@@ -183,22 +172,6 @@ impl TailscaleApiError {
     }
 }
 
-/// A Tailscale Service as the API returns it, with the fields D4 compares.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
-pub struct ServiceDefinition {
-    /// `svc:myapp`.
-    pub name: String,
-    /// The TailVIPs Tailscale assigned.
-    #[serde(default)]
-    pub addrs: Vec<String>,
-    #[serde(default)]
-    pub comment: String,
-    #[serde(default)]
-    pub ports: Vec<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
 impl ServiceDefinition {
     /// The definition of every Service Temps makes (D4): one port, the
     /// worker tag, the marker. Tailscale assigns the addresses.
@@ -290,11 +263,6 @@ pub fn service_name(name: &str) -> String {
     }
 }
 
-/// `svc:myapp` → `myapp`, the DNS label of `myapp.<tailnet>.ts.net`.
-pub fn service_label(name: &str) -> &str {
-    name.strip_prefix("svc:").unwrap_or(name)
-}
-
 /// The marker a Service Temps makes carries (D4): ownership is the
 /// install, the run id says who created it and is never rewritten.
 pub fn marker(install: &str, creator_run_id: i32) -> String {
@@ -325,19 +293,6 @@ pub fn ownership(service: &ServiceDefinition, install: &str) -> Ownership {
         Some((owner, creator_run_id)) if owner == install => Ownership::Ours { creator_run_id },
         _ => Ownership::Foreign,
     }
-}
-
-/// One device advertising a Service, as the API lists it: a device, no
-/// address (D4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ServiceHost {
-    /// The stable node id (`nXXXXCNTRL`), matching tailscaled's `Self.ID`.
-    pub node_id: Option<String>,
-    /// The machine's MagicDNS name or host name.
-    pub name: Option<String>,
-    /// Whether the tailnet admin approved it; `None` when the answer does not
-    /// say.
-    pub approved: Option<bool>,
 }
 
 impl ServiceHost {
@@ -1073,11 +1028,6 @@ pub fn auto_approvers_snippet(service: &str, tag: &str) -> String {
     )
 }
 
-/// Whether `name` can be a Service name.
-pub fn valid_name(name: &str) -> bool {
-    valid_service_label(name)
-}
-
 /// The `tailscale` provider in the ADR 058 D8 registry: a credential, not a
 /// tunnel. Its row holds the OAuth client sealed in `setup_secrets`.
 pub struct TailscaleFactory;
@@ -1143,10 +1093,34 @@ impl TailscaleFactory {
     }
 }
 
+/// What every Tailscale way in is (ADR-117 D2), a machine name or a
+/// Service: only the tailnet reaches it, through the per-address Serve socket
+/// (ADR 065 D3) where tailscaled's identity headers are trusted, under the
+/// tailnet's own `*.ts.net` names.
+pub fn capabilities() -> Capabilities {
+    Capabilities {
+        reach: Reach::Private {
+            network: "tailscale",
+        },
+        origin: Origin::ServeSocket {
+            identity_headers: &temps_core::tailnet::SERVE_IDENTITY_HEADERS,
+        },
+        dns: DnsHandling::ProviderHostname,
+    }
+}
+
+/// A credential, not a tunnel: no [`crate::registry::TunnelFactory`].
 #[async_trait]
-impl crate::registry::CredentialFactory for TailscaleFactory {
+impl crate::registry::ProviderFactory for TailscaleFactory {
     fn info(&self) -> ProviderInfo {
         Self::info()
+    }
+
+    fn capabilities(
+        &self,
+        _connector: Option<&temps_entities::ingress_connectors::Model>,
+    ) -> Capabilities {
+        capabilities()
     }
 
     async fn validate(
@@ -1162,12 +1136,24 @@ impl crate::registry::CredentialFactory for TailscaleFactory {
             Some(reason) => Err(IngressError::Validation(reason)),
         }
     }
+
+    fn run<'a>(
+        &self,
+        live: &'a crate::reachability::service::LiveOps,
+    ) -> Option<Box<dyn crate::reachability::run::ProviderRun + 'a>> {
+        Some(Box::new(run::TailscaleRun::new(live)))
+    }
+
+    fn plans(&self) -> Option<&dyn crate::reachability::plan::ProviderPlan> {
+        Some(self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use temps_core::tailnet::valid_service_label;
 
     // Answers in the shape Tailscale's v2 API documents: errors are
     // `{"message": …}`, a Service is `{name, addrs, comment, annotations,
@@ -1406,8 +1392,8 @@ mod tests {
 
     #[test]
     fn the_probe_name_is_one_no_tailnet_accepts() {
-        assert!(!valid_name(PROBE_SERVICE));
-        assert!(valid_name("myapp-staging"));
+        assert!(!valid_service_label(PROBE_SERVICE));
+        assert!(valid_service_label("myapp-staging"));
     }
 
     #[test]

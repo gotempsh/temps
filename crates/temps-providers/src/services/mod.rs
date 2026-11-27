@@ -38,6 +38,9 @@ pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
 use engine_selection::{EngineKind, EngineSelection};
 pub use healthcheck_defaults::*;
+pub use manager::link_env_aliases::{
+    apply_env_aliases, stored_env_aliases, validate_env_aliases, MAX_LINK_ENV_ALIASES,
+};
 pub(crate) use manager::record_wal_outcome;
 pub use manager::{
     service_overrides, HealthcheckApplied, HealthcheckCapability, ServiceHealthcheck,

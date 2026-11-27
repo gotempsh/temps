@@ -1092,15 +1092,22 @@ pub async fn create_environment_variable(
     )
     .await?;
 
+    let (value, is_secret) = crate::services::generated_value::resolve_create_value(
+        &request.key,
+        request.value,
+        request.is_secret,
+        request.generate,
+    )
+    .map_err(Problem::from)?;
     let var = state
         .env_var_service
         .create_environment_variable(
             project_id,
             request.environment_ids,
             request.key,
-            request.value,
+            value,
             request.include_in_preview,
-            request.is_secret,
+            is_secret,
         )
         .await
         .map_err(Problem::from)?;
@@ -2966,6 +2973,8 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             SecretSuggestionResponse,
             crate::services::secret_suggestion::SecretSuggestionReason,
             CreateEnvironmentVariableRequest,
+            crate::services::generated_value::GenerateValueRequest,
+            crate::services::generated_value::GeneratedValueKind,
             UpdateEnvironmentVariableRequest,
             EnvironmentVariableValueResponse,
             GetEnvironmentVariablesQuery,

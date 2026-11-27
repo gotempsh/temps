@@ -245,6 +245,7 @@ interface LinkOptions {
   project?: string
   databaseMode?: string
   databaseName?: string
+  envAlias?: string[]
 }
 
 interface UnlinkOptions {
@@ -411,6 +412,11 @@ export function registerServicesCommands(program: Command): void {
       'Which database deployments get: project (one per project), project_environment (one per environment) or custom',
     )
     .option('--database-name <name>', 'With --database-mode custom: the exact database name')
+    .option(
+      '--env-alias <APP_NAME=INJECTED_NAME>',
+      'Also inject a variable under the name the app reads, e.g. DATABASE_URL=POSTGRES_URL (repeatable)',
+      (value: string, previous: string[] = []) => [...previous, value],
+    )
     .action(linkServiceAction)
 
   services
@@ -1366,8 +1372,32 @@ export function linkDatabaseFields(options: Pick<LinkOptions, 'databaseMode' | '
   }
 }
 
+/**
+ * `--env-alias APP_NAME=INJECTED_NAME` flags as the link's `env_aliases`:
+ * the name the app reads, mapped to the variable the service injects. The
+ * server checks the names; this refuses a malformed or repeated flag.
+ */
+export function linkEnvAliases(values: string[] | undefined): Record<string, string> | undefined {
+  if (!values?.length) return undefined
+  const aliases: Record<string, string> = {}
+  for (const value of values) {
+    const at = value.indexOf('=')
+    const app = value.slice(0, at).trim()
+    const injected = value.slice(at + 1).trim()
+    if (at <= 0 || !app || !injected) {
+      throw new ValidationError(`--env-alias takes APP_NAME=INJECTED_NAME, such as DATABASE_URL=POSTGRES_URL, not "${value}"`)
+    }
+    if (app in aliases) {
+      throw new ValidationError(`--env-alias names ${app} twice`)
+    }
+    aliases[app] = injected
+  }
+  return aliases
+}
+
 async function linkServiceAction(options: LinkOptions): Promise<void> {
   const database = linkDatabaseFields(options)
+  const envAliases = linkEnvAliases(options.envAlias)
   await requireAuth()
   await setupClient()
 
@@ -1386,6 +1416,7 @@ async function linkServiceAction(options: LinkOptions): Promise<void> {
       body: {
         project_id: project.id,
         ...database,
+        ...(envAliases && { env_aliases: envAliases }),
       },
     })
     if (error) {

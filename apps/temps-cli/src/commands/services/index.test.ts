@@ -17,8 +17,27 @@ import {
   isValidSeverity,
   applyS3Flags,
   serviceEnvironmentEntries,
+  linkEnvAliases,
   registerServicesCommands,
 } from './index.js'
+
+describe('services link --env-alias', () => {
+  test('each flag maps the name the app reads to the injected one', () => {
+    expect(linkEnvAliases(undefined)).toBeUndefined()
+    expect(linkEnvAliases([])).toBeUndefined()
+    expect(linkEnvAliases(['DATABASE_URL=POSTGRES_URL', ' REDIS = REDIS_URL '])).toEqual({
+      DATABASE_URL: 'POSTGRES_URL',
+      REDIS: 'REDIS_URL',
+    })
+  })
+
+  test('a malformed or repeated alias is refused before any request', () => {
+    for (const bad of ['DATABASE_URL', '=POSTGRES_URL', 'DATABASE_URL=', '']) {
+      expect(() => linkEnvAliases([bad])).toThrow('APP_NAME=INJECTED_NAME')
+    }
+    expect(() => linkEnvAliases(['A=B', 'A=C'])).toThrow('names A twice')
+  })
+})
 
 describe('serviceEnvironmentEntries', () => {
   test('reads the name-to-value map the service environment endpoint returns', () => {

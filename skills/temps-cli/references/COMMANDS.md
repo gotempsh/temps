@@ -81,6 +81,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`server`](#server) - Resource usage of the machine running the Temps control plane (what /monitoring/server shows)
 - [`traces`](#traces-alias-trace) - Inspect distributed traces and operation latency
 - [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
+- [`ingress`](#ingress) - How this Temps machine receives traffic for your apps
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`otel`](#otel) - Inspect the OTLP ingest pipeline itself — throughput, drops and failure reasons (server-wide, not project-scoped; see "temps metrics" to query ingested application metrics)
 - [`kv`](#kv) - Read and write a project's keys in the KV store, and manage the KV service
@@ -478,6 +479,7 @@ Create a new service (git-based or manual deployment); add it to a project with 
 | `--no-is-web-app` | Set is_web_app to false | - | No |
 | `--performance-metrics-enabled` | Collect web performance metrics | - | No |
 | `--no-performance-metrics-enabled` | Set performance_metrics_enabled to false | - | No |
+| `--storage-service-env-aliases <json>` | Variable aliases per linked storage service, keyed by service id: app name to injected name, e.g. {"12":{"DATABASE_URL":"POSTGRES_URL"}} (JSON) | - | No |
 | `--use-default-wildcard` | Give environments a hostname under the instance's wildcard domain | - | No |
 | `--no-use-default-wildcard` | Set use_default_wildcard to false | - | No |
 
@@ -2228,6 +2230,7 @@ Set an environment variable. For a secret, read the value from a file or stdin (
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
+| `--generate-secret [bytes\|laravel]` | Have the server generate a random secret of this many bytes (16 to 64, 32 by default, hex), stored as a secret and never shown; for a new variable, instead of a value. `laravel`, the default for APP_KEY, makes a Laravel application key (base64:, 32 bytes) | - | No |
 | `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
 | `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
@@ -5160,6 +5163,7 @@ Link a service to a project
 | `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `--database-mode <mode>` | Which database deployments get: project (one per project), project_environment (one per environment) or custom | - | No |
 | `--database-name <name>` | With --database-mode custom: the exact database name | - | No |
+| `--env-alias <APP_NAME=INJECTED_NAME>` | Also inject a variable under the name the app reads, e.g. DATABASE_URL=POSTGRES_URL (repeatable) | - | No |
 
 ### `services unlink`
 
@@ -6311,6 +6315,7 @@ Manage platform settings
 - `public-ingress` - Show where third parties (webhooks, email tracking) call back into Temps, and whether it is reachable
 - `refresh-routes` - Rebuild the proxy route table now instead of waiting for the next change
 - `weekly-digest` - Generate and send the weekly digest now
+- `onboarding` - Onboarding commands
 - `oidc` - Oidc commands
 
 ### `settings show` (alias: `get`)
@@ -6518,6 +6523,42 @@ Generate and send the weekly digest now
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `settings onboarding`
+
+Onboarding commands
+
+**Subcommands:**
+
+- `get` - Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+- `update` - Change the install's first-run record
+
+#### `settings onboarding get`
+
+Show the install's first-run record: whether the welcome flow is finished, the steps left for later and why, and the default way in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `settings onboarding update`
+
+Change the install's first-run record
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--completed` | Mark the welcome flow finished (true) or reopen it (false) | - | No |
+| `--no-completed` | Set completed to false | - | No |
+| `--default-reach <json>` | How new apps are reached by default, e.g. {"audience":"public","way":"tunnel","naming":"wildcard","domain":"apps.example.com"} (JSON) | - | No |
+| `--done <value>` | Mark these steps done (one of: host, reach, agents, app) (repeatable) | - | No |
+| `--later <json>` | Leave steps for later with why, e.g. [{"step":"agents","reason":"no provider yet"}] (JSON) | - | No |
+| `--from-file <path>` | Start the request body from a JSON file (- for stdin); flags override it | - | No |
+| `--set <field=value>` | Set a body field by path, e.g. limits.memory=512 (repeatable) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `settings oidc`
@@ -11212,6 +11253,27 @@ Retry a failed historical backfill. Only valid when the facet's status is "faile
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+## `ingress`
+
+How this Temps machine receives traffic for your apps
+
+**Subcommands:**
+
+- `private` - Serve private addresses from this machine, only to connections from your private network (Tailscale, WireGuard, NetBird, your LAN…)
+
+### `ingress private`
+
+Serve private addresses from this machine, only to connections from your private network (Tailscale, WireGuard, NetBird, your LAN…)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--listen <address>` | One of this machine's private addresses, or "tailscale" for its Tailscale address | - | No |
+| `--admit <cidr...>` | Who may connect, as private ranges (default: the network of the --listen address; Tailscale's ranges on Tailscale) | - | No |
+| `--off` | Stop serving private addresses from this machine | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `otel-forward`
@@ -16576,6 +16638,7 @@ View platform and server information
 
 **Subcommands:**
 
+- `host-facts` - What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
 - `operations` (`ops`) - List recent and in-flight operations: deployments, rollbacks, promotions, restores, backups, autofixes
 - `maturity` - Show the compatibility promise (stable, beta, experimental) for every feature
 - `geo` - Look up the location of an IP address in the server's geolocation database
@@ -16587,6 +16650,16 @@ View platform and server information
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
 - `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
+
+### `platform host-facts`
+
+What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
 
 ### `platform operations` (alias: `ops`)
 
@@ -18618,6 +18691,7 @@ Configure this Temps instance as an MCP server for AI clients (Claude Code, Clau
 - `enable` - Enable the Temps MCP server on this instance (admin, one-time per instance)
 - `disable` - Disable the Temps MCP server on this instance (admin)
 - `add` - Configure an AI client to connect to this Temps instance over MCP. Clients: claude-code, claude-desktop, codex, cursor, vscode, windsurf, zed
+- `bridge` - Run the Temps MCP server on this computer over stdio, adding a tool that deploys local folders. AI apps start this themselves (see mcp add --deploy-folder); the API key comes from TEMPS_API_KEY
 - `remove` - Remove the Temps MCP server from an AI client
 - `status` - Show whether this instance has MCP enabled and which AI clients are configured
 
@@ -18655,10 +18729,22 @@ Configure an AI client to connect to this Temps instance over MCP. Clients: clau
 | `-w, --write` | Enable write tools (deploy, delete, restart, etc). Default: read-only | - | No |
 | `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
 | `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
-| `-y, --yes` | Skip prompts and confirmation (uses defaults; requires --api-key or an existing login) | - | No |
+| `-y, --yes` | Skip prompts and confirmation (uses defaults; requires --api-key or an existing login; creates a key for the app: read-only, or with --write one that can make changes) | - | No |
+| `-d, --deploy-folder <dir>` | Let the agent deploy project folders from this computer, from inside this folder (repeatable). The app then runs the Temps bridge locally (temps mcp bridge) instead of connecting over HTTP. Implies --write | - | No |
 | `--api-key-file <path>` | Read the API key from a file (- reads stdin) instead of --api-key | - | No |
 | `--api-key-stdin` | Read the API key from stdin instead of --api-key | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
+
+### `mcp bridge`
+
+Run the Temps MCP server on this computer over stdio, adding a tool that deploys local folders. AI apps start this themselves (see mcp add --deploy-folder); the API key comes from TEMPS_API_KEY
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-u, --url <url>` | The address of your Temps console (default: TEMPS_URL) | - | No |
+| `-f, --folder <dir>` | A folder the agent may deploy from, with everything inside it (repeatable) | - | No |
 
 ### `mcp remove`
 

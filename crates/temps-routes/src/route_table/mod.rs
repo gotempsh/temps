@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 
 mod load;
 mod pinned_upstream;
+mod private_view;
 pub use pinned_upstream::{PinnedUpstream, UpstreamAddresses, REFRESH_INTERVAL};
 
 /// Look up the address a container's node publishes its ports on (see
@@ -1604,6 +1605,12 @@ pub struct CachedPeerTable {
     /// `temps proxy`) rather than read from the environment here — this crate
     /// does not parse configuration.
     traefik_discovery_network: RwLock<Option<String>>,
+
+    /// The control plane's private view (ADR-115 D3): a table holding only
+    /// the private addresses node `0` serves on its listener, republished
+    /// from every snapshot this table stores. Created on first use, so an
+    /// install that never serves a private address pays nothing.
+    private_view: std::sync::OnceLock<Arc<CachedPeerTable>>,
 }
 
 impl CachedPeerTable {
@@ -1732,6 +1739,7 @@ impl CachedPeerTable {
             // Off until the bootstrap says otherwise: label discovery is
             // opt-in, so the safe default is "adopt nothing".
             traefik_discovery_network: RwLock::new(None),
+            private_view: std::sync::OnceLock::new(),
         }
     }
 
@@ -4118,6 +4126,25 @@ mod tests {
                 held[0].contains("only the control plane enforces"),
                 "{held:?}"
             );
+            // A worker on Tailscale admits both of its default ranges, stored
+            // as one list: the route is served with the list, not held back.
+            let mut snapshot = (*table.route_snapshot.load_full()).clone();
+            if let Some(entry) = snapshot.private.get_mut("app.internal.example.com") {
+                entry.address.range = Some("100.64.0.0/10,fd7a:115c:a1e0::/48".into());
+            }
+            table.route_snapshot.store(Arc::new(snapshot));
+            let (entries, held) = crate::route_sync::worker_private_routes(&table, &policy(&[]), 3);
+            assert!(held.is_empty(), "{held:?}");
+            assert_eq!(entries[0].range, "100.64.0.0/10,fd7a:115c:a1e0::/48");
+            // One public range in the list holds the route back.
+            let mut snapshot = (*table.route_snapshot.load_full()).clone();
+            if let Some(entry) = snapshot.private.get_mut("app.internal.example.com") {
+                entry.address.range = Some("100.64.0.0/10,8.8.8.0/24".into());
+            }
+            table.route_snapshot.store(Arc::new(snapshot));
+            let (entries, held) = crate::route_sync::worker_private_routes(&table, &policy(&[]), 3);
+            assert!(entries.is_empty());
+            assert!(held[0].contains("no private network range"), "{held:?}");
             let mut snapshot = (*table.route_snapshot.load_full()).clone();
             if let Some(entry) = snapshot.private.get_mut("app.internal.example.com") {
                 entry.address.range = Some("0.0.0.0/0".into());

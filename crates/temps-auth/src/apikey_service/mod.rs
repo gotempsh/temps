@@ -5,7 +5,7 @@ use crate::permissions::{Permission, Role};
 use chrono::Utc;
 use rand::RngExt;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect, Set, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
@@ -843,25 +843,46 @@ impl ApiKeyService {
             .one(self.db.as_ref())
             .await?;
 
-        let cli_login_key = match &harness_key {
-            Some(key) if key.is_active && key.last_used_at.is_none() => {
-                ApiKeyEntity::find()
-                    .filter(Column::UserId.eq(user_id))
-                    .filter(Column::IsActive.eq(true))
-                    .filter(Column::ProjectId.is_null())
-                    .filter(Column::Name.starts_with(crate::ai_harness::CLI_DEVICE_KEY_PREFIX))
+        // The most recently used agent credential (device login or MCP
+        // client key) of this user. With a dedicated key, only one created
+        // after it counts (see `derive_ai_harness_status`); a used, unexpired
+        // dedicated key or a deactivated one decides on its own.
+        let agent_key_query = || {
+            ApiKeyEntity::find()
+                .filter(Column::UserId.eq(user_id))
+                .filter(Column::IsActive.eq(true))
+                .filter(Column::ProjectId.is_null())
+                .filter(
+                    Condition::any()
+                        .add(Column::Name.starts_with(crate::ai_harness::CLI_DEVICE_KEY_PREFIX))
+                        .add(Column::Name.starts_with(crate::ai_harness::MCP_CLIENT_KEY_PREFIX)),
+                )
+                .filter(Column::LastUsedAt.is_not_null())
+                // An expired key is rejected; an older one still valid counts.
+                .filter(
+                    Condition::any()
+                        .add(Column::ExpiresAt.is_null())
+                        .add(Column::ExpiresAt.gt(Utc::now())),
+                )
+                .order_by_desc(Column::LastUsedAt)
+        };
+        let agent_key = match &harness_key {
+            Some(key)
+                if key.is_active
+                    && (key.last_used_at.is_none() || crate::ai_harness::expired(key)) =>
+            {
+                agent_key_query()
                     .filter(Column::CreatedAt.gte(key.created_at))
-                    .filter(Column::LastUsedAt.is_not_null())
-                    .order_by_desc(Column::LastUsedAt)
                     .one(self.db.as_ref())
                     .await?
             }
-            _ => None,
+            Some(_) => None,
+            None => agent_key_query().one(self.db.as_ref()).await?,
         };
 
         Ok(crate::ai_harness::derive_ai_harness_status(
             harness_key.as_ref(),
-            cli_login_key.as_ref(),
+            agent_key.as_ref(),
         ))
     }
 

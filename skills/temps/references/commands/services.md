@@ -335,6 +335,7 @@ Link a service to a project
 | `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | No |
 | `--database-mode <mode>` | Which database deployments get: project (one per project), project_environment (one per environment) or custom | - | No |
 | `--database-name <name>` | With --database-mode custom: the exact database name | - | No |
+| `--env-alias <APP_NAME=INJECTED_NAME>` | Also inject a variable under the name the app reads, e.g. DATABASE_URL=POSTGRES_URL (repeatable) | - | No |
 
 ### `services unlink`
 

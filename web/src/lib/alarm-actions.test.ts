@@ -120,7 +120,7 @@ describe('alarmQuickAction', () => {
         }),
         'app'
       )
-    ).toEqual({ kind: 'autofix', href: '/projects/app/errors/77/autofix' })
+    ).toEqual({ kind: 'autofix', href: '/projects/app/errors/77' })
   })
 
   test('offers nothing for resolved alarms or types without a fix', () => {

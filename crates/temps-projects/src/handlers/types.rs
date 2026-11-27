@@ -179,13 +179,18 @@ pub struct ProjectList {
 pub struct ProjectEnvVarInput {
     /// Variable name, e.g. `DATABASE_URL`
     pub key: String,
-    /// Variable value
+    /// Variable value. Leave empty when `generate` is set.
+    #[serde(default)]
     pub value: String,
     /// Mark the variable as a secret. Secret values are encrypted at rest,
     /// masked in list responses, and revealable only through an audited,
     /// permission-checked endpoint. Defaults to `false`.
     #[serde(default)]
     pub is_secret: bool,
+    /// Ask the server to generate the value (always stored as a secret)
+    /// instead of sending one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate: Option<temps_environments::services::generated_value::GenerateValueRequest>,
 }
 
 /// Cloudflare availability and the default used by future project creation.
@@ -263,6 +268,13 @@ pub struct CreateProjectRequest {
     pub performance_metrics_enabled: bool,
     #[serde(default)]
     pub storage_service_ids: Vec<i32>,
+    /// Variable aliases for each linked storage service, keyed by service id
+    /// (as a string, JSON object keys being strings): app name → injected
+    /// name, such as `{"12": {"DATABASE_URL": "POSTGRES_URL"}}`. Set before
+    /// the first deployment is queued.
+    #[serde(default)]
+    pub storage_service_env_aliases:
+        std::collections::BTreeMap<i32, std::collections::BTreeMap<String, String>>,
     pub use_default_wildcard: Option<bool>,
     pub custom_domain: Option<String>,
     pub is_public_repo: Option<bool>,
@@ -373,6 +385,8 @@ pub struct PaginationParams {
     /// Return only services that are members of this project group.
     /// Mutually exclusive with `ungrouped`.
     pub project_group_id: Option<i32>,
+    /// The order: `last_deployed` (the default) or `created`, newest first.
+    pub sort: Option<crate::services::project::ProjectOrder>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1399,6 +1413,12 @@ impl From<ProjectError> for Problem {
             | ProjectError::StorageLinksFailed { .. }) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Project Creation Failed")
+                    .with_detail(err.to_string())
+            }
+
+            err @ ProjectError::StorageAliasesOnUpdate { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Storage Aliases Are Set On The Link")
                     .with_detail(err.to_string())
             }
 

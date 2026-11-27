@@ -2794,6 +2794,7 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
             ProjectPresetResponse,
             RepositoryEnvExampleResponse,
             EnvExampleVariableResponse,
+            DatabaseOptionResponse,
             RepositoryComposeServicesResponse,
             ComposeServicePreviewResponse,
             ComposePortMapping,
@@ -3440,6 +3441,33 @@ pub struct EnvExampleVariableResponse {
     /// Description derived from a `# comment` immediately preceding the
     /// variable in the file, if any
     pub description: Option<String>,
+    /// The key looks like it holds a secret (`*_SECRET`, `*_KEY`,
+    /// `*_TOKEN`, ...); public client keys (`NEXT_PUBLIC_*`) never do.
+    #[serde(default)]
+    pub looks_secret: bool,
+    /// Temps can generate a value for it server-side (a session secret, not
+    /// a credential for another service).
+    #[serde(default)]
+    pub can_generate: bool,
+}
+
+/// A managed database the app could get, with what it would fill.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseOptionResponse {
+    /// The service type to create: `postgres`, `mariadb`, `mongodb`, `redis`.
+    pub service_type: String,
+    pub label: String,
+    /// The repository points at this database.
+    pub suggested: bool,
+    /// One line naming the evidence, when suggested.
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    /// Env-example keys a linked database of this type fills.
+    pub provides: Vec<String>,
+    /// App name → injected name for the keys it fills under another name
+    /// (`DATABASE_URL` → `POSTGRES_URL`); set on the link as `env_aliases`.
+    pub env_aliases: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -3450,6 +3478,120 @@ pub struct RepositoryEnvExampleResponse {
     /// if the repository has none
     pub path: Option<String>,
     pub variables: Vec<EnvExampleVariableResponse>,
+    /// Every database Temps can create, the suggested ones first (strongest
+    /// evidence first), each with the keys it would fill.
+    #[serde(default)]
+    pub databases: Vec<DatabaseOptionResponse>,
+}
+
+impl RepositoryEnvExampleResponse {
+    pub(crate) fn from_domain(
+        result: crate::services::git_provider_manager::RepositoryEnvExampleDomain,
+    ) -> Self {
+        let keys: Vec<&str> = result.variables.iter().map(|v| v.key.as_str()).collect();
+        let mut databases: Vec<DatabaseOptionResponse> = result
+            .suggested_services
+            .iter()
+            .map(|s| (s.kind, Some(s)))
+            .chain(
+                temps_presets::DatabaseKind::ALL
+                    .into_iter()
+                    .filter(|k| !result.suggested_services.iter().any(|s| s.kind == *k))
+                    .map(|k| (k, None)),
+            )
+            .map(|(kind, suggestion)| DatabaseOptionResponse {
+                service_type: kind.service_type().to_string(),
+                label: kind.label().to_string(),
+                suggested: suggestion.is_some(),
+                reason: suggestion.map(|s| s.reason.clone()),
+                evidence: suggestion.map(|s| s.evidence.clone()).unwrap_or_default(),
+                provides: keys
+                    .iter()
+                    .filter(|k| temps_presets::provided_by(k, kind).is_some())
+                    .map(|k| k.to_string())
+                    .collect(),
+                env_aliases: temps_presets::env_aliases(keys.iter().copied(), kind),
+            })
+            .collect();
+        databases.dedup_by(|a, b| a.service_type == b.service_type);
+        Self {
+            repository_id: result.repository_id,
+            path: result.path,
+            variables: result
+                .variables
+                .into_iter()
+                .map(|v| EnvExampleVariableResponse {
+                    looks_secret: temps_presets::looks_secret(&v.key),
+                    can_generate: temps_presets::can_generate(&v.key),
+                    key: v.key,
+                    default_value: v.default_value,
+                    description: v.description,
+                })
+                .collect(),
+            databases,
+        }
+    }
+}
+
+#[cfg(test)]
+mod env_example_response_tests {
+    use super::*;
+    use crate::services::git_provider_manager::{
+        EnvExampleVariableDomain, RepositoryEnvExampleDomain,
+    };
+
+    fn var(key: &str) -> EnvExampleVariableDomain {
+        EnvExampleVariableDomain {
+            key: key.to_string(),
+            default_value: String::new(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn suggested_database_comes_first_with_what_it_fills() {
+        let suggestions = temps_presets::suggest_services(
+            &[("DATABASE_URL".to_string(), String::new())],
+            &[temps_presets::RepoFile {
+                path: "package.json".into(),
+                content: r#"{"dependencies":{"pg":"8"}}"#.into(),
+            }],
+            &[],
+        );
+        let response = RepositoryEnvExampleResponse::from_domain(RepositoryEnvExampleDomain {
+            repository_id: 4,
+            path: Some(".env.example".into()),
+            variables: vec![
+                var("DATABASE_URL"),
+                var("SESSION_SECRET"),
+                var("STRIPE_API_KEY"),
+                var("PORT"),
+            ],
+            suggested_services: suggestions,
+        });
+
+        assert_eq!(
+            response.databases.len(),
+            4,
+            "every database is offered once"
+        );
+        let first = &response.databases[0];
+        assert_eq!(first.service_type, "postgres");
+        assert!(first.suggested);
+        assert!(first.reason.as_deref().unwrap_or_default().contains("pg"));
+        assert_eq!(first.provides, vec!["DATABASE_URL".to_string()]);
+        assert_eq!(
+            first.env_aliases.get("DATABASE_URL").map(String::as_str),
+            Some("POSTGRES_URL")
+        );
+        assert!(response.databases[1..].iter().all(|d| !d.suggested));
+
+        let secret = &response.variables[1];
+        assert!(secret.looks_secret && secret.can_generate);
+        let api_key = &response.variables[2];
+        assert!(api_key.looks_secret && !api_key.can_generate);
+        assert!(!response.variables[3].looks_secret);
+    }
 }
 
 #[utoipa::path(
@@ -3550,19 +3692,7 @@ pub async fn get_repository_env_example_live(
 
     Ok((
         StatusCode::OK,
-        Json(RepositoryEnvExampleResponse {
-            repository_id: result.repository_id,
-            path: result.path,
-            variables: result
-                .variables
-                .into_iter()
-                .map(|v| EnvExampleVariableResponse {
-                    key: v.key,
-                    default_value: v.default_value,
-                    description: v.description,
-                })
-                .collect(),
-        }),
+        Json(RepositoryEnvExampleResponse::from_domain(result)),
     ))
 }
 

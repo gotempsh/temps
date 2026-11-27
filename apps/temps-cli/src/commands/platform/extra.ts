@@ -4,12 +4,13 @@
 /**
  * Platform-wide reads: the operations feed (deployments, rollbacks,
  * restores, backups in flight), feature maturity, an IP geolocation lookup,
- * and a file from the server's static directory.
+ * the control plane's machine, and a file from the server's static directory.
  */
 
 import type { Command } from 'commander'
 import { client } from '../../lib/api-client.js'
-import { getFeatureMaturity, getIpGeolocation, listOperations } from '../../api/sdk.gen.js'
+import { getFeatureMaturity, getHostFacts, getIpGeolocation, listOperations } from '../../api/sdk.gen.js'
+import { endpoint } from '../../lib/endpoint.js'
 import type { OperationKind, OperationStatusFilter } from '../../api/types.gen.js'
 import { call, connect, fail, output, parseIntegerFlag, type JsonOption } from '../../lib/command-kit.js'
 import { json, newline, header, icons, keyValue } from '../../ui/output.js'
@@ -50,6 +51,12 @@ export function staticFilePath(raw: string): string {
 }
 
 export function registerPlatformExtraCommands(platform: Command): void {
+  endpoint(platform, getHostFacts, {
+    name: 'host-facts',
+    description:
+      "What Temps reads about the control plane's machine: processor, memory, swap, disk, Docker, ports 80 and 443, its addresses and Tailscale",
+  })
+
   platform
     .command('operations')
     .alias('ops')

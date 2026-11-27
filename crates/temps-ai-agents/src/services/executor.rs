@@ -11,7 +11,7 @@ use tokio::fs;
 use tokio::process::Command;
 
 use temps_core::jobs::GitPushEventJob;
-use temps_core::{EncryptionService, Job, JobQueue};
+use temps_core::{Job, JobQueue};
 use temps_deployments::services::deployment_token_service::{
     CreateDeploymentTokenRequest, DeploymentTokenService,
 };
@@ -24,11 +24,13 @@ use temps_memory::{memory_install_command, WorkflowMemoryFact, WorkflowMemoryPro
 use temps_notifications::services::NotificationService;
 use temps_notifications::types::{Notification, NotificationPriority};
 
-use crate::ai_cli::{AiCliProvider, AiRunConfig, AiRunResult, OnEventCallback};
+use crate::ai_cli::{AiRunResult, OnEventCallback};
 use crate::error::AgentError;
 use crate::sandbox::SandboxCreateConfig;
+use crate::services::agent_loop::{run_agent_loop, AgentLoopRequest, RegistrySandbox};
 use crate::services::sandbox_registry::SandboxRegistry;
 use crate::services::secret_service::{SecretService, SecretType};
+use temps_ai::AiService;
 
 use crate::services::config_service::AgentConfigService;
 use crate::services::prompt_builder::PromptBuilder;
@@ -138,14 +140,14 @@ fn synthetic_agent_config(
 pub struct AgentExecutor {
     db: Arc<DatabaseConnection>,
     git_provider_manager: Arc<dyn GitProviderManagerTrait>,
-    encryption_service: Arc<EncryptionService>,
     queue: Arc<dyn JobQueue>,
     run_service: Arc<AgentRunService>,
     config_service: Arc<AgentConfigService>,
     notification_service: Arc<NotificationService>,
-    /// If set, this provider is used instead of resolving one from config.
-    /// Intended for testing — inject a fake provider that simulates AI behaviour.
-    ai_provider_override: Option<Arc<dyn AiCliProvider>>,
+    /// The AI gateway every agent turn goes through (ADR-116 D1). Attached
+    /// once every plugin has registered; a run without one fails saying no
+    /// AI provider is configured.
+    ai_service: tokio::sync::RwLock<Option<Arc<dyn AiService>>>,
     /// Sandbox registry for running AI CLI inside isolated containers.
     sandbox_registry: Arc<SandboxRegistry>,
     /// Secret service for resolving encrypted secrets to inject into sandboxes.
@@ -183,6 +185,12 @@ pub struct AgentExecutor {
     /// `pub(crate)` so the `AutofixerService` (same crate) can call revoke
     /// at its own cleanup points.
     pub(crate) run_token_ids: tokio::sync::RwLock<std::collections::HashMap<i32, i32>>,
+    /// The cancel flag of each run whose agent loop is working, so
+    /// [`Self::cancel_run`] stops the loop before its next paid gateway
+    /// turn rather than letting it report the destroyed sandbox to the
+    /// model.
+    run_cancel_flags:
+        tokio::sync::RwLock<std::collections::HashMap<i32, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 /// Temps API permissions a workflow-run sandbox token is minted with.
@@ -472,7 +480,6 @@ impl AgentExecutor {
     pub fn new(
         db: Arc<DatabaseConnection>,
         git_provider_manager: Arc<dyn GitProviderManagerTrait>,
-        encryption_service: Arc<EncryptionService>,
         queue: Arc<dyn JobQueue>,
         run_service: Arc<AgentRunService>,
         config_service: Arc<AgentConfigService>,
@@ -484,18 +491,18 @@ impl AgentExecutor {
         Self {
             db,
             git_provider_manager,
-            encryption_service,
             queue,
             run_service,
             config_service,
             notification_service,
-            ai_provider_override: None,
+            ai_service: tokio::sync::RwLock::new(None),
             sandbox_registry,
             secret_service,
             definition_service,
             memory_provider: tokio::sync::RwLock::new(None),
             deployment_token_service: tokio::sync::RwLock::new(None),
             run_token_ids: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            run_cancel_flags: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -520,10 +527,18 @@ impl AgentExecutor {
         &self.sandbox_registry
     }
 
-    /// For testing: inject a custom AI CLI provider instead of resolving from config.
-    pub fn with_ai_provider(mut self, provider: Arc<dyn AiCliProvider>) -> Self {
-        self.ai_provider_override = Some(provider);
-        self
+    /// Attach the AI gateway agent runs use. Safe to call after the executor
+    /// has been registered as a service.
+    pub async fn attach_ai_service(&self, ai: Arc<dyn AiService>) {
+        *self.ai_service.write().await = Some(ai);
+    }
+
+    /// Builder form of [`Self::attach_ai_service`], for tests.
+    pub fn with_ai_service(self, ai: Arc<dyn AiService>) -> Self {
+        Self {
+            ai_service: tokio::sync::RwLock::new(Some(ai)),
+            ..self
+        }
     }
 
     // ── Memory helpers ──────────────────────────────────────────────────────
@@ -773,123 +788,9 @@ impl AgentExecutor {
             ))
         };
 
-        // Inject auth credentials into sandbox based on auth_type and provider.
-        // Use per-provider credentials from the `providers` map so each CLI
-        // gets its own key/token, not just the legacy Claude-only flat fields.
+        // ADR-116 D3: a run's sandbox gets no model credential. The agent's
+        // model turns run on the control plane, through the AI gateway.
         let mut sandbox_env = std::collections::HashMap::new();
-        // Stash decrypted credential + auth_type for file-based seeding after
-        // the sandbox container is created (ApiKey goes into env vars now;
-        // ConfigFile/OauthToken need the sandbox filesystem).
-        let mut deferred_credential: Option<(String, String)> = None; // (value, auth_type)
-        {
-            let provider_cfg = global_sandbox.provider_config(ai_provider);
-            if let Some(ref encrypted) = provider_cfg.credentials_encrypted {
-                if !encrypted.is_empty() {
-                    if let Ok(key) = self.encryption_service.decrypt_string(encrypted) {
-                        let provider_entry = crate::ai_cli::catalog::find_provider(ai_provider);
-                        let auth_type = if provider_cfg.auth_type.is_empty() {
-                            provider_entry
-                                .map(|p| p.default_flavor().id)
-                                .unwrap_or("api_key")
-                                .to_string()
-                        } else {
-                            provider_cfg.auth_type.clone()
-                        };
-                        let flavor = provider_entry.and_then(|p| p.flavor(&auth_type));
-
-                        match flavor.map(|f| f.format) {
-                            Some(crate::ai_cli::catalog::CredentialFormat::ApiKey) => {
-                                // `flavor` is `Some` in this arm: the match is over `flavor.map(..)`.
-                                if let Some(flavor) = flavor {
-                                    sandbox_env.insert(flavor.env_var.to_string(), key);
-                                }
-                            }
-                            Some(crate::ai_cli::catalog::CredentialFormat::OauthToken) => {
-                                use crate::ai_cli::credential_snapshot::{
-                                    resolve_claude_oauth, StoredClaudeCredential,
-                                };
-                                match StoredClaudeCredential::classify(&key) {
-                                    StoredClaudeCredential::LegacyToken(_) => {
-                                        // A pasted `setup-token` bearer is static
-                                        // (no refresh token), so every run may
-                                        // hold a copy.
-                                        sandbox_env.insert(
-                                            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
-                                            key.clone(),
-                                        );
-                                        deferred_credential = Some((key, auth_type));
-                                    }
-                                    StoredClaudeCredential::LoginSnapshot(_) => {
-                                        // A console sign-in rotates its refresh
-                                        // token, so a sandbox receives only an
-                                        // access token that outlives the run and
-                                        // never a credential file: the refresh
-                                        // token stays with the host CLI.
-                                        let needed = Duration::from_secs(
-                                            u64::try_from(timeout_seconds).unwrap_or(0) + 300,
-                                        );
-                                        let resolved = resolve_claude_oauth(&key, needed)
-                                            .await
-                                            .map_err(|error| AgentError::Validation {
-                                                message: format!(
-                                                    "Agent run {run_id} cannot use {ai_provider}: {error}"
-                                                ),
-                                            })?;
-                                        sandbox_env.insert(
-                                            "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
-                                            resolved.access_token,
-                                        );
-                                    }
-                                }
-                            }
-                            Some(crate::ai_cli::catalog::CredentialFormat::ConfigFile) => {
-                                // A console sign-in is stored without its
-                                // refresh token; make sure the copy a sandbox
-                                // receives outlives the run. Pasted auth files
-                                // are passed through unchanged.
-                                let key = if ai_provider == "codex_cli" {
-                                    let needed = Duration::from_secs(
-                                        u64::try_from(timeout_seconds).unwrap_or(0) + 300,
-                                    );
-                                    crate::ai_cli::credential_snapshot::resolve_codex_auth(
-                                        &key, needed,
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        AgentError::Validation {
-                                            message: format!(
-                                            "Agent run {run_id} cannot use {ai_provider}: {error}"
-                                        ),
-                                        }
-                                    })?
-                                } else {
-                                    key
-                                };
-                                deferred_credential = Some((key, auth_type));
-                            }
-                            Some(crate::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
-                                // This path hands credentials to the sandbox
-                                // directly; an endpoint key is only ever used
-                                // through the workspace model relay.
-                                return Err(AgentError::Validation {
-                                    message: format!(
-                                        "Agent run {run_id} cannot use {ai_provider}: it is connected to an OpenAI-compatible endpoint, which is supported only in AI workspaces. Connect {ai_provider} with auth.json or choose another harness for agent runs."
-                                    ),
-                                });
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "Unknown provider/auth_type {}/{} — falling back to env var",
-                                    ai_provider,
-                                    auth_type
-                                );
-                                sandbox_env.insert("ANTHROPIC_API_KEY".to_string(), key);
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // Workflow memory + platform env vars
         sandbox_env.insert("TEMPS_PROJECT_ID".to_string(), project.id.to_string());
@@ -1033,73 +934,6 @@ impl AgentExecutor {
                 None,
             )
             .await?;
-
-        // Write file-based credentials (ConfigFile / OauthToken).
-        if let Some((cred_value, auth_type)) = deferred_credential {
-            if let Some(provider_entry) = crate::ai_cli::catalog::find_provider(ai_provider) {
-                if let Some(flavor) = provider_entry.flavor(&auth_type) {
-                    let seed_path = flavor.seed_path();
-                    if let Some(idx) = seed_path.rfind('/') {
-                        let parent = &seed_path[..idx];
-                        let _ = self
-                            .sandbox_registry
-                            .exec(
-                                run_id,
-                                vec!["mkdir".into(), "-p".into(), parent.to_string()],
-                                std::collections::HashMap::new(),
-                                None,
-                            )
-                            .await;
-                    }
-
-                    let file_bytes = match flavor.format {
-                        crate::ai_cli::catalog::CredentialFormat::OauthToken => {
-                            let body = serde_json::json!({
-                                "claudeAiOauth": {
-                                    "accessToken": cred_value,
-                                    "expiresAt": chrono::Utc::now().timestamp_millis() + 365 * 24 * 3600 * 1000,
-                                    "scopes": [
-                                        "user:inference",
-                                        "user:mcp_servers",
-                                        "user:profile",
-                                        "user:sessions:claude_code"
-                                    ],
-                                    "subscriptionType": "max",
-                                    "rateLimitTier": "default_claude_max_20x"
-                                }
-                            });
-                            serde_json::to_vec_pretty(&body).unwrap_or_default()
-                        }
-                        crate::ai_cli::catalog::CredentialFormat::ConfigFile => {
-                            cred_value.into_bytes()
-                        }
-                        _ => Vec::new(),
-                    };
-
-                    if !file_bytes.is_empty() {
-                        if let Err(e) = self
-                            .sandbox_registry
-                            .write_file(run_id, &seed_path, &file_bytes, 0o600)
-                            .await
-                        {
-                            tracing::warn!(
-                                "Failed to write credential file {} for run {}: {}",
-                                seed_path,
-                                run_id,
-                                e
-                            );
-                        } else {
-                            tracing::debug!(
-                                "Seeded credential file {} for {} on run {}",
-                                seed_path,
-                                ai_provider,
-                                run_id
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         // Install the workflow memory script (best-effort).
         if let Err(e) = self
@@ -1646,6 +1480,14 @@ impl AgentExecutor {
                     ),
                     None,
                 )
+                .await?;
+            // ADR-116 D2: the run's tool loop offers the model the sandbox
+            // tools only. Say so rather than let a workflow that counts on
+            // these find out from a wrong answer.
+            let mut names: Vec<&str> = merged.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            self.run_service
+                .append_log(run_id, "warning", &mcp_not_offered_warning(&names), None)
                 .await?;
         }
 
@@ -2337,11 +2179,16 @@ impl AgentExecutor {
     /// call fails or its next status write returns
     /// [`AgentError::RunCancelled`], and it cannot overwrite `cancelled`.
     ///
+    /// An agent loop stops before its next model turn or tool call.
+    ///
     /// A step already running outside the sandbox on this server, such as a
     /// clone or a push to the git provider, is not interrupted: it finishes,
     /// and the run stops at the status write after it.
     pub async fn cancel_run(&self, run_id: i32) -> Result<agent_runs::Model, AgentError> {
         let run = self.run_service.cancel_run(run_id).await?;
+        if let Some(flag) = self.run_cancel_flags.read().await.get(&run_id) {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
 
         if let Err(error) = self
             .run_service
@@ -2412,6 +2259,7 @@ impl AgentExecutor {
         // Revoke the run-scoped deployment token immediately so it cannot be
         // used after the sandbox stops.  This is best-effort — failures are
         // logged in `revoke_run_token` and do not propagate here.
+        self.run_cancel_flags.write().await.remove(&run_id);
         if let Some(token_id) = self.run_token_ids.write().await.remove(&run_id) {
             self.revoke_run_token(run_id, token_id).await;
         }
@@ -2742,45 +2590,34 @@ impl AgentExecutor {
             tracing::warn!("Run {}: failed to persist prompt_text: {}", run_id, e);
         }
 
-        // Step 9: Resolve API key. Priority:
-        // 1. Per-agent encrypted key (config.api_key_encrypted)
-        // 2. Linked AI provider key (config.ai_provider_key_id → ai_provider_keys table)
-        // 3. Empty (Claude CLI uses ~/.claude auth / subscription mode)
-        let api_key = if let Some(ref encrypted) = config.api_key_encrypted {
-            self.encryption_service
-                .decrypt_string(encrypted)
-                .map_err(|e| AgentError::EncryptionError {
-                    message: format!(
-                        "Failed to decrypt API key for project {}: {}",
-                        run.project_id, e
+        // Step 9: the model. ADR-116 D5: an agent saved with a coding CLI
+        // runs on the AI gateway's default model; any other agent keeps the
+        // gateway model it names.
+        let model = gateway_model(&config.ai_provider, config.ai_model.as_deref());
+        if is_retired_harness(&config.ai_provider) {
+            self.run_service
+                .append_log(
+                    run_id,
+                    "info",
+                    &format!(
+                        "This agent was set up for {}. Agents now run through the AI \
+                         gateway, on its default model.",
+                        config.ai_provider
                     ),
-                })?
-        } else if let Some(key_id) = config.ai_provider_key_id {
-            // Look up the shared AI provider key
-            use temps_entities::ai_provider_keys;
-            let key_record = ai_provider_keys::Entity::find_by_id(key_id)
-                .one(self.db.as_ref())
-                .await
-                .map_err(AgentError::Database)?;
-            if let Some(key) = key_record {
-                self.encryption_service
-                    .decrypt_string(&key.api_key_encrypted)
-                    .map_err(|e| AgentError::EncryptionError {
-                        message: format!("Failed to decrypt AI provider key {}: {}", key_id, e),
-                    })?
-            } else {
-                tracing::warn!(
-                    "AI provider key {} not found for agent {}, running without API key",
-                    key_id,
-                    config.slug
-                );
-                String::new()
-            }
-        } else {
-            String::new()
-        };
+                    None,
+                )
+                .await?;
+        }
 
         // Step 10: Update status → "fixing"
+        // Registered before the status write: a cancel that lands before it
+        // fails that write, and one after it sets this flag.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.run_cancel_flags
+            .write()
+            .await
+            .insert(run_id, cancelled.clone());
+        // `execute_run`'s cleanup removes it on every path.
         self.run_service
             .update_status(
                 run_id,
@@ -2794,312 +2631,67 @@ impl AgentExecutor {
             .append_log(
                 run_id,
                 "info",
-                &format!("Running {} to fix the error...", config.ai_provider),
+                "The agent is working in the sandbox...",
                 None,
             )
             .await?;
-        tracing::info!("Run {}: invoking AI CLI {}", run_id, config.ai_provider);
+        tracing::info!("Run {}: agent loop started", run_id);
 
-        // Step 11: Run AI CLI via sandbox (or direct provider for testing)
+        // Step 11: the agent works in its sandbox on Temps' own tool loop
+        // (ADR-116 D2); every step streams to the run's log.
         let run_service_for_stream = self.run_service.clone();
         let stream_run_id = run_id;
         let on_event: OnEventCallback = Arc::new(move |line: String| {
             let svc = run_service_for_stream.clone();
             let rid = stream_run_id;
             Box::pin(async move {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    return;
-                }
-                let _ = svc.append_log(rid, "ai_event", trimmed, None).await;
+                let _ = svc.append_log(rid, "ai_event", &line, None).await;
             })
         });
-
-        let ai_result = if let Some(ref override_provider) = self.ai_provider_override {
-            // Testing path: use injected provider directly
-            let ai_config = AiRunConfig {
-                work_dir: work_dir.clone(),
-                prompt,
-                api_key: api_key.clone(),
-                max_turns: config.max_turns,
-                timeout: Duration::from_secs(config.timeout_seconds as u64),
-                model: config.ai_model.clone(),
-                thinking_level: None,
-                permission_mode: None,
-                on_event: Some(on_event),
-                permission_bridge: None,
-                resume_session_id: None,
-                mcp_server: None,
-            };
-            override_provider.run(ai_config).await?
-        } else {
-            // OpenCode lstats the first positional arg as a path — long
-            // prompts exceed NAME_MAX (255). Write to a temp file so the
-            // shell wrapper can `$(cat ...)` it instead.
-            if config.ai_provider == "opencode" {
-                if let Err(e) = self
-                    .sandbox_registry
-                    .write_file(run_id, "/tmp/.temps-prompt", prompt.as_bytes(), 0o644)
-                    .await
-                {
-                    tracing::warn!(
-                        "run {}: failed to write opencode prompt file: {}",
-                        run_id,
-                        e
-                    );
-                }
-            }
-
-            // Sandbox path: execute AI CLI inside isolated container
-            let cmd = build_claude_cmd(
-                &config.ai_provider,
-                &prompt,
-                config.max_turns,
-                false,
-                config.ai_model.as_deref(),
-            );
-
-            let mut env = std::collections::HashMap::new();
-            if !api_key.is_empty() {
-                // Set the correct env var for the provider (e.g. OPENAI_API_KEY for Codex)
-                let env_var = crate::ai_cli::catalog::find_provider(&config.ai_provider)
-                    .and_then(|p| {
-                        p.auth_flavors.iter().find(|f| {
-                            matches!(f.format, crate::ai_cli::catalog::CredentialFormat::ApiKey)
-                        })
-                    })
-                    .map(|f| f.env_var)
-                    .unwrap_or("ANTHROPIC_API_KEY");
-                env.insert(env_var.to_string(), api_key.clone());
-            }
-
-            let exec_result = tokio::time::timeout(
-                Duration::from_secs(config.timeout_seconds as u64),
-                self.sandbox_registry.exec(run_id, cmd, env, Some(on_event)),
-            )
-            .await
-            .map_err(|_| AgentError::AiCliTimeout {
-                provider: config.ai_provider.clone(),
-                timeout_secs: config.timeout_seconds as u64,
-            })??;
-
-            if exec_result.exit_code != 0 {
-                return Err(AgentError::AiCliFailed {
-                    provider: config.ai_provider.clone(),
-                    exit_code: exec_result.exit_code,
-                    stderr: crate::ai_cli::summarize_cli_failure(
-                        &config.ai_provider,
-                        &exec_result.stdout,
-                    ),
-                });
-            }
-
-            // Parse output based on provider format
-            let parsed = match config.ai_provider.as_str() {
-                "codex_cli" => {
-                    let (tokens_input, tokens_output, model) =
-                        crate::ai_cli::codex::parse_codex_output(&exec_result.stdout);
-                    crate::ai_cli::claude::ParsedClaudeOutput {
-                        tokens_input,
-                        tokens_output,
-                        model,
-                        session_id: None,
-                        is_max_turns_error: false,
-                    }
-                }
-                "opencode" => {
-                    let (tokens_input, tokens_output, model) =
-                        crate::ai_cli::opencode::parse_opencode_output(&exec_result.stdout);
-                    crate::ai_cli::claude::ParsedClaudeOutput {
-                        tokens_input,
-                        tokens_output,
-                        model,
-                        session_id: None,
-                        is_max_turns_error: false,
-                    }
-                }
-                _ => crate::ai_cli::claude::parse_claude_output(&exec_result.stdout),
-            };
-
-            AiRunResult {
-                output: exec_result.stdout,
-                exit_code: exec_result.exit_code,
-                tokens_input: parsed.tokens_input,
-                tokens_output: parsed.tokens_output,
-                model: parsed.model,
-                changed_files: None,
-                session_id: parsed.session_id,
-                is_max_turns_error: parsed.is_max_turns_error,
-            }
-        };
-
-        // Step 12b: Auto-continue if the CLI hit the max turns limit.
-        // Re-runs with --continue up to 2 more times so the agent can finish its work.
-        let mut ai_result = ai_result;
-        const MAX_CONTINUATIONS: usize = 2;
-        let mut continuation = 0;
-        while ai_result.is_max_turns_error && continuation < MAX_CONTINUATIONS {
-            continuation += 1;
-            tracing::warn!(
-                "Run {}: AI CLI hit max_turns limit, auto-continuing ({}/{})",
-                run_id,
-                continuation,
-                MAX_CONTINUATIONS
-            );
-            self.run_service
-                .append_log(
-                    run_id,
-                    "warning",
-                    &format!(
-                        "Workflow hit the turn limit. Auto-continuing ({}/{})...",
-                        continuation, MAX_CONTINUATIONS
-                    ),
-                    None,
-                )
-                .await?;
-
-            let continue_prompt = "Continue where you left off. Complete the task.".to_string();
-            let run_service_for_stream = self.run_service.clone();
-            let stream_run_id = run_id;
-            let on_event: OnEventCallback = Arc::new(move |line: String| {
-                let svc = run_service_for_stream.clone();
-                let rid = stream_run_id;
-                Box::pin(async move {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        return;
-                    }
-                    let _ = svc.append_log(rid, "ai_event", trimmed, None).await;
-                })
-            });
-
-            let cont_result = if let Some(ref override_provider) = self.ai_provider_override {
-                let ai_config = AiRunConfig {
-                    work_dir: work_dir.clone(),
-                    prompt: continue_prompt,
-                    api_key: api_key.clone(),
-                    max_turns: config.max_turns,
-                    timeout: Duration::from_secs(config.timeout_seconds as u64),
-                    model: config.ai_model.clone(),
-                    thinking_level: None,
-                    permission_mode: None,
-                    on_event: Some(on_event),
-                    permission_bridge: None,
-                    resume_session_id: None,
-                    mcp_server: None,
-                };
-                override_provider.continue_conversation(ai_config).await?
-            } else {
-                if config.ai_provider == "opencode" {
-                    if let Err(e) = self
-                        .sandbox_registry
-                        .write_file(
-                            run_id,
-                            "/tmp/.temps-prompt",
-                            continue_prompt.as_bytes(),
-                            0o644,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            "run {}: failed to write opencode prompt file (continue): {}",
-                            run_id,
-                            e
-                        );
-                    }
-                }
-                let cmd = build_claude_cmd(
-                    &config.ai_provider,
-                    &continue_prompt,
-                    config.max_turns,
-                    true,
-                    config.ai_model.as_deref(),
-                );
-                let mut env = std::collections::HashMap::new();
-                if !api_key.is_empty() {
-                    let env_var = crate::ai_cli::catalog::find_provider(&config.ai_provider)
-                        .and_then(|p| {
-                            p.auth_flavors.iter().find(|f| {
-                                matches!(f.format, crate::ai_cli::catalog::CredentialFormat::ApiKey)
-                            })
-                        })
-                        .map(|f| f.env_var)
-                        .unwrap_or("ANTHROPIC_API_KEY");
-                    env.insert(env_var.to_string(), api_key.clone());
-                }
-                let exec_result = tokio::time::timeout(
-                    Duration::from_secs(config.timeout_seconds as u64),
-                    self.sandbox_registry.exec(run_id, cmd, env, Some(on_event)),
-                )
+        let ai =
+            self.ai_service
+                .read()
                 .await
-                .map_err(|_| AgentError::AiCliTimeout {
-                    provider: config.ai_provider.clone(),
-                    timeout_secs: config.timeout_seconds as u64,
-                })??;
-
-                if exec_result.exit_code != 0 {
-                    break;
-                }
-
-                let parsed = if config.ai_provider == "codex_cli" {
-                    let (tokens_input, tokens_output, model) =
-                        crate::ai_cli::codex::parse_codex_output(&exec_result.stdout);
-                    crate::ai_cli::claude::ParsedClaudeOutput {
-                        tokens_input,
-                        tokens_output,
-                        model,
-                        session_id: None,
-                        is_max_turns_error: false,
-                    }
-                } else {
-                    crate::ai_cli::claude::parse_claude_output(&exec_result.stdout)
-                };
-                AiRunResult {
-                    output: exec_result.stdout,
-                    exit_code: exec_result.exit_code,
-                    tokens_input: parsed.tokens_input,
-                    tokens_output: parsed.tokens_output,
-                    model: parsed.model,
-                    changed_files: None,
-                    session_id: parsed.session_id,
-                    is_max_turns_error: parsed.is_max_turns_error,
-                }
-            };
-
-            // Merge: append new output, accumulate tokens, keep latest model/session
-            ai_result.output.push('\n');
-            ai_result.output.push_str(&cont_result.output);
-            ai_result.tokens_input = match (ai_result.tokens_input, cont_result.tokens_input) {
-                (Some(a), Some(b)) => Some(a + b),
-                (a, b) => a.or(b),
-            };
-            ai_result.tokens_output = match (ai_result.tokens_output, cont_result.tokens_output) {
-                (Some(a), Some(b)) => Some(a + b),
-                (a, b) => a.or(b),
-            };
-            if cont_result.model.is_some() {
-                ai_result.model = cont_result.model;
-            }
-            if cont_result.session_id.is_some() {
-                ai_result.session_id = cont_result.session_id;
-            }
-            ai_result.is_max_turns_error = cont_result.is_max_turns_error;
-        }
-
+                .clone()
+                .ok_or_else(|| AgentError::AgentModelFailed {
+                    run_id,
+                    turn: 1,
+                    reason: "No AI provider is configured: add one in the AI gateway".to_string(),
+                })?;
+        let sandbox = RegistrySandbox::new(self.sandbox_registry.clone(), run_id).await?;
+        let outcome = run_agent_loop(
+            ai.as_ref(),
+            &sandbox,
+            AgentLoopRequest {
+                run_id,
+                project_id: project.id,
+                model: model.clone(),
+                prompt,
+                // 0 (persistent workflows) sets no cap; the time budget bounds it.
+                max_turns: u32::try_from(config.max_turns).unwrap_or(1),
+                timeout: Duration::from_secs(u64::try_from(config.timeout_seconds).unwrap_or(0)),
+                cancelled,
+            },
+            Some(on_event),
+        )
+        .await?;
+        let ai_result = AiRunResult {
+            output: outcome.transcript.clone(),
+            exit_code: 0,
+            tokens_input: outcome
+                .tokens_input
+                .map(|t| i32::try_from(t).unwrap_or(i32::MAX)),
+            tokens_output: outcome
+                .tokens_output
+                .map(|t| i32::try_from(t).unwrap_or(i32::MAX)),
+            model,
+            changed_files: None,
+            session_id: None,
+            is_max_turns_error: outcome.exhausted_turns,
+        };
         // Step 13: Save AI output immediately (so it's preserved even if push fails later)
         self.run_service
-            .update_status(
-                run_id,
-                UpdateRunFields {
-                    ai_output: Some(ai_result.output.clone()),
-                    ai_model: ai_result.model.clone(),
-                    ai_provider: Some(config.ai_provider.clone()),
-                    tokens_input: ai_result.tokens_input,
-                    tokens_output: ai_result.tokens_output,
-                    ai_session_id: ai_result.session_id.clone(),
-                    ..Default::default()
-                },
-            )
+            .update_status(run_id, agent_output_fields(&ai_result))
             .await?;
         if ai_result.is_max_turns_error {
             self.run_service
@@ -3107,16 +2699,13 @@ impl AgentExecutor {
                     run_id,
                     "warning",
                     &format!(
-                        "AI CLI exhausted all turns (max_turns={}, continuations={}). Output may be incomplete.",
-                        config.max_turns, continuation
+                        "The agent used all {} turns before finishing. Its work may be incomplete.",
+                        config.max_turns
                     ),
                     Some(serde_json::json!({
-                        "exit_code": ai_result.exit_code,
-                        "tokens_input": ai_result.tokens_input,
-                        "tokens_output": ai_result.tokens_output,
+                        "turns": outcome.turns,
                         "model": ai_result.model,
                         "is_max_turns_error": true,
-                        "continuations": continuation,
                     })),
                 )
                 .await?;
@@ -3125,11 +2714,9 @@ impl AgentExecutor {
                 .append_log(
                     run_id,
                     "info",
-                    "AI CLI completed",
+                    "The agent finished",
                     Some(serde_json::json!({
-                        "exit_code": ai_result.exit_code,
-                        "tokens_input": ai_result.tokens_input,
-                        "tokens_output": ai_result.tokens_output,
+                        "turns": outcome.turns,
                         "model": ai_result.model,
                     })),
                 )
@@ -3139,9 +2726,7 @@ impl AgentExecutor {
         // Report deliverable: store the AI output as the report and complete.
         // No branch, no PR, no deployment.
         if config.deliverable == "report" {
-            // Extract all assistant text blocks from the AI output to build the full report.
-            // Supports both Claude stream-json and Codex --json formats.
-            let report_text = extract_report_text(&ai_result.output);
+            let report_text = finished_report(&ai_result, run_id, outcome.turns)?;
 
             self.run_service
                 .update_status(
@@ -4096,6 +3681,43 @@ impl AgentExecutor {
 }
 
 /// Build the CLI command args for running Claude (or Codex) in a sandbox.
+/// Coding CLIs an agent could be set up for before ADR-116.
+const RETIRED_HARNESSES: [&str; 3] = ["claude_cli", "codex_cli", "opencode"];
+
+/// Whether an agent's saved provider is a coding CLI agents no longer run.
+pub fn is_retired_harness(ai_provider: &str) -> bool {
+    RETIRED_HARNESSES.contains(&ai_provider)
+}
+
+/// What a finished agent loop saves on its run. The provider is the AI
+/// gateway's, whatever the agent was saved with: every run goes through the
+/// gateway now (ADR-116), so an agent set up for a retired coding CLI is not
+/// recorded as having run on it.
+fn agent_output_fields(ai_result: &AiRunResult) -> UpdateRunFields {
+    UpdateRunFields {
+        ai_output: Some(ai_result.output.clone()),
+        ai_model: ai_result.model.clone(),
+        ai_provider: Some(crate::services::agent_loop::GATEWAY_PROVIDER.to_string()),
+        tokens_input: ai_result.tokens_input,
+        tokens_output: ai_result.tokens_output,
+        ai_session_id: ai_result.session_id.clone(),
+        ..Default::default()
+    }
+}
+
+/// The gateway model an agent runs on: none (the gateway's default) for an
+/// agent saved with a coding CLI, whose model ids the gateway does not know;
+/// otherwise the model it names, if any (ADR-116 D5).
+pub fn gateway_model(ai_provider: &str, ai_model: Option<&str>) -> Option<String> {
+    if is_retired_harness(ai_provider) {
+        return None;
+    }
+    ai_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
 pub fn build_claude_cmd(
     provider_name: &str,
     prompt: &str,
@@ -4251,6 +3873,26 @@ pub fn normalize_markdown(raw: &str) -> String {
 /// `--json` (`type: "item.completed"` with `item.type: "agent_message"`).
 /// Falls back to a Claude `type: "result"` summary, then raw output.
 pub fn extract_report_text(output: &str) -> String {
+    // Last resort: raw output
+    assistant_report_text(output).unwrap_or_else(|| output.to_string())
+}
+
+/// What the model wrote in `output`, joined: the agent loop's text, a
+/// coding CLI's assistant messages, or its result summary. `None` when it
+/// wrote nothing, so a caller never takes the raw transcript for a report.
+/// The report a report run stores: what the model wrote once it was done.
+/// A run out of turns is not done (the loop ends that way only after a turn
+/// that called tools, whose results the model never read: its text then is
+/// progress, "I'll inspect the configuration"), and one that wrote no text
+/// has no report; both fail rather than complete with them.
+fn finished_report(result: &AiRunResult, run_id: i32, turns: u32) -> Result<String, AgentError> {
+    if result.is_max_turns_error {
+        return Err(AgentError::AgentReportUnfinished { run_id, turns });
+    }
+    assistant_report_text(&result.output).ok_or(AgentError::AgentWroteNoReport { run_id, turns })
+}
+
+pub fn assistant_report_text(output: &str) -> Option<String> {
     let mut assistant_texts: Vec<String> = Vec::new();
 
     for line in output.lines() {
@@ -4269,6 +3911,14 @@ pub fn extract_report_text(output: &str) -> String {
         };
 
         match event_type {
+            // Temps' own agent loop (ADR-116): {"type":"temps.text","text":"..."}
+            "temps.text" => {
+                if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+                    if !text.is_empty() {
+                        assistant_texts.push(text.to_string());
+                    }
+                }
+            }
             // Claude stream-json: {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
             "assistant" => {
                 if let Some(content) = v
@@ -4317,7 +3967,7 @@ pub fn extract_report_text(output: &str) -> String {
     }
 
     if !assistant_texts.is_empty() {
-        return assistant_texts.join("\n\n");
+        return Some(assistant_texts.join("\n\n"));
     }
 
     // Fallback: try the Claude "result" summary
@@ -4329,14 +3979,12 @@ pub fn extract_report_text(output: &str) -> String {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                 if let Some(result) = v.get("result").and_then(|r| r.as_str()) {
-                    return result.to_string();
+                    return Some(result.to_string());
                 }
             }
         }
     }
-
-    // Last resort: raw output
-    output.to_string()
+    None
 }
 
 /// Most skipped entries named individually in a run-log warning; the rest
@@ -4382,6 +4030,18 @@ fn skipped_overlay_entries_message(
         owner,
         repo
     ))
+}
+
+/// The run-log warning for MCP servers and custom tools an agent defines:
+/// they are installed in the sandbox, but the gateway tool loop (ADR-116 D2)
+/// does not offer them to the model.
+fn mcp_not_offered_warning(names: &[&str]) -> String {
+    format!(
+        "This agent defines MCP servers or custom tools ({}). Agents now run on the AI \
+         gateway's tool loop, which offers the model only its sandbox tools: these are \
+         installed in the sandbox but the agent cannot call them.",
+        names.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -4506,6 +4166,16 @@ mod scoped_token_git_env_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_the_loop_cannot_call_are_named_in_the_run_log() {
+        let warning = mcp_not_offered_warning(&["github", "temps-custom-tools"]);
+        assert!(
+            warning.contains("(github, temps-custom-tools)"),
+            "{warning}"
+        );
+        assert!(warning.contains("cannot call them"), "{warning}");
+    }
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
@@ -4580,131 +4250,219 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn an_agent_saved_with_a_coding_cli_runs_on_the_gateway_default_model() {
+        for cli in ["claude_cli", "codex_cli", "opencode"] {
+            assert!(is_retired_harness(cli));
+            assert_eq!(gateway_model(cli, Some("sonnet")), None);
+        }
+        assert!(!is_retired_harness("gateway"));
+        assert_eq!(
+            gateway_model("gateway", Some(" gpt-test ")),
+            Some("gpt-test".to_string())
+        );
+        assert_eq!(gateway_model("gateway", Some("  ")), None);
+        assert_eq!(gateway_model("gateway", None), None);
+    }
+
+    #[test]
+    fn a_transcript_with_no_model_text_has_no_report() {
+        // The last turns only called tools, then the turns ran out.
+        let transcript = [
+            r#"{"type":"temps.tool_call","id":"c1","name":"sandbox_exec","input":{"command":"ls"}}"#,
+            r#"{"type":"temps.tool_result","id":"c1","output":"src
+","is_error":false}"#,
+            r#"{"type":"temps.finish","reason":"max_turns","turns":3}"#,
+        ]
+        .join("\n");
+        assert_eq!(assistant_report_text(&transcript), None);
+        let with_text = format!(
+            "{}\n{transcript}",
+            r#"{"type":"temps.text","text":"Found the cause."}"#
+        );
+        assert_eq!(
+            assistant_report_text(&with_text).as_deref(),
+            Some("Found the cause.")
+        );
+    }
+
+    #[test]
+    fn a_report_run_out_of_turns_is_not_completed_with_its_progress_text() {
+        // max_turns = 1: the model said what it would do and called a tool,
+        // then the turns ran out before it read the result.
+        let transcript = [
+            r#"{"type":"temps.text","text":"I'll inspect the configuration."}"#,
+            r#"{"type":"temps.tool_call","id":"c1","name":"sandbox_read_file","input":{"path":"app.toml"}}"#,
+            r#"{"type":"temps.tool_result","id":"c1","output":"port = 3000","is_error":false}"#,
+            r#"{"type":"temps.finish","reason":"max_turns","turns":1}"#,
+        ]
+        .join("\n");
+        let result = |output: &str, exhausted: bool| AiRunResult {
+            output: output.to_string(),
+            exit_code: 0,
+            tokens_input: None,
+            tokens_output: None,
+            model: None,
+            changed_files: None,
+            session_id: None,
+            is_max_turns_error: exhausted,
+        };
+        let unfinished = finished_report(&result(&transcript, true), 7, 1).unwrap_err();
+        assert!(matches!(
+            unfinished,
+            AgentError::AgentReportUnfinished {
+                run_id: 7,
+                turns: 1
+            }
+        ));
+        assert!(unfinished.to_string().contains("max turns"));
+
+        let done = r#"{"type":"temps.text","text":"The port is 3000."}"#;
+        assert_eq!(
+            finished_report(&result(done, false), 7, 2).unwrap(),
+            "The port is 3000."
+        );
+        assert!(matches!(
+            finished_report(&result("", false), 7, 2),
+            Err(AgentError::AgentWroteNoReport { .. })
+        ));
+    }
+
+    #[test]
+    fn a_run_records_the_gateway_as_its_provider() {
+        let fields = agent_output_fields(&AiRunResult {
+            output: String::new(),
+            exit_code: 0,
+            tokens_input: Some(10),
+            tokens_output: Some(5),
+            model: Some("gpt-test".into()),
+            changed_files: None,
+            session_id: None,
+            is_max_turns_error: false,
+        });
+        assert_eq!(fields.ai_provider.as_deref(), Some("gateway"));
+        assert_eq!(fields.ai_model.as_deref(), Some("gpt-test"));
+        assert_eq!(fields.tokens_input, Some(10));
+    }
+
+    #[test]
+    fn the_report_and_pr_come_from_the_agent_loop_transcript() {
+        let transcript = [
+            r#"{"type":"temps.tool_call","id":"c1","name":"sandbox_exec","input":{"command":"ls"}}"#,
+            r#"{"type":"temps.tool_result","id":"c1","output":"exit code 0","is_error":false}"#,
+            r#"{"type":"temps.text","text":"Fixed the null check.\n<pr_title>fix: guard the empty order list</pr_title>\n<pr_body>\n## Summary\n- Guard it\n</pr_body>"}"#,
+            r#"{"type":"temps.finish","reason":"stop","turns":2}"#,
+        ]
+        .join("\n");
+        assert!(extract_report_text(&transcript).starts_with("Fixed the null check."));
+        let pr = extract_pr_metadata(&transcript);
+        assert_eq!(pr.title.as_deref(), Some("fix: guard the empty order list"));
+        assert_eq!(pr.body.as_deref(), Some("## Summary\n- Guard it"));
+    }
+
     // ---- Fakes ----
 
-    /// Fake AI CLI that writes files into work_dir and returns them in changed_files.
-    struct FakeAiCli {
+    /// A fake AI gateway: the agent writes `files_to_create` in the run's
+    /// sandbox with `sandbox_write_file`, then answers with `output`.
+    struct FakeGateway {
         files_to_create: Vec<(String, String)>,
         output: String,
+        turns: std::sync::atomic::AtomicUsize,
     }
 
-    fn fake_status(name: &str) -> crate::ai_cli::AiCliStatus {
-        crate::ai_cli::AiCliStatus {
-            provider: name.into(),
-            installed: true,
-            version: Some("1.0.0-fake".into()),
-            authenticated: true,
-            auth_method: Some("test".into()),
-            email: None,
-            subscription_type: None,
-            setup_hint: None,
-        }
-    }
-
-    #[async_trait]
-    impl AiCliProvider for FakeAiCli {
-        fn name(&self) -> &str {
-            "fake_cli"
-        }
-        async fn check_installed(&self) -> bool {
-            true
-        }
-        async fn get_status(&self) -> crate::ai_cli::AiCliStatus {
-            fake_status("fake_cli")
-        }
-        async fn run(&self, config: AiRunConfig) -> Result<AiRunResult, AgentError> {
-            for (path, content) in &self.files_to_create {
-                let full = config.work_dir.join(path);
-                if let Some(parent) = full.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                tokio::fs::write(&full, content).await?;
+    impl FakeGateway {
+        fn new(files_to_create: Vec<(String, String)>, output: &str) -> Self {
+            Self {
+                files_to_create,
+                output: output.to_string(),
+                turns: std::sync::atomic::AtomicUsize::new(0),
             }
-            Ok(AiRunResult {
-                output: self.output.clone(),
-                exit_code: 0,
-                tokens_input: Some(1000),
-                tokens_output: Some(500),
-                model: Some("fake-model".to_string()),
-                changed_files: Some(
-                    self.files_to_create
+        }
+    }
+
+    #[async_trait]
+    impl AiService for FakeGateway {
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn complete(
+            &self,
+            _request: temps_ai::AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+        async fn chat(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::ChatTurnResponse, temps_ai::AiError> {
+            let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if turn == 0 && !self.files_to_create.is_empty() {
+                return Ok(temps_ai::ChatTurnResponse {
+                    truncated: false,
+                    content: None,
+                    tool_calls: self
+                        .files_to_create
                         .iter()
-                        .map(|(p, _)| p.clone())
+                        .enumerate()
+                        .map(|(n, (path, content))| temps_ai::ToolCall {
+                            id: format!("write-{n}"),
+                            name: crate::services::agent_loop::SANDBOX_WRITE_TOOL.to_string(),
+                            arguments: serde_json::json!({ "path": path, "content": content })
+                                .to_string(),
+                        })
                         .collect(),
-                ),
-                session_id: None,
-                is_max_turns_error: false,
+                    usage: None,
+                });
+            }
+            Ok(temps_ai::ChatTurnResponse {
+                truncated: false,
+                content: Some(self.output.clone()),
+                tool_calls: Vec::new(),
+                usage: None,
             })
-        }
-        async fn continue_conversation(
-            &self,
-            config: AiRunConfig,
-        ) -> Result<AiRunResult, AgentError> {
-            self.run(config).await
         }
     }
 
-    /// Fake AI CLI that returns an error.
-    struct FailingAiCli;
+    /// A gateway whose every turn fails.
+    struct FailingGateway;
 
     #[async_trait]
-    impl AiCliProvider for FailingAiCli {
-        fn name(&self) -> &str {
-            "failing_cli"
-        }
-        async fn check_installed(&self) -> bool {
+    impl AiService for FailingGateway {
+        async fn is_available(&self) -> bool {
             true
         }
-        async fn get_status(&self) -> crate::ai_cli::AiCliStatus {
-            fake_status("failing_cli")
-        }
-        async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
-            Err(AgentError::AiCliFailed {
-                provider: "failing_cli".into(),
-                exit_code: 1,
-                stderr: "Simulated failure".into(),
-            })
-        }
-        async fn continue_conversation(
+        async fn complete(
             &self,
-            config: AiRunConfig,
-        ) -> Result<AiRunResult, AgentError> {
-            self.run(config).await
+            _request: temps_ai::AiRequest,
+        ) -> Result<temps_ai::AiResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+        async fn chat_stream(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::TokenStream, temps_ai::AiError> {
+            Err(temps_ai::AiError::NotAvailable)
+        }
+        async fn chat(
+            &self,
+            _request: temps_ai::ChatTurnRequest,
+        ) -> Result<temps_ai::ChatTurnResponse, temps_ai::AiError> {
+            Err(temps_ai::AiError::Provider {
+                purpose: "agents.run".into(),
+                reason: "Simulated failure".into(),
+            })
         }
     }
 
-    /// Fake AI CLI that returns no changes.
-    struct NoChangesAiCli;
-
-    #[async_trait]
-    impl AiCliProvider for NoChangesAiCli {
-        fn name(&self) -> &str {
-            "no_changes_cli"
-        }
-        async fn check_installed(&self) -> bool {
-            true
-        }
-        async fn get_status(&self) -> crate::ai_cli::AiCliStatus {
-            fake_status("no_changes_cli")
-        }
-        async fn run(&self, _config: AiRunConfig) -> Result<AiRunResult, AgentError> {
-            Ok(AiRunResult {
-                output: "I analyzed the code but couldn't find a fix.".into(),
-                exit_code: 0,
-                tokens_input: Some(500),
-                tokens_output: Some(200),
-                model: Some("fake-model".into()),
-                changed_files: Some(vec![]),
-                session_id: None,
-                is_max_turns_error: false,
-            })
-        }
-        async fn continue_conversation(
-            &self,
-            config: AiRunConfig,
-        ) -> Result<AiRunResult, AgentError> {
-            self.run(config).await
-        }
+    /// A gateway whose agent looks and changes nothing.
+    fn no_changes_gateway() -> FakeGateway {
+        FakeGateway::new(Vec::new(), "I analyzed the code but couldn't find a fix.")
     }
 
     /// Records what was pushed so tests can assert on it.
@@ -5061,8 +4819,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn make_encryption_service() -> Arc<EncryptionService> {
-        Arc::new(EncryptionService::new_from_password(
+    fn make_encryption_service() -> Arc<temps_core::EncryptionService> {
+        Arc::new(temps_core::EncryptionService::new_from_password(
             "test-password-for-autopilot",
         ))
     }
@@ -5160,15 +4918,14 @@ pub(crate) mod tests {
         let run_svc = Arc::new(AgentRunService::new(db.clone()));
         let config_svc = Arc::new(AgentConfigService::new(db.clone(), enc.clone()));
 
-        let ai = Arc::new(FakeAiCli {
-            files_to_create: vec![("src/fix.ts".into(), "fixed code".into())],
-            output: "I fixed the TypeError by adding a null check.".into(),
-        });
+        let ai = Arc::new(FakeGateway::new(
+            vec![("src/fix.ts".into(), "fixed code".into())],
+            "I fixed the TypeError by adding a null check.",
+        ));
 
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc,
             queue.clone(),
             run_svc,
             config_svc,
@@ -5177,7 +4934,7 @@ pub(crate) mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
-        .with_ai_provider(ai);
+        .with_ai_service(ai);
 
         executor.execute_run(run_id).await;
 
@@ -5303,11 +5060,10 @@ pub(crate) mod tests {
         let run_svc = Arc::new(AgentRunService::new(db.clone()));
         let config_svc = Arc::new(AgentConfigService::new(db.clone(), enc.clone()));
 
-        let ai = Arc::new(NoChangesAiCli);
+        let ai = Arc::new(no_changes_gateway());
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc,
             queue.clone(),
             run_svc,
             config_svc,
@@ -5316,7 +5072,7 @@ pub(crate) mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
-        .with_ai_provider(ai);
+        .with_ai_service(ai);
 
         executor.execute_run(run_id).await;
 
@@ -5423,15 +5179,11 @@ pub(crate) mod tests {
         let files: Vec<(String, String)> = (0..51)
             .map(|i| (format!("src/file_{}.ts", i), format!("content {}", i)))
             .collect();
-        let ai = Arc::new(FakeAiCli {
-            files_to_create: files,
-            output: "I refactored the entire codebase".into(),
-        });
+        let ai = Arc::new(FakeGateway::new(files, "I refactored the entire codebase"));
 
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc,
             queue.clone(),
             run_svc,
             config_svc,
@@ -5440,7 +5192,7 @@ pub(crate) mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
-        .with_ai_provider(ai);
+        .with_ai_service(ai);
 
         executor.execute_run(run_id).await;
 
@@ -5513,15 +5265,11 @@ pub(crate) mod tests {
         let run_svc = Arc::new(AgentRunService::new(db.clone()));
         let config_svc = Arc::new(AgentConfigService::new(db.clone(), enc.clone()));
 
-        let ai = Arc::new(FakeAiCli {
-            files_to_create: vec![],
-            output: "".into(),
-        });
+        let ai = Arc::new(FakeGateway::new(vec![], ""));
 
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc,
             queue.clone(),
             run_svc,
             config_svc,
@@ -5530,7 +5278,7 @@ pub(crate) mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
-        .with_ai_provider(ai);
+        .with_ai_service(ai);
 
         executor.execute_run(run_id).await;
 
@@ -5622,11 +5370,10 @@ pub(crate) mod tests {
         let run_svc = Arc::new(AgentRunService::new(db.clone()));
         let config_svc = Arc::new(AgentConfigService::new(db.clone(), enc.clone()));
 
-        let ai: Arc<dyn AiCliProvider> = Arc::new(FailingAiCli);
+        let ai: Arc<dyn AiService> = Arc::new(FailingGateway);
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc,
             queue.clone(),
             run_svc,
             config_svc,
@@ -5635,7 +5382,7 @@ pub(crate) mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
-        .with_ai_provider(ai);
+        .with_ai_service(ai);
 
         executor.execute_run(run_id).await;
 
@@ -6103,14 +5850,10 @@ pub(crate) mod tests {
         let run_svc = Arc::new(AgentRunService::new(db.clone()));
         let config_svc = Arc::new(AgentConfigService::new(db.clone(), enc.clone()));
 
-        let ai = Arc::new(FakeAiCli {
-            files_to_create: vec![],
-            output: "".into(),
-        });
+        let ai = Arc::new(FakeGateway::new(vec![], ""));
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc,
             queue.clone(),
             run_svc,
             config_svc,
@@ -6119,7 +5862,7 @@ pub(crate) mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
-        .with_ai_provider(ai);
+        .with_ai_service(ai);
 
         executor.execute_run(run_id).await;
 
@@ -6233,7 +5976,6 @@ pub(crate) mod tests {
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc.clone(),
             queue,
             run_svc.clone(),
             Arc::new(AgentConfigService::new(db.clone(), enc)),
@@ -6290,7 +6032,6 @@ pub(crate) mod tests {
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc.clone(),
             queue,
             Arc::new(AgentRunService::new(db.clone())),
             Arc::new(AgentConfigService::new(db.clone(), enc)),
@@ -6339,7 +6080,6 @@ pub(crate) mod tests {
         AgentExecutor::new(
             db.clone(),
             git,
-            enc,
             queue,
             run_svc,
             config_svc,
@@ -6396,7 +6136,6 @@ pub(crate) mod tests {
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc.clone(),
             queue,
             Arc::new(AgentRunService::new(db.clone())),
             Arc::new(AgentConfigService::new(db.clone(), enc)),
@@ -6422,12 +6161,20 @@ pub(crate) mod tests {
             .into_connection();
         let (executor, sandboxes) = make_executor_for_cancel_tests(db);
         executor.run_token_ids.write().await.insert(run_id, 999);
+        let loop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        executor
+            .run_cancel_flags
+            .write()
+            .await
+            .insert(run_id, loop_flag.clone());
 
         let run = executor.cancel_run(run_id).await.expect("cancel");
 
         assert_eq!(run.status, "cancelled");
         assert_eq!(*sandboxes.released.lock().unwrap(), vec![run_id]);
         assert!(executor.run_token_ids.read().await.is_empty());
+        // The agent loop sees the cancel before its next paid turn.
+        assert!(loop_flag.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -6476,7 +6223,6 @@ pub(crate) mod tests {
         let executor = AgentExecutor::new(
             db.clone(),
             git,
-            enc.clone(),
             queue,
             Arc::new(AgentRunService::new(db.clone())),
             Arc::new(AgentConfigService::new(db.clone(), enc)),

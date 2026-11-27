@@ -104,6 +104,7 @@ impl ExternalServiceManager {
             project_id_val,
             claim_user_id,
             DatabaseProvisioningConfig::default(),
+            BTreeMap::new(),
         )
         .await
     }
@@ -114,17 +115,20 @@ impl ExternalServiceManager {
         project_id_val: i32,
         claim_user_id: Option<i32>,
         provisioning: DatabaseProvisioningConfig,
+        env_aliases: BTreeMap<String, String>,
     ) -> Result<ProjectServiceInfo, ExternalServiceError> {
         let claims = claim_user_id
             .map(|user_id| BTreeMap::from([(service_id_val, user_id)]))
             .unwrap_or_default();
         let provisioning_by_service = BTreeMap::from([(service_id_val, provisioning)]);
+        let env_aliases_by_service = BTreeMap::from([(service_id_val, env_aliases)]);
         let mut links = self
             .link_services_to_project_transactionally(
                 &[service_id_val],
                 project_id_val,
                 &claims,
                 &provisioning_by_service,
+                &env_aliases_by_service,
             )
             .await?;
         let link = links
@@ -162,22 +166,26 @@ impl ExternalServiceManager {
         })
     }
 
-    /// Link every selected service and consume creator claims in one transaction.
+    /// Link every selected service, store each link's variable aliases and
+    /// consume creator claims in one transaction.
     ///
     /// Project creation uses this bulk operation so a validation or insert failure
     /// for a later database cannot leave an earlier database unlinked with its
-    /// one-time creator claim already consumed.
+    /// one-time creator claim already consumed, or a link stored without the
+    /// aliases its first deployment needs.
     pub async fn link_services_to_project_with_claims(
         &self,
         service_ids: &[i32],
         project_id: i32,
         claims: &BTreeMap<i32, i32>,
+        env_aliases_by_service: &BTreeMap<i32, BTreeMap<String, String>>,
     ) -> Result<(), ExternalServiceError> {
         self.link_services_to_project_transactionally(
             service_ids,
             project_id,
             claims,
             &BTreeMap::new(),
+            env_aliases_by_service,
         )
         .await?;
         Ok(())
@@ -189,12 +197,32 @@ impl ExternalServiceManager {
         project_id: i32,
         claims: &BTreeMap<i32, i32>,
         provisioning_by_service: &BTreeMap<i32, DatabaseProvisioningConfig>,
+        env_aliases_by_service: &BTreeMap<i32, BTreeMap<String, String>>,
     ) -> Result<Vec<project_services::Model>, ExternalServiceError> {
         let mut ordered_service_ids = service_ids.to_vec();
         ordered_service_ids.sort_unstable();
         ordered_service_ids.dedup();
         if ordered_service_ids.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Aliases are checked before anything is locked or written, and stored
+        // on the link row itself, so a link never exists without them.
+        let mut env_aliases_json = BTreeMap::new();
+        for service_id in &ordered_service_ids {
+            let aliases = env_aliases_by_service
+                .get(service_id)
+                .cloned()
+                .unwrap_or_default();
+            validate_env_aliases(*service_id, project_id, &aliases)?;
+            let json = serde_json::to_value(&aliases).map_err(|error| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "serializing variable aliases for service {service_id} in project {project_id}: {error}"
+                    ),
+                }
+            })?;
+            env_aliases_json.insert(*service_id, json);
         }
 
         let claims = claims.clone();
@@ -293,6 +321,9 @@ impl ExternalServiceManager {
                             service_id: Set(service.id),
                             database_provisioning_mode: Set(provisioning.mode.as_str().to_string()),
                             custom_database_name: Set(provisioning.custom_database_name),
+                            env_aliases: Set(env_aliases_json
+                                .remove(&service.id)
+                                .unwrap_or_else(|| serde_json::json!({}))),
                             created_at: Set(now),
                             updated_at: Set(now),
                             ..Default::default()
@@ -627,6 +658,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn link_aliases_are_written_by_the_link_insert_itself() {
+        let mut service = encrypted_service_model(71, serde_json::json!({}));
+        service.created_by_user_id = None;
+        let project = environment_preview_project(10);
+        let aliases = BTreeMap::from([("DATABASE_URL".to_string(), "POSTGRES_URL".to_string())]);
+        let link = project_services::Model {
+            id: 9,
+            project_id: 10,
+            service_id: 71,
+            database_provisioning_mode: DatabaseProvisioningMode::Project.as_str().to_string(),
+            custom_database_name: None,
+            env_aliases: serde_json::to_value(&aliases).expect("aliases serialize"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service.clone()]])
+                .append_query_results([vec![project.clone()]])
+                .append_query_results([Vec::<project_services::Model>::new(), Vec::new()])
+                .append_query_results([vec![link]])
+                .append_query_results([vec![service]])
+                .append_query_results([vec![project]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(Arc::clone(&db));
+        manager
+            .link_service_to_project_with_provisioning(
+                71,
+                10,
+                None,
+                DatabaseProvisioningConfig::default(),
+                aliases,
+            )
+            .await
+            .expect("link with variable aliases");
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("database still owned"));
+        let log = db.into_transaction_log();
+        let statements: Vec<String> = log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.to_string())
+            .collect();
+        let insert = statements
+            .iter()
+            .find(|sql| sql.starts_with("INSERT INTO \"project_services\""))
+            .expect("link insert executed");
+        assert!(insert.contains("env_aliases"), "{insert}");
+        assert!(insert.contains("POSTGRES_URL"), "{insert}");
+        assert!(
+            !statements
+                .iter()
+                .any(|sql| sql.starts_with("UPDATE \"project_services\"")),
+            "aliases must not be a second write after the link: {statements:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_link_aliases_are_refused_before_anything_is_written() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let manager = mock_service_manager_with_db(Arc::clone(&db));
+        let error = manager
+            .link_service_to_project_with_provisioning(
+                71,
+                10,
+                None,
+                DatabaseProvisioningConfig::default(),
+                BTreeMap::from([("DATABASE_URL".to_string(), "not a name".to_string())]),
+            )
+            .await
+            .expect_err("an alias onto something that is not a variable name is refused");
+        assert!(matches!(
+            error,
+            ExternalServiceError::InvalidDatabaseProvisioning {
+                service_id: 71,
+                project_id: 10,
+                ..
+            }
+        ));
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("database still owned"));
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[tokio::test]
     async fn database_provisioning_link_persists_selected_mode_and_name() {
         for (mode, name) in [
             (DatabaseProvisioningMode::Project, None),
@@ -644,6 +763,7 @@ mod tests {
                 service_id: 71,
                 database_provisioning_mode: mode.as_str().to_string(),
                 custom_database_name: name.clone(),
+                env_aliases: serde_json::json!({}),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
             };
@@ -667,6 +787,7 @@ mod tests {
                         mode,
                         custom_database_name: name.clone(),
                     },
+                    BTreeMap::new(),
                 )
                 .await
                 .expect("link with selected database provisioning");
@@ -715,6 +836,7 @@ mod tests {
                     mode: DatabaseProvisioningMode::Custom,
                     custom_database_name: Some("bad-name".to_string()),
                 },
+                BTreeMap::new(),
             )
             .await
             .expect_err("invalid custom database must reject link");
@@ -751,6 +873,7 @@ mod tests {
                 service_id: 17,
                 database_provisioning_mode: "project_environment".to_string(),
                 custom_database_name: None,
+                env_aliases: serde_json::json!({}),
                 created_at: now,
                 updated_at: now,
             },
@@ -760,6 +883,7 @@ mod tests {
                 service_id: 17,
                 database_provisioning_mode: "project_environment".to_string(),
                 custom_database_name: None,
+                env_aliases: serde_json::json!({}),
                 created_at: now,
                 updated_at: now,
             },
@@ -870,7 +994,12 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
 
         let error = manager
-            .link_services_to_project_with_claims(&service_ids, project.id, &claims)
+            .link_services_to_project_with_claims(
+                &service_ids,
+                project.id,
+                &claims,
+                &BTreeMap::new(),
+            )
             .await
             .expect_err("duplicate database types must reject the whole bulk link");
         assert!(matches!(

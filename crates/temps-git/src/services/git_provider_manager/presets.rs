@@ -343,53 +343,100 @@ impl GitProviderManager {
             })
             .await?;
 
-        let Some(env_path) =
-            temps_presets::detect_env_example_files_in_directory(&files, root_directory)
-                .into_iter()
-                .next()
-        else {
-            return Ok(RepositoryEnvExampleDomain {
-                repository_id,
-                path: None,
-                variables: Vec::new(),
-            });
-        };
-
-        let file = self
-            .execute_with_refresh(connection_id, |access_token| {
-                let provider_service = provider_service.clone();
-                let owner = repository.owner.clone();
-                let name = repository.name.clone();
-                let target_branch = target_branch.clone();
-                let env_path = env_path.clone();
-                async move {
-                    provider_service
-                        .get_file_content(
-                            &access_token,
-                            &owner,
-                            &name,
-                            &env_path,
-                            Some(&target_branch),
-                        )
-                        .await
-                }
-            })
-            .await?;
-
-        let content = decode_file_content(&file.content, &file.encoding);
-        let variables = temps_presets::parse_env_example(&content)
+        let env_path = temps_presets::detect_env_example_files_in_directory(&files, root_directory)
             .into_iter()
-            .map(|v| EnvExampleVariableDomain {
-                key: v.key,
-                default_value: v.default_value,
-                description: v.description,
-            })
+            .next();
+
+        let mut variables = Vec::new();
+        if let Some(env_path) = env_path.as_deref() {
+            let content = self
+                .read_repository_text_file(
+                    connection_id,
+                    &repository.owner,
+                    &repository.name,
+                    env_path,
+                    &target_branch,
+                )
+                .await?;
+            variables = temps_presets::parse_env_example(&content)
+                .into_iter()
+                .map(|v| EnvExampleVariableDomain {
+                    key: v.key,
+                    default_value: v.default_value,
+                    description: v.description,
+                })
+                .collect();
+        }
+
+        // Detection reads only the manifests and Compose file the tree fetch
+        // above already showed exist at the project root: at most
+        // `MANIFEST_FILES.len() + 1` small reads, and none when absent. A file
+        // that cannot be read is skipped; detection is a hint, never a gate.
+        let root = normalize_root(root_directory);
+        let mut manifests = Vec::new();
+        for manifest in temps_presets::MANIFEST_FILES {
+            let path = join_root(&root, manifest);
+            if !files.iter().any(|f| f == &path) {
+                continue;
+            }
+            match self
+                .read_repository_text_file(
+                    connection_id,
+                    &repository.owner,
+                    &repository.name,
+                    &path,
+                    &target_branch,
+                )
+                .await
+            {
+                Ok(content) => manifests.push(temps_presets::RepoFile { path, content }),
+                Err(error) => tracing::debug!(
+                    repository_id,
+                    path = %path,
+                    %error,
+                    "Skipping a manifest database detection could not read"
+                ),
+            }
+        }
+        let mut compose_images = Vec::new();
+        if let Some(compose_path) = [
+            "compose.yaml",
+            "compose.yml",
+            "docker-compose.yml",
+            "docker-compose.yaml",
+        ]
+        .iter()
+        .map(|name| join_root(&root, name))
+        .find(|path| files.iter().any(|f| f == path))
+        {
+            if let Ok(content) = self
+                .read_repository_text_file(
+                    connection_id,
+                    &repository.owner,
+                    &repository.name,
+                    &compose_path,
+                    &target_branch,
+                )
+                .await
+            {
+                compose_images = temps_presets::list_compose_services(&content)
+                    .map(|services| services.into_iter().filter_map(|s| s.image).collect())
+                    .unwrap_or_default();
+            }
+        }
+
+        let env_pairs: Vec<(String, String)> = variables
+            .iter()
+            .map(|v| (v.key.clone(), v.default_value.clone()))
             .collect();
+        let suggested_services =
+            temps_presets::suggest_services(&env_pairs, &manifests, &compose_images);
 
         Ok(RepositoryEnvExampleDomain {
             repository_id,
-            path: Some(env_path),
+            path: env_path,
             variables,
+            suggested_services,
         })
     }
 
@@ -1004,5 +1051,45 @@ services:
         tree.assert_async().await;
         dockerfile.assert_async().await;
         missing_nested_dockerfile.assert_async().await;
+    }
+}
+
+/// The project root as a path prefix: `""` for the repository root,
+/// `apps/web` otherwise.
+fn normalize_root(root_directory: &str) -> String {
+    let root = root_directory
+        .trim()
+        .trim_start_matches("./")
+        .trim_matches('/');
+    if root == "." {
+        String::new()
+    } else {
+        root.to_string()
+    }
+}
+
+fn join_root(root: &str, name: &str) -> String {
+    if root.is_empty() {
+        name.to_string()
+    } else {
+        format!("{root}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    #[test]
+    fn roots_join_onto_tree_paths() {
+        assert_eq!(
+            join_root(&normalize_root("./"), "package.json"),
+            "package.json"
+        );
+        assert_eq!(join_root(&normalize_root("."), "go.mod"), "go.mod");
+        assert_eq!(
+            join_root(&normalize_root("./apps/web/"), "package.json"),
+            "apps/web/package.json"
+        );
     }
 }

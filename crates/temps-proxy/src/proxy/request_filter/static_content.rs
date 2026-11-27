@@ -6,26 +6,85 @@
 use super::super::*;
 use super::Flow;
 
+/// Where a request's static files come from, if anywhere.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StaticSource {
+    /// Serve the files under this directory.
+    Dir(String),
+    /// Not a static deployment: the request goes on to its upstream.
+    NotStatic,
+    /// A private static route no project admitted: the project stage, which
+    /// applies the IP policy and the password wall, never ran for it (the
+    /// host was withdrawn by a reload, or belongs to no project). Never
+    /// served.
+    Unadmitted,
+}
+
 impl LoadBalancer {
+    /// The directory a request's static files come from. A path route
+    /// serves from its target: its files if the target is static, the
+    /// upstream otherwise. On node 0's private path (ADR-115 D3) the route
+    /// admitted there is the only one, since the public resolver no longer
+    /// knows the host, and it is served only once the project stage admitted
+    /// the request for that same project and environment.
+    pub(super) async fn static_source(&self, ctx: &ProxyContext) -> StaticSource {
+        if let Some(route) = ctx.path_route.as_ref() {
+            return route
+                .target
+                .as_ref()
+                .and_then(|target| target.static_dir())
+                .map_or(StaticSource::NotStatic, |dir| {
+                    StaticSource::Dir(dir.to_string())
+                });
+        }
+        if let Some(route) = ctx.private_route.as_ref() {
+            let Some(dir) = route.static_dir() else {
+                return StaticSource::NotStatic;
+            };
+            // The project stage polices per environment (IP policy,
+            // password wall), so the request must have been admitted for
+            // this route's own environment, not a sibling the host moved to
+            // between the private lookup and project resolution.
+            let admitted = match (
+                ctx.project.as_ref(),
+                ctx.environment.as_ref(),
+                route.project.as_ref(),
+                route.environment.as_ref(),
+            ) {
+                (Some(project), Some(environment), Some(owner), Some(owner_environment)) => {
+                    project.id == owner.id && environment.id == owner_environment.id
+                }
+                _ => false,
+            };
+            return if admitted {
+                StaticSource::Dir(dir.to_string())
+            } else {
+                StaticSource::Unadmitted
+            };
+        }
+        self.project_context_resolver
+            .get_static_path(&ctx.host)
+            .await
+            .map_or(StaticSource::NotStatic, StaticSource::Dir)
+    }
+
     /// A static deployment's files. A path route serves from its target instead: its files if the target is static, the upstream otherwise.
     pub(super) async fn static_files_stage(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
     ) -> Result<Flow> {
-        // Check if this is a static deployment using route table. A path
-        // route serves from its target instead: its files if the target is
-        // static, the upstream otherwise.
-        let static_dir = match ctx.path_route.as_ref() {
-            Some(route) => route
-                .target
-                .as_ref()
-                .and_then(|target| target.static_dir())
-                .map(str::to_string),
-            None => {
-                self.project_context_resolver
-                    .get_static_path(&ctx.host)
-                    .await
+        let static_dir = match self.static_source(ctx).await {
+            StaticSource::Dir(dir) => Some(dir),
+            StaticSource::NotStatic => None,
+            StaticSource::Unadmitted => {
+                warn!(
+                    host = %bounded_log_value(&ctx.host),
+                    "Private static route reached the file stage without an admitted project; refused"
+                );
+                ctx.routing_status = "private_route_unadmitted".to_string();
+                session.respond_error(404).await?;
+                return Ok(Flow::Answered);
             }
         };
         if let Some(static_dir) = static_dir {
@@ -230,5 +289,78 @@ impl LoadBalancer {
         }
 
         Ok(Flow::Continue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::markdown::tests::markdown_tests::make_ctx;
+    use crate::proxy::static_serving::static_path_route_redirect_tests::load_balancer;
+    use std::sync::Arc;
+
+    fn project(id: i32) -> Arc<temps_entities::projects::Model> {
+        Arc::new(super::super::order_tests::project(id))
+    }
+
+    fn environment(id: i32, project_id: i32) -> Arc<temps_entities::environments::Model> {
+        Arc::new(super::super::order_tests::environment(id, project_id))
+    }
+
+    /// A private static route owned by `owner` (project, environment).
+    fn private_static(owner: Option<(i32, i32)>) -> temps_routes::RouteInfo {
+        temps_routes::RouteInfo {
+            backend: temps_routes::BackendType::StaticDir {
+                path: "/srv/app".to_string(),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: owner.map(|(project_id, _)| project(project_id)),
+            environment: owner.map(|(project_id, id)| environment(id, project_id)),
+            deployment: None,
+            cert_eligible: false,
+        }
+    }
+
+    /// ADR-115 D3: a static deployment on node 0's private address is served
+    /// from its own route's directory, which the public resolver (it knows
+    /// no such host here) cannot give, but only after the project stage
+    /// admitted the request for the route's own project and environment.
+    /// One admitted for a sibling environment passed that environment's IP
+    /// policy and password wall, not this one's; one no project admitted
+    /// (a reload withdrew the host, or it belongs to none) passed neither.
+    #[tokio::test]
+    async fn a_private_static_route_is_served_only_once_its_environment_admitted_it() {
+        let data_dir = temp_dir::TempDir::new().expect("temp dir");
+        let lb = load_balancer(data_dir.path()).expect("load balancer");
+        let mut ctx = make_ctx();
+        ctx.host = "app.internal.example.com".to_string();
+
+        // Public: the resolver does not know the host.
+        assert_eq!(lb.static_source(&ctx).await, StaticSource::NotStatic);
+
+        // Private, admitted by the project stage for its own environment.
+        ctx.private_route = Some(private_static(Some((7, 70))));
+        ctx.project = Some(project(7));
+        ctx.environment = Some(environment(70, 7));
+        assert_eq!(
+            lb.static_source(&ctx).await,
+            StaticSource::Dir("/srv/app".to_string())
+        );
+
+        // A sibling environment of the same project, another project, no
+        // admission at all, or a route without an owner: never served.
+        ctx.environment = Some(environment(71, 7));
+        assert_eq!(lb.static_source(&ctx).await, StaticSource::Unadmitted);
+        ctx.project = Some(project(8));
+        ctx.environment = Some(environment(70, 8));
+        assert_eq!(lb.static_source(&ctx).await, StaticSource::Unadmitted);
+        ctx.project = None;
+        ctx.environment = None;
+        assert_eq!(lb.static_source(&ctx).await, StaticSource::Unadmitted);
+        ctx.private_route = Some(private_static(None));
+        ctx.project = Some(project(7));
+        ctx.environment = Some(environment(70, 7));
+        assert_eq!(lb.static_source(&ctx).await, StaticSource::Unadmitted);
     }
 }

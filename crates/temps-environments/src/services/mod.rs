@@ -4,6 +4,7 @@
 pub mod env_var_service;
 pub mod environment_service;
 pub mod environment_teardown;
+pub mod generated_value;
 pub mod ingress_service;
 pub mod preview_cleanup;
 pub mod secret_service;

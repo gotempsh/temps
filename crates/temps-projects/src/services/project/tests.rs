@@ -739,6 +739,7 @@ async fn an_external_project_is_not_deployed_on_creation() {
             memory_limit: None,
             is_public_repo: None,
             storage_service_ids: vec![],
+            storage_service_env_aliases: Default::default(),
             storage_service_claim_ids: vec![],
             storage_service_claim_user_id: None,
             source_type: temps_entities::source_type::SourceType::Git,
@@ -800,6 +801,7 @@ fn template_service_request(name: &str, slug: &str) -> CreateProjectRequest {
         memory_limit: None,
         is_public_repo: None,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -1377,6 +1379,7 @@ async fn test_update_project_emits_event() {
         memory_limit: None,
         is_public_repo: None,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -1941,6 +1944,7 @@ async fn test_update_project_event_includes_correct_data() {
         environment_variables: None,
         automatic_deploy: false,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         is_public_repo: None,
@@ -4360,6 +4364,7 @@ fn create_request(name: &str) -> CreateProjectRequest {
         memory_limit: None,
         is_public_repo: None,
         storage_service_ids: vec![],
+        storage_service_env_aliases: Default::default(),
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
         source_type: temps_entities::source_type::SourceType::Git,
@@ -5167,6 +5172,38 @@ async fn insert_search_test_project(
     .insert(db)
     .await
     .expect("insert search test project")
+}
+
+/// A project just created and not yet deployed sorts after every deployed
+/// one by default, so a caller watching for it lists newest first instead.
+#[tokio::test]
+async fn a_new_undeployed_project_leads_the_newest_first_order() {
+    if !temps_test_utils::docker_available().await {
+        println!("Docker not available, skipping");
+        return;
+    }
+    let test_db = TestDatabase::with_migrations().await.unwrap();
+    let db = test_db.db.clone();
+    let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+    let deployed = insert_search_test_project(db.as_ref(), "Deployed", "deployed").await;
+    let mut stamped: temps_entities::projects::ActiveModel = deployed.clone().into();
+    stamped.created_at = Set(chrono::Utc::now() - chrono::Duration::days(30));
+    stamped.last_deployment = Set(Some(chrono::Utc::now()));
+    stamped.update(db.as_ref()).await.expect("stamp deployment");
+    let fresh = insert_search_test_project(db.as_ref(), "Fresh", "fresh").await;
+
+    let (by_deployment, _) = service
+        .get_projects_paginated_filtered(1, 1, &[], None, None, ProjectOrder::LastDeployed)
+        .await
+        .unwrap();
+    assert_eq!(by_deployment[0].id, deployed.id);
+    let (newest, total) = service
+        .get_projects_paginated_filtered(1, 1, &[], None, None, ProjectOrder::Created)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(newest[0].id, fresh.id);
 }
 
 #[tokio::test]
@@ -6736,6 +6773,7 @@ async fn test_create_project_rolls_back_on_invalid_storage_service() {
         cloudflare_enabled: None,
         delivery_provider: None,
         storage_service_ids: vec![999_999],
+        storage_service_env_aliases: Default::default(),
         ..create_request("rollback-test")
     };
 
@@ -8251,6 +8289,7 @@ async fn update_project_keeps_the_repository_when_it_is_omitted() {
         storage_service_ids: vec![],
         storage_service_claim_ids: vec![],
         storage_service_claim_user_id: None,
+        storage_service_env_aliases: Default::default(),
         source_type: temps_entities::source_type::SourceType::Git,
         template_slug: None,
         hosting: Default::default(),
@@ -8357,6 +8396,7 @@ async fn update_project_with_only_a_build_command_keeps_the_stored_build_setting
                 storage_service_ids: vec![],
                 storage_service_claim_ids: vec![],
                 storage_service_claim_user_id: None,
+                storage_service_env_aliases: Default::default(),
                 source_type: temps_entities::source_type::SourceType::Git,
                 template_slug: None,
                 hosting: Default::default(),
@@ -8380,4 +8420,140 @@ async fn update_project_with_only_a_build_command_keeps_the_stored_build_setting
     assert_eq!(config["buildCommand"], "pnpm build");
     assert_eq!(config["installCommand"], "npm ci");
     assert_eq!(config["outputDir"], "dist");
+}
+
+/// A project update keeps its storage links, so it refuses variable aliases
+/// for them instead of answering success and dropping them, whichever caller
+/// reaches the update path, and before touching the database.
+#[tokio::test]
+async fn a_project_update_refuses_storage_aliases_instead_of_dropping_them() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let service = create_test_services(db, Arc::new(MockJobQueue::new())).await;
+    let request = |aliases: BTreeMap<i32, BTreeMap<String, String>>| CreateProjectRequest {
+        cloudflare_enabled: None,
+        delivery_provider: None,
+        name: "Updated".to_string(),
+        expected_slug: None,
+        repo_name: None,
+        repo_owner: None,
+        directory: "/".to_string(),
+        main_branch: "main".to_string(),
+        preset: Preset::Nixpacks.to_string(),
+        preset_config: None,
+        environment_variables: None,
+        git_url: None,
+        git_provider_connection_id: None,
+        automatic_deploy: false,
+        exposed_port: None,
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
+        is_public_repo: None,
+        storage_service_ids: vec![12],
+        storage_service_env_aliases: aliases,
+        storage_service_claim_ids: vec![],
+        storage_service_claim_user_id: None,
+        source_type: temps_entities::source_type::SourceType::Git,
+        template_slug: None,
+        hosting: Default::default(),
+    };
+
+    let asked = BTreeMap::from([
+        (
+            12,
+            BTreeMap::from([("DATABASE_URL".to_string(), "POSTGRES_URL".to_string())]),
+        ),
+        (13, BTreeMap::new()),
+    ]);
+    let Err(error) = service
+        .update_project(4, request(asked), DeployCaller::default())
+        .await
+    else {
+        panic!("aliases on an update are refused");
+    };
+    match &error {
+        ProjectError::StorageAliasesOnUpdate {
+            project_id,
+            service_ids,
+        } => {
+            assert_eq!(*project_id, 4);
+            assert_eq!(service_ids, &vec![12]);
+        }
+        other => panic!("expected StorageAliasesOnUpdate, got {other:?}"),
+    }
+    assert!(error.to_string().contains("temps services link"), "{error}");
+
+    // No aliases, or only empty ones, pass the check (and reach the
+    // database, which this mock has nothing for).
+    let empty = BTreeMap::from([(12, BTreeMap::new())]);
+    for aliases in [BTreeMap::new(), empty] {
+        assert!(!matches!(
+            service
+                .update_project(4, request(aliases), DeployCaller::default())
+                .await,
+            Err(ProjectError::StorageAliasesOnUpdate { .. })
+        ));
+    }
+}
+
+/// An invalid storage alias on a new project is the caller's mistake: a
+/// 400 before anything is written, not a 500 after the project exists.
+#[tokio::test]
+async fn a_new_project_refuses_an_invalid_storage_alias_before_writing() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let service = create_test_services(db, Arc::new(MockJobQueue::new())).await;
+    let request = |aliases: BTreeMap<i32, BTreeMap<String, String>>| CreateProjectRequest {
+        cloudflare_enabled: None,
+        delivery_provider: None,
+        name: "shop".to_string(),
+        expected_slug: None,
+        repo_name: None,
+        repo_owner: None,
+        directory: "/".to_string(),
+        main_branch: "main".to_string(),
+        preset: Preset::Nixpacks.to_string(),
+        preset_config: None,
+        environment_variables: None,
+        git_url: None,
+        git_provider_connection_id: None,
+        automatic_deploy: false,
+        exposed_port: None,
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
+        is_public_repo: None,
+        storage_service_ids: vec![12],
+        storage_service_env_aliases: aliases,
+        storage_service_claim_ids: vec![],
+        storage_service_claim_user_id: None,
+        source_type: temps_entities::source_type::SourceType::Git,
+        template_slug: None,
+        hosting: Default::default(),
+    };
+    for aliases in [
+        // Not a variable name.
+        BTreeMap::from([(
+            12,
+            BTreeMap::from([("BAD-NAME".to_string(), "POSTGRES_URL".to_string())]),
+        )]),
+        // A service the project does not link.
+        BTreeMap::from([(
+            13,
+            BTreeMap::from([("DATABASE_URL".to_string(), "POSTGRES_URL".to_string())]),
+        )]),
+    ] {
+        let Err(error) = service.create_project(request(aliases)).await else {
+            panic!("an invalid alias is refused");
+        };
+        assert!(
+            matches!(error, ProjectError::InvalidInput(_)),
+            "a 400, not {error:?}"
+        );
+    }
 }

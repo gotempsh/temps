@@ -1191,6 +1191,69 @@ async fn ai_harness_status_connects_through_a_later_device_login() {
     assert_eq!(status.key_id, Some(harness.id));
 }
 
+/// The welcome step never creates the dedicated key: a device login, or
+/// the Claude app's MCP key, connecting is what it waits for.
+#[tokio::test]
+async fn ai_harness_status_connects_without_a_dedicated_key_once_an_agent_key_is_used() {
+    let (_db, service, user) = setup_test_env().await;
+    let mut request = admin_key_request("mcp-claude-app-2026-11-25T10-00-00Z");
+    request.role_type = "reader".to_string();
+    let mcp = service.create_api_key(user.id, request).await.unwrap();
+    // A hand-made key in use proves nothing.
+    let manual = service
+        .create_api_key(user.id, admin_key_request("deploy from CI"))
+        .await
+        .unwrap();
+    service.validate_api_key(&manual.api_key).await.unwrap();
+
+    let before = service.ai_harness_status(user.id).await.unwrap();
+    assert_eq!(before.status, crate::ai_harness::AiHarnessState::Missing);
+
+    service.validate_api_key(&mcp.api_key).await.unwrap();
+
+    let status = service.ai_harness_status(user.id).await.unwrap();
+    assert_eq!(status.status, crate::ai_harness::AiHarnessState::Connected);
+    let via = status.connected_via.unwrap();
+    assert_eq!(via.id, mcp.id);
+    assert_eq!(
+        via.kind,
+        crate::ai_harness::AiHarnessCredentialKind::McpClient
+    );
+    assert_eq!(status.key_id, None);
+}
+
+/// A dedicated key the agent once used has expired, and the agent now
+/// connects with a newer MCP key: that key is found and shown, not a
+/// request to create another key.
+#[tokio::test]
+async fn ai_harness_status_connects_through_a_newer_key_after_the_dedicated_one_expired() {
+    let (db, service, user) = setup_test_env().await;
+    let harness = create_test_api_key(
+        &db.db,
+        user.id,
+        crate::ai_harness::AI_HARNESS_KEY_NAME,
+        "admin",
+    )
+    .await;
+    set_created_at(&db.db, harness.id, Utc::now() - Duration::days(2)).await;
+    let mut expired: api_keys::ActiveModel = harness.clone().into();
+    expired.last_used_at = Set(Some(Utc::now() - Duration::days(1)));
+    expired.expires_at = Set(Some(Utc::now() - Duration::hours(1)));
+    expired.update(db.db.as_ref()).await.unwrap();
+
+    let before = service.ai_harness_status(user.id).await.unwrap();
+    assert_eq!(before.status, crate::ai_harness::AiHarnessState::Missing);
+
+    let mut request = admin_key_request("mcp-claude-code-2026-11-26-a1b2c3");
+    request.role_type = "reader".to_string();
+    let mcp = service.create_api_key(user.id, request).await.unwrap();
+    service.validate_api_key(&mcp.api_key).await.unwrap();
+
+    let status = service.ai_harness_status(user.id).await.unwrap();
+    assert_eq!(status.status, crate::ai_harness::AiHarnessState::Connected);
+    assert_eq!(status.connected_via.map(|via| via.id), Some(mcp.id));
+}
+
 #[tokio::test]
 async fn ai_harness_status_ignores_earlier_and_other_users_device_logins() {
     let (db, service, user) = setup_test_env().await;

@@ -78,6 +78,9 @@ pub async fn check(
     port: u16,
 ) -> PrivateCheck {
     let host = entry.route.host.trim_end_matches('.').to_ascii_lowercase();
+    // Built where the check ends, so each result carries when it was
+    // observed: in a batch, an early one is not stamped with the time the
+    // whole batch finished.
     let result = |outcome, message: String, status| PrivateCheck {
         address_id: entry.address_id.clone(),
         hostname: host.clone(),
@@ -85,6 +88,7 @@ pub async fn check(
         outcome,
         message,
         status,
+        checked_at: Some(chrono::Utc::now()),
     };
     let Ok(listener) = entry.listener.parse::<IpAddr>() else {
         return result(
@@ -388,6 +392,7 @@ mod tests {
     #[tokio::test]
     async fn the_check_dials_the_listener_with_sni_and_host_and_follows_no_redirect() {
         let (port, root, seen) = tls_server("myapp.internal.test").await;
+        let started = chrono::Utc::now();
         let checked = check(
             &entry("myapp.internal.test", "127.0.0.1"),
             &Fixed(vec!["127.0.0.1".parse().unwrap()]),
@@ -402,6 +407,9 @@ mod tests {
             checked.message
         );
         assert_eq!(checked.status, Some(301), "the redirect is not followed");
+        // It says when it was observed: by the time it finished.
+        let at = checked.checked_at.expect("each check says when it ran");
+        assert!(at >= started && at <= chrono::Utc::now());
         assert_eq!(seen.connections.load(Ordering::SeqCst), 1);
         assert_eq!(
             seen.sni.lock().unwrap().as_deref(),

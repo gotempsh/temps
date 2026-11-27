@@ -783,6 +783,10 @@ pub struct LinkServiceRequest {
     /// Exact database name used when `database_provisioning_mode` is `custom`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_database_name: Option<String>,
+    /// Extra names for injected variables: app name → injected name, such as
+    /// `{"DATABASE_URL": "POSTGRES_URL"}`. The link injects both.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env_aliases: std::collections::BTreeMap<String, String>,
 }
 
 /// Available Docker container that can be imported as a service

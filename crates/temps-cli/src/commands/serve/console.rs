@@ -2129,6 +2129,11 @@ pub struct ConsoleApiParams {
     /// placement change. `None` with `--role console`, where the proxy is
     /// another process.
     pub control_plane_tunnels: Option<temps_ingress::control_plane::ControlPlaneHandle>,
+    /// The control plane's private ingress (ADR-115), run beside the
+    /// in-process proxy. Registered for the console's plugins, so a consent
+    /// change wakes it at once. `None` with `--role console`.
+    pub control_plane_private_ingress:
+        Option<Arc<temps_core::private_ingress::ControlPlanePrivateIngress>>,
 }
 
 /// The backlog `TcpListener::bind` uses, so a reserved port behaves the same.

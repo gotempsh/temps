@@ -37,6 +37,45 @@ static LISTEN: OnceLock<watch::Sender<Option<PublicListen>>> = OnceLock::new();
 /// Unset until [`start`].
 static MODE: OnceLock<watch::Sender<IngressMode>> = OnceLock::new();
 
+/// How long listing Docker's networks may take before the listener admits
+/// nobody.
+const DOCKER_NETWORKS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Every subnet Docker manages on this host, by network name. Interface
+/// names alone miss a bridge Docker was told to name (`appnet0`). An error
+/// admits nobody: the caller cannot tell a range is clear of them.
+async fn docker_networks(
+    docker: Option<&bollard::Docker>,
+) -> Result<Vec<(String, ipnet::IpNet)>, String> {
+    let Some(docker) = docker else {
+        return Ok(Vec::new());
+    };
+    let listed = tokio::time::timeout(
+        DOCKER_NETWORKS_TIMEOUT,
+        docker.list_networks(None::<bollard::query_parameters::ListNetworksOptions>),
+    )
+    .await
+    .map_err(|_| "listing Docker's networks timed out, so no range is admitted".to_string())?
+    .map_err(|error| {
+        format!("could not list Docker's networks ({error}), so no range is admitted")
+    })?;
+    Ok(listed
+        .into_iter()
+        .flat_map(|network| {
+            let name = network.name.unwrap_or_default();
+            network
+                .ipam
+                .and_then(|ipam| ipam.config)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(move |config| {
+                    let subnet = config.subnet?.parse::<ipnet::IpNet>().ok()?;
+                    Some((name.clone(), subnet))
+                })
+        })
+        .collect())
+}
+
 /// What this worker allows right now, or `None` before [`start`].
 pub fn current_mode() -> Option<IngressMode> {
     MODE.get().map(|sender| *sender.borrow())
@@ -88,6 +127,9 @@ pub struct ManagerConfig {
     pub pinned: bool,
     /// `agent.json`, re-read for `temps agent ingress` changes.
     pub config_path: PathBuf,
+    /// Docker on this worker: a private listener never admits a range over
+    /// one of its networks, whatever its bridge is called.
+    pub docker: Option<bollard::Docker>,
 }
 
 pub fn start(
@@ -219,6 +261,30 @@ async fn run(
         let target = resolve(&local, desired.as_ref());
         let private = local.mode == IngressMode::Private;
         let mut error = None;
+
+        // ADR-115 D8: who the private listener admits, decided from where it
+        // is to listen and published before it is bound, moved or checked: a
+        // new listener never serves with nobody admitted, a narrowed consent
+        // stops admitting a removed range before a slow check batch rather
+        // than after it, and the checks below run against the ranges in
+        // force. A range over a container network, or no range to admit,
+        // admits nobody, with the reason.
+        // Docker's own networks too: a bridge it was told to name has no
+        // telltale interface name. Unreadable, they admit nobody.
+        let docker = if private {
+            docker_networks(config.docker.as_ref()).await
+        } else {
+            Ok(Vec::new())
+        };
+        let admit_decision = match docker {
+            Ok(docker) => admit_for_target(&local, &target, &local_networks(), &docker),
+            Err(why) => admit_for_target(&local, &target, &local_networks(), &[]).map(|_| Err(why)),
+        };
+        let admit = match &admit_decision {
+            Some(Ok(admit)) => admit.clone(),
+            _ => Vec::new(),
+        };
+        store.set_private_admit(admit.clone());
         match target {
             Ok(None) => {
                 if let Some(current) = bound.take() {
@@ -340,7 +406,22 @@ async fn run(
             None
         };
 
+        // What was admitted above, reported only while a private listener
+        // is bound. A refusal stops the control plane from making new
+        // addresses private here, with the reason; the same ranges gate
+        // every private request here, so routes already in the snapshot
+        // follow the consent as it is now, not as it was when their address
+        // was applied.
+        let admit = if bound.as_ref().is_some_and(|b| b.private) {
+            if let (None, Some(Err(why))) = (&error, &admit_decision) {
+                error = Some(why.clone());
+            }
+            admit
+        } else {
+            Vec::new()
+        };
         let report = ListenerReport {
+            admit: admit.iter().map(ToString::to_string).collect(),
             interfaces: host_interfaces(),
             http: bound.as_ref().map(|b| b.http.to_string()),
             https: bound.as_ref().map(|b| b.https.to_string()),
@@ -495,6 +576,85 @@ const NON_PUBLIC_INTERFACES: &[&str] = &[
 ];
 
 /// Every address on this host with its interface name.
+/// Every address on this host with its interface, prefix and whether it is
+/// Tailscale's (ADR-115 D8). The control plane reads its own the same way.
+pub fn local_networks() -> Vec<temps_core::private_network::LocalNetwork> {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces
+                .iter()
+                .map(|interface| {
+                    let prefix = match &interface.addr {
+                        if_addrs::IfAddr::V4(v4) => u32::from(v4.netmask).count_ones(),
+                        if_addrs::IfAddr::V6(v6) => u128::from(v6.netmask).count_ones(),
+                    } as u8;
+                    let address = interface.ip();
+                    temps_core::private_network::LocalNetwork {
+                        interface: interface.name.clone(),
+                        address,
+                        prefix,
+                        tailscale: temps_core::private_network::is_tailscale_interface(
+                            &interface.name,
+                            address,
+                            prefix,
+                        ),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Who a private listener at `target` admits, before it is bound: `None`
+/// when nothing private is to be served there.
+pub fn admit_for_target(
+    local: &LocalIngress,
+    target: &Result<Option<(SocketAddr, SocketAddr)>, String>,
+    own: &[temps_core::private_network::LocalNetwork],
+    docker: &[(String, temps_core::private_network::IpNet)],
+) -> Option<Result<Vec<temps_core::private_network::IpNet>, String>> {
+    match target {
+        Ok(Some((_, https))) if local.mode == IngressMode::Private => {
+            Some(private_admit(local, https.ip(), own, docker))
+        }
+        _ => None,
+    }
+}
+
+/// What a private listener on `listener` admits (ADR-115 D8): the ranges
+/// its owner named, else the listen interface's subnet (Tailscale's ranges
+/// on Tailscale), never a range over one of this host's container bridges
+/// or Docker's networks (`docker`).
+pub fn private_admit(
+    local: &LocalIngress,
+    listener: IpAddr,
+    own: &[temps_core::private_network::LocalNetwork],
+    docker: &[(String, temps_core::private_network::IpNet)],
+) -> Result<Vec<temps_core::private_network::IpNet>, String> {
+    use temps_core::private_network::{
+        container_overlap, default_admit, is_container_interface, parse_admits,
+    };
+    let admit = if local.admit.is_empty() {
+        let network = own
+            .iter()
+            .find(|n| n.address == listener)
+            .ok_or_else(|| format!("{listener} is no longer an address of this worker"))?;
+        default_admit(network)?
+    } else {
+        parse_admits(&local.admit)?
+    };
+    let containers: Vec<(String, temps_core::private_network::IpNet)> = own
+        .iter()
+        .filter(|n| is_container_interface(&n.interface))
+        .filter_map(|n| Some((n.interface.clone(), n.subnet()?)))
+        .chain(docker.iter().cloned())
+        .collect();
+    if let Some(why) = container_overlap(&admit, &containers) {
+        return Err(why.replace("`--admit`", "`temps agent ingress private --admit`"));
+    }
+    Ok(admit)
+}
+
 fn own_addresses() -> Vec<(String, IpAddr)> {
     if_addrs::get_if_addrs()
         .map(|interfaces| {
@@ -779,6 +939,7 @@ mod tests {
                 ingress: LocalIngress::default(),
                 pinned: true,
                 config_path: data.path().join("agent.json"),
+                docker: None,
             },
             Arc::new(crate::route_store::RouteStore::new(
                 data.path().join("routes.json"),
@@ -928,8 +1089,106 @@ mod tests {
             http_port: 80,
             https_port: 443,
             tailscale_serve: false,
+            admit: Vec::new(),
         };
         let (http, _) = resolve(&local, None).unwrap().unwrap();
         assert!(http.ip().is_unspecified());
+    }
+
+    /// The ranges are decided from where the listener is to be bound, so
+    /// they are published before it is: a private target admits its
+    /// network, anything else admits nobody.
+    #[test]
+    fn who_a_listener_admits_is_known_before_it_is_bound() {
+        use temps_core::private_network::LocalNetwork;
+        let own = vec![LocalNetwork {
+            interface: "wg0".into(),
+            address: "10.8.0.1".parse().unwrap(),
+            prefix: 24,
+            tailscale: false,
+        }];
+        let target = |https: &str| -> Result<Option<(SocketAddr, SocketAddr)>, String> {
+            let https: SocketAddr = https.parse().unwrap();
+            Ok(Some((SocketAddr::new(https.ip(), 80), https)))
+        };
+        let private = LocalIngress {
+            mode: IngressMode::Private,
+            ..LocalIngress::default()
+        };
+        let admitted = admit_for_target(&private, &target("10.8.0.1:443"), &own, &[])
+            .expect("a private target")
+            .expect("its network is admitted");
+        assert_eq!(admitted, vec!["10.8.0.0/24".parse().unwrap()]);
+        // An address that is not this worker's admits nobody, with the reason.
+        let refused = admit_for_target(&private, &target("10.9.0.1:443"), &own, &[])
+            .expect("a private target")
+            .unwrap_err();
+        assert!(refused.contains("no longer an address"), "{refused}");
+        assert_eq!(admit_for_target(&private, &Ok(None), &own, &[]), None);
+        assert_eq!(
+            admit_for_target(&private, &Err("unbound".into()), &own, &[]),
+            None
+        );
+        let public = LocalIngress {
+            mode: IngressMode::Fixed,
+            ..LocalIngress::default()
+        };
+        assert_eq!(
+            admit_for_target(&public, &target("10.8.0.1:443"), &own, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_private_listener_admits_its_network_never_the_containers() {
+        use temps_core::private_network::LocalNetwork;
+        let net = |interface: &str, address: &str, prefix: u8, tailscale: bool| LocalNetwork {
+            interface: interface.into(),
+            address: address.parse().unwrap(),
+            prefix,
+            tailscale,
+        };
+        let own = vec![
+            net("wg0", "10.8.0.1", 24, false),
+            net("eth0", "172.20.0.5", 16, false),
+            net("docker0", "172.17.0.1", 16, false),
+            net("tailscale0", "100.101.102.103", 32, true),
+        ];
+        let local = |admit: &[&str]| LocalIngress {
+            mode: IngressMode::Private,
+            admit: admit.iter().map(|a| a.to_string()).collect(),
+            ..LocalIngress::default()
+        };
+        let ip = |t: &str| t.parse::<IpAddr>().unwrap();
+        let text = |admit: Vec<temps_core::private_network::IpNet>| -> Vec<String> {
+            admit.iter().map(ToString::to_string).collect()
+        };
+        assert_eq!(
+            text(private_admit(&local(&[]), ip("10.8.0.1"), &own, &[]).unwrap()),
+            ["10.8.0.0/24"]
+        );
+        assert_eq!(
+            text(private_admit(&local(&[]), ip("100.101.102.103"), &own, &[]).unwrap()),
+            ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+        );
+        assert_eq!(
+            text(private_admit(&local(&["10.8.0.0/28"]), ip("10.8.0.1"), &own, &[]).unwrap()),
+            ["10.8.0.0/28"]
+        );
+        let why =
+            private_admit(&local(&["172.16.0.0/12"]), ip("172.20.0.5"), &own, &[]).unwrap_err();
+        assert!(why.contains("container network docker0"), "{why}");
+        assert!(why.contains("temps agent ingress private --admit"), "{why}");
+
+        // A bridge Docker was told to name `appnet0` has no telltale
+        // interface name; its subnet comes from Docker itself.
+        let docker = vec![("appnet".to_string(), "10.8.0.0/26".parse().unwrap())];
+        let why =
+            private_admit(&local(&["10.8.0.0/24"]), ip("10.8.0.1"), &own, &docker).unwrap_err();
+        assert!(why.contains("container network appnet"), "{why}");
+        assert_eq!(
+            text(private_admit(&local(&["10.8.0.128/28"]), ip("10.8.0.1"), &own, &docker).unwrap()),
+            ["10.8.0.128/28"]
+        );
     }
 }

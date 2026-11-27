@@ -445,6 +445,7 @@ mod tests {
             service_id: 41,
             database_provisioning_mode: mode.to_string(),
             custom_database_name: None,
+            env_aliases: serde_json::json!({}),
             created_at: now,
             updated_at: now,
         }
