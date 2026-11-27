@@ -58,6 +58,7 @@ import {
 } from '@/lib/entity-tree'
 import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { serverDatabasesQuery } from '@/lib/server-databases'
+import { DEFAULT_PROJECT_PAGE_SIZE } from '@/lib/project-list-pagination'
 import { projectRoot } from '@/lib/project-navigation'
 import { SERVER_HOME, SERVER_PAGE } from '@/lib/server-navigation'
 import { groupHref } from '@/lib/terminology'
@@ -81,9 +82,10 @@ const TREE_QUERY = {
 } as const
 /**
  * Projects listed on a large server; the Projects page, with search, has
- * the rest. Few enough that the tree never grows with the server.
+ * the rest. Few enough that the tree never grows with the server, and as
+ * many as the Projects page's first page, so the two list the same rows.
  */
-const PROJECT_ROWS = 8
+const PROJECT_ROWS = DEFAULT_PROJECT_PAGE_SIZE
 /** Services listed under a project; its own page has the rest. */
 const SERVICE_ROWS = 20
 /** Services a monitor answer is asked for in one request. */
