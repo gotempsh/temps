@@ -7,6 +7,7 @@ import {
   validateInstallResult,
   registerPluginInstallCommands,
   installGrants,
+  trustQuestion,
 } from "./install.js";
 
 const repository = "https://github.com/gotempsh/temps-plugin-template";
@@ -37,6 +38,18 @@ test.each([
   { grant: ["ai_generate"], aiMaxTokens: "4097" },
 ])("rejects invalid or implicit AI grants %j", (options) => {
   expect(() => installGrants(options)).toThrow();
+});
+test("a plugin runs in a container unless the operator opts out", () => {
+  expect(installBody(repository, {})).not.toHaveProperty("isolation");
+  expect(
+    installBody(repository, { withoutContainer: false }),
+  ).not.toHaveProperty("isolation");
+  expect(installBody(repository, { withoutContainer: true })).toEqual({
+    repository_url: repository,
+    isolation: "process",
+  });
+  expect(trustQuestion(true)).toContain("everything Temps can");
+  expect(trustQuestion(false)).toContain("its own container");
 });
 test("advanced overrides are preserved", () => {
   expect(installBody(repository, { name: "my-plugin", ref: "v1.0.0" })).toEqual(

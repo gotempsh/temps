@@ -18,6 +18,7 @@ use crate::catalog::{
     validate_url, NpmRelease, PlatformRelease, RegistryConfig, RegistryEnvelope, RegistryPlugin,
     VerifiedRegistry,
 };
+use crate::sandbox::PluginIsolation;
 use crate::trust::{KeysetEnvelope, KeysetUse, VerifiedKeyset};
 
 pub const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
@@ -133,6 +134,9 @@ pub(crate) struct ActivationRollback {
 
 #[derive(Debug, Clone)]
 pub struct ActiveInstallation {
+    /// The isolation recorded when this installation was activated. `None`
+    /// for one activated before isolation was recorded.
+    pub(crate) isolation: Option<PluginIsolation>,
     pub(crate) source_identity: String,
     pub name: String,
     pub version: String,
@@ -180,6 +184,81 @@ impl VerifiedExecutable {
     #[cfg(not(unix))]
     pub(crate) fn command_path(&self, _plugin: &str) -> Result<PathBuf, InstallError> {
         Ok(self.display_path.clone())
+    }
+
+    /// Write the verified bytes to a new file at `destination` with `mode`.
+    ///
+    /// The bytes are read from the descriptor that was hashed, and hashed
+    /// again on the way out, so the copy is the build that was verified even
+    /// if the installed path is replaced or the file is rewritten meanwhile.
+    /// A partial or mismatching copy is removed.
+    #[cfg(unix)]
+    pub(crate) fn copy_to(
+        &self,
+        plugin: &str,
+        destination: &Path,
+        mode: u32,
+        expected_sha256: &str,
+    ) -> Result<(), InstallError> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let mut source = self
+            .file
+            .try_clone()
+            .map_err(|error| io_error(plugin, &self.display_path, error))?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_error(plugin, &self.display_path, error))?;
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination)
+            .map_err(|error| io_error(plugin, destination, error))?;
+        let copied = (|| {
+            let mut hasher = Sha256::new();
+            let mut buffer = vec![0u8; 1024 * 1024];
+            let mut total = 0u64;
+            loop {
+                let read = source
+                    .read(&mut buffer)
+                    .map_err(|error| io_error(plugin, &self.display_path, error))?;
+                if read == 0 {
+                    break;
+                }
+                total += read as u64;
+                if total > MAX_BINARY_BYTES {
+                    return Err(InstallError::TooLarge {
+                        url: self.display_path.display().to_string(),
+                        limit: MAX_BINARY_BYTES,
+                    });
+                }
+                hasher.update(&buffer[..read]);
+                target
+                    .write_all(&buffer[..read])
+                    .map_err(|error| io_error(plugin, destination, error))?;
+            }
+            let actual = hex::encode(hasher.finalize());
+            if actual != expected_sha256 {
+                return Err(InstallError::DigestMismatch {
+                    plugin: plugin.to_string(),
+                    version: "active".to_string(),
+                    expected: expected_sha256.to_string(),
+                    actual,
+                });
+            }
+            target
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|error| io_error(plugin, destination, error))?;
+            target
+                .sync_all()
+                .map_err(|error| io_error(plugin, destination, error))
+        })();
+        if copied.is_err() {
+            let _ = std::fs::remove_file(destination);
+        }
+        copied
     }
 }
 
@@ -251,6 +330,13 @@ impl LocalFileReceipt {
 struct ActiveRecord {
     version: String,
     directory: String,
+    /// The isolation chosen when this release was activated. It seeds the
+    /// plugin's database row when that row is missing; the row is what an
+    /// administrator changes afterwards. Absent in a record written before
+    /// isolation existed, which marks an installation that keeps running as
+    /// a process until an administrator moves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    isolation: Option<PluginIsolation>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -666,12 +752,22 @@ impl PluginInstaller {
     }
 
     pub async fn activate(&self, candidate: &InstallCandidate) -> Result<(), InstallError> {
+        self.activate_isolated(candidate, None).await
+    }
+
+    /// Activate `candidate` and record the isolation it was started with.
+    pub(crate) async fn activate_isolated(
+        &self,
+        candidate: &InstallCandidate,
+        isolation: Option<PluginIsolation>,
+    ) -> Result<(), InstallError> {
         write_json_atomically(
             &candidate.name,
             &candidate.plugin_root.join(ACTIVE_FILE),
             &ActiveRecord {
                 version: candidate.version.clone(),
                 directory: candidate.install_directory.clone(),
+                isolation,
             },
         )
         .await?;
@@ -1632,6 +1728,7 @@ async fn verify_active(
         });
     }
     Ok(ActiveInstallation {
+        isolation: active.isolation,
         name: name.to_string(),
         version: receipt.version,
         sha256: signed_digest,
@@ -1723,6 +1820,7 @@ async fn verify_operator_binary(
         });
     }
     Ok(ActiveInstallation {
+        isolation: active.isolation,
         name: name.to_string(),
         version: active.version.clone(),
         sha256: actual,
@@ -2644,6 +2742,7 @@ mod tests {
             &ActiveRecord {
                 version: "1.0.0".to_string(),
                 directory: "1.0.0".to_string(),
+                isolation: None,
             },
         )
         .await

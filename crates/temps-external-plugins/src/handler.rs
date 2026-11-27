@@ -4,6 +4,7 @@
 //! HTTP handlers for external plugin management endpoints.
 
 mod ai_tools;
+mod isolation;
 mod local_file;
 mod watches;
 use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
@@ -662,6 +663,10 @@ pub struct InstallPluginRequest {
     pub name: String,
     #[serde(default)]
     pub grants: Option<crate::grants::PluginGrantConfig>,
+    /// How a new installation is isolated. Omit it for a container. An
+    /// update keeps the isolation of the installed plugin.
+    #[serde(default)]
+    pub isolation: Option<crate::sandbox::PluginIsolation>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -684,6 +689,10 @@ pub struct InstallRepositoryRequest {
     pub progress_id: Option<String>,
     #[serde(default)]
     pub grants: Option<crate::grants::PluginGrantConfig>,
+    /// How a new installation is isolated. Omit it for a container. An
+    /// update keeps the isolation of the installed plugin.
+    #[serde(default)]
+    pub isolation: Option<crate::sandbox::PluginIsolation>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -882,6 +891,30 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             StatusCode::SERVICE_UNAVAILABLE,
             "Plugin Actor Activation Failed",
         ),
+        ExternalPluginsError::Sandbox(crate::sandbox::SandboxError::Unavailable { .. }) => {
+            (StatusCode::CONFLICT, "Plugin Containers Unavailable")
+        }
+        ExternalPluginsError::Sandbox(crate::sandbox::SandboxError::PrivilegedAccess {
+            ..
+        }) => (
+            StatusCode::CONFLICT,
+            "Plugin Needs Access A Container Is Not Given",
+        ),
+        ExternalPluginsError::Sandbox(crate::sandbox::SandboxError::Image { .. }) => {
+            (StatusCode::BAD_GATEWAY, "Plugin Base Image Unavailable")
+        }
+        ExternalPluginsError::Sandbox(
+            crate::sandbox::SandboxError::Storage { .. }
+            | crate::sandbox::SandboxError::Runtime { .. },
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, "Plugin Container Failed"),
+        ExternalPluginsError::IsolationManagedByLauncher { .. } => (
+            StatusCode::CONFLICT,
+            "Plugin Isolation Is Managed By The Launcher",
+        ),
+        ExternalPluginsError::IsolationChangeFailed { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Plugin Did Not Start With Its New Isolation",
+        ),
     };
     temps_core::problemdetails::new(status)
         .with_title(title)
@@ -982,6 +1015,10 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::Grant(_) => {
             "The plugin actor identity could not be committed after activation".to_string()
         }
+        ExternalPluginsError::Sandbox(error) => error.public_detail(),
+        // Both carry only the plugin name and an already public reason.
+        ExternalPluginsError::IsolationManagedByLauncher { .. }
+        | ExternalPluginsError::IsolationChangeFailed { .. } => error.to_string(),
     }
 }
 
@@ -1076,7 +1113,7 @@ async fn install_plugin(
         },
     )
     .await;
-    let selected = match state.service.select_plugin(&request.name).await {
+    let mut selected = match state.service.select_plugin(&request.name).await {
         Ok(selected) => selected,
         Err(error) => {
             record_audit(
@@ -1098,6 +1135,9 @@ async fn install_plugin(
         }
     };
     let identity = selected.identity.clone();
+    selected.isolation = request.isolation;
+    isolation::audit_requested_isolation(&state, &context, &identity.name, request.isolation)
+        .await?;
     record_required_audit(
         &state,
         &ExternalPluginWriteAudit {
@@ -1302,7 +1342,7 @@ async fn install_repository(
                 .map(crate::install_progress::ProgressGuard::handle),
         )
         .await;
-    let selected = match selected {
+    let mut selected = match selected {
         Ok(selected) => selected,
         Err(error) => {
             record_audit(
@@ -1326,6 +1366,9 @@ async fn install_repository(
     let commit = selected.source_commit().to_string();
     let selected_name = selected.name().to_string();
     let version = selected.version().to_string();
+    selected.isolation = request.isolation;
+    isolation::audit_requested_isolation(&state, &context, &selected_name, request.isolation)
+        .await?;
     let repository =
         crate::manager::repository_actor_source(selected.repository(), selected.path());
     record_required_audit(
@@ -1705,6 +1748,11 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             "/x/plugins/{name}/grants",
             get(get_plugin_grants).put(put_plugin_grants),
         )
+        .route("/x/plugins/sandbox", get(isolation::get_plugin_sandbox))
+        .route(
+            "/x/plugins/{name}/isolation",
+            get(isolation::get_plugin_isolation).put(isolation::put_plugin_isolation),
+        )
 }
 
 #[derive(OpenApiTrait)]
@@ -1728,6 +1776,9 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         ai_tools::put_plugin_ai_tools,
         get_plugin_grants,
         put_plugin_grants,
+        isolation::get_plugin_sandbox,
+        isolation::get_plugin_isolation,
+        isolation::put_plugin_isolation,
     ),
     components(
         schemas(
@@ -1758,6 +1809,11 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::ai_tools::UpdatePluginAiTools,
             crate::ai_tools::AiToolInfo,
             PluginGrantsResponse,
+            isolation::PluginSandboxResponse,
+            isolation::PluginIsolationResponse,
+            isolation::UpdatePluginIsolation,
+            crate::sandbox::PluginIsolation,
+            crate::sandbox::IsolationMode,
             crate::grants::PluginGrantConfig,
             PluginActorInfo,
             PluginAiCapability,
@@ -2040,8 +2096,8 @@ mod tests {
         }
     }
 
-    struct AllowSensitiveActions;
-    struct RequireSensitiveVerification;
+    pub(super) struct AllowSensitiveActions;
+    pub(super) struct RequireSensitiveVerification;
 
     #[async_trait::async_trait]
     impl temps_core::SensitiveActionAuthorizer for AllowSensitiveActions {
@@ -2097,8 +2153,8 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingAuditLogger {
-        operations: std::sync::Mutex<Vec<String>>,
+    pub(super) struct RecordingAuditLogger {
+        pub(super) operations: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -2115,11 +2171,11 @@ mod tests {
         }
     }
 
-    fn mock_db() -> Arc<sea_orm::DatabaseConnection> {
+    pub(super) fn mock_db() -> Arc<sea_orm::DatabaseConnection> {
         Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
     }
 
-    fn test_state() -> ExternalPluginsAppState {
+    pub(super) fn test_state() -> ExternalPluginsAppState {
         let config = ExternalPluginConfig::new(
             std::env::temp_dir().join("temps-external-plugins-handler-test"),
             "postgres://localhost/test".to_string(),
@@ -2131,7 +2187,7 @@ mod tests {
         }
     }
 
-    fn test_state_with_audit(
+    pub(super) fn test_state_with_audit(
         audit_service: Arc<dyn temps_core::AuditLogger>,
     ) -> ExternalPluginsAppState {
         let mut state = test_state();
@@ -2241,7 +2297,7 @@ mod tests {
         (temp, state, requests, server)
     }
 
-    fn metadata() -> Extension<temps_core::RequestMetadata> {
+    pub(super) fn metadata() -> Extension<temps_core::RequestMetadata> {
         Extension(temps_core::RequestMetadata {
             ip_address: "192.0.2.1".to_string(),
             user_agent: "external-plugin-test".to_string(),
@@ -2279,7 +2335,7 @@ mod tests {
         }
     }
 
-    fn user_auth(role: Role) -> RequireAuth {
+    pub(super) fn user_auth(role: Role) -> RequireAuth {
         RequireAuth(AuthContext::new_persisted_session(test_user(1), role, 1))
     }
 
@@ -2420,6 +2476,7 @@ mod tests {
             Ok(Json(InstallPluginRequest {
                 name: "safe-plugin".to_string(),
                 grants: None,
+                isolation: None,
             })),
         )
         .await
@@ -2478,6 +2535,7 @@ mod tests {
             Ok(Json(InstallPluginRequest {
                 name: "../../escape".to_string(),
                 grants: None,
+                isolation: None,
             })),
         )
         .await
@@ -2504,6 +2562,7 @@ mod tests {
             Ok(Json(InstallPluginRequest {
                 name: "safe".to_string(),
                 grants: None,
+                isolation: None,
             })),
         )
         .await
@@ -2535,6 +2594,7 @@ mod tests {
             Ok(Json(InstallPluginRequest {
                 name: "safe-plugin".to_string(),
                 grants: None,
+                isolation: None,
             })),
         )
         .await
@@ -2967,6 +3027,7 @@ mod tests {
             source_identity: "fixture".into(),
             active: true,
             ai_tools_enabled: enabled,
+            isolation: "container".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

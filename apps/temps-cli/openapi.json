@@ -44882,6 +44882,17 @@
               }
             ]
           },
+          "isolation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PluginIsolation",
+                "description": "How a new installation is isolated. Omit it for a container. An\nupdate keeps the isolation of the installed plugin."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "name": {
             "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
             "type": "string"
@@ -60330,6 +60341,14 @@
           "api_read",
           "api_write",
           "events_read"
+        ],
+        "type": "string"
+      },
+      "PluginIsolation": {
+        "description": "How an administrator asked for one plugin to be isolated. Stored on the\nplugin's actor row.",
+        "enum": [
+          "container",
+          "process"
         ],
         "type": "string"
       },
@@ -205715,6 +205734,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "How a new installation is isolated. Omit it for a container. An\nupdate keeps the isolation of the installed plugin.",
+            "in": "query",
+            "name": "isolation",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/PluginIsolation"
             }
           },
           {

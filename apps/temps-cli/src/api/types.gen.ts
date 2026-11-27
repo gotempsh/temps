@@ -21157,6 +21157,7 @@ export type InsightsResponse = {
 
 export type InstallPluginRequest = {
     grants?: PluginGrantConfig | null;
+    isolation?: PluginIsolation | null;
     /**
      * Validated registry name only. URLs, paths, versions, and hashes are not
      * accepted from HTTP callers.
@@ -28152,6 +28153,12 @@ export type PluginGrantConfig = {
  * Host-owned permissions granted to one durable external-plugin actor.
  */
 export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
+
+/**
+ * How an administrator asked for one plugin to be isolated. Stored on the
+ * plugin's actor row.
+ */
+export type PluginIsolation = 'container' | 'process';
 
 /**
  * Which policy decided a test.
@@ -111777,6 +111784,11 @@ export type InstallLocalFileData = {
     query: {
         name: string;
         version: string;
+        /**
+         * How a new installation is isolated. Omit it for a container. An
+         * update keeps the isolation of the installed plugin.
+         */
+        isolation?: PluginIsolation;
     };
     url: '/x/plugins/install/file';
 };

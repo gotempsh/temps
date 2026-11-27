@@ -15,6 +15,9 @@ pub struct Model {
     pub active: bool,
     /// Administrator consent for marked AI tools; false for existing and new actors.
     pub ai_tools_enabled: bool,
+    /// How the plugin is isolated: `container` (the default for a new actor)
+    /// or `process`. Actors that existed before the column keep `process`.
+    pub isolation: String,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

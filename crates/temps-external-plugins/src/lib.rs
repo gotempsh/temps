@@ -27,6 +27,7 @@ pub mod plugin;
 pub mod proxy;
 pub mod reporting;
 pub mod repository;
+pub mod sandbox;
 pub mod service;
 pub mod source_catalog;
 pub mod trust;

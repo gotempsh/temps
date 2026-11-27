@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ReloadFailureResponse } from '@/api/client/types.gen'
+import type {
+  PluginIsolation,
+  ReloadFailureResponse,
+} from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
   Dialog,
@@ -27,8 +30,10 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import {
+  usePluginSandbox,
   usePlugins,
   useReloadPlugins,
+  useSetPluginIsolation,
   useUninstallPlugin,
 } from '@/hooks/usePlugins'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
@@ -46,6 +51,7 @@ import {
   Plus,
   Puzzle,
   RefreshCw,
+  Box,
   Shield,
   Tag,
   Trash2,
@@ -61,6 +67,12 @@ import {
   RepositoryUpdateButton,
 } from '@/components/plugins/RepositoryUpdate'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
+import {
+  PluginIsolationDialog,
+  PluginIsolationStatus,
+  PluginSandboxNotice,
+} from '@/components/plugins/PluginIsolation'
+import { isolationActionLabel, oppositeIsolation } from '@/lib/plugin-isolation'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
 
 export function PluginsPage() {
@@ -75,6 +87,15 @@ export function PluginsPage() {
   const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
+  // How each plugin is isolated is an administrator's view.
+  const sandbox = usePluginSandbox(canManagePlugins)
+  const setIsolation = useSetPluginIsolation()
+  const [isolationChange, setIsolationChange] = useState<{
+    name: string
+    target: PluginIsolation
+  } | null>(null)
+  const isolationOf = (name: string) =>
+    sandbox.data?.plugins.find((plugin) => plugin.name === name)
   const [fileName, setFileName] = useState<string | null>(null)
   const [uninstallName, setUninstallName] = useState<string | null>(null)
   const [updateName, setUpdateName] = useState<string | null>(null)
@@ -93,7 +114,8 @@ export function PluginsPage() {
   const managementPending =
     requiresPersistentStorage ||
     reloadPlugins.isPending ||
-    uninstallPlugin.isPending
+    uninstallPlugin.isPending ||
+    setIsolation.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -130,6 +152,29 @@ export function PluginsPage() {
         setUninstallName(null)
         return
       }
+    }
+  }
+
+  const handleIsolationChange = async (
+    name: string,
+    target: PluginIsolation
+  ) => {
+    try {
+      await setIsolation.mutateAsync({ name, isolation: target })
+      setIsolationChange(null)
+      toast.success(
+        target === 'container'
+          ? `${name} now runs in a container`
+          : `${name} now runs without a container`
+      )
+    } catch (error) {
+      // Any other failure is toasted by the app-wide mutation error handler
+      // with the server's reason; the plugin is back on its previous isolation.
+      setIsolationChange(null)
+      handleSensitiveActionError(
+        error,
+        () => void handleIsolationChange(name, target)
+      )
     }
   }
 
@@ -183,6 +228,21 @@ export function PluginsPage() {
         onSensitiveError={handleSensitiveActionError}
       />
       {canManagePlugins && verificationDialog}
+      <PluginIsolationDialog
+        name={isolationChange?.name ?? ''}
+        target={canManagePlugins ? (isolationChange?.target ?? null) : null}
+        isPending={setIsolation.isPending}
+        onOpenChange={(open) => {
+          if (!open) setIsolationChange(null)
+        }}
+        onConfirm={() => {
+          if (isolationChange)
+            void handleIsolationChange(
+              isolationChange.name,
+              isolationChange.target
+            )
+        }}
+      />
       <ConfirmDeleteDialog
         open={canManagePlugins && uninstallName !== null}
         onOpenChange={(open) => {
@@ -297,6 +357,13 @@ export function PluginsPage() {
               )}
             </div>
 
+            {canManagePlugins && (
+              <PluginSandboxNotice
+                sandbox={sandbox.data}
+                unavailable={sandbox.isError}
+              />
+            )}
+
             {pluginsLoading ? (
               <RunningPluginsSkeleton />
             ) : plugins.length === 0 ? (
@@ -342,6 +409,9 @@ export function PluginsPage() {
                             <Tag className="size-3" /> v{plugin.version}
                           </span>
                           <Status tone="ok" label="Running" />
+                          <PluginIsolationStatus
+                            isolation={isolationOf(plugin.name)}
+                          />
                         </div>
                         {plugin.description && (
                           <p className="mt-1 text-sm text-muted-foreground">
@@ -387,6 +457,23 @@ export function PluginsPage() {
                             >
                               <Shield className="mr-2 size-4" /> Permissions
                             </DropdownMenuItem>
+                            {isolationOf(plugin.name)?.changeable && (
+                              <DropdownMenuItem
+                                onSelect={() =>
+                                  setIsolationChange({
+                                    name: plugin.name,
+                                    target: oppositeIsolation(
+                                      isolationOf(plugin.name)
+                                    ),
+                                  })
+                                }
+                              >
+                                <Box className="mr-2 size-4" />{' '}
+                                {isolationActionLabel(
+                                  oppositeIsolation(isolationOf(plugin.name))
+                                )}
+                              </DropdownMenuItem>
+                            )}
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
                               className="text-destructive focus:text-destructive"

@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-26
+> Generated on: 2026-11-27
 
 ## Installation
 
@@ -5061,6 +5061,7 @@ Install a GitHub TypeScript plugin on the configured Temps server; the server us
 | `--grant <permissions...>` | Explicitly approve declared host permissions (default: none); e.g. ai_generate projects_read | - | No |
 | `--ai-daily-calls <count>` | Maximum AI attempts per day (0 pauses usage; default: 100) | - | No |
 | `--ai-max-tokens <count>` | Maximum output tokens per AI call (1–4096; default: 1024) | - | No |
+| `--without-container` | Run the plugin as the Temps account instead of in its own container (only for a plugin that needs the Temps database or data directory) | - | No |
 
 ### `plugin update <name>`
 
@@ -5084,6 +5085,7 @@ Upload and activate a trusted native plugin on the configured Temps host
 | `--name <name>` | Expected plugin manifest name | - | Yes |
 | `--plugin-version <version>` | Expected plugin manifest version | - | Yes |
 | `-y, --yes` | Approve execution of this file without prompting | - | No |
+| `--without-container` | Run the plugin as the Temps account instead of in its own container (only for a plugin that needs the Temps database or data directory) | - | No |
 
 ### `plugin grants`
 

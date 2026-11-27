@@ -66,7 +66,14 @@ async fn create_and_resume_authorize_a_resource_with_one_database_connection() {
     };
     let binary = root.path().join("upload");
     std::fs::write(&binary, bytes).unwrap();
-    service.install_file(&receipt, &binary).await.unwrap();
+    service
+        .install_file(
+            &receipt,
+            &binary,
+            Some(crate::sandbox::PluginIsolation::Process),
+        )
+        .await
+        .unwrap();
     let settings = service.plugin_ai_tools("reports").await.unwrap();
     service
         .update_plugin_ai_tools(

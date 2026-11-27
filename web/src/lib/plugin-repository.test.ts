@@ -59,6 +59,15 @@ test('preserves explicit advanced overrides', () => {
     ref_name: valid.ref_name,
   })
 })
+test('asks for no container only when the administrator opted out', () => {
+  expect(repositoryInstallBody({ ...valid, uncontained: true })).toMatchObject({
+    isolation: 'process',
+  })
+  expect(
+    repositoryInstallBody({ ...valid, uncontained: false })
+  ).not.toHaveProperty('isolation')
+  expect(repositoryInstallBody(valid)).not.toHaveProperty('isolation')
+})
 test('requires explicit trust before sending install', () =>
   expect(
     repositoryInstallSchema.safeParse({ ...valid, trusted: false }).success

@@ -49,12 +49,26 @@ single accepted channel slot.
 The result is an important request boundary: plugin handlers consume a
 verified caller object instead of parsing identity headers themselves.
 
-Installed plugins are nevertheless fully trusted host code. They currently
-run as the Temps operating-system user and are not sandboxed from the instance
-filesystem or sibling processes. Per-process secrets and manifest capabilities
-prevent accidental request-authority widening; they do not contain a malicious
-plugin binary. Untrusted plugins require a separate UID, container, or
-equivalent sandbox with plugin-scoped storage and credentials.
+What contains the plugin itself is its isolation, which an administrator sees
+and changes per plugin under **Settings → Plugins**:
+
+| Isolation | What the plugin can reach |
+|---|---|
+| **Container** (default for a new installation) | Its own read-only executable, its own data directory, a private socket directory and a small temporary filesystem, inside a hardened container: every capability dropped, no privilege escalation, a read-only root filesystem, a non-root user, and memory, CPU and process limits. It never receives the control-plane database URL or the instance data directory, and the Docker socket is not mounted. It reaches Temps only through the platform API, with the permissions granted to it. |
+| **Separate user** (servers started with `--plugin-launcher`) | Runs as another operating-system account that cannot read Temps files. |
+| **Process** | Runs as the Temps account, with nothing between it and the control plane. Per-process secrets and manifest capabilities then only prevent accidental request-authority widening; they do not contain a malicious binary. |
+
+A plugin installed before isolation existed keeps running as a process after an
+upgrade, so nothing stops working, and its row shows **Not contained** until an
+administrator moves it into a container. A container needs Temps running
+directly on a Linux host with Docker; elsewhere the console says why plugins
+cannot be contained, and a new plugin installs only when the administrator
+explicitly chooses to run it without a container.
+
+Inside a container the plugin's paths are fixed: `--data-dir` is `/data`, the
+socket is `/run/temps-plugin/p.sock`, and only `/data`, the socket directory and
+`/tmp` are writable. Its outbound network access is the default Docker bridge;
+nothing is published to the host.
 
 ```mermaid
 sequenceDiagram
@@ -241,11 +255,12 @@ let manifest = PluginManifest::builder("trusted-maintenance-plugin", "1.0.0")
 
 `requires_db(true)` exposes the control-plane database URL.
 `requires_host_data_access(true)` exposes the instance data root, which may
-contain encryption and authentication keys. The flags minimize supplied data
-and disclose intent; they are not sandbox enforcement under the current
-shared-UID runtime. Use caller-scoped API operations for normal plugins, and
-enable these settings only for audited binaries that cannot function through
-the SDK boundary.
+contain encryption and authentication keys. A plugin in a container is never
+given either: one that declares these flags is refused there with an
+explanation, and runs only when an administrator chooses to run it without a
+container. Use caller-scoped API operations for normal plugins, and declare
+these flags only for audited binaries that cannot function through the SDK
+boundary.
 
 ---
 

@@ -8291,6 +8291,103 @@ async fn plugin_ai_tools_default_off_and_reversible() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A plugin installed before the upgrade keeps running as a process, a plugin
+/// installed afterwards is sandboxed in a container by default, and `down`
+/// removes the column without touching the actors.
+#[tokio::test]
+async fn plugin_isolation_keeps_installed_plugins_as_processes_and_is_reversible(
+) -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping plugin isolation migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping plugin isolation migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    async fn isolation_of(
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+    ) -> anyhow::Result<String> {
+        let row = db
+            .query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT isolation FROM external_plugin_actors WHERE plugin_name=$1",
+                [name.into()],
+            ))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no actor named {name}"))?;
+        Ok(row.try_get::<String>("", "isolation")?)
+    }
+
+    let target = "m20261127_000002_external_plugin_isolation";
+    Migrator::up(
+        &db,
+        Some(Migrator::migrations().len() as u32 - steps_back_to(target)),
+    )
+    .await?;
+    db.execute_unprepared("INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES ('00000000-0000-4000-8000-000000000001','installed','fixture','fixture',true)").await?;
+    Migrator::up(&db, None).await?;
+    let migration = Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == target)
+        .unwrap();
+    // Applying it again must change nothing: every statement is idempotent.
+    migration.up(&SchemaManager::new(&db)).await?;
+
+    assert_eq!(isolation_of(&db, "installed").await?, "process");
+    db.execute_unprepared("INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES ('00000000-0000-4000-8000-000000000002','fresh','fixture','fixture',true)").await?;
+    assert_eq!(isolation_of(&db, "fresh").await?, "container");
+    assert!(
+        db.execute_unprepared(
+            "UPDATE external_plugin_actors SET isolation='vm' WHERE plugin_name='fresh'"
+        )
+        .await
+        .is_err(),
+        "only the two known isolation values can be stored"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
+    migration.down(&SchemaManager::new(&db)).await?;
+    let columns = db.query_all(sea_orm::Statement::from_string(sea_orm::DatabaseBackend::Postgres,"SELECT column_name FROM information_schema.columns WHERE table_name='external_plugin_actors' AND column_name='isolation'")).await?;
+    assert!(columns.is_empty());
+    let actors = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM external_plugin_actors",
+        ))
+        .await?;
+    assert_eq!(actors.len(), 2, "rolling back keeps both actors");
+    Ok(())
+}
+
 /// ADR 062: only a brand-new database gets a random VXLAN network ID. An
 /// install that already ran (it has a user or a node) keeps 42, so no running
 /// cluster's network changes on upgrade, and `down` puts the cluster back on

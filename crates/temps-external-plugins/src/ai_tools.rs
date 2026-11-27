@@ -431,6 +431,7 @@ mod tests {
             source_identity: "fixture".into(),
             active: true,
             ai_tools_enabled: true,
+            isolation: "process".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -502,6 +503,7 @@ mod tests {
             source_identity: "fixture".into(),
             active: true,
             ai_tools_enabled: false,
+            isolation: "process".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -523,6 +525,7 @@ mod tests {
             source_identity: "fixture".into(),
             active: true,
             ai_tools_enabled: false,
+            isolation: "process".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

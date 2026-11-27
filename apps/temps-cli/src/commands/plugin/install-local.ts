@@ -19,10 +19,19 @@ export function registerLocalInstall(plugin: Command) {
     .requiredOption("--name <name>", "Expected plugin manifest name")
     .requiredOption("--plugin-version <version>", "Expected plugin manifest version")
     .option("-y, --yes", "Approve execution of this file without prompting")
+    .option(
+      "--without-container",
+      "Run the plugin as the Temps account instead of in its own container (only for a plugin that needs the Temps database or data directory)",
+    )
     .action(
       async (
         path: string,
-        options: { name: string; pluginVersion: string; yes?: boolean },
+        options: {
+          name: string;
+          pluginVersion: string;
+          yes?: boolean;
+          withoutContainer?: boolean;
+        },
       ) => {
         if (!options.yes && !process.stdin.isTTY)
           throw new Error(
@@ -52,7 +61,14 @@ export function registerLocalInstall(plugin: Command) {
           return;
         try {
           const { data } = await installLocalFile({
-            query: { name: options.name, version: options.pluginVersion },
+            query: {
+              name: options.name,
+              version: options.pluginVersion,
+              // Omitted for the default: a new plugin runs in its own container.
+              ...(options.withoutContainer
+                ? { isolation: "process" as const }
+                : {}),
+            },
             headers: { "X-Temps-Trust-Sha256": digest },
             body: { file: new File([Bun.file(path)], "plugin") },
             throwOnError: true,

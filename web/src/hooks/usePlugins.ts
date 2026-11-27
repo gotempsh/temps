@@ -3,14 +3,17 @@
 
 import {
   getPluginInstallationReporting,
+  getPluginSandbox,
   listExternalPlugins,
   listPluginCatalog,
+  putPluginIsolation,
   reloadPlugins,
   setPluginInstallationReporting,
   uninstallPlugin,
 } from '@/api/client/sdk.gen'
 import type {
   PluginCatalogResponse,
+  PluginIsolation,
   ReloadResponse,
 } from '@/api/client/types.gen'
 import type { PluginManifest } from '@/types/plugins'
@@ -27,6 +30,48 @@ export const PLUGIN_REPORTING_QUERY_KEY = [
   'external-plugins',
   'installation-reporting',
 ]
+export const PLUGIN_SANDBOX_QUERY_KEY = ['external-plugins', 'sandbox']
+
+/**
+ * Whether this server runs plugins in containers, and how each installed
+ * plugin is isolated. Administrators only: pass `enabled` from the caller's
+ * permission.
+ */
+export function usePluginSandbox(enabled = true) {
+  return useQuery({
+    queryKey: PLUGIN_SANDBOX_QUERY_KEY,
+    queryFn: async () => (await getPluginSandbox({ throwOnError: true })).data,
+    enabled,
+    retry: false,
+    refetchOnWindowFocus: 'always',
+  })
+}
+
+/** Move an installed plugin into a container, or out of one, and restart it. */
+export function useSetPluginIsolation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({
+      name,
+      isolation,
+    }: {
+      name: string
+      isolation: PluginIsolation
+    }) =>
+      (
+        await putPluginIsolation({
+          path: { name },
+          body: { isolation },
+          throwOnError: true,
+        })
+      ).data,
+    // The plugin restarts either way: a failed move returns it to its
+    // previous isolation, so the list and its navigation are refreshed too.
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
 
 export function usePluginInstallationReporting(enabled = true) {
   return useQuery({
@@ -136,6 +181,11 @@ export function useReloadPlugins() {
       await queryClient.invalidateQueries({
         queryKey: PLUGINS_QUERY_KEY,
         exact: true,
+      })
+      // A reload restarts every plugin, so what each one runs in, and why
+      // one did not start, may have changed.
+      await queryClient.invalidateQueries({
+        queryKey: PLUGIN_SANDBOX_QUERY_KEY,
       })
     },
   })

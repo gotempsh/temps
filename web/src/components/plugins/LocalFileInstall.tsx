@@ -20,7 +20,8 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { PLUGINS_QUERY_KEY } from '@/hooks/usePlugins'
+import { PLUGINS_QUERY_KEY, usePluginSandbox } from '@/hooks/usePlugins'
+import { PluginIsolationChoice } from './PluginIsolation'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 
 const schema = z.object({
@@ -31,6 +32,8 @@ const schema = z.object({
       'Enter the name declared by the plugin.'
     ),
   version: z.string().min(1, 'Enter the manifest version.').max(64),
+  /** Run the plugin as the Temps account instead of in its own container. */
+  uncontained: z.boolean().optional(),
   file: z.custom<File>(
     (value) =>
       typeof File !== 'undefined' &&
@@ -63,6 +66,7 @@ export function LocalFileInstall({
   onSensitiveError: (error: unknown, retry: () => void) => boolean
 }) {
   const queries = useQueryClient()
+  const sandbox = usePluginSandbox(open)
   const form = useForm<z.infer<typeof schema>>({
     resolver: zodResolver(schema),
     defaultValues: { name: '', version: '', approvedDestination: '' },
@@ -104,11 +108,17 @@ export function LocalFileInstall({
       version,
       sha256,
       target,
+      uncontained,
     }: z.infer<typeof schema> & { sha256: string; target: string }) => {
       return (
         await installLocalFile({
           baseUrl: target,
-          query: { name, version },
+          // Omitted for the default: a new plugin runs in its own container.
+          query: {
+            name,
+            version,
+            ...(uncontained ? { isolation: 'process' as const } : {}),
+          },
           headers: { 'X-Temps-Trust-Sha256': sha256 },
           body: { file },
           throwOnError: true,
@@ -212,6 +222,18 @@ export function LocalFileInstall({
                 </p>
               )}
             </div>
+            <Controller
+              control={form.control}
+              name="uncontained"
+              render={({ field }) => (
+                <PluginIsolationChoice
+                  id="plugin-file-uncontained"
+                  sandbox={sandbox.data}
+                  uncontained={field.value === true}
+                  onChange={field.onChange}
+                />
+              )}
+            />
             <Controller
               control={form.control}
               name="approvedDestination"

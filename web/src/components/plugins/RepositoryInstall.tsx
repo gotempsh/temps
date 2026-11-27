@@ -24,7 +24,8 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { ChevronDown } from 'lucide-react'
-import { PLUGINS_QUERY_KEY } from '@/hooks/usePlugins'
+import { PLUGINS_QUERY_KEY, usePluginSandbox } from '@/hooks/usePlugins'
+import { PluginIsolationChoice } from './PluginIsolation'
 import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import { toast } from 'sonner'
 import { useEffect, useState } from 'react'
@@ -53,6 +54,7 @@ export function RepositoryInstall({
   compact?: boolean
 }) {
   const queries = useQueryClient()
+  const sandbox = usePluginSandbox()
   const [progressId, setProgressId] = useState<string>()
   const [waitingSeconds, setWaitingSeconds] = useState(0)
   const [failure, setFailure] = useState<string>()
@@ -185,7 +187,7 @@ export function RepositoryInstall({
           </p>
           <p className="text-muted-foreground">
             A catalog listing is not a security audit. Review the source before
-            granting it the host’s permissions.
+            approving its permissions.
           </p>
           <Button
             type="button"
@@ -306,6 +308,21 @@ export function RepositoryInstall({
               </p>
             )}
           </section>
+          <div className="sm:col-span-2">
+            <Controller
+              control={form.control}
+              name="uncontained"
+              render={({ field }) => (
+                <PluginIsolationChoice
+                  id="plugin-uncontained"
+                  sandbox={sandbox.data}
+                  uncontained={field.value === true}
+                  onChange={field.onChange}
+                  disabled={disabled || install.isPending || install.isSuccess}
+                />
+              )}
+            />
+          </div>
           <div className="flex items-start gap-3 sm:col-span-2">
             <Controller
               control={form.control}
@@ -328,9 +345,10 @@ export function RepositoryInstall({
               htmlFor="plugin-trust"
               className="font-normal leading-relaxed"
             >
-              I trust this repository and its dependencies. Installed plugins
-              execute code with the Temps host’s permissions; Docker isolates
-              the build, not the running plugin.
+              I trust this repository and its dependencies. The plugin is built
+              in an isolated container and runs in its own container, limited to
+              the permissions approved above, unless you choose to run it
+              without one.
             </Label>
           </div>
           <p className="text-sm text-destructive sm:col-span-2">

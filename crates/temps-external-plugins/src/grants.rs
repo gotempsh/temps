@@ -7,6 +7,8 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_plugin_protocol::channel::{PluginActorInfo, PluginHostPermission};
+
+use crate::sandbox::PluginIsolation;
 use thiserror::Error;
 
 pub const MAX_PROMPT_BYTES: u32 = 65_536;
@@ -216,12 +218,135 @@ impl PluginGrantService {
         Ok(())
     }
 
+    /// How the active actor of `plugin_name` is isolated, or `None` when the
+    /// plugin has no active actor yet.
+    pub async fn isolation(
+        &self,
+        plugin_name: &str,
+    ) -> Result<Option<PluginIsolation>, GrantError> {
+        self.read_isolation(
+            plugin_name,
+            "SELECT isolation FROM external_plugin_actors WHERE plugin_name=$1 AND active=TRUE",
+            vec![plugin_name.into()],
+        )
+        .await
+    }
+
+    /// How every active actor is isolated, by plugin name, in one query.
+    pub async fn isolations(&self) -> Result<Vec<(String, PluginIsolation)>, GrantError> {
+        let database = |source| GrantError::Database {
+            plugin_name: "*".into(),
+            operation: "list isolation",
+            source,
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT plugin_name, isolation FROM external_plugin_actors WHERE active=TRUE ORDER BY plugin_name",
+            ))
+            .await
+            .map_err(database)?;
+        let mut isolations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("", "plugin_name").map_err(database)?;
+            let stored: String = row.try_get("", "isolation").map_err(database)?;
+            let isolation = PluginIsolation::parse(&stored).ok_or_else(|| GrantError::Invalid {
+                plugin_name: name.clone(),
+                reason: format!("unknown stored isolation '{stored}'"),
+            })?;
+            isolations.push((name, isolation));
+        }
+        Ok(isolations)
+    }
+
+    /// The isolation an update inherits: that of the active actor, when it
+    /// was installed from `source_identity`. A different source is a new
+    /// installation and inherits nothing.
+    pub async fn isolation_for_source(
+        &self,
+        plugin_name: &str,
+        source_identity: &str,
+    ) -> Result<Option<PluginIsolation>, GrantError> {
+        self.read_isolation(
+            plugin_name,
+            "SELECT isolation FROM external_plugin_actors WHERE plugin_name=$1 AND active=TRUE AND source_identity=$2",
+            vec![plugin_name.into(), source_identity.into()],
+        )
+        .await
+    }
+
+    async fn read_isolation(
+        &self,
+        plugin_name: &str,
+        sql: &str,
+        values: Vec<sea_orm::Value>,
+    ) -> Result<Option<PluginIsolation>, GrantError> {
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "read isolation",
+                source,
+            })?;
+        let Some(row) = row else { return Ok(None) };
+        let stored: String =
+            row.try_get("", "isolation")
+                .map_err(|source| GrantError::Database {
+                    plugin_name: plugin_name.into(),
+                    operation: "decode isolation",
+                    source,
+                })?;
+        PluginIsolation::parse(&stored)
+            .map(Some)
+            .ok_or_else(|| GrantError::Invalid {
+                plugin_name: plugin_name.into(),
+                reason: format!("unknown stored isolation '{stored}'"),
+            })
+    }
+
+    /// Change how the active actor of `plugin_name` is isolated.
+    pub async fn set_isolation(
+        &self,
+        plugin_name: &str,
+        isolation: PluginIsolation,
+    ) -> Result<(), GrantError> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE external_plugin_actors SET isolation=$2,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
+                [plugin_name.into(), isolation.as_str().into()],
+            ))
+            .await
+            .map_err(|source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "update isolation",
+                source,
+            })?;
+        if result.rows_affected() != 1 {
+            return Err(GrantError::NotFound {
+                plugin_name: plugin_name.into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Commit a candidate's actor. `isolation` is what a newly created actor
+    /// is stored with; an actor that already exists keeps its own.
     pub async fn commit_actor(
         &self,
         plugin_name: &str,
         actor_id: &str,
         sha256: &str,
         source_identity: &str,
+        isolation: PluginIsolation,
     ) -> Result<(), GrantError> {
         let transaction = self
             .db
@@ -251,8 +376,8 @@ impl PluginGrantService {
         )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "rotate activated actor", source })?;
         let result = transaction.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES($1::uuid,$2,$3,$4,TRUE) ON CONFLICT(plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
-            [actor_id.into(), plugin_name.into(), sha256.into(), source_identity.into()],
+            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active,isolation) VALUES($1::uuid,$2,$3,$4,TRUE,$5) ON CONFLICT(plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
+            [actor_id.into(), plugin_name.into(), sha256.into(), source_identity.into(), isolation.as_str().into()],
         )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "commit activated actor", source })?;
         if result.rows_affected() != 1 {
             return Err(GrantError::ActorChanged {
@@ -486,7 +611,13 @@ mod tests {
             .unwrap();
         let id = candidate.actor.id.clone();
         grants
-            .commit_actor("reports", &id, "binary-one", "fixture-source")
+            .commit_actor(
+                "reports",
+                &id,
+                "binary-one",
+                "fixture-source",
+                PluginIsolation::Process,
+            )
             .await
             .unwrap();
         let actor_id = uuid::Uuid::parse_str(&id).unwrap();
@@ -541,7 +672,13 @@ mod tests {
                 assert_eq!(rebound.actor.id, id);
             } else if activation == "actor" {
                 grants
-                    .commit_actor("reports", &id, next_hash, "fixture-source")
+                    .commit_actor(
+                        "reports",
+                        &id,
+                        next_hash,
+                        "fixture-source",
+                        PluginIsolation::Process,
+                    )
                     .await
                     .unwrap();
             } else {
@@ -597,7 +734,13 @@ mod tests {
         let name = "reports";
         let actor = uuid::Uuid::new_v4().to_string();
         service
-            .commit_actor(name, &actor, "previous", "fixture-source")
+            .commit_actor(
+                name,
+                &actor,
+                "previous",
+                "fixture-source",
+                PluginIsolation::Process,
+            )
             .await
             .unwrap();
 

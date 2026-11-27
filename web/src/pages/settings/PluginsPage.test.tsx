@@ -28,6 +28,7 @@ afterAll(() => {
 let role = 'reader'
 let pluginsSupported = true
 let reportingEnabledValues: boolean[] = []
+let sandboxEnabledValues: boolean[] = []
 
 mock.module('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { role } }),
@@ -75,6 +76,14 @@ mock.module('@/hooks/usePlugins', () => ({
     isPending: false,
     mutateAsync: () => Promise.resolve(),
   }),
+  usePluginSandbox: (enabled = true) => {
+    sandboxEnabledValues.push(enabled)
+    return { data: undefined, isError: false }
+  },
+  useSetPluginIsolation: () => ({
+    isPending: false,
+    mutateAsync: () => Promise.resolve(),
+  }),
 }))
 
 const { PluginsPage } = await import('./PluginsPage')
@@ -110,6 +119,7 @@ describe('PluginsPage management permissions', () => {
   })
 
   beforeEach(() => {
+    sandboxEnabledValues = []
     reportingEnabledValues = []
     pluginsSupported = true
   })
@@ -128,6 +138,9 @@ describe('PluginsPage management permissions', () => {
     expect(markup).not.toContain('GitHub repository')
     expect(markup).not.toContain('Install from file')
     expect(markup).not.toContain('Share installation counts')
+    // How plugins are isolated is an administrator's view: a reader must not
+    // even ask for it.
+    expect(sandboxEnabledValues.every((enabled) => !enabled)).toBe(true)
   })
 
   test('enables the catalog and management controls for system administrators', () => {

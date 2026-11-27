@@ -14,6 +14,7 @@ export type Options = {
   grant?: readonly string[];
   aiDailyCalls?: string;
   aiMaxTokens?: string;
+  withoutContainer?: boolean;
 };
 const HOST_PERMISSIONS = [
   "ai_generate",
@@ -35,6 +36,8 @@ type InstallBody = {
   ref_name?: string;
   path?: string;
   grants?: GrantConfig;
+  /** Omitted for the default: a new plugin runs in its own container. */
+  isolation?: "process";
 };
 type Result = {
   name: string;
@@ -86,6 +89,7 @@ export function installBody(repository: string, options: Options): InstallBody {
     ...(options.name === undefined ? {} : { name: options.name }),
     ...(options.ref === undefined ? {} : { ref_name: options.ref }),
     ...(grants === undefined ? {} : { grants }),
+    ...(options.withoutContainer ? { isolation: "process" as const } : {}),
   };
 }
 
@@ -204,15 +208,21 @@ async function send(url: string, body: InstallBody | { ref_name?: string }) {
   }
 }
 
-async function confirmTrust(yes?: boolean) {
+/** What the operator is asked to trust, given how the plugin will run. */
+export function trustQuestion(withoutContainer?: boolean): string {
+  return withoutContainer
+    ? "Trust this repository and its dependencies? Without a container the plugin runs as the Temps account and can reach everything Temps can."
+    : "Trust this repository and its dependencies? The plugin is built in an isolated container and, when newly installed, runs in its own container limited to the permissions you approve.";
+}
+
+async function confirmTrust(yes?: boolean, withoutContainer?: boolean) {
   if (yes) return true;
   if (!process.stdin.isTTY)
     throw new PluginInstallError(
       "Installation executes trusted repository code on the Temps host. Pass --yes to confirm non-interactively.",
     );
   return promptConfirm({
-    message:
-      "Trust this repository and its dependencies? Docker isolates the build, but installed plugins run with the Temps host’s permissions.",
+    message: trustQuestion(withoutContainer),
     default: false,
   });
 }
@@ -251,13 +261,17 @@ export function registerPluginInstallCommands(plugin: Command) {
       "--ai-max-tokens <count>",
       "Maximum output tokens per AI call (1–4096; default: 1024)",
     )
+    .option(
+      "--without-container",
+      "Run the plugin as the Temps account instead of in its own container (only for a plugin that needs the Temps database or data directory)",
+    )
     .action(async (repository: string, options: Options) => {
       const body = installBody(repository, options);
       if (body.grants)
         console.log(
           `Requested approvals: ${body.grants.permissions.join(", ") || "none"}. AI limits: ${body.grants.ai_daily_call_limit} calls/day, ${body.grants.ai_max_output_tokens} output tokens/call. The host only grants permissions declared by this plugin.`,
         );
-      if (await confirmTrust(options.yes))
+      if (await confirmTrust(options.yes, options.withoutContainer))
         await send("/x/plugins/install/repository", body);
     });
   plugin

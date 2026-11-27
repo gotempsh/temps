@@ -103,6 +103,9 @@ test("install-local requires consent and uploads the approved bytes without a cl
     expect(uploads[0]?.digest).toBe(digest);
     expect(uploads[0]?.bytes).toBe(bytes);
     expect(uploads[0]?.query).toBe("?name=fixture&version=1");
+    const uncontained = await run("--yes", "--without-container");
+    expect(uncontained.code, uncontained.stderr).toBe(0);
+    expect(uploads[1]?.query).toBe("?name=fixture&version=1&isolation=process");
     expect(uploads[0]?.filename).not.toContain(dir);
   } finally {
     server.stop(true);

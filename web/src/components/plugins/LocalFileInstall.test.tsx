@@ -41,7 +41,9 @@ test('binds trust and the upload to the digest shown for the selected file', asy
         />
       </QueryClientProvider>
     )
-    const trust = view.getByRole('checkbox') as HTMLButtonElement
+    const trust = view.getByRole('checkbox', {
+      name: /I trust this executable/,
+    }) as HTMLButtonElement
     const upload = view.getByLabelText('Executable')
     const choose = (file: File) =>
       fireEvent.change(upload, { target: { files: [file] } })
@@ -115,7 +117,9 @@ test('changing the destination requires fresh approval for submission and step-u
     await view.findByText(
       'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
     )
-    const trust = view.getByRole('checkbox')
+    const trust = view.getByRole('checkbox', {
+      name: /I trust this executable/,
+    })
     const send = view.getByRole('button', { name: 'Install plugin' })
     fireEvent.click(trust)
     fireEvent.click(send)
@@ -136,6 +140,69 @@ test('changing the destination requires fresh approval for submission and step-u
         new URL(newHost).origin,
       ])
     )
+  } finally {
+    api.restore()
+  }
+})
+
+test('offers running without a container and sends that choice only when it is ticked', async () => {
+  const host = 'https://console.example.test/api'
+  const queries: string[] = []
+  const api = mockApi({
+    'GET /x/plugins/sandbox': () =>
+      Response.json({
+        configured: false,
+        mode: 'process',
+        reason: 'plugin containers need a Linux server.',
+        setup_path: '/settings/plugins',
+        plugins: [],
+      }),
+    'POST /x/plugins/install/file': (request) => {
+      queries.push(new URL(request.url).search)
+      return Response.json({
+        name: 'fixture',
+        version: '1',
+        platform: 'test',
+        sha256: request.headers.get('X-Temps-Trust-Sha256'),
+      })
+    },
+  })
+  try {
+    client.setConfig({ baseUrl: host })
+    const view = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <LocalFileInstall
+          open
+          expectedName="fixture"
+          onOpenChange={() => {}}
+          onSensitiveError={() => false}
+        />
+      </QueryClientProvider>
+    )
+    // The server cannot contain plugins: the dialog says so before installing.
+    await waitFor(() =>
+      expect(
+        view.getByText(/plugin containers need a Linux server\./)
+      ).toBeTruthy()
+    )
+    const uncontained = view.getByRole('checkbox', {
+      name: /Run without a container/,
+    })
+    const trust = view.getByRole('checkbox', {
+      name: /I trust this executable/,
+    }) as HTMLButtonElement
+    fireEvent.change(view.getByLabelText('Executable'), {
+      target: { files: [new File(['hello'], 'plugin')] },
+    })
+    fireEvent.change(view.getByLabelText('Manifest version'), {
+      target: { value: '1' },
+    })
+    await waitFor(() => expect(trust.disabled).toBe(false))
+    fireEvent.click(uncontained)
+    fireEvent.click(trust)
+    fireEvent.click(view.getByRole('button', { name: 'Install plugin' }))
+    await waitFor(() => expect(queries).toHaveLength(1))
+    expect(queries[0]).toBe('?name=fixture&version=1&isolation=process')
   } finally {
     api.restore()
   }

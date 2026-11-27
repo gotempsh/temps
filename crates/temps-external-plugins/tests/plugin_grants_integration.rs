@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use temps_external_plugins::grants::{GrantError, PluginGrantConfig, PluginGrantService};
+use temps_external_plugins::sandbox::PluginIsolation;
 use temps_plugin_protocol::channel::PluginHostPermission;
 use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
@@ -409,6 +410,15 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
     assert_ne!(recreated.actor.id, grants.actor.id);
     let recreated_id =
         uuid::Uuid::parse_str(&recreated.actor.id).expect("recreated actor has a valid UUID");
+    // The entity reads every current column, so bring the table the rest of
+    // the way to the current schema before reading through it.
+    Migrator::migrations()
+        .into_iter()
+        .find(|migration| migration.name() == "m20261127_000002_external_plugin_isolation")
+        .expect("plugin isolation migration must be registered")
+        .up(&manager)
+        .await
+        .expect("apply plugin isolation after the consent schema");
     let persisted = external_plugin_actors::Entity::find_by_id(recreated_id)
         .one(db.as_ref())
         .await
@@ -465,6 +475,7 @@ async fn test_failed_different_source_candidate_preserves_actor_grants_and_usage
             "not-a-uuid",
             "sha256:replacement",
             "repository:trusted/replacement",
+            PluginIsolation::Process,
         )
         .await;
     let preserved = service
@@ -524,6 +535,7 @@ async fn test_successful_different_source_activation_rotates_to_default_deny_act
             &provisional.actor.id,
             "sha256:new",
             "repository:trusted/replacement",
+            PluginIsolation::Process,
         )
         .await
         .expect("commit replacement actor");
@@ -566,6 +578,7 @@ async fn test_stale_same_source_candidate_cannot_commit_unbound_actor() {
             &stale_id,
             "sha256:stale",
             "repository:trusted/same",
+            PluginIsolation::Process,
         )
         .await;
     let preserved = service
@@ -581,5 +594,148 @@ async fn test_stale_same_source_candidate_cannot_commit_unbound_actor() {
     assert_eq!(
         preserved.config.permissions,
         configured_grants().permissions
+    );
+}
+
+#[tokio::test]
+async fn test_isolation_is_stored_per_plugin_kept_by_a_same_source_update_and_reset_by_a_new_source(
+) {
+    let Some(database) = boot_database().await else {
+        return;
+    };
+    let service = PluginGrantService::new(database.connection_arc());
+    assert_eq!(
+        service.isolation("isolated-plugin").await.expect("read"),
+        None,
+        "a plugin with no actor has no stored isolation"
+    );
+
+    // A new installation is stored with the isolation it was started with.
+    let provisional = service
+        .prepare_actor("isolated-plugin", "repository:trusted/source")
+        .await
+        .expect("prepare actor");
+    service
+        .commit_actor(
+            "isolated-plugin",
+            &provisional.actor.id,
+            "sha256:first",
+            "repository:trusted/source",
+            PluginIsolation::Process,
+        )
+        .await
+        .expect("commit actor");
+    assert_eq!(
+        service.isolation("isolated-plugin").await.expect("read"),
+        Some(PluginIsolation::Process)
+    );
+
+    // An update from the same source keeps it, whatever the update asks for.
+    assert_eq!(
+        service
+            .isolation_for_source("isolated-plugin", "repository:trusted/source")
+            .await
+            .expect("read for source"),
+        Some(PluginIsolation::Process)
+    );
+    let same_source = service
+        .prepare_actor("isolated-plugin", "repository:trusted/source")
+        .await
+        .expect("prepare update");
+    service
+        .commit_actor(
+            "isolated-plugin",
+            &same_source.actor.id,
+            "sha256:second",
+            "repository:trusted/source",
+            PluginIsolation::Container,
+        )
+        .await
+        .expect("commit update");
+    assert_eq!(
+        service.isolation("isolated-plugin").await.expect("read"),
+        Some(PluginIsolation::Process),
+        "an update must not change the isolation an administrator chose"
+    );
+
+    // An administrator changes it.
+    service
+        .set_isolation("isolated-plugin", PluginIsolation::Container)
+        .await
+        .expect("change isolation");
+    assert_eq!(
+        service.isolations().await.expect("list"),
+        vec![("isolated-plugin".to_string(), PluginIsolation::Container)]
+    );
+
+    // Another source is another plugin: it inherits nothing.
+    assert_eq!(
+        service
+            .isolation_for_source("isolated-plugin", "repository:other/source")
+            .await
+            .expect("read for other source"),
+        None
+    );
+    let replacement = service
+        .prepare_actor("isolated-plugin", "repository:other/source")
+        .await
+        .expect("prepare replacement");
+    service
+        .commit_actor(
+            "isolated-plugin",
+            &replacement.actor.id,
+            "sha256:third",
+            "repository:other/source",
+            PluginIsolation::Process,
+        )
+        .await
+        .expect("commit replacement");
+    assert_eq!(
+        service.isolation("isolated-plugin").await.expect("read"),
+        Some(PluginIsolation::Process)
+    );
+}
+
+#[tokio::test]
+async fn test_set_isolation_of_a_plugin_without_an_actor_is_not_found_and_an_unknown_value_is_refused(
+) {
+    let Some(database) = boot_database().await else {
+        return;
+    };
+    let service = PluginGrantService::new(database.connection_arc());
+
+    let missing = service
+        .set_isolation("absent-plugin", PluginIsolation::Container)
+        .await
+        .expect_err("a plugin with no actor has nothing to change");
+    assert!(
+        matches!(&missing, GrantError::NotFound { plugin_name } if plugin_name == "absent-plugin"),
+        "{missing:?}"
+    );
+
+    // A row created by a start (not an installation) gets the column default.
+    service
+        .ensure_actor("started-plugin", "sha256:one", "repository:trusted/started")
+        .await
+        .expect("bind actor");
+    assert_eq!(
+        service.isolation("started-plugin").await.expect("read"),
+        Some(PluginIsolation::Container)
+    );
+
+    // The database refuses anything that is not a known isolation.
+    use sea_orm::ConnectionTrait as _;
+    let refused = database
+        .connection_arc()
+        .execute_unprepared(
+            "UPDATE external_plugin_actors SET isolation='virtual-machine' WHERE plugin_name='started-plugin'",
+        )
+        .await
+        .expect_err("the check constraint must refuse an unknown isolation");
+    assert!(
+        refused
+            .to_string()
+            .contains("external_plugin_actors_isolation_check"),
+        "{refused}"
     );
 }

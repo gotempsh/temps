@@ -52,6 +52,8 @@ export const repositoryInstallSchema = z.object({
     .boolean()
     .refine(Boolean, 'Confirm you trust this plugin before installing.'),
   grants: pluginGrantsSchema.optional(),
+  /** Run the plugin as the Temps account instead of in its own container. */
+  uncontained: z.boolean().optional(),
 })
 export type RepositoryInstallValues = z.infer<typeof repositoryInstallSchema>
 
@@ -84,5 +86,7 @@ export function repositoryInstallBody(values: RepositoryInstallValues) {
     ...(values.name ? { name: values.name } : {}),
     ...(values.ref_name ? { ref_name: values.ref_name } : {}),
     ...(values.grants ? { grants: values.grants } : {}),
+    // Omitted for the default: a new plugin runs in its own container.
+    ...(values.uncontained ? { isolation: 'process' as const } : {}),
   }
 }

@@ -21157,6 +21157,7 @@ export type InsightsResponse = {
 
 export type InstallPluginRequest = {
     grants?: PluginGrantConfig | null;
+    isolation?: PluginIsolation | null;
     /**
      * Validated registry name only. URLs, paths, versions, and hashes are not
      * accepted from HTTP callers.
@@ -21174,6 +21175,7 @@ export type InstallPluginResponse = {
 
 export type InstallRepositoryRequest = {
     grants?: PluginGrantConfig | null;
+    isolation?: PluginIsolation | null;
     name?: string | null;
     path?: string | null;
     progressId?: string | null;
@@ -21583,6 +21585,11 @@ export type IpAccessControlResponse = {
  * How a scope's CIDR list is applied.
  */
 export type IpAccessMode = 'disabled' | 'allow' | 'deny';
+
+/**
+ * What actually separates a running plugin from Temps.
+ */
+export type IsolationMode = 'container' | 'separate_user' | 'process';
 
 /**
  * The issues of a group.
@@ -28263,6 +28270,35 @@ export type PluginGrantsResponse = {
 export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
 
 /**
+ * How an administrator asked for one plugin to be isolated. Stored on the
+ * plugin's actor row.
+ */
+export type PluginIsolation = 'container' | 'process';
+
+/**
+ * How one installed plugin is separated from Temps.
+ */
+export type PluginIsolationResponse = {
+    /**
+     * Whether an administrator can change the isolation of this plugin
+     * here. False when every plugin runs through the plugin launcher.
+     */
+    changeable: boolean;
+    effective?: IsolationMode | null;
+    name: string;
+    requested?: PluginIsolation | null;
+    /**
+     * Whether the running plugin is kept away from Temps' own files,
+     * processes and database.
+     */
+    sandboxed: boolean;
+    /**
+     * Why the plugin did not start, when its last start failed.
+     */
+    start_failure?: string | null;
+};
+
+/**
  * The complete plugin manifest — the handshake contract.
  */
 export type PluginManifest = {
@@ -28370,6 +28406,30 @@ export type PluginManifest = {
      * SemVer version string
      */
     version: string;
+};
+
+/**
+ * Whether this server can run plugins in containers, and how each installed
+ * plugin is isolated.
+ */
+export type PluginSandboxResponse = {
+    /**
+     * Whether a newly installed plugin is confined on this server.
+     */
+    configured: boolean;
+    /**
+     * What confines a newly installed plugin on this server.
+     */
+    mode: IsolationMode;
+    plugins: Array<PluginIsolationResponse>;
+    /**
+     * Why plugins cannot run in containers here, when they cannot.
+     */
+    reason?: string | null;
+    /**
+     * Where the console explains what is missing.
+     */
+    setup_path?: string | null;
 };
 
 export type PluginSourceResponse = {
@@ -42331,6 +42391,14 @@ export type UpdatePluginAiTools = {
      * Binary revision returned by GET; a changed binary requires fresh consent.
      */
     installation_revision: string;
+};
+
+export type UpdatePluginIsolation = {
+    /**
+     * `container` confines the plugin. `process` runs it as the Temps
+     * account with nothing between it and the control plane.
+     */
+    isolation: PluginIsolation;
 };
 
 export type UpdatePreferencesRequest = {
@@ -112166,6 +112234,11 @@ export type InstallLocalFileData = {
     query: {
         name: string;
         version: string;
+        /**
+         * How a new installation is isolated. Omit it for a container. An
+         * update keeps the isolation of the installed plugin.
+         */
+        isolation?: PluginIsolation;
     };
     url: '/x/plugins/install/file';
 };
@@ -112378,6 +112451,39 @@ export type ReloadPluginsResponses = {
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
 
+export type GetPluginSandboxData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/sandbox';
+};
+
+export type GetPluginSandboxErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Stored plugin isolation could not be read
+     */
+    503: ProblemDetails;
+};
+
+export type GetPluginSandboxError = GetPluginSandboxErrors[keyof GetPluginSandboxErrors];
+
+export type GetPluginSandboxResponses = {
+    /**
+     * Plugin isolation on this server
+     */
+    200: PluginSandboxResponse;
+};
+
+export type GetPluginSandboxResponse = GetPluginSandboxResponses[keyof GetPluginSandboxResponses];
+
 export type GetPluginAiToolsData = {
     body?: never;
     path: {
@@ -112465,6 +112571,112 @@ export type PutPluginGrantsResponses = {
 };
 
 export type PutPluginGrantsResponse = PutPluginGrantsResponses[keyof PutPluginGrantsResponses];
+
+export type GetPluginIsolationData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/isolation';
+};
+
+export type GetPluginIsolationErrors = {
+    /**
+     * Invalid plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Stored plugin isolation could not be read
+     */
+    503: ProblemDetails;
+};
+
+export type GetPluginIsolationError = GetPluginIsolationErrors[keyof GetPluginIsolationErrors];
+
+export type GetPluginIsolationResponses = {
+    /**
+     * Isolation of the plugin
+     */
+    200: PluginIsolationResponse;
+};
+
+export type GetPluginIsolationResponse = GetPluginIsolationResponses[keyof GetPluginIsolationResponses];
+
+export type PutPluginIsolationData = {
+    body: UpdatePluginIsolation;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/isolation';
+};
+
+export type PutPluginIsolationErrors = {
+    /**
+     * Invalid plugin name or request body
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No active installation
+     */
+    404: ProblemDetails;
+    /**
+     * This server cannot run plugins in containers, the plugin asks for access a container is not given, or isolation is managed by the plugin launcher
+     */
+    409: ProblemDetails;
+    /**
+     * Request body is not JSON
+     */
+    415: ProblemDetails;
+    /**
+     * Unknown isolation
+     */
+    422: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * The plugin container could not be prepared
+     */
+    500: ProblemDetails;
+    /**
+     * The plugin did not start with the new isolation and was returned to the previous one
+     */
+    502: ProblemDetails;
+    /**
+     * Audit, database or plugin service unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type PutPluginIsolationError = PutPluginIsolationErrors[keyof PutPluginIsolationErrors];
+
+export type PutPluginIsolationResponses = {
+    /**
+     * Plugin restarted with the requested isolation
+     */
+    200: PluginIsolationResponse;
+};
+
+export type PutPluginIsolationResponse = PutPluginIsolationResponses[keyof PutPluginIsolationResponses];
 
 export type GetPluginStatusData = {
     body?: never;

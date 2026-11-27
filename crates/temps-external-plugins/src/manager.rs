@@ -15,7 +15,9 @@ use std::time::Duration;
 use temps_plugin_protocol::{
     HandshakeMessage, PluginLaunchConfig, PluginManifest, EXTERNAL_PLUGIN_PROTOCOL_VERSION,
 };
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -26,6 +28,9 @@ use utoipa::openapi::OpenApi;
 use crate::channel::PluginChannel;
 use crate::install::open_verified_executable;
 use crate::proxy::PluginProxy;
+use crate::sandbox::{
+    ContainerSandbox, IsolationMode, PluginIsolation, PluginLimits, SandboxError,
+};
 
 pub(crate) fn repository_actor_source(repository: &str, path: Option<&str>) -> String {
     match path {
@@ -53,11 +58,10 @@ pub struct ExternalPluginProcess {
     auth_secret: String,
     /// Path to the PID file for this process
     pid_file_path: PathBuf,
-    /// The child process handle
-    child: Child,
-    /// The launcher that started the plugin as another user, which is then
-    /// also the only way to stop it.
-    launcher: Option<crate::launcher::PluginLauncher>,
+    /// What runs the plugin, and therefore how it is stopped.
+    runtime: PluginRuntime,
+    /// What separates this plugin from Temps.
+    pub isolation: IsolationMode,
     /// Whether the plugin has UI assets
     pub has_ui: bool,
     /// Bidirectional channel for platform queries and event delivery
@@ -73,6 +77,68 @@ pub(crate) struct PendingPlugin {
     process: ExternalPluginProcess,
 }
 
+/// Why a plugin did not start.
+#[derive(Debug, thiserror::Error)]
+pub enum StartFailure {
+    /// Its container could not be used. Typed, because the reason is something
+    /// an administrator acts on and is safe to show.
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
+    /// It failed its startup protocol. The text can name local paths and is
+    /// kept in the server log.
+    #[error("Plugin startup verification failed: {reason}")]
+    Startup { reason: String },
+}
+
+impl From<String> for StartFailure {
+    fn from(reason: String) -> Self {
+        Self::Startup { reason }
+    }
+}
+
+impl StartFailure {
+    /// The reason as the manager has always reported it.
+    pub fn into_reason(self) -> String {
+        match self {
+            Self::Sandbox(error) => error.to_string(),
+            Self::Startup { reason } => reason,
+        }
+    }
+
+    /// What an administrator is shown: the sandbox's own explanation, or a
+    /// generic line for a protocol failure.
+    pub fn public_reason(&self) -> String {
+        match self {
+            Self::Sandbox(error) => error.public_detail(),
+            Self::Startup { .. } => "Plugin failed startup verification".to_string(),
+        }
+    }
+}
+
+/// One container launch: which verified executable, and where on the host
+/// its socket and data live.
+struct ContainerPlan<'a> {
+    binary_name: &'a str,
+    binary_path: &'a Path,
+    expected_sha256: &'a str,
+    expected_name: &'a str,
+    instance_name: &'a str,
+    socket_dir: &'a Path,
+    plugin_data_dir: &'a Path,
+}
+
+/// What `manifest` asks for that a plugin in a container is never given, in
+/// words an administrator reads.
+pub(crate) fn privileged_access(manifest: &PluginManifest) -> Option<&'static str> {
+    if manifest.requires_db {
+        Some("the control-plane database")
+    } else if manifest.requires_host_data_access {
+        Some("the instance data directory")
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PluginLoadFailure {
     pub plugin: Option<String>,
@@ -85,43 +151,122 @@ pub struct PluginReloadResult {
     pub failures: Vec<PluginLoadFailure>,
 }
 
-impl ExternalPluginProcess {
-    /// Send SIGKILL to the plugin process (non-blocking).
-    ///
-    /// Does NOT wait for exit — call `wait_for_exit()` for that.
-    /// This is used by the `Drop` impl where we can't await.
-    pub fn kill(&mut self) {
-        if let Some(id) = self.child.id() {
-            debug!(plugin = %self.manifest.name, pid = id, "Killing plugin process");
-            if let Some(launcher) = &self.launcher {
-                // Another user's process: only the launcher can signal it. The
-                // pid can't have been reused, because the plugin is our direct
-                // child and is not reaped until `child` is waited on.
-                if let Err(e) = launcher.kill(id) {
-                    warn!(plugin = %self.manifest.name, "Failed to stop plugin process: {e}");
+/// What runs a plugin: a child process of Temps, or a container.
+enum PluginRuntime {
+    Process {
+        /// The child process handle
+        child: Child,
+        /// The launcher that started the plugin as another user, which is
+        /// then also the only way to stop it.
+        launcher: Option<crate::launcher::PluginLauncher>,
+    },
+    Container(SandboxedPlugin),
+}
+
+/// A plugin container and the two host directories that exist only for it.
+/// Dropping it removes all three.
+struct SandboxedPlugin {
+    container: crate::sandbox::RunningContainer,
+    /// The staged copy of the verified executable this container runs.
+    staged_binary_dir: PathBuf,
+    /// The directory the plugin creates its socket in.
+    socket_dir: PathBuf,
+}
+
+impl Drop for SandboxedPlugin {
+    fn drop(&mut self) {
+        self.container.remove_in_background();
+        let _ = std::fs::remove_dir_all(&self.staged_binary_dir);
+        let _ = std::fs::remove_dir_all(&self.socket_dir);
+    }
+}
+
+/// A started plugin and the two ends of its staged handshake.
+struct PluginIo {
+    runtime: PluginRuntime,
+    stdin: Box<dyn AsyncWrite + Unpin + Send>,
+    reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    /// Bytes the plugin wrote to stderr. Never their content.
+    stderr_bytes: Arc<AtomicUsize>,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PluginRuntime {
+    /// Stop the plugin without waiting for it to be gone.
+    fn kill(&mut self, plugin: &str) {
+        match self {
+            Self::Process { child, launcher } => {
+                let Some(id) = child.id() else { return };
+                debug!(plugin = %plugin, pid = id, "Killing plugin process");
+                if let Some(launcher) = launcher {
+                    // Another user's process: only the launcher can signal it.
+                    // The pid can't have been reused, because the plugin is our
+                    // direct child and is not reaped until `child` is waited on.
+                    if let Err(e) = launcher.kill(id) {
+                        warn!(plugin = %plugin, "Failed to stop plugin process: {e}");
+                    }
+                    return;
                 }
-                return;
+                if let Err(e) = child.start_kill() {
+                    warn!(plugin = %plugin, "Failed to kill plugin process: {}", e);
+                }
             }
-            if let Err(e) = self.child.start_kill() {
-                warn!(
-                    plugin = %self.manifest.name,
-                    "Failed to kill plugin process: {}", e
-                );
+            Self::Container(sandboxed) => {
+                debug!(plugin = %plugin, container = %sandboxed.container.name(), "Removing plugin container");
+                sandboxed.container.remove_in_background();
             }
         }
     }
 
-    /// Kill the process and wait (async) for it to exit.
+    /// Stop a plugin that did not finish starting. A launched process is
+    /// stopped by its [`LaunchedPlugin`] guard instead.
+    fn abort_start(&mut self) {
+        match self {
+            Self::Process { child, .. } => {
+                let _ = child.start_kill();
+            }
+            Self::Container(sandboxed) => sandboxed.container.remove_in_background(),
+        }
+    }
+
+    /// The host process id, for a plugin that is a child process.
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Process { child, .. } => child.id(),
+            Self::Container(_) => None,
+        }
+    }
+}
+
+impl ExternalPluginProcess {
+    /// Stop the plugin (non-blocking): SIGKILL for a process, a forced
+    /// removal for a container.
+    ///
+    /// Does NOT wait for exit — call [`Self::shutdown`] for that.
+    /// This is used by the `Drop` impl where we can't await.
+    pub fn kill(&mut self) {
+        self.runtime.kill(&self.manifest.name);
+    }
+
+    /// Stop the plugin and wait (async) for it to be gone.
     ///
     /// Used during reload/shutdown from async context.
     pub async fn shutdown(&mut self) {
-        self.kill();
-        // Wait up to 5 seconds for the process to actually exit.
-        // This prevents zombie processes and ensures the socket is released.
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        match &mut self.runtime {
+            PluginRuntime::Process { .. } => {
+                self.runtime.kill(&self.manifest.name);
+                if let PluginRuntime::Process { child, .. } = &mut self.runtime {
+                    // Wait up to 5 seconds for the process to actually exit.
+                    // This prevents zombie processes and ensures the socket is released.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                }
+            }
+            PluginRuntime::Container(sandboxed) => sandboxed.container.remove().await,
+        }
     }
 
-    /// Clean up socket and PID files on disk.
+    /// Clean up socket and PID files on disk. A container's own directories
+    /// are removed when its [`SandboxedPlugin`] is dropped.
     fn cleanup_files(&self) {
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_file(&self.pid_file_path);
@@ -187,6 +332,14 @@ pub struct ExternalPluginConfig {
     /// Temps refuses to start them unless that user provably can't read its
     /// secrets. See [`crate::launcher`].
     pub launcher: Option<crate::launcher::PluginLauncher>,
+    /// The container runtime plugins are sandboxed with, or the reason this
+    /// server has none. See [`crate::sandbox`].
+    pub sandbox: ContainerSandbox,
+    /// Directory holding, per running container, the staged copy of the
+    /// verified executable that container runs.
+    pub sandbox_dir: PathBuf,
+    /// Resource caps every plugin container starts with.
+    pub limits: PluginLimits,
 }
 
 /// Maximum length of a Unix socket path on this platform.
@@ -288,6 +441,68 @@ async fn read_handshake_frame<R: AsyncBufRead + Unpin>(
         .map_err(|error| format!("Plugin {binary_name} sent non-UTF-8 {phase}: {error}"))
 }
 
+/// Copy the verified executable into a fresh, read-only directory of its own
+/// for a container to run. With Temps as root the plugin is another user, so
+/// it is given read and execute on the copy and nothing else.
+async fn stage_executable(
+    executable: crate::install::VerifiedExecutable,
+    plugin: &str,
+    expected_sha256: &str,
+    staged_dir: &Path,
+    temps_is_root: bool,
+) -> Result<(), String> {
+    let plugin = plugin.to_string();
+    let expected_sha256 = expected_sha256.to_string();
+    let staged_dir = staged_dir.to_path_buf();
+    let staging = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let describe = |error: std::io::Error| {
+            format!(
+                "Could not stage the executable of plugin '{plugin}' in {}: {error}",
+                staged_dir.display()
+            )
+        };
+        match std::fs::remove_dir_all(&staged_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(describe(error)),
+        }
+        std::fs::create_dir_all(&staged_dir).map_err(describe)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let (dir_mode, file_mode) = if temps_is_root {
+                (0o755, 0o555)
+            } else {
+                (0o700, 0o500)
+            };
+            std::fs::set_permissions(&staged_dir, std::fs::Permissions::from_mode(dir_mode))
+                .map_err(describe)?;
+            executable
+                .copy_to(
+                    &plugin,
+                    &staged_dir.join(crate::sandbox::STAGED_BINARY_FILE),
+                    file_mode,
+                    &expected_sha256,
+                )
+                .map_err(|error| error.to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (executable, expected_sha256, temps_is_root);
+            Err(format!(
+                "Plugin '{plugin}' cannot be staged for a container on this operating system"
+            ))
+        }
+    })
+    .await;
+    match staging {
+        Ok(result) => result,
+        Err(error) => Err(format!(
+            "Staging a plugin executable was interrupted: {error}"
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn secure_socket_directory(path: &Path, mode: u32) -> Result<(), std::io::Error> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -353,6 +568,9 @@ impl ExternalPluginConfig {
             plugins_dir: data_dir.join("plugins"),
             sockets_dir,
             pids_dir: data_dir.join("run").join("plugin-pids"),
+            sandbox_dir: data_dir.join("run").join("plugin-sandbox"),
+            sandbox: ContainerSandbox::not_configured(),
+            limits: PluginLimits::default(),
             data_dir: data_dir.join("plugin-data"),
             ui_assets_dir: data_dir.join("plugin-ui"),
             host_data_dir: data_dir,
@@ -368,6 +586,12 @@ impl ExternalPluginConfig {
     /// Run plugins as another user through `launcher` (see [`crate::launcher`]).
     pub fn with_launcher(mut self, launcher: crate::launcher::PluginLauncher) -> Self {
         self.launcher = Some(launcher);
+        self
+    }
+
+    /// Sandbox plugins in containers through `sandbox` (see [`crate::sandbox`]).
+    pub fn with_sandbox(mut self, sandbox: ContainerSandbox) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -431,6 +655,9 @@ pub struct ExternalPluginManager {
     /// before every plugin start, and a failure keeps the plugin from
     /// starting, so fixing the host and reloading plugins is enough.
     isolation: tokio::sync::OnceCell<crate::launcher::IsolationReport>,
+    /// Why each installed plugin that is not running failed its last start,
+    /// in words an administrator can be shown. Cleared when it starts.
+    start_failures: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl ExternalPluginManager {
@@ -445,6 +672,7 @@ impl ExternalPluginManager {
             watch_ready: Default::default(),
             audit_service: Arc::new(RwLock::new(None)),
             isolation: tokio::sync::OnceCell::new(),
+            start_failures: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -626,6 +854,13 @@ impl ExternalPluginManager {
         // Kill any stale plugin processes left over from a previous run
         // (e.g. if the server was killed without graceful shutdown).
         self.kill_stale_processes().await;
+        // The same for plugin containers this installation left running, and
+        // the executables staged for them.
+        self.config
+            .sandbox
+            .remove_stale(&ContainerSandbox::host_id(&self.config.host_data_dir))
+            .await;
+        let _ = tokio::fs::remove_dir_all(&self.config.sandbox_dir).await;
 
         // Under a launcher, prove the isolation at every start, plugins or
         // not, so the log says whether it holds before anything is installed.
@@ -672,7 +907,7 @@ impl ExternalPluginManager {
                     );
                     failures.push(PluginLoadFailure {
                         plugin: Some(installation.name),
-                        reason: "Plugin failed startup verification".to_string(),
+                        reason: e.public_reason(),
                     });
                 }
             }
@@ -762,61 +997,20 @@ impl ExternalPluginManager {
         }
     }
 
-    /// Spawn a single plugin binary and complete the handshake without adding
-    /// it to the active process table.
-    #[allow(clippy::too_many_arguments)] // Keep verified identity inputs explicit at the process security boundary.
-    async fn spawn_plugin(
+    /// Start the verified executable as a child process of Temps, directly or
+    /// through the plugin launcher.
+    async fn launch_process(
         &self,
+        binary_name: &str,
         binary_path: &Path,
         expected_sha256: &str,
-        expected_name: &str,
-        expected_version: &str,
-        instance_name: &str,
-        data_name: &str,
-        source_identity: String,
-        defer_actor_commit: bool,
-    ) -> Result<ExternalPluginProcess, String> {
-        let binary_name = binary_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        let socket_path = self
-            .config
-            .sockets_dir
-            .join(format!("{}.sock", instance_name));
-        let plugin_data_dir = self.config.data_dir.join(data_name);
-        // This authenticates traffic as belonging to the staged child process.
-        // Installed plugins are trusted host code under the current shared-UID
-        // architecture; this is protocol integrity, not a sandbox boundary.
-        let auth_secret = generate_plugin_auth_secret();
-
-        // Validate that the socket path fits within the OS limit.
-        let socket_path_len = socket_path.as_os_str().len();
-        if socket_path_len >= SUN_PATH_MAX {
-            return Err(format!(
-                "Socket path for {} is {} bytes, exceeds OS limit of {} bytes: {}. \
-                 Move your data directory to a shorter path.",
-                binary_name,
-                socket_path_len,
-                SUN_PATH_MAX,
-                socket_path.display(),
-            ));
-        }
-
-        // Remove stale socket
-        let _ = tokio::fs::remove_file(&socket_path).await;
-
-        debug!(binary = %binary_name, "Spawning external plugin");
-
-        let pid_file_path = self.config.pids_dir.join(format!("{}.pid", instance_name));
-
-        // Under a launcher, nothing starts until the plugin user is proven
-        // unable to read this process's secrets.
-        let launcher = self.verified_isolation().await?.cloned();
+        socket_path: &Path,
+        plugin_data_dir: &Path,
+        launcher: Option<&crate::launcher::PluginLauncher>,
+    ) -> Result<PluginIo, String> {
         #[cfg(unix)]
         if launcher.is_some() {
-            self.share_with_plugin_user(binary_path, &plugin_data_dir)
+            self.share_with_plugin_user(binary_path, plugin_data_dir)
                 .map_err(|error| {
                     format!(
                         "Could not give the plugin account access to {binary_name}'s files: \
@@ -833,7 +1027,7 @@ impl ExternalPluginManager {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let mut command = match &launcher {
+        let mut command = match launcher {
             // The launcher checks the digest again as the plugin user and
             // execs the binary by path: descriptors above 2 don't survive the
             // change of user, and the plugin user can't write the binary.
@@ -867,57 +1061,27 @@ impl ExternalPluginManager {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| match &launcher {
+            .map_err(|e| match launcher {
                 Some(launcher) => format!(
                     "Failed to start {binary_name} through the plugin launcher {}: {e}",
                     launcher.program().display()
                 ),
                 None => format!("Failed to spawn {}: {}", binary_name, e),
             })?;
-        // `kill_on_drop` can't signal another user's process, so every early
-        // return below stops a launched plugin through this guard instead.
-        // Declared after `child`, it drops first: the pid is still unreaped.
-        let mut launched = LaunchedPlugin {
-            launcher: launcher.as_ref(),
-            pid: child.id(),
-        };
         // Keep the verified executable descriptor alive until spawn has
         // completed and the child has inherited it.
         drop(executable);
 
-        let mut child_stdin = child
+        // A launched plugin is another user's process, which dropping `child`
+        // cannot signal: stop it here if its pipes cannot be taken.
+        let mut launched = LaunchedPlugin {
+            launcher,
+            pid: child.id(),
+        };
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| format!("Failed to open the launch-config pipe for {binary_name}"))?;
-
-        // Write PID file so we can clean up stale processes on restart
-        if let Some(pid) = child.id() {
-            let pid_write = async {
-                let mut file = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&pid_file_path)
-                    .await?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                        .await?;
-                }
-                file.write_all(pid.to_string().as_bytes()).await?;
-                file.sync_all().await
-            }
-            .await;
-            if let Err(e) = pid_write {
-                warn!(
-                    binary = %binary_name,
-                    "Failed to write PID file {}: {}",
-                    pid_file_path.display(),
-                    e
-                );
-            }
-        }
-
         let stdout = child
             .stdout
             .take()
@@ -948,8 +1112,245 @@ impl ExternalPluginManager {
         } else {
             None
         };
+        launched.pid = None;
+        Ok(PluginIo {
+            runtime: PluginRuntime::Process {
+                child,
+                launcher: launcher.cloned(),
+            },
+            stdin: Box::new(stdin),
+            reader: Box::new(BufReader::new(stdout)),
+            stderr_bytes,
+            stderr_task,
+        })
+    }
 
-        let mut reader = BufReader::new(stdout);
+    /// Start the verified executable in a hardened container.
+    ///
+    /// The container runs a copy made from the descriptor that was hashed,
+    /// mounted read-only, so it cannot run anything but the verified build.
+    async fn launch_container(&self, plan: ContainerPlan<'_>) -> Result<PluginIo, StartFailure> {
+        let ContainerPlan {
+            binary_name,
+            binary_path,
+            expected_sha256,
+            expected_name,
+            instance_name,
+            socket_dir,
+            plugin_data_dir,
+        } = plan;
+        let sandbox = &self.config.sandbox;
+        // Refuse before touching the disk when this server cannot sandbox.
+        sandbox
+            .availability()
+            .map_err(|reason| SandboxError::Unavailable {
+                plugin: expected_name.to_string(),
+                reason,
+            })?;
+
+        let executable = open_verified_executable(
+            binary_name,
+            &self.config.plugins_dir,
+            binary_path,
+            expected_sha256,
+        )
+        .await
+        .map_err(|error| StartFailure::from(error.to_string()))?;
+
+        let staged_binary_dir = self.config.sandbox_dir.join(instance_name);
+        let staged = stage_executable(
+            executable,
+            expected_name,
+            expected_sha256,
+            &staged_binary_dir,
+            sandbox.host().uid == 0,
+        )
+        .await;
+        if let Err(error) = staged {
+            let _ = tokio::fs::remove_dir_all(&staged_binary_dir).await;
+            return Err(error.into());
+        }
+        // A socket directory left by a launch that was not cleaned up.
+        let _ = tokio::fs::remove_dir_all(socket_dir).await;
+
+        let host_id = ContainerSandbox::host_id(&self.config.host_data_dir);
+        let launched = sandbox
+            .launch(&crate::sandbox::ContainerLaunch {
+                plugin_name: expected_name,
+                instance_name,
+                sha256: expected_sha256,
+                host_id: &host_id,
+                binary_dir: &staged_binary_dir,
+                socket_dir,
+                data_dir: plugin_data_dir,
+                host_api_url: self.config.host_api_url.as_deref(),
+                limits: self.config.limits,
+            })
+            .await;
+        let launched = match launched {
+            Ok(launched) => launched,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&staged_binary_dir).await;
+                let _ = tokio::fs::remove_dir_all(socket_dir).await;
+                return Err(error.into());
+            }
+        };
+        Ok(PluginIo {
+            runtime: PluginRuntime::Container(SandboxedPlugin {
+                container: launched.container,
+                staged_binary_dir,
+                socket_dir: socket_dir.to_path_buf(),
+            }),
+            stdin: launched.stdin,
+            reader: Box::new(BufReader::new(launched.stdout)),
+            stderr_bytes: launched.stderr_bytes,
+            stderr_task: Some(launched.pump),
+        })
+    }
+
+    /// Spawn a single plugin binary and complete the handshake without adding
+    /// it to the active process table.
+    #[allow(clippy::too_many_arguments)] // Keep verified identity inputs explicit at the process security boundary.
+    async fn spawn_plugin(
+        &self,
+        binary_path: &Path,
+        expected_sha256: &str,
+        expected_name: &str,
+        expected_version: &str,
+        instance_name: &str,
+        data_name: &str,
+        source_identity: String,
+        defer_actor_commit: bool,
+        isolation: PluginIsolation,
+    ) -> Result<ExternalPluginProcess, StartFailure> {
+        let binary_name = binary_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
+        let plugin_data_dir = self.config.data_dir.join(data_name);
+        // This authenticates traffic as belonging to the staged plugin launch.
+        // It is protocol integrity; what contains the plugin is its isolation.
+        let auth_secret = generate_plugin_auth_secret();
+
+        // Under a launcher, nothing starts until the plugin user is proven
+        // unable to read this process's secrets. A launcher is this host's
+        // sandbox, so it takes the place of a container.
+        let launcher = self.verified_isolation().await?.cloned();
+        let mode = match (&launcher, isolation) {
+            (Some(_), _) => IsolationMode::SeparateUser,
+            (None, PluginIsolation::Container) => IsolationMode::Container,
+            (None, PluginIsolation::Process) => IsolationMode::Process,
+        };
+        // A container gets a socket directory of its own, so it is never
+        // shown another plugin's socket.
+        let socket_path = match mode {
+            IsolationMode::Container => self
+                .config
+                .sockets_dir
+                .join(instance_name)
+                .join(crate::sandbox::SOCKET_FILE),
+            IsolationMode::SeparateUser | IsolationMode::Process => self
+                .config
+                .sockets_dir
+                .join(format!("{}.sock", instance_name)),
+        };
+
+        // Validate that the socket path fits within the OS limit.
+        let socket_path_len = socket_path.as_os_str().len();
+        if socket_path_len >= SUN_PATH_MAX {
+            return Err(format!(
+                "Socket path for {} is {} bytes, exceeds OS limit of {} bytes: {}. \
+                 Move your data directory to a shorter path.",
+                binary_name,
+                socket_path_len,
+                SUN_PATH_MAX,
+                socket_path.display(),
+            )
+            .into());
+        }
+
+        // Remove stale socket
+        let _ = tokio::fs::remove_file(&socket_path).await;
+
+        debug!(binary = %binary_name, isolation = ?mode, "Spawning external plugin");
+
+        let pid_file_path = self.config.pids_dir.join(format!("{}.pid", instance_name));
+
+        let io = match mode {
+            IsolationMode::Container => {
+                let socket_dir = self.config.sockets_dir.join(instance_name);
+                self.launch_container(ContainerPlan {
+                    binary_name,
+                    binary_path,
+                    expected_sha256,
+                    expected_name,
+                    instance_name,
+                    socket_dir: &socket_dir,
+                    plugin_data_dir: &plugin_data_dir,
+                })
+                .await?
+            }
+            IsolationMode::SeparateUser | IsolationMode::Process => {
+                if mode == IsolationMode::Process {
+                    warn!(
+                        plugin = %expected_name,
+                        "Plugin runs without a sandbox, with the access of the Temps account"
+                    );
+                }
+                self.launch_process(
+                    binary_name,
+                    binary_path,
+                    expected_sha256,
+                    &socket_path,
+                    &plugin_data_dir,
+                    launcher.as_ref(),
+                )
+                .await?
+            }
+        };
+        let PluginIo {
+            mut runtime,
+            stdin: mut child_stdin,
+            mut reader,
+            stderr_bytes,
+            stderr_task,
+        } = io;
+        // `kill_on_drop` can't signal another user's process, so every early
+        // return below stops a launched plugin through this guard instead.
+        // Declared after `runtime`, it drops first: the pid is still unreaped.
+        let mut launched = LaunchedPlugin {
+            launcher: launcher.as_ref(),
+            pid: runtime.pid(),
+        };
+
+        // Write PID file so we can clean up stale processes on restart
+        if let Some(pid) = runtime.pid() {
+            let pid_write = async {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&pid_file_path)
+                    .await?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                        .await?;
+                }
+                file.write_all(pid.to_string().as_bytes()).await?;
+                file.sync_all().await
+            }
+            .await;
+            if let Err(e) = pid_write {
+                warn!(
+                    binary = %binary_name,
+                    "Failed to write PID file {}: {}",
+                    pid_file_path.display(),
+                    e
+                );
+            }
+        }
 
         // Stage 1: the already-running child identifies its protocol and
         // declares which host values it needs. Nothing sensitive or privileged
@@ -992,7 +1393,7 @@ impl ExternalPluginManager {
                 if let Some(task) = stderr_task {
                     task.abort();
                 }
-                return Err(format!("{}{}", e, stderr_context));
+                return Err(format!("{}{}", e, stderr_context).into());
             }
             Err(_) => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1002,7 +1403,7 @@ impl ExternalPluginManager {
                 }
                 return Err(format!(
                     "Plugin {binary_name} did not emit the staged startup hello; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}{stderr_context}"
-                ));
+                ).into());
             }
         };
 
@@ -1011,14 +1412,14 @@ impl ExternalPluginManager {
         if manifest.name != expected_name || manifest.version != expected_version {
             let declared_name = manifest.name.clone();
             let declared_version = manifest.version.clone();
-            let _ = child.start_kill();
+            runtime.abort_start();
             if let Some(task) = stderr_task {
                 task.abort();
             }
             return Err(format!(
                 "Plugin binary {} declares {declared_name} v{declared_version}, but signed installation expects {expected_name} v{expected_version}",
                 binary_path.display()
-            ));
+            ).into());
         }
 
         debug!(plugin = %manifest.name, "Received manifest from plugin");
@@ -1026,7 +1427,7 @@ impl ExternalPluginManager {
         // The plugin is running its own code by now. Before it is sent the
         // launch configuration, confirm it really is another user.
         if launcher.is_some() {
-            let verified = match child.id() {
+            let verified = match runtime.pid() {
                 Some(pid) => {
                     crate::launcher::verify_plugin_process(pid, crate::launcher::temps_uid())
                 }
@@ -1036,13 +1437,31 @@ impl ExternalPluginManager {
                 if let Some(task) = stderr_task {
                     task.abort();
                 }
-                return Err(format!("Plugin {binary_name} was not started: {error}"));
+                return Err(format!("Plugin {binary_name} was not started: {error}").into());
+            }
+        }
+
+        // A container is given neither the control-plane database nor the
+        // instance data directory, whatever its manifest asks for. Nothing has
+        // been disclosed yet: refuse before the launch configuration is sent.
+        if mode == IsolationMode::Container {
+            let access = privileged_access(&manifest);
+            if let Some(access) = access {
+                runtime.abort_start();
+                if let Some(task) = stderr_task {
+                    task.abort();
+                }
+                return Err(SandboxError::PrivilegedAccess {
+                    plugin: manifest.name.clone(),
+                    access,
+                }
+                .into());
             }
         }
 
         // Stage 2: send one typed line to this same child. The manifest flags
-        // control disclosure/routing for trusted installed code; they do not
-        // turn a shared-UID plugin process into a security sandbox.
+        // control what an unsandboxed plugin is told; they are not what
+        // contains it.
         if manifest.requires_host_data_access {
             warn!(
                 plugin = %manifest.name,
@@ -1062,21 +1481,35 @@ impl ExternalPluginManager {
         let launch_json = serde_json::to_string(&launch_config).map_err(|error| {
             format!("Failed to encode launch configuration for {binary_name}: {error}")
         })?;
-        if let Err(error) = child_stdin
-            .write_all(format!("{launch_json}\n").as_bytes())
-            .await
-        {
-            let _ = child.start_kill();
+        let delivered = async {
+            child_stdin
+                .write_all(format!("{launch_json}\n").as_bytes())
+                .await?;
+            child_stdin.flush().await
+        }
+        .await;
+        if let Err(error) = delivered {
+            runtime.abort_start();
             return Err(format!(
                 "Failed to deliver typed launch configuration to {binary_name}: {error}"
-            ));
+            )
+            .into());
         }
-        if let Err(error) = child_stdin.shutdown().await {
-            let _ = child.start_kill();
-            return Err(format!(
-                "Failed to close the launch-config pipe for {binary_name}: {error}"
-            ));
-        }
+        // A process's pipe is closed here. A container's stdin shares the
+        // connection its stdout arrives on, so it stays open until the ready
+        // signal has been read; the plugin reads exactly one line of it.
+        let container_stdin = if mode == IsolationMode::Container {
+            Some(child_stdin)
+        } else {
+            if let Err(error) = child_stdin.shutdown().await {
+                runtime.abort_start();
+                return Err(format!(
+                    "Failed to close the launch-config pipe for {binary_name}: {error}"
+                )
+                .into());
+            }
+            None
+        };
 
         // Read ready signal (handshake phase 2)
         let (has_ui, openapi_schema) = match tokio::time::timeout(self.config.handshake_timeout, async {
@@ -1135,7 +1568,7 @@ impl ExternalPluginManager {
                 if let Some(task) = stderr_task {
                     task.abort();
                 }
-                return Err(format!("{}{}", e, stderr_context));
+                return Err(format!("{}{}", e, stderr_context).into());
             }
             Err(_) => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1146,11 +1579,14 @@ impl ExternalPluginManager {
                 return Err(format!(
                     "Ready signal timeout for {}{}",
                     binary_name, stderr_context
-                ));
+                ).into());
             }
         };
 
         debug!(plugin = %manifest.name, has_ui = has_ui, "Plugin is ready");
+        // The handshake is over: release the container's attach connection.
+        drop(container_stdin);
+        drop(reader);
 
         if has_ui {
             let ui_dir = self.config.ui_assets_dir.join(&manifest.name);
@@ -1184,36 +1620,81 @@ impl ExternalPluginManager {
         let channel = match channel {
             Some(channel) => channel,
             None => {
-                let _ = child.start_kill();
+                runtime.abort_start();
                 return Err(format!(
                     "Plugin {binary_name} did not establish an authenticated platform channel; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
-                ));
+                ).into());
             }
         };
 
         // Handed over: from here `ExternalPluginProcess` stops it.
         launched.pid = None;
         Ok(ExternalPluginProcess {
-            launcher: launcher.clone(),
+            runtime,
+            isolation: mode,
             manifest,
             binary_path: binary_path.to_path_buf(),
             sha256: expected_sha256.to_string(),
             socket_path,
             auth_secret,
             pid_file_path,
-            child,
             has_ui,
             channel: Some(channel),
             openapi_schema,
         })
     }
 
+    /// How an administrator asked for `plugin_name` to be isolated: the
+    /// value on its active actor row, or `None` when it has no such row yet.
+    ///
+    /// A failed read keeps the plugin from starting: guessing would either run
+    /// it unsandboxed or break a plugin that was deliberately not sandboxed.
+    pub(crate) async fn stored_isolation(
+        &self,
+        plugin_name: &str,
+    ) -> Result<Option<PluginIsolation>, String> {
+        crate::grants::PluginGrantService::new(self.db.clone())
+            .isolation(plugin_name)
+            .await
+            .map_err(|error| {
+                error!(plugin = %plugin_name, %error, "Could not read a plugin's isolation setting");
+                format!("The isolation setting of plugin '{plugin_name}' could not be read")
+            })
+    }
+
     /// Start a verified active install and register it under its signed name.
+    /// A failure is remembered so the plugin's status can say why it is not
+    /// running.
     async fn start_plugin(
         &self,
         installation: &crate::install::ActiveInstallation,
-    ) -> Result<PluginManifest, String> {
+    ) -> Result<PluginManifest, StartFailure> {
+        let started = self.start_plugin_once(installation).await;
+        let mut failures = self.start_failures.write().await;
+        match &started {
+            Ok(_) => {
+                failures.remove(&installation.name);
+            }
+            Err(failure) => {
+                failures.insert(installation.name.clone(), failure.public_reason());
+            }
+        }
+        started
+    }
+
+    async fn start_plugin_once(
+        &self,
+        installation: &crate::install::ActiveInstallation,
+    ) -> Result<PluginManifest, StartFailure> {
         let expected_name = &installation.name;
+        // The row is what an administrator changes. Without one, the choice
+        // recorded at activation applies (its commit was lost); an
+        // installation with neither was installed before plugins could be
+        // isolated and keeps running as it always has, as a process.
+        let stored = self.stored_isolation(expected_name).await?;
+        let isolation = stored
+            .or(installation.isolation)
+            .unwrap_or(PluginIsolation::Process);
         let process = self
             .spawn_plugin(
                 &installation.binary_path,
@@ -1224,8 +1705,25 @@ impl ExternalPluginManager {
                 expected_name,
                 installation.source_identity.clone(),
                 false,
+                isolation,
             )
             .await?;
+        if stored.is_none() {
+            // Starting bound the plugin's actor row. Write down what it runs
+            // with, so the next start does not fall back to the column default.
+            if let Err(error) = crate::grants::PluginGrantService::new(self.db.clone())
+                .set_isolation(expected_name, isolation)
+                .await
+            {
+                error!(plugin = %expected_name, %error, "Could not record a plugin's isolation");
+                let mut process = process;
+                process.shutdown().await;
+                return Err(format!(
+                    "The isolation of plugin '{expected_name}' could not be recorded"
+                )
+                .into());
+            }
+        }
         let manifest = process.manifest.clone();
         if let Some(mut replaced) = self
             .plugins
@@ -1247,7 +1745,8 @@ impl ExternalPluginManager {
         expected_sha256: &str,
         binary_path: &Path,
         source_identity: String,
-    ) -> Result<PendingPlugin, String> {
+        isolation: PluginIsolation,
+    ) -> Result<PendingPlugin, StartFailure> {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let instance_name = format!("candidate-{}", &suffix[..16]);
         let process = self
@@ -1260,6 +1759,7 @@ impl ExternalPluginManager {
                 expected_name,
                 source_identity,
                 true,
+                isolation,
             )
             .await?;
         Ok(PendingPlugin {
@@ -1280,6 +1780,10 @@ impl ExternalPluginManager {
     /// Atomically swap the process table entry, then stop the old process.
     pub(crate) async fn promote_candidate(&self, pending: PendingPlugin) -> PluginManifest {
         let manifest = pending.process.manifest.clone();
+        self.start_failures
+            .write()
+            .await
+            .remove(&pending.expected_name);
         let old = self
             .plugins
             .write()
@@ -1424,6 +1928,63 @@ impl ExternalPluginManager {
         self.plugins.read().await.contains_key(plugin_name)
     }
 
+    /// What separates a running plugin from Temps, or `None` when it is not
+    /// running.
+    pub async fn isolation_of(&self, plugin_name: &str) -> Option<IsolationMode> {
+        self.plugins
+            .read()
+            .await
+            .get(plugin_name)
+            .map(|process| process.isolation)
+    }
+
+    /// Why an installed plugin failed its last start, if it did.
+    pub async fn start_failure(&self, plugin_name: &str) -> Option<String> {
+        self.start_failures.read().await.get(plugin_name).cloned()
+    }
+
+    /// What separates every running plugin from Temps, by plugin name.
+    pub async fn running_isolation(&self) -> HashMap<String, IsolationMode> {
+        self.plugins
+            .read()
+            .await
+            .iter()
+            .map(|(name, process)| (name.clone(), process.isolation))
+            .collect()
+    }
+
+    /// Every installed plugin that failed its last start, with the reason.
+    pub async fn start_failures(&self) -> HashMap<String, String> {
+        self.start_failures.read().await.clone()
+    }
+
+    /// Stop `plugin_name` if it is running and start its verified active
+    /// installation again, with the isolation now stored for it.
+    pub(crate) async fn restart_from_active(
+        &self,
+        plugin_name: &str,
+    ) -> Result<PluginManifest, StartFailure> {
+        let active = crate::install::verified_active_installation(
+            plugin_name,
+            &self.config.plugins_dir,
+            &self.config.registry,
+        )
+        .await
+        .map_err(|error| {
+            StartFailure::from(format!(
+                "Cannot verify the active release of plugin '{plugin_name}': {error}"
+            ))
+        })?;
+        let old = self.plugins.write().await.remove(plugin_name);
+        if let Some(mut old) = old {
+            info!(plugin = %plugin_name, "Stopping external plugin to change its isolation");
+            old.shutdown().await;
+            // Drop owns socket and PID cleanup. Finish it before reusing either path.
+            drop(old);
+        }
+        self.start_plugin(&active).await
+    }
+
     /// Shut down all plugins gracefully.
     pub async fn shutdown_all(&self) {
         let mut plugins = self.plugins.write().await;
@@ -1436,6 +1997,7 @@ impl ExternalPluginManager {
 
     /// Shut down a specific plugin.
     pub async fn shutdown_plugin(&self, plugin_name: &str) {
+        self.start_failures.write().await.remove(plugin_name);
         let mut plugins = self.plugins.write().await;
         if let Some(mut process) = plugins.remove(plugin_name) {
             info!(plugin = %plugin_name, "Shutting down external plugin");
@@ -1507,7 +2069,9 @@ impl ExternalPluginManager {
         old.shutdown().await;
         // Drop owns socket and PID cleanup. Finish it before reusing either path.
         drop(old);
-        self.start_plugin(&active).await
+        self.start_plugin(&active)
+            .await
+            .map_err(StartFailure::into_reason)
     }
 
     /// Get the config.
@@ -1621,8 +2185,11 @@ mod tests {
                 socket_path: root.join(format!("{name}-{version}.sock")),
                 auth_secret: "fixture-auth".to_string(),
                 pid_file_path: root.join(format!("{name}-{version}.pid")),
-                child,
-                launcher: None,
+                runtime: PluginRuntime::Process {
+                    child,
+                    launcher: None,
+                },
+                isolation: IsolationMode::Process,
                 has_ui: false,
                 channel: None,
                 openapi_schema: None,
@@ -1757,6 +2324,80 @@ mod tests {
         assert!(status.success());
     }
 
+    #[test]
+    fn a_plugin_in_a_container_is_never_given_the_database_or_the_data_directory() {
+        let plain = PluginManifest::builder("reports", "1.0.0").build();
+        assert_eq!(privileged_access(&plain), None);
+        let database = PluginManifest::builder("reports", "1.0.0")
+            .requires_db(true)
+            .build();
+        assert_eq!(
+            privileged_access(&database),
+            Some("the control-plane database")
+        );
+        let data = PluginManifest::builder("reports", "1.0.0")
+            .requires_host_data_access(true)
+            .build();
+        assert_eq!(
+            privileged_access(&data),
+            Some("the instance data directory")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_prepare_candidate_in_a_container_runs_nothing_when_this_server_has_no_sandbox() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // Arrange: a candidate that leaves a marker the moment it executes.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".to_string(),
+        );
+        config.handshake_timeout = Duration::from_secs(2);
+        std::fs::create_dir_all(&config.plugins_dir).expect("plugins directory");
+        let marker = temp.path().join("executed");
+        let script = format!("#!/bin/sh\n: > '{}'\n", marker.display());
+        let binary = config.plugins_dir.join("contained-fixture");
+        std::fs::write(&binary, script.as_bytes()).expect("fixture script");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o500))
+            .expect("fixture permissions");
+        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+        let sandbox_dir = config.sandbox_dir.clone();
+        let manager = ExternalPluginManager::new(config, mock_db());
+
+        // Act: the default configuration was given no Docker client.
+        let failure = match manager
+            .prepare_candidate(
+                "contained",
+                "1.0.0",
+                &digest,
+                &binary,
+                "registry:https://registry.invalid".to_string(),
+                PluginIsolation::Container,
+            )
+            .await
+        {
+            Ok(_) => panic!("a container plugin must not start without a sandbox"),
+            Err(failure) => failure,
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Assert: refused with the reason, and never run outside a container.
+        let StartFailure::Sandbox(SandboxError::Unavailable { plugin, reason }) = &failure else {
+            panic!("expected an unavailable sandbox, got {failure:?}");
+        };
+        assert_eq!(plugin, "contained");
+        assert!(!reason.is_empty());
+        assert_eq!(failure.public_reason(), failure.to_string());
+        assert!(!marker.exists(), "the candidate must not have executed");
+        let staged = std::fs::read_dir(&sandbox_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(staged, 0, "a refused launch must leave nothing staged");
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn test_prepare_candidate_wrong_identity_receives_no_launch_configuration() {
@@ -1803,11 +2444,12 @@ mod tests {
                 &digest,
                 &binary,
                 "registry:https://registry.invalid".to_string(),
+                PluginIsolation::Process,
             )
             .await
         {
             Ok(_) => panic!("signed and declared identities must match"),
-            Err(error) => error,
+            Err(error) => error.into_reason(),
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
 

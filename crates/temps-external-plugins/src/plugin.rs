@@ -21,6 +21,7 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handler::{self, ExternalPluginsApiDoc, ExternalPluginsAppState};
 use crate::manager::ExternalPluginConfig;
+use crate::sandbox::{ContainerSandbox, SandboxHost};
 use crate::service::ExternalPluginsService;
 use tracing::{debug, warn};
 
@@ -70,6 +71,14 @@ impl TempsPlugin for ExternalPluginsPlugin {
         "external-plugins"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<sea_orm::DatabaseConnection>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -94,8 +103,29 @@ impl TempsPlugin for ExternalPluginsPlugin {
                 context.get_service::<dyn temps_core::plugin_builder::RemotePluginBuilder>();
             let ai_tools = Arc::new(temps_ai_api_tools::PluginToolsRegistry::default());
             context.register_service(ai_tools.clone());
+            // The Docker client deployments run on, registered in every
+            // profile (as a typed "disabled" where there is none), and where
+            // this process itself runs. An embedding that registers no
+            // runtime context keeps the historical host behaviour.
+            let docker = context.require_service::<temps_core::DockerHandle>();
+            let inside_container = context
+                .get_service::<temps_core::RuntimeContext>()
+                .is_some_and(|runtime| {
+                    runtime.execution_environment()
+                        == temps_core::runtime::ExecutionEnvironment::Docker
+                });
+            let config = self.config.clone().with_sandbox(ContainerSandbox::new(
+                docker.as_ref().clone(),
+                SandboxHost::detect(inside_container),
+            ));
+            if let Err(reason) = config.sandbox.availability() {
+                tracing::warn!(
+                    reason = %reason,
+                    "Plugins cannot run in containers on this server; a plugin set to container isolation will not start"
+                );
+            }
             let service = Arc::new(
-                ExternalPluginsService::new_empty(self.config.clone(), queue, db)
+                ExternalPluginsService::new_empty(config, queue, db)
                     .with_remote_builder(remote_builder)
                     .with_ai_tools_registry(ai_tools),
             );

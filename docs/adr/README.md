@@ -136,6 +136,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [115](./115-the-control-plane-serves-private-addresses.md) | The control plane serves private addresses | Proposed | amends [064](./064-making-a-project-reachable.md) |
 | [116](./116-agents-run-on-the-ai-gateway-only.md) | Agents run on the AI gateway only | Proposed | supersedes [037](./037-subscription-agent-cli-providers.md) |
 | [117](./117-ingress-provider-trait.md) | An ingress provider is one trait implementation | Proposed | supersedes [058](./058-ingress-modes-and-a-shared-app-domain.md) |
+| [118](./118-external-plugins-run-in-containers.md) | External plugins run in containers | Proposed |  |
 
 ## Supporting documents
 

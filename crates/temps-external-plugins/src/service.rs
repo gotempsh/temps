@@ -25,9 +25,12 @@ use crate::install::{
 use crate::install_progress::{
     InstallProgressStore, ProgressError, ProgressHandle, ProgressSnapshot, Stage,
 };
-use crate::manager::{ExternalPluginConfig, ExternalPluginManager, PluginReloadResult};
+use crate::manager::{
+    ExternalPluginConfig, ExternalPluginManager, PluginReloadResult, StartFailure,
+};
 use crate::proxy;
 use crate::repository::{self, RepositoryError};
+use crate::sandbox::{IsolationMode, PluginIsolation, SandboxError};
 
 /// Service that manages the external plugin lifecycle and provides data
 /// to the handler layer.
@@ -87,6 +90,33 @@ pub enum ExternalPluginsError {
     ShuttingDown,
     #[error("Plugin '{name}' has no active installation to uninstall")]
     NotInstalled { name: String },
+    /// The plugin's container could not be used. The previous active
+    /// version, if any, was preserved.
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
+    #[error("Plugin '{name}' is not isolated per plugin on this server: every plugin runs as a separate operating-system user through the plugin launcher")]
+    IsolationManagedByLauncher { name: String },
+    #[error("Plugin '{name}' could not be restarted with {isolation} isolation and was returned to its previous isolation: {reason}", isolation = isolation.as_str())]
+    IsolationChangeFailed {
+        name: String,
+        isolation: PluginIsolation,
+        reason: String,
+    },
+}
+
+/// How one installed plugin is isolated, and whether that can be changed here.
+#[derive(Debug, Clone)]
+pub struct PluginIsolationStatus {
+    /// What an administrator asked for. `None` when the plugin has no actor
+    /// yet, in which case it starts in a container.
+    pub requested: Option<PluginIsolation>,
+    /// What separates the running plugin from Temps. `None` when it is not
+    /// running.
+    pub effective: Option<IsolationMode>,
+    /// Why this server cannot put plugins in containers, if it cannot.
+    pub container_unavailable: Option<String>,
+    /// Whether this server isolates every plugin through the plugin launcher.
+    pub launcher: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -114,12 +144,18 @@ pub struct SelectedPlugin {
     registry: VerifiedRegistry,
     plugin: RegistryPlugin,
     pub identity: ReleaseIdentity,
+    /// How a new installation is isolated; `None` is a container. An update
+    /// keeps the isolation of the plugin it updates.
+    pub isolation: Option<PluginIsolation>,
 }
 
 pub struct SelectedRepository {
     source: repository::RepositorySource,
     _temporary: tempfile::TempDir,
     pub name: String,
+    /// How a new installation is isolated; `None` is a container. An update
+    /// keeps the isolation of the plugin it updates.
+    pub isolation: Option<PluginIsolation>,
 }
 
 impl SelectedRepository {
@@ -358,6 +394,7 @@ impl ExternalPluginsService {
             name: source.name.clone(),
             source,
             _temporary: temporary,
+            isolation: None,
         })
     }
 
@@ -391,6 +428,17 @@ impl ExternalPluginsService {
             &selected.name,
             &selected.source.repository,
             selected.source.path.as_deref(),
+        )
+        .await?;
+        // Refuse before the build, not after it: a server that cannot
+        // contain the plugin says so without making anyone wait for a build.
+        self.candidate_isolation(
+            &selected.name,
+            &crate::manager::repository_actor_source(
+                &selected.source.repository,
+                selected.source.path.as_deref(),
+            ),
+            selected.isolation,
         )
         .await?;
         let output = selected._temporary.path().join("plugin");
@@ -436,6 +484,7 @@ impl ExternalPluginsService {
                     &selected.source.repository,
                     selected.source.path.as_deref(),
                 ),
+                selected.isolation,
                 progress,
             )
             .await?;
@@ -452,6 +501,7 @@ impl ExternalPluginsService {
         &self,
         receipt: &crate::install::LocalFileReceipt,
         path: &std::path::Path,
+        isolation: Option<PluginIsolation>,
     ) -> Result<(), ExternalPluginsError> {
         if !self.manager.config().persistent_installations {
             return Err(ExternalPluginsError::PersistentStorageRequired);
@@ -470,8 +520,11 @@ impl ExternalPluginsService {
             }
             .into());
         }
+        // Refuse before the file is staged into the plugins directory.
+        self.candidate_isolation(&receipt.plugin_name, &receipt.actor_source(), isolation)
+            .await?;
         let candidate = PluginInstaller::prepare_file(dir, receipt, path).await?;
-        self.promote_operator_candidate(&candidate, receipt.actor_source(), None)
+        self.promote_operator_candidate(&candidate, receipt.actor_source(), isolation, None)
             .await?;
         Ok(())
     }
@@ -480,12 +533,23 @@ impl ExternalPluginsService {
         &self,
         candidate: &crate::install::InstallCandidate,
         source_identity: String,
+        requested_isolation: Option<PluginIsolation>,
         progress: Option<&ProgressHandle>,
     ) -> Result<String, ExternalPluginsError> {
         if let Some(progress) = progress {
             progress.advance(Stage::StartingPlugin).await;
         }
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
+        let isolation = match self
+            .candidate_isolation(&candidate.name, &source_identity, requested_isolation)
+            .await
+        {
+            Ok(isolation) => isolation,
+            Err(error) => {
+                let _ = installer.discard(candidate).await;
+                return Err(error);
+            }
+        };
         let pending = match self
             .manager
             .prepare_candidate(
@@ -494,25 +558,22 @@ impl ExternalPluginsService {
                 &candidate.sha256,
                 &candidate.binary_path,
                 source_identity,
+                isolation,
             )
             .await
         {
             Ok(pending) => pending,
-            Err(reason) => {
+            Err(failure) => {
                 tracing::warn!(
                     plugin = %candidate.name,
                     version = %candidate.version,
-                    reason = %reason,
+                    reason = %failure,
                     "Plugin candidate failed startup verification"
                 );
                 if let Err(error) = installer.discard(candidate).await {
                     tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected plugin candidate");
                 }
-                return Err(ExternalPluginsError::CandidateRejected {
-                    name: candidate.name.clone(),
-                    version: candidate.version.clone(),
-                    reason,
-                });
+                return Err(Self::candidate_failure(candidate, failure));
             }
         };
         let (candidate_actor_id, candidate_source_identity) =
@@ -539,7 +600,10 @@ impl ExternalPluginsService {
                 return Err(error.into());
             }
         };
-        if let Err(error) = installer.activate(candidate).await {
+        if let Err(error) = installer
+            .activate_isolated(candidate, Some(isolation))
+            .await
+        {
             self.manager.discard_candidate(pending).await;
             let _ = installer.discard(candidate).await;
             return Err(error.into());
@@ -550,6 +614,7 @@ impl ExternalPluginsService {
                 candidate,
                 &candidate_actor_id,
                 &candidate_source_identity,
+                isolation,
                 activation_rollback,
             )
             .await
@@ -564,12 +629,199 @@ impl ExternalPluginsService {
         Ok(candidate_actor_id)
     }
 
+    /// The isolation a candidate starts with. An update from the same source
+    /// keeps what is stored for the plugin it replaces; a new installation
+    /// gets what was requested, a container unless the administrator chose
+    /// otherwise. With a container, a server that cannot sandbox is refused
+    /// here, before anything is started.
+    async fn candidate_isolation(
+        &self,
+        name: &str,
+        source_identity: &str,
+        requested: Option<PluginIsolation>,
+    ) -> Result<PluginIsolation, ExternalPluginsError> {
+        let inherited = crate::grants::PluginGrantService::new(self.db.clone())
+            .isolation_for_source(name, source_identity)
+            .await?;
+        let isolation = inherited
+            .or(requested)
+            .unwrap_or(PluginIsolation::Container);
+        let config = self.manager.config();
+        if isolation == PluginIsolation::Container && config.launcher.is_none() {
+            config
+                .sandbox
+                .availability()
+                .map_err(|reason| SandboxError::Unavailable {
+                    plugin: name.to_string(),
+                    reason,
+                })?;
+        }
+        Ok(isolation)
+    }
+
+    fn candidate_failure(
+        candidate: &crate::install::InstallCandidate,
+        failure: StartFailure,
+    ) -> ExternalPluginsError {
+        match failure {
+            StartFailure::Sandbox(error) => ExternalPluginsError::Sandbox(error),
+            StartFailure::Startup { reason } => ExternalPluginsError::CandidateRejected {
+                name: candidate.name.clone(),
+                version: candidate.version.clone(),
+                reason,
+            },
+        }
+    }
+
+    /// How every installed plugin is isolated: those running, those that
+    /// failed their last start, and those with a stored choice.
+    pub async fn isolation_overview(
+        &self,
+    ) -> Result<Vec<(String, PluginIsolationStatus, Option<String>)>, ExternalPluginsError> {
+        let config = self.manager.config();
+        let container_unavailable = config.sandbox.availability().err();
+        let launcher = config.launcher.is_some();
+        let stored: std::collections::BTreeMap<String, PluginIsolation> =
+            crate::grants::PluginGrantService::new(self.db.clone())
+                .isolations()
+                .await?
+                .into_iter()
+                .collect();
+        let running = self.manager.running_isolation().await;
+        let mut failures = self.manager.start_failures().await;
+        let names: std::collections::BTreeSet<String> =
+            running.keys().chain(failures.keys()).cloned().collect();
+        Ok(names
+            .into_iter()
+            .map(|name| {
+                let status = PluginIsolationStatus {
+                    requested: stored.get(&name).copied(),
+                    effective: running.get(&name).copied(),
+                    container_unavailable: container_unavailable.clone(),
+                    launcher,
+                };
+                let failure = failures.remove(&name);
+                (name, status, failure)
+            })
+            .collect())
+    }
+
+    /// How `name` is isolated now, and whether this server can sandbox it.
+    pub async fn plugin_isolation(
+        &self,
+        name: &str,
+    ) -> Result<PluginIsolationStatus, ExternalPluginsError> {
+        validate_plugin_name(name)?;
+        let config = self.manager.config();
+        Ok(PluginIsolationStatus {
+            requested: crate::grants::PluginGrantService::new(self.db.clone())
+                .isolation(name)
+                .await?,
+            effective: self.manager.isolation_of(name).await,
+            container_unavailable: config.sandbox.availability().err(),
+            launcher: config.launcher.is_some(),
+        })
+    }
+
+    /// Move an installed plugin into a container, or out of one, and restart
+    /// it. When it does not start with the new isolation it is returned to
+    /// the previous one and started again, so a failed move never leaves a
+    /// working plugin stopped.
+    pub async fn set_plugin_isolation(
+        &self,
+        name: &str,
+        isolation: PluginIsolation,
+    ) -> Result<PluginIsolationStatus, ExternalPluginsError> {
+        validate_plugin_name(name)?;
+        let config = self.manager.config();
+        if !config.persistent_installations {
+            return Err(ExternalPluginsError::PersistentStorageRequired);
+        }
+        if config.launcher.is_some() {
+            return Err(ExternalPluginsError::IsolationManagedByLauncher { name: name.into() });
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        let active_path = config.plugins_dir.join(name).join("active.json");
+        match tokio::fs::symlink_metadata(&active_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ExternalPluginsError::NotInstalled { name: name.into() });
+            }
+            Err(error) => {
+                return Err(ExternalPluginsError::Install(InstallError::Io {
+                    plugin: name.into(),
+                    path: active_path.display().to_string(),
+                    reason: error.to_string(),
+                }))
+            }
+        }
+        let active = crate::install::verified_active_installation(
+            name,
+            &config.plugins_dir,
+            &config.registry,
+        )
+        .await?;
+        if isolation == PluginIsolation::Container {
+            config
+                .sandbox
+                .availability()
+                .map_err(|reason| SandboxError::Unavailable {
+                    plugin: name.to_string(),
+                    reason,
+                })?;
+        }
+        let grants = crate::grants::PluginGrantService::new(self.db.clone());
+        // What a start would use now: the row, else the choice recorded at
+        // activation, else the process an older installation has always been.
+        let previous = grants
+            .isolation(name)
+            .await?
+            .or(active.isolation)
+            .unwrap_or(PluginIsolation::Process);
+        // An installation with no row yet is bound exactly as a start would
+        // bind it, so there is a row to carry the setting.
+        grants
+            .ensure_actor(name, &active.sha256, &active.source_identity)
+            .await?;
+        let unchanged = previous == isolation && self.manager.is_running(name).await;
+        if !unchanged {
+            grants.set_isolation(name, isolation).await?;
+            self.ai_tools
+                .publish(self.ai_tools.snapshot().without_plugin(name));
+            if let Err(failure) = self.manager.restart_from_active(name).await {
+                error!(plugin = %name, reason = %failure, "Plugin did not start with its new isolation");
+                let reason = failure.public_reason();
+                grants.set_isolation(name, previous).await?;
+                if let Err(restore) = self.manager.restart_from_active(name).await {
+                    error!(plugin = %name, reason = %restore, "Plugin did not start with its previous isolation either");
+                }
+                self.refresh_runtime_surfaces().await;
+                return Err(ExternalPluginsError::IsolationChangeFailed {
+                    name: name.into(),
+                    isolation,
+                    reason,
+                });
+            }
+            self.refresh_runtime_surfaces().await;
+        }
+        Ok(PluginIsolationStatus {
+            requested: Some(isolation),
+            effective: self.manager.isolation_of(name).await,
+            container_unavailable: config.sandbox.availability().err(),
+            launcher: false,
+        })
+    }
+
     async fn commit_candidate_actor(
         &self,
         installer: &PluginInstaller,
         candidate: &crate::install::InstallCandidate,
         actor_id: &str,
         source_identity: &str,
+        isolation: PluginIsolation,
         rollback: crate::install::ActivationRollback,
     ) -> Result<(), crate::grants::GrantError> {
         let grants = crate::grants::PluginGrantService::new(self.db.clone());
@@ -579,6 +831,7 @@ impl ExternalPluginsService {
                 actor_id,
                 &candidate.sha256,
                 source_identity,
+                isolation,
             )
             .await;
         match &result {
@@ -934,6 +1187,7 @@ impl ExternalPluginsService {
             registry,
             plugin,
             identity,
+            isolation: None,
         })
     }
 
@@ -968,6 +1222,13 @@ impl ExternalPluginsService {
             }
             .into());
         }
+        // Refuse before the artifact is downloaded.
+        self.candidate_isolation(
+            &selected.identity.name,
+            &crate::manager::registry_actor_source(&self.manager.config().registry.url),
+            selected.isolation,
+        )
+        .await?;
 
         let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         {
@@ -983,6 +1244,18 @@ impl ExternalPluginsService {
                 &selected.plugin,
             )
             .await?;
+        let registry_source =
+            crate::manager::registry_actor_source(&self.manager.config().registry.url);
+        let isolation = match self
+            .candidate_isolation(&candidate.name, &registry_source, selected.isolation)
+            .await
+        {
+            Ok(isolation) => isolation,
+            Err(error) => {
+                let _ = installer.discard(&candidate).await;
+                return Err(error);
+            }
+        };
         let pending = match self
             .manager
             .prepare_candidate(
@@ -990,12 +1263,13 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
-                crate::manager::registry_actor_source(&self.manager.config().registry.url),
+                registry_source,
+                isolation,
             )
             .await
         {
             Ok(pending) => pending,
-            Err(reason) => {
+            Err(failure) => {
                 if let Err(cleanup_error) = installer.discard(&candidate).await {
                     tracing::warn!(
                         plugin = %candidate.name,
@@ -1003,11 +1277,7 @@ impl ExternalPluginsService {
                         "Failed to remove rejected plugin candidate"
                     );
                 }
-                return Err(ExternalPluginsError::CandidateRejected {
-                    name: candidate.name.clone(),
-                    version: candidate.version.clone(),
-                    reason,
-                });
+                return Err(Self::candidate_failure(&candidate, failure));
             }
         };
 
@@ -1030,7 +1300,10 @@ impl ExternalPluginsService {
                 return Err(error.into());
             }
         };
-        if let Err(error) = installer.activate(&candidate).await {
+        if let Err(error) = installer
+            .activate_isolated(&candidate, Some(isolation))
+            .await
+        {
             self.manager.discard_candidate(pending).await;
             if let Err(cleanup_error) = installer.discard(&candidate).await {
                 tracing::warn!(
@@ -1047,6 +1320,7 @@ impl ExternalPluginsService {
                 &candidate,
                 &candidate_actor_id,
                 &candidate_source_identity,
+                isolation,
                 activation_rollback,
             )
             .await
@@ -1445,6 +1719,7 @@ mod tests {
             },
             _temporary: tempfile::tempdir().expect("staging dir"),
             name: "fixture-plugin".into(),
+            isolation: Some(PluginIsolation::Process),
         };
         let installing_service = service.clone();
         let installing_progress = progress.clone();
@@ -1637,6 +1912,8 @@ mod tests {
     }
 
     #[cfg(unix)]
+    mod isolation;
+    #[cfg(unix)]
     mod watch_pool;
 
     #[cfg(unix)]
@@ -1777,6 +2054,7 @@ except Exception:
                 signer_key_id: "fixture-key".to_string(),
                 registry_source: "http://127.0.0.1/fixture".to_string(),
             },
+            isolation: Some(PluginIsolation::Process),
         }
     }
 
@@ -2649,6 +2927,7 @@ except Exception:
                 registry_source: "https://registry.temps.sh/api/plugins".to_string(),
             },
             plugin,
+            isolation: Some(PluginIsolation::Process),
         };
         let install_service = service.clone();
         let install = tokio::spawn(async move { install_service.install_selected(selected).await });
@@ -2704,7 +2983,10 @@ except Exception:
             platform: platform_target().unwrap(),
             sha256: hex::encode(Sha256::digest(&bytes)),
         };
-        service.install_file(&receipt, &binary).await.unwrap();
+        service
+            .install_file(&receipt, &binary, Some(PluginIsolation::Process))
+            .await
+            .unwrap();
         let original = service.manager.socket_path_for(name).await.unwrap();
 
         // The new receipt and actor have committed, while the original process remains live.
@@ -2723,7 +3005,13 @@ except Exception:
         let source = receipt.actor_source();
         let actor = grants.prepare_actor(name, &source).await.unwrap().actor.id;
         grants
-            .commit_actor(name, &actor, &receipt.sha256, &source)
+            .commit_actor(
+                name,
+                &actor,
+                &receipt.sha256,
+                &source,
+                PluginIsolation::Process,
+            )
             .await
             .unwrap();
 

@@ -14,6 +14,11 @@ use tokio::io::AsyncWriteExt;
 pub(super) struct FileIdentity {
     name: String,
     version: String,
+    /// How a new installation is isolated. Omit it for a container. An
+    /// update keeps the isolation of the installed plugin.
+    #[serde(default)]
+    #[param(value_type = Option<crate::sandbox::PluginIsolation>)]
+    isolation: Option<crate::sandbox::PluginIsolation>,
 }
 
 #[derive(ToSchema)]
@@ -140,6 +145,7 @@ pub(super) async fn install_local_file(
             "Another plugin file installation is in progress",
         )
     })?;
+    let requested_isolation = identity.isolation;
     let receipt = LocalFileReceipt {
         source: LocalFileSource::File,
         plugin_name: identity.name,
@@ -159,6 +165,13 @@ pub(super) async fn install_local_file(
         failure: None,
     };
     record_required_audit(&state, &audit).await?;
+    isolation::audit_requested_isolation(
+        &state,
+        &audit.context,
+        &receipt.plugin_name,
+        requested_isolation,
+    )
+    .await?;
     let upload = tokio::time::timeout(std::time::Duration::from_secs(300), receive_file(multipart))
         .await
         .unwrap_or_else(|_| {
@@ -185,7 +198,11 @@ pub(super) async fn install_local_file(
     // Once accepted, finish promotion/rollback and audit even if the caller disconnects.
     tokio::spawn(async move {
         let _permit = permit;
-        if let Err(err) = state.service.install_file(&receipt, &path).await {
+        if let Err(err) = state
+            .service
+            .install_file(&receipt, &path, requested_isolation)
+            .await
+        {
             record_audit(
                 &state,
                 &ExternalPluginWriteAudit {
