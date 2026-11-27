@@ -42,7 +42,7 @@ Create a new DNS provider
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Provider name | - | No |
-| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, powerdns, manual, pebble) | - | No |
 | `-d, --description <description>` | Provider description | - | No |
 | `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | No |
 | `--api-token-stdin` | Read the API token from stdin | - | No |
@@ -52,8 +52,10 @@ Create a new DNS provider
 | `--secret-access-key-stdin` | Read the AWS secret access key from stdin | - | No |
 | `--region <region>` | AWS region | - | No |
 | `--api-user <user>` | Namecheap API user | - | No |
-| `--api-key <key>` | API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history) | - | No |
-| `--api-key-stdin` | Read the Bunny or Namecheap API key from stdin | - | No |
+| `--api-key <key>` | API key (Bunny, Namecheap, PowerDNS; prefer --api-key-stdin to keep it out of shell history) | - | No |
+| `--api-key-stdin` | Read the Bunny, Namecheap or PowerDNS API key from stdin | - | No |
+| `--api-url <url>` | PowerDNS webserver URL, e.g. http://10.0.0.5:8081 | - | No |
+| `--server-id <id>` | PowerDNS server ID (default: localhost) | - | No |
 | `--username <username>` | Namecheap username | - | No |
 | `--client-ip <ip>` | Namecheap whitelisted client IP | - | No |
 | `--project-id <id>` | GCP project ID | - | No |

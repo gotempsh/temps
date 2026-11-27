@@ -27019,6 +27019,40 @@
             "type": "object"
           },
           {
+            "description": "PowerDNS Authoritative Server HTTP API",
+            "properties": {
+              "api_key": {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Value of the server's `api-key` setting"
+              },
+              "api_url": {
+                "description": "PowerDNS webserver URL, with or without the `/api/v1` path",
+                "example": "http://127.0.0.1:8081",
+                "type": "string"
+              },
+              "server_id": {
+                "description": "Server ID (defaults to `localhost`)",
+                "example": "localhost",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "powerdns"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "api_url",
+              "api_key",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Pebble challtestsrv mock DNS (LOCAL DEV/TEST ONLY)",
             "properties": {
               "management_url": {
@@ -27144,6 +27178,7 @@
           "digitalocean",
           "gcp",
           "azure",
+          "powerdns",
           "manual",
           "pebble"
         ],
