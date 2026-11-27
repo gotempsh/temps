@@ -439,22 +439,24 @@ describe('Projects', () => {
         .querySelectorAll(':scope > li[data-project]'),
     ].map((row) => row.getAttribute('data-project'))
 
-  test('a large server lists eight: trouble first, then those opened recently', async () => {
+  test('a large server lists eight: trouble, then those opened recently, in the list order', async () => {
     window.localStorage.setItem(
       RECENT_PROJECTS_KEY,
       JSON.stringify(['tree-key-of-nothing', 'project:12'])
     )
     const { view } = renderAt('/projects', large({ 110: 'down' }))
     await view.findByRole('link', { name: /^Project 1\b/ })
-    await waitFor(() => expect(listed(view)[0]).toBe('project-11'))
+    // Trouble earns its row but is not moved: the tree keeps the Projects
+    // page's order (nothing here has deployed, so the order as read).
+    await waitFor(() => expect(listed(view)).toContain('project-11'))
     expect(listed(view)).toEqual([
-      'project-11',
       'project-1',
       'project-2',
       'project-3',
       'project-4',
       'project-5',
       'project-6',
+      'project-11',
       'project-12',
     ])
     const all = view.getByRole('link', { name: 'All projects (12)' })

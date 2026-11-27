@@ -287,13 +287,13 @@ describe('pickProjects', () => {
     expect(pickProjects(few, 8, none)).toEqual({ shown: few, more: 0 })
   })
 
-  test('lists trouble first, then the recent, the rest in their order', () => {
+  test('picks trouble, then the recent, then the rest, all in list order', () => {
     const picked = pickProjects(nodes, 5, {
       isCurrent: () => false,
       inTrouble: (node) => node.key === 'p9',
       recent: ['p11', 'p4'],
     })
-    expect(keys(picked)).toEqual(['p9', 'p0', 'p1', 'p4', 'p11'])
+    expect(keys(picked)).toEqual(['p0', 'p1', 'p4', 'p9', 'p11'])
     expect(picked.more).toBe(7)
   })
 
