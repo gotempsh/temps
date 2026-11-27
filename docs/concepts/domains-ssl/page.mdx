@@ -141,6 +141,8 @@ For DNS-01 challenges and wildcard certificates, Temps needs API access to your 
 
 PowerDNS runs on your own network, so its API address is usually private. Add that address under **Settings > Security > Trusted private networks** before connecting it. Temps refuses writes to PowerDNS Secondary zones, because the next zone transfer would discard them; connect the server that holds the primary zone.
 
+The PowerDNS API has no TLS of its own, so its `api-key` crosses the network in plain text. Keep the API on a private network or VPN, or put a TLS reverse proxy in front of it and connect the `https://` address. For DNS-01 certificates, the ACME CA must resolve the challenge record through this PowerDNS server: the domain must be delegated to it, or, with a private ACME CA, the CA must query it directly.
+
 Configure DNS providers in **Settings > DNS Providers**. Once configured, Temps can automatically create and remove TXT records for certificate validation.
 
 ---
