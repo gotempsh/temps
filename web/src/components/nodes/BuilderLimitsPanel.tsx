@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -15,6 +16,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { NodeInfoResponse } from '@/api/client/types.gen'
 import { problemDetail } from '@/lib/api-problem'
+import { isStaleRevision, STALE_REVISION_MESSAGE } from '@/lib/stale-revision'
 import { toast } from 'sonner'
 
 const limitsSchema = z.object({
@@ -44,17 +46,34 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
     resolver: zodResolver(limitsSchema),
     defaultValues: limits,
   })
+  // The revision of the limits the form holds. It moves only when the form
+  // takes new values (load, "Load latest", a save), never with a background
+  // refetch of the node: sending a newer revision than the form was based on
+  // would let this save revert another admin's without a conflict.
+  const [baseRevision, setBaseRevision] = useState(node.build_limits_revision)
   const queryClient = useQueryClient()
+  const nodeQueryKey = adminGetNodeOptions({
+    path: { node_id: node.id },
+  }).queryKey
   const update = useMutation({
     ...adminSetNodeBuildLimitsMutation(),
-    onSuccess: async (_, { body }) => {
+    onSuccess: async (saved) => {
       toast.success('Builder limits saved')
-      form.reset(body)
-      await queryClient.invalidateQueries({
-        queryKey: adminGetNodeOptions({ path: { node_id: node.id } }).queryKey,
+      setBaseRevision(saved.revision)
+      form.reset({
+        concurrency: saved.concurrency,
+        queue_wait_seconds: saved.queue_wait_seconds,
+        build_timeout_seconds: saved.build_timeout_seconds,
       })
+      await queryClient.invalidateQueries({ queryKey: nodeQueryKey })
+    },
+    onError: (error) => {
+      // Fetch what the other save stored, so "Load latest" can show it.
+      if (isStaleRevision(error))
+        void queryClient.invalidateQueries({ queryKey: nodeQueryKey })
     },
   })
+  const stale = update.isError && isStaleRevision(update.error)
   const dirty = form.formState.isDirty
   return (
     <Card className="shadow-none">
@@ -75,7 +94,15 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
           className="space-y-4"
           onSubmit={form.handleSubmit((next) => {
             if (!update.isPending)
-              update.mutate({ path: { node_id: node.id }, body: next })
+              update.mutate({
+                path: { node_id: node.id },
+                // The limits this form was loaded with: the save is refused
+                // if someone else saved since, instead of reverting them.
+                body: {
+                  ...next,
+                  expected_revision: baseRevision,
+                },
+              })
           })}
         >
           <div className="grid gap-4 md:grid-cols-3">
@@ -115,10 +142,12 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
           </p>
           {update.isError && (
             <p role="alert" className="text-sm text-destructive">
-              {problemDetail(
-                update.error,
-                'Could not save builder limits. Try again.'
-              )}
+              {stale
+                ? STALE_REVISION_MESSAGE
+                : problemDetail(
+                    update.error,
+                    'Could not save builder limits. Try again.'
+                  )}
             </p>
           )}
           <div className="flex flex-wrap gap-2">
@@ -130,16 +159,17 @@ export function BuilderLimitsPanel({ node }: { node: NodeInfoResponse }) {
             >
               Save builder limits
             </Button>
-            {dirty && !update.isPending && (
+            {(dirty || stale) && !update.isPending && (
               <Button
                 type="button"
                 variant="outline"
                 onClick={() => {
                   update.reset()
+                  setBaseRevision(node.build_limits_revision)
                   form.reset(limits)
                 }}
               >
-                Reset
+                {stale ? 'Load latest' : 'Reset'}
               </Button>
             )}
           </div>

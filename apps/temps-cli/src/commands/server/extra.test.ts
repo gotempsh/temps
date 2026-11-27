@@ -7,17 +7,23 @@ import { registerServerCommands } from './index.js'
 import { runWithApi } from '../../lib/mock-api.js'
 
 describe('server metric helpers', () => {
-  test('metricWindowQuery validates times and percentile', () => {
-    expect(metricWindowQuery({ start: '2026-01-01T00:00:00Z', end: '2026-01-02T00:00:00Z', percentile: '0.95' })).toEqual({
+  test('metricWindowQuery validates times', () => {
+    expect(metricWindowQuery({ start: '2026-01-01T00:00:00Z', end: '2026-01-02T00:00:00Z' })).toEqual({
       start_time: '2026-01-01T00:00:00Z',
       end_time: '2026-01-02T00:00:00Z',
-      percentile: 95,
     })
-    // The API takes 0-100: the fraction is scaled, without float noise.
-    expect(metricWindowQuery({ percentile: '1' })).toEqual({ percentile: 100 })
-    expect(metricWindowQuery({ percentile: '0.29' })).toEqual({ percentile: 29 })
+    expect(metricWindowQuery({})).toEqual({})
     expect(() => metricWindowQuery({ start: 'yesterday' })).toThrow(/--start/)
-    expect(() => metricWindowQuery({ percentile: '95' })).toThrow(/--percentile/)
+  })
+
+  // The server refuses percentile on metric ranges (#2075): offering the flag
+  // would turn every use of it into an error.
+  test('server metrics offers no --percentile flag', async () => {
+    const run = await runWithApi(registerServerCommands, ['server', 'metrics', '--metric', 'node.cpu_percent', '--percentile', '0.9'], {
+      'GET /nodes/0/metrics': [],
+    })
+    expect(run.error?.message).toMatch(/unknown option '--percentile'/)
+    expect(run.requests).toEqual([])
   })
 
   test('nodeIdList and alertRuleRequest', () => {
@@ -48,7 +54,7 @@ describe('temps server (extras)', () => {
   }
 
   test.each([
-    [['metrics', '--metric', 'node.cpu_percent', '--node', '1', '--percentile', '0.9', '--start', '2026-01-01T00:00:00Z'], 'GET /nodes/1/metrics?metric=node.cpu_percent&range=1h&start_time=2026-01-01T00%3A00%3A00Z&percentile=90'],
+    [['metrics', '--metric', 'node.cpu_percent', '--node', '1', '--start', '2026-01-01T00:00:00Z'], 'GET /nodes/1/metrics?metric=node.cpu_percent&range=1h&start_time=2026-01-01T00%3A00%3A00Z'],
     [['cluster-metrics', '--metric', 'node.cpu_percent', '--nodes', '0,1', '--range', '24h'], 'GET /nodes/metrics/cluster?metric=node.cpu_percent&node_ids=0%2C1&range=24h'],
     [['cluster-latest', '--nodes', '0,1'], 'GET /nodes/metrics/cluster/latest?node_ids=0%2C1'],
     [['reporting'], 'GET /nodes/metrics/reporting'],

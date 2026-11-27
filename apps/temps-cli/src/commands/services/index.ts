@@ -517,7 +517,6 @@ export function registerServicesCommands(program: Command): void {
     .requiredOption('--id <id>', 'Service ID')
     .requiredOption('-m, --metric <name>', 'Metric name, e.g. "pg.connections_active"')
     .option('-r, --range <window>', 'Time window: 1h, 6h, 24h, 7d (default: 24h)')
-    .option('-p, --percentile <n>', 'Histogram percentile (0-100) instead of a plain average')
     .option('--json', 'Output raw JSON instead of a formatted table')
     .action(serviceMetricsRangeAction)
 
@@ -2074,7 +2073,6 @@ interface ServiceMetricsRangeOptions {
   id: string
   metric: string
   range?: string
-  percentile?: string
   json?: boolean
 }
 
@@ -2085,12 +2083,6 @@ async function serviceMetricsRangeAction(options: ServiceMetricsRangeOptions): P
   const id = parseServiceId(options.id)
   if (id === undefined) return
 
-  const percentile = options.percentile !== undefined ? Number(options.percentile) : undefined
-  if (percentile !== undefined && (isNaN(percentile) || percentile < 0 || percentile > 100)) {
-    warning('Invalid --percentile — must be a number between 0 and 100')
-    return
-  }
-
   const points = await withSpinner(`Fetching "${options.metric}"…`, async () => {
     const { data, error } = await externalServiceMetricsGetRange({
       client,
@@ -2098,7 +2090,6 @@ async function serviceMetricsRangeAction(options: ServiceMetricsRangeOptions): P
       query: {
         metric: options.metric,
         range: options.range,
-        percentile,
       },
     })
     if (error) {

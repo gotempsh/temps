@@ -186,7 +186,6 @@ export function registerServerCommands(program: Command): void {
     .option("--range <range>", `Time window: ${SERVER_RANGES.join(", ")}`, "1h")
     .option("--start <time>", "Start of an explicit window (ISO 8601); with --end, instead of --range")
     .option("--end <time>", "End of an explicit window (ISO 8601)")
-    .option("--percentile <p>", "Aggregate each bucket at this percentile (e.g. 0.95) instead of the mean")
     .option("--node <id>", "Node ID (0 = control plane)", "0")
     .option("--json", "Output in JSON format")
     .action(serverMetricsAction);
@@ -265,7 +264,6 @@ async function serverMetricsAction(options: {
   range?: string;
   start?: string;
   end?: string;
-  percentile?: string;
   node?: string;
   json?: boolean;
 }): Promise<void> {

@@ -42,7 +42,6 @@ Time series of one control-plane host metric, e.g. node.cpu_percent or node.netw
 | `--range <range>` | Time window: 1h, 6h, 24h, 7d | `1h` | No |
 | `--start <time>` | Start of an explicit window (ISO 8601); with --end, instead of --range | - | No |
 | `--end <time>` | End of an explicit window (ISO 8601) | - | No |
-| `--percentile <p>` | Aggregate each bucket at this percentile (e.g. 0.95) instead of the mean | - | No |
 | `--node <id>` | Node ID (0 = control plane) | `0` | No |
 | `--json` | Output in JSON format | - | No |
 

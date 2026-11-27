@@ -156,7 +156,21 @@ impl<'a> Walk<'a> {
             self.seen.pop();
             return;
         }
-        for key in ["allOf", "oneOf", "anyOf"] {
+        // An `allOf` member describes this same object (a flattened request
+        // body is `allOf: [Settings, {extra fields}]`), so it is no deeper:
+        // counting it would push the fields it brings past the depth limit.
+        for part in schema["allOf"].as_array().into_iter().flatten() {
+            match resolve(self.spec, part) {
+                Some((name, _)) if self.seen.iter().any(|s| s == name) => {}
+                Some((name, target)) => {
+                    self.seen.push(name.to_string());
+                    self.walk(target, prefix, depth);
+                    self.seen.pop();
+                }
+                None => self.walk(part, prefix, depth),
+            }
+        }
+        for key in ["oneOf", "anyOf"] {
             for part in schema[key].as_array().into_iter().flatten() {
                 self.walk(part, prefix, depth + 1);
             }
@@ -928,5 +942,38 @@ mod tests {
             found.contains("create_thing:auth.bearer_token"),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn a_credential_in_a_flattened_body_is_as_deep_as_without_the_flattening() {
+        // `Request` is `#[serde(flatten)] settings` + one field: an `allOf` of
+        // a reference and an inline object. Its fields are no deeper than
+        // the referenced schema's own.
+        let property = serde_json::json!({"type": "integer"});
+        let nested = serde_json::json!({
+            "Registry": {
+                "type": "object",
+                "properties": { "password": {"type": "string"} }
+            },
+            "Request": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Body"},
+                    {"type": "object", "properties": { "expected_revision": {"type": "string"} }}
+                ]
+            }
+        });
+        let mut document = doc(property, nested);
+        document["components"]["schemas"]["Body"]["properties"]["registry"] = serde_json::json!({
+            "oneOf": [{"type": "null"}, {"$ref": "#/components/schemas/Registry"}]
+        });
+        let direct = unmarked_secret_fields(&document);
+        assert!(
+            direct.contains("create_thing:registry.password"),
+            "{direct:?}"
+        );
+
+        document["paths"]["/things"]["post"]["requestBody"]["content"]["application/json"]
+            ["schema"] = serde_json::json!({"$ref": "#/components/schemas/Request"});
+        assert_eq!(unmarked_secret_fields(&document), direct);
     }
 }

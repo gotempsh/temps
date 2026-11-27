@@ -57,7 +57,9 @@ pub const SERVED_FINGERPRINT_MARKER: &str = "temps-served-fingerprint=";
 
 /// Exit code of the apply script when the member is not an initialized data
 /// node yet: `pg_autoctl create` is still running (a standby taking its
-/// first base backup), or its keeper is not running.
+/// first base backup), its keeper is not running, or its PostgreSQL is not
+/// accepting connections (the keeper is still bringing it up, for example
+/// after the node rebooted).
 pub const NOT_INITIALIZED_EXIT_CODE: i64 = 10;
 
 /// Exit code of the read-only status script when PostgreSQL is not accepting
@@ -111,6 +113,14 @@ for CMDLINE in /proc/[0-9]*/cmdline; do
 done
 if [ -z "$KEEPER" ]; then
   echo "temps: the pg_autoctl keeper is not running on this data node" >&2
+  exit 10
+fi
+# A keeper whose PostgreSQL is down is bringing it up (a former primary
+# rejoining after its node rebooted). It can serve no certificate, and
+# signalling it to reload only gets in its way: change nothing until
+# PostgreSQL accepts connections, and let a later pass apply.
+if ! pg_isready -q -h 127.0.0.1 -p "$NODE_PORT"; then
+  echo "temps: PostgreSQL on port $NODE_PORT is not accepting connections yet; nothing was changed" >&2
   exit 10
 fi"#;
 
@@ -236,24 +246,38 @@ if [ "$CUR_CERT" != "$CERT" ] || [ "$CUR_KEY" != "$KEY" ]; then
 fi"#;
 
 /// pg_autoctl reloads its configuration on `config set`, and a second change
-/// arriving during that reload can be missed, so the reload is repeated until
-/// PostgreSQL's settings and the served certificate both match.
+/// arriving during that reload can be missed, so the keeper is asked to
+/// reload again, at most every [`APPLY_RELOAD_EVERY_POLLS`] polls (10 s),
+/// until PostgreSQL's settings and the served certificate both match.
+///
+/// A PostgreSQL that stops accepting connections meanwhile ends the script
+/// with [`NOT_INITIALIZED_EXIT_CODE`] and no further signal: its keeper is
+/// restarting it, and a later pass finishes once it is back.
 const APPLY_AND_VERIFY: &str = r#"gosu postgres pg_autoctl config set --pgdata "$PGDATA" ssl.cert_file "$CERT" >/dev/null
 gosu postgres pg_autoctl config set --pgdata "$PGDATA" ssl.key_file "$KEY" >/dev/null
 EXPECTED=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
-for _ in $(seq 1 30); do
+for POLL in $(seq 1 30); do
   if grep -qxF "ssl_cert_file = '$CERT'" "$CONF" && grep -qxF "ssl_key_file = '$KEY'" "$CONF" \
     && [ "$(served_fingerprint)" = "$EXPECTED" ]; then
     APPLIED=1
     break
   fi
-  gosu postgres pg_autoctl reload --pgdata "$PGDATA" >/dev/null 2>&1 || true
+  if ! pg_isready -q -h 127.0.0.1 -p "$NODE_PORT"; then
+    echo "temps: PostgreSQL on port $NODE_PORT stopped accepting connections while its certificate was being applied; its keeper is not signalled again, a later pass finishes" >&2
+    exit 10
+  fi
+  if [ $((POLL % RELOAD_EVERY)) -eq 0 ]; then
+    gosu postgres pg_autoctl reload --pgdata "$PGDATA" >/dev/null 2>&1 || true
+  fi
   sleep 2
 done
 if [ -z "${APPLIED:-}" ]; then
   echo "temps: PostgreSQL on port $NODE_PORT does not serve certificate $EXPECTED after 60s; it serves '$(served_fingerprint)' with $(grep -E '^ssl_(cert|key)_file' "$CONF" | tr '\n' ' ')" >&2
   exit 5
 fi"#;
+
+/// Polls (2 s apart) between two reload signals of the apply script.
+pub const APPLY_RELOAD_EVERY_POLLS: u32 = 5;
 
 /// How long the apply script may run inside the data node before it and
 /// every process it started are killed. The control plane waits longer than
@@ -297,6 +321,7 @@ pub fn server_tls_apply_command(target: ClusterServerCertificate) -> Vec<String>
         format!("SLOT_B={slot_b}"),
         format!("LEGACY_DIR={LEGACY_CLUSTER_TLS_DIR}"),
         SERVED_FINGERPRINT_FN.to_string(),
+        format!("RELOAD_EVERY={APPLY_RELOAD_EVERY_POLLS}"),
         SLOT_FNS.to_string(),
     ];
     match target {
@@ -516,7 +541,7 @@ mod tests {
         // Never a leading wildcard: it would match this script's own shell.
         assert!(!s.contains(r#"*"pg_autoctl"#));
         assert!(s.contains("the pg_autoctl keeper is not running"));
-        assert_eq!(s.matches("exit 10").count(), 3);
+        assert_eq!(s.matches("exit 10").count(), 5);
     }
 
     #[test]
@@ -567,6 +592,199 @@ mod tests {
         let status = served_certificate_command();
         assert!(status[6].contains("openssl s_client -starttls postgres"));
         assert!(!status[6].contains("config set"));
+    }
+
+    /// What one run of the apply script did on a data node whose keeper
+    /// runs, with stand-ins for `gosu`, `pg_isready` and `openssl`.
+    struct ApplyRun {
+        exit_code: Option<i32>,
+        stderr: String,
+        /// Every `gosu` command line, in order.
+        gosu_calls: Vec<String>,
+    }
+
+    impl ApplyRun {
+        fn count(&self, needle: &str) -> usize {
+            self.gosu_calls
+                .iter()
+                .filter(|c| c.contains(needle))
+                .count()
+        }
+    }
+
+    /// Runs the self-signed apply script on a member already configured with
+    /// pg_auto_failover's pair, so it goes straight to applying. PostgreSQL
+    /// accepts connections for the first `ready_checks` `pg_isready` calls
+    /// and is down after them; it serves `served` once up. `None` when bash
+    /// is unavailable.
+    fn run_apply(ready_checks: u32, served: &str) -> Option<ApplyRun> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let pgdata = root.join("pgdata");
+        std::fs::create_dir(&pgdata).unwrap();
+        std::fs::write(pgdata.join("server.crt"), "cert").unwrap();
+        std::fs::write(pgdata.join("server.key"), "key").unwrap();
+        std::fs::write(
+            pgdata.join("postgresql-auto-failover.conf"),
+            format!(
+                "ssl_cert_file = '{0}/server.crt'\nssl_key_file = '{0}/server.key'\n",
+                pgdata.display()
+            ),
+        )
+        .unwrap();
+        // The keeper runs (`pg_autoctl run`), no `pg_autoctl create` does.
+        let proc_dir = root.join("proc/41");
+        std::fs::create_dir_all(&proc_dir).unwrap();
+        std::fs::write(
+            proc_dir.join("cmdline"),
+            "pg_autoctl\0run\0--pgdata\0/var/lib/postgresql/pgdata\0",
+        )
+        .unwrap();
+        let tools = [
+            (
+                "gosu",
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GOSU_LOG"
+case "$*" in
+  *"config get"*"ssl.cert_file"*) printf '%s' "$PGDATA_DIR/server.crt" ;;
+  *"config get"*"ssl.key_file"*) printf '%s' "$PGDATA_DIR/server.key" ;;
+esac
+exit 0
+"#,
+            ),
+            (
+                "pg_isready",
+                r#"#!/bin/sh
+CALLS=$(cat "$READY_COUNT" 2>/dev/null || echo 0)
+CALLS=$((CALLS + 1))
+echo "$CALLS" > "$READY_COUNT"
+[ "$CALLS" -le "$READY_CHECKS" ]
+"#,
+            ),
+            (
+                "openssl",
+                r#"#!/bin/sh
+case "$*" in
+  *"-pubkey"*|*"-pubout"*) echo PUBLIC-KEY ;;
+  "x509 -in "*"-fingerprint"*) echo "sha256 Fingerprint=AB:CD" ;;
+  *"-fingerprint"*) cat >/dev/null; echo "sha256 Fingerprint=$SERVED" ;;
+  *s_client*) ;;
+esac
+"#,
+            ),
+            ("timeout", "#!/bin/sh\nshift\nexec \"$@\"\n"),
+            ("sleep", "#!/bin/sh\nexit 0\n"),
+        ];
+        for (name, body) in tools {
+            let path = bin.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = script(ClusterServerCertificate::SelfSigned)
+            .replace(
+                "/proc/[0-9]*/cmdline",
+                &format!("{}/proc/[0-9]*/cmdline", root.display()),
+            )
+            .replace("/var/lib/postgresql/pgdata", pgdata.to_str().unwrap())
+            .replace("/var/lib/postgresql", root.to_str().unwrap());
+        let gosu_log = root.join("gosu.log");
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("NODE_PORT", "6201")
+            .env("PGDATA_DIR", &pgdata)
+            .env("GOSU_LOG", &gosu_log)
+            .env("READY_COUNT", root.join("ready.count"))
+            .env("READY_CHECKS", ready_checks.to_string())
+            .env("SERVED", served)
+            .output()
+            .ok()?;
+        Some(ApplyRun {
+            exit_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            gosu_calls: std::fs::read_to_string(&gosu_log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+        })
+    }
+
+    /// Regression: a former primary rejoining after its node rebooted has a
+    /// running keeper but no PostgreSQL yet. The TLS reconcile used to set
+    /// its certificate and signal its keeper to reload every 2 s for a
+    /// minute, pass after pass. It must change nothing, send no signal, and
+    /// report the member as initializing.
+    #[test]
+    fn a_member_whose_postgres_is_down_is_neither_changed_nor_signalled() {
+        let Some(run) = run_apply(0, "AB:CD") else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert_eq!(
+            run.exit_code,
+            Some(NOT_INITIALIZED_EXIT_CODE as i32),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("not accepting connections yet"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(run.count("config set"), 0, "{:?}", run.gosu_calls);
+        assert_eq!(run.count("reload"), 0, "{:?}", run.gosu_calls);
+    }
+
+    /// PostgreSQL going down while the certificate is applied ends the
+    /// script without signalling the keeper again.
+    #[test]
+    fn a_member_whose_postgres_stops_mid_apply_is_not_signalled_again() {
+        // Up for the gate, down at the first poll.
+        let Some(run) = run_apply(1, "00:00") else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert_eq!(
+            run.exit_code,
+            Some(NOT_INITIALIZED_EXIT_CODE as i32),
+            "{}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("stopped accepting connections"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(run.count("reload"), 0, "{:?}", run.gosu_calls);
+    }
+
+    /// A member that is up but does not serve the certificate yet is asked
+    /// to reload at most every 10 s, not on every 2 s poll.
+    #[test]
+    fn a_member_that_does_not_serve_the_certificate_yet_is_reloaded_sparingly() {
+        let Some(run) = run_apply(u32::MAX, "00:00") else {
+            eprintln!("bash unavailable; skipping");
+            return;
+        };
+        assert_eq!(run.exit_code, Some(5), "{}", run.stderr);
+        assert_eq!(run.count("config set"), 2, "{:?}", run.gosu_calls);
+        assert_eq!(
+            run.count("reload") as u32,
+            30 / APPLY_RELOAD_EVERY_POLLS,
+            "{:?}",
+            run.gosu_calls
+        );
+
+        let Some(run) = run_apply(u32::MAX, "AB:CD") else {
+            return;
+        };
+        assert_eq!(run.exit_code, Some(0), "{}", run.stderr);
+        assert_eq!(run.count("reload"), 0, "{:?}", run.gosu_calls);
     }
 }
 

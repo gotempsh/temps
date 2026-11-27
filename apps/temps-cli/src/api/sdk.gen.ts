@@ -4658,9 +4658,6 @@ export const promoteClusterMember = <ThrowOnError extends boolean = false>(optio
 
 /**
  * Fetch a time-series range for a single metric on an external service.
- *
- * Pass `percentile` to compute a histogram quantile instead of a plain
- * gauge/counter average.
  */
 export const externalServiceMetricsGetRange = <ThrowOnError extends boolean = false>(options: Options<ExternalServiceMetricsGetRangeData, ThrowOnError>): RequestResult<ExternalServiceMetricsGetRangeResponses, ExternalServiceMetricsGetRangeErrors, ThrowOnError> => (options.client ?? client).get<ExternalServiceMetricsGetRangeResponses, ExternalServiceMetricsGetRangeErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

@@ -8,6 +8,7 @@ import { loginWithDevice } from '../auth/login.js'
 import { getActiveContext, getContext, listContexts } from '../../config/contexts.js'
 import { credentials, getApiUrl, requireAuth } from '../../config/store.js'
 import { client, getErrorMessage, getWebUrl, setupClient } from '../../lib/api-client.js'
+import { settingsWriteBody, settingsWriteError } from '../../lib/settings-revision.js'
 import { header, icons, info, keyValue, newline, success, warning } from '../../ui/output.js'
 import { promptConfirm, promptSearch, promptSelect, promptText } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -300,9 +301,9 @@ async function setMcpServerEnabled(enabled: boolean, urlOverride?: string): Prom
 
     const { error } = await updateSettings({
       client,
-      body: { ...currentSettings, mcp_server: { enabled } } as AppSettings,
+      body: settingsWriteBody(currentSettings, { mcp_server: { enabled } }) as AppSettings,
     })
-    if (error) throw new Error(getErrorMessage(error))
+    if (error) throw new Error(settingsWriteError(error))
   })
 }
 

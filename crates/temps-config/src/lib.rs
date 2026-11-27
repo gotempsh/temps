@@ -61,7 +61,7 @@ pub use service::{
     anonymous_telemetry_preference, installation_mode, stateless_instance_id,
     stateless_telemetry_anonymous_id, stored_clickhouse_compression, ClusterCaRotationResult,
     ClusterNetworkState, ConfigService, ConfigServiceError, EffectiveTelemetryPolicies,
-    InstallationMode, RetentionPolicy, ServerConfig, SettingsUpdateResult,
+    InstallationMode, RetentionPolicy, ServerConfig, SettingsRevisionCheck, SettingsUpdateResult,
     TrustedPrivateNetworksIntent, TrustedProxyRangesIntent, AUTH_SECRET_FILE, ENCRYPTION_KEY_FILE,
     PIPELINE_LOGS_DIR_NAME,
 };

@@ -32,6 +32,7 @@ import { promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, success, info, warning, keyValue } from '../../ui/output.js'
 import { ValidationError } from '../../utils/errors.js'
 import { resolveValueSource } from '../../lib/value-source.js'
+import { isStaleRevision, settingsWriteError } from '../../lib/settings-revision.js'
 import {
   applyAssignments,
   collect,
@@ -333,7 +334,7 @@ async function applyAction(raw: string[] | undefined, options: ApplyOptions): Pr
   const sections = touchedSections(assignments, fromFile)
   await requireAuth()
   await setupClient()
-  const current = await withSpinner('Fetching settings...', readCurrentSettings)
+  let current = await withSpinner('Fetching settings...', readCurrentSettings)
   let body = mergeSettings(current, fromFile, assignments)
   const risky = sections.filter((section) => SENSITIVE_SETTINGS.has(section))
   const confirmed = await confirmRisk(
@@ -346,11 +347,18 @@ async function applyAction(raw: string[] | undefined, options: ApplyOptions): Pr
   // prompt, so rebuild the body on a fresh read: a change another admin saved
   // meanwhile is kept instead of being reverted to the first read.
   if (risky.length > 0) {
-    body = mergeSettings(await withSpinner('Fetching settings...', readCurrentSettings), fromFile, assignments)
+    current = await withSpinner('Fetching settings...', readCurrentSettings)
+    body = mergeSettings(current, fromFile, assignments)
   }
+  // `expected_revision` is the revision of the read the body was built from:
+  // a save someone made since is refused (409) instead of being reverted.
+  const write = { ...body, expected_revision: typeof current.revision === 'string' ? current.revision : undefined }
   const result = await withSpinner('Saving settings...', async () => {
-    const { data, error } = await updateSettings({ client, body: body as unknown as AppSettings })
-    if (error) fail(`Could not save ${sections.join(', ')}`, error)
+    const { data, error } = await updateSettings({ client, body: write as unknown as AppSettings })
+    if (error) {
+      if (isStaleRevision(error)) throw new Error(settingsWriteError(error))
+      fail(`Could not save ${sections.join(', ')}`, error)
+    }
     return data
   })
   if (options.json) {

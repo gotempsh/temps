@@ -21,6 +21,7 @@ function node(overrides: Partial<NodeInfoResponse> = {}): NodeInfoResponse {
     labels: {},
     capacity: {},
     build_limits: {} as NodeInfoResponse['build_limits'],
+    build_limits_revision: '0',
     last_heartbeat: new Date(NOW - 10_000).toISOString(),
     created_at: new Date(NOW - 86_400_000).toISOString(),
     public_ingress_enabled: false,

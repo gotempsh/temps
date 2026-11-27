@@ -654,3 +654,55 @@ fn only_mixed_placement_spans_control_plane_and_workers() {
         member(Some(3))
     ]));
 }
+
+/// A `--profile control-plane` server has no Docker handle, and an HA
+/// PostgreSQL cluster whose members are all on workers needs none: the
+/// cluster service only builds member specs. Building it used to require a
+/// local Docker handle, so every cluster creation on such a server failed
+/// with "This process has no local Docker daemon" before placement was known.
+#[test]
+fn a_control_plane_server_builds_a_postgres_cluster_service_without_docker() {
+    let manager = control_plane_manager();
+    assert!(
+        manager.require_docker().is_err(),
+        "the control-plane manager must have no Docker handle"
+    );
+
+    let cluster = manager
+        .create_cluster_service_instance("pg-ha".to_string(), ServiceType::Postgres)
+        .expect("building the Postgres cluster service needs no local Docker")
+        .expect("Postgres supports the cluster topology");
+    assert_eq!(
+        cluster.valid_cluster_roles(),
+        vec!["monitor", "primary", "replica"]
+    );
+}
+
+/// `initialize_cluster` on a control-plane server gets past building the
+/// cluster service and reaches member validation, instead of failing on the
+/// missing local Docker handle.
+#[tokio::test]
+async fn initialize_cluster_on_a_control_plane_server_does_not_require_docker() {
+    let service = external_services::Model {
+        name: "pg-ha".to_string(),
+        topology: "cluster".to_string(),
+        status: "creating".to_string(),
+        ..encrypted_service_model(41, serde_json::json!({ "database": "app" }))
+    };
+    let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+        .append_query_results(vec![vec![service]])
+        .into_connection();
+    let manager = control_plane_manager_with_db(Arc::new(db));
+
+    let err = manager
+        .initialize_cluster(41, &[member("arbiter", Some(3))])
+        .await
+        .expect_err("an unknown role is refused");
+    assert!(
+        matches!(
+            err,
+            ExternalServiceError::ParameterValidationFailed { service_id: 41, .. }
+        ),
+        "expected the role to be validated, got: {err:?}"
+    );
+}

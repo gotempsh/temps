@@ -78,6 +78,7 @@ use uuid::Uuid;
 mod acme;
 mod edge_rules;
 mod markdown;
+mod outlier;
 mod policy;
 mod request_filter;
 pub use request_filter::private_ingress::PrivateIngressPath;
@@ -4637,6 +4638,7 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
+        outlier::record_connect_failure(ctx.replica_in_flight.as_ref(), peer.address(), &e);
         ctx.replica_in_flight.take();
         // Retry on connection failure — handles stale pooled connections where
         // the upstream closed the keep-alive connection before we sent the
@@ -4661,6 +4663,25 @@ impl ProxyHttp for LoadBalancer {
             debug!("Upstream connection failed after retry: {:?}", e);
         }
         e
+    }
+
+    /// A new connection to the replica proves it accepts them again, so
+    /// passive outlier detection forgets its failed connects.
+    async fn connected_to_upstream(
+        &self,
+        _session: &mut PingoraSession,
+        reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _digest: Option<&pingora_core::protocols::Digest>,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        outlier::record_connect_success(ctx.replica_in_flight.as_ref(), reused);
+        Ok(())
     }
 
     /// `fail_to_proxy` already logs every failure once, with the request

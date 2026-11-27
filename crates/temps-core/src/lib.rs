@@ -83,6 +83,7 @@ pub mod docker_socket_grant;
 pub mod node_labels;
 pub mod retention;
 pub mod retry;
+pub mod revision;
 pub mod runtime;
 pub mod s3_endpoint;
 pub mod same_origin;
