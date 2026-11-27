@@ -14,9 +14,9 @@ const plugin: PluginManifest = {
 }
 
 // Only plugin APIs are mocked; the real console and authenticated session render
-// the controls. These tests never install or stop binaries on a shared instance.
+// the controls. These tests never add or remove a plugin on a shared instance.
 test.beforeEach(async ({ page }) => {
-  await page.route('**/api/x/plugins/catalog', (route) =>
+  await page.route('**/api/x/plugins/catalog/repositories', (route) =>
     route.fulfill({
       json: {
         available: true,
@@ -25,9 +25,12 @@ test.beforeEach(async ({ page }) => {
       },
     })
   )
+  await page.route('**/api/x/plugins/services', (route) =>
+    route.fulfill({ json: { configured: true, plugins: [], retired: [] } })
+  )
 })
 
-test('uninstall requires confirmation and automatically refreshes Running', async ({
+test('removing a plugin requires confirmation and refreshes the list', async ({
   page,
   consoleErrors,
 }) => {
@@ -44,30 +47,31 @@ test('uninstall requires confirmation and automatically refreshes Running', asyn
       await route.fulfill({
         json: {
           name: plugin.name,
-          message: 'Plugin uninstalled; data preserved.',
+          message:
+            "Plugin 'deployment-pulse' was removed; its service and the files it stored were kept",
         },
       })
     }
   )
   await page.goto('/settings/plugins')
   await page.getByRole('tab', { name: /^Running/ }).click()
-  const openUninstall = async () => {
+  const openRemove = async () => {
     await page
       .getByRole('button', { name: 'Actions for Deployment Pulse' })
       .click()
-    await page.getByRole('menuitem', { name: 'Uninstall' }).click()
+    await page.getByRole('menuitem', { name: 'Remove' }).click()
   }
-  await openUninstall()
+  await openRemove()
   const dialog = page.getByRole('alertdialog')
-  await expect(dialog).toContainText('data is preserved')
+  await expect(dialog).toContainText('keeps running')
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
   await expect(dialog).toBeHidden()
   expect(uninstallRequests).toBe(0)
-  await openUninstall()
-  await dialog.getByRole('button', { name: 'Uninstall', exact: true }).click()
+  await openRemove()
+  await dialog.getByRole('button', { name: 'Remove', exact: true }).click()
   await expect(dialog).toBeHidden()
   await expect(
-    page.getByText('No verified plugins are running.', { exact: true })
+    page.getByText('No plugins are added.', { exact: true })
   ).toBeVisible()
   expect(uninstallRequests).toBe(1)
   expect(consoleErrors).toEqual([])
@@ -110,9 +114,9 @@ for (const status of [207, 502]) {
               ? [
                   {
                     plugin: plugin.name,
-                    reason: 'Signing key has been revoked.',
+                    reason: 'The service this plugin runs as is not reachable.',
                   },
-                  { plugin: null, reason: 'Unable to read plugin directory.' },
+                  { plugin: null, reason: 'Unable to read the plugin list.' },
                 ]
               : [],
         },
@@ -130,14 +134,14 @@ for (const status of [207, 502]) {
       .getByRole('alert')
       .filter({ hasText: 'Some plugins could not be reloaded' })
     await expect(alert).toContainText(
-      'deployment-pulse: Signing key has been revoked.'
+      'deployment-pulse: The service this plugin runs as is not reachable.'
     )
     await expect(alert).toContainText(
-      'Plugin registry: Unable to read plugin directory.'
+      'Plugin registry: Unable to read the plugin list.'
     )
     if (status === 502) {
       await expect(
-        page.getByText('No verified plugins are running.', { exact: true })
+        page.getByText('No plugins are added.', { exact: true })
       ).toBeVisible()
     } else {
       await expect(

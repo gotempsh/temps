@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 # ADR-119: A plugin is a Temps service
 
-**Status:** Proposed
+**Status:** Proposed — both steps under Sequencing are implemented
 **Date:** 2026-11-27
 
 **Supersedes in part:** [ADR-118](./118-external-plugins-run-in-containers.md)
@@ -62,14 +62,22 @@ Removing a plugin revokes its actor and its grants and stops routing to it. The 
 
 ### D7. Surfaces
 
-`GET /x/plugins/services` lists service plugins with their state and is the capability endpoint (`configured`, `reason`, `setup_path`). `POST /x/plugins/services` adds one; it requires `SystemAdmin` and recent sensitive-action verification, and is audit-logged before Temps connects and with its outcome. The console has **Add from service** on Settings > Plugins and shows each plugin's state and service; the CLI has `temps plugin services` and `temps plugin add-service`.
+`GET /x/plugins/services` lists service plugins with their state and is the capability endpoint (`configured`, `reason`, `setup_path`). `POST /x/plugins/services` adds one; it requires `SystemAdmin` and recent sensitive-action verification, and is audit-logged before Temps connects and with its outcome. `POST /x/plugins/{name}/uninstall` removes one. The console has **Add from service** on Settings > Plugins and shows each plugin's state and service; the CLI has `temps plugin services`, `temps plugin add-service` and `temps plugin remove`.
+
+The catalogue on Settings > Plugins is a list of repositories. Each listing links to its source at the listed commit and to the new-service flow with the repository filled in; nothing is installed from it.
 
 ## Sequencing
 
 1. Additive: the service runtime described above, next to the executable runtimes of ADR-118.
-2. Breaking: the executable runtimes (process, plugin launcher, plugin container) and the binary install paths are removed. After that upgrade, a plugin installed as an executable does not start; Settings > Plugins lists it as needing to be added again from a service, with the reason. Its data and its row are kept. Nothing is migrated or redeployed on the administrator's behalf.
+2. Breaking: the executable runtimes (process, plugin launcher, plugin container) and every path that installed or updated an executable (file upload, repository build, registry download, the isolation setting) are removed, with their API routes, console pages and CLI commands.
 
-ADR-118's reasoning about what a plugin must not reach stands. Its container, image, limits and isolation column are what step 2 removes.
+### D8. A plugin installed as an executable is retired, not migrated
+
+After the upgrade, a plugin an earlier version installed as an executable does not start. Temps reads its installation record from disk, runs nothing, and lists it on Settings > Plugins and in `GET /x/plugins/services` (`retired`: name, version, reason) until an administrator removes it. Removing it revokes its actor and grants and deletes only the record that marked it installed; its releases and the files it stored stay where they are. Nothing is migrated or redeployed on the administrator's behalf: the administrator deploys the plugin as a service and adds that service.
+
+`--plugin-launcher` is still accepted so an existing unit file does not stop the server from starting; it is ignored with a warning.
+
+ADR-118's reasoning about what a plugin must not reach stands. Its container, image, limits and isolation setting are what step 2 removed.
 
 ## Consequences
 
@@ -77,7 +85,8 @@ ADR-118's reasoning about what a plugin must not reach stands. Its container, im
 - Plugins work wherever deployments work, including a Temps that itself runs in a container and services on worker nodes.
 - An idle plugin holds no memory when its environment stops when idle, which is what a 4 GB server needs.
 - A plugin has one channel, so Temps attaches to one container. A plugin service runs with one replica.
-- The signed registry publishes native executables today. Until its entries name something deployable (a pinned image or a Git commit), a registry plugin cannot be installed once step 2 lands, and the console says why.
+- The signed registry publishes native executables, which nothing runs any more. Until its entries name something deployable (a pinned image or a Git commit) there is no verified source for a service plugin; the repository catalogue is unsigned discovery only.
+- The SDKs still contain the child-process start-up path, used by the local `temps plugin dev` simulator. Temps itself no longer uses it.
 
 ## Decisions taken without a precedent in the code
 
@@ -90,3 +99,6 @@ These were chosen conservatively and are for the owner to confirm:
 5. **AI-tool consent is per build**: a new deployment is a new build, so consent given to a plugin's AI tools is asked for again after each deployment.
 6. **Events start an idle plugin** only when the plugin is granted events; otherwise they are not delivered.
 7. **Default data directory `/data`**, falling back to a temporary directory with a warning when no volume is mounted.
+8. **A retired plugin's record is read without verifying its signature**, because nothing is executed: it is only named and removed.
+9. **`--plugin-launcher` is ignored with a warning** instead of being rejected at start.
+10. **The installation-count report to the registry is removed** with the installs it counted.

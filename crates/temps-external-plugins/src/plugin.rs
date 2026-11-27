@@ -21,7 +21,6 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handler::{self, ExternalPluginsApiDoc, ExternalPluginsAppState};
 use crate::manager::ExternalPluginConfig;
-use crate::sandbox::{ContainerSandbox, SandboxHost};
 use crate::service::ExternalPluginsService;
 use tracing::{debug, warn};
 
@@ -95,38 +94,11 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // Discovery is deferred to a background task because the
             // per-plugin handshake timeout (default 30s) would otherwise
             // block the console API from coming up.
-            // A process with no Docker of its own (a hosted control plane)
-            // compiles plugins on a joined worker node. Registered by the
-            // deployments plugin, which runs earlier; absent where the node
-            // machinery is not part of the build.
-            let remote_builder =
-                context.get_service::<dyn temps_core::plugin_builder::RemotePluginBuilder>();
             let ai_tools = Arc::new(temps_ai_api_tools::PluginToolsRegistry::default());
             context.register_service(ai_tools.clone());
-            // The Docker client deployments run on, registered in every
-            // profile (as a typed "disabled" where there is none), and where
-            // this process itself runs. An embedding that registers no
-            // runtime context keeps the historical host behaviour.
-            let docker = context.require_service::<temps_core::DockerHandle>();
-            let inside_container = context
-                .get_service::<temps_core::RuntimeContext>()
-                .is_some_and(|runtime| {
-                    runtime.execution_environment()
-                        == temps_core::runtime::ExecutionEnvironment::Docker
-                });
-            let config = self.config.clone().with_sandbox(ContainerSandbox::new(
-                docker.as_ref().clone(),
-                SandboxHost::detect(inside_container),
-            ));
-            if let Err(reason) = config.sandbox.availability() {
-                tracing::warn!(
-                    reason = %reason,
-                    "Plugins cannot run in containers on this server; a plugin set to container isolation will not start"
-                );
-            }
+            let config = self.config.clone();
             let service = Arc::new(
                 ExternalPluginsService::new_empty(config, queue, db)
-                    .with_remote_builder(remote_builder)
                     .with_ai_tools_registry(ai_tools),
             );
             service
@@ -312,20 +284,14 @@ mod tests {
 
     #[test]
     fn test_plugin_name() {
-        let config = ExternalPluginConfig::new(
-            PathBuf::from("/tmp/test"),
-            "postgres://localhost/test".to_string(),
-        );
+        let config = ExternalPluginConfig::new(PathBuf::from("/tmp/test"));
         let plugin = ExternalPluginsPlugin::new(config);
         assert_eq!(plugin.name(), "external-plugins");
     }
 
     #[test]
     fn test_plugin_openapi_schema() {
-        let config = ExternalPluginConfig::new(
-            PathBuf::from("/tmp/test"),
-            "postgres://localhost/test".to_string(),
-        );
+        let config = ExternalPluginConfig::new(PathBuf::from("/tmp/test"));
         let plugin = ExternalPluginsPlugin::new(config);
         let schema = plugin.openapi_schema();
         assert!(schema.is_some());

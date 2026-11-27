@@ -36219,18 +36219,6 @@
         ],
         "description": "A file object as returned by the provider."
       },
-      "FileUpload": {
-        "properties": {
-          "file": {
-            "format": "binary",
-            "type": "string"
-          }
-        },
-        "required": [
-          "file"
-        ],
-        "type": "object"
-      },
       "FillSecretRequest": {
         "properties": {
           "value": {
@@ -44866,67 +44854,6 @@
         "required": [
           "data",
           "count"
-        ],
-        "type": "object"
-      },
-      "InstallPluginRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "grants": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/PluginGrantConfig"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "isolation": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/PluginIsolation",
-                "description": "How a new installation is isolated. Omit it for a container. An\nupdate keeps the isolation of the installed plugin."
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "name": {
-            "description": "Validated registry name only. URLs, paths, versions, and hashes are not\naccepted from HTTP callers.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name"
-        ],
-        "type": "object"
-      },
-      "InstallPluginResponse": {
-        "properties": {
-          "message": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "platform": {
-            "type": "string"
-          },
-          "sha256": {
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "version",
-          "platform",
-          "sha256",
-          "message"
         ],
         "type": "object"
       },
@@ -60187,10 +60114,6 @@
             "description": "Whether a Docker client exists AND a daemon answered a ping at startup.\nIn the `control-plane` profile a daemon may still be present for\ndiagnostics, but no workloads are placed here regardless.",
             "type": "boolean"
           },
-          "external_plugins": {
-            "description": "External plugin binaries and plugin-owned files may be installed.",
-            "type": "boolean"
-          },
           "image_builds_local": {
             "description": "Container images can be built by this process. Requires a local Docker\ndaemon; always `false` when `docker` is `false`.",
             "type": "boolean"
@@ -60304,54 +60227,6 @@
           "tools"
         ],
         "type": "object"
-      },
-      "PluginGrantConfig": {
-        "properties": {
-          "ai_daily_call_limit": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "ai_max_output_tokens": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "permissions": {
-            "items": {
-              "$ref": "#/components/schemas/PluginHostPermission"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "permissions",
-          "ai_daily_call_limit",
-          "ai_max_output_tokens"
-        ],
-        "type": "object"
-      },
-      "PluginHostPermission": {
-        "description": "Host-owned permissions granted to one durable external-plugin actor.",
-        "enum": [
-          "ai_generate",
-          "projects_read",
-          "environments_read",
-          "deployments_read",
-          "api_read",
-          "api_write",
-          "events_read"
-        ],
-        "type": "string"
-      },
-      "PluginIsolation": {
-        "description": "How an administrator asked for one plugin to be isolated. Stored on the\nplugin's actor row.",
-        "enum": [
-          "container",
-          "process",
-          "service"
-        ],
-        "type": "string"
       },
       "PolicySource": {
         "description": "Which policy decided a test.",
@@ -67486,28 +67361,6 @@
           "address",
           "prefix_len",
           "listen_port"
-        ],
-        "type": "object"
-      },
-      "RegistryEnvelope": {
-        "description": "The outer envelope signs the decoded bytes in `payload`. Encoding the\npayload instead of reserializing a JSON object avoids ambiguous map order,\nwhitespace, and number representations.",
-        "properties": {
-          "key_id": {
-            "type": "string"
-          },
-          "payload": {
-            "description": "Standard-base64 encoded JSON [`RegistryDocument`].",
-            "type": "string"
-          },
-          "signature": {
-            "description": "Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.",
-            "type": "string"
-          }
-        },
-        "required": [
-          "key_id",
-          "payload",
-          "signature"
         ],
         "type": "object"
       },
@@ -205714,110 +205567,6 @@
         ],
         "tags": [
           "Workflow App API"
-        ]
-      }
-    },
-    "/x/plugins/install/file": {
-      "post": {
-        "operationId": "install_local_file",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "version",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "How a new installation is isolated. Omit it for a container. An\nupdate keeps the isolation of the installed plugin.",
-            "in": "query",
-            "name": "isolation",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/PluginIsolation"
-            }
-          },
-          {
-            "description": "Operator approval to execute the file with this SHA-256",
-            "in": "header",
-            "name": "X-Temps-Trust-Sha256",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "multipart/form-data": {
-              "schema": {
-                "$ref": "#/components/schemas/FileUpload"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InstallPluginResponse"
-                }
-              }
-            },
-            "description": "Plugin verified, installed and started"
-          },
-          "400": {
-            "description": "Invalid plugin identity, digest header or multipart upload"
-          },
-          "401": {
-            "description": "Authentication required"
-          },
-          "403": {
-            "description": "Administrator permission or sensitive-action authorization required"
-          },
-          "408": {
-            "description": "Upload timed out"
-          },
-          "409": {
-            "description": "Persistent storage is required or the existing installation uses a different source"
-          },
-          "413": {
-            "description": "Executable exceeds the upload limit"
-          },
-          "428": {
-            "description": "Additional verification required for this sensitive action"
-          },
-          "429": {
-            "description": "Another file upload is in progress"
-          },
-          "500": {
-            "description": "Could not stage, activate or persist the installation"
-          },
-          "502": {
-            "description": "Plugin verification or startup failed"
-          },
-          "503": {
-            "description": "Plugin actor activation is unavailable or the service is shutting down"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "External Plugins"
         ]
       }
     },

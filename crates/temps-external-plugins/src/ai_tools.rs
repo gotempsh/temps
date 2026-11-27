@@ -313,7 +313,6 @@ mod tests {
         ExternalPluginsService::new_empty(
             crate::manager::ExternalPluginConfig::new(
                 std::env::temp_dir().join("plugin-ai-service-test"),
-                "postgres://localhost/test".into(),
             ),
             None,
             Arc::new(db),
@@ -589,10 +588,7 @@ mod tests {
         std::fs::create_dir_all(directory.path().join("plugins/reports")).unwrap();
         std::fs::write(directory.path().join("plugins/reports/active.json"), "{}").unwrap();
         let service = ExternalPluginsService::new_empty(
-            crate::manager::ExternalPluginConfig::new(
-                directory.path().to_path_buf(),
-                "postgres://localhost/test".into(),
-            ),
+            crate::manager::ExternalPluginConfig::new(directory.path().to_path_buf()),
             None,
             Arc::new(
                 MockDatabase::new(DatabaseBackend::Postgres)

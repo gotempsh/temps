@@ -17,19 +17,23 @@ import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
-import type { RepositorySelection } from './RepositoryInstall'
-import { filterRepositoryCatalog } from './RepositoryCatalog-shared'
+import { CopyButton } from '@/components/ui/copy-button'
+import { Link } from 'react-router'
+import {
+  deployPluginPath,
+  filterRepositoryCatalog,
+} from './RepositoryCatalog-shared'
 
+/**
+ * Plugins published as Git repositories. A plugin runs as a Temps service, so
+ * each listing leads to deploying its repository; nothing is installed from
+ * here.
+ */
 export function RepositoryCatalog({
-  canInstall,
-  disabled,
-  installedNames,
-  onSelect,
+  addedNames,
 }: {
-  canInstall: boolean
-  disabled: boolean
-  installedNames: string[]
-  onSelect: (plugin: RepositorySelection) => void
+  /** Names of the plugins already added to this server. */
+  addedNames: string[]
 }) {
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('')
@@ -138,11 +142,10 @@ export function RepositoryCatalog({
         </div>
       ) : (
         <>
-          {!canInstall && (
-            <p className="text-sm text-muted-foreground">
-              A system administrator can install these plugins.
-            </p>
-          )}
+          <p className="text-sm text-muted-foreground">
+            Deploy a plugin as a service, then add it with Add from service.
+            Listings are not a security audit.
+          </p>
           <p
             role="status"
             className="text-sm text-muted-foreground tabular-nums"
@@ -153,12 +156,7 @@ export function RepositoryCatalog({
           {filtered.length === 0 ? (
             <div className="rounded-lg border p-4 text-sm text-muted-foreground">
               {catalog.data?.plugins.length === 0 ? (
-                <>
-                  <p>No catalog plugins support this server’s platform yet.</p>
-                  <p>
-                    Compatible plugins will appear here when they are listed.
-                  </p>
-                </>
+                <p>No plugins are listed yet.</p>
               ) : (
                 <p>No matching plugins. Try another search or category.</p>
               )}
@@ -195,6 +193,12 @@ export function RepositoryCatalog({
                         {plugin.category} · By {plugin.author} · v
                         {plugin.latestVersion}
                       </p>
+                      {plugin.path && (
+                        <p className="mt-1 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                          Directory in the repository:{' '}
+                          <code>{plugin.path}</code>
+                        </p>
+                      )}
                     </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap items-center gap-3">
@@ -208,22 +212,21 @@ export function RepositoryCatalog({
                         Review source
                       </a>
                     </div>
-                    {installedNames.includes(plugin.name) && (
-                      <Badge variant="secondary">Installed</Badge>
+                    {addedNames.includes(plugin.name) && (
+                      <Badge variant="secondary">Added</Badge>
                     )}
-                    {canInstall && (
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        disabled={disabled}
-                        onClick={() => onSelect(plugin)}
-                      >
-                        {installedNames.includes(plugin.name)
-                          ? 'Review version'
-                          : 'Review and install'}
-                      </Button>
-                    )}
+                    <CopyButton
+                      value={plugin.repository}
+                      label={`Copy the Git link of ${plugin.title}`}
+                      className="h-8 rounded-md border bg-background px-3"
+                    >
+                      Copy Git link
+                    </CopyButton>
+                    <Button asChild variant="outline" size="sm">
+                      <Link to={deployPluginPath(plugin.repository)}>
+                        Deploy
+                      </Link>
+                    </Button>
                   </div>
                 </article>
               ))}
@@ -239,15 +242,6 @@ export function RepositoryCatalog({
               Show more
             </Button>
           )}
-          <p className="text-sm text-muted-foreground">
-            {catalog.data?.platform && (
-              <>
-                Compatible with <code>{catalog.data.platform}</code>.{' '}
-              </>
-            )}
-            Community listings are not a security audit; review access before
-            installing.
-          </p>
         </>
       )}
     </section>

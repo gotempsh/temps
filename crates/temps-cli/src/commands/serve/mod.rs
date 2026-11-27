@@ -289,12 +289,10 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
-    /// Program that runs each external plugin as a separate, unprivileged
-    /// user (verbs `exec`, `signal` and `probe`; see the
-    /// `temps_external_plugins::launcher` docs). When set, Temps refuses to
-    /// start plugins unless that user provably cannot read this process's
-    /// environment, memory or secret files. Fixed by how the host is built.
-    #[arg(long, env = "TEMPS_PLUGIN_LAUNCHER")]
+    /// No longer used. A plugin runs only as a Temps service, so Temps starts
+    /// no plugin executable and needs no launcher. Still accepted, and
+    /// ignored with a warning, so a host that passes it keeps starting.
+    #[arg(long, env = "TEMPS_PLUGIN_LAUNCHER", hide = true)]
     pub plugin_launcher: Option<PathBuf>,
 
     /// Console/Admin address (defaults to random port on localhost).
@@ -531,8 +529,10 @@ impl ServeCommand {
         // Children reset this on exec, so plugins and builds are unaffected.
         make_process_non_dumpable();
 
-        if let Some(ref launcher) = self.plugin_launcher {
-            std::env::set_var("TEMPS_PLUGIN_LAUNCHER", launcher);
+        if self.plugin_launcher.is_some() {
+            tracing::warn!(
+                "--plugin-launcher (TEMPS_PLUGIN_LAUNCHER) is ignored: a plugin runs only as a Temps service, and Temps starts no plugin executable"
+            );
         }
 
         // Set screenshot provider from CLI flag (takes precedence over env var)

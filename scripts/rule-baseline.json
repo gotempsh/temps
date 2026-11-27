@@ -158,8 +158,7 @@
       "functions_over_300_lines": 2
     },
     "temps-external-plugins": {
-      "unguarded_require_auth": 2,
-      "functions_over_300_lines": 1
+      "unguarded_require_auth": 2
     },
     "temps-file-store": {
       "lazy_error_variants": 1

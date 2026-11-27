@@ -57,6 +57,28 @@ impl From<ServicePluginView> for ServicePluginResponse {
     }
 }
 
+/// A plugin an earlier version installed as an executable. It does not run:
+/// a plugin runs only as a Temps service.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RetiredPluginResponse {
+    pub name: String,
+    /// The version that was installed, when its record still says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Why it does not run and what to do about it.
+    pub reason: String,
+}
+
+impl From<crate::retired::RetiredPlugin> for RetiredPluginResponse {
+    fn from(plugin: crate::retired::RetiredPlugin) -> Self {
+        Self {
+            name: plugin.name,
+            version: plugin.version,
+            reason: crate::retired::RETIRED_REASON.to_string(),
+        }
+    }
+}
+
 /// Whether this server can run plugins as services, and the ones it runs.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PluginServicesResponse {
@@ -69,6 +91,9 @@ pub struct PluginServicesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_path: Option<String>,
     pub plugins: Vec<ServicePluginResponse>,
+    /// Plugins installed as executables, which no longer run. Each stays
+    /// listed, with the reason, until an administrator removes it.
+    pub retired: Vec<RetiredPluginResponse>,
 }
 
 /// The deployed service to add as a plugin.
@@ -159,6 +184,14 @@ pub(super) async fn get_plugin_services(
             .then(|| crate::service_runtime::ServiceAttachError::Unavailable.public_reason()),
         setup_path: (!configured).then(|| SETUP_PATH.to_string()),
         plugins,
+        retired: state
+            .service
+            .manager()
+            .retired_plugins()
+            .await
+            .into_iter()
+            .map(RetiredPluginResponse::from)
+            .collect(),
     }))
 }
 
@@ -434,6 +467,7 @@ mod tests {
         );
         assert_eq!(listed.setup_path.as_deref(), Some("/settings/plugins"));
         assert!(listed.plugins.is_empty());
+        assert!(listed.retired.is_empty());
 
         let error = add_service_plugin(
             user_auth(Role::PlatformAdmin),
@@ -454,6 +488,83 @@ mod tests {
                 "EXTERNAL_PLUGIN_SERVICE_ADD_FAILED"
             ]
         );
+    }
+
+    /// What an upgrade finds on a server where an earlier version installed
+    /// a plugin as an executable.
+    #[tokio::test]
+    async fn a_plugin_installed_as_an_executable_is_listed_with_the_reason_until_it_is_removed() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = crate::manager::ExternalPluginConfig::new(root.path().to_path_buf());
+        let installation = config.plugins_dir.join("reports");
+        std::fs::create_dir_all(installation.join("1.4.0-abc")).expect("release");
+        std::fs::write(installation.join("1.4.0-abc/plugin"), b"binary").expect("binary");
+        std::fs::write(
+            installation.join("active.json"),
+            br#"{"version":"1.4.0","directory":"1.4.0-abc"}"#,
+        )
+        .expect("active record");
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let database = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let service = Arc::new(ExternalPluginsService::new_empty(
+            config,
+            None,
+            Arc::new(database),
+        ));
+        service.manager().discover_and_start().await;
+        let state = ExternalPluginsAppState {
+            service,
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+
+        // It is not a plugin anyone can use: no manifest, no route.
+        let Json(manifests) =
+            list_external_plugins(user_auth(Role::User), State(state.clone())).await;
+        assert!(manifests.is_empty());
+        // An administrator sees it, with what to do.
+        let Json(listed) =
+            get_plugin_services(user_auth(Role::PlatformAdmin), State(state.clone()))
+                .await
+                .expect("the listing is readable");
+        assert!(listed.plugins.is_empty());
+        assert_eq!(listed.retired.len(), 1);
+        assert_eq!(listed.retired[0].name, "reports");
+        assert_eq!(listed.retired[0].version.as_deref(), Some("1.4.0"));
+        assert!(listed.retired[0]
+            .reason
+            .contains("Deploy the plugin as a service"));
+        let body = serde_json::to_value(&listed).expect("serializable");
+        assert_eq!(body["retired"][0]["name"], "reports");
+
+        // Removing it is audited and keeps what it stored.
+        let Json(removed) = uninstall_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            Path("reports".to_string()),
+        )
+        .await
+        .expect("an installed executable can be removed");
+        assert_eq!(removed.name, "reports");
+        assert!(removed.data_preserved);
+        assert_eq!(
+            operations(&audit),
+            [
+                "EXTERNAL_PLUGIN_UNINSTALL_REQUESTED",
+                "EXTERNAL_PLUGIN_UNINSTALLED"
+            ]
+        );
+        assert!(installation.join("1.4.0-abc/plugin").is_file());
+        let Json(after) = get_plugin_services(user_auth(Role::PlatformAdmin), State(state))
+            .await
+            .expect("the listing is readable");
+        assert!(after.retired.is_empty());
     }
 
     #[tokio::test]
@@ -545,18 +656,6 @@ mod tests {
         assert_eq!(listed.environment_name.as_deref(), Some("production"));
         assert_eq!(listed.deployment_id, Some(deployment_id));
         assert!(!listed.stops_when_idle);
-
-        // A service plugin's isolation is its service; it cannot be moved.
-        let error = state
-            .service
-            .set_plugin_isolation("reports", crate::sandbox::PluginIsolation::Process)
-            .await
-            .expect_err("a service plugin is not moved");
-        assert_eq!(
-            service_problem(&error).status_code,
-            StatusCode::CONFLICT,
-            "{error}"
-        );
 
         // Removing the plugin revokes it and leaves the service alone.
         state

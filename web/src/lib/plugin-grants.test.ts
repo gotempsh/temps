@@ -2,10 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { expect, test } from 'bun:test'
 import { emptyPluginGrants, pluginGrantsSchema } from './plugin-grants'
-import {
-  repositoryInstallBody,
-  repositorySelectionValues,
-} from './plugin-repository'
 
 test('new grants deny all host access and defaults are independent', () => {
   const first = emptyPluginGrants()
@@ -33,21 +29,4 @@ test('zero daily calls is an explicit pause', () => {
     pluginGrantsSchema.parse({ ...emptyPluginGrants(), ai_daily_call_limit: 0 })
       .ai_daily_call_limit
   ).toBe(0)
-})
-
-test('install sends selected grants but a different catalog selection does not inherit approval', () => {
-  const selected = repositorySelectionValues({
-    name: 'example',
-    repository: 'https://github.com/example/plugin',
-    commit: 'a'.repeat(40),
-  })
-  const grants = {
-    ...emptyPluginGrants(),
-    permissions: ['ai_generate' as const],
-  }
-  expect(
-    repositoryInstallBody({ ...selected, trusted: true, grants }).grants
-  ).toEqual(grants)
-  expect(repositorySelectionValues(null).grants).toBeUndefined()
-  expect(repositorySelectionValues(null).trusted).toBe(false)
 })

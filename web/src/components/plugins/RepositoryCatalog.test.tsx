@@ -4,7 +4,12 @@ import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { RepositoryCatalogPlugin } from '@/api/client/types.gen'
-import { RepositoryCatalog, filterRepositoryCatalog } from './RepositoryCatalog'
+import { MemoryRouter } from 'react-router'
+import {
+  RepositoryCatalog,
+  deployPluginPath,
+  filterRepositoryCatalog,
+} from './RepositoryCatalog'
 
 const plugin: RepositoryCatalogPlugin = {
   name: 'example',
@@ -41,25 +46,25 @@ test('catalog searches names, summaries, authors and repositories and combines c
   expect(filterRepositoryCatalog([plugin], 'missing', '')).toEqual([])
 })
 
-function renderCatalog(canInstall: boolean, available = true) {
+function renderCatalog({
+  available = true,
+  added = [] as string[],
+  plugins = [plugin],
+} = {}) {
   const client = new QueryClient()
   client.setQueryData(['repository-plugin-catalog'], {
     available,
     source:
       'https://raw.githubusercontent.com/gotempsh/plugins/main/registry/catalog.json',
-    platform: 'darwin-arm64',
-    plugins: available ? [plugin] : [],
+    plugins: available ? plugins : [],
     reason: available ? undefined : 'GitHub returned HTTP 404.',
   })
   try {
     return renderToStaticMarkup(
       <QueryClientProvider client={client}>
-        <RepositoryCatalog
-          canInstall={canInstall}
-          disabled={false}
-          installedNames={[]}
-          onSelect={() => {}}
-        />
+        <MemoryRouter>
+          <RepositoryCatalog addedNames={added} />
+        </MemoryRouter>
       </QueryClientProvider>
     )
   } finally {
@@ -67,25 +72,48 @@ function renderCatalog(canInstall: boolean, available = true) {
   }
 }
 
-test('catalog shows exact commit source link and explicit review action for admins', () => {
-  const html = renderCatalog(true)
+test('a listing links to its exact source and to deploying its repository as a service', () => {
+  const html = renderCatalog()
   expect(html).toContain(
     `${plugin.repository}/tree/${plugin.commit}/plugins/demo`
   )
-  expect(html).toContain('Review and install')
+  expect(html).toContain(
+    'href="/projects/new?source=git-url&amp;repo=https%3A%2F%2Fgithub.com%2Fexample%2Fplugin"'
+  )
+  expect(html).toContain('Copy Git link')
+  // A plugin kept in a subdirectory says which one to deploy.
+  expect(html).toContain('<code>plugins/demo</code>')
   expect(html).toContain('not a security audit')
-  expect(html).toContain('darwin-arm64')
+  expect(html).toContain('Add from service')
+  expect(html).not.toContain('Added</')
 })
 
-test('non-admins can browse without install controls', () => {
-  const html = renderCatalog(false)
-  expect(html).toContain('Example plugin')
-  expect(html).not.toContain('Review and install')
-  expect(html).toContain('system administrator')
+test('nothing in the catalogue installs a plugin', () => {
+  const html = renderCatalog()
+  expect(html).not.toContain('install')
+  expect(html).not.toContain('Install')
+  // The catalogue is not filtered by the server's platform any more.
+  expect(html).not.toContain('Compatible with')
+})
+
+test('a plugin already added to this server is marked', () => {
+  expect(renderCatalog({ added: ['example'] })).toContain('Added</')
+})
+
+test('the deploy link carries the repository as one encoded parameter', () => {
+  expect(deployPluginPath('https://github.com/example/plugin?x=1&y=2')).toBe(
+    '/projects/new?source=git-url&repo=https%3A%2F%2Fgithub.com%2Fexample%2Fplugin%3Fx%3D1%26y%3D2'
+  )
+})
+
+test('an empty catalogue says so instead of rendering an empty list', () => {
+  const html = renderCatalog({ plugins: [] })
+  expect(html).toContain('No plugins are listed yet.')
+  expect(html).not.toContain('No matching plugins.')
 })
 
 test('unavailable catalog is visible and points to a concrete recovery path', () => {
-  const html = renderCatalog(true, false)
+  const html = renderCatalog({ available: false })
   expect(html).toContain('GitHub catalog unavailable')
   expect(html).toContain('GitHub returned HTTP 404.')
   expect(html).toContain('Refresh catalog')

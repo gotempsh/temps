@@ -108,19 +108,13 @@ pub struct SourceCatalog {
 }
 
 impl SourceCatalog {
-    pub async fn list(
-        &self,
-        platform: &str,
-    ) -> Result<Vec<RepositoryCatalogPlugin>, SourceCatalogError> {
+    pub async fn list(&self) -> Result<Vec<RepositoryCatalogPlugin>, SourceCatalogError> {
         let mut cache = self.cache.lock().await;
         if let Some(cached) = cache
             .as_ref()
             .filter(|entry| entry.expires > Instant::now())
         {
-            return cached
-                .result
-                .clone()
-                .map(|plugins| filter_platform(&plugins, platform));
+            return cached.result.clone();
         }
         #[cfg(test)]
         let source = self.test_source.as_deref().unwrap_or(SOURCE);
@@ -137,7 +131,7 @@ impl SourceCatalog {
             expires,
             result: result.clone(),
         });
-        result.map(|plugins| filter_platform(&plugins, platform))
+        result
     }
 
     async fn fetch(source: &str) -> Result<Vec<RepositoryCatalogPlugin>, SourceCatalogError> {
@@ -187,17 +181,6 @@ impl SourceCatalog {
     }
 }
 
-fn filter_platform(
-    plugins: &[RepositoryCatalogPlugin],
-    platform: &str,
-) -> Vec<RepositoryCatalogPlugin> {
-    plugins
-        .iter()
-        .filter(|plugin| plugin.platforms.iter().any(|entry| entry == platform))
-        .cloned()
-        .collect()
-}
-
 fn valid_https_url(value: &str) -> bool {
     url::Url::parse(value).is_ok_and(|url| {
         url.scheme() == "https"
@@ -226,7 +209,7 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
     let mut names = HashSet::new();
     let mut repositories = HashSet::new();
     for plugin in &document.plugins {
-        let valid = crate::install::validate_plugin_name(&plugin.name).is_ok()
+        let valid = crate::naming::valid_plugin_name(&plugin.name)
             && crate::repository::parse_repository(&plugin.repository).is_ok()
             && (document.schema_version == 2 || plugin.path.is_none())
             && matches!(crate::repository::normalize_path(plugin.path.as_deref(), &plugin.repository), Ok(path) if path == plugin.path)
@@ -241,7 +224,7 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
             && bounded_text(&plugin.description, 4000)
             && bounded_text(&plugin.author, 160)
             && bounded_text(&plugin.category, 80)
-            && crate::install::validate_version(&plugin.name, &plugin.latest_version).is_ok()
+            && crate::naming::valid_version(&plugin.latest_version)
             && plugin.platforms.len() <= 6
             && plugin.platforms.iter().all(|platform| {
                 matches!(
@@ -324,8 +307,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({"schema_version":1,"plugins":[entry.clone()]}))
                 .unwrap();
         let plugins = parse_document(&body).unwrap();
-        assert_eq!(filter_platform(&plugins, "darwin-arm64").len(), 0);
-        assert_eq!(filter_platform(&plugins, "linux-amd64-gnu").len(), 1);
+        assert_eq!(plugins.len(), 1);
         let duplicates = serde_json::to_vec(
             &serde_json::json!({"schema_version":1,"plugins":[entry.clone(),entry]}),
         )
@@ -444,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_catalog_filters_platform_without_a_network_request() {
+    async fn a_cached_catalog_is_served_without_a_network_request() {
         let catalog = SourceCatalog::default();
         let plugin: RepositoryCatalogPlugin = serde_json::from_value(serde_json::json!({
             "name":"demo", "title":"Demo", "summary":"Summary", "description":"Description",
@@ -458,8 +440,9 @@ mod tests {
             expires: Instant::now() + TTL,
             result: Ok(vec![plugin]),
         });
-        assert_eq!(catalog.list("linux-amd64-gnu").await.unwrap().len(), 1);
-        assert!(catalog.list("darwin-arm64").await.unwrap().is_empty());
+        // No test source is set: a fetch would go to the network and fail.
+        assert_eq!(catalog.list().await.unwrap().len(), 1);
+        assert_eq!(catalog.list().await.unwrap()[0].name, "demo");
     }
 
     #[tokio::test]
@@ -469,12 +452,12 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
         server.await.unwrap();
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
     }
@@ -488,7 +471,7 @@ mod tests {
         ];
         for response in responses {
             let (catalog, server) = mock_catalog(response).await;
-            assert!(catalog.list("linux-amd64-gnu").await.is_err());
+            assert!(catalog.list().await.is_err());
             server.await.unwrap();
         }
     }
@@ -497,10 +480,7 @@ mod tests {
     async fn concurrent_misses_share_one_fetch() {
         let (catalog, server) = mock_catalog(b"HTTP/1.1 200 OK\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"schema_version\":1,\"plugins\":[]}").await;
         let catalog = std::sync::Arc::new(catalog);
-        let (first, second) = tokio::join!(
-            catalog.list("linux-amd64-gnu"),
-            catalog.list("darwin-arm64")
-        );
+        let (first, second) = tokio::join!(catalog.list(), catalog.list());
         assert!(first.is_ok());
         assert!(second.is_ok());
         server.await.unwrap();
@@ -522,11 +502,11 @@ mod tests {
             test_source: Some(format!("http://{address}/catalog.json")),
         };
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
         server.await.unwrap();

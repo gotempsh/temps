@@ -79,7 +79,6 @@ impl temps_node_agent::plugin_build_handler::PluginContainerBuilder for Containe
             temps_external_plugins::repository::ContainerBuildSource::Archive(archive),
             target,
             output,
-            None,
         )
         .await
         .map_err(plugin_build_error)

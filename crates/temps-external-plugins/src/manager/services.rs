@@ -15,6 +15,7 @@ use std::time::Instant;
 use sea_orm::EntityTrait;
 use serde::Serialize;
 use tokio::sync::Notify;
+use tracing::error;
 use utoipa::ToSchema;
 
 use super::*;
@@ -254,17 +255,14 @@ impl ExternalPluginManager {
         let name = manifest.name.clone();
         let process = ExternalPluginProcess {
             manifest: manifest.clone(),
-            binary_path: PathBuf::new(),
-            sha256: target.build,
+            build: target.build,
             endpoint: target.endpoint,
             auth_secret,
-            pid_file_path: PathBuf::new(),
-            runtime: PluginRuntime::Service(AttachedService {
+            service: AttachedService {
                 binding,
                 deployment_id: target.deployment_id,
                 generation,
-            }),
-            isolation: IsolationMode::Service,
+            },
             has_ui: hello.has_ui,
             channel: Some(channel),
             openapi_schema,
@@ -298,9 +296,9 @@ impl ExternalPluginManager {
         let taken = || ServiceAttachError::NameTaken {
             name: name.to_string(),
         };
-        match self.plugins.read().await.get(name).map(|p| &p.runtime) {
+        match self.plugins.read().await.get(name).map(|p| &p.service) {
             None => {}
-            Some(PluginRuntime::Service(attached)) if attached.binding == binding => {}
+            Some(attached) if attached.binding == binding => {}
             Some(_) => return Err(taken()),
         }
         let source = PluginGrantService::new(self.db.clone())
@@ -349,10 +347,8 @@ impl ExternalPluginManager {
         let binding = {
             let _attaching = self.services.attach.lock().await;
             let mut plugins = self.plugins.write().await;
-            let binding = match plugins.get(name).map(|process| &process.runtime) {
-                Some(PluginRuntime::Service(attached)) if attached.generation == generation => {
-                    attached.binding
-                }
+            let binding = match plugins.get(name).map(|process| &process.service) {
+                Some(attached) if attached.generation == generation => attached.binding,
                 _ => return,
             };
             let manifest = plugins.remove(name).map(|process| process.manifest.clone());
@@ -531,14 +527,8 @@ impl ExternalPluginManager {
 
     /// The service a plugin runs as, whether or not Temps is attached to it.
     pub async fn service_binding_of(&self, plugin_name: &str) -> Option<ServiceBinding> {
-        if let Some(PluginRuntime::Service(attached)) = self
-            .plugins
-            .read()
-            .await
-            .get(plugin_name)
-            .map(|process| &process.runtime)
-        {
-            return Some(attached.binding);
+        if let Some(process) = self.plugins.read().await.get(plugin_name) {
+            return Some(process.service.binding);
         }
         self.services
             .dormant
@@ -550,14 +540,8 @@ impl ExternalPluginManager {
 
     /// Whether `plugin_name` runs as a service, attached or not.
     pub async fn is_service_plugin(&self, plugin_name: &str) -> bool {
-        matches!(
-            self.plugins
-                .read()
-                .await
-                .get(plugin_name)
-                .map(|process| &process.runtime),
-            Some(PluginRuntime::Service(_))
-        ) || self.services.dormant.read().await.contains_key(plugin_name)
+        self.plugins.read().await.contains_key(plugin_name)
+            || self.services.dormant.read().await.contains_key(plugin_name)
     }
 
     /// Every plugin that runs as a service and how it is doing, by name.
@@ -567,15 +551,12 @@ impl ExternalPluginManager {
             .read()
             .await
             .iter()
-            .filter_map(|(name, process)| match &process.runtime {
-                PluginRuntime::Service(attached) => Some(ServicePluginStatus {
-                    name: name.clone(),
-                    binding: Some(attached.binding),
-                    deployment_id: Some(attached.deployment_id),
-                    state: ServicePluginState::Running,
-                    detail: None,
-                }),
-                _ => None,
+            .map(|(name, process)| ServicePluginStatus {
+                name: name.clone(),
+                binding: Some(process.service.binding),
+                deployment_id: Some(process.service.deployment_id),
+                state: ServicePluginState::Running,
+                detail: None,
             })
             .collect();
         statuses.extend(
@@ -611,15 +592,7 @@ impl ExternalPluginManager {
             .await
             .remove(plugin_name)
             .is_some();
-        let mut plugins = self.plugins.write().await;
-        let attached = matches!(
-            plugins.get(plugin_name).map(|process| &process.runtime),
-            Some(PluginRuntime::Service(_))
-        );
-        if attached {
-            plugins.remove(plugin_name);
-        }
-        drop(plugins);
+        let attached = self.plugins.write().await.remove(plugin_name).is_some();
         self.start_failures.write().await.remove(plugin_name);
         attached || was_dormant
     }
@@ -629,13 +602,12 @@ impl ExternalPluginManager {
     /// stops. `None` for other plugins, and for a manager that is not shared.
     pub(super) async fn service_proxy_for(&self, plugin_name: &str) -> Option<PluginProxy> {
         let this = self.services.this.get()?.clone();
-        let manifest = match self.plugins.read().await.get(plugin_name) {
-            Some(process) if matches!(process.runtime, PluginRuntime::Service(_)) => {
-                Some(process.manifest.clone())
-            }
-            Some(_) => return None,
-            None => None,
-        };
+        let manifest = self
+            .plugins
+            .read()
+            .await
+            .get(plugin_name)
+            .map(|process| process.manifest.clone());
         let manifest = match manifest {
             Some(manifest) => manifest,
             None => self
@@ -674,11 +646,8 @@ impl ExternalPluginManager {
         let (binding, target) = {
             let plugins = self.plugins.read().await;
             let process = plugins.get(plugin_name)?;
-            let PluginRuntime::Service(attached) = &process.runtime else {
-                return None;
-            };
             (
-                attached.binding,
+                process.service.binding,
                 (process.endpoint.clone(), process.auth_secret.clone()),
             )
         };

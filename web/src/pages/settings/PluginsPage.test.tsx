@@ -5,14 +5,14 @@ import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 import { MemoryRouter } from 'react-router'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import type { PluginServicesResponse } from '@/api/client/types.gen'
 
 // `mock.module` lasts for the whole `bun test` process, so every module
 // replaced below is put back after this file: otherwise each test file that
-// runs later gets this file's fake user, plugins and platform features.
+// runs later gets this file's fake user and plugins.
 const MOCKED_MODULES = [
   '@/contexts/AuthContext',
   '@/contexts/BreadcrumbContext',
-  '@/hooks/usePlatformFeatures',
   '@/hooks/usePageTitle',
   '@/hooks/useSensitiveActionVerification',
   '@/hooks/usePlugins',
@@ -25,10 +25,16 @@ afterAll(() => {
   for (const [path, real] of realModules) mock.module(path, () => real)
 })
 
+const RETIRED_REASON =
+  'This plugin was installed as an executable, and plugins now run only as Temps services.'
+
 let role = 'reader'
-let pluginsSupported = true
-let reportingEnabledValues: boolean[] = []
-let sandboxEnabledValues: boolean[] = []
+let servicesEnabledValues: boolean[] = []
+let services: PluginServicesResponse = {
+  configured: true,
+  plugins: [],
+  retired: [],
+}
 
 mock.module('@/contexts/AuthContext', () => ({
   useAuth: () => ({ user: { role } }),
@@ -36,10 +42,6 @@ mock.module('@/contexts/AuthContext', () => ({
 
 mock.module('@/contexts/BreadcrumbContext', () => ({
   useBreadcrumbs: () => ({ setBreadcrumbs: () => undefined }),
-}))
-
-mock.module('@/hooks/usePlatformFeatures', () => ({
-  usePlatformFeatures: () => ({ data: { external_plugins: pluginsSupported } }),
 }))
 
 mock.module('@/hooks/usePageTitle', () => ({
@@ -55,17 +57,16 @@ mock.module('@/hooks/useSensitiveActionVerification', () => ({
 
 mock.module('@/hooks/usePlugins', () => ({
   PLUGINS_QUERY_KEY: ['external-plugins'],
+  PLUGIN_SERVICES_QUERY_KEY: ['external-plugins', 'services'],
   usePlugins: () => ({ data: [], isLoading: false }),
-  usePluginInstallationReporting: (enabled = true) => {
-    reportingEnabledValues.push(enabled)
-    return {
-      data: { enabled: false },
-      isLoading: false,
-      isError: false,
-    }
+  usePluginServices: (enabled = true) => {
+    servicesEnabledValues.push(enabled)
+    return { data: enabled ? services : undefined, isError: false }
   },
-  useSetPluginInstallationReporting: () => ({
+  useAddServicePlugin: () => ({
     isPending: false,
+    isError: false,
+    reset: () => undefined,
     mutateAsync: () => Promise.resolve(),
   }),
   useReloadPlugins: () => ({
@@ -76,19 +77,11 @@ mock.module('@/hooks/usePlugins', () => ({
     isPending: false,
     mutateAsync: () => Promise.resolve(),
   }),
-  usePluginSandbox: (enabled = true) => {
-    sandboxEnabledValues.push(enabled)
-    return { data: undefined, isError: false }
-  },
-  useSetPluginIsolation: () => ({
-    isPending: false,
-    mutateAsync: () => Promise.resolve(),
-  }),
 }))
 
 const { PluginsPage } = await import('./PluginsPage')
 
-function renderPage() {
+function renderPage(path = '/settings/plugins') {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -96,82 +89,95 @@ function renderPage() {
     available: true,
     source:
       'https://raw.githubusercontent.com/gotempsh/plugins/main/registry/catalog.json',
-    platform: 'linux-amd64-gnu',
     plugins: [],
   })
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={[path]}>
         <PluginsPage />
       </MemoryRouter>
     </QueryClientProvider>
   )
 }
 
-describe('PluginsPage management permissions', () => {
-  test('explains durable storage requirements while keeping plugins discoverable', () => {
-    role = 'admin'
-    pluginsSupported = false
-    const markup = renderPage()
-    expect(markup).toContain('Plugins need persistent storage')
-    expect(markup).toContain('Available plugins')
-    expect(markup).toContain('full-profile')
-  })
-
+describe('PluginsPage', () => {
   beforeEach(() => {
-    sandboxEnabledValues = []
-    reportingEnabledValues = []
-    pluginsSupported = true
+    servicesEnabledValues = []
+    services = { configured: true, plugins: [], retired: [] }
   })
 
-  test('lets readers browse the GitHub catalog without management controls', () => {
+  test('readers browse the catalogue without management controls', () => {
     role = 'reader'
 
     const markup = renderPage()
 
-    expect(reportingEnabledValues).toEqual([])
     expect(markup).toContain('Browse')
-    expect(markup).toContain('system administrator')
-    expect(markup).not.toContain('Reload Plugins')
     expect(markup).toContain('Available plugins')
-    expect(markup).not.toContain('Build and install')
-    expect(markup).not.toContain('GitHub repository')
-    expect(markup).not.toContain('Install from file')
-    expect(markup).not.toContain('Share installation counts')
-    // How plugins are isolated is an administrator's view: a reader must not
-    // even ask for it.
-    expect(sandboxEnabledValues.every((enabled) => !enabled)).toBe(true)
-  })
-
-  test('enables the catalog and management controls for system administrators', () => {
-    role = 'admin'
-
-    const markup = renderPage()
-
-    expect(reportingEnabledValues).toEqual([])
+    expect(markup).not.toContain('Add from service</button>')
     expect(markup).not.toContain('Reload plugins')
-    expect(markup).toContain('Available plugins')
-    expect(markup).toContain('Install from GitHub')
-    expect(markup).toContain('Install from file')
-    expect(markup).toContain('aria-selected="true"')
-    expect(markup).not.toContain('Build and install')
-    expect(markup).not.toContain('id="plugin-repo"')
-    expect(markup).not.toContain('Share installation counts')
-    expect(markup).not.toContain('running-plugins-title')
+    // Which services are plugins is an administrator's view: a reader must
+    // not even ask for it.
+    expect(servicesEnabledValues.every((enabled) => !enabled)).toBe(true)
   })
 
-  test('explains when no catalog plugins support the server platform', () => {
+  test('adding a service is the only way an administrator adds a plugin', () => {
     role = 'admin'
 
     const markup = renderPage()
 
+    expect(markup).toContain('Add from service</button>')
+    expect(markup).toContain('Available plugins')
+    expect(markup).toContain('aria-selected="true"')
+    for (const removed of [
+      'Install from file',
+      'Install from GitHub',
+      'Build and install',
+      'Review and install',
+      'Update plugin',
+      'persistent storage',
+      'without a container',
+    ]) {
+      expect(markup).not.toContain(removed)
+    }
+  })
+
+  test('a plugin installed as an executable is explained on every tab until it is removed', () => {
+    role = 'admin'
+    services = {
+      configured: true,
+      plugins: [],
+      retired: [{ name: 'reports', version: '1.2.0', reason: RETIRED_REASON }],
+    }
+
+    for (const path of ['/settings/plugins', '/settings/plugins?tab=running']) {
+      const markup = renderPage(path)
+      expect(markup).toContain('1 plugin no longer runs')
+      expect(markup).toContain('reports v1.2.0:')
+      expect(markup).toContain('plugins now run only as Temps services')
+      expect(markup).toContain('Remove entry')
+    }
+  })
+
+  test('a reader is not shown plugins that no longer run', () => {
+    role = 'reader'
+    services = {
+      configured: true,
+      plugins: [],
+      retired: [{ name: 'reports', reason: RETIRED_REASON }],
+    }
+
+    expect(renderPage()).not.toContain('no longer run')
+  })
+
+  test('the list of added plugins says how to add the first one', () => {
+    role = 'admin'
+
+    const markup = renderPage('/settings/plugins?tab=running')
+
+    expect(markup).toContain('No plugins are added.')
     expect(markup).toContain(
-      'No catalog plugins support this server’s platform yet.'
+      'Deploy a plugin as a service, then add that service here.'
     )
-    expect(markup).toContain(
-      'Compatible plugins will appear here when they are listed.'
-    )
-    expect(markup).not.toContain('No matching plugins.')
-    expect(markup).not.toContain('Review and install')
+    expect(markup).toContain('Reload plugins')
   })
 })

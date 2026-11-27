@@ -5,7 +5,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 # ADR-118: External plugins run in containers
 
-**Status:** Proposed
+**Status:** Superseded — the plugin container, image, limits and isolation setting described here were removed by ADR-119; the reasoning about what a plugin must not reach stands
 **Date:** 2026-11-27
 
 **Superseded in part by:** [ADR-119](./119-a-plugin-is-a-temps-service.md)

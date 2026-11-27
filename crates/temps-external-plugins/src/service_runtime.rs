@@ -398,7 +398,7 @@ fn check_hello(service: &str, hello: &PluginServiceHello) -> Result<(), ServiceA
             found: hello.protocol_version,
         });
     }
-    if crate::install::validate_plugin_name(&hello.manifest.name).is_err() {
+    if !crate::naming::valid_plugin_name(&hello.manifest.name) {
         return Err(ServiceAttachError::InvalidName {
             service: service.to_string(),
             name: hello.manifest.name.clone(),

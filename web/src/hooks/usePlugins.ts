@@ -3,22 +3,12 @@
 
 import {
   addServicePlugin,
-  getPluginInstallationReporting,
-  getPluginSandbox,
   getPluginServices,
   listExternalPlugins,
-  listPluginCatalog,
-  putPluginIsolation,
   reloadPlugins,
-  setPluginInstallationReporting,
   uninstallPlugin,
 } from '@/api/client/sdk.gen'
-import type {
-  AddServicePlugin,
-  PluginCatalogResponse,
-  PluginIsolation,
-  ReloadResponse,
-} from '@/api/client/types.gen'
+import type { AddServicePlugin, ReloadResponse } from '@/api/client/types.gen'
 import type { PluginManifest } from '@/types/plugins'
 import {
   queryOptions,
@@ -28,12 +18,6 @@ import {
 } from '@tanstack/react-query'
 
 export const PLUGINS_QUERY_KEY = ['external-plugins']
-export const PLUGIN_CATALOG_QUERY_KEY = ['external-plugins', 'catalog']
-export const PLUGIN_REPORTING_QUERY_KEY = [
-  'external-plugins',
-  'installation-reporting',
-]
-export const PLUGIN_SANDBOX_QUERY_KEY = ['external-plugins', 'sandbox']
 export const PLUGIN_SERVICES_QUERY_KEY = ['external-plugins', 'services']
 
 /**
@@ -66,75 +50,6 @@ export function useAddServicePlugin() {
 }
 
 /**
- * Whether this server runs plugins in containers, and how each installed
- * plugin is isolated. Administrators only: pass `enabled` from the caller's
- * permission.
- */
-export function usePluginSandbox(enabled = true) {
-  return useQuery({
-    queryKey: PLUGIN_SANDBOX_QUERY_KEY,
-    queryFn: async () => (await getPluginSandbox({ throwOnError: true })).data,
-    enabled,
-    retry: false,
-    refetchOnWindowFocus: 'always',
-  })
-}
-
-/** Move an installed plugin into a container, or out of one, and restart it. */
-export function useSetPluginIsolation() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: async ({
-      name,
-      isolation,
-    }: {
-      name: string
-      isolation: PluginIsolation
-    }) =>
-      (
-        await putPluginIsolation({
-          path: { name },
-          body: { isolation },
-          throwOnError: true,
-        })
-      ).data,
-    // The plugin restarts either way: a failed move returns it to its
-    // previous isolation, so the list and its navigation are refreshed too.
-    onSettled: async () => {
-      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
-    },
-  })
-}
-
-export function usePluginInstallationReporting(enabled = true) {
-  return useQuery({
-    queryKey: PLUGIN_REPORTING_QUERY_KEY,
-    queryFn: async () =>
-      (await getPluginInstallationReporting({ throwOnError: true })).data,
-    enabled,
-    retry: false,
-  })
-}
-
-export function useSetPluginInstallationReporting() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: async (enabled: boolean) =>
-      (
-        await setPluginInstallationReporting({
-          body: { enabled },
-          throwOnError: true,
-        })
-      ).data,
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: PLUGIN_REPORTING_QUERY_KEY,
-      })
-    },
-  })
-}
-
-/**
  * Fetch the list of running external plugin manifests.
  * The endpoint is optional, so startup without a plugin host degrades to an
  * empty list instead of breaking navigation throughout the dashboard.
@@ -158,8 +73,8 @@ export function pluginManifestQueryOptions() {
     queryFn: fetchPluginManifests,
     staleTime: 5 * 60 * 1000,
     gcTime: 10 * 60 * 1000,
-    // CLI installs happen outside this tab. Refresh local manifests when the
-    // user returns to the console, without polling the public registry.
+    // Plugins are also added from the CLI and follow their service's
+    // deployments. Refresh the list when the user returns to the console.
     refetchOnWindowFocus: 'always',
     retry: false,
   })
@@ -169,21 +84,10 @@ export function usePlugins() {
   return useQuery(pluginManifestQueryOptions())
 }
 
-/** Fetch the signed registry catalog exposed by the backend. */
-export function usePluginCatalog(enabled = true) {
-  return useQuery({
-    queryKey: PLUGIN_CATALOG_QUERY_KEY,
-    queryFn: async (): Promise<PluginCatalogResponse> => {
-      const response = await listPluginCatalog({ throwOnError: true })
-      return response.data
-    },
-    staleTime: 5 * 60 * 1000,
-    retry: false,
-    enabled,
-  })
-}
-
-/** Stop and uninstall the selected plugin, retaining its application data. */
+/**
+ * Remove a plugin: revoke its permissions and stop routing to it. The service
+ * it runs as, and the files it stored, are kept.
+ */
 export function useUninstallPlugin() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -200,7 +104,7 @@ export function useUninstallPlugin() {
   })
 }
 
-/** Reload all verified plugin installations from disk. */
+/** Connect again to every plugin's service. */
 export function useReloadPlugins() {
   const queryClient = useQueryClient()
 
@@ -209,17 +113,10 @@ export function useReloadPlugins() {
       const response = await reloadPlugins({ throwOnError: true })
       return response.data
     },
-    // A 502 reload can stop every plugin; refresh navigation even on failure.
+    // Every plugin is connected again, so the list, its navigation and each
+    // plugin's state may have changed, also when the reload failed.
     onSettled: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: PLUGINS_QUERY_KEY,
-        exact: true,
-      })
-      // A reload restarts every plugin, so what each one runs in, and why
-      // one did not start, may have changed.
-      await queryClient.invalidateQueries({
-        queryKey: PLUGIN_SANDBOX_QUERY_KEY,
-      })
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },
   })
 }

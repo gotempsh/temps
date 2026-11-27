@@ -5038,61 +5038,18 @@ Label a visitor with your app's user id, as your backend would (browser identify
 
 ## `plugin`
 
-Create and build TypeScript plugins, or install and manage external plugins
+Create TypeScript plugins, add a deployed service as a plugin and manage its permissions
 
 **Subcommands:**
 
-- `install` - Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
-- `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
-- `install-local` - Upload and activate a trusted native plugin on the configured Temps host
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
-- `services` - List the plugins that run as Temps services and whether each is running
+- `services` - List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason
 - `add-service` - Make a deployed service a plugin; it starts with no permissions
+- `remove` - Remove a plugin and revoke its permissions; its service and the files it stored are kept
 - `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 - `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
 - `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
-
-### `plugin install <repository>`
-
-Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--path <path>` | Plugin subdirectory containing package.json and bun.lock (default: repository root) | - | No |
-| `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | No |
-| `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | No |
-| `-y, --yes` | Trust the repository and allow installation without prompting | - | No |
-| `--grant <permissions...>` | Explicitly approve declared host permissions (default: none); e.g. ai_generate projects_read | - | No |
-| `--ai-daily-calls <count>` | Maximum AI attempts per day (0 pauses usage; default: 100) | - | No |
-| `--ai-max-tokens <count>` | Maximum output tokens per AI call (1–4096; default: 1024) | - | No |
-| `--without-container` | Run the plugin as the Temps account instead of in its own container (only for a plugin that needs the Temps database or data directory) | - | No |
-
-### `plugin update <name>`
-
-Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--ref <ref>` | Use a different branch, tag, or commit | - | No |
-| `-y, --yes` | Trust the update without prompting | - | No |
-
-### `plugin install-local <file>`
-
-Upload and activate a trusted native plugin on the configured Temps host
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--name <name>` | Expected plugin manifest name | - | Yes |
-| `--plugin-version <version>` | Expected plugin manifest version | - | Yes |
-| `-y, --yes` | Approve execution of this file without prompting | - | No |
-| `--without-container` | Run the plugin as the Temps account instead of in its own container (only for a plugin that needs the Temps database or data directory) | - | No |
 
 ### `plugin grants`
 
@@ -5122,7 +5079,7 @@ Replace all host grants; --clear revokes all permissions immediately
 
 ### `plugin services`
 
-List the plugins that run as Temps services and whether each is running
+List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason
 
 ### `plugin add-service`
 
@@ -5134,6 +5091,10 @@ Make a deployed service a plugin; it starts with no permissions
 |------|-------------|---------|----------|
 | `--project <id>` | Id of the service the plugin runs as | - | Yes |
 | `--environment <id>` | Id of the environment whose deployment is the plugin | - | Yes |
+
+### `plugin remove <name>`
+
+Remove a plugin and revoke its permissions; its service and the files it stored are kept
 
 ### `plugin dev [binary] [args...]`
 

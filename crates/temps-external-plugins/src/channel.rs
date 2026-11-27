@@ -56,7 +56,6 @@ pub struct PluginChannel {
     closed: tokio::sync::watch::Receiver<bool>,
     grant_service: PluginGrantService,
     actor_id: String,
-    source_identity: String,
     host_permissions: Vec<PluginHostPermission>,
 }
 
@@ -302,7 +301,6 @@ impl PluginChannel {
             closed,
             grant_service: channel_grants,
             actor_id: channel_actor_id,
-            source_identity,
             host_permissions: channel_permissions,
         })
     }
@@ -311,10 +309,6 @@ impl PluginChannel {
     /// gone: its process exited, or the container of its service stopped.
     pub(crate) fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
         self.closed.clone()
-    }
-
-    pub(crate) fn actor_binding(&self) -> (&str, &str) {
-        (&self.actor_id, &self.source_identity)
     }
 
     /// Push a platform event to the plugin over the channel.
@@ -1336,7 +1330,6 @@ mod tests {
             reader_task: tokio::spawn(async {}),
             grant_service: PluginGrantService::new(db),
             actor_id: "actor".to_string(),
-            source_identity: "sha256:test".to_string(),
             host_permissions: vec![PluginHostPermission::EventsRead],
             closed: tokio::sync::watch::channel(false).1,
         }

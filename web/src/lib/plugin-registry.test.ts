@@ -4,9 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   canManageExternalPlugins,
-  pluginInstallAction,
   pluginReloadFailures,
-  safeRegistryNavigationUrl,
 } from './plugin-registry'
 
 describe('pluginReloadFailures', () => {
@@ -39,36 +37,6 @@ describe('pluginReloadFailures', () => {
       { reason: 'Invalid registry state' },
     ]
     expect(pluginReloadFailures({ failures })).toEqual(failures)
-  })
-})
-
-describe('safeRegistryNavigationUrl', () => {
-  test('accepts absolute HTTP and HTTPS registry metadata', () => {
-    expect(
-      safeRegistryNavigationUrl('https://github.com/gotempsh/plugins')
-    ).toBe('https://github.com/gotempsh/plugins')
-  })
-
-  test('rejects script, data, credential, and relative targets', () => {
-    expect(
-      safeRegistryNavigationUrl('javascript:alert(document.cookie)')
-    ).toBeUndefined()
-    expect(
-      safeRegistryNavigationUrl('data:image/svg+xml,<svg/>')
-    ).toBeUndefined()
-    expect(
-      safeRegistryNavigationUrl('https://token@example.com/plugin')
-    ).toBeUndefined()
-    expect(safeRegistryNavigationUrl('//evil.example/plugin')).toBeUndefined()
-    expect(safeRegistryNavigationUrl('/relative/plugin')).toBeUndefined()
-  })
-})
-
-describe('pluginInstallAction', () => {
-  test('offers installation, recognizes the active release, and permits upgrades', () => {
-    expect(pluginInstallAction(undefined, '1.0.0')).toBe('install')
-    expect(pluginInstallAction('1.0.0', '1.0.0')).toBe('installed')
-    expect(pluginInstallAction('1.0.0', '1.1.0')).toBe('upgrade')
   })
 })
 

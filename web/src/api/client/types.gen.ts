@@ -17008,10 +17008,6 @@ export type FileObject = {
     purpose?: string;
 };
 
-export type FileUpload = {
-    file: Blob | File;
-};
-
 export type FillSecretRequest = {
     /**
      * The credential. Stored encrypted; never returned and never shown to the
@@ -21180,51 +21176,6 @@ export type InsightsResponse = {
     data: Array<Insight>;
 };
 
-export type InstallPluginRequest = {
-    grants?: PluginGrantConfig | null;
-    isolation?: PluginIsolation | null;
-    /**
-     * Validated registry name only. URLs, paths, versions, and hashes are not
-     * accepted from HTTP callers.
-     */
-    name: string;
-};
-
-export type InstallPluginResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    version: string;
-};
-
-export type InstallRepositoryRequest = {
-    grants?: PluginGrantConfig | null;
-    isolation?: PluginIsolation | null;
-    name?: string | null;
-    path?: string | null;
-    progressId?: string | null;
-    ref_name?: string | null;
-    repository_url: string;
-};
-
-export type InstallRepositoryResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    source_commit: string;
-    version: string;
-};
-
-export type InstallationReportingSettings = {
-    /**
-     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
-     * with the official Temps registry after a verified install succeeds.
-     */
-    enabled: boolean;
-};
-
 /**
  * Create a template.
  */
@@ -21610,11 +21561,6 @@ export type IpAccessControlResponse = {
  * How a scope's CIDR list is applied.
  */
 export type IpAccessMode = 'disabled' | 'allow' | 'deny';
-
-/**
- * What actually separates a running plugin from Temps.
- */
-export type IsolationMode = 'container' | 'separate_user' | 'process' | 'service';
 
 /**
  * The issues of a group.
@@ -25557,13 +25503,6 @@ export type NotificationRouteTestResult = {
     severity: string;
 };
 
-export type NpmRelease = {
-    binary_path: string;
-    integrity: string;
-    name: string;
-    version: string;
-};
-
 export type NpsSummary = {
     /**
      * Answers of 0 to 6.
@@ -28148,10 +28087,6 @@ export type PlatformFeatures = {
      */
     docker: boolean;
     /**
-     * External plugin binaries and plugin-owned files may be installed.
-     */
-    external_plugins?: boolean;
-    /**
      * Container images can be built by this process. Requires a local Docker
      * daemon; always `false` when `docker` is `false`.
      */
@@ -28228,12 +28163,6 @@ export type PlatformInfo = {
     platforms: Array<string>;
 };
 
-export type PlatformRelease = {
-    npm?: NpmRelease | null;
-    sha256: string;
-    url: string;
-};
-
 export type PluginActorInfo = {
     active: boolean;
     id: string;
@@ -28269,13 +28198,6 @@ export type PluginAiToolsResponse = {
  */
 export type PluginCapability = 'api_read' | 'api_write';
 
-export type PluginCatalogResponse = {
-    available: boolean;
-    plugins: Array<RegistryPlugin>;
-    reason?: string | null;
-    source: string;
-};
-
 export type PluginGrantConfig = {
     ai_daily_call_limit: number;
     ai_max_output_tokens: number;
@@ -28293,35 +28215,6 @@ export type PluginGrantsResponse = {
  * Host-owned permissions granted to one durable external-plugin actor.
  */
 export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
-
-/**
- * How an administrator asked for one plugin to be isolated. Stored on the
- * plugin's actor row.
- */
-export type PluginIsolation = 'container' | 'process' | 'service';
-
-/**
- * How one installed plugin is separated from Temps.
- */
-export type PluginIsolationResponse = {
-    /**
-     * Whether an administrator can change the isolation of this plugin
-     * here. False when every plugin runs through the plugin launcher.
-     */
-    changeable: boolean;
-    effective?: IsolationMode | null;
-    name: string;
-    requested?: PluginIsolation | null;
-    /**
-     * Whether the running plugin is kept away from Temps' own files,
-     * processes and database.
-     */
-    sandboxed: boolean;
-    /**
-     * Why the plugin did not start, when its last start failed.
-     */
-    start_failure?: string | null;
-};
 
 /**
  * The complete plugin manifest — the handshake contract.
@@ -28434,30 +28327,6 @@ export type PluginManifest = {
 };
 
 /**
- * Whether this server can run plugins in containers, and how each installed
- * plugin is isolated.
- */
-export type PluginSandboxResponse = {
-    /**
-     * Whether a newly installed plugin is confined on this server.
-     */
-    configured: boolean;
-    /**
-     * What confines a newly installed plugin on this server.
-     */
-    mode: IsolationMode;
-    plugins: Array<PluginIsolationResponse>;
-    /**
-     * Why plugins cannot run in containers here, when they cannot.
-     */
-    reason?: string | null;
-    /**
-     * Where the console explains what is missing.
-     */
-    setup_path?: string | null;
-};
-
-/**
  * Whether this server can run plugins as services, and the ones it runs.
  */
 export type PluginServicesResponse = {
@@ -28471,31 +28340,20 @@ export type PluginServicesResponse = {
      */
     reason?: string | null;
     /**
+     * Plugins installed as executables, which no longer run. Each stays
+     * listed, with the reason, until an administrator removes it.
+     */
+    retired: Array<RetiredPluginResponse>;
+    /**
      * Where the console explains what is missing.
      */
     setup_path?: string | null;
-};
-
-export type PluginSourceResponse = {
-    builder_image: string;
-    commit: string;
-    kind: 'github';
-    path?: string | null;
-    ref_name: string;
-    repository_url: string;
-    version: string;
-} | {
-    kind: 'local-file';
-    platform: string;
-    sha256: string;
-    version: string;
 };
 
 export type PluginStatusResponse = {
     configured: boolean;
     reason?: string | null;
     setup_path: string;
-    source?: PluginSourceResponse | null;
 };
 
 /**
@@ -29137,22 +28995,6 @@ export type ProfileResponse = {
     ingress: string;
     ingress_source: string;
 };
-
-export type ProgressSnapshot = {
-    elapsed_ms: number;
-    id: string;
-    stages: Array<ProgressStage>;
-    status: ProgressStatus;
-};
-
-export type ProgressStage = {
-    elapsed_ms: number;
-    message: string;
-    stage: string;
-    status: ProgressStatus;
-};
-
-export type ProgressStatus = 'running' | 'completed' | 'failed';
 
 export type ProjectAccessResponse = {
     created_at: string;
@@ -32049,40 +31891,6 @@ export type RegisterWireguardMeshResponse = {
 };
 
 /**
- * The outer envelope signs the decoded bytes in `payload`. Encoding the
- * payload instead of reserializing a JSON object avoids ambiguous map order,
- * whitespace, and number representations.
- */
-export type RegistryEnvelope = {
-    key_id: string;
-    /**
-     * Standard-base64 encoded JSON [`RegistryDocument`].
-     */
-    payload: string;
-    /**
-     * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
-     */
-    signature: string;
-};
-
-export type RegistryPlugin = {
-    author: string;
-    category: string;
-    description: string;
-    docs_url?: string | null;
-    keywords?: Array<string>;
-    logo_url?: string | null;
-    name: string;
-    platforms: {
-        [key: string]: PlatformRelease;
-    };
-    repository?: string | null;
-    summary: string;
-    title: string;
-    version: string;
-};
-
-/**
  * Response for `POST /projects/{project_id}/github/reinstall-webhook`
  */
 export type ReinstallGithubWebhookResponse = {
@@ -32427,7 +32235,6 @@ export type RepositoryCatalogPlugin = {
 
 export type RepositoryCatalogResponse = {
     available: boolean;
-    platform: string;
     plugins: Array<RepositoryCatalogPlugin>;
     reason?: string | null;
     source: string;
@@ -33315,6 +33122,22 @@ export type RetentionCleanupReport = {
      * Schedule scope, or `None` when every schedule was considered.
      */
     schedule_id?: number | null;
+};
+
+/**
+ * A plugin an earlier version installed as an executable. It does not run:
+ * a plugin runs only as a Temps service.
+ */
+export type RetiredPluginResponse = {
+    name: string;
+    /**
+     * Why it does not run and what to do about it.
+     */
+    reason: string;
+    /**
+     * The version that was installed, when its record still says.
+     */
+    version?: string | null;
 };
 
 /**
@@ -42477,14 +42300,6 @@ export type UpdatePluginAiTools = {
     installation_revision: string;
 };
 
-export type UpdatePluginIsolation = {
-    /**
-     * `container` confines the plugin. `process` runs it as the Temps
-     * account with nothing between it and the control plane.
-     */
-    isolation: PluginIsolation;
-};
-
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
 };
@@ -42780,10 +42595,6 @@ export type UpdatePublicIngressSettingsRequest = {
      * What DNS points at, or `None` for the listen address.
      */
     public_address?: string | null;
-};
-
-export type UpdateRepositoryRequest = {
-    ref_name?: string | null;
 };
 
 export type UpdateRouteRequest = {
@@ -112264,35 +112075,6 @@ export type ListExternalPluginsResponses = {
 
 export type ListExternalPluginsResponse = ListExternalPluginsResponses[keyof ListExternalPluginsResponses];
 
-export type ListPluginCatalogData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/catalog';
-};
-
-export type ListPluginCatalogErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-};
-
-export type ListPluginCatalogError = ListPluginCatalogErrors[keyof ListPluginCatalogErrors];
-
-export type ListPluginCatalogResponses = {
-    /**
-     * Signed plugin catalogue, or an unavailable state when registry trust is not configured
-     */
-    200: PluginCatalogResponse;
-};
-
-export type ListPluginCatalogResponse = ListPluginCatalogResponses[keyof ListPluginCatalogResponses];
-
 export type ListRepositoryPluginCatalogData = {
     body?: never;
     path?: never;
@@ -112305,198 +112087,6 @@ export type ListRepositoryPluginCatalogResponses = {
 };
 
 export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
-
-export type InstallLocalFileData = {
-    body: FileUpload;
-    headers: {
-        /**
-         * Operator approval to execute the file with this SHA-256
-         */
-        'X-Temps-Trust-Sha256': string;
-    };
-    path?: never;
-    query: {
-        name: string;
-        version: string;
-        /**
-         * How a new installation is isolated. Omit it for a container. An
-         * update keeps the isolation of the installed plugin.
-         */
-        isolation?: PluginIsolation;
-    };
-    url: '/x/plugins/install/file';
-};
-
-export type InstallLocalFileErrors = {
-    /**
-     * Invalid plugin identity, digest header or multipart upload
-     */
-    400: unknown;
-    /**
-     * Authentication required
-     */
-    401: unknown;
-    /**
-     * Administrator permission or sensitive-action authorization required
-     */
-    403: unknown;
-    /**
-     * Upload timed out
-     */
-    408: unknown;
-    /**
-     * Persistent storage is required or the existing installation uses a different source
-     */
-    409: unknown;
-    /**
-     * Executable exceeds the upload limit
-     */
-    413: unknown;
-    /**
-     * Additional verification required for this sensitive action
-     */
-    428: unknown;
-    /**
-     * Another file upload is in progress
-     */
-    429: unknown;
-    /**
-     * Could not stage, activate or persist the installation
-     */
-    500: unknown;
-    /**
-     * Plugin verification or startup failed
-     */
-    502: unknown;
-    /**
-     * Plugin actor activation is unavailable or the service is shutting down
-     */
-    503: unknown;
-};
-
-export type InstallLocalFileResponses = {
-    /**
-     * Plugin verified, installed and started
-     */
-    200: InstallPluginResponse;
-};
-
-export type InstallLocalFileResponse = InstallLocalFileResponses[keyof InstallLocalFileResponses];
-
-export type GetRepositoryInstallProgressData = {
-    body?: never;
-    path: {
-        /**
-         * Client-generated installation UUID
-         */
-        id: string;
-    };
-    query?: never;
-    url: '/x/plugins/install/progress/{id}';
-};
-
-export type GetRepositoryInstallProgressErrors = {
-    404: ProblemDetails;
-};
-
-export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
-
-export type GetRepositoryInstallProgressResponses = {
-    200: ProgressSnapshot;
-};
-
-export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
-
-export type InstallRepositoryData = {
-    body: InstallRepositoryRequest;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/install/repository';
-};
-
-export type InstallRepositoryErrors = {
-    /**
-     * Invalid repository source
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Plugin source conflict
-     */
-    409: ProblemDetails;
-    /**
-     * Request body exceeds configured limit
-     */
-    413: ProblemDetails;
-    /**
-     * Request content type is not application/json
-     */
-    415: ProblemDetails;
-    /**
-     * Request JSON does not match install schema
-     */
-    422: ProblemDetails;
-    /**
-     * Recent sensitive-action verification required
-     */
-    428: ProblemDetails;
-    /**
-     * Local plugin installation failed
-     */
-    500: ProblemDetails;
-    /**
-     * Repository, build, or startup failed
-     */
-    502: ProblemDetails;
-    /**
-     * Plugin service or security audit unavailable
-     */
-    503: ProblemDetails;
-};
-
-export type InstallRepositoryError = InstallRepositoryErrors[keyof InstallRepositoryErrors];
-
-export type InstallRepositoryResponses = {
-    /**
-     * Repository commit built, verified, and activated
-     */
-    200: InstallRepositoryResponse;
-};
-
-export type InstallRepositoryResponse2 = InstallRepositoryResponses[keyof InstallRepositoryResponses];
-
-export type GetPluginInstallationReportingData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/installation-reporting';
-};
-
-export type GetPluginInstallationReportingResponses = {
-    200: InstallationReportingSettings;
-};
-
-export type GetPluginInstallationReportingResponse = GetPluginInstallationReportingResponses[keyof GetPluginInstallationReportingResponses];
-
-export type SetPluginInstallationReportingData = {
-    body: InstallationReportingSettings;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/installation-reporting';
-};
-
-export type SetPluginInstallationReportingResponses = {
-    200: InstallationReportingSettings;
-};
-
-export type SetPluginInstallationReportingResponse = SetPluginInstallationReportingResponses[keyof SetPluginInstallationReportingResponses];
 
 export type ReloadPluginsData = {
     body?: never;
@@ -112534,39 +112124,6 @@ export type ReloadPluginsResponses = {
 };
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
-
-export type GetPluginSandboxData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/sandbox';
-};
-
-export type GetPluginSandboxErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Stored plugin isolation could not be read
-     */
-    503: ProblemDetails;
-};
-
-export type GetPluginSandboxError = GetPluginSandboxErrors[keyof GetPluginSandboxErrors];
-
-export type GetPluginSandboxResponses = {
-    /**
-     * Plugin isolation on this server
-     */
-    200: PluginSandboxResponse;
-};
-
-export type GetPluginSandboxResponse = GetPluginSandboxResponses[keyof GetPluginSandboxResponses];
 
 export type GetPluginServicesData = {
     body?: never;
@@ -112754,112 +112311,6 @@ export type PutPluginGrantsResponses = {
 
 export type PutPluginGrantsResponse = PutPluginGrantsResponses[keyof PutPluginGrantsResponses];
 
-export type GetPluginIsolationData = {
-    body?: never;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/isolation';
-};
-
-export type GetPluginIsolationErrors = {
-    /**
-     * Invalid plugin name
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Stored plugin isolation could not be read
-     */
-    503: ProblemDetails;
-};
-
-export type GetPluginIsolationError = GetPluginIsolationErrors[keyof GetPluginIsolationErrors];
-
-export type GetPluginIsolationResponses = {
-    /**
-     * Isolation of the plugin
-     */
-    200: PluginIsolationResponse;
-};
-
-export type GetPluginIsolationResponse = GetPluginIsolationResponses[keyof GetPluginIsolationResponses];
-
-export type PutPluginIsolationData = {
-    body: UpdatePluginIsolation;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/isolation';
-};
-
-export type PutPluginIsolationErrors = {
-    /**
-     * Invalid plugin name or request body
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * No active installation
-     */
-    404: ProblemDetails;
-    /**
-     * This server cannot run plugins in containers, the plugin asks for access a container is not given, or isolation is managed by the plugin launcher
-     */
-    409: ProblemDetails;
-    /**
-     * Request body is not JSON
-     */
-    415: ProblemDetails;
-    /**
-     * Unknown isolation
-     */
-    422: ProblemDetails;
-    /**
-     * Recent sensitive-action verification required
-     */
-    428: ProblemDetails;
-    /**
-     * The plugin container could not be prepared
-     */
-    500: ProblemDetails;
-    /**
-     * The plugin did not start with the new isolation and was returned to the previous one
-     */
-    502: ProblemDetails;
-    /**
-     * Audit, database or plugin service unavailable
-     */
-    503: ProblemDetails;
-};
-
-export type PutPluginIsolationError = PutPluginIsolationErrors[keyof PutPluginIsolationErrors];
-
-export type PutPluginIsolationResponses = {
-    /**
-     * Plugin restarted with the requested isolation
-     */
-    200: PluginIsolationResponse;
-};
-
-export type PutPluginIsolationResponse = PutPluginIsolationResponses[keyof PutPluginIsolationResponses];
-
 export type GetPluginStatusData = {
     body?: never;
     path: {
@@ -112888,7 +112339,7 @@ export type GetPluginStatusError = GetPluginStatusErrors[keyof GetPluginStatusEr
 
 export type GetPluginStatusResponses = {
     /**
-     * Verified active plugin status
+     * Whether Temps is connected to the plugin
      */
     200: PluginStatusResponse;
 };
@@ -112918,7 +112369,7 @@ export type UninstallPluginErrors = {
      */
     403: ProblemDetails;
     /**
-     * No active installation
+     * No plugin with this name
      */
     404: ProblemDetails;
     /**
@@ -112926,7 +112377,7 @@ export type UninstallPluginErrors = {
      */
     428: ProblemDetails;
     /**
-     * Local deactivation failed
+     * The plugin could not be removed
      */
     500: ProblemDetails;
     /**
@@ -112939,43 +112390,12 @@ export type UninstallPluginError = UninstallPluginErrors[keyof UninstallPluginEr
 
 export type UninstallPluginResponses = {
     /**
-     * Plugin deactivated; data and releases preserved
+     * Plugin removed; its service or stored files are kept
      */
     200: UninstallPluginResponse;
 };
 
 export type UninstallPluginResponse2 = UninstallPluginResponses[keyof UninstallPluginResponses];
-
-export type UpdateRepositoryData = {
-    body: UpdateRepositoryRequest;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/x/plugins/{name}/update';
-};
-
-export type UpdateRepositoryErrors = {
-    /**
-     * No repository-backed active plugin
-     */
-    404: ProblemDetails;
-    /**
-     * Build or startup failed; previous plugin preserved
-     */
-    502: ProblemDetails;
-};
-
-export type UpdateRepositoryError = UpdateRepositoryErrors[keyof UpdateRepositoryErrors];
-
-export type UpdateRepositoryResponses = {
-    /**
-     * Repository plugin explicitly updated to a new pinned commit
-     */
-    200: InstallRepositoryResponse;
-};
-
-export type UpdateRepositoryResponse = UpdateRepositoryResponses[keyof UpdateRepositoryResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

@@ -21,3 +21,8 @@ export function filterRepositoryCatalog(
       ].some((value) => value.toLowerCase().includes(needle))
   )
 }
+
+/** Where the new-service flow opens with a public repository filled in. */
+export function deployPluginPath(repository: string): string {
+  return `/projects/new?source=git-url&repo=${encodeURIComponent(repository)}`
+}

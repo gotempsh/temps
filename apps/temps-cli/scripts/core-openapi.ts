@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /** Preserve the core plugin management contracts alongside the core API. */
-const CORE_PLUGIN_PATHS = new Set(['/x/plugins/{name}/ai-tools', '/x/plugins/install/file'])
+const CORE_PLUGIN_PATHS = new Set(['/x/plugins/{name}/ai-tools'])
 
 /** Plugin APIs and legacy management bindings are excluded from the CLI SDK. */
 export function isPluginPath(path: string): boolean {

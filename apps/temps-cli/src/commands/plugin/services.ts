@@ -3,7 +3,7 @@
 import type { Command } from "commander";
 import { requireAuth } from "../../config/store.js";
 import { client, setupClient, getErrorMessage } from "../../lib/api-client.js";
-import { PluginInstallError } from "./install.js";
+import { PluginCommandError, pluginName } from "./grants.js";
 
 // Plugin APIs intentionally use local interfaces, outside the canonical core SDK.
 interface ServicePlugin {
@@ -19,11 +19,23 @@ interface ServicePlugin {
   deployment_id?: number | null;
 }
 
+/** A plugin an earlier version installed as an executable; it never runs. */
+interface RetiredPlugin {
+  name: string;
+  version?: string | null;
+  reason: string;
+}
+
 interface PluginServicesResponse {
   configured: boolean;
   reason?: string | null;
   setup_path?: string | null;
   plugins: ServicePlugin[];
+  retired: RetiredPlugin[];
+}
+
+interface RemovedPlugin {
+  message: string;
 }
 
 interface AddedServicePlugin {
@@ -37,7 +49,7 @@ interface AddedServicePlugin {
 /** A positive integer id given on the command line. */
 export function serviceId(value: string | undefined, what: string): number {
   if (value === undefined || !/^[1-9][0-9]{0,9}$/.test(value))
-    throw new PluginInstallError(
+    throw new PluginCommandError(
       `Enter the numeric id of the ${what}, as shown by "temps projects list" and "temps environments list".`,
     );
   return Number(value);
@@ -47,7 +59,7 @@ export function registerPluginServiceCommands(plugin: Command) {
   plugin
     .command("services")
     .description(
-      "List the plugins that run as Temps services and whether each is running",
+      "List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason",
     )
     .action(async () => {
       await requireAuth();
@@ -63,7 +75,7 @@ export function registerPluginServiceCommands(plugin: Command) {
         });
         console.log(JSON.stringify(result.data, null, 2));
       } catch (error) {
-        throw new PluginInstallError(getErrorMessage(error));
+        throw new PluginCommandError(getErrorMessage(error));
       }
     });
   plugin
@@ -96,7 +108,26 @@ export function registerPluginServiceCommands(plugin: Command) {
         });
         console.log(JSON.stringify(result.data, null, 2));
       } catch (error) {
-        throw new PluginInstallError(getErrorMessage(error));
+        throw new PluginCommandError(getErrorMessage(error));
+      }
+    });
+  plugin
+    .command("remove <name>")
+    .description(
+      "Remove a plugin and revoke its permissions; its service and the files it stored are kept",
+    )
+    .action(async (name: string) => {
+      pluginName(name);
+      await requireAuth();
+      await setupClient();
+      try {
+        const result = await client.post<{ 200: RemovedPlugin }, unknown, true>({
+          url: `/x/plugins/${name}/uninstall`,
+          throwOnError: true,
+        });
+        console.log(result.data.message);
+      } catch (error) {
+        throw new PluginCommandError(getErrorMessage(error));
       }
     });
 }

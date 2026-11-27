@@ -8,15 +8,15 @@ import { resolve, join } from "node:path";
 import { promptConfirm } from "../../ui/prompts.js";
 import { TARGETS, validName, PluginPublishError } from "./model.js";
 import { buildPlugin, loadConfig, publishPlugin } from "./workflow.js";
-import { registerPluginInstallCommands } from "./install.js";
 import { registerPluginGrantCommands } from "./grants.js";
 import { registerPluginServiceCommands } from "./services.js";
 
 export function registerPluginCommands(program: Command) {
   const plugin = program
     .command("plugin")
-    .description("Create and build TypeScript plugins, or install and manage external plugins");
-  registerPluginInstallCommands(plugin);
+    .description(
+      "Create TypeScript plugins, add a deployed service as a plugin and manage its permissions",
+    );
   registerPluginGrantCommands(plugin);
   registerPluginServiceCommands(plugin);
   registerPluginDevCommands(plugin);

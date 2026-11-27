@@ -12,12 +12,12 @@ import {
 } from './primary-navigation'
 
 describe('plugin management route', () => {
-  test('covers the list and the install page', () => {
+  test('covers the list and the pages under it', () => {
     expect(isPluginsManagementRoute(PLUGINS_MANAGEMENT_URL)).toBe(true)
     expect(isPluginsManagementRoute('/settings/plugins/install')).toBe(true)
   })
 
-  test('is not the pages an installed plugin adds', () => {
+  test('is not the pages a plugin adds', () => {
     expect(isPluginsManagementRoute('/plugins/some-plugin')).toBe(false)
     expect(isPluginsManagementRoute('/plugins/some-plugin/settings')).toBe(
       false

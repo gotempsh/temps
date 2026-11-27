@@ -29,7 +29,13 @@ import {
 } from '@tanstack/react-query'
 import { getCurrentUserOptions } from '@/api/client/@tanstack/react-query.gen'
 import { lazy, Suspense, useEffect, type ReactNode } from 'react'
-import { BrowserRouter, Route, Routes, useLocation } from 'react-router'
+import {
+  BrowserRouter,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+} from 'react-router'
 import { toast, Toaster } from 'sonner'
 import { gitProviderSetupPath, problemSetupPath } from '@/lib/api-problem'
 import { useScrollToLinkedSection } from '@/hooks/useOpenSectionFromHash'
@@ -484,11 +490,6 @@ const CreateOidcProviderPage = lazy(() =>
 const OidcProviderDetailPage = lazy(() =>
   import('./pages/settings/OidcProviderDetailPage').then((m) => ({
     default: m.OidcProviderDetailPage,
-  }))
-)
-const PluginInstallPage = lazy(() =>
-  import('./pages/settings/PluginInstallPage').then((m) => ({
-    default: m.PluginInstallPage,
   }))
 )
 const PluginsPage = lazy(() =>
@@ -1083,7 +1084,9 @@ const FullAppRoutes = () => {
                           <Route path="plugins" element={<PluginsPage />} />
                           <Route
                             path="plugins/install"
-                            element={<PluginInstallPage />}
+                            element={
+                              <Navigate to="/settings/plugins" replace />
+                            }
                           />
                           <Route
                             path="otel-pipeline"

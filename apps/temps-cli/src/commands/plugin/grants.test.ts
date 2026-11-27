@@ -3,7 +3,44 @@
 import { expect, spyOn, test } from "bun:test";
 import { Command } from "commander";
 import { config, credentials } from "../../config/store.js";
-import { grantReplacement, registerPluginGrantCommands } from "./grants.js";
+import {
+  grantReplacement,
+  pluginName,
+  registerPluginGrantCommands,
+  requestedGrants,
+} from "./grants.js";
+
+test("host permissions require explicit flags and preserve zero daily calls", () => {
+  expect(requestedGrants({})).toBeUndefined();
+  expect(
+    requestedGrants({
+      grant: ["ai_generate", "ai_generate"],
+      aiDailyCalls: "0",
+      aiMaxTokens: "512",
+    }),
+  ).toEqual({
+    permissions: ["ai_generate"],
+    ai_daily_call_limit: 0,
+    ai_max_output_tokens: 512,
+  });
+});
+test.each([
+  { grant: ["system_admin"] },
+  { aiDailyCalls: "100" },
+  { grant: ["ai_generate"], aiDailyCalls: "-1" },
+  { grant: ["ai_generate"], aiDailyCalls: "1.5" },
+  { grant: ["ai_generate"], aiDailyCalls: "10001" },
+  { grant: ["ai_generate"], aiMaxTokens: "0" },
+  { grant: ["ai_generate"], aiMaxTokens: "4097" },
+])("rejects invalid or implicit AI grants %j", (options) => {
+  expect(() => requestedGrants(options)).toThrow();
+});
+test("a plugin name that could change the request path is refused", () => {
+  expect(pluginName("reports")).toBe("reports");
+  for (const name of ["", "Reports", "../reload", "a/b", "-reports", "a".repeat(65)])
+    expect(() => pluginName(name)).toThrow(/plugin name/);
+});
+
 
 test("explicit clear revokes all permissions and disables AI quota", () => {
   expect(grantReplacement({ clear: true })).toEqual({

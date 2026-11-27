@@ -8,7 +8,6 @@ import type {
   PluginServicesResponse,
   ServicePluginResponse,
 } from '../../api/client/types.gen'
-import { isolationSummary } from '../../lib/plugin-isolation'
 import {
   addServiceFailure,
   servicePluginPath,
@@ -17,6 +16,7 @@ import {
 } from '../../lib/plugin-services'
 import {
   EnvironmentChoice,
+  RetiredPluginNotice,
   ServicePluginNotice,
   ServicePluginOrigin,
   ServicePluginStatus,
@@ -41,6 +41,7 @@ const services = (
 ): PluginServicesResponse => ({
   configured: true,
   plugins: [],
+  retired: [],
   ...overrides,
 })
 
@@ -219,9 +220,45 @@ test("a refusal shows the server's reason", () => {
   )
 })
 
-test('a plugin that runs as a service counts as contained', () => {
-  expect(isolationSummary('service')).toMatchObject({
-    tone: 'ok',
-    label: 'Runs as a service',
-  })
+const RETIRED_REASON =
+  'This plugin was installed as an executable, and plugins now run only as Temps services.'
+
+test('a plugin installed as an executable is listed with the reason and a way to remove it', () => {
+  const markup = render(
+    <RetiredPluginNotice
+      retired={[
+        { name: 'reports', version: '1.2.0', reason: RETIRED_REASON },
+        { name: 'audit-export', reason: RETIRED_REASON },
+      ]}
+      onRemove={() => {}}
+    />
+  )
+  expect(markup).toContain('2 plugins no longer run')
+  expect(markup).toContain('reports v1.2.0:')
+  // An entry whose version could not be read is still listed.
+  expect(markup).toContain('audit-export:')
+  expect(markup).toContain('plugins now run only as Temps services')
+  expect(markup.match(/Remove entry/g)).toHaveLength(2)
+  expect(markup).not.toContain(' disabled=""')
+})
+
+test('the removal is not offered while another change is in flight', () => {
+  const markup = render(
+    <RetiredPluginNotice
+      retired={[{ name: 'reports', reason: RETIRED_REASON }]}
+      disabled
+      onRemove={() => {}}
+    />
+  )
+  expect(markup).toContain('1 plugin no longer runs')
+  expect(markup).toContain(' disabled=""')
+})
+
+test('nothing is shown when no plugin was installed as an executable', () => {
+  expect(render(<RetiredPluginNotice retired={[]} onRemove={() => {}} />)).toBe(
+    ''
+  )
+  expect(
+    render(<RetiredPluginNotice retired={undefined} onRemove={() => {}} />)
+  ).toBe('')
 })

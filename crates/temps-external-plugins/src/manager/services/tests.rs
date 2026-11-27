@@ -213,7 +213,7 @@ impl Platform {
     }
 
     pub(crate) fn config(&self) -> ExternalPluginConfig {
-        ExternalPluginConfig::new(self.root.path().into(), "postgres://localhost/test".into())
+        ExternalPluginConfig::new(self.root.path().into())
     }
 
     pub(crate) fn runtime(&self) -> ServiceRuntime {

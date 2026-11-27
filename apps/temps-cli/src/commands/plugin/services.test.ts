@@ -11,13 +11,18 @@ test("a service or environment is named by a positive numeric id", () => {
     expect(() => serviceId(value, "service")).toThrow(/numeric id/);
 });
 
-test("listing and adding service plugins are discoverable CLI commands", () => {
+test("listing, adding and removing plugins are discoverable CLI commands", () => {
   const command = new Command("plugin");
   registerPluginServiceCommands(command);
   expect(command.commands.map((c) => c.name())).toEqual([
     "services",
     "add-service",
+    "remove",
   ]);
+  expect(command.commands[0]?.description()).toContain("no longer run");
+  expect(command.commands[2]?.description()).toContain(
+    "the files it stored are kept",
+  );
   const help = command.commands[1]?.helpInformation() ?? "";
   expect(help).toContain("--project <id>");
   expect(help).toContain("--environment <id>");
@@ -56,7 +61,7 @@ test("service plugin commands use the shared authenticated client", async () => 
           },
           { status: 201 },
         )
-      : Response.json({ configured: true, plugins: [] });
+      : Response.json({ configured: true, plugins: [], retired: [] });
   }) as typeof globalThis.fetch);
   const log = spyOn(console, "log").mockImplementation(() => {});
   try {
@@ -116,6 +121,89 @@ test("a refusal reports the server's reason and an invalid id never calls the se
         { from: "user" },
       ),
     ).rejects.toThrow(/is not a plugin/);
+    expect(calls).toBe(1);
+  } finally {
+    fetch.mockRestore();
+    apiUrl.mockRestore();
+    apiKey.mockRestore();
+  }
+});
+
+test("a plugin that no longer runs is listed with the reason and can be removed", async () => {
+  const apiKey = spyOn(credentials, "getApiKey").mockResolvedValue("test-key");
+  const apiUrl = spyOn(config, "get").mockImplementation(
+    () => "https://temps.invalid" as never,
+  );
+  const reason =
+    "This plugin was installed as an executable, and plugins now run only as Temps services.";
+  const requests: Array<[string, string]> = [];
+  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (
+    input,
+    init,
+  ) => {
+    const request = new Request(input, init);
+    requests.push([request.method, request.url]);
+    return request.method === "POST"
+      ? Response.json({
+          name: "reports",
+          message:
+            "Plugin 'reports' was removed; its service and the files it stored were kept",
+        })
+      : Response.json({
+          configured: true,
+          plugins: [],
+          retired: [{ name: "reports", version: "1.2.0", reason }],
+        });
+  }) as typeof globalThis.fetch);
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    const command = new Command("plugin");
+    registerPluginServiceCommands(command);
+    await command.parseAsync(["services"], { from: "user" });
+    expect(log.mock.calls.at(-1)?.[0]).toContain(reason);
+    expect(log.mock.calls.at(-1)?.[0]).toContain('"version": "1.2.0"');
+
+    await command.parseAsync(["remove", "reports"], { from: "user" });
+    expect(requests).toEqual([
+      ["GET", "https://temps.invalid/api/x/plugins/services"],
+      ["POST", "https://temps.invalid/api/x/plugins/reports/uninstall"],
+    ]);
+    expect(log.mock.calls.at(-1)?.[0]).toContain("the files it stored were kept");
+  } finally {
+    log.mockRestore();
+    fetch.mockRestore();
+    apiUrl.mockRestore();
+    apiKey.mockRestore();
+  }
+});
+
+test("removing a plugin reports a refusal and never sends an unsafe name", async () => {
+  const apiKey = spyOn(credentials, "getApiKey").mockResolvedValue("test-key");
+  const apiUrl = spyOn(config, "get").mockImplementation(
+    () => "https://temps.invalid" as never,
+  );
+  let calls = 0;
+  const fetch = spyOn(globalThis, "fetch").mockImplementation((async () => {
+    calls += 1;
+    return new Response(
+      JSON.stringify({
+        title: "Plugin Not Installed",
+        detail: "Plugin 'reports' is not installed",
+      }),
+      { status: 404, headers: { "content-type": "application/problem+json" } },
+    );
+  }) as unknown as typeof globalThis.fetch);
+  try {
+    const command = new Command("plugin");
+    command.exitOverride();
+    registerPluginServiceCommands(command);
+    await expect(
+      command.parseAsync(["remove", "../reload"], { from: "user" }),
+    ).rejects.toThrow(/plugin name/);
+    expect(calls).toBe(0);
+    await expect(
+      command.parseAsync(["remove", "reports"], { from: "user" }),
+    ).rejects.toThrow(/is not installed/);
     expect(calls).toBe(1);
   } finally {
     fetch.mockRestore();

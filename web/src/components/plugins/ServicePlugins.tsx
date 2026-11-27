@@ -9,6 +9,7 @@ import type {
   EnvironmentResponse,
   PluginServicesResponse,
   ProjectResponse,
+  RetiredPluginResponse,
   ServicePluginResponse,
 } from '@/api/client/types.gen'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
@@ -174,6 +175,61 @@ function ServicePluginProblem({
         </Button>
       </span>
     </li>
+  )
+}
+
+/**
+ * Plugins an earlier version of Temps installed as executables. Temps no
+ * longer starts them: each is listed with the reason and what to do until an
+ * administrator removes it, so a plugin that stopped working after an upgrade
+ * never just disappears.
+ */
+export function RetiredPluginNotice({
+  retired,
+  disabled,
+  onRemove,
+}: {
+  retired: RetiredPluginResponse[] | undefined
+  disabled?: boolean
+  onRemove: (name: string) => void
+}) {
+  if (!retired || retired.length === 0) return null
+  return (
+    <Alert variant="destructive">
+      <AlertCircle className="size-4" />
+      <AlertTitle>
+        {retired.length === 1
+          ? '1 plugin no longer runs'
+          : `${retired.length} plugins no longer run`}
+      </AlertTitle>
+      <AlertDescription>
+        <ul className="space-y-2">
+          {retired.map((plugin) => (
+            <li
+              key={plugin.name}
+              className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between"
+            >
+              <span className="min-w-0 [overflow-wrap:anywhere]">
+                <strong>
+                  {plugin.name}
+                  {plugin.version ? ` v${plugin.version}` : ''}:
+                </strong>{' '}
+                {plugin.reason}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                disabled={disabled}
+                onClick={() => onRemove(plugin.name)}
+              >
+                Remove entry
+              </Button>
+            </li>
+          ))}
+        </ul>
+      </AlertDescription>
+    </Alert>
   )
 }
 

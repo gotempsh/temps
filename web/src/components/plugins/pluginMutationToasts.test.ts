@@ -5,14 +5,13 @@ import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-// Plugin mutations (install, update, permissions, reload, uninstall) carry no
+// Plugin mutations (add, permissions, reload, remove) carry no
 // `onError` of their own, so the app-wide default in App.tsx already toasts
 // "<problem title>" + "<problem detail>" when they fail. A second
 // `toast.error` in the call site's catch block showed the failure twice
 // (title-only and title+detail). Failures must be reported in one place.
 const SOURCES = [
-  'RepositoryInstall.tsx',
-  'RepositoryUpdate.tsx',
+  'ServicePlugins.tsx',
   'PluginPermissionsDialog.tsx',
   '../../pages/settings/PluginsPage.tsx',
 ]
