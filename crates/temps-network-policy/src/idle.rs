@@ -648,10 +648,11 @@ mod tests {
         assert_eq!(snapshot.remote.addresses(&sandbox).count(), 1);
     }
 
-    /// Node 0 reads its mode and the revision in one query, and its
-    /// `off` snapshot comes from the cache: a steady pass is one query.
+    /// Node 0 reads its mode and the revision in one query, and in `off`
+    /// it takes no snapshot at all (nothing reads what it would observe):
+    /// a steady pass is one query and no clone.
     #[tokio::test]
-    async fn node_zero_in_legacy_takes_its_snapshot_from_the_cache() {
+    async fn node_zero_in_off_takes_no_snapshot() {
         use temps_workload_netpol::PolicySource;
         let Some((db, _)) = fixture().await else {
             return;
@@ -659,10 +660,10 @@ mod tests {
         let (service, queries) = counted(&db).await;
         let source = crate::source::DbPolicySource::new(Arc::new(service), CONTROL_PLANE_NODE_ID);
         assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
-        assert!(source.off_snapshot().await.unwrap().is_some());
+        assert!(source.off_snapshot().await.unwrap().is_none());
         queries.store(0, Ordering::Relaxed);
         assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
-        assert!(source.off_snapshot().await.unwrap().is_some());
+        assert!(source.off_snapshot().await.unwrap().is_none());
         assert_eq!(
             queries.load(Ordering::Relaxed),
             1,

@@ -546,8 +546,13 @@ async fn wire_egress_recording(context: &PluginContext) {
     let sidecars: Option<Arc<dyn SidecarRefresh>> = context
         .get_service::<StandaloneSandboxRegistry>()
         .map(|registry| registry as Arc<dyn SidecarRefresh>);
-    let traffic = Arc::new(SandboxTraffic::new(db, docker, sidecars));
     let recorder = context.require_service::<temps_workload_egress::local::LocalEgressRecorder>();
+    let traffic = Arc::new(SandboxTraffic::new(
+        db,
+        docker,
+        recorder.installation(),
+        sidecars,
+    ));
     adapter.set_local(LocalSteering {
         recorder: Arc::downgrade(&recorder),
         traffic: traffic.clone(),

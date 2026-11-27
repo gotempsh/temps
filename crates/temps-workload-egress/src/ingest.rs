@@ -45,9 +45,45 @@ pub struct EgressIngestOutcome {
     /// Records dropped because their project's telemetry storage quota is
     /// used up, as its own OTLP logs are refused then.
     pub over_quota: u64,
+    /// Records dropped because their project's quota could not be checked:
+    /// a failed check never stores past a quota that may be used up.
+    pub quota_unchecked: u64,
+}
+
+/// A project's telemetry quota, as checked for one batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quota {
+    Admits,
+    Exceeded,
+    /// The check failed: treated as exceeded, counted apart.
+    Unchecked,
 }
 
 impl EgressRecordingService {
+    /// A slot of the telemetry ingest limit for a batch from `node_id`,
+    /// taken before its body is read. None when there is no limit (or no
+    /// store: [`Self::ingest`] then says so).
+    pub fn try_acquire_ingest_permit(
+        &self,
+        node_id: i32,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, EgressRecordingError> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
+        store
+            .try_acquire_ingest_permit()
+            .map_err(|error| match error {
+                temps_otel::OtelError::IngestSaturated { limit } => {
+                    EgressRecordingError::IngestSaturated { node_id, limit }
+                }
+                source => EgressRecordingError::Store {
+                    node_id,
+                    records: 0,
+                    source,
+                },
+            })
+    }
+
     /// Checks `headers` carry `node_id`'s token and the node is active, the
     /// same check every node endpoint makes. The error is the status and
     /// detail to answer with.
@@ -184,27 +220,47 @@ impl EgressRecordingService {
         // A project whose telemetry quota is used up stores no more of
         // these, as it stores no more of its own logs. One (cached) check
         // per project in the batch; a workload without a project has none.
-        let mut admitted: HashMap<i32, bool> = HashMap::new();
+        let mut admitted: HashMap<i32, Quota> = HashMap::new();
         for project_id in logs.iter().filter_map(|log| log.project_id) {
             if admitted.contains_key(&project_id) {
                 continue;
             }
-            let admits = match store.admits(project_id).await {
-                Ok(admits) => admits,
+            let quota = match store.admits(project_id).await {
+                Ok(true) => Quota::Admits,
+                Ok(false) => Quota::Exceeded,
                 Err(error) => {
-                    // Degrade to storing: a failed check never loses records.
-                    tracing::warn!(node_id, project_id, %error, "egress recording: could not check the project's telemetry quota; storing");
-                    true
+                    // Fail closed: storing could go past a quota that is
+                    // used up, so the project's records are dropped and
+                    // counted, as when it is over its quota.
+                    tracing::warn!(
+                        node_id,
+                        project_id,
+                        %error,
+                        "egress recording: could not check the project's telemetry quota; \
+                         its records in this batch are dropped"
+                    );
+                    Quota::Unchecked
                 }
             };
-            admitted.insert(project_id, admits);
+            admitted.insert(project_id, quota);
         }
-        let before = logs.len();
         logs.retain(|log| {
-            log.project_id
-                .is_none_or(|project_id| admitted.get(&project_id).copied().unwrap_or(true))
+            let quota = log
+                .project_id
+                .and_then(|project_id| admitted.get(&project_id).copied())
+                .unwrap_or(Quota::Admits);
+            match quota {
+                Quota::Admits => true,
+                Quota::Exceeded => {
+                    outcome.over_quota += 1;
+                    false
+                }
+                Quota::Unchecked => {
+                    outcome.quota_unchecked += 1;
+                    false
+                }
+            }
         });
-        outcome.over_quota = (before - logs.len()) as u64;
         if outcome.over_quota > 0 {
             tracing::warn!(
                 node_id,

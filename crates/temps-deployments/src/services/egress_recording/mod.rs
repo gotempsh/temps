@@ -18,7 +18,7 @@
 //! - **who may see and change it** ([`EnvironmentEgress`]): whoever may
 //!   read or write the project's environments, which the handlers check;
 //! - **how its traffic reaches the recorder on this host** ([`traffic`]):
-//!   its containers are started with the recorder as their HTTP(S) proxy
+//!   its containers are started with the recorder as their HTTPS proxy
 //!   (`temps_workload_egress::steering`), so it applies to containers
 //!   started after it is turned on.
 
@@ -34,7 +34,8 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter, QuerySelect, RelationTrait,
+    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, PaginatorTrait, QueryFilter,
+    QuerySelect, RelationTrait,
 };
 use temps_entities::environment_workload_isolation::{self, EnvironmentWorkloadIsolation};
 use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
@@ -84,7 +85,7 @@ pub enum RecordedEgress {
     /// deployments: the replicas start unrecorded, and the log says so.
     NotServing,
     /// Local replicas start with the recorder at this address as their
-    /// HTTP(S) proxy, labelled as steered by this installation.
+    /// HTTPS proxy, labelled as steered by this installation.
     Proxy(SocketAddr, InstallationId),
 }
 
@@ -337,16 +338,40 @@ impl WorkloadEgressAdapter for EnvironmentEgressAdapter {
             noun: NOUN,
             id: workload.id.to_string(),
         })?;
+        // Only a live environment: one deleted since the caller resolved
+        // it is not found, never reported as switched.
+        let live = || {
+            sea_orm::Condition::all()
+                .add(environments::Column::Id.eq(id))
+                .add(environments::Column::DeletedAt.is_null())
+        };
         let result = environments::Entity::update_many()
             .col_expr(environments::Column::EgressRecording, Expr::value(enabled))
-            .filter(environments::Column::Id.eq(id))
+            .filter(live())
             .filter(environments::Column::EgressRecording.ne(enabled))
             .exec(self.db.as_ref())
             .await
             .map_err(EgressRecordingError::db(
                 "updating an environment's egress recording",
             ))?;
-        Ok(result.rows_affected == 1)
+        if result.rows_affected == 1 {
+            return Ok(true);
+        }
+        // Nothing changed: already that value, or no longer there.
+        let still = environments::Entity::find()
+            .filter(live())
+            .count(self.db.as_ref())
+            .await
+            .map_err(EgressRecordingError::db(
+                "reading whether an environment is still live",
+            ))?;
+        if still == 0 {
+            return Err(EgressRecordingError::NotFound {
+                noun: NOUN,
+                id: workload.id.to_string(),
+            });
+        }
+        Ok(false)
     }
 
     /// Containers already going through the recorder start or stop being

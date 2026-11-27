@@ -308,10 +308,16 @@ pub fn unix_millis() -> u64 {
 }
 
 /// `path` without its query string or fragment, cut to
-/// [`MAX_RECORDED_PATH`] bytes at a character boundary.
+/// [`MAX_RECORDED_PATH`] bytes at a character boundary. A Temps relay path
+/// (`/.temps/<relay>/<credential>/...`, however a client spelled it) keeps
+/// only its relay: what follows is a relay credential, and a request for one
+/// sent to some other host must not write that credential into the logs.
 pub fn recorded_path(path: &str) -> String {
     let end = path.find(['?', '#']).unwrap_or(path.len());
     let path = &path[..end];
+    if let Some(relay) = relay_path_kind(path) {
+        return format!("/.temps/{relay}/…");
+    }
     if path.len() <= MAX_RECORDED_PATH {
         return path.to_string();
     }
@@ -320,6 +326,34 @@ pub fn recorded_path(path: &str) -> String {
         cut -= 1;
     }
     format!("{}…", &path[..cut])
+}
+
+/// The first segment after a leading `/.temps/` (also spelled with extra
+/// slashes, any case, or a percent-encoded dot), cut to a bounded safe
+/// token; None when `path` is not under `/.temps/`.
+fn relay_path_kind(path: &str) -> Option<String> {
+    let rest = path.trim_start_matches('/');
+    let under = |prefix: &str| {
+        rest.get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .and_then(|_| rest.get(prefix.len()..))
+    };
+    let after = under(".temps/").or_else(|| under("%2etemps/"))?;
+    let segment = after
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let safe = segment.len() <= 32
+        && !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    Some(if safe {
+        segment.to_ascii_lowercase()
+    } else {
+        "_other".to_string()
+    })
 }
 
 /// The method as recorded: upper-case ASCII token, or `_OTHER`.
@@ -864,6 +898,33 @@ mod tests {
             assert!(!batch.push(allowed(1, "api.example.com", at)));
         }
         assert_eq!(batch.len(), 5);
+    }
+
+    /// A relay path sent to any host keeps its relay and loses the
+    /// credential after it, however the client spelled the prefix.
+    #[test]
+    fn relay_paths_lose_their_credential() {
+        let token = "tk_0123456789abcdef0123456789abcdef";
+        for path in [
+            format!("/.temps/model-relay/{token}/v1/messages"),
+            format!("//.temps//model-relay/{token}"),
+            format!("/.TEMPS/Model-Relay/{token}/responses?x=1"),
+            format!("/%2Etemps/model-relay/{token}"),
+        ] {
+            let recorded = recorded_path(&path);
+            assert_eq!(recorded, "/.temps/model-relay/…", "{path}");
+        }
+        assert_eq!(
+            recorded_path(&format!("/.temps/{token}{token}")),
+            "/.temps/_other/…",
+            "an unbounded segment is never recorded"
+        );
+        assert_eq!(
+            recorded_path(&format!("/.temps/mcp/{token}")),
+            "/.temps/mcp/…"
+        );
+        assert_eq!(recorded_path("/docs/.temps/x"), "/docs/.temps/x");
+        assert_eq!(recorded_path("/é.temps"), "/é.temps");
     }
 
     #[test]

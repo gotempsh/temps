@@ -302,6 +302,16 @@ impl NetworkPolicyService {
             hasher.finish()
         };
         let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+        // Reports from nodes that stopped reporting are never read again
+        // (readers skip anything older than ENFORCER_REPORT_TTL): dropped
+        // here, so retired nodes hold no memory.
+        observed.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+        if mode == NodeMode::Off {
+            // Nothing reads an `off` node's workloads: other nodes take
+            // only workloads of nodes outside `off` as peers.
+            observed.remove(&node_id);
+            return;
+        }
         observed.insert(
             node_id,
             ObservedReport {
@@ -1606,6 +1616,30 @@ mod remote_tests {
         assert!(seen_by(3).is_empty(), "an oversized report is ignored");
     }
 
+    /// Nothing reads an `off` node's workloads, so its report is not kept
+    /// (and replaces what it reported before), and a report from a node
+    /// that stopped reporting is dropped by the next one.
+    #[test]
+    fn off_reports_and_expired_reports_hold_no_memory() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = NetworkPolicyService::new(Arc::new(db));
+        let alpha = WorkloadRef::new(WorkloadKind::Deployment, 1);
+        let report = || IdentityMap::new().with(alpha, ip("10.202.0.2"));
+        service.record_observed(3, report(), NodeMode::Enforce);
+        service.record_observed(3, report(), NodeMode::Off);
+        assert!(
+            !service.observed.lock().unwrap().contains_key(&3),
+            "an off report replaces the node's earlier one and is not kept"
+        );
+
+        service.record_observed(5, report(), NodeMode::Shadow);
+        service.observed.lock().unwrap().get_mut(&5).unwrap().seen =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.record_observed(6, report(), NodeMode::Enforce);
+        let kept: Vec<i32> = service.observed.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, [6], "the expired report of node 5 is swept");
+    }
+
     /// Only addresses inside the reporting node's own compute subnet are
     /// shared: a container's node-local bridge address is not, and a node
     /// cannot claim an address another node allocates.
@@ -2008,6 +2042,10 @@ mod tests {
         // The snapshot a node enforces.
         let source = DbPolicySource::new(service.clone(), CONTROL_PLANE_NODE_ID);
         assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert!(
+            source.off_snapshot().await.unwrap().is_none(),
+            "in off nothing reads what the control plane would observe"
+        );
         let snapshot = source.snapshot().await.unwrap();
         let sandbox_policy = snapshot
             .policies

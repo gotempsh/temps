@@ -332,8 +332,27 @@ async fn the_adapter_describes_sandboxes_from_their_rows_and_stores_the_opt_in()
     adapter.set_enabled(on_worker, true).await.unwrap();
     assert!(f.recording(ON_WORKER.0).await);
     assert!(adapter.load(&[on_worker.id]).await.unwrap()[0].enabled);
+    assert!(
+        !adapter.set_enabled(on_worker, true).await.unwrap(),
+        "already on: no change"
+    );
     adapter.set_enabled(on_worker, false).await.unwrap();
     assert!(!f.recording(ON_WORKER.0).await);
+
+    // A sandbox destroyed after the caller resolved it is not found, and
+    // its row is left as it was.
+    let destroyed = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(ON_OTHER_WORKER.0));
+    let before = f.recording(ON_OTHER_WORKER.0).await;
+    for enabled in [true, false] {
+        assert!(
+            matches!(
+                adapter.set_enabled(destroyed, enabled).await,
+                Err(EgressRecordingError::NotFound { .. })
+            ),
+            "turning recording {enabled} on a destroyed sandbox"
+        );
+    }
+    assert_eq!(f.recording(ON_OTHER_WORKER.0).await, before);
 }
 
 #[tokio::test]
@@ -351,7 +370,7 @@ async fn an_owner_turns_recording_on_and_off_for_a_sandbox_with_or_without_a_pro
     assert_eq!(
         status.logs_path.as_deref(),
         Some(
-            "/projects/sample-agent/telemetry-logs?attribute_key=temps.sandbox.id&attribute_value=sbx_00000000000a4101"
+            "/projects/sample-agent/telemetry-logs?attribute_key=temps.platform.workload&attribute_value=sandbox/sbx_00000000000a4101"
         )
     );
 
@@ -617,6 +636,7 @@ async fn the_adapter_never_keeps_the_recorder_alive() {
     let traffic = Arc::new(super::local::SandboxTraffic::new(
         f.db.connection_arc(),
         bollard::Docker::connect_with_local_defaults().expect("docker client"),
+        temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
         None,
     ));
     wired.adapter.set_local(super::LocalSteering {

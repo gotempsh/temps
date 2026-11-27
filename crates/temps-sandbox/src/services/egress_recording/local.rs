@@ -39,7 +39,8 @@ use sea_orm::{
 use temps_entities::sandboxes;
 use temps_sandbox_providers::docker::EgressProxyEndpoint;
 use temps_workload::{WorkloadKind, WorkloadRef};
-use temps_workload_egress::local::{LocalTraffic, RecordedTraffic};
+use temps_workload_egress::local::{LocalTraffic, LocalTrafficError, RecordedTraffic};
+use temps_workload_egress::steering::InstallationId;
 use tracing::warn;
 
 use super::policy;
@@ -128,6 +129,25 @@ impl RecordedRow {
     }
 }
 
+/// The sidecars among `endpoints` that hand their traffic to this
+/// installation's recorder. Two installations can share a Docker daemon
+/// (and, after a takeover, the recorder's listener): a sidecar another one
+/// started is never taken for one of this installation's sandboxes, whose
+/// container name can be the same, nor replaced. A sidecar that does not
+/// hand off sends nothing here, and one labelled by an earlier version
+/// (the address alone) names nobody: a recorded sandbox's is recreated
+/// with this installation's label when the recorder starts.
+fn handing_off_here(
+    endpoints: Vec<EgressProxyEndpoint>,
+    installation: InstallationId,
+) -> Vec<EgressProxyEndpoint> {
+    let ours = installation.to_string();
+    endpoints
+        .into_iter()
+        .filter(|endpoint| endpoint.hands_off && endpoint.installation.as_deref() == Some(&ours))
+        .collect()
+}
+
 /// Each sandbox's sidecar addresses on the egress network, by sandbox
 /// container name: one pass over the endpoints, so matching rows against
 /// them costs one lookup each instead of a scan.
@@ -142,9 +162,40 @@ fn endpoints_by_sandbox(endpoints: &[EgressProxyEndpoint]) -> HashMap<&str, Vec<
     by_sandbox
 }
 
+/// What [`SandboxTraffic::stray_ids`] reads of a sandbox that may have a
+/// stray hand-off: enough to name its container and tell whether its
+/// sidecar can be replaced, never its policy.
+#[derive(Debug, Clone, PartialEq, sea_orm::FromQueryResult)]
+pub struct StrayCandidate {
+    pub id: i32,
+    pub public_id: String,
+    pub agent_run_id: Option<i32>,
+    pub status: String,
+}
+
+impl StrayCandidate {
+    fn container_name(&self) -> String {
+        container_of(&self.public_id, self.agent_run_id)
+    }
+}
+
+/// The rows a sidecar of sandbox container `name` can belong to: the
+/// public ids and agent run ids [`container_of`] could have built it from.
+/// None for a name it never builds.
+fn container_sources(name: &str) -> Option<(Vec<String>, Option<i32>)> {
+    let suffix = name.strip_prefix(SANDBOX_CONTAINER_PREFIX)?;
+    if suffix.is_empty() {
+        return None;
+    }
+    Some((
+        vec![format!("sbx_{suffix}"), suffix.to_string()],
+        suffix.parse::<i32>().ok(),
+    ))
+}
+
 /// The sandboxes among `rows` (which do not record) whose sidecar is listed
 /// handing its traffic to the recorder, and that can be replaced now.
-fn strays_among(rows: &[RecordedRow], endpoints: &[EgressProxyEndpoint]) -> Vec<i32> {
+fn strays_among(rows: &[StrayCandidate], endpoints: &[EgressProxyEndpoint]) -> Vec<i32> {
     let handing_off: HashSet<&str> = endpoints
         .iter()
         .filter(|endpoint| endpoint.hands_off)
@@ -205,6 +256,8 @@ fn traffic_from(
 pub struct SandboxTraffic {
     db: Arc<DatabaseConnection>,
     docker: bollard::Docker,
+    /// This installation, as its sidecars' labels name it.
+    installation: InstallationId,
     /// Absent without a local registry: the table still follows opt-ins,
     /// and sidecars pick the hand-off up when they are next reconciled.
     sidecars: Option<Arc<dyn SidecarRefresh>>,
@@ -235,11 +288,13 @@ impl SandboxTraffic {
     pub fn new(
         db: Arc<DatabaseConnection>,
         docker: bollard::Docker,
+        installation: InstallationId,
         sidecars: Option<Arc<dyn SidecarRefresh>>,
     ) -> Self {
         Self {
             db,
             docker,
+            installation,
             sidecars,
             pending: std::sync::Mutex::new(HashSet::new()),
             resync: std::sync::atomic::AtomicBool::new(false),
@@ -247,6 +302,14 @@ impl SandboxTraffic {
             rows: std::sync::Mutex::new(None),
             strays_seen: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// This host's sidecars that hand their traffic to this installation's
+    /// recorder ([`handing_off_here`]).
+    async fn endpoints(&self) -> Result<Vec<EgressProxyEndpoint>, bollard::errors::Error> {
+        temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker)
+            .await
+            .map(|endpoints| handing_off_here(endpoints, self.installation))
     }
 
     /// Notes that `sandbox`'s sidecar could not be refreshed, or that it
@@ -294,18 +357,62 @@ impl SandboxTraffic {
     /// hands its traffic to the recorder: an opt-out stored, then the
     /// control plane stopped before the sidecar was replaced. Only read
     /// when such a sidecar is listed.
-    async fn stray_ids(&self) -> Result<Vec<i32>, String> {
-        let endpoints = temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker)
-            .await
-            .map_err(|e| format!("could not list the sandbox egress proxies: {e}"))?;
-        if !endpoints.iter().any(|endpoint| endpoint.hands_off) {
+    ///
+    /// Reads only the rows the handing-off sidecars name (a bounded set:
+    /// one per sidecar listed), and none of their policies.
+    async fn stray_ids(&self) -> Result<Vec<i32>, LocalTrafficError> {
+        let endpoints = self.endpoints().await.map_err(LocalTrafficError::docker(
+            WorkloadKind::Sandbox,
+            "listing the sandbox egress proxies",
+        ))?;
+        let mut public_ids: Vec<String> = Vec::new();
+        let mut run_ids: Vec<i32> = Vec::new();
+        for endpoint in endpoints.iter().filter(|endpoint| endpoint.hands_off) {
+            if let Some((ids, run)) = container_sources(&endpoint.sandbox) {
+                public_ids.extend(ids);
+                run_ids.extend(run);
+            }
+        }
+        if public_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = self
-            .local_rows(false)
-            .await
-            .map_err(|e| format!("could not read this host's sandboxes: {e}"))?;
+        let rows = self.stray_candidates(public_ids, run_ids).await.map_err(
+            LocalTrafficError::database(WorkloadKind::Sandbox, "reading this host's sandboxes"),
+        )?;
         Ok(strays_among(&rows, &endpoints))
+    }
+
+    /// This host's live Docker sandboxes that do not record and whose
+    /// container may be named after one of `public_ids` or `run_ids`.
+    async fn stray_candidates(
+        &self,
+        public_ids: Vec<String>,
+        run_ids: Vec<i32>,
+    ) -> Result<Vec<StrayCandidate>, sea_orm::DbErr> {
+        let mut named = Condition::any().add(sandboxes::Column::PublicId.is_in(public_ids));
+        if !run_ids.is_empty() {
+            named = named.add(sandboxes::Column::AgentRunId.is_in(run_ids));
+        }
+        sandboxes::Entity::find()
+            .select_only()
+            .columns([
+                sandboxes::Column::Id,
+                sandboxes::Column::PublicId,
+                sandboxes::Column::AgentRunId,
+                sandboxes::Column::Status,
+            ])
+            .filter(sandboxes::Column::EgressRecording.eq(false))
+            .filter(sandboxes::Column::NodeId.is_null())
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .filter(
+                Condition::any()
+                    .add(sandboxes::Column::Backend.is_null())
+                    .add(sandboxes::Column::Backend.eq("docker")),
+            )
+            .filter(named)
+            .into_model::<StrayCandidate>()
+            .all(self.db.as_ref())
+            .await
     }
 
     /// Every sidecar to bring to the recorder's state when it starts or
@@ -479,15 +586,16 @@ impl LocalTraffic for SandboxTraffic {
 
     /// The host's address on the sidecars' egress network, once the first
     /// sandbox created it.
-    async fn listen_address(&self) -> Result<Option<IpAddr>, String> {
+    async fn listen_address(&self) -> Result<Option<IpAddr>, LocalTrafficError> {
         temps_sandbox_providers::docker::egress_network_gateway(&self.docker)
             .await
-            .map_err(|e| {
+            .map_err(LocalTrafficError::docker(
+                WorkloadKind::Sandbox,
                 format!(
-                    "could not inspect the sandbox egress network '{}': {e}",
+                    "inspecting the sandbox egress network '{}'",
                     temps_sandbox_providers::docker::SANDBOX_EGRESS_NETWORK
-                )
-            })
+                ),
+            ))
     }
 
     /// Publishes the recorder's address and the recorded sandboxes for the
@@ -499,17 +607,27 @@ impl LocalTraffic for SandboxTraffic {
         &self,
         address: SocketAddr,
         discover: bool,
-    ) -> Result<RecordedTraffic, String> {
+    ) -> Result<RecordedTraffic, LocalTrafficError> {
         let rows = match self.current_rows(discover).await {
             Ok(rows) => rows,
-            Err(e) => {
+            Err(source) => {
                 self.published
                     .store(false, std::sync::atomic::Ordering::Relaxed);
-                return Err(format!("could not read the recorded sandboxes: {e}"));
+                return Err(LocalTrafficError::Database {
+                    kind: WorkloadKind::Sandbox,
+                    operation: "reading the recorded sandboxes",
+                    source,
+                });
             }
         };
         let names: HashSet<String> = rows.iter().map(RecordedRow::container_name).collect();
-        temps_sandbox_providers::docker::publish_egress_recording(Some((address, names)));
+        temps_sandbox_providers::docker::publish_egress_recording(Some(
+            temps_sandbox_providers::docker::PublishedEgressRecording {
+                address,
+                installation: self.installation.to_string(),
+                sandboxes: names,
+            },
+        ));
         self.published
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // With nothing recording the sidecars are listed only while one may
@@ -521,9 +639,10 @@ impl LocalTraffic for SandboxTraffic {
         {
             return Ok(RecordedTraffic::default());
         }
-        let endpoints = temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker)
-            .await
-            .map_err(|e| format!("could not list the sandbox egress proxies: {e}"))?;
+        let endpoints = self.endpoints().await.map_err(LocalTrafficError::docker(
+            WorkloadKind::Sandbox,
+            "listing the sandbox egress proxies",
+        ))?;
         let (traffic, strays) = traffic_from(&rows, &endpoints);
         self.strays_seen
             .store(strays, std::sync::atomic::Ordering::Relaxed);
@@ -624,6 +743,7 @@ mod tests {
         let traffic = SandboxTraffic::new(
             db,
             bollard::Docker::connect_with_local_defaults().expect("docker client"),
+            temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
             Some(sidecars),
         );
         traffic
@@ -638,7 +758,7 @@ mod tests {
     async fn refreshed(traffic: &SandboxTraffic, discover: bool) -> Option<RecordedTraffic> {
         match traffic.refresh(RECORDER.parse().unwrap(), discover).await {
             Ok(traffic) => Some(traffic),
-            Err(error) if error.contains("egress proxies") => {
+            Err(error @ LocalTrafficError::Docker { .. }) => {
                 eprintln!("Docker cannot list containers, skipping: {error}");
                 None
             }
@@ -854,6 +974,33 @@ mod tests {
 
     /// A changed opt-in replaces the sidecar of a sandbox this host runs,
     /// leaves a worker's alone, and keeps a failure for the next refresh.
+    /// A stray is looked up among only the rows its sidecar's name can
+    /// belong to: this host's sandboxes that do not record, never another
+    /// node's, and a name no row has finds nothing.
+    #[tokio::test]
+    async fn stray_candidates_are_only_the_named_rows_of_this_host() {
+        let Some(f) = fixture().await else { return };
+        let traffic = traffic(f.db.connection_arc(), FlakySidecars::failing(0));
+        let found = traffic
+            .stray_candidates(
+                vec![
+                    ON_CONTROL_PLANE.1.to_string(),
+                    ON_WORKER.1.to_string(),
+                    "sbx_ffffffffffffffff".to_string(),
+                ],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let ids: Vec<i32> = found.iter().map(|row| row.id).collect();
+        assert_eq!(ids, [ON_CONTROL_PLANE.0], "{found:?}");
+        assert!(traffic
+            .stray_candidates(vec!["sbx_ffffffffffffffff".to_string()], vec![987_654])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn a_changed_opt_in_steers_only_this_hosts_sandboxes() {
         let Some(f) = fixture().await else { return };
@@ -936,6 +1083,77 @@ mod tests {
         );
     }
 
+    /// Only sidecars handing off to this installation's recorder count: a
+    /// sidecar another installation on the same daemon started (the same
+    /// container name, a matching row here) is never attributed to this
+    /// installation's sandbox, and neither is one that does not hand off or
+    /// whose label names nobody.
+    #[test]
+    fn only_sidecars_handing_off_to_this_installation_count() {
+        let ours = InstallationId::from_bytes([7; 8]);
+        let endpoint =
+            |address: &str, hands_off: bool, installation: Option<&str>| EgressProxyEndpoint {
+                sandbox: "temps-sandbox-aaaa".into(),
+                address: address.parse().unwrap(),
+                hands_off,
+                installation: installation.map(str::to_string),
+            };
+        let kept = handing_off_here(
+            vec![
+                endpoint("172.30.0.2", true, Some("0707070707070707")),
+                endpoint("172.30.0.3", true, Some("0909090909090909")),
+                endpoint("172.30.0.4", true, None),
+                endpoint("172.30.0.5", false, None),
+            ],
+            ours,
+        );
+        let addresses: Vec<String> = kept.iter().map(|e| e.address.to_string()).collect();
+        assert_eq!(addresses, ["172.30.0.2"]);
+
+        let row = RecordedRow {
+            id: 7,
+            public_id: "sbx_aaaa".into(),
+            agent_run_id: None,
+            status: "running".into(),
+            egress_policy: Default::default(),
+        };
+        let foreign = handing_off_here(
+            vec![endpoint("172.30.0.3", true, Some("0909090909090909"))],
+            ours,
+        );
+        let (traffic, strays) = traffic_from(&[row], &foreign);
+        assert!(!strays);
+        assert_eq!(
+            traffic.identities.address_count(),
+            0,
+            "another installation's sidecar maps to nothing here"
+        );
+    }
+
+    /// A stray is looked up by what its sidecar's name could have been
+    /// built from, and every row a name can come from is among them.
+    #[test]
+    fn a_sidecar_name_leads_back_to_the_rows_it_can_belong_to() {
+        assert_eq!(
+            container_sources("temps-sandbox-aaaa"),
+            Some((vec!["sbx_aaaa".to_string(), "aaaa".to_string()], None))
+        );
+        assert_eq!(
+            container_sources("temps-sandbox-42"),
+            Some((vec!["sbx_42".to_string(), "42".to_string()], Some(42)))
+        );
+        assert_eq!(container_sources("temps-sandbox-"), None);
+        assert_eq!(container_sources("something-else"), None);
+        for (public_id, run) in [("sbx_aaaa", None), ("sbx_bbbb", Some(42))] {
+            let name = container_of(public_id, run);
+            let (ids, run_id) = container_sources(&name).unwrap();
+            assert!(
+                ids.iter().any(|id| id == public_id) || run_id == run,
+                "{name} leads back to {public_id}/{run:?}"
+            );
+        }
+    }
+
     /// Sidecars are found by name in one pass, whatever the number of
     /// recorded sandboxes.
     #[test]
@@ -944,6 +1162,7 @@ mod tests {
             sandbox: sandbox.into(),
             address: address.parse().unwrap(),
             hands_off: true,
+            installation: None,
         };
         let endpoints = [
             endpoint("temps-sandbox-a", "172.30.0.2"),
@@ -966,17 +1185,17 @@ mod tests {
     /// left alone.
     #[test]
     fn strays_are_the_non_recording_sandboxes_whose_sidecar_hands_off() {
-        let row = |id: i32, public_id: &str, status: &str| RecordedRow {
+        let row = |id: i32, public_id: &str, status: &str| StrayCandidate {
             id,
             public_id: public_id.into(),
             agent_run_id: None,
             status: status.into(),
-            egress_policy: Default::default(),
         };
         let endpoint = |sandbox: &str, hands_off: bool| EgressProxyEndpoint {
             sandbox: sandbox.into(),
             address: "172.30.0.9".parse().unwrap(),
             hands_off,
+            installation: None,
         };
         let rows = [
             row(1, "sbx_aaaa", "running"),
@@ -1011,16 +1230,19 @@ mod tests {
                 sandbox: "temps-sandbox-aaaa".into(),
                 address: "172.30.0.2".parse().unwrap(),
                 hands_off: true,
+                installation: None,
             },
             EgressProxyEndpoint {
                 sandbox: "temps-sandbox-bbbb".into(),
                 address: "172.30.0.3".parse().unwrap(),
                 hands_off: true,
+                installation: None,
             },
             EgressProxyEndpoint {
                 sandbox: "temps-sandbox-cccc".into(),
                 address: "172.30.0.4".parse().unwrap(),
                 hands_off: false,
+                installation: None,
             },
         ];
         let (traffic, strays) = traffic_from(&[recorded], &endpoints);

@@ -125,7 +125,22 @@ pub(super) fn container_has_internal_proxy(
 /// drift, never per request.
 struct EgressRecordingRoute {
     address: std::net::SocketAddr,
+    installation: String,
     sandboxes: std::collections::HashSet<String>,
+}
+
+/// Where this host's egress recorder takes recorded sandboxes' traffic.
+#[derive(Debug, Clone)]
+pub struct PublishedEgressRecording {
+    /// Where the recorder listens on the sidecars' network.
+    pub address: std::net::SocketAddr,
+    /// The installation the recorder belongs to, as it names itself in
+    /// [`SANDBOX_EGRESS_RECORDING_LABEL`]: two installations can share a
+    /// Docker daemon, and a recorder must never take the other's sidecars
+    /// for its own sandboxes, whose container names can be the same.
+    pub installation: String,
+    /// The recorded sandboxes, by container name.
+    pub sandboxes: std::collections::HashSet<String>,
 }
 
 /// What this process knows about the egress recorder.
@@ -147,17 +162,21 @@ static EGRESS_RECORDING: std::sync::RwLock<EgressRecordingState> =
 /// that nothing records on this host (`None`). An egress proxy created or
 /// checked from now on hands the traffic of a recorded sandbox to
 /// `address`.
-pub fn publish_egress_recording(
-    route: Option<(std::net::SocketAddr, std::collections::HashSet<String>)>,
-) {
+pub fn publish_egress_recording(route: Option<PublishedEgressRecording>) {
     let mut slot = match EGRESS_RECORDING.write() {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
     };
     *slot = match route {
-        Some((address, sandboxes)) => {
-            EgressRecordingState::Serving(EgressRecordingRoute { address, sandboxes })
-        }
+        Some(PublishedEgressRecording {
+            address,
+            installation,
+            sandboxes,
+        }) => EgressRecordingState::Serving(EgressRecordingRoute {
+            address,
+            installation,
+            sandboxes,
+        }),
         None => EgressRecordingState::Off,
     };
 }
@@ -182,6 +201,38 @@ pub(super) fn egress_recording_environment_value(sandbox_container_name: &str) -
             })
         }
     }
+}
+
+/// The value `sandbox_container_name`'s egress proxy is labelled with in
+/// [`SANDBOX_EGRESS_RECORDING_LABEL`]: `<installation>@<address>` while that
+/// sandbox records, empty otherwise, and `None` while the recorder has not
+/// said (the sidecar keeps what it has).
+pub(super) fn egress_recording_label_value(sandbox_container_name: &str) -> Option<String> {
+    let slot = match EGRESS_RECORDING.read() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*slot {
+        EgressRecordingState::Unknown => None,
+        EgressRecordingState::Off => Some(String::new()),
+        EgressRecordingState::Serving(route) => {
+            Some(if route.sandboxes.contains(sandbox_container_name) {
+                format!("{}@{}", route.installation, route.address)
+            } else {
+                String::new()
+            })
+        }
+    }
+}
+
+/// The installation a [`SANDBOX_EGRESS_RECORDING_LABEL`] value names: what
+/// comes before its `@`. None for an empty label, and for one an earlier
+/// version wrote (the address alone), which names nobody.
+pub fn handed_off_to(label: &str) -> Option<&str> {
+    label
+        .split_once('@')
+        .map(|(installation, _)| installation)
+        .filter(|installation| !installation.is_empty())
 }
 
 /// The host's address on [`SANDBOX_EGRESS_NETWORK`] (its gateway), where a
@@ -220,6 +271,9 @@ pub struct EgressProxyEndpoint {
     /// Whether it was started handing outbound traffic to the egress
     /// recorder ([`SANDBOX_EGRESS_RECORDING_LABEL`]).
     pub hands_off: bool,
+    /// The installation whose recorder it hands off to ([`handed_off_to`]),
+    /// when it hands off and its label names one.
+    pub installation: Option<String>,
 }
 
 /// Every running sandbox egress proxy on this host: the sandbox it serves
@@ -261,15 +315,17 @@ pub async fn egress_proxy_endpoints(
         else {
             continue;
         };
-        let hands_off = container
+        let label = container
             .labels
             .as_ref()
             .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
-            .is_some_and(|value| !value.is_empty());
+            .map(String::as_str)
+            .unwrap_or("");
         endpoints.push(EgressProxyEndpoint {
             sandbox,
             address,
-            hands_off,
+            hands_off: !label.is_empty(),
+            installation: handed_off_to(label).map(str::to_string),
         });
     }
     Ok(endpoints)
@@ -1243,6 +1299,17 @@ impl DockerSandboxProvider {
                     .unwrap_or("")
                     .to_string()
             });
+        let existing_label = || {
+            existing
+                .as_ref()
+                .and_then(|info| info.config.as_ref())
+                .and_then(|config| config.labels.as_ref())
+                .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let recording_label =
+            egress_recording_label_value(sandbox_container_name).unwrap_or_else(existing_label);
 
         if let Some(info) = &existing {
             let image_matches = info
@@ -1289,7 +1356,9 @@ impl DockerSandboxProvider {
                     .as_ref()
                     .and_then(|config| config.labels.as_ref())
                     .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
-                    .map_or(recording.is_empty(), |label| *label == recording);
+                    .map_or(recording_label.is_empty(), |label| {
+                        *label == recording_label
+                    });
             let rules_match = egress.is_carried_by(info, sandbox_container_name);
             // A stopped proxy is always recreated rather than started: it
             // was parked with its sandbox, and its endpoint still names the
@@ -1319,7 +1388,10 @@ impl DockerSandboxProvider {
             control_plane_url,
             &egress,
             &internal_proxy,
-            &recording,
+            HandOff {
+                address: &recording,
+                label: &recording_label,
+            },
         )
         .await?;
 
@@ -1423,8 +1495,12 @@ impl DockerSandboxProvider {
         control_plane_url: &str,
         egress: &SidecarEgressPolicy,
         internal_proxy: &str,
-        recording: &str,
+        hand_off: HandOff<'_>,
     ) -> Result<(), AgentError> {
+        let HandOff {
+            address: recording,
+            label: recording_label,
+        } = hand_off;
         let mut tmpfs = HashMap::new();
         tmpfs.insert("/tmp".to_string(), "size=16m,mode=1777".to_string());
         let body = bollard::models::ContainerCreateBody {
@@ -1457,7 +1533,7 @@ impl DockerSandboxProvider {
                 ),
                 (
                     SANDBOX_EGRESS_RECORDING_LABEL.to_string(),
-                    recording.to_string(),
+                    recording_label.to_string(),
                 ),
             ])),
             host_config: Some(bollard::models::HostConfig {
@@ -1545,10 +1621,23 @@ impl DockerSandboxProvider {
             // Never started: the proxy that runs is recreated on start,
             // with the address current then.
             &internal_proxy_environment_value(),
-            &egress_recording_environment_value(sandbox_container_name).unwrap_or_default(),
+            HandOff {
+                address: &egress_recording_environment_value(sandbox_container_name)
+                    .unwrap_or_default(),
+                label: &egress_recording_label_value(sandbox_container_name).unwrap_or_default(),
+            },
         )
         .await
     }
+}
+
+/// Where a sidecar hands recorded traffic: the recorder's address (its
+/// environment) and the [`SANDBOX_EGRESS_RECORDING_LABEL`] value naming the
+/// installation too. Both empty when it hands nothing off.
+#[derive(Debug, Clone, Copy)]
+struct HandOff<'a> {
+    address: &'a str,
+    label: &'a str,
 }
 
 /// How long a replacement waits for a removal already in progress.
@@ -1573,16 +1662,35 @@ mod identity_tests {
     fn only_recorded_sandboxes_hand_their_traffic_to_the_recorder() {
         let recorded = "temps-sandbox-recorded-only-test";
         let address: std::net::SocketAddr = "172.30.0.1:41000".parse().unwrap();
-        publish_egress_recording(Some((
+        publish_egress_recording(Some(PublishedEgressRecording {
             address,
-            std::collections::HashSet::from([recorded.to_string()]),
-        )));
+            installation: "0102030405060708".to_string(),
+            sandboxes: std::collections::HashSet::from([recorded.to_string()]),
+        }));
         assert_eq!(
             egress_recording_environment_value(recorded).as_deref(),
             Some("172.30.0.1:41000")
         );
+        // The label names the installation as well, so a recorder sharing
+        // the daemon never takes this sidecar for one of its own.
+        let label = egress_recording_label_value(recorded);
+        assert_eq!(label.as_deref(), Some("0102030405060708@172.30.0.1:41000"));
+        assert_eq!(
+            label.as_deref().and_then(handed_off_to),
+            Some("0102030405060708")
+        );
+        assert_eq!(
+            handed_off_to("172.30.0.1:41000"),
+            None,
+            "an old label names nobody"
+        );
+        assert_eq!(handed_off_to(""), None);
         assert_eq!(
             egress_recording_environment_value("temps-sandbox-other-only-test").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            egress_recording_label_value("temps-sandbox-other-only-test").as_deref(),
             Some("")
         );
         publish_egress_recording(None);
@@ -1590,6 +1698,7 @@ mod identity_tests {
             egress_recording_environment_value(recorded).as_deref(),
             Some("")
         );
+        assert_eq!(egress_recording_label_value(recorded).as_deref(), Some(""));
     }
 
     #[test]

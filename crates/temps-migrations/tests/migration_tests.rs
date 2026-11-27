@@ -11484,7 +11484,39 @@ async fn test_otel_log_events_workload_owner_is_added_and_reverses() -> anyhow::
         .await?;
     assert!(index.is_none(), "the index is built after boot, not here");
 
-    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    // Down never deletes telemetry on its own: while records without a
+    // project exist it refuses, saying how to proceed, and the schema and
+    // every record stay.
+    let refused = Migrator::down(&db, Some(steps_back_to(MIGRATION)))
+        .await
+        .expect_err("down refuses while records without a project exist");
+    assert!(
+        refused.to_string().contains("without a project"),
+        "{refused}"
+    );
+    async fn count(db: &sea_orm::DatabaseConnection, sql: String) -> Result<i64, sea_orm::DbErr> {
+        let row = db
+            .query_one(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                sql,
+            ))
+            .await?
+            .expect("a count");
+        row.try_get::<i64>("", "n")
+    }
+    let remaining = count(
+        &db,
+        format!("SELECT count(*) AS n FROM seaql_migrations WHERE version >= '{MIGRATION}'"),
+    )
+    .await?;
+    assert!(remaining >= 1, "the migration is still applied");
+    let all = || "SELECT count(*) AS n FROM otel_log_events".to_string();
+    assert_eq!(count(&db, all()).await?, 5, "no record is deleted");
+
+    // The operator removes them, as the error says; then down goes through.
+    db.execute_unprepared("DELETE FROM otel_log_events WHERE project_id IS NULL")
+        .await?;
+    Migrator::down(&db, Some(remaining as u32)).await?;
     let columns = db
         .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -11508,17 +11540,10 @@ async fn test_otel_log_events_workload_owner_is_added_and_reverses() -> anyhow::
         vec![("project_id".to_string(), "NO".to_string())],
         "down drops the workload columns and requires a project again"
     );
-    let left = db
-        .query_one(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            "SELECT count(*) AS n FROM otel_log_events".to_string(),
-        ))
-        .await?
-        .expect("a count");
     assert_eq!(
-        left.try_get::<i64>("", "n")?,
+        count(&db, all()).await?,
         3,
-        "down removes only the records without a project"
+        "the records with a project are kept"
     );
     Ok(())
 }

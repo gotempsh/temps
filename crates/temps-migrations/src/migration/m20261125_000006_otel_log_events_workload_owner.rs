@@ -31,8 +31,10 @@
 //! one chunk per transaction, by `temps_schema`'s post-migration step. Until
 //! then a workload's records are still read correctly, by a scan.
 //!
-//! Down deletes the records that have no project, since the column cannot
-//! hold them once it is `NOT NULL` again.
+//! Down refuses while any record has no project, since the column cannot
+//! hold them once it is `NOT NULL` again: it never deletes telemetry on its
+//! own. An operator who rolls back deletes (or exports) them first:
+//! `DELETE FROM otel_log_events WHERE project_id IS NULL`.
 
 use sea_orm_migration::prelude::*;
 
@@ -58,8 +60,18 @@ impl MigrationTrait for Migration {
         manager
             .get_connection()
             .execute_unprepared(
+                r#"DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM otel_log_events WHERE project_id IS NULL) THEN
+                        RAISE EXCEPTION 'cannot roll back m20261125_000006: otel_log_events holds log records without a project (recorded outbound connections of workloads in no project), which a NOT NULL project_id cannot hold; export them if needed, then DELETE FROM otel_log_events WHERE project_id IS NULL and roll back again';
+                    END IF;
+                END $$;"#,
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
                 "DROP INDEX IF EXISTS idx_otel_logs_workload_timestamp; \
-                 DELETE FROM otel_log_events WHERE project_id IS NULL; \
                  ALTER TABLE otel_log_events ALTER COLUMN project_id SET NOT NULL; \
                  ALTER TABLE otel_log_events \
                      DROP COLUMN IF EXISTS workload_kind, \

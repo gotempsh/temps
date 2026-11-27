@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
@@ -99,6 +99,11 @@ impl From<EgressRecordingError> for Problem {
             EgressRecordingError::IngestUnavailable { .. } => {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("OpenTelemetry Storage Unavailable")
+                    .with_detail(detail)
+            }
+            EgressRecordingError::IngestSaturated { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Telemetry Ingest Saturated")
                     .with_detail(detail)
             }
             EgressRecordingError::Store { .. } => {
@@ -231,9 +236,11 @@ async fn ingest_node_records(
     State(state): State<Arc<EgressRecordingNodeState>>,
     Path(node_id): Path<i32>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<EgressIngestOutcome>, Problem> {
-    // Authenticated before the body is parsed.
+    // Authenticated, and a slot of the telemetry ingest limit taken, before
+    // the body is read: neither a stranger nor a burst of batches makes the
+    // control plane buffer up to MAX_BATCH_BODY per request.
     state
         .service
         .authenticate_node(&headers, node_id)
@@ -242,6 +249,17 @@ async fn ingest_node_records(
             problemdetails::new(status)
                 .with_title("Node Authentication Failed")
                 .with_detail(detail)
+        })?;
+    let _permit = state.service.try_acquire_ingest_permit(node_id)?;
+    let body = axum::body::to_bytes(body, MAX_BATCH_BODY)
+        .await
+        .map_err(|e| {
+            problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                .with_title("Egress Record Batch Too Large")
+                .with_detail(format!(
+                    "egress record batch from node {node_id} was not read: over \
+                     {MAX_BATCH_BODY} bytes or cut short: {e}"
+                ))
         })?;
     let batch: EgressRecordBatch = serde_json::from_slice(&body).map_err(|e| {
         problemdetails::new(StatusCode::BAD_REQUEST)

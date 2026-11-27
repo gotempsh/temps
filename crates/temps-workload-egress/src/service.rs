@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
+use tokio::sync::OwnedSemaphorePermit;
 
 use async_trait::async_trait;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -20,6 +21,7 @@ use utoipa::ToSchema;
 use crate::adapter::{RecordedWorkload, WorkloadEgressAdapter};
 use crate::error::EgressRecordingError;
 use crate::local::LocalServing;
+use crate::records;
 
 /// The node id the control plane uses for itself.
 pub const CONTROL_PLANE_NODE_ID: i32 = 0;
@@ -50,12 +52,23 @@ pub trait EgressLogStore: Send + Sync {
     }
     async fn query(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError>;
     async fn count(&self, query: LogQuery) -> Result<u64, OtelError>;
+    /// A slot of the process-wide telemetry ingest limit, held while a
+    /// node's batch is read and stored, as OTLP ingest holds one: a burst
+    /// of batches is refused rather than buffered. None when the store has
+    /// no such limit.
+    fn try_acquire_ingest_permit(&self) -> Result<Option<OwnedSemaphorePermit>, OtelError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
 impl EgressLogStore for temps_otel::OtelService {
     async fn store(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
         self.ingest_platform_logs(records).await
+    }
+
+    fn try_acquire_ingest_permit(&self) -> Result<Option<OwnedSemaphorePermit>, OtelError> {
+        temps_otel::OtelService::try_acquire_ingest_permit(self).map(Some)
     }
 
     /// The same cached quota check OTLP log ingest makes.
@@ -369,7 +382,6 @@ impl EgressRecordingService {
     /// The status of `workload`, given what its nodes answered.
     async fn status_of(
         &self,
-        adapter: &dyn WorkloadEgressAdapter,
         workload: &RecordedWorkload,
         nodes: Vec<NodeAnswer>,
     ) -> Result<EgressRecordingStatus, EgressRecordingError> {
@@ -380,7 +392,7 @@ impl EgressRecordingService {
                 .map_err(EgressRecordingError::db("looking up a workload's project"))?
                 .filter(|project| project.deleted_at.is_none())
                 .map(|project| {
-                    logs_path(&project.slug, adapter.id_attribute(), &workload.public_id)
+                    logs_path(&project.slug, workload.workload.kind, &workload.public_id)
                 }),
             None => None,
         };
@@ -407,7 +419,7 @@ impl EgressRecordingService {
     ) -> Result<EgressRecordingStatus, EgressRecordingError> {
         let adapter = self.adapter(workload.workload.kind)?;
         let nodes = self.nodes_of(adapter.as_ref(), workload).await?;
-        self.status_of(adapter.as_ref(), workload, nodes).await
+        self.status_of(workload, nodes).await
     }
 
     /// Turns recording on or off for `workload`, which the caller has
@@ -452,7 +464,7 @@ impl EgressRecordingService {
             enabled,
             ..workload.clone()
         };
-        let status = self.status_of(adapter.as_ref(), &now, nodes).await?;
+        let status = self.status_of(&now, nodes).await?;
         // What the row held before is what this write found, not what the
         // caller read earlier: a request racing another to the same value
         // changes nothing, and is audited as no change.
@@ -471,9 +483,18 @@ impl EgressRecordingService {
     }
 }
 
-/// The console path of a project's logs filtered to one workload's records.
-pub fn logs_path(project_slug: &str, id_attribute: &str, public_id: &str) -> String {
+/// The console path of a project's logs filtered to one workload's
+/// recorded connections: by [`records::PLATFORM_WORKLOAD_ATTRIBUTE`], which
+/// only the platform writes, so a log the project sent carrying the
+/// workload's id is never among them.
+pub fn logs_path(
+    project_slug: &str,
+    kind: temps_workload::WorkloadKind,
+    public_id: &str,
+) -> String {
     format!(
-        "/projects/{project_slug}/telemetry-logs?attribute_key={id_attribute}&attribute_value={public_id}"
+        "/projects/{project_slug}/telemetry-logs?attribute_key={}&attribute_value={}",
+        records::PLATFORM_WORKLOAD_ATTRIBUTE,
+        records::platform_workload(kind, public_id)
     )
 }

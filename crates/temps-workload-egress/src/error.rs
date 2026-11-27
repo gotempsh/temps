@@ -58,6 +58,12 @@ pub enum EgressRecordingError {
     )]
     IngestUnavailable { node_id: i32, records: usize },
 
+    #[error(
+        "egress records from node {node_id} not accepted: telemetry ingest is at its limit \
+         of {limit} concurrent requests; the node retries with its next batch"
+    )]
+    IngestSaturated { node_id: i32, limit: usize },
+
     #[error("storing {records} egress records from node {node_id} failed: {source}")]
     Store {
         node_id: i32,

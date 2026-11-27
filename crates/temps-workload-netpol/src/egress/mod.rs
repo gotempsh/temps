@@ -54,7 +54,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
-use temps_workload::WorkloadRef;
+use temps_workload::{WorkloadKind, WorkloadRef};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -1160,6 +1160,12 @@ impl EgressProxy {
             OpenError::Refused(refusal)
         };
         let admission = rules.check_host(host, port).map_err(refuse)?;
+        // Only a sandbox has a proxy of its own in front of it (its
+        // sidecar), which sets this header on every request it sends on.
+        // Any other workload talks to this proxy directly, so its header is
+        // its own choice: under a rule admitting a name it could pick any
+        // address. It is ignored and the name resolved here.
+        let pinned = pinned.filter(|_| pins_admitted_address(rules.workload));
         let addrs: Vec<IpAddr> = match (pinned, host.parse::<IpAddr>()) {
             (Some(pinned), _) => vec![unmap(pinned)],
             (None, Ok(ip)) => vec![ip],
@@ -1450,12 +1456,20 @@ struct ParsedRequest {
     admitted_address: Option<IpAddr>,
 }
 
+/// Whether [`ADMITTED_ADDRESS`] is honoured for `workload`: only for a
+/// sandbox, whose requests all come through its sidecar, which overwrites
+/// the header with the address it admitted.
+pub fn pins_admitted_address(workload: WorkloadRef) -> bool {
+    workload.kind == WorkloadKind::Sandbox
+}
+
 /// The header a workload's own egress proxy (a sandbox's sidecar) sends
 /// with a request it admitted: the address it admitted the destination at.
 /// The recorder checks that address against its own rules and connects
 /// there, so the two never disagree on where the request goes (split DNS,
 /// or an answer that changed between the two lookups). A sender can only
-/// choose among the addresses the recorder's rules admit anyway, and it is
+/// choose among the addresses the recorder's rules admit anyway, it is
+/// honoured only from a sandbox ([`pins_admitted_address`]), and it is
 /// never passed on.
 pub const ADMITTED_ADDRESS: &str = "x-temps-egress-address";
 

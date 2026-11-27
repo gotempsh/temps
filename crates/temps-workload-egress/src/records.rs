@@ -36,6 +36,19 @@ pub const SERVICE_NAME: &str = "temps-egress-proxy";
 /// `temps.platform.source` of every record.
 pub const PLATFORM_SOURCE: &str = "egress-proxy";
 
+/// The attribute every record names its workload under, as
+/// [`platform_workload`] writes it. Under `temps.platform.*`, which
+/// ordinary log ingest removes, so only the platform can write it: a filter
+/// on it finds the workload's recorded connections and never a log the
+/// workload (or anything else in its project) sent carrying the same id.
+pub const PLATFORM_WORKLOAD_ATTRIBUTE: &str = "temps.platform.workload";
+
+/// The [`PLATFORM_WORKLOAD_ATTRIBUTE`] value of a workload of `kind` whose
+/// API names it `public_id`: `sandbox/sbx_...`, `deployment/42`.
+pub fn platform_workload(kind: temps_workload::WorkloadKind, public_id: &str) -> String {
+    format!("{}/{public_id}", kind.as_str())
+}
+
 /// Who the record is about, as the control plane knows it (never as the
 /// node or the workload says).
 #[derive(Debug, Clone)]
@@ -200,6 +213,10 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
         who.workload.kind.as_str().to_string(),
     );
     text(who.id_attribute, who.public_id.clone());
+    text(
+        PLATFORM_WORKLOAD_ATTRIBUTE,
+        platform_workload(who.workload.kind, &who.public_id),
+    );
     text("temps.node.id", who.node_id.to_string());
     text("temps.node.name", who.node_name.clone());
     text("temps.egress.kind", record.kind.as_str().to_string());
@@ -281,6 +298,19 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
 
 #[cfg(test)]
 mod tests {
+
+    /// The key the console's link filters on is one ordinary log ingest
+    /// removes, so a workload's own logs can never carry it.
+    #[test]
+    fn the_workload_key_is_one_only_the_platform_writes() {
+        assert!(PLATFORM_WORKLOAD_ATTRIBUTE
+            .starts_with(temps_otel::platform_logs::PLATFORM_ATTRIBUTE_PREFIX));
+        assert_eq!(
+            platform_workload(temps_workload::WorkloadKind::Sandbox, "sbx_1"),
+            "sandbox/sbx_1"
+        );
+    }
+
     use super::*;
     use temps_workload::WorkloadKind;
     use temps_workload_netpol::{EgressReason, RelayKind};
@@ -333,6 +363,10 @@ mod tests {
         assert_eq!(log.severity, LogSeverity::Info);
         assert_eq!(attr("otel.scope.name"), Some("temps.egress"));
         assert_eq!(attr("temps.platform.source"), Some("egress-proxy"));
+        assert!(
+            attr("temps.platform.workload").is_some_and(|value| value.contains('/')),
+            "the workload is named under a key only the platform writes"
+        );
         assert_eq!(attr("temps.sandbox.id"), Some("sbx_0123456789abcdef"));
         assert_eq!(attr("temps.node.id"), Some("3"));
         assert_eq!(attr("server.address"), Some("api.example.com"));
@@ -434,6 +468,10 @@ mod tests {
         assert_eq!(attr("temps.environment.id"), Some("9"));
         assert_eq!(attr("temps.sandbox.id"), None);
         assert_eq!(attr("temps.platform.source"), Some("egress-proxy"));
+        assert!(
+            attr("temps.platform.workload").is_some_and(|value| value.contains('/')),
+            "the workload is named under a key only the platform writes"
+        );
     }
 
     #[test]

@@ -73,17 +73,13 @@ impl PolicySource for DbPolicySource {
         Ok(mode)
     }
 
-    /// The cached snapshot: no query while nothing it depends on changed.
+    /// None: in `off` nothing on the control plane reads what this
+    /// enforcer would observe. Its egress table is its own, and the control
+    /// plane's own workloads are recorded by the local recorder, which keeps
+    /// a table of its own; other nodes never take an `off` node's workloads
+    /// as peers. So an idle pass lists no containers and clones no snapshot.
     async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
-        let (_, revision) = self.last();
-        self.service
-            .cached_snapshot(self.node_id, revision)
-            .await
-            .map(|(snapshot, _)| Some((*snapshot).clone()))
-            .map_err(|e| EnforcerError::Source {
-                node: self.node(),
-                reason: e.to_string(),
-            })
+        Ok(None)
     }
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {

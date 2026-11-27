@@ -99,6 +99,56 @@ pub struct RecordedTraffic {
     pub identities: IdentityMap,
 }
 
+/// Why a workload kind's traffic source could not answer the recorder,
+/// with the underlying error kept: a database read and a Docker call fail
+/// for different reasons and are told apart by variant.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalTrafficError {
+    #[error("{kind} egress recording: {operation} failed: {source}")]
+    Database {
+        kind: WorkloadKind,
+        /// What was being read, as a sentence fragment.
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("{kind} egress recording: {operation} failed: {source}")]
+    Docker {
+        kind: WorkloadKind,
+        /// What was asked of Docker, naming the network or containers.
+        operation: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl LocalTrafficError {
+    /// A database read for `kind` failed while doing `operation`.
+    pub fn database(
+        kind: WorkloadKind,
+        operation: &'static str,
+    ) -> impl FnOnce(sea_orm::DbErr) -> Self {
+        move |source| Self::Database {
+            kind,
+            operation,
+            source,
+        }
+    }
+
+    /// A Docker call for `kind` failed while doing `operation`.
+    pub fn docker<E: std::error::Error + Send + Sync + 'static>(
+        kind: WorkloadKind,
+        operation: impl Into<String>,
+    ) -> impl FnOnce(E) -> Self {
+        let operation = operation.into();
+        move |source| Self::Docker {
+            kind,
+            operation,
+            source: Box::new(source),
+        }
+    }
+}
+
 /// How one workload kind's traffic reaches the recorder on this host.
 #[async_trait]
 pub trait LocalTraffic: Send + Sync {
@@ -107,7 +157,7 @@ pub trait LocalTraffic: Send + Sync {
     /// The address on this host this kind's workloads reach the recorder
     /// on (the host's address on a Docker network of theirs). `None` while
     /// that network does not exist yet.
-    async fn listen_address(&self) -> Result<Option<IpAddr>, String>;
+    async fn listen_address(&self) -> Result<Option<IpAddr>, LocalTrafficError>;
 
     /// Brings this kind's steering up to date with the recorder serving it
     /// at `address`, and returns its recorded workloads. Called on every
@@ -115,8 +165,11 @@ pub trait LocalTraffic: Send + Sync {
     /// the last refresh did not see: nothing may be skipped for looking
     /// unchanged. Part of the call, not a flag set beforehand, so a refresh
     /// already under way can never clear it.
-    async fn refresh(&self, address: SocketAddr, discover: bool)
-        -> Result<RecordedTraffic, String>;
+    async fn refresh(
+        &self,
+        address: SocketAddr,
+        discover: bool,
+    ) -> Result<RecordedTraffic, LocalTrafficError>;
 
     /// The recorder began serving this kind at `address`.
     async fn started(&self, _address: SocketAddr) {}
@@ -440,7 +493,7 @@ impl LocalEgressRecorder {
                     let Some(this) = recorder.upgrade() else {
                         return;
                     };
-                    this.set_serving(kind, Err(error));
+                    this.set_serving(kind, Err(error.to_string()));
                     drop(this);
                     tokio::time::sleep(REFRESH_INTERVAL).await;
                     continue;
@@ -956,7 +1009,7 @@ mod tests {
             self.kind
         }
 
-        async fn listen_address(&self) -> Result<Option<IpAddr>, String> {
+        async fn listen_address(&self) -> Result<Option<IpAddr>, LocalTrafficError> {
             Ok(None)
         }
 
@@ -964,9 +1017,15 @@ mod tests {
             &self,
             _address: SocketAddr,
             _discover: bool,
-        ) -> Result<RecordedTraffic, String> {
+        ) -> Result<RecordedTraffic, LocalTrafficError> {
             if self.fail.load(Ordering::SeqCst) {
-                return Err("the container list timed out".into());
+                return Err(LocalTrafficError::docker(
+                    self.kind(),
+                    "listing the containers",
+                )(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the container list timed out",
+                )));
             }
             let subject = WorkloadRef::new(self.kind, 1);
             Ok(RecordedTraffic {
@@ -1156,7 +1215,7 @@ mod tests {
             WorkloadKind::Sandbox
         }
 
-        async fn listen_address(&self) -> Result<Option<IpAddr>, String> {
+        async fn listen_address(&self) -> Result<Option<IpAddr>, LocalTrafficError> {
             Ok(None)
         }
 
@@ -1164,12 +1223,19 @@ mod tests {
             &self,
             _address: SocketAddr,
             _discover: bool,
-        ) -> Result<RecordedTraffic, String> {
+        ) -> Result<RecordedTraffic, LocalTrafficError> {
             let generation = self.generation.load(Ordering::SeqCst);
             let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
             if first {
                 // Held until the test lets the first refresh finish.
-                let _permit = self.gate.acquire().await.map_err(|e| e.to_string())?;
+                let _permit = self
+                    .gate
+                    .acquire()
+                    .await
+                    .map_err(LocalTrafficError::docker(
+                        self.kind(),
+                        "waiting for the gate",
+                    ))?;
             }
             let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(generation));
             Ok(RecordedTraffic {
@@ -1251,7 +1317,7 @@ mod tests {
             WorkloadKind::Sandbox
         }
 
-        async fn listen_address(&self) -> Result<Option<IpAddr>, String> {
+        async fn listen_address(&self) -> Result<Option<IpAddr>, LocalTrafficError> {
             Ok(None)
         }
 
@@ -1259,13 +1325,19 @@ mod tests {
             &self,
             _address: SocketAddr,
             discover: bool,
-        ) -> Result<RecordedTraffic, String> {
+        ) -> Result<RecordedTraffic, LocalTrafficError> {
             self.refreshes.fetch_add(1, Ordering::SeqCst);
             if discover {
                 self.discovered.fetch_add(1, Ordering::SeqCst);
             }
             if self.fail.load(Ordering::SeqCst) {
-                return Err("the container list timed out".into());
+                return Err(LocalTrafficError::docker(
+                    self.kind(),
+                    "listing the containers",
+                )(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the container list timed out",
+                )));
             }
             if !discover && self.lists_only_on_discover.load(Ordering::SeqCst) {
                 return Ok(RecordedTraffic::default());

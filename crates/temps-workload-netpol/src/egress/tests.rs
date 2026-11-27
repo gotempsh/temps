@@ -544,10 +544,18 @@ async fn echo_server() -> SocketAddr {
 }
 
 async fn start(rules: Vec<EgressRule>, max_connections: usize) -> (Arc<EgressProxy>, SocketAddr) {
-    let identities = IdentityMap::new().with(sandbox(1), "127.0.0.1".parse().unwrap());
+    start_as(sandbox(1), rules, max_connections).await
+}
+
+async fn start_as(
+    subject: WorkloadRef,
+    rules: Vec<EgressRule>,
+    max_connections: usize,
+) -> (Arc<EgressProxy>, SocketAddr) {
+    let identities = IdentityMap::new().with(subject, "127.0.0.1".parse().unwrap());
     let table = EgressTable::build(
         &[EgressPolicy {
-            subject: sandbox(1),
+            subject,
             rules,
             record: false,
             public_only: false,
@@ -1382,4 +1390,38 @@ async fn an_admitted_address_is_checked_and_connected_to_instead_of_resolving() 
         forward.headers,
         vec![("Accept".to_string(), b"*/*".to_vec())]
     );
+}
+
+/// Only a sandbox's sidecar pins the address: a deployment talks to the
+/// proxy directly, so its header is ignored and the name resolved here. A
+/// name that does not resolve is refused even with a pin the rules admit.
+#[tokio::test]
+async fn an_admitted_address_from_a_workload_without_a_sidecar_is_ignored() {
+    let echo = echo_server().await;
+    let deployment = WorkloadRef::new(WorkloadKind::Deployment, 1);
+    assert!(!pins_admitted_address(deployment));
+    assert!(pins_admitted_address(sandbox(1)));
+    let (_proxy, addr) = start_as(
+        deployment,
+        vec![cidr_rule(
+            1,
+            "127.0.0.1/32",
+            Some(echo.port()),
+            Action::Allow,
+        )],
+        4,
+    )
+    .await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "CONNECT unresolvable.invalid:{} HTTP/1.1\r\nX-Temps-Egress-Address: 127.0.0.1\r\n\r\n",
+                echo.port()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_line(&mut client).await, "HTTP/1.1 403 Forbidden");
 }

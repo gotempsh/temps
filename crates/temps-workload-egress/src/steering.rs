@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Sending a workload's HTTP(S) through the recorder with proxy variables.
+//! Sending a workload's HTTPS through the recorder with proxy variables.
 //!
 //! A sandbox has no other way out, so its traffic reaches the recorder
 //! whatever it does. A container that reaches the network directly is
@@ -19,8 +19,20 @@
 //! platform's own endpoints. What `NO_PROXY` misses is refused by the
 //! recorder and shows up, refused, in the workload's activity.
 //!
-//! **A workload's own proxy settings win.** A variable the workload
-//! already sets is left alone, and its `NO_PROXY` entries are kept.
+//! **Only HTTPS is steered.** Plain HTTP stays direct: a container calls its
+//! siblings by names only its Docker network resolves (`http://inventory`),
+//! often named nowhere but in its own code, and no `NO_PROXY` entry can say
+//! "every name without a dot" to every client. The recorder, on the host,
+//! could neither resolve such a name nor reach a private address, so a
+//! steered plain-HTTP call to a sibling would break. A sibling called over
+//! HTTPS by such a name is rare (it needs a certificate for it); one named
+//! in the workload's variables stays direct through `NO_PROXY`.
+//!
+//! **A workload's own proxy settings win.** When the workload, or the
+//! image it runs, already routes HTTPS through a proxy (`HTTPS_PROXY`, or
+//! `ALL_PROXY`, which clients use when no scheme-specific variable is set)
+//! nothing is steered: setting `HTTPS_PROXY` would take precedence over its
+//! route. Its `NO_PROXY` entries are kept in the merged list.
 //!
 //! Any workload kind whose containers reach the network directly uses
 //! this; it is not specific to one.
@@ -76,9 +88,41 @@ pub fn steered_by(label: &str, installation: InstallationId) -> bool {
         .is_some_and(|(id, _)| id == installation.to_string())
 }
 
-/// The proxy variables, in both cases: tools disagree on which they read.
-pub const PROXY_VARIABLES: [(&str, &str); 2] =
-    [("HTTP_PROXY", "http_proxy"), ("HTTPS_PROXY", "https_proxy")];
+/// The proxy variable steering sets, in both cases: tools disagree on which
+/// they read.
+pub const STEERED_VARIABLES: (&str, &str) = ("HTTPS_PROXY", "https_proxy");
+
+/// Variables that already route a workload's HTTPS through a proxy of its
+/// own, in both cases: with any of them set nothing is steered.
+pub const OWN_HTTPS_ROUTE: [(&str, &str); 2] =
+    [("HTTPS_PROXY", "https_proxy"), ("ALL_PROXY", "all_proxy")];
+
+/// What [`proxy_variables`] reads from an image's own environment: what
+/// routes it, and what it keeps direct. Nothing else of an image's `ENV` is
+/// read, since its values are whatever the Dockerfile baked in.
+pub const ROUTING_VARIABLES: [&str; 8] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+/// The routing variables of an image's `ENV` entries (`NAME=value`), for
+/// [`proxy_variables`] to treat as the workload's own: a container takes
+/// its image's `ENV` unless its own variables replace it.
+pub fn image_routing_variables<'a>(
+    env: impl IntoIterator<Item = &'a str>,
+) -> HashMap<String, String> {
+    env.into_iter()
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(name, _)| ROUTING_VARIABLES.contains(name))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
 
 /// Destinations that never go through the recorder: this host, private and
 /// link-local ranges (for the clients that take ranges) and internal name
@@ -102,44 +146,44 @@ pub const ALWAYS_DIRECT: [&str; 12] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProxyVariables {
     /// Variables to set, replacing the workload's `NO_PROXY`/`no_proxy`
-    /// with a merged list.
+    /// with a merged list. Empty when nothing is steered.
     pub variables: BTreeMap<String, String>,
-    /// Proxy variables the workload already sets, left alone: what uses
-    /// them is not recorded.
+    /// The variables that already route the workload's HTTPS through a
+    /// proxy of its own, left alone: nothing is steered then.
     pub kept: Vec<String>,
 }
 
 impl ProxyVariables {
-    /// Whether anything is steered: at least one proxy variable was set.
+    /// Whether anything is steered: the HTTPS proxy variable was set.
     pub fn steers(&self) -> bool {
-        PROXY_VARIABLES
-            .iter()
-            .any(|(upper, _)| self.variables.contains_key(*upper))
+        self.variables.contains_key(STEERED_VARIABLES.0)
     }
 }
 
-/// The variables that send `existing`'s workload through the recorder at
-/// `proxy`, keeping `direct` (the platform's own hosts) and everything
-/// internal direct.
+/// The variables that send `existing`'s workload's HTTPS through the
+/// recorder at `proxy`, keeping `direct` (the platform's own hosts) and
+/// everything internal direct. `existing` is what the container starts
+/// with: its own variables over its image's routing variables
+/// ([`image_routing_variables`]).
 pub fn proxy_variables(
     proxy: SocketAddr,
     existing: &HashMap<String, String>,
     direct: &[String],
 ) -> ProxyVariables {
     let set = |name: &str| existing.get(name).is_some_and(|value| !value.is_empty());
-    let url = format!("http://{proxy}");
     let mut steering = ProxyVariables::default();
-    for (upper, lower) in PROXY_VARIABLES {
+    for (upper, lower) in OWN_HTTPS_ROUTE {
         if set(upper) || set(lower) {
             steering.kept.push(upper.to_string());
-            continue;
         }
-        steering.variables.insert(upper.to_string(), url.clone());
-        steering.variables.insert(lower.to_string(), url.clone());
     }
-    if !steering.steers() {
+    if !steering.kept.is_empty() {
         return steering;
     }
+    let url = format!("http://{proxy}");
+    let (upper, lower) = STEERED_VARIABLES;
+    steering.variables.insert(upper.to_string(), url.clone());
+    steering.variables.insert(lower.to_string(), url);
 
     let mut entries: Vec<String> = Vec::new();
     let mut add = |entry: &str| {
@@ -334,15 +378,21 @@ mod tests {
         );
     }
 
+    /// HTTPS goes through the recorder, in both cases; plain HTTP stays
+    /// direct, so a call to a sibling by a name only its Docker network
+    /// resolves (`http://inventory`) never reaches a recorder that cannot.
     #[test]
-    fn a_workload_is_given_the_recorder_in_both_cases() {
+    fn a_workload_is_given_the_recorder_for_https_in_both_cases() {
         let steering = proxy_variables(proxy(), &HashMap::new(), &[]);
         assert!(steering.steers());
-        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        for name in ["HTTPS_PROXY", "https_proxy"] {
             assert_eq!(
                 steering.variables[name], "http://172.18.0.1:13128",
                 "{name}"
             );
+        }
+        for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            assert!(!steering.variables.contains_key(name), "{name} is not set");
         }
         assert_eq!(
             steering.variables["NO_PROXY"],
@@ -410,19 +460,34 @@ mod tests {
         assert!(no_proxy(&steering).contains(&"console.example.com"));
     }
 
-    /// A workload that already goes through a proxy of its own keeps it,
-    /// for that scheme, and its `NO_PROXY` entries survive the merge.
+    /// A workload whose HTTPS already goes through a proxy of its own,
+    /// by `HTTPS_PROXY` or by `ALL_PROXY` (which a scheme-specific variable
+    /// would take precedence over), is not steered at all. Its own
+    /// `NO_PROXY` entries survive the merge when it is.
     #[test]
     fn a_workloads_own_proxy_settings_win() {
+        for (name, kept) in [
+            ("https_proxy", "HTTPS_PROXY"),
+            ("HTTPS_PROXY", "HTTPS_PROXY"),
+            ("ALL_PROXY", "ALL_PROXY"),
+            ("all_proxy", "ALL_PROXY"),
+        ] {
+            let existing = variables(&[(name, "http://corp-proxy.example.com:8080")]);
+            let steering = proxy_variables(proxy(), &existing, &[]);
+            assert_eq!(steering.kept, [kept], "{name}");
+            assert!(!steering.steers(), "{name}");
+            assert!(steering.variables.is_empty(), "{name}: {steering:?}");
+        }
+
+        // An HTTP-only proxy says nothing about HTTPS: HTTPS is steered,
+        // and the HTTP proxy is left to the workload.
         let existing = variables(&[
-            ("https_proxy", "http://corp-proxy.example.com:8080"),
+            ("HTTP_PROXY", "http://corp-proxy.example.com:8080"),
             ("NO_PROXY", "metrics.example.com, LOCALHOST"),
         ]);
         let steering = proxy_variables(proxy(), &existing, &[]);
-        assert_eq!(steering.kept, ["HTTPS_PROXY"]);
-        assert!(!steering.variables.contains_key("HTTPS_PROXY"));
-        assert!(!steering.variables.contains_key("https_proxy"));
-        assert_eq!(steering.variables["HTTP_PROXY"], "http://172.18.0.1:13128");
+        assert!(steering.steers() && steering.kept.is_empty());
+        assert!(!steering.variables.contains_key("HTTP_PROXY"));
         let direct = no_proxy(&steering);
         assert_eq!(&direct[..2], ["metrics.example.com", "localhost"]);
         assert_eq!(
@@ -430,11 +495,30 @@ mod tests {
             1,
             "entries are not repeated"
         );
+    }
 
-        let both = variables(&[("HTTP_PROXY", "http://a:1"), ("HTTPS_PROXY", "http://a:1")]);
-        let nothing = proxy_variables(proxy(), &both, &[]);
-        assert!(!nothing.steers());
-        assert!(nothing.variables.is_empty(), "{nothing:?}");
+    /// An image's own routing variables count as the workload's: an image
+    /// that sets `HTTPS_PROXY` is not steered, and nothing else of its
+    /// `ENV` is read.
+    #[test]
+    fn an_images_own_routing_variables_count() {
+        let image = image_routing_variables([
+            "PATH=/usr/local/bin:/usr/bin",
+            "HTTPS_PROXY=http://image-proxy.example.com:8080",
+            "API_TOKEN=abcdef0123456789",
+            "no_proxy=metrics.example.com",
+            "MALFORMED",
+        ]);
+        assert_eq!(
+            image,
+            variables(&[
+                ("HTTPS_PROXY", "http://image-proxy.example.com:8080"),
+                ("no_proxy", "metrics.example.com"),
+            ])
+        );
+        let steering = proxy_variables(proxy(), &image, &[]);
+        assert_eq!(steering.kept, ["HTTPS_PROXY"]);
+        assert!(!steering.steers());
     }
 
     #[test]

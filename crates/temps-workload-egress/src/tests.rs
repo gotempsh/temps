@@ -340,7 +340,7 @@ async fn recording_is_off_by_default_and_reports_whether_it_can_work() {
     assert_eq!(
         status.logs_path.as_deref(),
         Some(
-            "/projects/sample-agent/telemetry-logs?attribute_key=temps.box.id&attribute_value=box_4101"
+            "/projects/sample-agent/telemetry-logs?attribute_key=temps.platform.workload&attribute_value=sandbox/box_4101"
         )
     );
 
@@ -1088,6 +1088,10 @@ async fn a_page_past_any_offset_is_empty_not_an_error() {
 struct OverQuota {
     inner: CollectStore,
     over: i32,
+    /// Every quota check fails.
+    unchecked: bool,
+    /// The telemetry ingest limit: this many slots, or none.
+    permits: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[async_trait]
@@ -1097,6 +1101,9 @@ impl EgressLogStore for OverQuota {
     }
 
     async fn admits(&self, project_id: i32) -> Result<bool, OtelError> {
+        if self.unchecked {
+            return Err(OtelError::IngestSaturated { limit: 1 });
+        }
         Ok(project_id != self.over)
     }
 
@@ -1106,6 +1113,19 @@ impl EgressLogStore for OverQuota {
 
     async fn count(&self, query: LogQuery) -> Result<u64, OtelError> {
         self.inner.count(query).await
+    }
+
+    fn try_acquire_ingest_permit(
+        &self,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, OtelError> {
+        let Some(permits) = &self.permits else {
+            return Ok(None);
+        };
+        permits
+            .clone()
+            .try_acquire_owned()
+            .map(Some)
+            .map_err(|_| OtelError::IngestSaturated { limit: 1 })
     }
 }
 
@@ -1118,6 +1138,8 @@ async fn a_project_over_its_quota_stores_no_more_records() {
     let store = Arc::new(OverQuota {
         inner: CollectStore::default(),
         over: PROJECT,
+        unchecked: false,
+        permits: None,
     });
     let service = f.with_store(Some(store.clone()));
     service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
@@ -1139,4 +1161,95 @@ async fn a_project_over_its_quota_stores_no_more_records() {
     let stored = store.inner.0.lock().unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].workload, Some(workload(PROJECTLESS)));
+}
+
+/// A quota check that fails stores nothing for that project: storing could
+/// go past a quota that is used up. The records are dropped and counted
+/// apart; a workload without a project (no quota) still records.
+#[tokio::test]
+async fn a_failed_quota_check_stores_nothing_for_that_project() {
+    let Some(f) = fixture().await else { return };
+    let store = Arc::new(OverQuota {
+        inner: CollectStore::default(),
+        over: -1,
+        unchecked: true,
+        permits: None,
+    });
+    let service = f.with_store(Some(store.clone()));
+    service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
+    service
+        .set_enabled(&f.row(PROJECTLESS), true)
+        .await
+        .unwrap();
+    let outcome = service
+        .ingest(
+            f.worker_a,
+            batch(vec![
+                record(ON_WORKER, "api.example.com", ConnectionOutcome::Allowed),
+                record(ON_WORKER, "api.example.com", ConnectionOutcome::Allowed),
+                record(PROJECTLESS, "api.example.com", ConnectionOutcome::Allowed),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (outcome.stored, outcome.over_quota, outcome.quota_unchecked),
+        (1, 0, 2)
+    );
+    let stored = store.inner.0.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].workload, Some(workload(PROJECTLESS)));
+}
+
+/// A batch from a node takes a slot of the telemetry ingest limit before
+/// its body is read, as OTLP ingest does: with every slot taken it is
+/// refused with a 503 and nothing is stored; with one free it is stored and
+/// the slot given back.
+#[tokio::test]
+async fn the_node_endpoint_refuses_batches_while_telemetry_ingest_is_saturated() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let Some(f) = fixture().await else { return };
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let store = Arc::new(OverQuota {
+        inner: CollectStore::default(),
+        over: -1,
+        unchecked: false,
+        permits: Some(permits.clone()),
+    });
+    let service = f.with_store(Some(store.clone()));
+    service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
+    let app = crate::handlers::node_routes(Arc::new(crate::handlers::EgressRecordingNodeState {
+        service,
+    }));
+    let body = serde_json::to_string(&batch(vec![record(
+        ON_WORKER,
+        "api.example.com",
+        ConnectionOutcome::Allowed,
+    )]))
+    .unwrap();
+    let post = || {
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/internal/nodes/{}/egress-records", f.worker_a))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {NODE_TOKEN}"))
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+    };
+
+    let held = permits.clone().try_acquire_owned().unwrap();
+    let refused = post().await.unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(store.inner.0.lock().unwrap().is_empty());
+
+    drop(held);
+    let accepted = post().await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(store.inner.0.lock().unwrap().len(), 1);
+    assert_eq!(permits.available_permits(), 1, "the slot is given back");
 }

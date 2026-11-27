@@ -8,7 +8,7 @@
 //! [`LocalTraffic`]:
 //!
 //! **A container is steered when it starts.** A replica of an environment
-//! that records is created with the recorder as its HTTP(S) proxy and the
+//! that records is created with the recorder as its HTTPS proxy and the
 //! label [`STEERED_LABEL`] (see `RecordedEgress`). Nothing changes for a
 //! container that is already running.
 //!
@@ -51,7 +51,7 @@ use sea_orm::{
 };
 use temps_entities::{deployment_containers, deployments, environments};
 use temps_workload::{WorkloadKind, WorkloadRef};
-use temps_workload_egress::local::{LocalTraffic, RecordedTraffic};
+use temps_workload_egress::local::{LocalTraffic, LocalTrafficError, RecordedTraffic};
 use temps_workload_egress::steering::{steered_by, InstallationId, STEERED_LABEL};
 use temps_workload_netpol::rule::{Action, PortRange};
 use temps_workload_netpol::{EgressPolicy, EgressRule, EgressTarget, HostPattern, IdentityMap};
@@ -200,7 +200,7 @@ impl DeploymentTraffic {
     /// steered before the database knows where it runs, and must be in the
     /// table from its first connection. One row at most, whatever the
     /// number of environments.
-    async fn any_recording(&self) -> Result<bool, String> {
+    async fn any_recording(&self) -> Result<bool, LocalTrafficError> {
         environments::Entity::find()
             .select_only()
             .column(environments::Column::Id)
@@ -210,7 +210,10 @@ impl DeploymentTraffic {
             .one(self.db.as_ref())
             .await
             .map(|id| id.is_some())
-            .map_err(|e| format!("could not read whether an environment records: {e}"))
+            .map_err(LocalTrafficError::database(
+                WorkloadKind::Deployment,
+                "reading whether an environment records",
+            ))
     }
 
     /// The environments that record now and have a container on this host,
@@ -220,7 +223,7 @@ impl DeploymentTraffic {
     /// replica before it is ready) or any more (one being torn down) keeps
     /// its way out and is not recorded, instead of having this host's whole
     /// batch refused.
-    async fn recorded_here(&self) -> Result<BTreeSet<i32>, String> {
+    async fn recorded_here(&self) -> Result<BTreeSet<i32>, LocalTrafficError> {
         deployment_containers::Entity::find()
             .select_only()
             .column(deployments::Column::EnvironmentId)
@@ -242,7 +245,10 @@ impl DeploymentTraffic {
             .all(self.db.as_ref())
             .await
             .map(|ids| ids.into_iter().collect())
-            .map_err(|e| format!("could not read the environments recorded on this host: {e}"))
+            .map_err(LocalTrafficError::database(
+                WorkloadKind::Deployment,
+                "reading the environments recorded on this host",
+            ))
     }
 }
 
@@ -253,7 +259,7 @@ impl LocalTraffic for DeploymentTraffic {
     }
 
     /// The host's address on the deployment network, once it exists.
-    async fn listen_address(&self) -> Result<Option<IpAddr>, String> {
+    async fn listen_address(&self) -> Result<Option<IpAddr>, LocalTrafficError> {
         let network = match self
             .docker
             .inspect_network(
@@ -267,10 +273,10 @@ impl LocalTraffic for DeploymentTraffic {
                 status_code: 404, ..
             }) => return Ok(None),
             Err(error) => {
-                return Err(format!(
-                    "could not inspect the deployment network '{}': {error}",
-                    self.network
-                ))
+                return Err(LocalTrafficError::docker(
+                    WorkloadKind::Deployment,
+                    format!("inspecting the deployment network '{}'", self.network),
+                )(error))
             }
         };
         Ok(network
@@ -289,7 +295,7 @@ impl LocalTraffic for DeploymentTraffic {
         &self,
         _address: SocketAddr,
         discover: bool,
-    ) -> Result<RecordedTraffic, String> {
+    ) -> Result<RecordedTraffic, LocalTrafficError> {
         if !discover
             && !needs_listing(
                 self.any_recording().await?,
@@ -313,7 +319,10 @@ impl LocalTraffic for DeploymentTraffic {
                 ..Default::default()
             }))
             .await
-            .map_err(|e| format!("could not list the steered deployment containers: {e}"))?;
+            .map_err(LocalTrafficError::docker(
+                WorkloadKind::Deployment,
+                "listing the steered deployment containers",
+            ))?;
         let steered = steered_containers(&containers, &self.network, self.installation);
         self.steered_seen
             .store(!steered.is_empty(), Ordering::Relaxed);
@@ -350,7 +359,16 @@ mod tests {
         );
         traffic.steered_seen.store(false, Ordering::Relaxed);
         let address: SocketAddr = "172.18.0.1:13128".parse().unwrap();
-        assert!(traffic.refresh(address, true).await.is_err());
+        assert!(
+            matches!(
+                traffic.refresh(address, true).await,
+                Err(LocalTrafficError::Docker {
+                    kind: WorkloadKind::Deployment,
+                    ..
+                })
+            ),
+            "a failed Docker list is a Docker error"
+        );
         assert!(
             traffic.refresh(address, false).await.is_err(),
             "an ordinary refresh lists again (and fails while Docker does)"
@@ -517,6 +535,34 @@ mod tests {
         assert_eq!(off.workload, super::super::workload(9));
         assert!(!off.record, "not recorded, and not cut off");
         assert!(rules("172.18.0.99").is_none());
+    }
+
+    /// A failed database read reaches the recorder as a database error,
+    /// with its cause, never flattened into a message.
+    #[tokio::test]
+    async fn a_failed_database_read_keeps_its_cause() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("connection reset".to_string())])
+            .into_connection();
+        let traffic = DeploymentTraffic::new(
+            Arc::new(db),
+            bollard::Docker::connect_with_local_defaults().expect("docker client"),
+            NETWORK.to_string(),
+            InstallationId::from_bytes([1; 8]),
+        );
+        traffic.steered_seen.store(false, Ordering::Relaxed);
+        let address: SocketAddr = "172.18.0.1:13128".parse().unwrap();
+        match traffic.refresh(address, false).await {
+            Err(LocalTrafficError::Database {
+                kind: WorkloadKind::Deployment,
+                operation,
+                source: sea_orm::DbErr::Custom(message),
+            }) => {
+                assert_eq!(operation, "reading whether an environment records");
+                assert_eq!(message, "connection reset");
+            }
+            other => panic!("expected a database error, got {other:?}"),
+        }
     }
 
     /// Only an environment that records and that the database places on

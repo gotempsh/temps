@@ -329,8 +329,14 @@ impl DeployImageJob {
             )
             .await?;
         let mut labels = replica_labels(context, &self.config.service_name);
-        self.steer_replica_egress(context, assignment, &mut environment_vars, &mut labels)
-            .await?;
+        self.steer_replica_egress(
+            image_tag,
+            context,
+            assignment,
+            &mut environment_vars,
+            &mut labels,
+        )
+        .await?;
 
         let request = DeployRequest {
             image_name: image_tag.to_string(),
@@ -497,6 +503,7 @@ impl DeployImageJob {
     /// only while the recorder serves.
     async fn steer_replica_egress(
         &self,
+        image_tag: &str,
         context: &WorkflowContext,
         assignment: &NodeAssignment,
         environment_vars: &mut HashMap<String, String>,
@@ -551,26 +558,46 @@ impl DeployImageJob {
             }
             RecordedEgress::Proxy(address, installation) => (address, installation),
         };
-        let Some(steering) = recorded.variables(environment_vars) else {
+        // The container starts with its image's `ENV` under its own
+        // variables: a proxy the image sets is the workload's own route,
+        // which a steered HTTPS_PROXY would replace.
+        let image_routing = match self.image_routing_variables(image_tag).await {
+            Ok(routing) => routing,
+            Err(unknown) => {
+                return self
+                    .log(
+                        context,
+                        format!(
+                            "Outbound connection recording is on for this environment, but \
+                             the image's own proxy settings could not be read ({unknown}), so \
+                             they are left as they are: this replica's connections are not \
+                             recorded"
+                        ),
+                    )
+                    .await;
+            }
+        };
+        let mut existing = image_routing;
+        existing.extend(
+            environment_vars
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        let Some(steering) = recorded.variables(&existing) else {
             return Ok(());
         };
         if !steering.steers() {
             return self
                 .log(
                     context,
-                    "Outbound connection recording is on for this environment, but the \
-                     deployment sets its own HTTP_PROXY and HTTPS_PROXY, which are kept: its \
-                     connections are not recorded"
-                        .to_string(),
+                    format!(
+                        "Outbound connection recording is on for this environment, but the \
+                         deployment or its image routes HTTPS through a proxy of its own ({}), \
+                         which is kept: its connections are not recorded",
+                        steering.kept.join(", ")
+                    ),
                 )
                 .await;
-        }
-        for kept in &steering.kept {
-            self.log(
-                context,
-                format!("{kept} is set by the deployment and kept: what uses it is not recorded"),
-            )
-            .await?;
         }
         environment_vars.extend(steering.variables);
         labels.insert(
@@ -580,11 +607,33 @@ impl DeployImageJob {
         self.log(
             context,
             format!(
-                "Recording outbound connections: HTTP(S) to public destinations goes through \
-                 the egress recorder at {address}; internal addresses stay direct"
+                "Recording outbound connections: HTTPS to public destinations goes through \
+                 the egress recorder at {address}; plain HTTP and internal addresses stay \
+                 direct"
             ),
         )
         .await
+    }
+
+    /// The proxy variables `image_tag` sets in its own `ENV`
+    /// ([`temps_workload_egress::steering::ROUTING_VARIABLES`]), read from
+    /// this host's image store: a steered replica always runs here.
+    async fn image_routing_variables(
+        &self,
+        image_tag: &str,
+    ) -> Result<HashMap<String, String>, ImageRoutingUnknown> {
+        let builder = self
+            .image_builder
+            .as_ref()
+            .ok_or(ImageRoutingUnknown::NoImageBuilder)?;
+        let image = builder
+            .inspect_image(image_tag)
+            .await
+            .map_err(ImageRoutingUnknown::Inspect)?;
+        let config = image.config.ok_or(ImageRoutingUnknown::NotReported)?;
+        Ok(temps_workload_egress::steering::image_routing_variables(
+            config.env.iter().map(String::as_str),
+        ))
     }
 
     /// Use remote environment variables for remote deployments (linked-service
@@ -1365,6 +1414,18 @@ impl DeployImageJob {
     }
 }
 
+/// Why an image's own proxy settings are unknown, so a replica is not
+/// steered over them.
+#[derive(Debug, thiserror::Error)]
+enum ImageRoutingUnknown {
+    #[error("this host has no image builder to inspect the image with")]
+    NoImageBuilder,
+    #[error("inspecting the image failed: {0}")]
+    Inspect(temps_deployer::BuilderError),
+    #[error("the image store did not report the image's configuration")]
+    NotReported,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1374,6 +1435,90 @@ mod tests {
     use temps_deployer::{ContainerInfo, ContainerStats, DeployerError, ExecResult};
 
     const CONTAINER_ID: &str = "replica-container";
+
+    /// A local image store whose one image declares `env` (`None`: it does
+    /// not report its configuration).
+    struct ImageWithEnv(Option<Vec<String>>);
+
+    #[async_trait]
+    impl temps_deployer::ImageBuilder for ImageWithEnv {
+        async fn build_image(
+            &self,
+            _request: temps_deployer::BuildRequest,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn build_image_with_callback(
+            &self,
+            _request: temps_deployer::BuildRequestWithCallback,
+        ) -> Result<temps_deployer::BuildResult, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn import_image(
+            &self,
+            _image_path: std::path::PathBuf,
+            _tag: &str,
+        ) -> Result<String, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn save_image(
+            &self,
+            _image_name: &str,
+            _output_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn extract_from_image(
+            &self,
+            _image_name: &str,
+            _source_path: &str,
+            _destination_path: &std::path::Path,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn list_images(&self) -> Result<Vec<String>, temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn remove_image(
+            &self,
+            _image_name: &str,
+        ) -> Result<(), temps_deployer::BuilderError> {
+            unimplemented!("not used")
+        }
+
+        async fn inspect_image(
+            &self,
+            image_name: &str,
+        ) -> Result<temps_deployer::ImageInfo, temps_deployer::BuilderError> {
+            Ok(temps_deployer::ImageInfo {
+                id: format!("sha256:{image_name}"),
+                architecture: "amd64".to_string(),
+                os: "linux".to_string(),
+                platform: "linux/amd64".to_string(),
+                size_bytes: 1,
+                tags: vec![image_name.to_string()],
+                created: None,
+                working_dir: None,
+                config: self.0.clone().map(|env| temps_deployer::ImageConfig {
+                    exposed_ports: Vec::new(),
+                    user: None,
+                    user_omitted: false,
+                    env,
+                    entrypoint: Vec::new(),
+                }),
+            })
+        }
+
+        fn get_native_platform(&self) -> String {
+            "linux/amd64".to_string()
+        }
+    }
 
     /// Deployer whose create result and inspection sequence each test scripts.
     /// The last scripted inspection repeats. `created` flips on the create
@@ -1866,37 +2011,43 @@ mod tests {
 
         let recorder = "172.18.0.1:13128".parse().unwrap();
         let installation = temps_workload_egress::steering::InstallationId::from_bytes([7; 8]);
+        let recorded_image =
+            |recorded_egress, assignment: &NodeAssignment, isolation, image: ImageWithEnv| {
+                let assignment = assignment.clone();
+                async move {
+                    let deployer = Arc::new(ScriptedDeployer::default());
+                    let mut variables = HashMap::new();
+                    variables.insert(
+                        "DATABASE_URL".to_string(),
+                        "postgres://app:pw@postgres-main:5432/app".to_string(),
+                    );
+                    let job = builder()
+                        .environment_variables(variables.clone())
+                        .remote_environment_variables(Some(variables))
+                        .recorded_egress(recorded_egress)
+                        .workload_isolation(isolation)
+                        .image_builder(Arc::new(image))
+                        .build(deployer.clone())
+                        .unwrap();
+                    let writer = Arc::new(RecordingLogWriter::default());
+                    let context = context_writing_to(&writer);
+                    // What the container is created with is what matters here,
+                    // not whether the scripted replica then becomes ready.
+                    let _ = deploy(&job, &context, &deployer, &assignment, false).await;
+                    let request = deployer
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .first()
+                        .cloned()
+                        .expect("a container was created");
+                    let lines = writer.lines.lock().unwrap().join("\n");
+                    (request, lines)
+                }
+            };
+        let plain_image = || ImageWithEnv(Some(vec!["PATH=/usr/bin".to_string()]));
         let recorded_with = |recorded_egress, assignment: &NodeAssignment, isolation| {
-            let assignment = assignment.clone();
-            async move {
-                let deployer = Arc::new(ScriptedDeployer::default());
-                let mut variables = HashMap::new();
-                variables.insert(
-                    "DATABASE_URL".to_string(),
-                    "postgres://app:pw@postgres-main:5432/app".to_string(),
-                );
-                let job = builder()
-                    .environment_variables(variables.clone())
-                    .remote_environment_variables(Some(variables))
-                    .recorded_egress(recorded_egress)
-                    .workload_isolation(isolation)
-                    .build(deployer.clone())
-                    .unwrap();
-                let writer = Arc::new(RecordingLogWriter::default());
-                let context = context_writing_to(&writer);
-                // What the container is created with is what matters here,
-                // not whether the scripted replica then becomes ready.
-                let _ = deploy(&job, &context, &deployer, &assignment, false).await;
-                let request = deployer
-                    .requests
-                    .lock()
-                    .unwrap()
-                    .first()
-                    .cloned()
-                    .expect("a container was created");
-                let lines = writer.lines.lock().unwrap().join("\n");
-                (request, lines)
-            }
+            recorded_image(recorded_egress, assignment, isolation, plain_image())
         };
         let recorded = |recorded_egress, assignment: &NodeAssignment| {
             recorded_with(
@@ -1912,9 +2063,17 @@ mod tests {
         )
         .await;
         let env = &request.environment_vars;
-        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        for name in ["HTTPS_PROXY", "https_proxy"] {
             assert_eq!(env[name], "http://172.18.0.1:13128", "{name}");
         }
+        assert!(
+            !env.contains_key("HTTP_PROXY") && !env.contains_key("http_proxy"),
+            "plain HTTP stays direct"
+        );
+        assert!(
+            !env.contains_key("PATH"),
+            "nothing of the image's own ENV is copied"
+        );
         assert!(
             env["NO_PROXY"]
                 .split(',')
@@ -1971,6 +2130,43 @@ mod tests {
             lines.contains("isolation, which does not record yet"),
             "{lines}"
         );
+
+        // A proxy the image sets in its own ENV is the workload's route: it
+        // is kept, not replaced, and the log says so. An image whose ENV
+        // cannot be read is left alone too.
+        for (image, said) in [
+            (
+                ImageWithEnv(Some(vec![
+                    "HTTPS_PROXY=http://image-proxy.example.com:8080".to_string(),
+                ])),
+                "routes HTTPS through a proxy of its own (HTTPS_PROXY)",
+            ),
+            (
+                ImageWithEnv(Some(vec![
+                    "ALL_PROXY=socks5://image-proxy.example.com:1080".to_string(),
+                ])),
+                "routes HTTPS through a proxy of its own (ALL_PROXY)",
+            ),
+            (
+                ImageWithEnv(None),
+                "the image's own proxy settings could not be read",
+            ),
+        ] {
+            let (request, lines) = recorded_image(
+                RecordedEgress::Proxy(recorder, installation),
+                &NodeAssignment::Local,
+                temps_workload::Isolation::Process,
+                image,
+            )
+            .await;
+            assert!(
+                !request.environment_vars.contains_key("HTTPS_PROXY")
+                    && !request.environment_vars.contains_key("NO_PROXY")
+                    && !request.labels.contains_key(STEERED_LABEL),
+                "{said}: not steered"
+            );
+            assert!(lines.contains(said), "{said}: {lines}");
+        }
     }
 
     // Create phase.

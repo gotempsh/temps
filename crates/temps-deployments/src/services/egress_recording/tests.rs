@@ -338,11 +338,32 @@ async fn the_adapter_describes_environments_from_their_rows_and_containers() {
         adapter.load(&[i64::from(PRODUCTION)]).await.unwrap()[0].enabled,
         "the switch is read back from the row"
     );
+    assert!(
+        !adapter
+            .set_enabled(workload(PRODUCTION), true)
+            .await
+            .unwrap(),
+        "already on: no change"
+    );
     adapter
         .set_enabled(workload(PRODUCTION), false)
         .await
         .unwrap();
     assert!(!f.recording(PRODUCTION).await);
+
+    // An environment deleted after the caller resolved it is not found,
+    // and its row is left as it was.
+    let before = f.recording(DELETED).await;
+    for enabled in [true, false] {
+        assert!(
+            matches!(
+                adapter.set_enabled(workload(DELETED), enabled).await,
+                Err(EgressRecordingError::NotFound { .. })
+            ),
+            "turning recording {enabled} on a deleted environment"
+        );
+    }
+    assert_eq!(f.recording(DELETED).await, before);
 }
 
 /// The same flow sandboxes use: an environment records where one of its
@@ -364,7 +385,7 @@ async fn an_environment_records_where_one_of_its_nodes_can() {
     assert_eq!(
         status.logs_path.as_deref(),
         Some(
-            "/projects/shop/telemetry-logs?attribute_key=temps.environment.id&attribute_value=6101"
+            "/projects/shop/telemetry-logs?attribute_key=temps.platform.workload&attribute_value=deployment/6101"
         )
     );
     let nodes: Vec<(&str, bool, Option<&str>)> = status

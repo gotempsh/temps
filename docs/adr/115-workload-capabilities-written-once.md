@@ -118,15 +118,22 @@ How traffic reaches the proxy is the one part that really differs:
   to the proxy, which applies the sandbox's own egress policy.
 - **Environments** reach the network directly, so their containers are
   steered: a replica of an environment that records is started with the
-  proxy as its HTTP(S) proxy. This is opt-in and cooperative, and its limits
+  proxy as its HTTPS proxy. This is opt-in and cooperative, and its limits
   are accepted for now:
+  - only HTTPS is steered. Plain HTTP stays direct, because a container
+    calls its siblings by names only its Docker network resolves, often
+    named only in its code, and no bypass list can exempt "every name
+    without a dot" for every client;
+  - a deployment or image that already routes HTTPS through a proxy of its
+    own (`HTTPS_PROXY`, or `ALL_PROXY`, which a scheme-specific variable
+    would override) keeps it and is not recorded;
   - it applies to containers started after it is turned on, and turning it
     off stops recording at once without touching running containers;
   - only clients that honour the proxy variables are recorded;
   - only public destinations go through the proxy. Internal names and
     addresses stay direct, and what the bypass list misses is refused and
     shows as refused in the activity;
-  - while it is on, the environment's outbound HTTP(S) depends on the node's
+  - while it is on, the environment's outbound HTTPS depends on the node's
     proxy being up, including across a control-plane restart;
   - only replicas on the control plane are recorded until worker agents
     serve the proxy, and only replicas of image deployments: a Compose

@@ -98,7 +98,7 @@ export function environmentEgress(
     key: [projectId, environmentId],
     noun: 'environment',
     appliesNote:
-      'Applies to containers started after it is turned on: redeploy to start recording. Only HTTP(S) to public destinations goes through the recorder, and while it is on those requests depend on the node being up.',
+      'Applies to containers started after it is turned on: redeploy to start recording. Only HTTPS to public destinations goes through the recorder (plain HTTP stays direct, and a proxy the deployment or its image sets is kept), and while it is on those requests depend on the node being up.',
     status: async (signal) =>
       (
         await getEnvironmentEgressRecording({

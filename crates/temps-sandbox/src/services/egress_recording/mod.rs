@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use temps_entities::sandboxes;
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::LocalEgressRecorder;
@@ -167,16 +167,40 @@ impl WorkloadEgressAdapter for SandboxEgressAdapter {
             noun: NOUN,
             id: workload.id.to_string(),
         })?;
+        // Only a live sandbox: one destroyed since the caller resolved it
+        // is not found, never reported as switched.
+        let live = || {
+            sea_orm::Condition::all()
+                .add(sandboxes::Column::Id.eq(id))
+                .add(sandboxes::Column::Status.ne("destroyed"))
+        };
         let result = sandboxes::Entity::update_many()
             .col_expr(sandboxes::Column::EgressRecording, Expr::value(enabled))
-            .filter(sandboxes::Column::Id.eq(id))
+            .filter(live())
             .filter(sandboxes::Column::EgressRecording.ne(enabled))
             .exec(self.db.as_ref())
             .await
             .map_err(EgressRecordingError::db(
                 "updating a sandbox's egress recording",
             ))?;
-        Ok(result.rows_affected == 1)
+        if result.rows_affected == 1 {
+            return Ok(true);
+        }
+        // Nothing changed: already that value, or no longer there.
+        let still = sandboxes::Entity::find()
+            .filter(live())
+            .count(self.db.as_ref())
+            .await
+            .map_err(EgressRecordingError::db(
+                "reading whether a sandbox is still live",
+            ))?;
+        if still == 0 {
+            return Err(EgressRecordingError::NotFound {
+                noun: NOUN,
+                id: workload.id.to_string(),
+            });
+        }
+        Ok(false)
     }
 
     /// The table and the published set follow at once, and a sandbox of
