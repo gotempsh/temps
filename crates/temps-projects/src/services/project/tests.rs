@@ -8389,3 +8389,80 @@ async fn update_project_with_only_a_build_command_keeps_the_stored_build_setting
     assert_eq!(config["installCommand"], "npm ci");
     assert_eq!(config["outputDir"], "dist");
 }
+
+/// A project update keeps its storage links, so it refuses variable aliases
+/// for them instead of answering success and dropping them, whichever caller
+/// reaches the update path, and before touching the database.
+#[tokio::test]
+async fn a_project_update_refuses_storage_aliases_instead_of_dropping_them() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let service = create_test_services(db, Arc::new(MockJobQueue::new())).await;
+    let request = |aliases: BTreeMap<i32, BTreeMap<String, String>>| CreateProjectRequest {
+        cloudflare_enabled: None,
+        delivery_provider: None,
+        name: "Updated".to_string(),
+        expected_slug: None,
+        repo_name: None,
+        repo_owner: None,
+        directory: "/".to_string(),
+        main_branch: "main".to_string(),
+        preset: Preset::Nixpacks.to_string(),
+        preset_config: None,
+        environment_variables: None,
+        git_url: None,
+        git_provider_connection_id: None,
+        automatic_deploy: false,
+        exposed_port: None,
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
+        is_public_repo: None,
+        storage_service_ids: vec![12],
+        storage_service_env_aliases: aliases,
+        storage_service_claim_ids: vec![],
+        storage_service_claim_user_id: None,
+        source_type: temps_entities::source_type::SourceType::Git,
+        template_slug: None,
+        hosting: Default::default(),
+    };
+
+    let asked = BTreeMap::from([
+        (
+            12,
+            BTreeMap::from([("DATABASE_URL".to_string(), "POSTGRES_URL".to_string())]),
+        ),
+        (13, BTreeMap::new()),
+    ]);
+    let Err(error) = service
+        .update_project(4, request(asked), DeployCaller::default())
+        .await
+    else {
+        panic!("aliases on an update are refused");
+    };
+    match &error {
+        ProjectError::StorageAliasesOnUpdate {
+            project_id,
+            service_ids,
+        } => {
+            assert_eq!(*project_id, 4);
+            assert_eq!(service_ids, &vec![12]);
+        }
+        other => panic!("expected StorageAliasesOnUpdate, got {other:?}"),
+    }
+    assert!(error.to_string().contains("temps services link"), "{error}");
+
+    // No aliases, or only empty ones, pass the check (and reach the
+    // database, which this mock has nothing for).
+    let empty = BTreeMap::from([(12, BTreeMap::new())]);
+    for aliases in [BTreeMap::new(), empty] {
+        assert!(!matches!(
+            service
+                .update_project(4, request(aliases), DeployCaller::default())
+                .await,
+            Err(ProjectError::StorageAliasesOnUpdate { .. })
+        ));
+    }
+}

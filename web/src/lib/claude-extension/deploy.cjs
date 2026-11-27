@@ -101,6 +101,20 @@ const LEFT_OUT_DIRECTORIES = new Set([
   '.terraform',
 ])
 
+/**
+ * Directories of credential stores that some projects keep a copy of for a
+ * mounted configuration: AWS, Azure and Kubernetes profiles, SSH and GPG keys,
+ * Docker registry logins. Never uploaded, whatever `.gitignore` says.
+ */
+const CREDENTIAL_DIRECTORIES = new Set([
+  '.aws',
+  '.azure',
+  '.docker',
+  '.gnupg',
+  '.kube',
+  '.ssh',
+])
+
 /** Files that hold secrets more often than not. */
 const SECRET_FILE_NAMES = new Set([
   '.envrc',
@@ -126,7 +140,9 @@ const REGISTRY_CREDENTIAL = /_auth|_password|npmAuthToken|npmAuthIdent/i
 
 /** Whether a file or directory is left out whatever `.gitignore` says. */
 function alwaysLeftOut(name, isDirectory) {
-  if (isDirectory) return LEFT_OUT_DIRECTORIES.has(name)
+  if (isDirectory) {
+    return LEFT_OUT_DIRECTORIES.has(name) || CREDENTIAL_DIRECTORIES.has(name)
+  }
   if (SECRET_FILE_NAMES.has(name)) return true
   // .env, .env.local, .env.production; examples hold no secrets and some
   // builds read them.
@@ -140,6 +156,77 @@ function alwaysLeftOut(name, isDirectory) {
 
 function escapeRegex(char) {
   return /[.*+?^${}()|[\]\\/]/.test(char) ? `\\${char}` : char
+}
+
+/** Git's POSIX character classes (`[[:digit:]]`), as regular expression members. */
+const POSIX_CLASSES = {
+  alnum: 'A-Za-z0-9',
+  alpha: 'A-Za-z',
+  blank: ' \\t',
+  cntrl: '\\x00-\\x1f\\x7f',
+  digit: '0-9',
+  graph: '\\x21-\\x7e',
+  lower: 'a-z',
+  print: '\\x20-\\x7e',
+  punct: '!-\\/:-@\\[-`{-~',
+  space: ' \\t\\n\\r\\f\\v',
+  upper: 'A-Z',
+  xdigit: '0-9A-Fa-f',
+}
+
+/**
+ * The bracket expression opening at `glob[start]`, as Git reads it: `!` or `^`
+ * negates, a `]` right after the opening is a member, `[:class:]` is a POSIX
+ * class, a backslash escapes. No bracket matches `/`. An unknown
+ * class matches nothing, as in Git. `null` when the bracket is not closed.
+ */
+function bracketToRegex(glob, start) {
+  let i = start + 1
+  let negate = false
+  if (glob[i] === '!' || glob[i] === '^') {
+    negate = true
+    i += 1
+  }
+  let members = ''
+  let unknownClass = false
+  let first = true
+  while (i < glob.length) {
+    const char = glob[i]
+    if (char === ']' && !first) {
+      if (unknownClass) return { regex: '(?!)', end: i }
+      // A bracket never matches `/`, positive or negated, whatever its
+      // members (a range, a class such as [:punct:]). The lookahead keeps
+      // the members as written, so a `-` first after `!` stays literal.
+      return {
+        regex: `(?!/)[${negate ? '^' : ''}${members}]`,
+        end: i,
+      }
+    }
+    first = false
+    if (char === '[' && glob[i + 1] === ':') {
+      const close = glob.indexOf(':]', i + 2)
+      if (close !== -1) {
+        const posix = POSIX_CLASSES[glob.slice(i + 2, close)]
+        if (posix === undefined) unknownClass = true
+        else members += posix
+        i = close + 2
+        continue
+      }
+    }
+    if (char === '\\' && i + 1 < glob.length) {
+      members += classMember(glob[i + 1])
+      i += 2
+      continue
+    }
+    members += char === '-' ? '-' : classMember(char)
+    i += 1
+  }
+  return null
+}
+
+/** One literal character inside a regular expression class. */
+function classMember(char) {
+  return /[\\\]\[^-]/.test(char) ? `\\${char}` : char
 }
 
 /** A `.gitignore` glob as a regular expression body. */
@@ -168,15 +255,13 @@ function globToRegex(glob) {
     } else if (char === '?') {
       out += '[^/]'
     } else if (char === '[') {
-      const end = glob.indexOf(']', i + 2)
-      if (end === -1) {
+      const bracket = bracketToRegex(glob, i)
+      if (!bracket) {
         out += '\\['
         continue
       }
-      let members = glob.slice(i + 1, end).replace(/\\/g, '\\\\')
-      if (members[0] === '!') members = `^${members.slice(1)}`
-      out += `[${members}]`
-      i = end
+      out += bracket.regex
+      i = bracket.end
     } else if (char === '\\' && i + 1 < glob.length) {
       out += escapeRegex(glob[i + 1])
       i += 1

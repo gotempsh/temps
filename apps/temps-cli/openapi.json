@@ -153397,6 +153397,9 @@
             },
             "description": "Project updated successfully"
           },
+          "400": {
+            "description": "Invalid update, such as storage variable aliases, which are set on the service link"
+          },
           "401": {
             "description": "Unauthorized"
           },

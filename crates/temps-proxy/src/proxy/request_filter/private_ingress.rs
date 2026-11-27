@@ -102,7 +102,9 @@ impl LoadBalancer {
                 )
                 .await;
         }
-        let Some(address) = private.view.private_address_for(&ctx.host) else {
+        // The route and its range come from one snapshot: the range checked
+        // is the range of the route the request is sent to.
+        let Some(private_route) = private.view.private_route_for(&ctx.host) else {
             return self
                 .private_refusal(
                     session,
@@ -113,7 +115,7 @@ impl LoadBalancer {
                 )
                 .await;
         };
-        let in_range = match (peer, address.range.as_deref()) {
+        let in_range = match (peer, private_route.address.range.as_deref()) {
             (Some(peer), Some(range)) => temps_core::worker_ingress::ip_in_range(peer, range),
             _ => false,
         };
@@ -148,27 +150,8 @@ impl LoadBalancer {
             ctx.routing_status = "private_https_redirect".to_string();
             return Ok(Flow::Answered);
         }
-        let route = private
-            .view
-            .get_route_by_sni(&ctx.host)
-            .or_else(|| private.view.get_route_by_host(&ctx.host))
-            .or_else(|| private.view.get_route(&ctx.host));
-        match route {
-            Some(route) => {
-                ctx.private_route = Some(route);
-                Ok(Flow::Continue)
-            }
-            None => {
-                self.private_refusal(
-                    session,
-                    ctx,
-                    StatusCode::NOT_FOUND,
-                    "no-route",
-                    "no private route for this host",
-                )
-                .await
-            }
-        }
+        ctx.private_route = Some(private_route.route);
+        Ok(Flow::Continue)
     }
 
     async fn private_refusal(

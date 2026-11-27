@@ -31,7 +31,9 @@ fn control_plane_private_snapshot(snapshot: &RouteTableSnapshot) -> RouteTableSn
                 && private.address.on_listener()
                 && private.address.range.is_some()
         })
-        .map(|(host, private)| (host.clone(), private.clone()))
+        // Keyed by the normalized host, so the request path finds one with
+        // a single hash lookup, an unknown host included.
+        .map(|(host, private)| (normalize_host(host), private.clone()))
         .collect();
     let exact = private
         .iter()
@@ -55,6 +57,11 @@ fn control_plane_private_snapshot(snapshot: &RouteTableSnapshot) -> RouteTableSn
         private,
         ..RouteTableSnapshot::default()
     }
+}
+
+/// A host as the private view keys it: lower case, without a trailing dot.
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
 }
 
 impl CachedPeerTable {
@@ -86,19 +93,28 @@ impl CachedPeerTable {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// The private address at `host` in this view, with the range a visitor
-    /// must come from. `None` for a host the view does not serve.
-    pub fn private_address_for(&self, host: &str) -> Option<PrivateAddress> {
+    /// The private route at `host` in this view: the route and the range a
+    /// visitor must come from, both from one snapshot, so a reload between
+    /// the range check and the backend choice can never pair one host's
+    /// range with a replacement route. `None` for a host the view does not
+    /// serve, and for the reserved console and ingress hostnames (D5). One
+    /// hash lookup.
+    pub fn private_route_for(&self, host: &str) -> Option<PrivateRoute> {
         let snapshot = self.route_snapshot.load();
         if snapshot.private.is_empty() {
             return None;
         }
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        snapshot
-            .private
-            .iter()
-            .find(|(candidate, _)| candidate.trim_end_matches('.').eq_ignore_ascii_case(&host))
-            .map(|(_, private)| private.address.clone())
+        let host = normalize_host(host);
+        if snapshot.legacy.is_reserved(&host) {
+            return None;
+        }
+        snapshot.private.get(&host).cloned()
+    }
+
+    /// The private address at `host` in this view, with the range a visitor
+    /// must come from. `None` for a host the view does not serve.
+    pub fn private_address_for(&self, host: &str) -> Option<PrivateAddress> {
+        self.private_route_for(host).map(|private| private.address)
     }
 
     /// Hosts node `0` serves on its listener, for the inside checks.
@@ -259,5 +275,56 @@ mod tests {
             .private_view()
             .get_route("app.internal.example.com")
             .is_none());
+    }
+
+    /// The proxy checks a private route's range and sends the request to
+    /// that same route: both come from one lookup, so a reload that replaces
+    /// the host's route and narrows its range cannot pair the old range
+    /// with the new backend.
+    #[test]
+    fn a_private_route_and_its_range_come_from_one_snapshot() {
+        let table = table();
+        table.reserve_hostname_for_test("console.example.com");
+        let view = table.private_view();
+        table.insert_private_route_for_test(
+            "app.internal.example.com",
+            PrivateRoute {
+                route: route("/srv/old"),
+                address: address(Some(0), "listener"),
+            },
+        );
+        let first = view
+            .private_route_for("App.Internal.Example.com.")
+            .expect("served");
+        assert_eq!(first.route.static_dir(), Some("/srv/old"));
+        assert_eq!(first.address.range.as_deref(), Some("100.64.0.0/10"));
+
+        let mut narrowed = address(Some(0), "listener");
+        narrowed.range = Some("100.64.0.0/24".into());
+        table.insert_private_route_for_test(
+            "app.internal.example.com",
+            PrivateRoute {
+                route: route("/srv/new"),
+                address: narrowed,
+            },
+        );
+        let second = view
+            .private_route_for("app.internal.example.com")
+            .expect("served");
+        assert_eq!(second.route.static_dir(), Some("/srv/new"));
+        assert_eq!(second.address.range.as_deref(), Some("100.64.0.0/24"));
+
+        // Unknown and reserved hosts are not served.
+        assert!(view
+            .private_route_for("other.internal.example.com")
+            .is_none());
+        table.insert_private_route_for_test(
+            "console.example.com",
+            PrivateRoute {
+                route: route("/srv/console"),
+                address: address(Some(0), "listener"),
+            },
+        );
+        assert!(view.private_route_for("console.example.com").is_none());
     }
 }

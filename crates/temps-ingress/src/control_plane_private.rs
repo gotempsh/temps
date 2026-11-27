@@ -310,9 +310,18 @@ impl CheckRotation {
         }
     }
 
-    /// Every hostname's latest result, in hostname order.
+    /// Every hostname's latest result, the most recently checked first. The
+    /// store keeps a bounded number of them, so past that bound it is the
+    /// oldest results that are dropped, never one just checked.
     fn report(&self) -> Vec<PrivateCheck> {
-        self.results.values().cloned().collect()
+        let mut results: Vec<&PrivateCheck> = self.results.values().collect();
+        results.sort_by(|a, b| {
+            self.checked_at
+                .get(&b.hostname)
+                .cmp(&self.checked_at.get(&a.hostname))
+                .then_with(|| a.hostname.cmp(&b.hostname))
+        });
+        results.into_iter().cloned().collect()
     }
 
     fn clear(&mut self) {
@@ -922,6 +931,20 @@ mod tests {
         rotation.record(&second, results, start + Duration::from_secs(1));
         assert!(!rotation.has_unchecked(&hosts));
         assert_eq!(rotation.report().len(), 65);
+
+        // Past the store's bound the oldest results go: the last batch
+        // checked leads the report.
+        let report = rotation.report();
+        let freshest: Vec<&str> = report[..second.len()]
+            .iter()
+            .map(|c| c.hostname.as_str())
+            .collect();
+        assert!(freshest.contains(&"app064.internal.example.test"));
+        assert_eq!(
+            report.last().map(|c| c.hostname.as_str()),
+            Some("app063.internal.example.test"),
+            "the one result not checked again is the oldest"
+        );
 
         // A hostname no longer served drops out of the report.
         rotation.retain(&hosts[..10]);

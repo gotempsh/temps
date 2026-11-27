@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -60,6 +61,17 @@ interface Bridge {
     folders: string[]
   }
   parseSse(text: string): unknown[]
+  serialQueue(maxWaiting: number): {
+    <T>(task: () => Promise<T>, token?: object): Promise<T | null>
+    withdraw(token: object): boolean
+  }
+  MAX_WAITING_DEPLOYS: number
+  run(
+    config: unknown,
+    input: NodeJS.ReadableStream,
+    output: NodeJS.WritableStream,
+    log: (line: string) => void
+  ): void
 }
 
 // Claude runs the extension with Node; use it when it is installed, so the
@@ -512,6 +524,196 @@ describe('bridge over stdio', () => {
         message: 'The extension received a message that is not JSON.',
       },
     })
+  })
+})
+
+describe('folder deployments run one at a time', () => {
+  test('each waits for the one before it, and a full queue refuses at once', async () => {
+    const queue = bridge.serialQueue(2)
+    let running = 0
+    let most = 0
+    const releases: Array<() => void> = []
+    const task = (name: string) => () =>
+      new Promise<string>((resolve) => {
+        running++
+        most = Math.max(most, running)
+        releases.push(() => {
+          running--
+          resolve(name)
+        })
+      })
+    const first = queue(task('first'))
+    const second = queue(task('second'))
+    const third = queue(task('third'))
+    // The first runs; two wait; a fourth is past the queue.
+    await expect(queue(task('fourth'))).rejects.toThrow(/already waiting/)
+    const order: string[] = []
+    for (const done of [first, second, third]) {
+      while (releases.length === 0) await Bun.sleep(1)
+      releases.shift()!()
+      order.push(await done)
+    }
+    expect(order).toEqual(['first', 'second', 'third'])
+    expect(most).toBe(1)
+    // A failed deployment does not stop the next.
+    await expect(
+      queue(() => Promise.reject(new Error('boom')))
+    ).rejects.toThrow('boom')
+    expect(await queue(() => Promise.resolve('after'))).toBe('after')
+    expect(bridge.MAX_WAITING_DEPLOYS).toBeGreaterThan(0)
+  })
+
+  test('a waiting task withdrawn leaves its place to the next call and never runs', async () => {
+    const queue = bridge.serialQueue(2)
+    const ran: string[] = []
+    const releases: Array<() => void> = []
+    const task = (name: string) => () =>
+      new Promise<string>((resolve) => {
+        ran.push(name)
+        releases.push(() => resolve(name))
+      })
+    const tokens = { first: {}, second: {}, third: {} }
+    const first = queue(task('first'), tokens.first)
+    const second = queue(task('second'), tokens.second)
+    const third = queue(task('third'), tokens.third)
+    await expect(queue(task('refused'))).rejects.toThrow(/2 folder deployments/)
+    // The running one stays; a waiting one leaves, and its place is free.
+    while (releases.length === 0) await Bun.sleep(1)
+    expect(queue.withdraw(tokens.first)).toBe(false)
+    expect(queue.withdraw(tokens.second)).toBe(true)
+    expect(await second).toBeNull()
+    const fourth = queue(task('fourth'))
+    for (const done of [first, third, fourth]) {
+      while (releases.length === 0) await Bun.sleep(1)
+      releases.shift()!()
+      await done
+    }
+    expect(ran).toEqual(['first', 'third', 'fourth'])
+  })
+})
+
+describe('cancelling a folder deployment', () => {
+  test('a call cancelled while preparing its archive sends nothing more to Temps', async () => {
+    const deployModule = createRequire(import.meta.url)(DEPLOY_PATH) as {
+      deployFolder: (...args: unknown[]) => Promise<string>
+    }
+    const original = deployModule.deployFolder
+    let prepared = () => {}
+    let started = false
+    let upload: unknown = 'not attempted'
+    // Like the real one: prepare the archive, then upload it through the
+    // bridge's API callback.
+    deployModule.deployFolder = async (_config, _args, api) => {
+      started = true
+      await new Promise<void>((resolve) => {
+        prepared = resolve
+      })
+      try {
+        upload = await (
+          api as (
+            v: string,
+            p: string,
+            h: object,
+            b: string
+          ) => Promise<unknown>
+        )('POST', '/api/projects/1/deployments', {}, 'archive')
+      } catch (error) {
+        upload = error
+      }
+      return 'deployed'
+    }
+    const forwarded: unknown[] = []
+    const server = serve(async (req) => {
+      forwarded.push(await req.text())
+      return new Response(null, { status: 202 })
+    })
+    try {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      let written = ''
+      output.on('data', (chunk) => (written += String(chunk)))
+      const config = bridge.readConfig({
+        TEMPS_URL: `http://127.0.0.1:${server.port}`,
+        TEMPS_API_KEY: KEY,
+      })
+      bridge.run(config, input, output, () => {})
+      input.write(
+        `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'temps_deploy_folder', arguments: {} } })}\n`
+      )
+      while (!started) await Bun.sleep(1)
+      input.write(
+        `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 1 } })}\n`
+      )
+      await Bun.sleep(10)
+      prepared()
+      await Bun.sleep(30)
+      expect(upload).toBeInstanceOf(Error)
+      expect(String(upload)).toMatch(/cancelled/)
+      expect(forwarded).toEqual([])
+      expect(written).toBe('')
+      input.end()
+    } finally {
+      deployModule.deployFolder = original
+      server.stop(true)
+    }
+  })
+
+  test('a cancelled call still waiting never starts, gets no reply, and is not forwarded', async () => {
+    const deployModule = createRequire(import.meta.url)(DEPLOY_PATH) as {
+      deployFolder: (...args: unknown[]) => Promise<string>
+    }
+    const original = deployModule.deployFolder
+    const started: unknown[] = []
+    let releaseFirst = () => {}
+    deployModule.deployFolder = (_config, args) => {
+      started.push(args)
+      return new Promise<string>((resolve) => {
+        releaseFirst = () => resolve('deployed')
+      })
+    }
+    // Anything forwarded would reach this server.
+    const forwarded: unknown[] = []
+    const server = serve(async (req) => {
+      forwarded.push(await req.json())
+      return new Response(null, { status: 202 })
+    })
+    try {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      let written = ''
+      output.on('data', (chunk) => (written += String(chunk)))
+      const config = bridge.readConfig({
+        TEMPS_URL: `http://127.0.0.1:${server.port}`,
+        TEMPS_API_KEY: KEY,
+      })
+      bridge.run(config, input, output, () => {})
+      const call = (id: number) =>
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          method: 'tools/call',
+          params: { name: 'temps_deploy_folder', arguments: { n: id } },
+        })
+      input.write(`${call(1)}\n${call(2)}\n`)
+      while (started.length === 0) await Bun.sleep(1)
+      input.write(
+        `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 2 } })}\n`
+      )
+      await Bun.sleep(10)
+      releaseFirst()
+      await Bun.sleep(30)
+      expect(started).toEqual([{ n: 1 }])
+      const replies = written
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { id: number })
+      expect(replies.map((reply) => reply.id)).toEqual([1])
+      expect(forwarded).toEqual([])
+      input.end()
+    } finally {
+      deployModule.deployFolder = original
+      server.stop(true)
+    }
   })
 })
 

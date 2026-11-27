@@ -5,7 +5,7 @@ import {
   getAiHarnessStatusOptions,
   getProjectsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import { getProjects } from '@/api/client/sdk.gen'
+import { getEnvironments, getProjects } from '@/api/client/sdk.gen'
 import { Badge } from '@/components/ui/badge'
 import { CopyButton } from '@/components/ui/copy-button'
 import { problemDetail } from '@/lib/api-problem'
@@ -15,7 +15,12 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ChoiceList } from './ChoiceList'
 import { LATER_REASONS, deployAppPrompt } from './onboarding'
-import { newProjects, projectsBaseline, type ProjectsBaseline } from './ship'
+import {
+  hasLiveEnvironment,
+  newProjects,
+  projectsBaseline,
+  type ProjectsBaseline,
+} from './ship'
 import { useUpdateOnboarding } from './useOnboarding'
 
 type Source = 'agent' | 'project'
@@ -67,14 +72,22 @@ export function ShipStep() {
     setBefore(projectsBaseline(projects.data.list, projects.data.serverDate))
   const appeared = newProjects(before, list)
 
-  const finish = async (path: string) => {
-    await updateOnboarding.mutateAsync({ done: ['app'], completed: true })
-    await queryClient.invalidateQueries({ queryKey: getProjectsQueryKey() })
-    navigate(path)
-  }
-
+  // The app step is done once the project is live; opening one whose
+  // deployment failed or has not finished closes the wizard and leaves the
+  // step open, as New project does.
   const openCreated = useMutation({
-    mutationFn: async (slug: string) => finish(`/projects/${slug}`),
+    mutationFn: async (project: { id: number; slug: string }) => {
+      const { data } = await getEnvironments({
+        path: { project_id: project.id },
+        throwOnError: true,
+      })
+      const live = hasLiveEnvironment(data)
+      await updateOnboarding.mutateAsync(
+        live ? { done: ['app'], completed: true } : { completed: true }
+      )
+      await queryClient.invalidateQueries({ queryKey: getProjectsQueryKey() })
+      navigate(`/projects/${project.slug}`)
+    },
   })
   // Leaving for New project closes the wizard but leaves the step open:
   // nothing is live until that page deploys.
@@ -164,11 +177,11 @@ export function ShipStep() {
                       size="sm"
                       busy={
                         openCreated.isPending &&
-                        openCreated.variables === p.slug
+                        openCreated.variables?.slug === p.slug
                       }
                       busyLabel="Opening…"
                       aria-disabled={pending || undefined}
-                      onClick={() => !pending && openCreated.mutate(p.slug)}
+                      onClick={() => !pending && openCreated.mutate(p)}
                       title={`Open ${p.name}`}
                       aria-label={`Open ${p.name}`}
                     >

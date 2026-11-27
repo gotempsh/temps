@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { bridgeKeyFilePath, type McpServerEntry } from './base.js'
-import { ClaudeCodeAdapter, claudeCodeAddArgs, parseClaudeCodeMcpGetOutput } from './claude-code.js'
+import { bridgeKeyFilePath, localBridgeCommand, type McpServerEntry } from './base.js'
+import { ClaudeCodeAdapter, claudeCodeAddArgs, claudeCodeEntryMatches, parseClaudeCodeMcpGetOutput } from './claude-code.js'
 
 describe('parseClaudeCodeMcpGetOutput', () => {
   test('extracts the URL from a well-formed mcp get entry', () => {
@@ -127,6 +127,9 @@ function fakeCli(dir: string): string {
   return file
 }
 
+/** The arguments Claude Code saves for an entry's bridge. */
+const savedArgs = (entry: McpServerEntry): string[] => localBridgeCommand(entry, entry.bridge!).args
+
 const bridgeTo = (origin: string, apiKey: string): McpServerEntry => ({
   url: `${origin}/mcp?write=1`,
   apiKey,
@@ -163,6 +166,78 @@ describe('ClaudeCodeAdapter.addServer with a bridge', () => {
     expect(readFileSync(fileA, 'utf8').trim()).toBe('key-a')
     const keys = readdirSync(join(dir, '.temps', 'mcp')).map((name) => readFileSync(join(dir, '.temps', 'mcp', name), 'utf8'))
     expect(keys.join('')).not.toContain('key-b')
+  })
+
+  test('a refused install is already installed only when the setup is the same, not merely the instance', async () => {
+    const env = { PATH: process.env.PATH, STATE_DIR: join(dir, 'state') }
+    const adapter = new ClaudeCodeAdapter({ binary: fakeCli(dir), home: dir, env })
+    // The ordinary HTTP entry first, as `claude mcp get` prints it.
+    mkdirSync(env.STATE_DIR, { recursive: true })
+    writeFileSync(
+      join(env.STATE_DIR, 'entry'),
+      'temps:\n  Scope: User config\n  Type: http\n  URL: https://a.example.test/mcp\n',
+    )
+    // Asked again with a folder: Claude keeps the HTTP entry, which cannot
+    // deploy folders, so this is no success.
+    const withFolder = await adapter.addServer(bridgeTo('https://a.example.test', 'key-a2'))
+    expect(withFolder.success).toBe(false)
+    expect(withFolder.reason).toContain('set up differently')
+    expect(withFolder.reason).toContain('temps mcp remove claude-code')
+
+    // A bridge asked for other folders is not the installed one either.
+    expect((await adapter.removeServer()).success).toBe(true)
+    await adapter.addServer(bridgeTo('https://a.example.test', 'key-a'))
+    const other = await adapter.addServer({
+      ...bridgeTo('https://a.example.test', 'key-a3'),
+      bridge: { folders: ['/srv/apps', '/srv/more'], packageSpec: '@temps-sdk/cli@1.2.3' },
+    })
+    expect(other.success).toBe(false)
+    expect(other.reason).toContain('set up differently')
+  })
+
+  test('a bridge for a folder with a space in its name is recognised as installed from the saved arguments', async () => {
+    const env = { PATH: process.env.PATH, STATE_DIR: join(dir, 'state') }
+    const adapter = new ClaudeCodeAdapter({ binary: fakeCli(dir), home: dir, env })
+    const entry = {
+      ...bridgeTo('https://a.example.test', 'key-a'),
+      bridge: { folders: ['/srv/My Projects'], packageSpec: '@temps-sdk/cli@1.2.3' },
+    }
+    expect(await adapter.addServer(entry)).toEqual({ success: true })
+    // Without Claude Code's saved configuration the printed line is all
+    // there is, and it cannot tell this folder from others: not installed.
+    expect((await adapter.addServer({ ...entry, apiKey: 'key-a2' })).success).toBe(false)
+    // With it, as Claude Code keeps it, the arguments are exact.
+    writeFileSync(
+      join(dir, '.claude.json'),
+      JSON.stringify({ mcpServers: { temps: { type: 'stdio', command: 'npx', args: savedArgs(entry) } } }),
+    )
+    expect(await adapter.addServer({ ...entry, apiKey: 'key-a3' })).toEqual({
+      success: true,
+      alreadyInstalled: true,
+    })
+  })
+
+  test('different folder lists that print the same line are never taken for each other', () => {
+    const two = {
+      ...bridgeTo('https://a.example.test', 'key-a'),
+      bridge: { folders: ['/srv/a', '/srv/b'], packageSpec: '@temps-sdk/cli@1.2.3' },
+    }
+    const one = {
+      ...two,
+      bridge: { folders: ['/srv/a --folder /srv/b'], packageSpec: '@temps-sdk/cli@1.2.3' },
+    }
+    // Both print this line.
+    const printed =
+      'temps:\n  Type: stdio\n  Command: npx\n  Args: -y @temps-sdk/cli@1.2.3 mcp bridge --url https://a.example.test --folder /srv/a --folder /srv/b\n'
+    // From the line alone: the two folders match, the one with spaces is
+    // unverifiable and so not installed.
+    expect(claudeCodeEntryMatches(printed, two)).toBe(true)
+    expect(claudeCodeEntryMatches(printed, one)).toBe(false)
+    // From the saved arguments, each matches only itself.
+    expect(claudeCodeEntryMatches(printed, two, savedArgs(two))).toBe(true)
+    expect(claudeCodeEntryMatches(printed, one, savedArgs(two))).toBe(false)
+    expect(claudeCodeEntryMatches(printed, two, savedArgs(one))).toBe(false)
+    expect(claudeCodeEntryMatches(printed, one, savedArgs(one))).toBe(true)
   })
 
   test('a refused install for the same instance is already installed, and leaves the key the entry sends', async () => {

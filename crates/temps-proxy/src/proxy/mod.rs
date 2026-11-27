@@ -4500,7 +4500,15 @@ impl ProxyHttp for LoadBalancer {
             )?
         } else if let Some(route) = ctx.private_route.as_ref() {
             // ADR-115 D3: the private route admitted in `request_filter`, and
-            // nothing else; no fallback to the console.
+            // nothing else; no fallback to the console. A static route's
+            // files are answered in `request_filter`; one reaching here has
+            // no upstream, and must not fall back to the console address.
+            if route.static_dir().is_some() {
+                return Err(Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    "private route is static and has no upstream",
+                ));
+            }
             crate::services::peer_for_selection(
                 route.select_backend_avoiding(&ctx.failed_upstreams),
             )?

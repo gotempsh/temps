@@ -541,6 +541,17 @@ pub enum ProjectError {
         reason: String,
     },
 
+    /// A project update does not change its storage links, so it cannot
+    /// change their variable aliases either. Refused instead of answering
+    /// success and dropping them; a link's aliases are set on the link.
+    #[error(
+        "Updating project {project_id} does not change its storage links, so it cannot set variable aliases for storage services {service_ids:?}. Set them on the link instead: `temps services link --id <service> --project <project> --env-alias APP_NAME=INJECTED_NAME`."
+    )]
+    StorageAliasesOnUpdate {
+        project_id: i32,
+        service_ids: Vec<i32>,
+    },
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 

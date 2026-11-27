@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { bridgeApiKey } from '../bridge.js'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -192,9 +193,17 @@ describe('the local bridge entry', () => {
         '--folder',
         '/srv/apps',
       ],
-      env: { TEMPS_API_KEY: 'secret-key' },
+      env: { TEMPS_API_KEY: 'secret-key', TEMPS_API_KEY_FILE: '' },
     })
     expect(command.args.join(' ')).not.toContain('secret-key')
+  })
+
+  test('an inline-key entry overrides an inherited key file, which would win over its key', () => {
+    const command = localBridgeCommand(entry, entry.bridge!)
+    // What an app such as VS Code does: its own environment, then the entry's.
+    const inherited = { TEMPS_API_KEY_FILE: '/home/me/.temps/mcp/instance-a.key', HOME: '/home/me' }
+    const launched = { ...inherited, ...command.env }
+    expect(bridgeApiKey(launched)).toBe('secret-key')
   })
 
   test('with a key file, the environment names the file and holds no key', () => {

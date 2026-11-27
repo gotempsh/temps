@@ -268,6 +268,17 @@ pub async fn run_agent_loop(
         }
 
         if response.tool_calls.is_empty() {
+            // A reply with neither text nor a tool call is no final message:
+            // an empty `choices` array or an empty assistant message. Ending
+            // the run as a success would hand a report run a finish event
+            // for its analysis.
+            if text.trim().is_empty() {
+                return Err(AgentError::AgentModelFailed {
+                    run_id: request.run_id,
+                    turn,
+                    reason: "the model's reply had no text and no tool call".to_string(),
+                });
+            }
             transcript
                 .push(json!({ "type": "temps.finish", "reason": "stop", "turns": turn }))
                 .await;
@@ -512,7 +523,9 @@ fn exec_command(cwd: &str, command: &str, secs: u64) -> Vec<String> {
         secs.to_string(),
         "sh".to_string(),
         "-c".to_string(),
-        format!("cd {} && {}", shell_quote(cwd), command),
+        // `cd X && a; b` would still run `b` where the shell started when
+        // `X` is missing: stop the whole script instead.
+        format!("cd {} || exit 1\n{}", shell_quote(cwd), command),
     ]
 }
 
@@ -765,7 +778,7 @@ mod tests {
                 "120",
                 "sh",
                 "-c",
-                "cd '/workspace' && cargo test"
+                "cd '/workspace' || exit 1\ncargo test"
             ]
         );
 
@@ -1000,7 +1013,7 @@ mod tests {
     #[test]
     fn a_cwd_with_a_quote_cannot_break_out_of_the_cd() {
         let cmd = exec_command("/tmp/it's", "ls", 5);
-        assert_eq!(cmd[6], r"cd '/tmp/it'\''s' && ls");
+        assert_eq!(cmd[6], "cd '/tmp/it'\\''s' || exit 1\nls");
     }
 
     #[test]
@@ -1079,5 +1092,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((outcome.tokens_input, outcome.tokens_output), (None, None));
+    }
+
+    /// A gateway reply with no text and no tool call (an empty `choices`
+    /// array) fails the run instead of completing it with nothing.
+    #[tokio::test]
+    async fn an_empty_reply_fails_the_run() {
+        let ai = ScriptedAi::new(vec![Ok(ChatTurnResponse {
+            content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        })]);
+        let error = run_agent_loop(&ai, &MemorySandbox::default(), request(5), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::AgentModelFailed { turn: 1, .. }),
+            "{error:?}"
+        );
+
+        let blank = ScriptedAi::new(vec![Ok(text_turn("   "))]);
+        assert!(
+            run_agent_loop(&blank, &MemorySandbox::default(), request(5), None)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A missing working directory stops the whole script: nothing after
+    /// the first command runs in the directory the shell started in.
+    #[test]
+    fn a_missing_cwd_stops_every_command_after_it() {
+        let dir = std::env::temp_dir().join(format!("agent-loop-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing");
+        let marker = dir.join("ran");
+        let cmd = exec_command(
+            missing.to_str().unwrap(),
+            &format!("pwd; touch {}", shell_quote(marker.to_str().unwrap())),
+            5,
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd[6])
+            .current_dir(&dir)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert!(!marker.exists(), "a command after the failed cd ran");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

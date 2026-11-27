@@ -6,6 +6,7 @@ import { initialRows } from './env'
 import {
   detectedFrom,
   linkAliases,
+  hasLiveEnvironment,
   newProjects,
   projectNameFrom,
   projectsBaseline,
@@ -122,5 +123,20 @@ describe('new projects', () => {
 
   test('nothing is new before the step has its first listing', () => {
     expect(newProjects(null, [at(1, '2026-11-26T10:00:00Z')])).toEqual([])
+  })
+})
+
+describe('live environments', () => {
+  test('only an environment serving a deployment counts', () => {
+    expect(hasLiveEnvironment([])).toBe(false)
+    expect(hasLiveEnvironment([{ current_deployment_id: null }, {}])).toBe(
+      false
+    )
+    expect(
+      hasLiveEnvironment([
+        { current_deployment_id: null },
+        { current_deployment_id: 7 },
+      ])
+    ).toBe(true)
   })
 })

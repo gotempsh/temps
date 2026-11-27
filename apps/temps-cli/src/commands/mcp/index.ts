@@ -501,8 +501,11 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   }
   info(`Restart ${adapter.label} to pick up the change.`)
   if (!bridge) {
+    // Claude Code refuses a second entry under the same name, so its entry
+    // is removed first; the other apps replace theirs.
+    const first = adapter.id === 'claude-code' ? `run temps mcp remove ${adapter.id}, then ` : ''
     info(
-      `To let ${adapter.label} deploy project folders from this computer, run this again with --deploy-folder <folder that holds your projects>.`,
+      `To let ${adapter.label} deploy project folders from this computer, ${first}run this again with --deploy-folder <folder that holds your projects>.`,
     )
   }
 

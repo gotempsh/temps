@@ -143,7 +143,7 @@ export const AUDIENCES: Array<{ id: Audience; label: string; detail: string }> =
       id: 'private',
       label: 'Only my devices',
       detail:
-        'Over your private network: Tailscale, WireGuard, your LAN… Nothing is reachable from the internet.',
+        'Over your private network: Tailscale, WireGuard, your LAN… The names set up here answer only there; apps keep their generated addresses.',
     },
   ]
 
@@ -280,9 +280,97 @@ export function dnsProviderFor(
   }
 }
 
-/** The registrable domain: the last two labels. The token check lists the real zones. */
+/**
+ * Public suffixes of two labels, under which anyone registers a domain: under
+ * them the zone is the last three labels (example.co.uk), never the suffix
+ * itself (co.uk). The common ones only; the token check lists the real zones.
+ */
+const TWO_LABEL_SUFFIXES = new Set([
+  'ac.uk',
+  'co.uk',
+  'gov.uk',
+  'ltd.uk',
+  'me.uk',
+  'net.uk',
+  'org.uk',
+  'plc.uk',
+  'sch.uk',
+  'com.au',
+  'net.au',
+  'org.au',
+  'edu.au',
+  'gov.au',
+  'id.au',
+  'asn.au',
+  'co.nz',
+  'net.nz',
+  'org.nz',
+  'ac.nz',
+  'govt.nz',
+  'co.jp',
+  'ne.jp',
+  'or.jp',
+  'ac.jp',
+  'go.jp',
+  'co.kr',
+  'or.kr',
+  'co.in',
+  'net.in',
+  'org.in',
+  'firm.in',
+  'gen.in',
+  'ind.in',
+  'co.za',
+  'org.za',
+  'web.za',
+  'co.il',
+  'org.il',
+  'co.id',
+  'or.id',
+  'web.id',
+  'com.br',
+  'net.br',
+  'org.br',
+  'com.mx',
+  'org.mx',
+  'com.ar',
+  'com.co',
+  'com.pe',
+  'com.cn',
+  'net.cn',
+  'org.cn',
+  'com.hk',
+  'org.hk',
+  'com.tw',
+  'org.tw',
+  'com.sg',
+  'org.sg',
+  'com.my',
+  'com.ph',
+  'com.vn',
+  'co.th',
+  'in.th',
+  'com.tr',
+  'com.ua',
+  'com.pl',
+  'com.es',
+  'com.pt',
+  'co.at',
+  'or.at',
+  'com.eg',
+  'com.sa',
+  'com.ng',
+  'co.ke',
+])
+
+/** The registrable domain: the last two labels, or three under a two-label public suffix. The token check lists the real zones. */
 export function zoneOf(domain: string): string {
-  return domain.split('.').slice(-2).join('.')
+  const labels = domain.split('.')
+  const lastTwo = labels.slice(-2).join('.')
+  if (labels.length > 2 && TWO_LABEL_SUFFIXES.has(lastTwo.toLowerCase())) {
+    return labels.slice(-3).join('.')
+  }
+  return lastTwo
 }
 
 /** Whether a wildcard under this domain is deeper than Cloudflare's free certificate covers. */
@@ -421,7 +509,8 @@ export function nameProblem(choice: AccessChoice): string | null {
   ) {
     const zone = zoneOf(choice.domain)
     const [first, ...rest] = choice.domain.split('.')
-    return `Cloudflare’s free certificate covers one level under ${zone}. Use ${first}.${zone}, or ${first}-${rest.slice(0, -2).join('-')}.${zone}.`
+    const middle = rest.slice(0, rest.length - zone.split('.').length)
+    return `Cloudflare’s free certificate covers one level under ${zone}. Use ${first}.${zone}, or ${first}-${middle.join('-')}.${zone}.`
   }
   return null
 }
@@ -519,6 +608,20 @@ export interface AccessPlan {
   caveats: string[]
 }
 
+/**
+ * What a private way in leaves as it was. It serves the names it sets up on
+ * the private network only; every app still gets its generated addresses,
+ * one per environment and one per deployment, which this step does not
+ * change. They answer wherever this box answers from the internet.
+ */
+export function generatedAddressesCaveat(facts: BoxFacts): string {
+  const where =
+    facts.inbound === false
+      ? 'This box doesn’t answer from the internet now, so nothing reaches them from there until it does.'
+      : 'They are public wherever this box answers from the internet.'
+  return `Every app still gets its generated addresses, one for each environment and one for each deployment, and a private name doesn’t replace them. ${where}`
+}
+
 export function accessPlan(choice: AccessChoice, facts: BoxFacts): AccessPlan {
   const name = recordName(choice)
   const perApp = choice.naming === 'per_app'
@@ -611,13 +714,17 @@ export function accessPlan(choice: AccessChoice, facts: BoxFacts): AccessPlan {
         'Paste it here',
       ],
       temps: [
-        `Serve these apps only to connections on ${facts.privateNetwork?.label} (${facts.privateNetwork?.address}:443), never on a public address`,
+        `Serve the apps under ${name} only to connections on ${facts.privateNetwork?.label} (${facts.privateNetwork?.address}:443), never on a public address`,
         perApp
           ? `Get ${name} a certificate by DNS challenge, and one for each new app`
-          : `Get one certificate for ${name} by DNS challenge, since nothing on the internet can reach this box`,
+          : `Get one certificate for ${name} by DNS challenge, since the private address can’t be reached from the internet`,
         `Refuse any request from outside ${facts.privateNetwork?.admit.join(', ')}`,
       ],
       caveats: [
+        // Nothing moves a new app here by itself, and its generated
+        // addresses keep serving it beside the private name.
+        `To reach an app on this network, add ${perApp ? 'its private name' : `its name under ${name}`} on the app’s Domains page.`,
+        generatedAddressesCaveat(facts),
         ...eachNew,
         `The record${perApp ? 's are' : ' is'} public but point${perApp ? '' : 's'} at a private address: only devices on that network can connect.`,
       ],
@@ -632,6 +739,7 @@ export function accessPlan(choice: AccessChoice, facts: BoxFacts): AccessPlan {
     temps: [`Serve the app at ${base.example} through Tailscale Serve`],
     caveats: [
       'One app per machine name. Each further app needs a Tailscale Service: a tagged machine and an OAuth client.',
+      generatedAddressesCaveat(facts),
       'The machine’s name appears in public certificate logs.',
     ],
   }

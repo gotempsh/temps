@@ -1487,6 +1487,7 @@ pub async fn get_project_by_slug(
     request_body = CreateProjectRequest,
     responses(
         (status = 200, description = "Project updated successfully", body = ProjectResponse),
+        (status = 400, description = "Invalid update, such as storage variable aliases, which are set on the service link"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Project not found"),
@@ -1522,7 +1523,8 @@ pub async fn update_project(
         environment_variables: project.environment_variables.clone(),
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids.clone(),
-        storage_service_env_aliases: Default::default(),
+        // Refused by the service when set: an update keeps the links.
+        storage_service_env_aliases: project.storage_service_env_aliases.clone(),
         storage_service_claim_ids: Vec::new(),
         storage_service_claim_user_id: None,
         is_public_repo: None,               // Keep existing setting
@@ -3968,6 +3970,27 @@ mod tests {
     use axum::http::StatusCode;
     use chrono::Utc;
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// An update cannot set a link's aliases: the service refuses them, and
+    /// the client reads a 400 naming where they are set.
+    #[test]
+    fn a_refused_storage_alias_is_a_bad_request_naming_the_link() {
+        let problem: temps_core::problemdetails::Problem =
+            crate::services::types::ProjectError::StorageAliasesOnUpdate {
+                project_id: 4,
+                service_ids: vec![12],
+            }
+            .into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default()
+            .to_string();
+        assert!(detail.contains("[12]"), "{detail}");
+        assert!(detail.contains("temps services link"), "{detail}");
+    }
     use temps_auth::{AuthContext, Permission};
     use temps_entities::users;
     use temps_providers::ExternalServiceProjectScope;

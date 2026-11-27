@@ -55,7 +55,11 @@ export function localBridgeCommand(entry: McpServerEntry, bridge: LocalBridge, k
       new URL(entry.url).origin,
       ...bridge.folders.flatMap((folder) => ['--folder', folder]),
     ],
-    env: keyFile ? { TEMPS_API_KEY_FILE: keyFile } : { TEMPS_API_KEY: entry.apiKey },
+    // The key file wins over TEMPS_API_KEY, so an entry that holds its key
+    // inline clears TEMPS_API_KEY_FILE: one inherited from wherever the app
+    // was started, for another instance, would otherwise be read and its key
+    // sent to this entry's URL.
+    env: keyFile ? { TEMPS_API_KEY_FILE: keyFile } : { TEMPS_API_KEY: entry.apiKey, TEMPS_API_KEY_FILE: '' },
   }
 }
 

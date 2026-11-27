@@ -4,6 +4,8 @@
 import { describe, expect, test } from 'bun:test'
 import {
   accessPlan,
+  AUDIENCES,
+  generatedAddressesCaveat,
   accessProblems,
   accessSummary,
   allWays,
@@ -194,6 +196,23 @@ describe('access', () => {
     expect(accessPlan(nested, FACTS).records[0].name).toBe('*.example.com')
     expect(flatNote(nested)).toMatch(/one level under example\.com/)
     expect(flatNote(choice({}))).toBeNull()
+    // A zone under a two-label public suffix is the apex, not nested: the
+    // zone is example.co.uk, never co.uk.
+    const uk = choice({ domain: 'example.co.uk' })
+    expect(accessProblems(uk, FACTS)).toEqual([])
+    expect(flatNote(uk)).toBeNull()
+    expect(appAddress('hello', uk, FACTS)).toBe('hello.example.co.uk')
+    expect(accessPlan(uk, FACTS).records[0].name).toBe('*.example.co.uk')
+    const ukNested = choice({ domain: 'apps.example.co.uk' })
+    expect(appAddress('hello', ukNested, FACTS)).toBe(
+      'hello-apps.example.co.uk'
+    )
+    expect(flatNote(ukNested)).toMatch(/one level under example\.co\.uk/)
+    expect(
+      nameProblem(
+        choice({ naming: 'per_app', domain: 'hello.apps.example.co.uk' })
+      )
+    ).toMatch(/Use hello\.example\.co\.uk, or hello-apps\.example\.co\.uk/)
     expect(
       appAddress(
         'hello',
@@ -303,6 +322,38 @@ describe('access', () => {
     expect(tailnet.records[0].value).toBe('100.101.102.103')
     expect(tailnet.who).toMatch(/100\.64\.0\.0\/10/)
     expect(tailnet.temps.some((t) => t.includes('DNS challenge'))).toBe(true)
+    // It promises privacy only for the names it sets up, and says every
+    // app keeps its generated addresses, per environment and per
+    // deployment, which it does not change.
+    expect(
+      tailnet.temps.some((t) => t.includes('apps under *.home.example.com'))
+    ).toBe(true)
+    expect(tailnet.temps.some((t) => /^Serve these apps/.test(t))).toBe(false)
+    expect(tailnet.caveats[0]).toContain('Domains page')
+    expect(tailnet.caveats[0]).not.toMatch(/alone|only/)
+    expect(tailnet.caveats[1]).toMatch(
+      /one for each environment and one for each deployment, and a private name doesn’t replace them/
+    )
+    expect(tailnet.caveats[1]).not.toMatch(/answer from the internet now/)
+    expect(
+      accessPlan(
+        choice({
+          audience: 'private',
+          way: 'tailnet_domain',
+          domain: 'home.example.com',
+        }),
+        closed
+      ).caveats[1]
+    ).toMatch(/doesn’t answer from the internet now/)
+    // The Tailscale Serve name says the same, and the choice itself no
+    // longer promises that nothing is reachable from the internet.
+    expect(
+      accessPlan(choice({ audience: 'private', way: 'tailnet_name' }), FACTS)
+        .caveats
+    ).toContain(generatedAddressesCaveat(FACTS))
+    expect(AUDIENCES.find((a) => a.id === 'private')?.detail).not.toMatch(
+      /Nothing is reachable/
+    )
   })
 
   test('any private network serves your domain privately, not only Tailscale', () => {

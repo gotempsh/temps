@@ -1414,6 +1414,12 @@ impl From<ProjectError> for Problem {
                     .with_detail(err.to_string())
             }
 
+            err @ ProjectError::StorageAliasesOnUpdate { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Storage Aliases Are Set On The Link")
+                    .with_detail(err.to_string())
+            }
+
             ProjectError::InvalidInput(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Input")
                 .with_detail(msg),

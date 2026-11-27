@@ -149,3 +149,18 @@ export function newProjects<T extends { id: number; created_at: string }>(
     (p) => !baseline.ids.has(p.id) && Date.parse(p.created_at) >= baseline.since
   )
 }
+
+/** Deployment states in which an app is live: serving now, or a static build that finished. */
+/**
+ * Whether one of a project's environments is serving a deployment. Opening a
+ * project from the step marks the app step done only then: an agent may
+ * create a project and fail to upload its source, or its first build may
+ * fail. An environment's current deployment is set only when one completes,
+ * so this holds however many failed after it, which a page of the
+ * deployment history cannot tell.
+ */
+export function hasLiveEnvironment(
+  environments: { current_deployment_id?: number | null }[]
+): boolean {
+  return environments.some((e) => e.current_deployment_id != null)
+}

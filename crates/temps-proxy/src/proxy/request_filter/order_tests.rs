@@ -155,7 +155,7 @@ fn fixture() -> Fixture {
     fixture_with(ProxyConfig::default())
 }
 
-fn project(id: i32) -> projects::Model {
+pub(super) fn project(id: i32) -> projects::Model {
     let now = chrono::Utc::now();
     projects::Model {
         id,
@@ -221,7 +221,7 @@ fn project(id: i32) -> projects::Model {
     }
 }
 
-fn environment(id: i32, project_id: i32) -> environments::Model {
+pub(super) fn environment(id: i32, project_id: i32) -> environments::Model {
     let now = chrono::Utc::now();
     environments::Model {
         id,
@@ -2288,6 +2288,57 @@ async fn a_peer_outside_the_range_is_refused_on_the_private_address() {
     send_on_socket(&lb, &listener, &get_on(PRIVATE_HOST, "/"), CLEAN_IP)
         .await
         .assert_answered("private_outside_range", "403");
+}
+
+/// ADR-115 D3: the file stage serves a private static route only when the
+/// project stage admitted the request for that route's environment. Here
+/// the stage itself runs, so it cannot go back to the public resolver
+/// (which does not know the host) or skip the admission check unnoticed.
+#[tokio::test]
+async fn the_file_stage_refuses_a_private_static_route_its_environment_did_not_admit() {
+    let f = fixture();
+    let mut route = route_for(OTHER_ENVIRONMENT, |_, _| {});
+    route.backend = BackendType::StaticDir {
+        path: "projects/site/production/deploy-1".to_string(),
+    };
+    for (environment_id, admitted) in [
+        (None, false),
+        (Some(ENVIRONMENT), false),
+        (Some(OTHER_ENVIRONMENT), true),
+    ] {
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        client
+            .write_all(get_on(PRIVATE_HOST, "/").as_bytes())
+            .await
+            .expect("write request");
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        assert!(session.read_request().await.expect("read request"));
+        let mut ctx = f.lb.new_ctx();
+        ctx.host = PRIVATE_HOST.to_string();
+        ctx.path = "/".to_string();
+        ctx.private_route = Some(route.clone());
+        if let Some(id) = environment_id {
+            ctx.project = Some(Arc::new(project(PROJECT)));
+            ctx.environment = Some(Arc::new(environment(id, PROJECT)));
+        }
+        let flow =
+            f.lb.static_files_stage(&mut session, &mut ctx)
+                .await
+                .expect("static_files_stage");
+        if admitted {
+            // Served from the route's own directory: not refused, and not
+            // passed on as though the host had no static files.
+            assert_ne!(ctx.routing_status, "private_route_unadmitted");
+            assert!(matches!(flow, super::Flow::Answered), "{}", ctx.routing_status);
+        } else {
+            assert!(matches!(flow, super::Flow::Answered));
+            assert_eq!(ctx.routing_status, "private_route_unadmitted");
+            drop(session);
+            let mut raw = Vec::new();
+            client.read_to_end(&mut raw).await.expect("read response");
+            assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 404"));
+        }
+    }
 }
 
 /// Without consent nothing changes: the public host is routed as before,

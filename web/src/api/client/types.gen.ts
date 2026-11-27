@@ -79192,6 +79192,10 @@ export type UpdateProjectData = {
 
 export type UpdateProjectErrors = {
     /**
+     * Invalid update, such as storage variable aliases, which are set on the service link
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;

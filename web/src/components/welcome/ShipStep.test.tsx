@@ -41,9 +41,25 @@ function renderStep() {
   return { view, client }
 }
 
-function mock(status: 'connected' | 'missing', projects: () => unknown[]) {
+function mock(
+  status: 'connected' | 'missing',
+  projects: () => unknown[],
+  /** Each environment's current (live) deployment, by project. */
+  current: Record<number, (number | null)[]> = { 2: [1], 3: [1] }
+) {
   const patches: unknown[] = []
+  const environmentsOf = (id: number) => () =>
+    jsonResponse(
+      (current[id] ?? []).map((deployment, i) => ({
+        id: i + 1,
+        project_id: id,
+        name: i === 0 ? 'production' : `preview-${i}`,
+        current_deployment_id: deployment,
+      }))
+    )
   const api = mockApi({
+    'GET /projects/2/environments': environmentsOf(2),
+    'GET /projects/3/environments': environmentsOf(3),
     'GET /api-keys/ai-harness/status': () =>
       jsonResponse({ status, reason: null, connected_via: null }),
     'GET /projects': () => {
@@ -115,6 +131,37 @@ test('a project another operator creates meanwhile is offered, not credited, and
   list = [project(3, 'agents-app', AFTER), ...list]
   await act(() => client.refetchQueries())
   fireEvent.click(await view.findByRole('button', { name: 'Open agents-app' }))
+  await view.findByText('Project page')
+  expect(patches).toEqual([{ done: ['app'], completed: true }])
+  api.restore()
+})
+
+test('opening a new project whose deployment failed leaves the app step open', async () => {
+  let list = [project(1, 'existing')]
+  const { api, patches } = mock('connected', () => list, { 2: [null] })
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  list = [project(2, 'broken-app', AFTER), ...list]
+  await act(() => client.refetchQueries())
+  fireEvent.click(await view.findByRole('button', { name: 'Open broken-app' }))
+  await view.findByText('Project page')
+  // The wizard closes, but nothing is live, so the step is not done.
+  expect(patches).toEqual([{ completed: true }])
+  api.restore()
+})
+
+test('a project live in one environment marks the step done, however many deployments failed since', async () => {
+  let list = [project(1, 'existing')]
+  // Its production deployment is live; a preview has none. How many
+  // failures came after it does not matter: the environment says what is live.
+  const { api, patches } = mock('connected', () => list, { 2: [null, 3] })
+  const { view, client } = renderStep()
+  await view.findByText('Waiting for a new project…')
+
+  list = [project(2, 'retried-app', AFTER), ...list]
+  await act(() => client.refetchQueries())
+  fireEvent.click(await view.findByRole('button', { name: 'Open retried-app' }))
   await view.findByText('Project page')
   expect(patches).toEqual([{ done: ['app'], completed: true }])
   api.restore()

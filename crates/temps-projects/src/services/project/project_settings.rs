@@ -8,6 +8,28 @@ use super::*;
 use temps_config::deployment_config::DeploymentConfigExt;
 use temps_presets::stored_preset::StoredPresetConfigExt;
 
+/// A project update does not change its storage links, so it cannot change
+/// their variable aliases either: refuse them instead of answering success
+/// and dropping them. Every caller of the update path goes through this, not
+/// only the HTTP handler.
+pub(crate) fn refuse_storage_aliases_on_update(
+    project_id: i32,
+    aliases: &BTreeMap<i32, BTreeMap<String, String>>,
+) -> Result<(), ProjectError> {
+    let service_ids: Vec<i32> = aliases
+        .iter()
+        .filter(|(_, names)| !names.is_empty())
+        .map(|(service_id, _)| *service_id)
+        .collect();
+    if service_ids.is_empty() {
+        return Ok(());
+    }
+    Err(ProjectError::StorageAliasesOnUpdate {
+        project_id,
+        service_ids,
+    })
+}
+
 impl ProjectService {
     pub async fn compose_security_policy(
         &self,
@@ -77,6 +99,7 @@ impl ProjectService {
         build_settings: TopLevelBuildSettings,
         caller: DeployCaller,
     ) -> Result<Project, ProjectError> {
+        refuse_storage_aliases_on_update(project_id, &request.storage_service_env_aliases)?;
         // Find the existing project
         let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())

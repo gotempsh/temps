@@ -456,6 +456,13 @@ function toolResult(id, text, isError) {
 }
 
 /** Whether a message calls the tool this bridge answers itself. */
+/** The request a `notifications/cancelled` message cancels, if it is one. */
+function cancelledRequestId(message) {
+  if (!message || message.method !== 'notifications/cancelled') return undefined
+  const params = message.params
+  return params && typeof params === 'object' ? params.requestId : undefined
+}
+
 function isDeployCall(message) {
   return (
     message.method === 'tools/call' &&
@@ -489,6 +496,60 @@ function withDeployTool(message, replies) {
   })
 }
 
+/** Folder deployments that may wait behind the one running. */
+const MAX_WAITING_DEPLOYS = 4
+
+/**
+ * One task at a time, with at most `maxWaiting` waiting behind it. A folder
+ * deployment holds its archive (up to the packing limit) and an upload
+ * connection until the server answers, so running them one by one bounds
+ * the bridge's memory to one of each; a call past the queue is refused at
+ * once rather than held.
+ *
+ * `queue(task, token)` runs `task` in its turn. `queue.withdraw(token)`
+ * takes a task that is still waiting out of the queue, freeing its place:
+ * it never runs, and its promise resolves with `null`. A task already
+ * running is not affected; it reports `false`.
+ */
+function serialQueue(maxWaiting) {
+  const waiting = []
+  let running = false
+  const next = () => {
+    if (running) return
+    const entry = waiting.shift()
+    if (!entry) return
+    running = true
+    Promise.resolve()
+      .then(entry.task)
+      .then(entry.resolve, entry.reject)
+      .finally(() => {
+        running = false
+        next()
+      })
+  }
+  const queue = (task, token) => {
+    if (running && waiting.length >= maxWaiting) {
+      return Promise.reject(
+        new Error(
+          `${waiting.length} folder deployments are already waiting for the one running. Try again once they finish.`
+        )
+      )
+    }
+    return new Promise((resolve, reject) => {
+      waiting.push({ task, token, resolve, reject })
+      next()
+    })
+  }
+  queue.withdraw = (token) => {
+    const at = waiting.findIndex((entry) => entry.token === token)
+    if (at === -1) return false
+    const [entry] = waiting.splice(at, 1)
+    entry.resolve(null)
+    return true
+  }
+  return queue
+}
+
 /**
  * Run the bridge over the given streams. `config` is either the settings or
  * the Error that explains why they are unusable; then every request is
@@ -500,6 +561,10 @@ function run(config, input, output, log) {
   let discarding = false
   let pending = 0
   let ended = false
+  const deployOneAtATime = serialQueue(MAX_WAITING_DEPLOYS)
+  // Folder deployments this bridge answers itself, by request id, so a
+  // cancellation of one stays here: the server never saw the call.
+  const localCalls = new Map()
 
   const write = (message) => output.write(`${JSON.stringify(message)}\n`)
   const maybeExit = () => {
@@ -528,22 +593,51 @@ function run(config, input, output, log) {
     const method =
       message && typeof message.method === 'string' ? message.method : 'reply'
     const started = Date.now()
+    const cancelled = cancelledRequestId(message)
+    if (cancelled !== undefined && localCalls.has(cancelled)) {
+      // MCP: the call is not answered once cancelled. One still waiting
+      // leaves the queue, freeing its place; one preparing its archive
+      // stops before its next request to Temps, the upload included; one
+      // already uploading has sent its archive.
+      const call = localCalls.get(cancelled)
+      call.cancelled = true
+      deployOneAtATime.withdraw(call)
+      log(`temps: ${deploy.DEPLOY_TOOL_NAME} request ${cancelled} cancelled`)
+      return
+    }
     if (isRequest && isDeployCall(message)) {
+      const call = { cancelled: false }
+      localCalls.set(id, call)
       // Answered here: a tool error is a result Claude reads, not a failure.
       try {
         if (config instanceof Error) throw config
-        const text = await deploy.deployFolder(
-          config,
-          message.params.arguments,
-          (verb, path, headers, body) => send(config, verb, path, headers, body)
+        const text = await deployOneAtATime(
+          () =>
+            deploy.deployFolder(
+              config,
+              message.params.arguments,
+              (verb, path, headers, body) => {
+                if (call.cancelled) {
+                  return Promise.reject(
+                    new Error(
+                      `${deploy.DEPLOY_TOOL_NAME} request ${id} was cancelled; nothing more is sent to Temps.`
+                    )
+                  )
+                }
+                return send(config, verb, path, headers, body)
+              }
+            ),
+          call
         )
-        write(toolResult(id, text, false))
+        if (!call.cancelled) write(toolResult(id, text, false))
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error)
-        write(toolResult(id, text, true))
+        if (!call.cancelled) write(toolResult(id, text, true))
+      } finally {
+        localCalls.delete(id)
       }
       log(
-        `temps: ${deploy.DEPLOY_TOOL_NAME} answered in ${Date.now() - started} ms`
+        `temps: ${deploy.DEPLOY_TOOL_NAME} ${call.cancelled ? 'cancelled' : 'answered'} in ${Date.now() - started} ms`
       )
       return
     }
@@ -618,6 +712,8 @@ function main(env = process.env, argv = process.argv.slice(2)) {
 }
 
 module.exports = {
+  serialQueue,
+  MAX_WAITING_DEPLOYS,
   plainHttpAllowed,
   tailnetLocalAddresses,
   plainHttpSource,

@@ -34,6 +34,45 @@ export function parseClaudeCodeMcpGetOutput(output: string): string | null {
 
 const CLAUDE_CODE_ID = 'claude-code'
 
+/** The text after `mcp bridge` in a printed command, its `--url` and `--folder` arguments; null when `text` starts no bridge. */
+function bridgeTarget(text: string): string | null {
+  const match = text.match(/\bmcp\s+bridge\b([^\n]*)/)
+  if (!match) return null
+  return (match[1] ?? '').trim()
+}
+
+/**
+ * Whether the entry `claude mcp get` printed is the one `entry` would install:
+ * the same transport, and the same URL (HTTP) or the same instance and
+ * folders (bridge). Only then is a refused duplicate already installed; an
+ * HTTP entry asked to deploy folders, or a bridge asked for other folders,
+ * is not.
+ *
+ * A bridge's folders are compared on `installedArgs`, the arguments as
+ * Claude Code saved them, when they could be read. The printed line joins
+ * them with spaces, so it cannot tell one folder named `/a --folder /b`
+ * from the two folders `/a` and `/b`: from it alone a bridge matches only
+ * when no requested argument has whitespace in it, and otherwise is
+ * reported as set up differently, never as installed.
+ */
+export function claudeCodeEntryMatches(
+  installed: string,
+  entry: McpServerEntry,
+  installedArgs: string[] | null = null,
+): boolean {
+  const target = bridgeTarget(installed)
+  if (!entry.bridge) return target === null && parseClaudeCodeMcpGetOutput(installed) === entry.url
+  if (target === null) return false
+  const command = localBridgeCommand(entry, entry.bridge).args
+  const wanted = command.slice(command.indexOf('bridge') + 1)
+  if (installedArgs) {
+    const at = installedArgs.indexOf('bridge')
+    return at !== -1 && JSON.stringify(installedArgs.slice(at + 1)) === JSON.stringify(wanted)
+  }
+  if (wanted.some((arg) => /\s/.test(arg))) return false
+  return JSON.stringify(target.split(/\s+/).filter(Boolean)) === JSON.stringify(wanted)
+}
+
 /**
  * The `claude mcp add` arguments for an entry: the HTTP endpoint, or the
  * bridge over stdio when it deploys local folders. The name comes before
@@ -95,6 +134,24 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
   /** Claude Code keeps one user configuration per config directory; key files are kept apart the same way. */
   private profile(): string {
     return this.env.CLAUDE_CONFIG_DIR ? path.resolve(this.env.CLAUDE_CONFIG_DIR) : ''
+  }
+
+  /**
+   * The arguments of the user-scope `temps` entry as Claude Code saved them
+   * (`.claude.json` in its config directory), or null when they cannot be
+   * read. Only used to tell whether a refused install is already in place.
+   */
+  private installedArgs(): string[] | null {
+    const dir = this.profile() || this.home
+    try {
+      const config = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')) as {
+        mcpServers?: Record<string, { args?: unknown }>
+      }
+      const args = config.mcpServers?.[MCP_SERVER_NAME]?.args
+      return Array.isArray(args) && args.every((arg) => typeof arg === 'string') ? args : null
+    } catch {
+      return null
+    }
   }
 
   private keyFile(entry: McpServerEntry): string {
@@ -183,12 +240,16 @@ export class ClaudeCodeAdapter implements McpClientAdapter {
       // entry reads: a refused install never changes the key it sends.
       if (keyFile) await restoreBridgeKeyFile(keyFile, previousKey).catch(() => undefined)
       if (/already exists/i.test(reason)) {
-        const installed = await this.getServerUrl()
-        if (sameOrigin(installed, entry.url)) return { success: true, alreadyInstalled: true }
+        const installedText = this.getServerEntry(binary)
+        const installed = installedText ? parseClaudeCodeMcpGetOutput(installedText) : null
+        if (installedText && claudeCodeEntryMatches(installedText, entry, this.installedArgs())) {
+          return { success: true, alreadyInstalled: true }
+        }
         const where = installed ? ` for ${new URL(installed).origin}` : ''
+        const how = sameOrigin(installed, entry.url) ? ', set up differently' : ''
         return {
           success: false,
-          reason: `Claude Code already has a ${MCP_SERVER_NAME} server${where}. Run temps mcp remove claude-code, then add it again.`,
+          reason: `Claude Code already has a ${MCP_SERVER_NAME} server${where}${how}. Run temps mcp remove claude-code, then add it again.`,
         }
       }
       return { success: false, reason }

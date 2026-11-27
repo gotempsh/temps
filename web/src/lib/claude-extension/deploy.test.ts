@@ -98,6 +98,17 @@ describe('what is never uploaded', () => {
       expect(deploy.alwaysLeftOut(name, false)).toBe(false)
     }
     expect(deploy.alwaysLeftOut('dist', true)).toBe(false)
+    // Credential stores kept in a project for a mounted configuration.
+    for (const store of [
+      '.aws',
+      '.azure',
+      '.docker',
+      '.gnupg',
+      '.kube',
+      '.ssh',
+    ]) {
+      expect(deploy.alwaysLeftOut(store, true)).toBe(true)
+    }
   })
 })
 
@@ -119,6 +130,53 @@ describe('.gitignore', () => {
   )
   const ignored = (path: string, isDirectory = false) =>
     deploy.isIgnored(rules, path, isDirectory)
+
+  test('bracket expressions read POSIX classes, negation and escapes as git does', () => {
+    const classes = deploy.parseIgnore(
+      [
+        'credential-[[:digit:]].json',
+        'key[[:upper:][:digit:]]',
+        'note[!a-c].md',
+        'raw[]x]',
+        'odd[[:nosuch:]]',
+      ].join('\n'),
+      ''
+    )
+    const hit = (p: string) => deploy.isIgnored(classes, p, false)
+    expect(hit('credential-1.json')).toBe(true)
+    expect(hit('config/credential-7.json')).toBe(true)
+    expect(hit('credential-x.json')).toBe(false)
+    expect(hit('credential-1]json')).toBe(false)
+    expect(hit('keyA')).toBe(true)
+    expect(hit('key4')).toBe(true)
+    expect(hit('keya')).toBe(false)
+    expect(hit('noted.md')).toBe(true)
+    expect(hit('notea.md')).toBe(false)
+    expect(hit('raw]')).toBe(true)
+    expect(hit('rawx')).toBe(true)
+    // An unknown class matches nothing, as in git.
+    expect(hit('oddn')).toBe(false)
+  })
+
+  test('a bracket never matches a slash, and a hyphen first after ! is literal', () => {
+    const hyphen = deploy.parseIgnore('credential[!-a].json', '')
+    // [!-a] is "not - and not a": 1 is excluded, as git excludes it.
+    expect(deploy.isIgnored(hyphen, 'credential1.json', false)).toBe(true)
+    expect(deploy.isIgnored(hyphen, 'credential-.json', false)).toBe(false)
+    expect(deploy.isIgnored(hyphen, 'credentiala.json', false)).toBe(false)
+
+    const exception = deploy.parseIgnore(
+      ['*.json', '!config[[:punct:]]local.json', 'a[/]b', 'x[!y]z'].join('\n'),
+      ''
+    )
+    const hit = (p: string) => deploy.isIgnored(exception, p, false)
+    // The exception re-includes config-local.json, never config/local.json.
+    expect(hit('config-local.json')).toBe(false)
+    expect(hit('config/local.json')).toBe(true)
+    expect(hit('a/b')).toBe(false)
+    expect(hit('x/z')).toBe(false)
+    expect(hit('xqz')).toBe(true)
+  })
 
   test('patterns match the way git matches them', () => {
     expect(ignored('dist', true)).toBe(true)
