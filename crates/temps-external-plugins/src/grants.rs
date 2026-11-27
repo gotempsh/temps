@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_plugin_protocol::channel::{PluginActorInfo, PluginHostPermission};
 
+use crate::scope::{PluginWriteArea, MAX_WRITE_PROJECTS};
 use crate::service_runtime::ServiceBinding;
 use thiserror::Error;
 
@@ -20,6 +21,12 @@ pub struct PluginGrantConfig {
     pub permissions: Vec<PluginHostPermission>,
     pub ai_daily_call_limit: u32,
     pub ai_max_output_tokens: u32,
+    /// What a plugin granted `api_write` may change. Empty: nothing.
+    #[serde(default)]
+    pub write_areas: Vec<PluginWriteArea>,
+    /// The only projects those changes may touch. Absent: every project.
+    #[serde(default)]
+    pub write_project_ids: Option<Vec<i32>>,
 }
 
 impl Default for PluginGrantConfig {
@@ -28,6 +35,8 @@ impl Default for PluginGrantConfig {
             permissions: Vec::new(),
             ai_daily_call_limit: 100,
             ai_max_output_tokens: 1_024,
+            write_areas: Vec::new(),
+            write_project_ids: None,
         }
     }
 }
@@ -311,7 +320,7 @@ impl PluginGrantService {
 
     pub async fn get(&self, plugin_name: &str) -> Result<PluginGrants, GrantError> {
         let row = self.db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "SELECT a.id::text AS id,a.plugin_name,a.active,COALESCE(g.permissions,ARRAY[]::text[]) AS permissions,COALESCE(g.ai_daily_call_limit,100) AS ai_daily_call_limit,COALESCE(g.ai_max_output_tokens,1024) AS ai_max_output_tokens FROM external_plugin_actors a LEFT JOIN external_plugin_grants g ON g.actor_id=a.id WHERE a.plugin_name=$1 AND a.active=TRUE",
+            "SELECT a.id::text AS id,a.plugin_name,a.active,COALESCE(g.permissions,ARRAY[]::text[]) AS permissions,COALESCE(g.ai_daily_call_limit,100) AS ai_daily_call_limit,COALESCE(g.ai_max_output_tokens,1024) AS ai_max_output_tokens,COALESCE(g.write_areas,ARRAY[]::text[]) AS write_areas,g.write_project_ids FROM external_plugin_actors a LEFT JOIN external_plugin_grants g ON g.actor_id=a.id WHERE a.plugin_name=$1 AND a.active=TRUE",
             [plugin_name.into()])).await
             .map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "read grants", source })?
             .ok_or_else(|| GrantError::NotFound { plugin_name: plugin_name.into() })?;
@@ -345,6 +354,25 @@ impl PluginGrantService {
                     operation: "decode AI token limit",
                     source,
                 })?;
+        let decode = |operation: &'static str| {
+            move |source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation,
+                source,
+            }
+        };
+        let stored_areas: Vec<String> = row
+            .try_get("", "write_areas")
+            .map_err(decode("decode write areas"))?;
+        // An area this build does not know grants nothing.
+        let mut write_areas: Vec<PluginWriteArea> = stored_areas
+            .iter()
+            .filter_map(|value| PluginWriteArea::from_stored(value))
+            .collect();
+        write_areas.sort();
+        let write_project_ids: Option<Vec<i32>> = row
+            .try_get("", "write_project_ids")
+            .map_err(decode("decode write projects"))?;
         Ok(PluginGrants {
             actor: PluginActorInfo {
                 id: row
@@ -361,6 +389,8 @@ impl PluginGrantService {
                 permissions,
                 ai_daily_call_limit: daily.max(0) as u32,
                 ai_max_output_tokens: output.max(0) as u32,
+                write_areas,
+                write_project_ids,
             },
         })
     }
@@ -383,14 +413,20 @@ impl PluginGrantService {
         config: PluginGrantConfig,
     ) -> Result<PluginGrants, GrantError> {
         validate(plugin_name, &config)?;
+        self.ensure_projects_exist(plugin_name, &config).await?;
         let values = config
             .permissions
             .iter()
             .map(|p| p.as_str().to_string())
             .collect::<Vec<_>>();
+        let areas = config
+            .write_areas
+            .iter()
+            .map(|area| area.as_str().to_string())
+            .collect::<Vec<_>>();
         let result = self.db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_grants(actor_id,permissions,ai_daily_call_limit,ai_max_output_tokens) SELECT id,$3,$4,$5 FROM external_plugin_actors WHERE plugin_name=$1 AND id=$2::uuid AND active=TRUE ON CONFLICT(actor_id) DO UPDATE SET permissions=EXCLUDED.permissions,ai_daily_call_limit=EXCLUDED.ai_daily_call_limit,ai_max_output_tokens=EXCLUDED.ai_max_output_tokens,updated_at=NOW()",
-            [plugin_name.into(), actor_id.into(), values.into(), (config.ai_daily_call_limit as i32).into(), (config.ai_max_output_tokens as i32).into()])).await
+            "INSERT INTO external_plugin_grants(actor_id,permissions,ai_daily_call_limit,ai_max_output_tokens,write_areas,write_project_ids) SELECT id,$3,$4,$5,$6,$7 FROM external_plugin_actors WHERE plugin_name=$1 AND id=$2::uuid AND active=TRUE ON CONFLICT(actor_id) DO UPDATE SET permissions=EXCLUDED.permissions,ai_daily_call_limit=EXCLUDED.ai_daily_call_limit,ai_max_output_tokens=EXCLUDED.ai_max_output_tokens,write_areas=EXCLUDED.write_areas,write_project_ids=EXCLUDED.write_project_ids,updated_at=NOW()",
+            [plugin_name.into(), actor_id.into(), values.into(), (config.ai_daily_call_limit as i32).into(), (config.ai_max_output_tokens as i32).into(), areas.into(), config.write_project_ids.clone().into()])).await
             .map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "update grants", source })?;
         if result.rows_affected() != 1 {
             return Err(GrantError::ActorChanged {
@@ -398,6 +434,46 @@ impl PluginGrantService {
             });
         }
         self.get(plugin_name).await
+    }
+
+    /// A limit to some projects may only name projects that exist: a limit
+    /// to a project that was deleted, or mistyped, would look like a limit
+    /// and allow nothing.
+    async fn ensure_projects_exist(
+        &self,
+        plugin_name: &str,
+        config: &PluginGrantConfig,
+    ) -> Result<(), GrantError> {
+        let Some(projects) = &config.write_project_ids else {
+            return Ok(());
+        };
+        let database = |source| GrantError::Database {
+            plugin_name: plugin_name.into(),
+            operation: "check the projects a plugin is limited to",
+            source,
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM projects WHERE id = ANY($1)",
+                [projects.clone().into()],
+            ))
+            .await
+            .map_err(database)?;
+        let mut existing = Vec::with_capacity(rows.len());
+        for row in rows {
+            existing.push(row.try_get::<i32>("", "id").map_err(database)?);
+        }
+        match projects.iter().find(|id| !existing.contains(id)) {
+            None => Ok(()),
+            Some(missing) => Err(GrantError::Invalid {
+                plugin_name: plugin_name.into(),
+                reason: format!(
+                    "project {missing} does not exist, so changes cannot be limited to it"
+                ),
+            }),
+        }
     }
 
     pub async fn revoke_actor(&self, plugin_name: &str) -> Result<(), GrantError> {
@@ -431,6 +507,44 @@ fn validate(plugin_name: &str, config: &PluginGrantConfig) -> Result<(), GrantEr
                 "daily calls must be <= 10000 and output tokens must be 1..={MAX_OUTPUT_TOKENS}"
             ),
         });
+    }
+    let invalid = |reason: String| GrantError::Invalid {
+        plugin_name: plugin_name.into(),
+        reason,
+    };
+    let may_write = config.permissions.contains(&PluginHostPermission::ApiWrite);
+    if !may_write && (!config.write_areas.is_empty() || config.write_project_ids.is_some()) {
+        return Err(invalid(
+            "what a plugin may change can only be chosen together with the api_write permission"
+                .to_string(),
+        ));
+    }
+    let mut areas = config.write_areas.clone();
+    areas.sort();
+    areas.dedup();
+    if areas.len() != config.write_areas.len() {
+        return Err(invalid("an area to change is listed twice".to_string()));
+    }
+    if let Some(projects) = &config.write_project_ids {
+        if projects.is_empty() {
+            return Err(invalid(
+                "a limit to some projects must list at least one; omit it to allow every project"
+                    .to_string(),
+            ));
+        }
+        if projects.len() > MAX_WRITE_PROJECTS {
+            return Err(invalid(format!(
+                "changes can be limited to at most {MAX_WRITE_PROJECTS} projects"
+            )));
+        }
+        let mut unique = projects.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != projects.len() || projects.iter().any(|id| *id <= 0) {
+            return Err(invalid(
+                "the projects to limit changes to must be distinct positive ids".to_string(),
+            ));
+        }
     }
     Ok(())
 }

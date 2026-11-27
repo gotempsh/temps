@@ -12,13 +12,59 @@ export const pluginPermissionValues = [
   'api_write',
 ] as const
 
-export const pluginGrantsSchema = z.object({
-  permissions: z
-    .array(z.enum(pluginPermissionValues))
-    .max(pluginPermissionValues.length),
-  ai_daily_call_limit: z.number().int().min(0).max(10000),
-  ai_max_output_tokens: z.number().int().min(1).max(4096),
-})
+/** The areas of Temps a permission to change can be narrowed to. */
+export const pluginWriteAreaValues = [
+  'projects',
+  'environments',
+  'deployments',
+] as const
+
+export type PluginWriteAreaValue = (typeof pluginWriteAreaValues)[number]
+
+/** How many services a permission to change can be limited to. */
+export const MAX_WRITE_SERVICES = 100
+
+const AI_CALLS_MESSAGE = 'Choose 0 to 10,000 AI calls per day.'
+const AI_TOKENS_MESSAGE = 'Choose 1 to 4,096 output tokens per call.'
+
+export const pluginGrantsSchema = z
+  .object({
+    permissions: z
+      .array(z.enum(pluginPermissionValues))
+      .max(pluginPermissionValues.length),
+    ai_daily_call_limit: z
+      .number(AI_CALLS_MESSAGE)
+      .int(AI_CALLS_MESSAGE)
+      .min(0, AI_CALLS_MESSAGE)
+      .max(10000, AI_CALLS_MESSAGE),
+    ai_max_output_tokens: z
+      .number(AI_TOKENS_MESSAGE)
+      .int(AI_TOKENS_MESSAGE)
+      .min(1, AI_TOKENS_MESSAGE)
+      .max(4096, AI_TOKENS_MESSAGE),
+    /** What a plugin allowed to change things may change. Empty: nothing. */
+    write_areas: z
+      .array(z.enum(pluginWriteAreaValues))
+      .max(pluginWriteAreaValues.length),
+    /** The services its changes are limited to; `null` is every service. */
+    write_project_ids: z
+      .array(z.number().int().positive())
+      .max(
+        MAX_WRITE_SERVICES,
+        `Changes can be limited to at most ${MAX_WRITE_SERVICES} services.`
+      )
+      .nullable(),
+  })
+  .superRefine((value, context) => {
+    if (!value.permissions.includes('api_write')) return
+    if (value.write_project_ids?.length === 0)
+      context.addIssue({
+        code: 'custom',
+        path: ['write_project_ids'],
+        message:
+          'Choose at least one service, or let the plugin change every service.',
+      })
+  })
 
 export type PluginGrantsValues = z.infer<typeof pluginGrantsSchema>
 
@@ -27,7 +73,62 @@ export function emptyPluginGrants(): PluginGrantsValues {
     permissions: [],
     ai_daily_call_limit: 100,
     ai_max_output_tokens: 1024,
+    write_areas: [],
+    write_project_ids: null,
   }
+}
+
+/**
+ * What is sent to the server: where a plugin may change things only means
+ * something together with the permission to change, so it is dropped
+ * without it.
+ */
+export function pluginGrantsBody(
+  values: PluginGrantsValues
+): PluginGrantsValues {
+  if (values.permissions.includes('api_write')) return values
+  return { ...values, write_areas: [], write_project_ids: null }
+}
+
+/** Every message of a failed validation, in the order the form shows them. */
+export function pluginGrantErrors(errors: unknown): string[] {
+  if (typeof errors !== 'object' || errors === null) return []
+  const messages = new Set<string>()
+  const visit = (node: unknown) => {
+    if (typeof node !== 'object' || node === null) return
+    const message = (node as { message?: unknown }).message
+    if (typeof message === 'string' && message !== '') messages.add(message)
+    for (const [key, child] of Object.entries(node))
+      if (key !== 'ref' && key !== 'message') visit(child)
+  }
+  visit(errors)
+  return [...messages]
+}
+
+export const pluginWriteAreaLabels = {
+  projects: {
+    label: 'Services',
+    description: 'Create, change and delete services.',
+  },
+  environments: {
+    label: 'Environments',
+    description: 'Create, change and delete environments.',
+  },
+  deployments: {
+    label: 'Deployments',
+    description: 'Start, cancel and roll back deployments.',
+  },
+} satisfies Record<PluginWriteAreaValue, { label: string; description: string }>
+
+/** What the outbound profile of a plugin's service means, in a word. */
+export function pluginOutboundLabel(profile: string): {
+  label: string
+  tone: 'open' | 'limited' | 'closed'
+} {
+  if (profile === 'none') return { label: 'No outbound access', tone: 'closed' }
+  if (profile === 'restricted')
+    return { label: 'Allowed destinations only', tone: 'limited' }
+  return { label: 'Unrestricted', tone: 'open' }
 }
 
 export const pluginPermissionLabels = {
@@ -59,9 +160,9 @@ export const pluginPermissionLabels = {
       'Receive subscribed service, deployment, and domain events across this instance.',
   },
   api_write: {
-    label: 'Change supported API resources',
+    label: 'Change things in Temps',
     description:
-      'Use supported API writes on behalf of an authenticated user, within that user’s permissions. Does not grant AI or credential access.',
+      'Make changes on behalf of a signed-in user, within that user’s permissions and only in the areas and services chosen below. Does not grant AI or credential access.',
   },
 } satisfies Record<
   PluginGrantsValues['permissions'][number],

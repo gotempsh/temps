@@ -28,6 +28,7 @@ fn configured_grants() -> PluginGrantConfig {
         ],
         ai_daily_call_limit: 3,
         ai_max_output_tokens: 2_048,
+        ..Default::default()
     }
 }
 
@@ -338,6 +339,32 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         Err(error) => panic!("historical actor migration database: {error}"),
     };
     let db = database.connection_arc();
+    let manager = SchemaManager::new(db.as_ref());
+    // The grant service reads every current column, so the plugin migrations
+    // after the consent schema are applied before it is used, rolled back in
+    // reverse with the tables they extend, and applied again at the end.
+    let later = || {
+        let mut later = Migrator::migrations()
+            .into_iter()
+            .filter(|migration| {
+                migration.name().contains("external_plugin_")
+                    && migration.name() >= "m20261127_000002_external_plugin_isolation"
+            })
+            .collect::<Vec<_>>();
+        later.sort_by(|a, b| a.name().cmp(b.name()));
+        assert!(
+            later.len() >= 4,
+            "the later plugin migrations are registered"
+        );
+        later
+    };
+    for migration in later() {
+        let name = migration.name().to_string();
+        migration
+            .up(&manager)
+            .await
+            .unwrap_or_else(|error| panic!("apply {name} after the consent schema: {error}"));
+    }
     let service = PluginGrantService::new(db.clone());
     service
         .ensure_actor(
@@ -363,8 +390,14 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .into_iter()
         .find(|migration| migration.name() == CONSENT)
         .expect("AI consent migration must be registered");
-    let manager = SchemaManager::new(db.as_ref());
     // Roll back dependent columns before dropping their owning table.
+    for migration in later().into_iter().rev() {
+        let name = migration.name().to_string();
+        migration
+            .down(&manager)
+            .await
+            .unwrap_or_else(|error| panic!("roll back {name} on populated tables: {error}"));
+    }
     consent_migration
         .down(&manager)
         .await
@@ -398,6 +431,13 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .up(&manager)
         .await
         .expect("reapply AI consent before using the current actor service");
+    for migration in later() {
+        let name = migration.name().to_string();
+        migration
+            .up(&manager)
+            .await
+            .unwrap_or_else(|error| panic!("reapply {name}: {error}"));
+    }
     let recreated = service
         .ensure_actor(
             "rollback-plugin",
@@ -409,27 +449,6 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
     assert_ne!(recreated.actor.id, grants.actor.id);
     let recreated_id =
         uuid::Uuid::parse_str(&recreated.actor.id).expect("recreated actor has a valid UUID");
-    // The entity reads every current column, so bring the table the rest of
-    // the way to the current schema before reading through it.
-    let mut later = Migrator::migrations()
-        .into_iter()
-        .filter(|migration| {
-            migration.name().contains("external_plugin_")
-                && migration.name() >= "m20261127_000002_external_plugin_isolation"
-        })
-        .collect::<Vec<_>>();
-    later.sort_by(|a, b| a.name().cmp(b.name()));
-    assert!(
-        later.len() >= 3,
-        "the later plugin migrations are registered"
-    );
-    for migration in later {
-        let name = migration.name().to_string();
-        migration
-            .up(&manager)
-            .await
-            .unwrap_or_else(|error| panic!("apply {name} after the consent schema: {error}"));
-    }
     let persisted = external_plugin_actors::Entity::find_by_id(recreated_id)
         .one(db.as_ref())
         .await

@@ -21,6 +21,10 @@ import {
   pluginPermissionValues,
   type PluginGrantsValues,
 } from '@/lib/plugin-grants'
+import {
+  PluginWriteScopeFields,
+  type WriteScopeService,
+} from './PluginWriteScope'
 
 export function PluginGrantFields({
   value,
@@ -28,12 +32,22 @@ export function PluginGrantFields({
   disabled,
   requested,
   requirements,
+  services = [],
+  servicesLoading,
+  servicesFailed,
+  servicesTotal,
 }: {
   value: PluginGrantsValues
   onChange: (value: PluginGrantsValues) => void
   disabled?: boolean
+  /** What the plugin's manifest asks for. Only that can be allowed. */
   requested?: PluginGrantsValues['permissions']
   requirements?: PluginPermissionRequirement[] | null
+  /** The services a permission to change can be limited to. */
+  services?: WriteScopeService[]
+  servicesLoading?: boolean
+  servicesFailed?: boolean
+  servicesTotal?: number
 }) {
   const id = useId()
   const icons = {
@@ -45,26 +59,35 @@ export function PluginGrantFields({
     api_read: Eye,
     api_write: Pencil,
   }
+  // Like an app's permission screen: what the plugin asks for, plus anything
+  // it still holds from before it stopped asking, so that can be taken away.
   const visible = requirements
     ? pluginPermissionValues.filter((p) =>
         requirements.some((r) => r.permission === p)
       )
-    : pluginPermissionValues
+    : requested
+      ? pluginPermissionValues.filter(
+          (p) => requested.includes(p) || value.permissions.includes(p)
+        )
+      : pluginPermissionValues
+  const asksNothing = visible.length === 0
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground">
         {requirements
           ? 'Approve the access you want to grant. Optional permissions enable extra features.'
-          : 'Permission requirements are not published. Review the source before choosing access.'}{' '}
+          : requested
+            ? 'This plugin asks for the access listed here. Allow only what you want it to have.'
+            : 'Permission requirements are not published. Review the source before choosing access.'}{' '}
         Nothing is granted by default.
       </p>
-      {requirements?.length === 0 && (
+      {asksNothing && (
         <p className="flex items-center gap-2 text-sm">
           <ShieldCheck className="size-4 text-muted-foreground" />
           No host API permissions requested.
         </p>
       )}
-      <div className="divide-y rounded-lg border">
+      <div className={asksNothing ? 'hidden' : 'divide-y rounded-lg border'}>
         {visible.map((permission) => {
           const requirement = requirements?.find(
             (r) => r.permission === permission
@@ -115,13 +138,25 @@ export function PluginGrantFields({
                   className="text-sm text-muted-foreground"
                 >
                   {requirement?.reason || text.description}
-                  {!declared && ' Not requested by this plugin.'}
+                  {!declared &&
+                    ' No longer requested by this plugin; once removed it cannot be allowed again.'}
                 </p>
               </div>
             </div>
           )
         })}
       </div>
+      {value.permissions.includes('api_write') && (
+        <PluginWriteScopeFields
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          services={services}
+          servicesLoading={servicesLoading}
+          servicesFailed={servicesFailed}
+          servicesTotal={servicesTotal}
+        />
+      )}
       {value.permissions.includes('ai_generate') && (
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2">

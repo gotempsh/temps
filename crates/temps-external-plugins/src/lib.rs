@@ -29,6 +29,7 @@ pub mod plugin;
 pub mod proxy;
 pub mod repository;
 pub mod retired;
+pub mod scope;
 pub mod service;
 pub mod service_runtime;
 pub mod source_catalog;

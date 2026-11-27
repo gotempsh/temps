@@ -28,18 +28,71 @@ const HOST_PERMISSIONS = [
   "api_write",
 ] as const;
 
+/** The areas of Temps a permission to change can be narrowed to. */
+const WRITE_AREAS = ["projects", "environments", "deployments"] as const;
+
+/** How many services a permission to change can be limited to. */
+const MAX_WRITE_PROJECTS = 100;
+
 type GrantConfig = {
   permissions: (typeof HOST_PERMISSIONS)[number][];
   ai_daily_call_limit: number;
   ai_max_output_tokens: number;
+  /** What `api_write` may change. Empty: nothing. */
+  write_areas: (typeof WRITE_AREAS)[number][];
+  /** The services its changes are limited to; `null` is every service. */
+  write_project_ids: number[] | null;
 };
 
 export type GrantOptions = {
   grant?: readonly string[];
   aiDailyCalls?: string;
   aiMaxTokens?: string;
+  write?: readonly string[];
+  writeProject?: readonly string[];
   clear?: boolean;
 };
+
+/** Where a permission to change reaches, from `--write` and `--write-project`. */
+function writeScope(
+  options: GrantOptions,
+  permissions: readonly string[],
+): Pick<GrantConfig, "write_areas" | "write_project_ids"> {
+  const areas = [...new Set(options.write ?? [])];
+  if (
+    areas.some(
+      (area) => !WRITE_AREAS.includes(area as (typeof WRITE_AREAS)[number]),
+    )
+  )
+    throw new PluginCommandError(
+      `Supported --write values: ${WRITE_AREAS.join(", ")}.`,
+    );
+  if (
+    (options.write !== undefined || options.writeProject !== undefined) &&
+    !permissions.includes("api_write")
+  )
+    throw new PluginCommandError(
+      "--write and --write-project require an explicit --grant api_write.",
+    );
+  if (options.writeProject === undefined)
+    return {
+      write_areas: areas as GrantConfig["write_areas"],
+      write_project_ids: null,
+    };
+  const projects = [...new Set(options.writeProject)];
+  if (
+    projects.length === 0 ||
+    projects.length > MAX_WRITE_PROJECTS ||
+    projects.some((id) => !/^[1-9]\d*$/.test(id))
+  )
+    throw new PluginCommandError(
+      `--write-project takes 1 to ${MAX_WRITE_PROJECTS} service ids; omit it to allow every service.`,
+    );
+  return {
+    write_areas: areas as GrantConfig["write_areas"],
+    write_project_ids: projects.map(Number),
+  };
+}
 
 /**
  * The grants the flags ask for, or nothing when no flag was given. A plugin
@@ -49,7 +102,9 @@ export function requestedGrants(options: GrantOptions): GrantConfig | undefined 
   if (
     !options.grant &&
     options.aiDailyCalls === undefined &&
-    options.aiMaxTokens === undefined
+    options.aiMaxTokens === undefined &&
+    options.write === undefined &&
+    options.writeProject === undefined
   )
     return undefined;
   const permissions = [...new Set(options.grant ?? [])];
@@ -101,6 +156,7 @@ export function requestedGrants(options: GrantOptions): GrantConfig | undefined 
       4096,
       "--ai-max-tokens",
     ),
+    ...writeScope(options, permissions),
   };
 }
 
@@ -117,11 +173,23 @@ interface PluginGrantsResponse {
   };
   permissions: string[];
   requested_permissions: string[];
+  write_areas: string[];
+  write_project_ids?: number[] | null;
+  public_paths: string[];
+  events: string[];
+  outbound_network: { profile: string; detail: string; settings_path: string };
 }
+
 
 export function grantReplacement(options: GrantOptions) {
   if (options.clear) {
-    if (options.grant || options.aiDailyCalls || options.aiMaxTokens)
+    if (
+      options.grant ||
+      options.aiDailyCalls ||
+      options.aiMaxTokens ||
+      options.write ||
+      options.writeProject
+    )
       throw new PluginCommandError(
         "Use --clear by itself to revoke all host permissions.",
       );
@@ -129,6 +197,8 @@ export function grantReplacement(options: GrantOptions) {
       permissions: [],
       ai_daily_call_limit: 0,
       ai_max_output_tokens: 1024,
+      write_areas: [],
+      write_project_ids: null,
     };
   }
   const grants = requestedGrants(options);
@@ -147,7 +217,9 @@ export function registerPluginGrantCommands(plugin: Command) {
     );
   grants
     .command("get <name>")
-    .description("Show current grants, actor identity, and AI availability")
+    .description(
+      "Show what a plugin asks for, what it is allowed, and what it can reach",
+    )
     .action(async (name: string) => {
       pluginName(name);
       await requireAuth();
@@ -176,6 +248,14 @@ export function registerPluginGrantCommands(plugin: Command) {
     .option(
       "--ai-max-tokens <count>",
       "Maximum AI output tokens per call (1–4096)",
+    )
+    .option(
+      "--write <areas...>",
+      "With api_write: what may change (projects, environments, deployments). Omitted: nothing",
+    )
+    .option(
+      "--write-project <ids...>",
+      "With api_write: the only services that may change. Omitted: every service",
     )
     .option("--clear", "Revoke all host permissions")
     .action(async (name: string, options: GrantOptions) => {

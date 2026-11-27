@@ -147,6 +147,7 @@ export function PluginsPage() {
         onOpenChange={setAddingService}
         services={services.data}
         onSensitiveError={handleSensitiveActionError}
+        onAdded={setPermissionsName}
       />
       {canManagePlugins && verificationDialog}
       <ConfirmDeleteDialog

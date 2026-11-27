@@ -28202,13 +28202,45 @@ export type PluginGrantConfig = {
     ai_daily_call_limit: number;
     ai_max_output_tokens: number;
     permissions: Array<PluginHostPermission>;
+    /**
+     * What a plugin granted `api_write` may change. Empty: nothing.
+     */
+    write_areas?: Array<PluginWriteArea>;
+    /**
+     * The only projects those changes may touch. Absent: every project.
+     */
+    write_project_ids?: Array<number> | null;
 };
 
+/**
+ * Everything a plugin asks for and everything it was given, in one place:
+ * what an administrator reads before granting anything.
+ */
 export type PluginGrantsResponse = {
     actor: PluginActorInfo;
     ai: PluginAiCapability;
+    /**
+     * The platform events the plugin asks to receive.
+     */
+    events: Array<string>;
+    /**
+     * What the plugin's container may connect to.
+     */
+    outbound_network: PluginOutboundNetwork;
     permissions: Array<PluginHostPermission>;
+    /**
+     * Routes of the plugin that anyone can open without signing in.
+     */
+    public_paths: Array<string>;
     requested_permissions: Array<PluginHostPermission>;
+    /**
+     * What a plugin granted `api_write` may change. Empty: nothing.
+     */
+    write_areas: Array<PluginWriteArea>;
+    /**
+     * The only projects those changes may touch. Absent: every project.
+     */
+    write_project_ids?: Array<number> | null;
 };
 
 /**
@@ -28327,6 +28359,24 @@ export type PluginManifest = {
 };
 
 /**
+ * What a plugin's container may connect to on the network.
+ */
+export type PluginOutboundNetwork = {
+    /**
+     * What that profile means, in words.
+     */
+    detail: string;
+    /**
+     * `open`, `restricted` or `none`.
+     */
+    profile: string;
+    /**
+     * Where an administrator changes it.
+     */
+    settings_path: string;
+};
+
+/**
  * Whether this server can run plugins as services, and the ones it runs.
  */
 export type PluginServicesResponse = {
@@ -28360,6 +28410,11 @@ export type PluginStatusResponse = {
  * Who stands behind a plugin, and so how much it may ask for.
  */
 export type PluginTier = 'community' | 'verified';
+
+/**
+ * An area of the platform a plugin may be allowed to change.
+ */
+export type PluginWriteArea = 'projects' | 'environments' | 'deployments';
 
 /**
  * Which policy decided a test.
@@ -112299,13 +112354,40 @@ export type PutPluginAiToolsResponse = PutPluginAiToolsResponses[keyof PutPlugin
 export type GetPluginGrantsData = {
     body?: never;
     path: {
+        /**
+         * The plugin's name
+         */
         name: string;
     };
     query?: never;
     url: '/x/plugins/{name}/grants';
 };
 
+export type GetPluginGrantsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
+     */
+    404: ProblemDetails;
+    /**
+     * The plugin's permissions could not be read
+     */
+    500: ProblemDetails;
+};
+
+export type GetPluginGrantsError = GetPluginGrantsErrors[keyof GetPluginGrantsErrors];
+
 export type GetPluginGrantsResponses = {
+    /**
+     * What the plugin asks for and what it was given
+     */
     200: PluginGrantsResponse;
 };
 
@@ -112314,13 +112396,52 @@ export type GetPluginGrantsResponse = GetPluginGrantsResponses[keyof GetPluginGr
 export type PutPluginGrantsData = {
     body: PluginGrantConfig;
     path: {
+        /**
+         * The plugin's name
+         */
         name: string;
     };
     query?: never;
     url: '/x/plugins/{name}/grants';
 };
 
+export type PutPluginGrantsErrors = {
+    /**
+     * A permission the plugin did not ask for, or a scope that is not valid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The plugin is not running or was never added
+     */
+    404: ProblemDetails;
+    /**
+     * The plugin was replaced while its permissions were being changed
+     */
+    409: ProblemDetails;
+    /**
+     * Recent verification is required
+     */
+    428: ProblemDetails;
+    /**
+     * The plugin's permissions could not be saved
+     */
+    500: ProblemDetails;
+};
+
+export type PutPluginGrantsError = PutPluginGrantsErrors[keyof PutPluginGrantsErrors];
+
 export type PutPluginGrantsResponses = {
+    /**
+     * The permissions now in effect
+     */
     200: PluginGrantsResponse;
 };
 

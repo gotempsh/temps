@@ -57,12 +57,58 @@ fn grant_problem(error: crate::grants::GrantError) -> Problem {
     }
 }
 
+/// Everything a plugin asks for and everything it was given, in one place:
+/// what an administrator reads before granting anything.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PluginGrantsResponse {
     pub actor: PluginActorInfo,
     pub requested_permissions: Vec<PluginHostPermission>,
     pub permissions: Vec<PluginHostPermission>,
     pub ai: PluginAiCapability,
+    /// What a plugin granted `api_write` may change. Empty: nothing.
+    pub write_areas: Vec<crate::scope::PluginWriteArea>,
+    /// The only projects those changes may touch. Absent: every project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_project_ids: Option<Vec<i32>>,
+    /// Routes of the plugin that anyone can open without signing in.
+    pub public_paths: Vec<String>,
+    /// The platform events the plugin asks to receive.
+    pub events: Vec<String>,
+    /// What the plugin's container may connect to.
+    pub outbound_network: PluginOutboundNetwork,
+}
+
+/// What a plugin's container may connect to on the network.
+#[derive(Debug, Serialize, ToSchema, PartialEq, Eq)]
+pub struct PluginOutboundNetwork {
+    /// `open`, `restricted` or `none`.
+    pub profile: String,
+    /// What that profile means, in words.
+    pub detail: String,
+    /// Where an administrator changes it.
+    pub settings_path: String,
+}
+
+impl PluginOutboundNetwork {
+    /// The profile of the environment the plugin runs in; an environment
+    /// that sets none keeps the default for deployments, which is open.
+    fn of(stored: Option<String>) -> Self {
+        let profile = match stored.as_deref() {
+            Some("restricted") => "restricted",
+            Some("none") => "none",
+            _ => "open",
+        };
+        let detail = match profile {
+            "restricted" => "The plugin can only connect to the destinations its service's network policy allows.",
+            "none" => "The plugin cannot connect to anything outside Temps.",
+            _ => "The plugin can connect to anything its server can reach, including the internet.",
+        };
+        Self {
+            profile: profile.to_string(),
+            detail: detail.to_string(),
+            settings_path: "/settings/network-policy".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -91,7 +137,21 @@ impl temps_core::audit::AuditOperation for PluginGrantChangeAudit {
     }
 }
 
-#[utoipa::path(tag = "External Plugins", get, path = "/x/plugins/{name}/grants", params(("name" = String, Path)), responses((status = 200, body = PluginGrantsResponse)), security(("bearer_auth" = [])))]
+/// What a plugin asks for and what an administrator gave it.
+#[utoipa::path(
+    tag = "External Plugins",
+    get,
+    path = "/x/plugins/{name}/grants",
+    params(("name" = String, Path, description = "The plugin's name")),
+    responses(
+        (status = 200, description = "What the plugin asks for and what it was given", body = PluginGrantsResponse),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 404, description = "No plugin with that name was added", body = temps_core::ProblemDetails),
+        (status = 500, description = "The plugin's permissions could not be read", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn get_plugin_grants(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
@@ -101,7 +161,25 @@ async fn get_plugin_grants(
     plugin_grants_response(&state, &name).await.map(Json)
 }
 
-#[utoipa::path(tag = "External Plugins", put, path = "/x/plugins/{name}/grants", params(("name" = String, Path)), request_body = crate::grants::PluginGrantConfig, responses((status = 200, body = PluginGrantsResponse)), security(("bearer_auth" = [])))]
+/// Choose what a plugin may do, and how far a permission to change reaches.
+#[utoipa::path(
+    tag = "External Plugins",
+    put,
+    path = "/x/plugins/{name}/grants",
+    params(("name" = String, Path, description = "The plugin's name")),
+    request_body = crate::grants::PluginGrantConfig,
+    responses(
+        (status = 200, description = "The permissions now in effect", body = PluginGrantsResponse),
+        (status = 400, description = "A permission the plugin did not ask for, or a scope that is not valid", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 404, description = "The plugin is not running or was never added", body = temps_core::ProblemDetails),
+        (status = 409, description = "The plugin was replaced while its permissions were being changed", body = temps_core::ProblemDetails),
+        (status = 428, description = "Recent verification is required", body = temps_core::ProblemDetails),
+        (status = 500, description = "The plugin's permissions could not be saved", body = temps_core::ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
 async fn put_plugin_grants(
     RequireAuth(auth): RequireAuth,
     State(state): State<ExternalPluginsAppState>,
@@ -185,18 +263,35 @@ async fn plugin_grants_response(
         .plugin_grants(name)
         .await
         .map_err(grant_problem)?;
-    let requested_permissions = state
+    let manifest = state
         .service
         .manifests()
         .await
         .into_iter()
-        .find(|manifest| manifest.name == name)
-        .map(|manifest| manifest.host_permissions)
+        .find(|manifest| manifest.name == name);
+    let (requested_permissions, public_paths, events) = manifest
+        .map(|manifest| {
+            (
+                manifest.host_permissions,
+                manifest.public_paths,
+                manifest.events,
+            )
+        })
         .unwrap_or_default();
+    let outbound = state
+        .service
+        .plugin_outbound_profile(name)
+        .await
+        .map_err(|error| service_problem(&error))?;
     let configured = state.service.manager().ai_available().await;
     Ok(PluginGrantsResponse {
         actor: grants.actor,
         requested_permissions,
+        write_areas: grants.config.write_areas,
+        write_project_ids: grants.config.write_project_ids,
+        public_paths,
+        events,
+        outbound_network: PluginOutboundNetwork::of(outbound),
         permissions: grants.config.permissions,
         ai: PluginAiCapability {
             configured,
@@ -775,6 +870,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::ai_tools::UpdatePluginAiTools,
             crate::ai_tools::AiToolInfo,
             PluginGrantsResponse,
+            PluginOutboundNetwork,
+            crate::scope::PluginWriteArea,
             services::PluginServicesResponse,
             services::ServicePluginResponse,
             services::RetiredPluginResponse,

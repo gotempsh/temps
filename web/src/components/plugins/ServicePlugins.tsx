@@ -295,11 +295,14 @@ export function AddServicePluginDialog({
   onOpenChange,
   services,
   onSensitiveError,
+  onAdded,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   services: PluginServicesResponse | undefined
   onSensitiveError: (error: unknown, retry: () => void) => boolean
+  /** The plugin that was just added, so what it asks for can be shown. */
+  onAdded?: (name: string) => void
 }) {
   const configured = services?.configured !== false
   const add = useAddServicePlugin()
@@ -346,9 +349,10 @@ export function AddServicePluginDialog({
         environment_id: values.environmentId,
       })
       toast.success(
-        `${added.display_name ?? added.name} is now a plugin. Grant it permissions to let it use Temps.`
+        `${added.display_name ?? added.name} is now a plugin. It can use Temps only as far as you allow.`
       )
       onOpenChange(false)
+      onAdded?.(added.name)
     } catch (error) {
       // Any other failure is shown by the app-wide mutation error handler
       // with the server's reason, and repeated below the form.

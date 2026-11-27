@@ -238,6 +238,8 @@ Capabilities describe the maximum class of calls a plugin intends to make. They 
 
 Declare only what the plugin needs. A plugin that only lists projects should request `ApiRead`, not `ApiWrite`.
 
+An administrator who allows a plugin to change things also chooses how far that reaches: which areas (services, environments, deployments) and, optionally, which services. Until an area is chosen, every change is refused. A call outside the chosen areas or services fails with a permission error that says what was outside; handle it as you handle a denied permission. A plugin limited to some services cannot create a service, and a call on a collection must name `project_id` in its body.
+
 A plugin cannot ask for the control-plane database or the instance data
 directory. A manifest that sets `requires_db(true)` or
 `requires_host_data_access(true)` is refused, by the SDK when the plugin

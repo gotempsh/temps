@@ -101,6 +101,27 @@ impl ExternalPluginsService {
             .await
     }
 
+    /// What the plugin's container may connect to: the outbound profile of
+    /// the environment it runs in. `None` when the plugin names no service,
+    /// or when the environment keeps the default, which is open.
+    pub async fn plugin_outbound_profile(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, ExternalPluginsError> {
+        use sea_orm::EntityTrait;
+        let Some(binding) = self.manager.service_binding_of(name).await else {
+            return Ok(None);
+        };
+        let profile = temps_entities::network_policy_profiles::Entity::find_by_id((
+            "deployment".to_string(),
+            i64::from(binding.environment_id),
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|source| ExternalPluginsError::ServiceLookup { source })?;
+        Ok(profile.and_then(|profile| profile.egress))
+    }
+
     /// Install the bridge plugins use to call the platform's own HTTP API.
     ///
     /// The console builds its router *after* plugins start (the router

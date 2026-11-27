@@ -5052,12 +5052,12 @@ Inspect or replace a plugin's host API permissions and AI limits
 
 **Subcommands:**
 
-- `get` - Show current grants, actor identity, and AI availability
+- `get` - Show what a plugin asks for, what it is allowed, and what it can reach
 - `set` - Replace all host grants; --clear revokes all permissions immediately
 
 #### `plugin grants get <name>`
 
-Show current grants, actor identity, and AI availability
+Show what a plugin asks for, what it is allowed, and what it can reach
 
 #### `plugin grants set <name>`
 
@@ -5070,6 +5070,8 @@ Replace all host grants; --clear revokes all permissions immediately
 | `--grant <permissions...>` | Complete list of permissions to grant | - | No |
 | `--ai-daily-calls <count>` | Daily AI call limit (0–10000) | - | No |
 | `--ai-max-tokens <count>` | Maximum AI output tokens per call (1–4096) | - | No |
+| `--write <areas...>` | With api_write: what may change (projects, environments, deployments). Omitted: nothing | - | No |
+| `--write-project <ids...>` | With api_write: the only services that may change. Omitted: every service | - | No |
 | `--clear` | Revoke all host permissions | - | No |
 
 ### `plugin services`

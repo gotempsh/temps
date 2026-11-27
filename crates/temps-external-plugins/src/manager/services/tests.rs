@@ -29,7 +29,8 @@ use temps_plugin_protocol::channel::PluginHostPermission;
 pub(crate) const TOKEN: &str = "dt_fixture";
 
 /// A plugin with one route, named by the test. It subscribes to deployment
-/// events and counts the ones it is given.
+/// events and counts the ones it is given, asks to change platform data and
+/// serves one path without a Temps session.
 struct Reports {
     name: &'static str,
     privileged: bool,
@@ -41,6 +42,8 @@ impl ExternalPlugin for Reports {
         let mut manifest = PluginManifest::builder(self.name, "1.0.0")
             .display_name("Reports")
             .host_permission(PluginHostPermission::EventsRead)
+            .host_permission(PluginHostPermission::ApiWrite)
+            .public_path("/hooks/*")
             .event("deployment.succeeded")
             .build();
         manifest.requires_db = self.privileged;

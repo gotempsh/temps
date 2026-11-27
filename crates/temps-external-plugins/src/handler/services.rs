@@ -721,6 +721,163 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_permission_screen_shows_what_a_plugin_asks_for_and_narrows_what_it_may_change() {
+        use super::super::{get_plugin_grants, put_plugin_grants};
+        use crate::grants::PluginGrantConfig;
+        use crate::scope::PluginWriteArea;
+        use temps_plugin_protocol::channel::PluginHostPermission;
+
+        let Some(platform) = platform("choosing what a plugin may change over the API").await
+        else {
+            return;
+        };
+        let plugin = serve_plugin("reports", TOKEN);
+        let binding = platform.service("reports-service").await;
+        platform.deploy(binding, plugin.port).await;
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = state_on(&platform, audit.clone()).await;
+        let (status, _) = add_service_plugin(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            metadata(),
+            add(binding),
+        )
+        .await
+        .expect("a deployed plugin service is added");
+        assert_eq!(status, StatusCode::CREATED);
+
+        // A plugin that was just added asks for things and has none of them.
+        let Json(asked) = get_plugin_grants(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            Path("reports".to_string()),
+        )
+        .await
+        .expect("the permission screen");
+        assert!(asked
+            .requested_permissions
+            .contains(&PluginHostPermission::ApiWrite));
+        assert!(asked.permissions.is_empty());
+        assert!(asked.write_areas.is_empty());
+        assert_eq!(asked.write_project_ids, None);
+        assert_eq!(asked.public_paths, ["/hooks/*"]);
+        assert_eq!(asked.events, ["deployment.succeeded"]);
+        assert_eq!(asked.outbound_network.profile, "open");
+        assert_eq!(
+            asked.outbound_network.settings_path,
+            "/settings/network-policy"
+        );
+
+        let save = |config: PluginGrantConfig| {
+            put_plugin_grants(
+                user_auth(Role::PlatformAdmin),
+                State(state.clone()),
+                metadata(),
+                Path("reports".to_string()),
+                Json(config),
+            )
+        };
+        let writing = |areas: &[PluginWriteArea], projects: Option<Vec<i32>>| PluginGrantConfig {
+            permissions: vec![PluginHostPermission::ApiWrite],
+            write_areas: areas.to_vec(),
+            write_project_ids: projects,
+            ..Default::default()
+        };
+
+        // What may change cannot be chosen without the permission to change.
+        let problem = save(PluginGrantConfig {
+            write_areas: vec![PluginWriteArea::Deployments],
+            ..Default::default()
+        })
+        .await
+        .expect_err("areas without api_write");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(problem.into_response().into_body(), usize::MAX)
+            .await
+            .expect("problem body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert_eq!(body["title"], "Invalid Plugin Grants");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("api_write")),
+            "{body}"
+        );
+
+        for (config, why) in [
+            (
+                writing(
+                    &[PluginWriteArea::Deployments, PluginWriteArea::Deployments],
+                    None,
+                ),
+                "an area listed twice",
+            ),
+            (
+                writing(&[PluginWriteArea::Deployments], Some(Vec::new())),
+                "an empty project limit",
+            ),
+            (
+                writing(&[PluginWriteArea::Deployments], Some(vec![i32::MAX])),
+                "a project that does not exist",
+            ),
+        ] {
+            let problem = save(config).await.expect_err(why);
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{why}");
+        }
+        let unknown = save(writing(
+            &[PluginWriteArea::Deployments],
+            Some(vec![i32::MAX]),
+        ))
+        .await
+        .expect_err("a project that does not exist");
+        let body = axum::body::to_bytes(unknown.into_response().into_body(), usize::MAX)
+            .await
+            .expect("problem body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert!(
+            body["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(&i32::MAX.to_string())),
+            "the refusal names the missing project: {body}"
+        );
+
+        // Deployments only, and only in the plugin's own project.
+        let Json(saved) = save(writing(
+            &[PluginWriteArea::Deployments],
+            Some(vec![binding.project_id]),
+        ))
+        .await
+        .expect("a narrowed write permission is saved");
+        assert_eq!(saved.permissions, [PluginHostPermission::ApiWrite]);
+        assert_eq!(saved.write_areas, [PluginWriteArea::Deployments]);
+        assert_eq!(saved.write_project_ids, Some(vec![binding.project_id]));
+        let json = serde_json::to_value(&saved).expect("json");
+        assert_eq!(json["write_areas"], serde_json::json!(["deployments"]));
+        assert!(operations(&audit).contains(&"EXTERNAL_PLUGIN_GRANTS_CHANGED".to_string()));
+
+        // The environment's network policy is what the screen reports.
+        use sea_orm::ConnectionTrait;
+        platform
+            .db()
+            .execute_unprepared(&format!(
+                "INSERT INTO network_policy_profiles (subject_kind, subject_id, egress) \
+                 VALUES ('deployment', {}, 'none')",
+                binding.environment_id
+            ))
+            .await
+            .expect("a network policy for the plugin's environment");
+        let Json(closed) = get_plugin_grants(
+            user_auth(Role::PlatformAdmin),
+            State(state.clone()),
+            Path("reports".to_string()),
+        )
+        .await
+        .expect("the permission screen");
+        assert_eq!(closed.outbound_network.profile, "none");
+        assert!(closed.outbound_network.detail.contains("cannot connect"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_service_that_is_not_a_plugin_is_refused_with_a_reason_and_an_audit_entry() {
         let Some(platform) = platform("refusing a service over the API").await else {
             return;

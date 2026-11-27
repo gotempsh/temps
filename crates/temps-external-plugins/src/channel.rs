@@ -467,7 +467,18 @@ async fn dispatch_request(
             None
         }
     };
-    let allowed = required_permission.is_none_or(effective);
+    // A change must also fall inside what an administrator allowed the plugin
+    // to change. Decided before the audit entry, so a call outside that scope
+    // is recorded as denied and never reaches the router.
+    let scope_denial = match &req.call {
+        PlatformCallRequest::ApiCall(call)
+            if call.method.is_mutating() && effective(PluginHostPermission::ApiWrite) =>
+        {
+            write_denial(plugin_name, db, &current.config, call).await
+        }
+        _ => None,
+    };
+    let allowed = required_permission.is_none_or(effective) && scope_denial.is_none();
     let Some(auditor) = audit_service.read().await.clone() else {
         return ChannelResponse::err(
             req.id,
@@ -558,7 +569,9 @@ async fn dispatch_request(
             } else {
                 PluginHostPermission::ApiRead
             };
-            if effective(permission) {
+            if let Some(denial) = scope_denial {
+                Err(denial)
+            } else if effective(permission) {
                 handle_api_call(plugin_name, host_api, capabilities, call.clone()).await
             } else {
                 denied(permission)
@@ -687,6 +700,82 @@ impl temps_core::audit::AuditOperation for PluginHostOperationAudit {
     fn serialize(&self) -> temps_core::AuditResult<String> {
         temps_core::serialize_audit_operation(self)
     }
+}
+
+/// Why a changing call falls outside what the plugin may change, if it does.
+///
+/// A path a plugin cannot delegate at all is left to [`handle_api_call`],
+/// which refuses it as it always did.
+async fn write_denial(
+    plugin_name: &str,
+    db: &DatabaseConnection,
+    config: &crate::grants::PluginGrantConfig,
+    call: &ApiCall,
+) -> Option<ChannelError> {
+    use crate::scope::{WriteScope, WriteTarget};
+    let target = WriteTarget::of_path(&call.path)?;
+    let scope = WriteScope {
+        areas: &config.write_areas,
+        projects: config.write_project_ids.as_deref(),
+    };
+    let denied = |denial: crate::scope::WriteDenied| {
+        ChannelError::new(ChannelErrorCode::PermissionDenied, denial.to_string())
+    };
+    if let Err(denial) = scope.allows_area(plugin_name, target) {
+        return Some(denied(denial));
+    }
+    if !scope.limits_projects() {
+        return None;
+    }
+    let project = match target_project(db, target, call).await {
+        Ok(project) => project,
+        Err(error) => {
+            error!(plugin = %plugin_name, path = %call.path, %error, "Could not find the project a plugin call changes");
+            return Some(ChannelError::new(
+                ChannelErrorCode::Internal,
+                format!(
+                    "Temps could not check which project the call to {} changes, so plugin '{plugin_name}' was not allowed to make it; see the server log",
+                    call.path
+                ),
+            ));
+        }
+    };
+    scope.allows_project(plugin_name, project).err().map(denied)
+}
+
+/// The project a changing call belongs to.
+async fn target_project(
+    db: &DatabaseConnection,
+    target: crate::scope::WriteTarget,
+    call: &ApiCall,
+) -> Result<crate::scope::TargetProject, sea_orm::DbErr> {
+    use crate::scope::{PluginWriteArea, TargetProject, WriteTarget};
+    use sea_orm::EntityTrait;
+    let known =
+        |project_id: Option<i32>| project_id.map_or(TargetProject::Unknown, TargetProject::Known);
+    Ok(match target {
+        WriteTarget::Record(PluginWriteArea::Projects, id) => TargetProject::Known(id),
+        WriteTarget::Record(PluginWriteArea::Environments, id) => known(
+            temps_entities::environments::Entity::find_by_id(id)
+                .one(db)
+                .await?
+                .map(|environment| environment.project_id),
+        ),
+        WriteTarget::Record(PluginWriteArea::Deployments, id) => known(
+            temps_entities::deployments::Entity::find_by_id(id)
+                .one(db)
+                .await?
+                .map(|deployment| deployment.project_id),
+        ),
+        WriteTarget::Collection(PluginWriteArea::Projects) => TargetProject::New,
+        WriteTarget::Collection(_) => known(match &call.body {
+            Some(CallBody::Json(body)) => body
+                .decode::<crate::scope::NamedProject>()
+                .ok()
+                .and_then(|named| named.id()),
+            _ => None,
+        }),
+    })
 }
 
 /// Serve an [`ApiCall`] through the platform's own router.
@@ -1210,6 +1299,7 @@ mod tests {
                     permissions: vec![PluginHostPermission::AiGenerate],
                     ai_daily_call_limit: daily_limit,
                     ai_max_output_tokens: 128,
+                    ..Default::default()
                 },
             )
             .await
@@ -1320,6 +1410,165 @@ mod tests {
 
     /// A channel to `plugin_name` over `tx`, with no live socket behind it:
     /// `send_event` only touches the outgoing queue.
+    fn change(method: HttpMethod, path: &str, body: Option<serde_json::Value>) -> ApiCall {
+        ApiCall {
+            method,
+            path: path.to_string(),
+            query: None,
+            body: body.map(|value| CallBody::json(&value).expect("json body")),
+            actor: ActorToken::new("unused: the scope is decided before the actor is"),
+        }
+    }
+
+    fn scoped(
+        areas: &[crate::scope::PluginWriteArea],
+        projects: Option<Vec<i32>>,
+    ) -> crate::grants::PluginGrantConfig {
+        crate::grants::PluginGrantConfig {
+            permissions: vec![PluginHostPermission::ApiWrite],
+            write_areas: areas.to_vec(),
+            write_project_ids: projects,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_must_fall_inside_the_areas_and_projects_an_administrator_allowed() {
+        use crate::manager::services::tests::platform;
+        use crate::scope::PluginWriteArea::{Deployments, Environments, Projects};
+        let Some(platform) = platform("scoping what a plugin may change").await else {
+            return;
+        };
+        let db = platform.db();
+        let allowed = platform.service("allowed").await;
+        let other = platform.service("other").await;
+        let allowed_deployment = platform.deploy(allowed, 1).await;
+        let other_deployment = platform.deploy(other, 1).await;
+        let reason = |config: &crate::grants::PluginGrantConfig, call: ApiCall| {
+            let db = db.clone();
+            let config = config.clone();
+            async move {
+                write_denial("reports", db.as_ref(), &config, &call)
+                    .await
+                    .map(|denial| {
+                        assert_eq!(denial.code, ChannelErrorCode::PermissionDenied);
+                        denial.message
+                    })
+            }
+        };
+
+        // Write permission with no area chosen changes nothing.
+        let nothing = scoped(&[], None);
+        let denial = reason(&nothing, change(HttpMethod::Post, "/projects", None))
+            .await
+            .expect("no area was allowed");
+        assert!(denial.contains("may not change projects"), "{denial}");
+        assert!(denial.contains("Allowed: nothing"), "{denial}");
+
+        // Only the chosen area may be changed, in any project.
+        let deployments = scoped(&[Deployments], None);
+        assert_eq!(
+            reason(
+                &deployments,
+                change(
+                    HttpMethod::Delete,
+                    &format!("/deployments/{other_deployment}"),
+                    None
+                )
+            )
+            .await,
+            None
+        );
+        let denial = reason(
+            &deployments,
+            change(
+                HttpMethod::Patch,
+                &format!("/environments/{}", allowed.environment_id),
+                None,
+            ),
+        )
+        .await
+        .expect("environments were not allowed");
+        assert!(denial.contains("may not change environments"), "{denial}");
+
+        // Limited to one project: its records may change, others may not.
+        let limited = scoped(
+            &[Projects, Environments, Deployments],
+            Some(vec![allowed.project_id]),
+        );
+        for path in [
+            format!("/projects/{}", allowed.project_id),
+            format!("/environments/{}", allowed.environment_id),
+            format!("/deployments/{allowed_deployment}"),
+        ] {
+            assert_eq!(
+                reason(&limited, change(HttpMethod::Put, &path, None)).await,
+                None,
+                "{path}"
+            );
+        }
+        for path in [
+            format!("/projects/{}", other.project_id),
+            format!("/environments/{}", other.environment_id),
+            format!("/deployments/{other_deployment}"),
+        ] {
+            let denial = reason(&limited, change(HttpMethod::Put, &path, None))
+                .await
+                .unwrap_or_else(|| panic!("{path} is outside the limit"));
+            assert!(
+                denial.contains(&format!("not project {}", other.project_id)),
+                "{denial}"
+            );
+        }
+        // A limited plugin cannot create a project, and a new environment or
+        // deployment must name a project inside the limit.
+        let denial = reason(&limited, change(HttpMethod::Post, "/projects", None))
+            .await
+            .expect("a new project is outside every limit");
+        assert!(denial.contains("cannot create a project"), "{denial}");
+        assert_eq!(
+            reason(
+                &limited,
+                change(
+                    HttpMethod::Post,
+                    "/deployments",
+                    Some(serde_json::json!({ "project_id": allowed.project_id }))
+                )
+            )
+            .await,
+            None
+        );
+        let denial = reason(
+            &limited,
+            change(
+                HttpMethod::Post,
+                "/deployments",
+                Some(serde_json::json!({ "project_id": other.project_id })),
+            ),
+        )
+        .await
+        .expect("the named project is outside the limit");
+        assert!(denial.contains("not project"), "{denial}");
+        let denial = reason(&limited, change(HttpMethod::Post, "/environments", None))
+            .await
+            .expect("no project is named");
+        assert!(denial.contains("does not say which project"), "{denial}");
+        // A record that does not exist belongs to no allowed project.
+        let denial = reason(
+            &limited,
+            change(HttpMethod::Delete, "/deployments/2147483600", None),
+        )
+        .await
+        .expect("an unknown deployment is not inside the limit");
+        assert!(denial.contains("does not say which project"), "{denial}");
+
+        // A path a plugin cannot delegate at all is refused elsewhere, as before.
+        assert_eq!(
+            reason(&nothing, change(HttpMethod::Post, "/settings", None)).await,
+            None
+        );
+    }
+
     fn channel_over(plugin_name: &str, tx: mpsc::Sender<ChannelMessage>) -> PluginChannel {
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
