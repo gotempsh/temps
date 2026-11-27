@@ -79,10 +79,35 @@ pub trait LocalAddresses: Send + Sync {
 }
 
 /// The machine's container networks (Docker's), by name: no admitted range
-/// may overlap one (ADR-115 D8).
+/// may overlap one (ADR-115 D8). `None` when they could not be listed (an
+/// error or a timeout), which is not the same as there being none: a range
+/// that overlaps a network nobody listed would admit its containers.
 #[async_trait]
 pub trait ContainerNetworks: Send + Sync {
-    async fn networks(&self) -> Vec<(String, IpNet)>;
+    async fn networks(&self) -> Option<Vec<(String, IpNet)>>;
+}
+
+/// Why nothing is served while Docker's networks cannot be listed. Only the
+/// listing of this pass counts: an older one would miss a network created
+/// since, whose containers a range overlapping it would admit.
+pub const CONTAINER_NETWORKS_UNKNOWN: &str = "Docker's networks could not be listed, so private addresses are not served until they can be: a range that overlaps a container network would admit its containers. Check that Docker answers (`docker network ls`).";
+
+/// The networks to offer for a consent. While Docker's networks are unknown
+/// (its listing failed this pass), no option can be served, and each says
+/// why rather than look usable: a consent saved for it would serve nothing.
+fn offered_networks(
+    own: &[LocalNetwork],
+    containers: Option<&[(String, IpNet)]>,
+) -> Vec<temps_core::private_network::PrivateNetworkOption> {
+    let mut options = network_options(own, containers.unwrap_or_default());
+    if containers.is_none() {
+        for option in &mut options {
+            option
+                .problem
+                .get_or_insert_with(|| CONTAINER_NETWORKS_UNKNOWN.to_string());
+        }
+    }
+    options
 }
 
 /// The consent as the loop applies it.
@@ -178,7 +203,7 @@ pub struct PrivateIngressDecision {
 pub fn decide(
     consent: Option<ConsentInput>,
     own: &[LocalNetwork],
-    containers: &[(String, IpNet)],
+    containers: Option<&[(String, IpNet)]>,
     runtime: &ControlPlanePrivateIngress,
 ) -> PrivateIngressDecision {
     let Some(consent) = consent else {
@@ -192,6 +217,9 @@ pub fn decide(
             default_admit(&network)?
         } else {
             consent.admit.clone()
+        };
+        let Some(containers) = containers else {
+            return Err(CONTAINER_NETWORKS_UNKNOWN.to_string());
         };
         if let Some(why) = container_overlap(&admit, containers) {
             return Err(why);
@@ -228,6 +256,19 @@ pub fn decide(
             }),
         },
     }
+}
+
+/// Forget node `0`'s private listener report. For a control plane whose
+/// console and proxy run as separate processes, where no loop serves or
+/// reports node `0`'s private addresses (ADR-115 D7): a report left by an
+/// earlier single-process run would otherwise keep offering its listener
+/// to the planner, which would point private names at a proxy that cannot
+/// serve them.
+pub async fn forget_control_plane_report(db: &DatabaseConnection) -> Result<u64, sea_orm::DbErr> {
+    let deleted = temps_entities::node_public_ingress::Entity::delete_by_id(CONTROL_PLANE_NODE_ID)
+        .exec(db)
+        .await?;
+    Ok(deleted.rows_affected)
 }
 
 pub struct ControlPlanePrivateIngressLoop {
@@ -305,7 +346,15 @@ impl CheckRotation {
             self.checked_at.insert(host.clone(), at);
             self.results.remove(host);
         }
-        for result in results {
+        // Each result keeps when it was checked: one carried into a later
+        // report, while other hosts take their turn, is not re-stamped as
+        // just seen working. The checker stamps each one as it ends, so a
+        // quick one in a slow batch keeps its own time; one it did not
+        // stamp takes now.
+        let now = chrono::Utc::now();
+        for mut result in results {
+            let at = result.checked_at.map_or(now, |at| at.min(now));
+            result.checked_at = Some(at);
             self.results.insert(result.hostname.clone(), result);
         }
     }
@@ -416,10 +465,14 @@ impl ControlPlanePrivateIngressLoop {
             warn!("the stored private ingress consent names an address or range this version refuses; serving nothing");
         }
         let own = self.addresses.addresses();
-        let containers = all_container_networks(&own, self.containers.networks().await);
+        let listed = self.containers.networks().await;
+        if listed.is_none() {
+            warn!("could not list Docker's networks; serving no private address until they can be");
+        }
+        let containers = listed.map(|docker| all_container_networks(&own, docker));
         self.runtime
-            .set_networks(network_options(&own, &containers));
-        let decision = decide(input, &own, &containers, &self.runtime);
+            .set_networks(offered_networks(&own, containers.as_deref()));
+        let decision = decide(input, &own, containers.as_deref(), &self.runtime);
         let before = self.runtime.serving();
         if !self
             .runtime
@@ -515,9 +568,7 @@ impl ControlPlanePrivateIngressLoop {
     }
 
     async fn clear_report(&self) -> Result<(), sea_orm::DbErr> {
-        temps_entities::node_public_ingress::Entity::delete_by_id(CONTROL_PLANE_NODE_ID)
-            .exec(self.db.as_ref())
-            .await?;
+        forget_control_plane_report(self.db.as_ref()).await?;
         Ok(())
     }
 }
@@ -596,11 +647,11 @@ mod tests {
     struct Containers(Option<Arc<ControlPlanePrivateIngress>>);
     #[async_trait]
     impl ContainerNetworks for Containers {
-        async fn networks(&self) -> Vec<(String, IpNet)> {
+        async fn networks(&self) -> Option<Vec<(String, IpNet)>> {
             if let Some(runtime) = &self.0 {
                 runtime.consent_written(true);
             }
-            Vec::new()
+            Some(Vec::new())
         }
     }
 
@@ -774,7 +825,7 @@ mod tests {
         let decision = decide(
             consent(PrivateListen::Tailscale, &[]),
             &own(),
-            &containers(),
+            Some(&containers()),
             &wildcard(),
         );
         let serving = decision.serving.unwrap();
@@ -801,7 +852,7 @@ mod tests {
         let decision = decide(
             consent(PrivateListen::Address("10.8.0.1".parse().unwrap()), &[]),
             &own(),
-            &containers(),
+            Some(&containers()),
             &wildcard(),
         );
         let serving = decision.serving.unwrap();
@@ -817,7 +868,7 @@ mod tests {
                 &["10.8.0.0/25", "192.168.50.0/24"],
             ),
             &own(),
-            &containers(),
+            Some(&containers()),
             &wildcard(),
         );
         assert_eq!(
@@ -832,7 +883,7 @@ mod tests {
             let decision = decide(
                 consent(PrivateListen::Address("10.8.0.1".parse().unwrap()), admit),
                 &own(),
-                &containers(),
+                Some(&containers()),
                 &wildcard(),
             );
             assert_eq!(decision.serving, None, "{admit:?}");
@@ -846,7 +897,7 @@ mod tests {
         let decision = decide(
             consent(PrivateListen::Tailscale, &[]),
             &own(),
-            &containers(),
+            Some(&containers()),
             &runtime(&["203.0.113.7:443"]),
         );
         assert_eq!(decision.serving, None);
@@ -855,9 +906,76 @@ mod tests {
         assert!(report.error.unwrap().contains("--tls-address=0.0.0.0:443"));
     }
 
+    /// A Docker listing that fails or times out is unknown, not empty, and
+    /// an earlier listing is no stand-in: a network created since (here a
+    /// custom-named bridge, which no interface prefix reveals) would be
+    /// missed. Unknown serves nothing, and no network is offered as usable.
+    #[test]
+    fn a_failed_docker_listing_serves_nothing_even_after_an_empty_one() {
+        let consent = || {
+            consent(
+                PrivateListen::Address("10.8.0.1".parse().unwrap()),
+                &["10.8.0.0/24"],
+            )
+        };
+        // Listed, empty: served.
+        assert!(decide(consent(), &own(), Some(&[]), &wildcard())
+            .serving
+            .is_some());
+        assert!(offered_networks(&own(), Some(&[]))
+            .iter()
+            .any(|o| o.problem.is_none()));
+
+        // The next listing fails: refused, the report says why, and every
+        // option says it cannot be served now.
+        let decision = decide(consent(), &own(), None, &wildcard());
+        assert_eq!(decision.serving, None);
+        assert_eq!(
+            decision.report.unwrap().error.as_deref(),
+            Some(CONTAINER_NETWORKS_UNKNOWN)
+        );
+        let offered = offered_networks(&own(), None);
+        assert!(!offered.is_empty());
+        assert!(offered.iter().all(|o| o.problem.is_some()));
+
+        // Listed again with a custom-named bridge in the range: refused.
+        let custom: Vec<(String, IpNet)> =
+            vec![("br-apps".to_string(), "10.8.0.0/24".parse().unwrap())];
+        assert_eq!(
+            decide(consent(), &own(), Some(&custom), &wildcard()).serving,
+            None
+        );
+    }
+
+    /// A console running without the proxy forgets node 0's report, row 0
+    /// and nothing else, so no plan offers a listener nobody serves.
+    #[tokio::test]
+    async fn a_split_console_forgets_node_zeros_listener() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        assert_eq!(forget_control_plane_report(&db).await.unwrap(), 1);
+        let statements: Vec<String> = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|t| t.statements())
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(statements.len(), 1);
+        assert!(
+            statements[0].starts_with("DELETE FROM \"node_public_ingress\"")
+                && statements[0].contains("\"node_id\" = 0"),
+            "{}",
+            statements[0]
+        );
+    }
+
     #[test]
     fn no_consent_serves_and_reports_nothing() {
-        let decision = decide(None, &own(), &containers(), &wildcard());
+        let decision = decide(None, &own(), Some(&containers()), &wildcard());
         assert_eq!(
             decision,
             PrivateIngressDecision {
@@ -907,6 +1025,7 @@ mod tests {
             outcome: temps_core::worker_ingress::PrivateCheckOutcome::Reachable,
             message: "answered".into(),
             status: Some(200),
+            checked_at: None,
         }
     }
 
@@ -945,6 +1064,29 @@ mod tests {
             Some("app063.internal.example.test"),
             "the one result not checked again is the oldest"
         );
+
+        // Each result says when it ran. The one carried from the first
+        // batch keeps its time: the report does not make it look checked
+        // again with the second.
+        let carried = report.last().and_then(|c| c.checked_at).unwrap();
+        assert!(report.iter().all(|c| c.checked_at.is_some()));
+        assert!(report[..second.len()]
+            .iter()
+            .all(|c| c.checked_at.unwrap() >= carried));
+
+        // A result the checker stamped when it ran keeps that time, not
+        // the end of its batch.
+        let third = rotation.next(&hosts, 1);
+        let early = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let mut stamped = passed(&third[0].0);
+        stamped.checked_at = Some(early);
+        rotation.record(&third, vec![stamped], start + Duration::from_secs(2));
+        let kept = rotation
+            .report()
+            .into_iter()
+            .find(|c| c.hostname == third[0].0)
+            .and_then(|c| c.checked_at);
+        assert_eq!(kept, Some(early));
 
         // A hostname no longer served drops out of the report.
         rotation.retain(&hosts[..10]);

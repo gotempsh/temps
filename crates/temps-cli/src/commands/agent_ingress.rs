@@ -372,6 +372,34 @@ fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// The commands the control plane's private-ingress messages tell an
+    /// operator to run on a worker parse as written.
+    #[test]
+    fn the_worker_commands_the_console_suggests_parse() {
+        #[derive(clap::Parser)]
+        struct Agent {
+            #[command(subcommand)]
+            ingress: AgentIngressCommand,
+        }
+        use clap::Parser;
+        for message in [
+            temps_config::private_ingress::NODE_ZERO_TAILSCALE_SERVE,
+            temps_config::private_ingress::SPLIT_ROLE_UNAVAILABLE,
+        ] {
+            let command = message
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .find(|quoted| quoted.starts_with("temps agent ingress"))
+                .unwrap_or_else(|| panic!("no worker command in {message}"));
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert_eq!(&words[..3], ["temps", "agent", "ingress"], "{command}");
+            let parsed =
+                Agent::try_parse_from(std::iter::once("ingress").chain(words[3..].iter().copied()));
+            assert!(parsed.is_ok(), "{command}: {:?}", parsed.err());
+        }
+    }
+
     #[test]
     fn private_takes_tailscale_or_a_private_address_only() {
         let private = |listen: &str| super::private(Some(listen), &[], false);

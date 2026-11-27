@@ -1438,8 +1438,25 @@ impl ServeCommand {
                 db.clone(),
                 runtime,
                 route_table.clone(),
+                self.profile.local_workloads_enabled(),
                 docker_handle.clone(),
             );
+        } else {
+            // ADR-115 D7: nothing in this process serves node 0's private
+            // addresses, so a report an earlier single-process run left is
+            // not true now. Forget it, so no plan offers its listener.
+            match rt.block_on(
+                temps_ingress::control_plane_private::forget_control_plane_report(db.as_ref()),
+            ) {
+                Ok(0) => {}
+                Ok(_) => info!(
+                    "the console runs without the proxy; forgot node 0's private listener report"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    "could not forget node 0's private listener report; plans may still offer it"
+                ),
+            }
         }
 
         // Build the console params once; both roles consume them.

@@ -16,8 +16,11 @@ import {
   useOnboarding,
   useUpdateOnboarding,
 } from '@/components/welcome/useOnboarding'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 import { Button, Callout, Wizard } from '@temps-sdk/ds'
@@ -37,14 +40,23 @@ export function Welcome() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams, setSearchParams] = useSearchParams()
+  // Setup is the administrator's: for anyone else the onboarding query is
+  // disabled, and would stay pending forever.
+  const isAdmin = useIsInstanceAdmin()
+  const role = useCurrentUserRole()
   const onboarding = useOnboarding()
   const update = useUpdateOnboarding()
-  const host = useQuery({ ...getHostFactsOptions(), staleTime: 60_000 })
+  const host = useQuery({
+    ...getHostFactsOptions(),
+    staleTime: 60_000,
+    enabled: isAdmin,
+  })
   // This machine's private networks (ADR-115 D8); absent where the proxy
   // runs in another process, and the facts then fall back to Tailscale.
   const privateIngress = useQuery({
     ...getPrivateIngressOptions(),
     staleTime: 60_000,
+    enabled: isAdmin,
   })
 
   useEffect(() => {
@@ -80,21 +92,30 @@ export function Welcome() {
         currentStep={step}
         steps={STEPS.map((s) => ({ id: s.key, label: s.title }))}
         headerActions={
-          <Button
-            variant="outline"
-            busy={skip.isPending}
-            busyLabel="Saving…"
-            onClick={() => skip.mutate()}
-          >
-            Skip setup
-          </Button>
+          isAdmin ? (
+            <Button
+              variant="outline"
+              busy={skip.isPending}
+              busyLabel="Saving…"
+              onClick={() => skip.mutate()}
+            >
+              Skip setup
+            </Button>
+          ) : undefined
         }
         footer={null}
       >
         {/* No card around the step: its own lists and choices are the
             surfaces, so nothing nests. */}
         <section aria-label="Current step" className="min-w-0">
-          {onboarding.isPending ? (
+          {!isAdmin ? (
+            <div className="space-y-4">
+              <AdminOnlyNote action="set up this install" role={role} />
+              <Button variant="outline" onClick={() => navigate('/projects')}>
+                All projects
+              </Button>
+            </div>
+          ) : onboarding.isPending ? (
             <div className="space-y-3" role="status" aria-label="Loading setup">
               <Skeleton className="h-8 w-64" />
               <Skeleton className="h-32 w-full" />
@@ -116,12 +137,7 @@ export function Welcome() {
           ) : step === 'reach' ? (
             host.data ? (
               <ReachStep
-                facts={factsFromHost(
-                  host.data,
-                  privateIngress.data?.networks.length
-                    ? privateIngress.data.networks
-                    : undefined
-                )}
+                facts={factsFromHost(host.data, privateIngress.data)}
                 onContinue={() => goTo(following('reach'))}
               />
             ) : host.isError ? (

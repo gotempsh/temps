@@ -29,6 +29,7 @@ interface Rule {
 interface Collected {
   files: { name: string }[]
   leftOut: string[]
+  leftOutCount: number
   total: number
 }
 interface Deploy {
@@ -39,7 +40,12 @@ interface Deploy {
   HOSTS: { extension: Host; cli: Host }
   collectFiles(
     root: string,
-    limits?: { files?: number; bytes?: number; ignoreBytes?: number }
+    limits?: {
+      files?: number
+      bytes?: number
+      ignoreBytes?: number
+      entries?: number
+    }
   ): Promise<Collected>
   packZip(
     collected: Collected,
@@ -373,6 +379,30 @@ describe('packing a folder', () => {
   })
 })
 
+describe('a folder with many entries left out', () => {
+  const root = join(SCRATCH, 'many-left-out')
+  const built: Record<string, string> = { 'package.json': '{}' }
+  for (let i = 0; i < 50; i++) built[`out-${i}.log`] = 'built'
+  built['.gitignore'] = '*.log\n'
+  tree(root, built)
+
+  test('keeps only the names it shows, and counts the rest', async () => {
+    const collected = await deploy.collectFiles(root)
+    expect(collected.files.map((f) => f.name)).toEqual([
+      '.gitignore',
+      'package.json',
+    ])
+    expect(collected.leftOut).toHaveLength(12)
+    expect(collected.leftOutCount).toBe(50)
+  })
+
+  test('a folder past the entry limit is refused, its ignored entries counted', async () => {
+    await expect(deploy.collectFiles(root, { entries: 20 })).rejects.toThrow(
+      'more than 20 files and folders, counting those left out'
+    )
+  })
+})
+
 describe('a folder that changes while it is packed', () => {
   test('a folder swapped for a symlink after listing does not lead the read outside', async () => {
     const root = join(SCRATCH, 'swapped')
@@ -430,6 +460,67 @@ describe('a folder that changes while it is packed', () => {
         'config/app.json changed while the folder was read'
       )
       expect(swapped).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('a .gitignore that appears after its lookup refuses the listing, never uploads what it lists', async () => {
+    const root = join(SCRATCH, 'ignore-appears')
+    tree(root, { 'package.json': '{}', 'sub/app.js': 'ok' })
+    const ignore = join(root, 'sub', '.gitignore')
+    const lstat = fsPromises.lstat
+    let created = false
+    // The lookup finds nothing; a checkout then writes the .gitignore and
+    // the private file it lists before the directory is listed.
+    const spy = spyOn(fsPromises, 'lstat').mockImplementation((async (
+      file: string,
+      ...rest: unknown[]
+    ) => {
+      const answer = (lstat as (...args: unknown[]) => Promise<unknown>)(
+        file,
+        ...rest
+      )
+      if (file === ignore && !created) {
+        created = true
+        await answer.catch(() => {})
+        writeFileSync(ignore, 'private.csv\n')
+        writeFileSync(join(root, 'sub', 'private.csv'), 'secret rows')
+      }
+      return answer
+    }) as never)
+    try {
+      await expect(deploy.collectFiles(root)).rejects.toThrow(
+        'changed while it was read'
+      )
+      expect(created).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('a .gitignore that cannot be looked up refuses the folder, never reads as no rules', async () => {
+    const root = join(SCRATCH, 'ignore-unreadable')
+    tree(root, {
+      'package.json': '{}',
+      '.gitignore': 'private.csv\n',
+      'private.csv': 'secret rows',
+    })
+    const ignore = join(root, '.gitignore')
+    const lstat = fsPromises.lstat
+    const spy = spyOn(fsPromises, 'lstat').mockImplementation((async (
+      file: string,
+      ...rest: unknown[]
+    ) => {
+      if (file === ignore) {
+        throw Object.assign(new Error('I/O error'), { code: 'EIO' })
+      }
+      return (lstat as (...args: unknown[]) => unknown)(file, ...rest)
+    }) as never)
+    try {
+      await expect(deploy.collectFiles(root)).rejects.toThrow(
+        'could not be read (EIO)'
+      )
     } finally {
       spy.mockRestore()
     }

@@ -179,6 +179,13 @@ impl<'a> PublicIngressStore<'a> {
         let now = chrono::Utc::now();
         // Inside checks (ADR 064 D7), stamped with when they arrived: the
         // worker's clock never says when an address was last seen working.
+        // Node 0's own checks run on this machine's clock and keep when
+        // they ran, so a result carried while other hosts take their turn
+        // keeps its age (never later than now).
+        let stamp = |check: &temps_core::worker_ingress::PrivateCheck| match check.checked_at {
+            Some(at) if node_id == temps_core::CONTROL_PLANE_NODE_ID => at.min(now),
+            _ => now,
+        };
         report.private_checks.truncate(MAX_PRIVATE_CHECKS);
         let private_checks =
             (report.mode == Some(temps_core::worker_ingress::IngressMode::Private)).then(|| {
@@ -192,7 +199,7 @@ impl<'a> PublicIngressStore<'a> {
                         "outcome": check.outcome,
                         "message": check.message.chars().take(1000).collect::<String>(),
                         "status": check.status,
-                        "received_at": now,
+                        "received_at": stamp(check),
                     }))
                     .collect::<Vec<_>>())
             });
@@ -508,6 +515,68 @@ mod tests {
             insert.contains("\"consent_at\":\"2026-11-26T10:00:00.123456Z\""),
             "{insert}"
         );
+    }
+
+    /// Node 0's inside checks keep when they ran, so a result carried into
+    /// a later report keeps its age; a worker's are stamped on arrival,
+    /// whatever its report says, and a time in the future is never kept.
+    #[tokio::test]
+    async fn only_node_zeros_inside_checks_keep_when_they_ran() {
+        use temps_core::worker_ingress::{IngressMode, PrivateCheck, PrivateCheckOutcome};
+        let ran: chrono::DateTime<chrono::Utc> = "2026-11-20T08:00:00Z".parse().unwrap();
+        let check = |host: &str, at| PrivateCheck {
+            address_id: "env:1".into(),
+            hostname: host.into(),
+            listener: "10.8.0.2".into(),
+            outcome: PrivateCheckOutcome::Reachable,
+            message: "answered".into(),
+            status: Some(200),
+            checked_at: Some(at),
+        };
+        let future = chrono::Utc::now() + chrono::Duration::days(1);
+        for node_id in [temps_core::CONTROL_PLANE_NODE_ID, 3] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<node_public_ingress::Model>::new()])
+                .append_query_results([Vec::<node_public_ingress::Model>::new()])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection();
+            PublicIngressStore::new(&db)
+                .record_report(
+                    node_id,
+                    ListenerReport {
+                        mode: Some(IngressMode::Private),
+                        private_checks: vec![
+                            check("old.example.test", ran),
+                            check("ahead.example.test", future),
+                        ],
+                        ..ListenerReport::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let insert = db
+                .into_transaction_log()
+                .iter()
+                .flat_map(|t| t.statements())
+                .map(|s| s.to_string())
+                .find(|sql| sql.starts_with("INSERT INTO \"node_public_ingress\""))
+                .expect("the report is written")
+                .replace('\\', "");
+            let kept = insert.contains("\"received_at\":\"2026-11-20T08:00:00Z\"");
+            assert_eq!(
+                kept,
+                node_id == temps_core::CONTROL_PLANE_NODE_ID,
+                "{insert}"
+            );
+            assert!(
+                !insert.contains(&future.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+                "{insert}"
+            );
+        }
     }
 
     #[tokio::test]

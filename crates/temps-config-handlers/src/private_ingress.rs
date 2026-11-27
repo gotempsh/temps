@@ -57,6 +57,11 @@ fn private_ingress_problem(error: PrivateIngressError) -> Problem {
                 .detail(error.to_string())
                 .build()
         }
+        PrivateIngressError::Unavailable => ErrorBuilder::new(StatusCode::CONFLICT)
+            .type_("https://temps.sh/probs/private-ingress-unavailable")
+            .title("Private Ingress Unavailable")
+            .detail(error.to_string())
+            .build(),
     }
 }
 
@@ -155,8 +160,10 @@ async fn get_private_ingress(
 /// `listen` is `tailscale` (the Tailscale interface's address) or one of the
 /// machine's private addresses. The proxy then serves an address made
 /// private on this machine only to connections that arrive on that address
-/// from inside its range. `tailscale_serve` also lets Temps write its own
-/// entries in tailscaled's Serve configuration.
+/// from inside its range. `tailscale_serve` must be false: the control
+/// plane does not write Tailscale Serve entries (a worker's agent does).
+/// Where the console and proxy run as separate processes nothing here
+/// applies a consent, and saving one is a 409.
 #[utoipa::path(
     tag = "Settings",
     put,
@@ -165,6 +172,7 @@ async fn get_private_ingress(
     responses(
         (status = 200, description = "The stored consent", body = PrivateIngressConsent),
         (status = 400, description = "The address is not one a private listener may use; the detail says why"),
+        (status = 409, description = "The console and proxy run as separate processes, so nothing here serves private addresses"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 500, description = "The consent could not be written")
@@ -308,7 +316,10 @@ mod tests {
 
     fn app(db: DatabaseConnection, audit: Arc<RecordingAudit>) -> Router {
         configure_private_ingress_routes().with_state(Arc::new(PrivateIngressHandlerState {
-            private_ingress_service: Arc::new(PrivateIngressService::new(Arc::new(db), None)),
+            private_ingress_service: Arc::new(PrivateIngressService::new(
+                Arc::new(db),
+                Some(temps_core::private_ingress::ControlPlanePrivateIngress::new()),
+            )),
             audit_service: audit,
         }))
     }
@@ -411,13 +422,13 @@ mod tests {
         let (status, body) = send(
             app(db, audit.clone()),
             "PUT",
-            Some(serde_json::json!({"listen": "100.101.102.103", "tailscale_serve": true})),
+            Some(serde_json::json!({"listen": "100.101.102.103", "tailscale_serve": false})),
             Some(admin()),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["listen"], "100.101.102.103");
-        assert_eq!(body["tailscale_serve"], true);
+        assert_eq!(body["tailscale_serve"], false);
         let records = audit.records.lock().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, "PRIVATE_INGRESS_UPDATED");

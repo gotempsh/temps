@@ -56,8 +56,11 @@ export function ShipStep() {
     // server's clock, which the shared project list does not.
     queryKey: ['welcome', 'ship', 'projects'],
     queryFn: async ({ signal }) => {
+      // Newest first: the agent's project has usually not deployed yet,
+      // and the default order puts never-deployed projects last, past
+      // the first page on an install with many deployed ones.
       const { data, response } = await getProjects({
-        query: { page: 1, per_page: 20 },
+        query: { page: 1, per_page: 20, sort: 'created' },
         signal,
         throwOnError: true,
       })

@@ -161,14 +161,17 @@ impl TempsPlugin for InfraPlugin {
             context.register_service(platform_info_service.clone());
 
             let server_config = config_service.get_server_config();
-            let temps_ports: Vec<u16> = std::iter::once(server_config.address.as_str())
-                .chain(server_config.tls_address.as_deref())
-                .filter_map(crate::services::host_facts::listener_port)
-                .collect();
+            // Full addresses, not just ports: a proxy bound to one LAN or
+            // overlay address answers only there.
+            let temps_listeners: Vec<std::net::SocketAddr> =
+                std::iter::once(server_config.address.as_str())
+                    .chain(server_config.tls_address.as_deref())
+                    .filter_map(crate::services::host_facts::listener_probe_address)
+                    .collect();
             let host_facts_service = Arc::new(crate::services::HostFactsService::new(
                 platform_info_service.clone(),
                 docker_handle_for_facts,
-                temps_ports,
+                temps_listeners,
                 config_service.data_dir(),
             ));
             context.register_service(host_facts_service);

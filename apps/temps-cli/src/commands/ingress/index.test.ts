@@ -25,11 +25,12 @@ describe('privateIntent', () => {
     expect(privateIntent({ off: true, admit: ['10.8.0.0/24'] }).kind).toBe('invalid')
   })
 
-  test('--tailscale-serve is carried with --listen', () => {
-    expect(privateIntent({ listen: ' 100.64.0.7 ', tailscaleServe: true })).toEqual({
-      kind: 'serve',
-      request: { listen: '100.64.0.7', admit: [], tailscale_serve: true },
-    })
+  test('a blank --admit is refused, never read as the default network', () => {
+    for (const admit of [[''], ['  '], ['10.8.0.0/24', ' ']]) {
+      const intent = privateIntent({ listen: '10.8.0.1', admit })
+      expect(intent.kind).toBe('invalid')
+      if (intent.kind === 'invalid') expect(intent.error).toContain('empty range')
+    }
   })
 
   test('--off withdraws the consent', () => {
@@ -40,9 +41,6 @@ describe('privateIntent', () => {
     expect(privateIntent({ off: true, listen: 'tailscale' }).kind).toBe('invalid')
   })
 
-  test('--tailscale-serve alone is refused', () => {
-    expect(privateIntent({ tailscaleServe: true }).kind).toBe('invalid')
-  })
 
   test('an empty --listen is refused', () => {
     expect(privateIntent({ listen: '  ' }).kind).toBe('invalid')
@@ -54,6 +52,10 @@ describe('describePrivateStatus', () => {
 
   test('without consent nothing is served', () => {
     expect(describePrivateStatus({ consent: null })).toBe('This machine does not serve private addresses.')
+    // A split-role install with no consent yet says why it cannot serve.
+    expect(describePrivateStatus({ consent: null, error: 'It runs its console and proxy apart.' })).toBe(
+      'This machine does not serve private addresses: It runs its console and proxy apart.',
+    )
   })
 
   test('names the address it serves on and who it admits', () => {

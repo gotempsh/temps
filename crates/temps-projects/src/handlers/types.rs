@@ -385,6 +385,8 @@ pub struct PaginationParams {
     /// Return only services that are members of this project group.
     /// Mutually exclusive with `ungrouped`.
     pub project_group_id: Option<i32>,
+    /// The order: `last_deployed` (the default) or `created`, newest first.
+    pub sort: Option<crate::services::project::ProjectOrder>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

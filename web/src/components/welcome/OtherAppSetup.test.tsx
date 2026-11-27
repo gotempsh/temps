@@ -8,10 +8,18 @@ import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render } from '@testing-library/react'
+import type { McpAppId } from '@/lib/mcp-clients'
+import { useState } from 'react'
 import { OtherAppSetup } from './OtherAppSetup'
 
 installBrowserWindow()
 afterEach(cleanup)
+
+/** The picked app is held by the step around it. */
+function PickedApp() {
+  const [app, setApp] = useState<McpAppId>('cursor')
+  return <OtherAppSetup appId={app} onAppChange={setApp} />
+}
 
 function renderAsAdmin() {
   const client = new QueryClient({
@@ -28,7 +36,7 @@ function renderAsAdmin() {
           refetch: () => {},
         }}
       >
-        <OtherAppSetup />
+        <PickedApp />
       </AuthContext.Provider>
     </QueryClientProvider>
   )
@@ -73,6 +81,35 @@ test('the settings appear once the server is on and a key exists, with the key i
   expect(
     view.getByText(/bunx @temps-sdk\/cli mcp add vscode --url .* --write -y/)
   ).toBeTruthy()
+  api.restore()
+})
+
+test("switching apps after making a key asks for the new app's own key", async () => {
+  const api = mockApi({
+    'GET /settings': () => jsonResponse({ mcp_server: { enabled: true } }),
+    'POST /api-keys': async (request) => {
+      const sent = await request.json()
+      return jsonResponse({
+        id: 9,
+        name: sent.name,
+        key_prefix: 'tk_abc12',
+        api_key: 'tk_abc12_secret',
+        role_type: 'user',
+        created_at: '2026-11-25T10:00:00Z',
+      })
+    },
+  })
+  const view = renderAsAdmin()
+  await view.findByText('First create a key, then copy the settings.')
+  fireEvent.click(view.getByRole('button', { name: 'Create key' }))
+  await view.findByLabelText('Cursor settings')
+
+  fireEvent.click(view.getByRole('combobox', { name: 'Which app?' }))
+  fireEvent.click(await view.findByRole('option', { name: /Zed/ }))
+  // Zed's settings never carry the key named for Cursor.
+  await view.findByText('First create a key, then copy the settings.')
+  expect(view.queryByLabelText('Zed settings')).toBeNull()
+  expect(view.container.textContent).not.toContain('tk_abc12_secret')
   api.restore()
 })
 

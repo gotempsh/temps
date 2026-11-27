@@ -19230,8 +19230,11 @@
             "type": "string"
           },
           "value": {
-            "description": "The value. Leave it empty and set `generate` to have the server make\none instead.",
-            "type": "string"
+            "description": "The value; an empty string is stored as one. Required unless\n`generate` asks the server to make the value instead.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -61135,6 +61138,10 @@
             },
             "type": "array"
           },
+          "available": {
+            "description": "Whether a process of this control plane applies a consent here.\n`false` where the console runs without the proxy (split roles): no\nprivate address is served, a consent cannot be given, and `error`\nsays why and what to run instead.",
+            "type": "boolean"
+          },
           "consent": {
             "oneOf": [
               {
@@ -61178,6 +61185,7 @@
           }
         },
         "required": [
+          "available",
           "admit",
           "networks"
         ],
@@ -62353,6 +62361,14 @@
           "status"
         ],
         "type": "object"
+      },
+      "ProjectOrder": {
+        "description": "How a project list is ordered.",
+        "enum": [
+          "last_deployed",
+          "created"
+        ],
+        "type": "string"
       },
       "ProjectPresetResponse": {
         "properties": {
@@ -153053,6 +153069,15 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "last_deployed (the default): most recently deployed first, never-deployed last. created: newest first, deployed or not.",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ProjectOrder"
+            }
           }
         ],
         "responses": {
@@ -194687,7 +194712,7 @@
         ]
       },
       "put": {
-        "description": "`listen` is `tailscale` (the Tailscale interface's address) or one of the\nmachine's private addresses. The proxy then serves an address made\nprivate on this machine only to connections that arrive on that address\nfrom inside its range. `tailscale_serve` also lets Temps write its own\nentries in tailscaled's Serve configuration.",
+        "description": "`listen` is `tailscale` (the Tailscale interface's address) or one of the\nmachine's private addresses. The proxy then serves an address made\nprivate on this machine only to connections that arrive on that address\nfrom inside its range. `tailscale_serve` must be false: the control\nplane does not write Tailscale Serve entries (a worker's agent does).\nWhere the console and proxy run as separate processes nothing here\napplies a consent, and saving one is a 409.",
         "operationId": "put_private_ingress",
         "requestBody": {
           "content": {
@@ -194718,6 +194743,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The console and proxy run as separate processes, so nothing here serves private addresses"
           },
           "500": {
             "description": "The consent could not be written"

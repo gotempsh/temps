@@ -100,7 +100,7 @@ mod tests {
                 "control-plane",
                 "no Docker in this test",
             )),
-            vec![8080],
+            vec![std::net::SocketAddr::from(([127, 0, 0, 1], 8080))],
             std::env::temp_dir(),
         ));
         configure_host_facts_routes().with_state(service)

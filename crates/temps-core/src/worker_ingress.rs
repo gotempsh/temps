@@ -406,6 +406,12 @@ pub struct PrivateCheck {
     /// The HTTP status the listener answered with, when it answered.
     #[serde(default)]
     pub status: Option<u16>,
+    /// When the check ran, set only by the control plane for node `0`'s
+    /// own checks, which share its clock. A worker's report never sets it:
+    /// its checks are stamped with when they arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub checked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[cfg(test)]

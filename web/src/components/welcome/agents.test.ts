@@ -6,6 +6,7 @@ import type { AiHarnessCredential } from '@/api/client'
 import {
   CONNECTABLE_AGENTS,
   agentConnection,
+  mcpClientFor,
   agentWaitingLine,
   mcpSetupBlocker,
 } from './agents'
@@ -42,9 +43,12 @@ test('the agents shown are the ones with a logo', () => {
 })
 
 describe('agentConnection', () => {
-  const via = (kind: AiHarnessCredential['kind']): AiHarnessCredential => ({
+  const via = (
+    kind: AiHarnessCredential['kind'],
+    name = 'mcp-claude-app-2026-11-25T10-00-00Z'
+  ): AiHarnessCredential => ({
     id: 3,
-    name: 'key',
+    name,
     key_prefix: 'tk_ab12c',
     kind,
     last_used_at: '2026-11-25T10:00:00Z',
@@ -61,10 +65,35 @@ describe('agentConnection', () => {
 
   test('the Claude app is connected only once its own key is used', () => {
     expect(
-      agentConnection('claude_app', {
-        status: 'connected',
-        connected_via: via('mcp_client'),
-      })
+      agentConnection(
+        'claude_app',
+        { status: 'connected', connected_via: via('mcp_client') },
+        mcpClientFor('claude_app', 'cursor')
+      )
+    ).toEqual({ kind: 'connected' })
+  })
+
+  test("another app's MCP key does not connect the Claude app, or a different app", () => {
+    const cursor = {
+      status: 'connected' as const,
+      connected_via: via('mcp_client', 'mcp-cursor-2026-11-20T09-00-00Z'),
+    }
+    const claude = agentConnection(
+      'claude_app',
+      cursor,
+      mcpClientFor('claude_app', 'cursor')
+    )
+    expect(claude).toEqual({
+      kind: 'waiting',
+      line: 'Waiting for the Claude app to call Temps. Another agent is already connected, so you can continue without it.',
+      canContinue: true,
+    })
+    expect(
+      agentConnection('other_app', cursor, mcpClientFor('other_app', 'zed'))
+        .kind
+    ).toBe('waiting')
+    expect(
+      agentConnection('other_app', cursor, mcpClientFor('other_app', 'cursor'))
     ).toEqual({ kind: 'connected' })
   })
 
@@ -82,10 +111,14 @@ describe('agentConnection', () => {
 
   test('another app waits for an MCP key in the same way', () => {
     expect(
-      agentConnection('other_app', {
-        status: 'connected',
-        connected_via: via('mcp_client'),
-      })
+      agentConnection(
+        'other_app',
+        {
+          status: 'connected',
+          connected_via: via('mcp_client', 'mcp-vscode-2026-11-25T10-00-00Z'),
+        },
+        mcpClientFor('other_app', 'vscode')
+      )
     ).toEqual({ kind: 'connected' })
     expect(agentConnection('other_app', { status: 'missing' })).toEqual({
       kind: 'waiting',

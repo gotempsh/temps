@@ -325,6 +325,7 @@ export function ReachStep({
           <Button
             busy={save.isPending}
             busyLabel="Saving…"
+            disabled={later.isPending}
             onClick={() => save.mutate()}
           >
             {choice.way === 'tunnel'
@@ -341,10 +342,14 @@ export function ReachStep({
             Back
           </Button>
         )}
+        {/* One write at a time: a deferral saved while Save is still
+            enabling private ingress would leave the step, and the save
+            would go on to serve privately and mark the step done. */}
         <Button
           variant="ghost"
           busy={later.isPending}
           busyLabel="Saving…"
+          disabled={save.isPending}
           onClick={() => later.mutate()}
         >
           Do this later

@@ -221,10 +221,12 @@ pub struct DockerSandboxConfig {
     /// rename applies to the sandboxes created after it.
     pub preview_gateway_container_name: crate::preview_gateway::GatewayName,
     /// Most bytes of each exec stream (stdout, stderr) kept for the result,
-    /// enforced while Docker's output is read. `None` keeps all of it, which
-    /// is what callers on the control plane expect; a worker node sets it so
-    /// a chatty command cannot exhaust the node's memory before the response
-    /// is truncated. Streamed lines are still delivered in full.
+    /// enforced while Docker's output is read: the tail of anything longer
+    /// is kept, so a chatty command (an agent's `sandbox_exec`, a build that
+    /// prints megabytes) cannot exhaust the host's memory before its result
+    /// is truncated. Defaults to [`crate::remote::WORKER_EXEC_OUTPUT_LIMIT`],
+    /// the bound a worker node already applies; `None` keeps all of it.
+    /// Streamed lines are still delivered in full.
     pub exec_output_limit: Option<usize>,
 }
 
@@ -238,7 +240,7 @@ impl Default for DockerSandboxConfig {
             network_mode: "full".to_string(),
             control_plane_url: "http://host.docker.internal:8080".to_string(),
             preview_gateway_container_name: crate::preview_gateway::GatewayName::default(),
-            exec_output_limit: None,
+            exec_output_limit: Some(crate::remote::WORKER_EXEC_OUTPUT_LIMIT),
         }
     }
 }

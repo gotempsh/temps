@@ -20,6 +20,7 @@
 //! {"type":"temps.finish","reason":"stop"|"max_turns","turns":3}
 //! ```
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,6 +127,21 @@ pub struct AgentLoopRequest {
     pub max_turns: u32,
     /// The whole run's time budget.
     pub timeout: Duration,
+    /// Set when the run is cancelled. The loop checks it before every model
+    /// turn and every tool call, so a cancelled run starts no further paid
+    /// gateway turn; a turn already in flight finishes, and its reply is
+    /// dropped.
+    pub cancelled: Arc<AtomicBool>,
+}
+
+/// [`AgentError::RunCancelled`] once the run's cancel flag is set.
+fn ensure_not_cancelled(request: &AgentLoopRequest) -> Result<(), AgentError> {
+    if request.cancelled.load(Ordering::Acquire) {
+        return Err(AgentError::RunCancelled {
+            run_id: request.run_id,
+        });
+    }
+    Ok(())
 }
 
 /// How a run ended.
@@ -235,6 +251,7 @@ pub async fn run_agent_loop(
     let mut turn = 0u32;
 
     while max_turns == 0 || turn < max_turns {
+        ensure_not_cancelled(&request)?;
         turn += 1;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -257,6 +274,9 @@ pub async fn run_agent_loop(
                 turn,
                 reason: error.to_string(),
             })?;
+        // A cancel during the turn ends the run here: its reply is neither
+        // a final answer nor a tool call to run in a destroyed sandbox.
+        ensure_not_cancelled(&request)?;
         usage.add(response.usage);
 
         let text = response.content.unwrap_or_default();
@@ -265,6 +285,19 @@ pub async fn run_agent_loop(
                 .push(json!({ "type": "temps.text", "text": text }))
                 .await;
             last_text = text.clone();
+        }
+
+        // A reply cut off at the output-token limit is partial, tool calls
+        // included (their arguments may be cut too): ending the run as a
+        // success would save half an analysis as the report, and on the last
+        // allowed turn a tool call would carry that partial text into an
+        // exhausted-turns outcome.
+        if response.truncated {
+            return Err(AgentError::AgentModelFailed {
+                run_id: request.run_id,
+                turn,
+                reason: "the model's reply was cut off at its output-token limit, so it is not a final answer".to_string(),
+            });
         }
 
         if response.tool_calls.is_empty() {
@@ -296,6 +329,7 @@ pub async fn run_agent_loop(
         assistant.tool_calls = Some(response.tool_calls.clone());
         messages.push(assistant);
         for call in response.tool_calls {
+            ensure_not_cancelled(&request)?;
             transcript
                 .push(json!({
                     "type": "temps.tool_call",
@@ -312,6 +346,9 @@ pub async fn run_agent_loop(
             if remaining.is_zero() {
                 return Err(timed_out(&request, turn));
             }
+            // Again after the log write above, which awaits the database: a
+            // cancel landing during it must not start a sandbox command.
+            ensure_not_cancelled(&request)?;
             let (output, is_error) = match tokio::time::timeout(
                 remaining,
                 execute_tool(sandbox, &call, remaining),
@@ -695,6 +732,7 @@ mod tests {
 
     fn text_turn(text: &str) -> ChatTurnResponse {
         ChatTurnResponse {
+            truncated: false,
             content: Some(text.to_string()),
             tool_calls: Vec::new(),
             usage: None,
@@ -703,6 +741,7 @@ mod tests {
 
     fn tool_turn(id: &str, name: &str, arguments: serde_json::Value) -> ChatTurnResponse {
         ChatTurnResponse {
+            truncated: false,
             content: None,
             tool_calls: vec![ToolCall {
                 id: id.to_string(),
@@ -729,6 +768,7 @@ mod tests {
             prompt: "Fix the failing test".to_string(),
             max_turns,
             timeout: Duration::from_secs(900),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -855,6 +895,7 @@ mod tests {
     #[tokio::test]
     async fn a_tool_batch_stops_at_the_run_deadline() {
         let ai = ScriptedAi::new(vec![Ok(ChatTurnResponse {
+            truncated: false,
             content: None,
             tool_calls: vec![
                 ToolCall {
@@ -1099,6 +1140,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_reply_fails_the_run() {
         let ai = ScriptedAi::new(vec![Ok(ChatTurnResponse {
+            truncated: false,
             content: None,
             tool_calls: Vec::new(),
             usage: None,
@@ -1117,6 +1159,135 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A reply the provider cut off at its output-token limit is partial
+    /// text: the run fails instead of saving half a report as its answer.
+    #[tokio::test]
+    async fn a_reply_cut_off_at_the_token_limit_fails_the_run() {
+        let mut cut = text_turn("## Findings\n1. The first of three");
+        cut.truncated = true;
+        let ai = ScriptedAi::new(vec![Ok(cut)]);
+        let error = run_agent_loop(&ai, &MemorySandbox::default(), request(5), None)
+            .await
+            .unwrap_err();
+        match error {
+            AgentError::AgentModelFailed { turn, reason, .. } => {
+                assert_eq!(turn, 1);
+                assert!(reason.contains("output-token limit"), "{reason}");
+            }
+            other => panic!("expected AgentModelFailed, got {other:?}"),
+        }
+    }
+
+    /// A cut-off reply that also calls a tool fails too: on the last turn
+    /// it would otherwise end as exhausted turns carrying the partial text.
+    #[tokio::test]
+    async fn a_cut_off_reply_with_a_tool_call_fails_the_run() {
+        let mut cut = tool_turn("c1", SANDBOX_EXEC_TOOL, json!({ "command": "ls" }));
+        cut.content = Some("## Findings\n1. The first".to_string());
+        cut.truncated = true;
+        let ai = ScriptedAi::new(vec![Ok(cut)]);
+        let sandbox = MemorySandbox::default();
+        let error = run_agent_loop(&ai, &sandbox, request(1), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::AgentModelFailed { turn: 1, .. }),
+            "{error:?}"
+        );
+        assert!(sandbox.commands.lock().unwrap().is_empty());
+    }
+
+    /// A cancel landing while the tool call is being logged stops the run
+    /// before the command starts.
+    #[tokio::test]
+    async fn a_cancel_during_the_tool_log_write_starts_no_command() {
+        let req = request(5);
+        let flag = req.cancelled.clone();
+        let on_event: OnEventCallback = Arc::new(move |line: String| {
+            let flag = flag.clone();
+            Box::pin(async move {
+                if line.contains("temps.tool_call") {
+                    flag.store(true, Ordering::Release);
+                }
+            })
+        });
+        let ai = ScriptedAi::new(vec![Ok(tool_turn(
+            "c1",
+            SANDBOX_EXEC_TOOL,
+            json!({ "command": "cargo test" }),
+        ))]);
+        let sandbox = MemorySandbox::default();
+        let error = run_agent_loop(&ai, &sandbox, req, Some(on_event))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::RunCancelled { run_id: 7 }));
+        assert!(sandbox.commands.lock().unwrap().is_empty());
+    }
+
+    /// The gateway whose turn the run is cancelled during.
+    struct CancelDuringTurn {
+        inner: ScriptedAi,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl AiService for CancelDuringTurn {
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn complete(&self, _request: AiRequest) -> Result<AiResponse, AiError> {
+            Err(AiError::NotAvailable)
+        }
+        async fn chat_stream(&self, _request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+            Err(AiError::NotAvailable)
+        }
+        async fn chat(&self, request: ChatTurnRequest) -> Result<ChatTurnResponse, AiError> {
+            let reply = self.inner.chat(request).await;
+            self.cancelled.store(true, Ordering::Release);
+            reply
+        }
+    }
+
+    /// Cancelled while the gateway returns a tool call, the run neither runs
+    /// the call in its destroyed sandbox nor pays for another turn to tell
+    /// the model it failed.
+    #[tokio::test]
+    async fn a_run_cancelled_during_a_turn_runs_no_tool_and_starts_no_turn() {
+        let req = request(5);
+        let ai = CancelDuringTurn {
+            inner: ScriptedAi::new(vec![
+                Ok(tool_turn(
+                    "c1",
+                    SANDBOX_EXEC_TOOL,
+                    json!({ "command": "cargo test" }),
+                )),
+                Ok(text_turn("never asked for")),
+            ]),
+            cancelled: req.cancelled.clone(),
+        };
+        let sandbox = MemorySandbox::default();
+        let error = run_agent_loop(&ai, &sandbox, req, None).await.unwrap_err();
+        assert!(
+            matches!(error, AgentError::RunCancelled { run_id: 7 }),
+            "{error:?}"
+        );
+        assert_eq!(ai.inner.requests.lock().unwrap().len(), 1);
+        assert!(sandbox.commands.lock().unwrap().is_empty());
+    }
+
+    /// A run cancelled before its first turn makes no gateway call at all.
+    #[tokio::test]
+    async fn a_cancelled_run_makes_no_gateway_call() {
+        let req = request(5);
+        req.cancelled.store(true, Ordering::Release);
+        let ai = ScriptedAi::new(vec![Ok(text_turn("never asked for"))]);
+        let error = run_agent_loop(&ai, &MemorySandbox::default(), req, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::RunCancelled { run_id: 7 }));
+        assert!(ai.requests.lock().unwrap().is_empty());
     }
 
     /// A missing working directory stops the whole script: nothing after

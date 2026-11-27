@@ -5,6 +5,7 @@ import { getAiHarnessStatusOptions } from '@/api/client/@tanstack/react-query.ge
 import { CopyButton } from '@/components/ui/copy-button'
 import { describeHarnessConnection } from '@/lib/ai-onboarding'
 import { problemDetail } from '@/lib/api-problem'
+import type { McpAppId } from '@/lib/mcp-clients'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import { Button, Callout } from '@temps-sdk/ds'
 import { AppWindow, SquareTerminal } from 'lucide-react'
@@ -15,6 +16,7 @@ import {
   type AgentPath,
   AGENT_PATH_LOGOS,
   agentConnection,
+  mcpClientFor,
 } from './agents'
 import { LogoStack } from './LogoStack'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -47,12 +49,16 @@ const TAB_ICONS: Record<AgentPath, ReactNode> = {
  */
 export function AgentsStep({ onContinue }: { onContinue: () => void }) {
   const [path, setPath] = useState<AgentPath>('coding_agent')
+  // Held here so the connection is checked against the key of the app
+  // picked under Another app, not any app's.
+  const [otherApp, setOtherApp] = useState<McpAppId>('cursor')
+  const client = mcpClientFor(path, otherApp)
   const harness = useQuery({
     ...getAiHarnessStatusOptions(),
     // Polls until the picked path is connected: on the Claude app path an
     // earlier CLI login is not enough, so it keeps watching for its key.
     refetchInterval: (query) =>
-      agentConnection(path, query.state.data).kind === 'connected'
+      agentConnection(path, query.state.data, client).kind === 'connected'
         ? false
         : 3000,
   })
@@ -73,7 +79,7 @@ export function AgentsStep({ onContinue }: { onContinue: () => void }) {
   const commands = harnessCommands(window.location.origin)
   const prompt = connectAgentPrompt(window.location.origin)
   const hint = reachHint(window.location.origin)
-  const connection = agentConnection(path, harness.data)
+  const connection = agentConnection(path, harness.data, client)
   const connected = connection.kind === 'connected'
   const canContinue =
     connected || (connection.kind === 'waiting' && connection.canContinue)
@@ -125,7 +131,7 @@ export function AgentsStep({ onContinue }: { onContinue: () => void }) {
                   onUseCodingAgent={() => setPath('coding_agent')}
                 />
               ) : choice.id === 'other_app' ? (
-                <OtherAppSetup />
+                <OtherAppSetup appId={otherApp} onAppChange={setOtherApp} />
               ) : (
                 <CodingAgentSetup
                   prompt={prompt}

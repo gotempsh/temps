@@ -5174,6 +5174,38 @@ async fn insert_search_test_project(
     .expect("insert search test project")
 }
 
+/// A project just created and not yet deployed sorts after every deployed
+/// one by default, so a caller watching for it lists newest first instead.
+#[tokio::test]
+async fn a_new_undeployed_project_leads_the_newest_first_order() {
+    if !temps_test_utils::docker_available().await {
+        println!("Docker not available, skipping");
+        return;
+    }
+    let test_db = TestDatabase::with_migrations().await.unwrap();
+    let db = test_db.db.clone();
+    let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+
+    let deployed = insert_search_test_project(db.as_ref(), "Deployed", "deployed").await;
+    let mut stamped: temps_entities::projects::ActiveModel = deployed.clone().into();
+    stamped.created_at = Set(chrono::Utc::now() - chrono::Duration::days(30));
+    stamped.last_deployment = Set(Some(chrono::Utc::now()));
+    stamped.update(db.as_ref()).await.expect("stamp deployment");
+    let fresh = insert_search_test_project(db.as_ref(), "Fresh", "fresh").await;
+
+    let (by_deployment, _) = service
+        .get_projects_paginated_filtered(1, 1, &[], None, None, ProjectOrder::LastDeployed)
+        .await
+        .unwrap();
+    assert_eq!(by_deployment[0].id, deployed.id);
+    let (newest, total) = service
+        .get_projects_paginated_filtered(1, 1, &[], None, None, ProjectOrder::Created)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(newest[0].id, fresh.id);
+}
+
 #[tokio::test]
 async fn project_search_is_case_insensitive_bounded_and_honors_hidden_projects() {
     if !temps_test_utils::docker_available().await {
@@ -8464,5 +8496,64 @@ async fn a_project_update_refuses_storage_aliases_instead_of_dropping_them() {
                 .await,
             Err(ProjectError::StorageAliasesOnUpdate { .. })
         ));
+    }
+}
+
+/// An invalid storage alias on a new project is the caller's mistake: a
+/// 400 before anything is written, not a 500 after the project exists.
+#[tokio::test]
+async fn a_new_project_refuses_an_invalid_storage_alias_before_writing() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let service = create_test_services(db, Arc::new(MockJobQueue::new())).await;
+    let request = |aliases: BTreeMap<i32, BTreeMap<String, String>>| CreateProjectRequest {
+        cloudflare_enabled: None,
+        delivery_provider: None,
+        name: "shop".to_string(),
+        expected_slug: None,
+        repo_name: None,
+        repo_owner: None,
+        directory: "/".to_string(),
+        main_branch: "main".to_string(),
+        preset: Preset::Nixpacks.to_string(),
+        preset_config: None,
+        environment_variables: None,
+        git_url: None,
+        git_provider_connection_id: None,
+        automatic_deploy: false,
+        exposed_port: None,
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
+        is_public_repo: None,
+        storage_service_ids: vec![12],
+        storage_service_env_aliases: aliases,
+        storage_service_claim_ids: vec![],
+        storage_service_claim_user_id: None,
+        source_type: temps_entities::source_type::SourceType::Git,
+        template_slug: None,
+        hosting: Default::default(),
+    };
+    for aliases in [
+        // Not a variable name.
+        BTreeMap::from([(
+            12,
+            BTreeMap::from([("BAD-NAME".to_string(), "POSTGRES_URL".to_string())]),
+        )]),
+        // A service the project does not link.
+        BTreeMap::from([(
+            13,
+            BTreeMap::from([("DATABASE_URL".to_string(), "POSTGRES_URL".to_string())]),
+        )]),
+    ] {
+        let Err(error) = service.create_project(request(aliases)).await else {
+            panic!("an invalid alias is refused");
+        };
+        assert!(
+            matches!(error, ProjectError::InvalidInput(_)),
+            "a 400, not {error:?}"
+        );
     }
 }

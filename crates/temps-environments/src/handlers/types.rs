@@ -65,10 +65,10 @@ pub fn create_environment_app_state(
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateEnvironmentVariableRequest {
     pub key: String,
-    /// The value. Leave it empty and set `generate` to have the server make
-    /// one instead.
+    /// The value; an empty string is stored as one. Required unless
+    /// `generate` asks the server to make the value instead.
     #[serde(default)]
-    pub value: String,
+    pub value: Option<String>,
     pub environment_ids: Vec<i32>,
     /// Include this environment variable in preview environments (default: false)
     #[serde(default = "default_include_in_preview")]

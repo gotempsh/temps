@@ -71,7 +71,9 @@ pub struct DockerFact {
 pub enum PortHolder {
     /// Nothing answers on it.
     Free,
-    /// Temps' own proxy is configured to listen on it.
+    /// Temps' own proxy is configured to listen on it, and it answers.
+    /// Configured but not answering (a separate proxy process stopped) is
+    /// `Free`: nothing serves it.
     Temps,
     /// Something else answers on it.
     Other,
@@ -155,23 +157,73 @@ pub fn listener_port(address: &str) -> Option<u16> {
         .or_else(|| address.rsplit_once(':').and_then(|(_, p)| p.parse().ok()))
 }
 
-/// Who holds `port`, given what Temps is configured to listen on and whether
-/// something answered a local connection.
-pub fn port_holder(port: u16, temps_ports: &[u16], answered: bool) -> PortHolder {
-    if temps_ports.contains(&port) {
-        PortHolder::Temps
-    } else if answered {
-        PortHolder::Other
-    } else {
-        PortHolder::Free
+/// Where to connect to reach a listener configured at `address`: the address
+/// itself when it names one (a proxy bound only to a LAN or overlay address
+/// answers nowhere else), the loopback of its family when it is unspecified
+/// (`0.0.0.0`, `::`), and IPv4 loopback for a host name.
+pub fn listener_probe_address(address: &str) -> Option<SocketAddr> {
+    let parsed = address.parse::<SocketAddr>().ok().or_else(|| {
+        listener_port(address).map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    })?;
+    Some(match parsed.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, parsed.port()))
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, parsed.port()))
+        }
+        _ => parsed,
+    })
+}
+
+/// Who holds a port: Temps when one of its configured listeners on the port
+/// answered at its own address, someone else when only local loopback
+/// answered, and nobody when nothing did (a configured proxy that is stopped
+/// serves nothing).
+pub fn port_holder(temps_answered: bool, loopback_answered: bool) -> PortHolder {
+    match (temps_answered, loopback_answered) {
+        (true, _) => PortHolder::Temps,
+        (false, true) => PortHolder::Other,
+        (false, false) => PortHolder::Free,
     }
 }
 
-/// The first tailnet address among `addresses`.
-pub fn tailnet_address(addresses: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
-    addresses
+/// Whether something accepts a TCP connection at `address`, within the
+/// probe timeout. A connection, never a bind: binding even briefly could make
+/// a real service fail to start.
+async fn answers(address: SocketAddr) -> bool {
+    tokio::time::timeout(PORT_PROBE_TIMEOUT, tokio::net::TcpStream::connect(address))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// Who holds `port`, given the probe addresses of Temps' own listeners.
+async fn probe_port(port: u16, temps_listeners: &[SocketAddr]) -> PortHolder {
+    let mut temps_answered = false;
+    for listener in temps_listeners.iter().filter(|l| l.port() == port) {
+        if answers(*listener).await {
+            temps_answered = true;
+            break;
+        }
+    }
+    let loopback_answered =
+        !temps_answered && answers(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await;
+    port_holder(temps_answered, loopback_answered)
+}
+
+/// The first address on Tailscale's own interface among `interfaces`
+/// (name, address, prefix length). Other overlays and carrier-grade NAT use
+/// `100.64.0.0/10` too, so the range alone never says Tailscale runs.
+pub fn tailnet_address<'a>(
+    interfaces: impl IntoIterator<Item = (&'a str, IpAddr, u8)>,
+) -> Option<IpAddr> {
+    interfaces
         .into_iter()
-        .find(|ip| temps_core::tailnet::is_tailscale_ip(*ip))
+        .find(|(name, ip, prefix)| {
+            temps_core::private_network::is_tailscale_interface(name, *ip, *prefix)
+        })
+        .map(|(_, ip, _)| ip)
 }
 
 fn not_checked_inbound() -> InboundCheck {
@@ -188,8 +240,8 @@ fn not_checked_inbound() -> InboundCheck {
 pub struct HostFactsService {
     platform_info: Arc<PlatformInfoService>,
     docker: Arc<DockerHandle>,
-    /// The ports Temps' proxy is configured to listen on.
-    temps_ports: Vec<u16>,
+    /// Where Temps' proxy listeners answer (`listener_probe_address`).
+    temps_listeners: Vec<SocketAddr>,
     /// Temps' data directory, whose disk is reported.
     data_dir: std::path::PathBuf,
 }
@@ -198,13 +250,13 @@ impl HostFactsService {
     pub fn new(
         platform_info: Arc<PlatformInfoService>,
         docker: Arc<DockerHandle>,
-        temps_ports: Vec<u16>,
+        temps_listeners: Vec<SocketAddr>,
         data_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             platform_info,
             docker,
-            temps_ports,
+            temps_listeners,
             data_dir,
         }
     }
@@ -326,28 +378,34 @@ impl HostFactsService {
     async fn ports(&self) -> Vec<PortFact> {
         let mut facts = Vec::with_capacity(2);
         for port in [80u16, 443] {
-            // A connection, never a bind: binding even briefly could make a
-            // real service fail to start.
-            let answered = tokio::time::timeout(
-                PORT_PROBE_TIMEOUT,
-                tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
-            )
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
             facts.push(PortFact {
                 port,
-                holder: port_holder(port, &self.temps_ports, answered),
+                holder: probe_port(port, &self.temps_listeners).await,
             });
         }
         facts
     }
 
     async fn tailscale(&self) -> TailscaleFact {
-        let addresses = if_addrs::get_if_addrs()
-            .map(|ifs| ifs.into_iter().map(|i| i.ip()).collect::<Vec<_>>())
+        let interfaces: Vec<(String, IpAddr, u8)> = if_addrs::get_if_addrs()
+            .map(|ifs| {
+                ifs.into_iter()
+                    .map(|i| {
+                        let prefix = match &i.addr {
+                            if_addrs::IfAddr::V4(v4) => u32::from(v4.netmask).count_ones(),
+                            if_addrs::IfAddr::V6(v6) => u128::from(v6.netmask).count_ones(),
+                        };
+                        let ip = i.ip();
+                        (i.name, ip, u8::try_from(prefix).unwrap_or(0))
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        let Some(ip) = tailnet_address(addresses) else {
+        let Some(ip) = tailnet_address(
+            interfaces
+                .iter()
+                .map(|(name, ip, prefix)| (name.as_str(), *ip, *prefix)),
+        ) else {
             return TailscaleFact {
                 running: false,
                 ip: None,
@@ -437,19 +495,91 @@ mod tests {
     }
 
     #[test]
-    fn a_port_temps_listens_on_is_temps_even_when_it_answers() {
-        assert_eq!(port_holder(80, &[80, 443], true), PortHolder::Temps);
-        assert_eq!(port_holder(80, &[8080], true), PortHolder::Other);
-        assert_eq!(port_holder(443, &[8080], false), PortHolder::Free);
+    fn a_listener_is_probed_at_its_own_address() {
+        let probe = |a: &str| listener_probe_address(a).map(|a| a.to_string());
+        assert_eq!(probe("0.0.0.0:443").as_deref(), Some("127.0.0.1:443"));
+        assert_eq!(probe("[::]:443").as_deref(), Some("[::1]:443"));
+        assert_eq!(
+            probe("192.168.1.20:443").as_deref(),
+            Some("192.168.1.20:443")
+        );
+        assert_eq!(probe("10.8.0.1:443").as_deref(), Some("10.8.0.1:443"));
+        assert_eq!(probe("[fd00::1]:443").as_deref(), Some("[fd00::1]:443"));
+        assert_eq!(probe("localhost:80").as_deref(), Some("127.0.0.1:80"));
+        assert_eq!(probe("not-an-address"), None);
     }
 
     #[test]
-    fn only_cgnat_tailnet_addresses_count() {
+    fn a_port_is_temps_only_while_temps_answers_on_it() {
+        assert_eq!(port_holder(true, false), PortHolder::Temps);
+        assert_eq!(port_holder(true, true), PortHolder::Temps);
+        assert_eq!(port_holder(false, true), PortHolder::Other);
+        // Configured, but its separate proxy process is stopped: nothing
+        // serves the port, so it is not reported as Temps listening.
+        assert_eq!(port_holder(false, false), PortHolder::Free);
+    }
+
+    /// A proxy bound to one address answers there, not on loopback; probing
+    /// loopback alone called its port free.
+    #[tokio::test]
+    async fn a_proxy_bound_to_one_address_holds_its_port() {
+        let lan = if_addrs::get_if_addrs().ok().and_then(|ifs| {
+            ifs.into_iter()
+                .map(|i| i.ip())
+                .find(|ip| ip.is_ipv4() && !ip.is_loopback())
+        });
+        let Some(lan) = lan else {
+            println!("no non-loopback IPv4 address, skipping");
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind((lan, 0)).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let port = bound.port();
+        // Nothing on loopback answers for that port.
+        assert!(!answers(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await);
+        let configured = listener_probe_address(&bound.to_string()).unwrap();
+        assert_eq!(probe_port(port, &[configured]).await, PortHolder::Temps);
+        // Someone else's listener: not Temps'.
+        assert_eq!(probe_port(port, &[]).await, PortHolder::Free);
+        let unspecified = listener_probe_address(&format!("0.0.0.0:{port}")).unwrap();
+        assert_eq!(probe_port(port, &[unspecified]).await, PortHolder::Free);
+        drop(listener);
+        assert_eq!(probe_port(port, &[configured]).await, PortHolder::Free);
+    }
+
+    #[tokio::test]
+    async fn a_loopback_listener_is_temps_when_configured_and_other_when_not() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let all = listener_probe_address(&format!("0.0.0.0:{port}")).unwrap();
+        assert_eq!(probe_port(port, &[all]).await, PortHolder::Temps);
+        assert_eq!(probe_port(port, &[]).await, PortHolder::Other);
+    }
+
+    #[test]
+    fn only_tailscales_own_interface_says_tailscale_runs() {
         let lan: IpAddr = "192.168.1.20".parse().unwrap();
         let tailnet: IpAddr = "100.101.102.103".parse().unwrap();
-        let not_tailnet: IpAddr = "100.128.0.1".parse().unwrap();
-        assert_eq!(tailnet_address([lan, not_tailnet, tailnet]), Some(tailnet));
-        assert_eq!(tailnet_address([lan, not_tailnet]), None);
+        let cgnat_wan: IpAddr = "100.72.4.9".parse().unwrap();
+        let netbird: IpAddr = "100.92.10.4".parse().unwrap();
+        // A carrier-grade NAT WAN and NetBird use 100.64.0.0/10 as well.
+        assert_eq!(
+            tailnet_address([
+                ("eth0", lan, 24),
+                ("eth1", cgnat_wan, 10),
+                ("wt0", netbird, 16),
+                ("tailscale0", tailnet, 32),
+            ]),
+            Some(tailnet)
+        );
+        assert_eq!(
+            tailnet_address([("eth1", cgnat_wan, 10), ("wt0", netbird, 16)]),
+            None
+        );
+        // macOS: a utun host route in Tailscale's range.
+        assert_eq!(tailnet_address([("utun4", tailnet, 32)]), Some(tailnet));
     }
 
     #[test]
@@ -469,7 +599,7 @@ mod tests {
                 "control-plane",
                 "this process runs without Docker",
             )),
-            vec![8080],
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))],
             std::env::temp_dir(),
         );
         let docker = service.docker().await;

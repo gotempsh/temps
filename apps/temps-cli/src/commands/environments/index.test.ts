@@ -434,6 +434,8 @@ describe('vars set value sources', () => {
     const existing = await runWithApi(registerEnvironmentsCommands,
       ['environments', 'vars', '-p', 'app', 'set', 'EXISTING', '--generate-secret', '-e', 'production'], routes)
     expect(existing.bodies.some(b => b.request === 'POST /projects/4/env-vars')).toBe(false)
+    // A failure, so a script does not go on with the old value.
+    expect(existing.error?.message).toContain('EXISTING already exists')
   })
 
   test('the generated secret request: 32 bytes unless given, 16 to 64', () => {

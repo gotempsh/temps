@@ -20,7 +20,9 @@
  *   including those above the folder up to its repository's root.
  * - At most LIMITS.files files and LIMITS.bytes bytes, and nothing is read
  *   into memory past those bytes (a `.gitignore` past LIMITS.ignoreBytes is
- *   refused unread).
+ *   refused unread). Directories are read as a stream and at most
+ *   LIMITS.entries entries are listed in all; what is left out is counted,
+ *   and only the first names shown are kept.
  * Then it uploads a ZIP to the endpoint `temps deploy` uses. The server checks
  * the key there: it must be allowed to deploy that project. Claude asks the
  * user before running the tool (it is marked as making changes).
@@ -43,7 +45,13 @@ const LIMITS = {
   files: 10000,
   bytes: 100 * 1024 * 1024,
   ignoreBytes: 1024 * 1024,
+  // Entries listed in all, left out or not: a folder of a million ignored
+  // build outputs is refused rather than walked.
+  entries: 200000,
 }
+
+/** How many left-out names the result shows; the rest are only counted. */
+const LEFT_OUT_SHOWN = 12
 
 const DEPLOY_TOOL = {
   name: DEPLOY_TOOL_NAME,
@@ -525,15 +533,53 @@ async function rulesAbove(root, limits) {
   return { prefix: base, rules, ignored: null }
 }
 
+/**
+ * A folder's own `.gitignore`: its rules and the file as it was read (null
+ * when there is none). Only a missing file means no rules; any other error
+ * reading it throws, since uploading what it lists would be worse than not
+ * uploading.
+ */
+async function localIgnore(directory, base, limits) {
+  const file = path.join(directory, '.gitignore')
+  let stat
+  try {
+    stat = await fsp.lstat(file)
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { rules: [], read: null }
+    throw new Error(
+      `${file} could not be read (${error && error.code ? error.code : error}), so what it leaves out is unknown. Try again.`
+    )
+  }
+  if (!stat.isFile()) return { rules: [], read: null }
+  return { rules: await readIgnore(directory, base, limits), read: stat }
+}
+
 /** `readIgnore` for a folder that may have no `.gitignore`. */
 async function readIgnoreIfFile(directory, base, limits) {
+  return (await localIgnore(directory, base, limits)).rules
+}
+
+/**
+ * Whether the `.gitignore` the listing saw is the one whose rules were read:
+ * none then and none now, or the same file, unchanged. A `.gitignore`
+ * created, removed or rewritten meanwhile (a checkout in progress) would
+ * leave the listing filtered by rules it does not have.
+ */
+async function sameIgnore(directory, read, listed) {
+  if (!read) return !listed
+  if (!listed) return false
   try {
-    const stat = await fsp.lstat(path.join(directory, '.gitignore'))
-    if (!stat.isFile()) return []
+    const now = await fsp.lstat(path.join(directory, '.gitignore'))
+    return (
+      now.isFile() &&
+      now.ino === read.ino &&
+      now.dev === read.dev &&
+      now.size === read.size &&
+      now.mtimeMs === read.mtimeMs
+    )
   } catch {
-    return []
+    return false
   }
-  return readIgnore(directory, base, limits)
 }
 
 /**
@@ -573,26 +619,39 @@ async function openedPath(handle) {
 }
 
 /**
- * The files to upload under `root`, and what was left out. Throws when the
- * folder is over the limits, naming what to leave out. Each file is recorded
- * with its device and inode, which `packZip` checks the file it opens against.
+ * The files to upload under `root`, sorted by name, and what was left out:
+ * `leftOut` holds the first LEFT_OUT_SHOWN names and `leftOutCount` counts
+ * them all. Throws when the folder is over the limits, naming what to leave
+ * out. Each file is recorded with its device and inode, which `packZip`
+ * checks the file it opens against.
  */
 async function collectFiles(root, limits = LIMITS) {
   limits = { ...LIMITS, ...limits }
   const files = []
   const leftOut = []
+  let leftOutCount = 0
+  let listed = 0
   let total = 0
+  const leaveOut = (name) => {
+    leftOutCount += 1
+    if (leftOut.length < LEFT_OUT_SHOWN) leftOut.push(name)
+  }
 
   // Paths in `.gitignore` rules are from the repository's top; `prefix` is
   // where `root` is in it.
   const above = await rulesAbove(root, limits)
   if (above.ignored) {
-    leftOut.push(
+    leaveOut(
       `${path.basename(root)}/ (${above.ignored} is in a .gitignore above it)`
     )
-    return { files, leftOut, total }
+    return { files, leftOut, leftOutCount, total }
   }
   const { prefix } = above
+
+  const changed = (what) =>
+    new Error(
+      `${what} changed while the folder was read. Try again once the folder has stopped changing.`
+    )
 
   const walk = async (directory, relative, rules) => {
     // A directory swapped for a symlink since it was listed is not followed,
@@ -600,28 +659,30 @@ async function collectFiles(root, limits = LIMITS) {
     // it was listed) is not read.
     const before = await fsp.lstat(directory)
     if (!before.isDirectory()) return
-    const entries = await fsp.readdir(directory, { withFileTypes: true })
-    const after = await fsp.lstat(directory)
-    if (
-      !after.isDirectory() ||
-      after.ino !== before.ino ||
-      after.dev !== before.dev ||
-      (await fsp.realpath(directory)) !== directory
-    ) {
+    if ((await fsp.realpath(directory)) !== directory) {
       throw new Error(
         `${directory} changed while it was read. Try again once the folder has stopped changing.`
       )
     }
-    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-    if (entries.some((e) => e.name === '.gitignore' && e.isFile())) {
-      rules = rules.concat(
-        await readIgnore(directory, `${prefix}${relative}`, limits)
-      )
-    }
-    for (const entry of entries) {
+    const ignore = await localIgnore(directory, `${prefix}${relative}`, limits)
+    rules = rules.concat(ignore.rules)
+    let listedIgnore = false
+    // Streamed, so a huge directory is never held as one listing: only the
+    // entries kept for upload are, and those are bounded by the limits.
+    const kept = []
+    const handle = await fsp.opendir(directory)
+    for await (const entry of handle) {
+      listed += 1
+      if (listed > limits.entries) {
+        await handle.close().catch(() => {})
+        throw new Error(
+          `${root} has more than ${limits.entries} files and folders, counting those left out. Deploy a smaller folder, or move what the build doesn't need (generated files, data, media) out of it, then try again.`
+        )
+      }
       const name = `${relative}${entry.name}`
+      if (entry.name === '.gitignore' && entry.isFile()) listedIgnore = true
       if (entry.isSymbolicLink()) {
-        leftOut.push(name)
+        leaveOut(name)
         continue
       }
       const isDirectory = entry.isDirectory()
@@ -630,20 +691,35 @@ async function collectFiles(root, limits = LIMITS) {
         alwaysLeftOut(entry.name, isDirectory) ||
         isIgnored(rules, `${prefix}${name}`, isDirectory)
       ) {
-        leftOut.push(isDirectory ? `${name}/` : name)
+        leaveOut(isDirectory ? `${name}/` : name)
         continue
       }
+      kept.push({ name: entry.name, isDirectory })
+    }
+    const after = await fsp.lstat(directory)
+    if (
+      !after.isDirectory() ||
+      after.ino !== before.ino ||
+      after.dev !== before.dev ||
+      (await fsp.realpath(directory)) !== directory ||
+      !(await sameIgnore(directory, ignore.read, listedIgnore))
+    ) {
+      throw new Error(
+        `${directory} changed while it was read. Try again once the folder has stopped changing.`
+      )
+    }
+    kept.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+    for (const entry of kept) {
+      const name = `${relative}${entry.name}`
       const absolute = path.join(directory, entry.name)
-      if (isDirectory) {
+      if (entry.isDirectory) {
         await walk(absolute, `${name}/`, rules)
         continue
       }
       const stat = await fsp.lstat(absolute)
       if (!stat.isFile()) continue
       if (!(await stillInside(absolute, stat, directory, before))) {
-        throw new Error(
-          `${name} changed while the folder was read. Try again once the folder has stopped changing.`
-        )
+        throw changed(name)
       }
       files.push({
         name,
@@ -668,7 +744,7 @@ async function collectFiles(root, limits = LIMITS) {
   }
 
   await walk(root, '', above.rules)
-  return { files, leftOut, total }
+  return { files, leftOut, leftOutCount, total }
 }
 
 const CRC_TABLE = (() => {
@@ -747,7 +823,14 @@ async function packZip(collected, limits = LIMITS) {
       REGISTRY_SETTINGS.has(path.basename(file.name)) &&
       REGISTRY_CREDENTIAL.test(data.toString('utf8'))
     ) {
-      collected.leftOut.push(file.name)
+      // Shown first: a credential kept out of the upload is worth seeing.
+      collected.leftOutCount =
+        (collected.leftOutCount ?? collected.leftOut.length) + 1
+      collected.leftOut.unshift(file.name)
+      collected.leftOut.length = Math.min(
+        collected.leftOut.length,
+        LEFT_OUT_SHOWN
+      )
       continue
     }
     const deflated = await deflateRaw(data)
@@ -913,10 +996,11 @@ async function chooseEnvironment(api, config, projectId, environmentId) {
   )
 }
 
-function leftOutLine(leftOut) {
-  if (leftOut.length === 0) return 'Nothing was left out.'
-  const shown = leftOut.slice(0, 12).join(', ')
-  const more = leftOut.length > 12 ? ` and ${leftOut.length - 12} more` : ''
+function leftOutLine({ leftOut, leftOutCount }) {
+  if (leftOutCount === 0) return 'Nothing was left out.'
+  const shown = leftOut.join(', ')
+  const rest = leftOutCount - leftOut.length
+  const more = rest > 0 ? ` and ${rest} more` : ''
   return `Left out: ${shown}${more}.`
 }
 
@@ -938,7 +1022,7 @@ async function deployFolder(config, args, api) {
   const { zip, packed, bytes } = await packZip(collected)
   if (packed.length === 0) {
     throw new Error(
-      `${root} has nothing to deploy once secrets, dependencies and what .gitignore lists are left out. ${leftOutLine(collected.leftOut)}`
+      `${root} has nothing to deploy once secrets, dependencies and what .gitignore lists are left out. ${leftOutLine(collected)}`
     )
   }
 
@@ -968,7 +1052,7 @@ async function deployFolder(config, args, api) {
   return [
     `Deployment ${id} of ${target} started: Temps is building it now.`,
     `Uploaded ${packed.length} file${packed.length === 1 ? '' : 's'} (${megabytes(bytes)}, ${megabytes(zip.length)} zipped) from ${root}.`,
-    leftOutLine(collected.leftOut),
+    leftOutLine(collected),
     `Follow the build and its logs with the temps tool (deployment ${id}).`,
   ].join('\n')
 }

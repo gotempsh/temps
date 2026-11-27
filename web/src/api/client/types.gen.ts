@@ -9180,10 +9180,10 @@ export type CreateEnvironmentVariableRequest = {
     is_secret?: boolean;
     key: string;
     /**
-     * The value. Leave it empty and set `generate` to have the server make
-     * one instead.
+     * The value; an empty string is stored as one. Required unless
+     * `generate` asks the server to make the value instead.
      */
-    value?: string;
+    value?: string | null;
 };
 
 export type CreateEnvironmentVolumeRequest = {
@@ -28868,6 +28868,13 @@ export type PrivateIngressStatus = {
      * served.
      */
     admit: Array<string>;
+    /**
+     * Whether a process of this control plane applies a consent here.
+     * `false` where the console runs without the proxy (split roles): no
+     * private address is served, a consent cannot be given, and `error`
+     * says why and what to run instead.
+     */
+    available: boolean;
     consent?: PrivateIngressConsent | null;
     /**
      * Why nothing is served although consent was given, with the fix.
@@ -29494,6 +29501,11 @@ export type ProjectMonitorHealth = {
      */
     status: string;
 };
+
+/**
+ * How a project list is ordered.
+ */
+export type ProjectOrder = 'last_deployed' | 'created';
 
 export type ProjectPresetResponse = {
     /**
@@ -79031,6 +79043,10 @@ export type GetProjectsData = {
          * Return only services that are members of this project group. Mutually exclusive with ungrouped.
          */
         project_group_id?: number;
+        /**
+         * last_deployed (the default): most recently deployed first, never-deployed last. created: newest first, deployed or not.
+         */
+        sort?: ProjectOrder;
     };
     url: '/projects';
 };
@@ -104807,6 +104823,10 @@ export type PutPrivateIngressErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * The console and proxy run as separate processes, so nothing here serves private addresses
+     */
+    409: unknown;
     /**
      * The consent could not be written
      */

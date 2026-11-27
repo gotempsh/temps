@@ -369,6 +369,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     const invalid = groups.filter((g) => !isValidGroupKey(g))
     if (invalid.length > 0) {
       warning(`Unknown tool group(s): ${invalid.join(', ')}. Available: ${TOOL_GROUPS.map((g) => g.key).join(', ')}`)
+      process.exitCode = 1
       return
     }
   } else {
@@ -381,6 +382,8 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   for (const folder of deployFolders) {
     if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
       warning(`${folder} is not a folder on this computer. Pass the folder that holds your projects to --deploy-folder.`)
+      // Nothing was installed: a script must not carry on as if it were.
+      process.exitCode = 1
       return
     }
   }
@@ -391,6 +394,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
       checkBridgeAddress(mcpBaseUrl)
     } catch (error) {
       warning(error instanceof Error ? error.message : String(error))
+      process.exitCode = 1
       return
     }
   }

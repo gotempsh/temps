@@ -968,36 +968,7 @@ impl AiService for GatewayAiService {
                 reason: e.to_string(),
             })?;
 
-        let usage = resp.usage.as_ref().map(|u| temps_ai::ChatTurnUsage {
-            input_tokens: u64::try_from(u.prompt_tokens).unwrap_or(0),
-            output_tokens: u64::try_from(u.completion_tokens).unwrap_or(0),
-        });
-        let choice = resp.choices.into_iter().next();
-        let (content, tool_calls) = match choice {
-            Some(c) => {
-                let content = c
-                    .message
-                    .content
-                    .as_ref()
-                    .and_then(|mc| mc.as_text())
-                    .map(str::to_string)
-                    .filter(|s| !s.is_empty());
-                let tool_calls = c
-                    .message
-                    .tool_calls
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(parse_tool_call)
-                    .collect();
-                (content, tool_calls)
-            }
-            None => (None, Vec::new()),
-        };
-        Ok(ChatTurnResponse {
-            content,
-            tool_calls,
-            usage,
-        })
+        Ok(turn_response(resp))
     }
 
     async fn chat_stream(&self, request: ChatTurnRequest) -> Result<TokenStream, AiError> {
@@ -1278,6 +1249,46 @@ where
             yield Ok(ChatStreamDelta::ToolCall(tc));
         }
     })
+}
+
+/// One gateway reply as a chat turn: its first choice's text and tool calls,
+/// the tokens it used, and whether the provider cut it off at its
+/// output-token limit (`finish_reason: length`).
+fn turn_response(resp: ChatCompletionResponse) -> ChatTurnResponse {
+    let usage = resp.usage.as_ref().map(|u| temps_ai::ChatTurnUsage {
+        input_tokens: u64::try_from(u.prompt_tokens).unwrap_or(0),
+        output_tokens: u64::try_from(u.completion_tokens).unwrap_or(0),
+    });
+    let choice = resp.choices.into_iter().next();
+    let truncated = choice
+        .as_ref()
+        .is_some_and(|c| c.finish_reason.as_deref() == Some("length"));
+    let (content, tool_calls) = match choice {
+        Some(c) => {
+            let content = c
+                .message
+                .content
+                .as_ref()
+                .and_then(|mc| mc.as_text())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
+            let tool_calls = c
+                .message
+                .tool_calls
+                .unwrap_or_default()
+                .iter()
+                .filter_map(parse_tool_call)
+                .collect();
+            (content, tool_calls)
+        }
+        None => (None, Vec::new()),
+    };
+    ChatTurnResponse {
+        content,
+        tool_calls,
+        usage,
+        truncated,
+    }
 }
 
 #[cfg(test)]
@@ -1572,6 +1583,21 @@ mod tests {
             }],
             usage: None,
         }
+    }
+
+    #[test]
+    fn a_reply_stopped_at_the_token_limit_is_marked_truncated() {
+        let finished = turn_response(chat_response(Some(MessageContent::Text(
+            "done".to_string(),
+        ))));
+        assert!(!finished.truncated);
+        assert_eq!(finished.content.as_deref(), Some("done"));
+
+        let mut cut = chat_response(Some(MessageContent::Text("## Find".to_string())));
+        cut.choices[0].finish_reason = Some("length".to_string());
+        let cut = turn_response(cut);
+        assert!(cut.truncated);
+        assert_eq!(cut.content.as_deref(), Some("## Find"));
     }
 
     #[tokio::test]

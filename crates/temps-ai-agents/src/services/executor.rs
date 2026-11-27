@@ -185,6 +185,12 @@ pub struct AgentExecutor {
     /// `pub(crate)` so the `AutofixerService` (same crate) can call revoke
     /// at its own cleanup points.
     pub(crate) run_token_ids: tokio::sync::RwLock<std::collections::HashMap<i32, i32>>,
+    /// The cancel flag of each run whose agent loop is working, so
+    /// [`Self::cancel_run`] stops the loop before its next paid gateway
+    /// turn rather than letting it report the destroyed sandbox to the
+    /// model.
+    run_cancel_flags:
+        tokio::sync::RwLock<std::collections::HashMap<i32, Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 /// Temps API permissions a workflow-run sandbox token is minted with.
@@ -496,6 +502,7 @@ impl AgentExecutor {
             memory_provider: tokio::sync::RwLock::new(None),
             deployment_token_service: tokio::sync::RwLock::new(None),
             run_token_ids: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            run_cancel_flags: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2172,11 +2179,16 @@ impl AgentExecutor {
     /// call fails or its next status write returns
     /// [`AgentError::RunCancelled`], and it cannot overwrite `cancelled`.
     ///
+    /// An agent loop stops before its next model turn or tool call.
+    ///
     /// A step already running outside the sandbox on this server, such as a
     /// clone or a push to the git provider, is not interrupted: it finishes,
     /// and the run stops at the status write after it.
     pub async fn cancel_run(&self, run_id: i32) -> Result<agent_runs::Model, AgentError> {
         let run = self.run_service.cancel_run(run_id).await?;
+        if let Some(flag) = self.run_cancel_flags.read().await.get(&run_id) {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
 
         if let Err(error) = self
             .run_service
@@ -2247,6 +2259,7 @@ impl AgentExecutor {
         // Revoke the run-scoped deployment token immediately so it cannot be
         // used after the sandbox stops.  This is best-effort — failures are
         // logged in `revoke_run_token` and do not propagate here.
+        self.run_cancel_flags.write().await.remove(&run_id);
         if let Some(token_id) = self.run_token_ids.write().await.remove(&run_id) {
             self.revoke_run_token(run_id, token_id).await;
         }
@@ -2597,6 +2610,14 @@ impl AgentExecutor {
         }
 
         // Step 10: Update status → "fixing"
+        // Registered before the status write: a cancel that lands before it
+        // fails that write, and one after it sets this flag.
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.run_cancel_flags
+            .write()
+            .await
+            .insert(run_id, cancelled.clone());
+        // `execute_run`'s cleanup removes it on every path.
         self.run_service
             .update_status(
                 run_id,
@@ -2649,6 +2670,7 @@ impl AgentExecutor {
                 // 0 (persistent workflows) sets no cap; the time budget bounds it.
                 max_turns: u32::try_from(config.max_turns).unwrap_or(1),
                 timeout: Duration::from_secs(u64::try_from(config.timeout_seconds).unwrap_or(0)),
+                cancelled,
             },
             Some(on_event),
         )
@@ -4281,6 +4303,7 @@ pub(crate) mod tests {
             let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if turn == 0 && !self.files_to_create.is_empty() {
                 return Ok(temps_ai::ChatTurnResponse {
+                    truncated: false,
                     content: None,
                     tool_calls: self
                         .files_to_create
@@ -4297,6 +4320,7 @@ pub(crate) mod tests {
                 });
             }
             Ok(temps_ai::ChatTurnResponse {
+                truncated: false,
                 content: Some(self.output.clone()),
                 tool_calls: Vec::new(),
                 usage: None,
@@ -6036,12 +6060,20 @@ pub(crate) mod tests {
             .into_connection();
         let (executor, sandboxes) = make_executor_for_cancel_tests(db);
         executor.run_token_ids.write().await.insert(run_id, 999);
+        let loop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        executor
+            .run_cancel_flags
+            .write()
+            .await
+            .insert(run_id, loop_flag.clone());
 
         let run = executor.cancel_run(run_id).await.expect("cancel");
 
         assert_eq!(run.status, "cancelled");
         assert_eq!(*sandboxes.released.lock().unwrap(), vec![run_id]);
         assert!(executor.run_token_ids.read().await.is_empty());
+        // The agent loop sees the cancel before its next paid turn.
+        assert!(loop_flag.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]

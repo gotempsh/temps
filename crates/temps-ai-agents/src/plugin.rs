@@ -945,7 +945,10 @@ impl TempsPlugin for AgentsPlugin {
                         network_mode: global_sandbox.network_mode.clone(),
                         control_plane_url: platform_config_service.resolve_internal_url().await,
                         preview_gateway_container_name: preview_gateway_name.clone(),
-                        exec_output_limit: None,
+                        // The default bounds each exec stream, as a worker
+                        // node does: an agent's command cannot buffer
+                        // unbounded output on the control plane.
+                        ..DockerSandboxConfig::default()
                     };
                     let provider = DockerSandboxProvider::new(docker.clone(), config);
                     // Unix sockets must live on the daemon host, not a Docker

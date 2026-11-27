@@ -14923,8 +14923,10 @@ export const getPrivateIngress = <ThrowOnError extends boolean = false>(options?
  * `listen` is `tailscale` (the Tailscale interface's address) or one of the
  * machine's private addresses. The proxy then serves an address made
  * private on this machine only to connections that arrive on that address
- * from inside its range. `tailscale_serve` also lets Temps write its own
- * entries in tailscaled's Serve configuration.
+ * from inside its range. `tailscale_serve` must be false: the control
+ * plane does not write Tailscale Serve entries (a worker's agent does).
+ * Where the console and proxy run as separate processes nothing here
+ * applies a consent, and saving one is a 409.
  */
 export const putPrivateIngress = <ThrowOnError extends boolean = false>(options: Options<PutPrivateIngressData, ThrowOnError>): RequestResult<PutPrivateIngressResponses, PutPrivateIngressErrors, ThrowOnError> => (options.client ?? client).put<PutPrivateIngressResponses, PutPrivateIngressErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

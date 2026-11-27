@@ -127,6 +127,39 @@ describe('factsFromHost', () => {
       }).inbound
     ).toBe(true)
   })
+
+  test('a console without its proxy offers no private plan, and says why', () => {
+    const host = {
+      inbound: { checked: false, reachable: null },
+      tailscale: {
+        running: true,
+        ip: '100.101.102.103',
+        machine: 'box-01',
+        tailnet: 'tail0000.ts.net',
+      },
+    }
+    const reason = 'This control plane runs its console and proxy apart.'
+    const split = factsFromHost(host, {
+      available: false,
+      error: reason,
+      networks: [],
+    })
+    expect(split.privateNetwork).toBeNull()
+    const [domainWay] = waysFor('private', split)
+    expect(domainWay.available).toBe(false)
+    expect(domainWay.recommended).toBe(false)
+    expect(domainWay.note).toBe(reason)
+    expect(audienceStatus('private', split)).toEqual({
+      available: false,
+      note: reason,
+    })
+    expect(initialChoice(split).audience).toBe('public')
+    // The same host where the console serves privately itself.
+    expect(
+      factsFromHost(host, { available: true, networks: [] }).privateNetwork
+        ?.listen
+    ).toBe('tailscale')
+  })
 })
 
 describe('access', () => {

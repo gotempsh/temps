@@ -711,14 +711,16 @@ async function setEnvVar(
 
   if (envs.length === 0) {
     errorOutput('No environments found. Create an environment first.')
+    process.exitCode = 1
     return
   }
 
   // Check if variable already exists
   const existingVar = existingVars.find(v => v.key === key)
   if (generate && existingVar) {
-    errorOutput(`${key} already exists; --generate-secret only creates a new variable`)
-    return
+    // Nothing was generated: fail, so a script does not go on with the
+    // old value.
+    throw new Error(`${key} already exists; --generate-secret only creates a new variable`)
   }
 
   // Prompt only when no source was given; mask the input for a secret. A

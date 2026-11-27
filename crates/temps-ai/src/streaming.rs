@@ -337,6 +337,9 @@ pub struct ChatTurnResponse {
     pub tool_calls: Vec<ToolCall>,
     /// The tokens the turn used, when the provider reports them.
     pub usage: Option<ChatTurnUsage>,
+    /// The provider stopped the reply at its output-token limit
+    /// (`finish_reason: length`): the text is partial, not a final answer.
+    pub truncated: bool,
 }
 
 /// The tokens one chat turn used: the whole prompt (cached share included)

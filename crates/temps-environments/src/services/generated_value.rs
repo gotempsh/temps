@@ -45,14 +45,20 @@ fn default_bytes() -> u32 {
 /// generated value is always stored write-only.
 pub fn resolve_create_value(
     key: &str,
-    value: String,
+    value: Option<String>,
     is_secret: bool,
     generate: Option<GenerateValueRequest>,
 ) -> Result<(String, bool), EnvVarError> {
     let Some(generate) = generate else {
-        return Ok((value, is_secret));
+        // A value is required unless the server is asked to make one; an
+        // empty one is kept only when it was sent.
+        return value.map(|value| (value, is_secret)).ok_or_else(|| {
+            EnvVarError::InvalidInput(format!(
+                "Environment variable '{key}' needs a value, or 'generate' to have the server make one"
+            ))
+        });
     };
-    if !value.is_empty() {
+    if value.as_deref().is_some_and(|value| !value.is_empty()) {
         return Err(EnvVarError::InvalidInput(format!(
             "Environment variable '{key}': send either a value or 'generate', not both"
         )));
@@ -96,17 +102,32 @@ mod tests {
 
     #[test]
     fn without_generate_the_value_is_kept() {
-        let (value, is_secret) = resolve_create_value("PORT", "3000".into(), false, None).unwrap();
+        let (value, is_secret) =
+            resolve_create_value("PORT", Some("3000".into()), false, None).unwrap();
         assert_eq!(value, "3000");
         assert!(!is_secret);
+    }
+
+    /// Leaving out both the value and `generate` is a mistake, refused
+    /// before anything is stored; an empty value sent on purpose is kept.
+    #[test]
+    fn a_value_is_required_unless_generated() {
+        let error = resolve_create_value("PORT", None, false, None).unwrap_err();
+        assert!(matches!(error, EnvVarError::InvalidInput(_)));
+        assert!(error.to_string().contains("PORT"), "{error}");
+        assert_eq!(
+            resolve_create_value("EMPTY", Some(String::new()), false, None).unwrap(),
+            (String::new(), false)
+        );
+        // An empty value beside `generate` is no value.
+        assert!(resolve_create_value("K", Some(String::new()), true, secret(32)).is_ok());
     }
 
     #[test]
     fn a_generated_secret_is_random_hex_and_always_secret() {
         let (a, is_secret) =
-            resolve_create_value("SESSION_SECRET", String::new(), false, secret(32)).unwrap();
-        let (b, _) =
-            resolve_create_value("SESSION_SECRET", String::new(), false, secret(32)).unwrap();
+            resolve_create_value("SESSION_SECRET", None, false, secret(32)).unwrap();
+        let (b, _) = resolve_create_value("SESSION_SECRET", None, false, secret(32)).unwrap();
         assert!(is_secret, "a generated value is stored write-only");
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
@@ -115,7 +136,8 @@ mod tests {
 
     #[test]
     fn value_and_generate_together_are_refused() {
-        let error = resolve_create_value("API_KEY", "typed".into(), true, secret(32)).unwrap_err();
+        let error =
+            resolve_create_value("API_KEY", Some("typed".into()), true, secret(32)).unwrap_err();
         assert!(error.to_string().contains("API_KEY"));
         assert!(error.to_string().contains("not both"));
     }
@@ -123,11 +145,11 @@ mod tests {
     #[test]
     fn sizes_outside_the_bounds_are_refused() {
         for bytes in [0, 15, 65, 4096] {
-            let error = resolve_create_value("K", String::new(), true, secret(bytes)).unwrap_err();
+            let error = resolve_create_value("K", None, true, secret(bytes)).unwrap_err();
             assert!(error.to_string().contains(&bytes.to_string()), "{error}");
         }
-        assert!(resolve_create_value("K", String::new(), true, secret(16)).is_ok());
-        assert!(resolve_create_value("K", String::new(), true, secret(64)).is_ok());
+        assert!(resolve_create_value("K", None, true, secret(16)).is_ok());
+        assert!(resolve_create_value("K", None, true, secret(64)).is_ok());
     }
 
     #[test]

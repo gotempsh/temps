@@ -32,6 +32,12 @@ export interface BoxFacts {
    * can use.
    */
   privateNetwork: PrivateNetwork | null
+  /**
+   * Why this control plane serves no private address at all, when the
+   * server says so (a console running without its proxy): the private ways
+   * say this instead of offering a plan its save would refuse.
+   */
+  privateUnavailable?: string | null
 }
 
 /** A private network of this box, as the private-ingress status lists it. */
@@ -81,9 +87,20 @@ export interface HostFactsLike {
   }
 }
 
+/** The subset of the private-ingress status the access step reads. */
+export interface PrivateIngressLike {
+  available: boolean
+  error?: string | null
+  networks: PrivateNetworkLike[]
+}
+
+/** Said when the server reports no reason of its own. */
+export const PRIVATE_UNAVAILABLE =
+  'This console runs without its proxy, so it serves no private addresses. Run temps serve with both in one process, or serve them from a worker.'
+
 export function factsFromHost(
   host: HostFactsLike,
-  networks?: PrivateNetworkLike[]
+  privateIngress?: PrivateIngressLike
 ): BoxFacts {
   const tailscale =
     host.tailscale.running && host.tailscale.ip
@@ -93,21 +110,30 @@ export function factsFromHost(
           tailnet: host.tailscale.tailnet ?? null,
         }
       : null
+  const unavailable =
+    privateIngress && !privateIngress.available
+      ? privateIngress.error || PRIVATE_UNAVAILABLE
+      : null
   return {
     publicIp: host.public_ip ?? null,
     lanIp: host.lan_ip ?? null,
     inbound: host.inbound.checked ? (host.inbound.reachable ?? null) : null,
     tailscale,
-    // Without the server's list (the proxy runs elsewhere), Tailscale is
-    // the one private network the host facts can name.
-    privateNetwork: networks
-      ? privateNetworkOf(networks)
-      : tailscale && {
-          label: 'Tailscale',
-          address: tailscale.ip,
-          listen: 'tailscale',
-          admit: ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'],
-        },
+    // A console without its proxy serves nothing privately, whatever
+    // networks the host is on. Otherwise the server's list; before its
+    // first pass lists any (or when the status could not be read),
+    // Tailscale is the one private network the host facts can name.
+    privateNetwork: unavailable
+      ? null
+      : privateIngress?.networks.length
+        ? privateNetworkOf(privateIngress.networks)
+        : tailscale && {
+            label: 'Tailscale',
+            address: tailscale.ip,
+            listen: 'tailscale',
+            admit: ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'],
+          },
+    privateUnavailable: unavailable,
   }
 }
 
@@ -219,7 +245,7 @@ export function waysFor(audience: Audience, facts: BoxFacts): WayOption[] {
       available: net !== null && SERVED_WAYS.includes('tailnet_domain'),
       recommended: net !== null && SERVED_WAYS.includes('tailnet_domain'),
       note: !net
-        ? NO_PRIVATE_NETWORK
+        ? (facts.privateUnavailable ?? NO_PRIVATE_NETWORK)
         : SERVED_WAYS.includes('tailnet_domain')
           ? undefined
           : NOT_YET_SERVED,

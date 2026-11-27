@@ -48,6 +48,7 @@ function mock(
   current: Record<number, (number | null)[]> = { 2: [1], 3: [1] }
 ) {
   const patches: unknown[] = []
+  const listed: (string | null)[] = []
   const environmentsOf = (id: number) => () =>
     jsonResponse(
       (current[id] ?? []).map((deployment, i) => ({
@@ -62,7 +63,8 @@ function mock(
     'GET /projects/3/environments': environmentsOf(3),
     'GET /api-keys/ai-harness/status': () =>
       jsonResponse({ status, reason: null, connected_via: null }),
-    'GET /projects': () => {
+    'GET /projects': (request) => {
+      listed.push(new URL(request.url).searchParams.get('sort'))
       const response = jsonResponse({
         projects: projects(),
         page: 1,
@@ -77,15 +79,17 @@ function mock(
       return jsonResponse({ done: [], later: [] })
     },
   })
-  return { api, patches }
+  return { api, patches, listed }
 }
 
 test('with an agent connected, it leads, and the operator opens the new project their agent made', async () => {
   let list = [project(1, 'existing')]
-  const { api, patches } = mock('connected', () => list)
+  const { api, patches, listed } = mock('connected', () => list)
   const { view, client } = renderStep()
 
   const agent = await view.findByRole('radio', { name: /Ask your agent/ })
+  // Newest first: a never-deployed project would sort past the first page.
+  expect(listed[0]).toBe('created')
   await view.findByText('Recommended')
   expect(agent.getAttribute('aria-checked')).toBe('true')
   expect(

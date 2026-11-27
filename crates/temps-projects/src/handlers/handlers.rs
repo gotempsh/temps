@@ -34,7 +34,7 @@ use super::types::{
     UpdateDeploymentConfigRequest, UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
     UpdateServiceTemplateRuntimeRequest, UpgradeServiceTemplateRequest,
 };
-use crate::services::project::GroupFilter;
+use crate::services::project::{GroupFilter, ProjectOrder};
 use crate::template_creation::{
     canonicalize_template_upgrade_environment_variables, missing_required_template_configuration,
     require_template_creation_permissions, resolve_image_template_runtime,
@@ -563,6 +563,7 @@ async fn canonical_template_app_url(
             super::types::CloudflareProjectCapability,
             temps_core::docker_socket_grant::DockerSocketCapability,
             PaginatedProjectList,
+            ProjectOrder,
             PaginationParams,
             UpdateProjectSettingsRequest,
             UpdateGitSettingsRequest,
@@ -1326,7 +1327,8 @@ fn build_group_filter(
         ("per_page" = Option<i64>, Query, description = "Number of items per page (1-100)"),
         ("search" = Option<String>, Query, description = "Case-insensitive project name or slug filter"),
         ("ungrouped" = Option<bool>, Query, description = "When true, return only services that are not a member of any project group. Mutually exclusive with project_group_id."),
-        ("project_group_id" = Option<i32>, Query, description = "Return only services that are members of this project group. Mutually exclusive with ungrouped.")
+        ("project_group_id" = Option<i32>, Query, description = "Return only services that are members of this project group. Mutually exclusive with ungrouped."),
+        ("sort" = Option<ProjectOrder>, Query, description = "last_deployed (the default): most recently deployed first, never-deployed last. created: newest first, deployed or not.")
     ),
     responses(
         (status = 200, description = "List of projects", body = PaginatedProjectList),
@@ -1362,7 +1364,14 @@ pub async fn get_projects(
 
     let (projects, total) = state
         .project_service
-        .get_projects_paginated_filtered(page, per_page, &hidden, search, group_filter)
+        .get_projects_paginated_filtered(
+            page,
+            per_page,
+            &hidden,
+            search,
+            group_filter,
+            params.sort.unwrap_or_default(),
+        )
         .await
         .map_err(Problem::from)?;
 

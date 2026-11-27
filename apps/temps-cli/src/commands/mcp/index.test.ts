@@ -298,7 +298,10 @@ describe('mcp add --deploy-folder', () => {
       expect(add).not.toHaveBeenCalled()
       expect(warnings[0]).toContain('is not a folder on this computer')
       expect(warnings[1]).toContain('plain HTTP')
+      // Nothing was installed, so the command fails for a script.
+      expect(process.exitCode).toBe(1)
     } finally {
+      process.exitCode = 0
       add.mockRestore()
       spies.forEach((spy) => spy.mockRestore())
     }

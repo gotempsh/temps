@@ -19,7 +19,6 @@ import { newline, header, icons, json, colors, success, info, keyValue, warning 
 export interface PrivateOptions {
   listen?: string
   admit?: string[]
-  tailscaleServe?: boolean
   off?: boolean
   json?: boolean
 }
@@ -36,19 +35,19 @@ export type PrivateIntent =
 
 export function privateIntent(options: PrivateOptions): PrivateIntent {
   if (options.off) {
-    if (options.listen !== undefined || options.tailscaleServe || options.admit?.length) {
+    if (options.listen !== undefined || options.admit?.length) {
       return {
         kind: 'invalid',
-        error: '--off cannot be combined with --listen, --admit or --tailscale-serve',
+        error: '--off cannot be combined with --listen or --admit',
       }
     }
     return { kind: 'off' }
   }
   if (options.listen === undefined) {
-    if (options.tailscaleServe || options.admit?.length) {
+    if (options.admit?.length) {
       return {
         kind: 'invalid',
-        error: '--admit and --tailscale-serve need --listen (one of this machine\'s private addresses, or tailscale)',
+        error: '--admit needs --listen (one of this machine\'s private addresses, or tailscale)',
       }
     }
     return { kind: 'status' }
@@ -57,10 +56,18 @@ export function privateIntent(options: PrivateOptions): PrivateIntent {
   if (listen === '') {
     return { kind: 'invalid', error: '--listen needs one of this machine\'s private addresses, or "tailscale"' }
   }
-  const admit = (options.admit ?? []).map((range) => range.trim()).filter(Boolean)
+  const admit = (options.admit ?? []).map((range) => range.trim())
+  // A blank range (an unset variable in a script) is a mistake, not "the
+  // default": dropping it would admit the listen address's whole network.
+  if (admit.some((range) => range === '')) {
+    return {
+      kind: 'invalid',
+      error: '--admit was given an empty range. Name a private range (10.8.0.0/24), or leave --admit out to admit the --listen address\'s own network',
+    }
+  }
   return {
     kind: 'serve',
-    request: { listen, admit, tailscale_serve: options.tailscaleServe ?? false },
+    request: { listen, admit, tailscale_serve: false },
   }
 }
 
@@ -70,7 +77,11 @@ export function describePrivateStatus(
     Partial<Pick<PrivateIngressStatus, 'serving' | 'error' | 'admit'>>,
 ): string {
   if (!status.consent) {
-    return 'This machine does not serve private addresses.'
+    // Without a consent the only reason is that nothing here could apply
+    // one (a console running without its proxy): say it before a write.
+    return status.error
+      ? `This machine does not serve private addresses: ${status.error}`
+      : 'This machine does not serve private addresses.'
   }
   if (status.serving) {
     const admit = status.admit?.length ? `, to ${status.admit.join(', ')} only` : ''
@@ -110,7 +121,6 @@ export function registerIngressCommands(program: Command): void {
       '--admit <cidr...>',
       'Who may connect, as private ranges (default: the network of the --listen address; Tailscale\'s ranges on Tailscale)',
     )
-    .option('--tailscale-serve', 'Also let Temps write its entries in Tailscale Serve')
     .option('--off', 'Stop serving private addresses from this machine')
     .option('--json', 'Output in JSON format')
     .action(privateAction)
@@ -165,7 +175,6 @@ async function privateAction(options: PrivateOptions): Promise<void> {
   newline()
   header(`${icons.info} Private addresses on this machine`)
   keyValue('Listen', status.consent?.listen ?? colors.muted('Not set'))
-  keyValue('Tailscale Serve', status.consent ? (status.consent.tailscale_serve ? 'Yes' : 'No') : colors.muted('-'))
   keyValue('Status', describePrivateStatus(status))
   if (status.networks?.length) {
     newline()

@@ -127,6 +127,11 @@ pub struct PrivateIngressRequest {
 /// in `node_public_ingress` row `0`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PrivateIngressStatus {
+    /// Whether a process of this control plane applies a consent here.
+    /// `false` where the console runs without the proxy (split roles): no
+    /// private address is served, a consent cannot be given, and `error`
+    /// says why and what to run instead.
+    pub available: bool,
     /// `null` until the operator consents.
     pub consent: Option<PrivateIngressConsent>,
     /// The private address served on now (`100.101.102.103`), `null` when
@@ -190,6 +195,7 @@ impl PrivateIngressStatus {
             Vec::new()
         };
         Self {
+            available: true,
             serving,
             admit,
             networks: Vec::new(),
@@ -210,7 +216,20 @@ pub enum PrivateIngressError {
 
     #[error("Failed to serialize the private ingress consent for settings row 1: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// No process of this control plane applies a consent (ADR-115 D7).
+    #[error("{SPLIT_ROLE_UNAVAILABLE}")]
+    Unavailable,
 }
+
+/// Why node `0` serves no private address when its console and proxy run
+/// as separate processes: the loop runs only beside the proxy, in
+/// `temps serve` with both (ADR-115 D7).
+pub const SPLIT_ROLE_UNAVAILABLE: &str = "This control plane runs its console and proxy as separate processes, so it serves no private address itself. Run `temps serve` with both in one process to serve them here, or serve them from a worker (`temps agent ingress private`).";
+
+/// Why node `0`'s consent refuses Tailscale Serve: node `0` does not write
+/// its tailnet machine name's Serve entries; a worker's agent does.
+pub const NODE_ZERO_TAILSCALE_SERVE: &str = "the control plane does not serve its tailnet machine name through Tailscale Serve; give the consent without it, or serve the machine name from a worker (`temps agent ingress private --tailscale-serve`)";
 
 /// Read the consent from the `settings.data` document. A missing key is no
 /// consent; a malformed one is logged and read as none, which serves
@@ -269,8 +288,17 @@ impl PrivateIngressService {
             None => None,
         };
         let mut status = PrivateIngressStatus::from_report(consent, row.as_ref());
-        if let Some(runtime) = &self.runtime {
-            status.networks = runtime.networks();
+        match &self.runtime {
+            Some(runtime) => status.networks = runtime.networks(),
+            // Nothing here applies the consent, so no report is current:
+            // one left by an earlier single-process run is not served now.
+            None => {
+                status.available = false;
+                status.serving = None;
+                status.admit = Vec::new();
+                status.reported_at = None;
+                status.error = Some(SPLIT_ROLE_UNAVAILABLE.to_string());
+            }
         }
         Ok(status)
     }
@@ -280,6 +308,15 @@ impl PrivateIngressService {
         &self,
         request: PrivateIngressRequest,
     ) -> Result<(Option<PrivateIngressConsent>, PrivateIngressConsent), PrivateIngressError> {
+        if self.runtime.is_none() {
+            return Err(PrivateIngressError::Unavailable);
+        }
+        if request.tailscale_serve {
+            return Err(PrivateIngressError::Validation {
+                field: "tailscale_serve",
+                reason: NODE_ZERO_TAILSCALE_SERVE.to_string(),
+            });
+        }
         let listen = PrivateListen::parse(&request.listen)?;
         let admit =
             temps_core::private_network::parse_admits(&request.admit).map_err(|reason| {
@@ -482,6 +519,7 @@ mod tests {
         let status = PrivateIngressStatus::from_report(Some(consent.clone()), Some(&served));
         assert_eq!(status.serving.as_deref(), Some("100.101.102.103"));
         assert_eq!(status.admit, ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]);
+        assert!(status.available);
         assert_eq!(status.error, None);
 
         let refused = report(
@@ -514,11 +552,94 @@ mod tests {
         assert!(status.consent.is_none());
     }
 
+    /// ADR-115 D7: with the console and proxy in separate processes nothing
+    /// applies a consent. Saving one is refused, saying why, and the status
+    /// says so instead of the address an earlier single-process run served
+    /// or waiting forever.
+    #[tokio::test]
+    async fn without_a_loop_in_this_process_consent_is_unavailable() {
+        let consent = serde_json::json!({
+            "private_ingress": {"listen": "10.8.0.1", "updated_at": "2026-11-26T10:00:00Z"}
+        });
+        let settings = temps_entities::settings::Model {
+            id: 1,
+            data: consent,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        // An earlier single-process run's report on this same consent.
+        let report = temps_entities::node_public_ingress::Model {
+            node_id: 0,
+            listen_address: None,
+            http_port: 80,
+            https_port: 443,
+            public_address: None,
+            interfaces: None,
+            listening: Some(serde_json::json!({
+                "https": "10.8.0.1:443",
+                "admit": ["10.8.0.0/24"],
+                "consent_at": "2026-11-26T10:00:00Z"
+            })),
+            mode: Some("private".to_string()),
+            last_check: None,
+            private_checks: None,
+            tailscale: None,
+            checked_at: Some(Utc::now()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![settings]])
+            .append_query_results([vec![report]])
+            .into_connection();
+        let service = PrivateIngressService::new(Arc::new(db), None);
+        let status = service.status().await.unwrap();
+        assert!(!status.available);
+        assert_eq!(status.serving, None);
+        assert!(status.admit.is_empty());
+        assert_eq!(status.error.as_deref(), Some(SPLIT_ROLE_UNAVAILABLE));
+
+        let error = service
+            .put(PrivateIngressRequest {
+                listen: "10.8.0.1".into(),
+                admit: vec![],
+                tailscale_serve: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PrivateIngressError::Unavailable));
+    }
+
+    /// Node 0 does not write Tailscale Serve entries, so a consent asking
+    /// for them is refused instead of stored and shown as enabled.
+    #[tokio::test]
+    async fn the_control_plane_refuses_tailscale_serve() {
+        let service = PrivateIngressService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            Some(temps_core::private_ingress::ControlPlanePrivateIngress::new()),
+        );
+        let error = service
+            .put(PrivateIngressRequest {
+                listen: "tailscale".into(),
+                admit: vec![],
+                tailscale_serve: true,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PrivateIngressError::Validation {
+                field: "tailscale_serve",
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn put_validates_before_touching_the_database() {
         let service = PrivateIngressService::new(
             Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
-            None,
+            Some(temps_core::private_ingress::ControlPlanePrivateIngress::new()),
         );
         let error = service
             .put(PrivateIngressRequest {
@@ -573,7 +694,7 @@ mod tests {
             .put(PrivateIngressRequest {
                 listen: "TAILSCALE".into(),
                 admit: vec![" 100.64.0.7/10 ".into()],
-                tailscale_serve: true,
+                tailscale_serve: false,
             })
             .await
             .unwrap();
@@ -581,7 +702,7 @@ mod tests {
         assert_eq!(after.listen, "tailscale");
         // Stored normalized.
         assert_eq!(after.admit, ["100.64.0.0/10"]);
-        assert!(after.tailscale_serve);
+        assert!(!after.tailscale_serve);
         // The wake-up is stored until the loop waits for it.
         tokio::time::timeout(std::time::Duration::from_secs(1), runtime.changed())
             .await

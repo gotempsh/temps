@@ -29,6 +29,37 @@ struct StorageLinks {
     claim_user_id: Option<i32>,
 }
 
+/// A create request's storage variable aliases, checked before anything is
+/// written: each names a service the project links, with valid variable
+/// names. A bad alias is the caller's mistake (400), never a failure to link
+/// after the project exists.
+fn validate_storage_aliases(request: &CreateProjectRequest) -> Result<(), ProjectError> {
+    for (service_id, aliases) in &request.storage_service_env_aliases {
+        if !request.storage_service_ids.contains(service_id) {
+            return Err(ProjectError::InvalidInput(format!(
+                "Variable aliases were sent for service {service_id}, which project '{}' does not link",
+                request.name
+            )));
+        }
+        temps_providers::services::validate_env_aliases(*service_id, 0, aliases).map_err(
+            |error| match error {
+                temps_providers::ExternalServiceError::InvalidDatabaseProvisioning {
+                    reason,
+                    ..
+                } => ProjectError::InvalidInput(format!(
+                    "Storage service {service_id} for project '{}': {reason}",
+                    request.name
+                )),
+                other => ProjectError::InvalidInput(format!(
+                    "Storage service {service_id} for project '{}': {other}",
+                    request.name
+                )),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 impl ProjectService {
     pub async fn create_project(
         &self,
@@ -156,6 +187,7 @@ impl ProjectService {
         defer_initial_deployment: bool,
         instantiation_token: Option<String>,
     ) -> Result<Project, ProjectError> {
+        validate_storage_aliases(&request)?;
         let mut request = request;
         if request.source_type == temps_entities::source_type::SourceType::External {
             if request.repo_name.is_some()

@@ -23,8 +23,9 @@ use temps_routes::route_table::PrivateAddress;
 use tokio::sync::Notify;
 use tracing::{debug, info};
 
-/// How long listing Docker's networks may take before the pass goes on
-/// with the container bridge interfaces alone.
+/// How long listing Docker's networks may take. A listing that fails or
+/// times out is reported as unknown, never as no networks: the loop then
+/// serves nothing until a listing succeeds.
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Every address on this machine, with its interface and prefix.
@@ -36,15 +37,51 @@ impl LocalAddresses for HostAddresses {
     }
 }
 
-/// Docker's networks on this machine, when this process has a Docker
-/// client (not with `--profile control-plane`).
-struct DockerNetworks(Option<Arc<bollard::Docker>>);
+/// Makes a Docker client, or says it cannot.
+type DockerConnect = Box<dyn Fn() -> Option<bollard::Docker> + Send + Sync>;
+
+/// Docker's networks on this machine.
+enum DockerNetworks {
+    /// No container runs on this machine (`--profile control-plane`), so
+    /// there is none to overlap.
+    NotUsed,
+    /// Containers run here. The client is the one startup connected, or
+    /// one made on a later pass when Docker did not answer at boot: until
+    /// one lists, the inventory is unknown, never empty.
+    Used {
+        client: tokio::sync::Mutex<Option<Arc<bollard::Docker>>>,
+        connect: DockerConnect,
+    },
+}
+
+impl DockerNetworks {
+    fn new(used: bool, client: Option<Arc<bollard::Docker>>) -> Self {
+        if !used {
+            return Self::NotUsed;
+        }
+        Self::Used {
+            client: tokio::sync::Mutex::new(client),
+            connect: Box::new(|| bollard::Docker::connect_with_defaults().ok()),
+        }
+    }
+}
 
 #[async_trait]
 impl ContainerNetworks for DockerNetworks {
-    async fn networks(&self) -> Vec<(String, IpNet)> {
-        let Some(docker) = &self.0 else {
-            return Vec::new();
+    async fn networks(&self) -> Option<Vec<(String, IpNet)>> {
+        let docker = match self {
+            Self::NotUsed => return Some(Vec::new()),
+            Self::Used { client, connect } => {
+                let mut client = client.lock().await;
+                if client.is_none() {
+                    *client = connect().map(Arc::new);
+                }
+                let Some(docker) = client.clone() else {
+                    debug!("no Docker client for private ingress; its networks are unknown");
+                    return None;
+                };
+                docker
+            }
         };
         let listed = tokio::time::timeout(
             DOCKER_TIMEOUT,
@@ -55,14 +92,14 @@ impl ContainerNetworks for DockerNetworks {
             Ok(Ok(networks)) => networks,
             Ok(Err(error)) => {
                 debug!(%error, "could not list Docker networks for private ingress");
-                return Vec::new();
+                return None;
             }
             Err(_) => {
                 debug!("listing Docker networks for private ingress timed out");
-                return Vec::new();
+                return None;
             }
         };
-        networks
+        let networks = networks
             .into_iter()
             .flat_map(|network| {
                 let name = network.name.unwrap_or_default();
@@ -76,7 +113,8 @@ impl ContainerNetworks for DockerNetworks {
                         Some((name.clone(), subnet))
                     })
             })
-            .collect()
+            .collect();
+        Some(networks)
     }
 }
 
@@ -122,6 +160,7 @@ pub(super) fn start_control_plane_private_ingress(
     db: Arc<sea_orm::DatabaseConnection>,
     runtime: Arc<ControlPlanePrivateIngress>,
     route_table: Arc<temps_routes::CachedPeerTable>,
+    docker_used: bool,
     docker: Option<Arc<bollard::Docker>>,
 ) {
     let private = ControlPlanePrivateIngressLoop::new(
@@ -129,7 +168,7 @@ pub(super) fn start_control_plane_private_ingress(
         runtime,
         route_table,
         Arc::new(HostAddresses),
-        Arc::new(DockerNetworks(docker)),
+        Arc::new(DockerNetworks::new(docker_used, docker)),
         Arc::new(AgentInsideCheck),
     );
     let shutdown = Arc::new(Notify::new());
@@ -146,6 +185,35 @@ pub(super) fn start_control_plane_private_ingress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn docker_that_did_not_answer_at_boot_is_unknown_not_empty() {
+        // No containers on this machine: nothing can overlap.
+        assert_eq!(
+            DockerNetworks::new(false, None).networks().await,
+            Some(Vec::new())
+        );
+        // Containers run here but no client could be made: unknown.
+        let unreachable = DockerNetworks::Used {
+            client: tokio::sync::Mutex::new(None),
+            connect: Box::new(|| None),
+        };
+        assert_eq!(unreachable.networks().await, None);
+        // A client to a daemon that does not answer: unknown on every pass.
+        let down = DockerNetworks::Used {
+            client: tokio::sync::Mutex::new(None),
+            connect: Box::new(|| {
+                bollard::Docker::connect_with_unix(
+                    "/nonexistent/temps-test/docker.sock",
+                    1,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .ok()
+            }),
+        };
+        assert_eq!(down.networks().await, None);
+        assert_eq!(down.networks().await, None);
+    }
 
     #[test]
     fn an_address_without_a_range_or_listener_is_not_checked() {

@@ -20,7 +20,6 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Callout } from '@temps-sdk/ds'
-import { useState } from 'react'
 import { mcpSetupBlocker } from './agents'
 import { McpAccessFooter, McpKeyStep, McpServerStep } from './McpAccessSteps'
 import { useMcpAccess } from './useMcpAccess'
@@ -31,9 +30,14 @@ import { useMcpAccess } from './useMcpAccess'
  * themselves, with no extension. The user turns on the MCP server, creates
  * a key, and pastes a settings snippet that already holds it.
  */
-export function OtherAppSetup() {
+export function OtherAppSetup({
+  appId,
+  onAppChange: setAppId,
+}: {
+  appId: McpAppId
+  onAppChange: (app: McpAppId) => void
+}) {
   const origin = window.location.origin
-  const [appId, setAppId] = useState<McpAppId>('cursor')
   const app = mcpApp(appId)
   const mcp = useMcpAccess(appId)
   const blocker = mcpSetupBlocker(
@@ -51,7 +55,14 @@ export function OtherAppSetup() {
         <Label htmlFor="other-app">Which app?</Label>
         <Select
           value={appId}
-          onValueChange={(value) => setAppId(value as McpAppId)}
+          onValueChange={(value) => {
+            if (value === appId) return
+            // A key is named for the app it was made for, which is how the
+            // step tells that app connected: another app's settings must
+            // not carry it, so the new app gets a key of its own.
+            mcp.createKey.reset()
+            setAppId(value as McpAppId)
+          }}
         >
           <SelectTrigger id="other-app" className="w-full sm:w-[240px]">
             <SelectValue />

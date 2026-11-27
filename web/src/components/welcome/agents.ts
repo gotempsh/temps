@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { AiHarnessState, AiHarnessStatusResponse } from '@/api/client'
+import type { McpAppId } from '@/lib/mcp-clients'
 import type { Choice } from './ChoiceList'
 
 /**
@@ -63,16 +64,31 @@ export type AgentConnection =
   | { kind: 'waiting'; line: string; canContinue: boolean }
 
 /**
+ * The client name in the MCP keys made for a path (`mcp-<client>-<time>`,
+ * `mcpKeyName`): the Claude app's, or the app picked under Another app.
+ */
+export function mcpClientFor(
+  path: AgentPath,
+  otherApp: McpAppId
+): string | null {
+  if (path === 'claude_app') return 'claude-app'
+  if (path === 'other_app') return otherApp
+  return null
+}
+
+/**
  * The status the server reports names the agent credential used most
- * recently. On an MCP app path (the Claude app, another app), another agent
- * being connected (an earlier `temps login`) is not proof the app works: the
- * step keeps waiting for an MCP key to be used, but lets the user continue.
+ * recently. On an MCP app path (the Claude app, another app), only a key made
+ * for that app (`client`, from `mcpClientFor`) proves it works: another agent
+ * being connected (an earlier `temps login`, or Cursor's key when the Claude
+ * app is picked) keeps the step waiting, but lets the user continue.
  */
 export function agentConnection(
   path: AgentPath,
   data:
     | Pick<AiHarnessStatusResponse, 'status' | 'reason' | 'connected_via'>
-    | undefined
+    | undefined,
+  client: string | null = null
 ): AgentConnection {
   if (path === 'coding_agent') {
     return data?.status === 'connected'
@@ -85,7 +101,9 @@ export function agentConnection(
   }
   if (
     data?.connected_via?.kind === 'mcp_client' &&
-    data.status === 'connected'
+    data.status === 'connected' &&
+    client !== null &&
+    data.connected_via.name.startsWith(`mcp-${client}-`)
   ) {
     return { kind: 'connected' }
   }
