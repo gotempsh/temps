@@ -3,6 +3,7 @@
 
 import { getSettings, updateSettings } from '@/api/client'
 import { errorWithStatus } from '@/lib/http-error-status'
+import { isStaleRevision, STALE_REVISION_MESSAGE } from '@/lib/stale-revision'
 import type {
   AppSettings,
   AppSettingsResponse,
@@ -318,17 +319,33 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
  * Update platform settings. Reads the current full settings from the server,
  * merges the partial update on top, validates, and persists. No localStorage —
  * always round-trip through the server so we never write stale cached data.
+ *
+ * `expectedRevision` is the revision the caller's form was rendered from:
+ * when someone else saved since, the server refuses the save with 409
+ * (#2081) and this throws an error `isStaleRevision` recognizes. Without
+ * one, the revision of the read just above is used.
  */
 export async function updatePlatformSettings(
-  settings: Partial<PlatformSettings>
+  settings: Partial<PlatformSettings>,
+  options: { expectedRevision?: string } = {}
 ): Promise<PlatformSettings> {
   const current = await getPlatformSettings()
   const updated = { ...current, ...settings }
 
   validateSettings(updated)
 
-  const body = buildPlatformSettingsUpdateBody(updated, settings)
+  const body = {
+    ...buildPlatformSettingsUpdateBody(updated, settings),
+    expected_revision: options.expectedRevision ?? current.revision ?? null,
+  }
   const result = await updateSettings({ body })
+  if (result.error && isStaleRevision(result.error)) {
+    throw Object.assign(new Error(STALE_REVISION_MESSAGE), {
+      status: 409,
+      current_revision: (result.error as { current_revision: string })
+        .current_revision,
+    })
+  }
   if (result.error) {
     // The generated client resolves (rather than throws) on non-2xx
     // responses, so a failed save must be surfaced explicitly here —
@@ -346,15 +363,20 @@ export async function updatePlatformSettings(
   // briefly before the invalidating refetch lands. Strip both write-only geo
   // fields; `maxmind_license_key_saved` (already on `updated.geo`) is what
   // the UI actually reads back.
-  if (updated.geo) {
+  // The saved revision, so the next save from the same page is not refused.
+  const saved = {
+    ...updated,
+    revision: result.data?.revision ?? current.revision,
+  }
+  if (saved.geo) {
     const {
       maxmind_license_key: _key,
       clear_maxmind_license_key: _clear,
       ...maskedGeo
-    } = updated.geo
-    return { ...updated, geo: maskedGeo as GeoSettings }
+    } = saved.geo
+    return { ...saved, geo: maskedGeo as GeoSettings }
   }
-  return updated
+  return saved
 }
 
 export function buildPlatformSettingsUpdateBody(

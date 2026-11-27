@@ -3307,7 +3307,9 @@ mod shield_enforcement_tests {
     #[tokio::test]
     async fn edge_rules_never_touch_acme_or_the_challenge_endpoints() -> Result<()> {
         let Some((h, _, _)) = edge_harness(&[serde_json::json!({
-            "expression": {"combinator": "all", "children": []},
+            "expression": {"combinator": "all", "children": [
+                {"kind": "condition", "field": "path", "op": "starts_with", "values": ["/"]}
+            ]},
             "action": {"type": "block", "status": 403}
         })])
         .await?

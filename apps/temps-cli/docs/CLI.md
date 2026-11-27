@@ -2837,7 +2837,6 @@ Show a time-series range for a single metric
 | `--id <id>` | Service ID | - | Yes |
 | `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
 | `-r, --range <window>` | Time window: 1h, 6h, 24h, 7d (default: 24h) | - | No |
-| `-p, --percentile <n>` | Histogram percentile (0-100) instead of a plain average | - | No |
 | `--json` | Output raw JSON instead of a formatted table | - | No |
 
 #### `services metrics status`
@@ -3679,7 +3678,7 @@ Create a new API key
 | `-n, --name <name>` | API key name | - | No |
 | `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | No |
 | `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | No |
-| `-p, --permissions <permissions>` | Comma-separated list of permissions | - | No |
+| `-p, --permissions <permissions>` | Comma-separated list of the key's exact permissions (the key uses the custom role) | - | No |
 | `--project-id <id>` | Confine to one project’s deployment and environment APIs | - | No |
 | `--environment-id <id>` | Confine to one environment (requires --project-id) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |

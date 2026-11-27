@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
+import { Command } from 'commander'
 import {
   schemaToPromptParams,
   parseSetPairs,
@@ -16,6 +17,7 @@ import {
   isValidSeverity,
   applyS3Flags,
   serviceEnvironmentEntries,
+  registerServicesCommands,
 } from './index.js'
 
 describe('serviceEnvironmentEntries', () => {
@@ -263,5 +265,22 @@ describe('applyS3Flags', () => {
   test('rejects unknown backends and non-S3 service types with context', () => {
     expect(() => applyS3Flags('s3', {}, { backend: 'minio' })).toThrow(/Unknown --backend "minio"/)
     expect(() => applyS3Flags('redis', {}, { bucket: ['a'] })).toThrow(/not "redis"/)
+  })
+})
+
+describe('services metrics range', () => {
+  // The server computes no histogram percentiles and refuses the parameter
+  // (#2075), so the CLI must not offer a flag that can only fail.
+  test('offers no --percentile flag', () => {
+    const program = new Command()
+    registerServicesCommands(program)
+    const range = program.commands
+      .find((c) => c.name() === 'services')
+      ?.commands.find((c) => c.name() === 'metrics')
+      ?.commands.find((c) => c.name() === 'range')
+    expect(range).toBeDefined()
+    const flags = range!.options.map((o) => o.long)
+    expect(flags).toContain('--metric')
+    expect(flags).not.toContain('--percentile')
   })
 })

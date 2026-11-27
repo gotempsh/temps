@@ -5237,7 +5237,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -6293,6 +6293,10 @@
             "description": "When enabled, Admin-role accounts without MFA enrolled are rejected\nat password login (bherila/temps#32). SSO/OIDC logins are unaffected.",
             "type": "boolean"
           },
+          "revision": {
+            "description": "Revision of these settings. Send it back as `expected_revision` when\nsaving, so a save made by someone else since this read is not\nsilently reverted.",
+            "type": "string"
+          },
           "screenshots": {
             "$ref": "#/components/schemas/ScreenshotSettings"
           },
@@ -6376,7 +6380,8 @@
           "tenant_resource_ceilings",
           "self_update",
           "image_retention",
-          "mcp_server"
+          "mcp_server",
+          "revision"
         ],
         "type": "object"
       },
@@ -18266,7 +18271,8 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "description": "When the key stops working. Must be in the future. Defaults to one\nyear after creation when left out: API keys always expire.",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -18274,9 +18280,11 @@
             ]
           },
           "name": {
+            "description": "Up to 255 characters, unique among the caller's keys. Surrounding\nwhitespace is trimmed; a blank name is refused.",
             "type": "string"
           },
           "permissions": {
+            "description": "The key's permissions, required with `role_type: custom`. Any other\nrole carries its own: a non-empty list with it is refused, while an\nempty list or none gives the role's permissions. Fixed once the key is\ncreated.",
             "example": [
               "projects:read",
               "deployments:read"
@@ -18298,6 +18306,7 @@
             ]
           },
           "role_type": {
+            "description": "A predefined role (`admin`, `platform_admin`, `user`, `reader`,\n`api_reader`) or `custom` for an explicit permission list.",
             "example": "admin",
             "type": "string"
           }
@@ -18326,7 +18335,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -18883,7 +18892,7 @@
       "CreateDeploymentTokenRequest": {
         "properties": {
           "deployment_id": {
-            "description": "Optional deployment ID - if set, token is scoped to a specific deployment",
+            "description": "Optional deployment of this project (and of `environment_id`, when\nset) - if set, token is scoped to a specific deployment.",
             "format": "int32",
             "type": [
               "integer",
@@ -18891,7 +18900,7 @@
             ]
           },
           "environment_id": {
-            "description": "Optional environment ID - if not set, token applies to all environments",
+            "description": "Optional environment of this project - if not set, token applies to\nall environments. An environment of another project is refused.",
             "format": "int32",
             "type": [
               "integer",
@@ -18899,7 +18908,8 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "description": "When the token stops working. Must be in the future; leave it out for\na token that does not expire.",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -18907,10 +18917,11 @@
             ]
           },
           "name": {
+            "description": "Up to 255 characters, unique within the project. Surrounding\nwhitespace is trimmed; a blank name is refused.",
             "type": "string"
           },
           "permissions": {
-            "description": "List of permissions (e.g., [\"visitors:enrich\", \"emails:send\"])\nIf not provided, defaults to full access",
+            "description": "List of permissions (e.g., [\"visitors:enrich\", \"emails:send\"]).\nIf not provided, defaults to full access (`[\"*\"]`). An empty list is\nrefused: the token could do nothing.",
             "example": [
               "visitors:enrich",
               "emails:send"
@@ -18951,7 +18962,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -19073,7 +19084,7 @@
             ]
           },
           "position": {
-            "description": "Where to insert the rule (0 = first). Defaults to the end.",
+            "description": "Where to insert the rule: 0 is first, and the number of rules the\nproject has is after the last one. Defaults to the end. A position\noutside that range is refused.",
             "format": "int32",
             "type": [
               "integer",
@@ -25542,7 +25553,7 @@
             ]
           },
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -50275,14 +50286,6 @@
             "description": "Metric name, e.g. `\"pg.connections_active\"`.",
             "type": "string"
           },
-          "percentile": {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
           "range": {
             "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
             "type": "string"
@@ -52513,6 +52516,10 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "revision": {
+            "description": "Revision of the stored limits. Send it back as `expected_revision`\nwhen saving, so a save made by someone else since this read is not\nsilently reverted.",
+            "type": "string"
           }
         },
         "required": [
@@ -52520,7 +52527,8 @@
           "concurrency",
           "queue_wait_seconds",
           "build_timeout_seconds",
-          "is_default"
+          "is_default",
+          "revision"
         ],
         "type": "object"
       },
@@ -53030,6 +53038,10 @@
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimits"
           },
+          "build_limits_revision": {
+            "description": "Revision of `build_limits`, to send as `expected_revision` when\nsaving them (`PUT /internal/nodes/{node_id}/build-limits`).",
+            "type": "string"
+          },
           "capacity": {
             "description": "Resource capacity/usage metrics from the latest heartbeat"
           },
@@ -53158,6 +53170,7 @@
           "labels",
           "capacity",
           "build_limits",
+          "build_limits_revision",
           "created_at",
           "public_ingress_enabled",
           "public_ingress_unsupported_reasons"
@@ -64616,6 +64629,10 @@
               "null"
             ]
           },
+          "revision": {
+            "description": "Revision of the settings above that a save writes. Send it back as\n`expected_revision`, so a save made since this read is not reverted.",
+            "type": "string"
+          },
           "running": {
             "type": [
               "boolean",
@@ -64631,7 +64648,8 @@
           "agent_reports",
           "interfaces",
           "private_on_tailscale",
-          "behind_nat"
+          "behind_nat",
+          "revision"
         ],
         "type": "object"
       },
@@ -77193,6 +77211,26 @@
         ],
         "type": "object"
       },
+      "SetNodeBuildLimitsRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BuildLimits"
+          },
+          {
+            "properties": {
+              "expected_revision": {
+                "description": "The `revision` the limits were read with. When set and the stored\nlimits have changed since, the save is refused with 409 and nothing\nchanges. When omitted the save is unconditional (older clients).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "A worker's new build limits."
+      },
       "SetNodeNetworkPolicyModeRequest": {
         "properties": {
           "mode": {
@@ -77478,6 +77516,13 @@
         "properties": {
           "message": {
             "type": "string"
+          },
+          "revision": {
+            "description": "`PUT /settings`: revision of the saved settings, to send as\n`expected_revision` with the next save.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -86647,7 +86692,8 @@
       "UpdateApiKeyRequest": {
         "properties": {
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "description": "A new expiry, which must be in the future. Leave it out, or send the\nkey's current expiry back unchanged (even one that has passed), to\nkeep it: an expired key can be renamed or deactivated without\nextending it. API keys always expire, so `null` is refused for a key\nthat has an expiry.",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -86661,12 +86707,14 @@
             ]
           },
           "name": {
+            "description": "New name, trimmed; a blank name is refused. Leave it out to keep the\ncurrent one.",
             "type": [
               "string",
               "null"
             ]
           },
           "permissions": {
+            "description": "A key's permissions are fixed when it is created. The key's current\npermissions are accepted unchanged; any other list is refused with 400.\nTo change them, create a new key and delete this one.",
             "example": [
               "projects:read",
               "deployments:read"
@@ -87451,7 +87499,8 @@
       "UpdateDeploymentTokenRequest": {
         "properties": {
           "expires_at": {
-            "example": "2024-12-31T23:59:59Z",
+            "description": "A future time sets a new expiry, `null` removes it (the token no\nlonger expires), and leaving the field out, or sending the current\nexpiry back unchanged (even one that has passed), keeps it.",
+            "example": "2030-12-31T23:59:59Z",
             "format": "date-time",
             "type": [
               "string",
@@ -87465,12 +87514,14 @@
             ]
           },
           "name": {
+            "description": "New name. Leave it out to keep the current one.",
             "type": [
               "string",
               "null"
             ]
           },
           "permissions": {
+            "description": "Replaces the token's permissions. Leave it out to keep them; an empty\nlist is refused.",
             "example": [
               "visitors:enrich",
               "emails:send"
@@ -89010,24 +89061,35 @@
         "type": "object"
       },
       "UpdateProjectSecretRequest": {
-        "description": "Request to update a project secret. The `value` field is optional — omit it\nto rotate only the environment scoping / preview flag without touching the\nciphertext.",
+        "description": "Request to update a project secret. Every field is optional, and a field\nthat is left out (or `null`) keeps its stored value: rotating only the\n`value` keeps the secret's environments, preview flag and compose services\nexactly as they are.",
         "properties": {
           "compose_services": {
-            "description": "Docker Compose services allowed to read this secret, by compose\nservice name. Empty (the default) delivers it to every service in the\nstack, which is how secrets behaved before scoping existed.\n\nIgnored by non-Compose presets: those deploy a single container, which\nalways receives every secret in scope for its environment.",
+            "description": "Replaces the Docker Compose services allowed to read this secret, by\ncompose service name. An empty list delivers it to every service in\nthe stack. Omit to keep the current services.\n\nIgnored by non-Compose presets: those deploy a single container, which\nalways receives every secret in scope for its environment.",
             "items": {
               "type": "string"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "environment_ids": {
+            "description": "Replaces the environments the secret applies to. Omit to keep the\ncurrent environments. Bindings to deleted environments are always\nkept, so an empty list applies the secret to every environment of the\nproject only when it has none; a secret still bound to a deleted\nenvironment stays limited to it.",
             "items": {
               "format": "int32",
               "type": "integer"
             },
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "include_in_preview": {
-            "type": "boolean"
+            "description": "Whether preview environments receive the secret. Omit to keep the\ncurrent setting.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "value": {
             "description": "New plaintext value, <= 1 MiB. Omit to keep the existing value.",
@@ -89450,6 +89512,13 @@
           "enabled": {
             "type": "boolean"
           },
+          "expected_revision": {
+            "description": "The `revision` the settings were read with. When set and they have\nchanged since, the save is refused with 409 and nothing changes.\nWhen omitted the save is unconditional (older clients).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "http_port": {
             "format": "int32",
             "minimum": 0,
@@ -89808,6 +89877,26 @@
           "message"
         ],
         "type": "object"
+      },
+      "UpdateSettingsRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AppSettings"
+          },
+          {
+            "properties": {
+              "expected_revision": {
+                "description": "The `revision` from `GET /settings`. When set and the settings have\nchanged since, the save is refused with 409 and nothing changes.\nWhen omitted the save is unconditional (older clients).",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "`PUT /settings` body: the settings document (partial documents keep the\nomitted fields), plus the revision it was read with.\n\nSchema only: the handler reads the raw body, because which fields were\nsent is information deserialization destroys."
       },
       "UpdateShieldEntryRequest": {
         "description": "Replaces an entry's verdict, note and expiry; what it matches stays.",
@@ -112813,7 +112902,7 @@
             "description": "API key created successfully"
           },
           "400": {
-            "description": "Bad request"
+            "description": "Bad request: a blank name, an expiry in the past, permissions with a role other than custom, or an invalid scope"
           },
           "401": {
             "description": "Unauthorized"
@@ -113032,7 +113121,7 @@
             "description": "API key updated successfully"
           },
           "400": {
-            "description": "Bad request"
+            "description": "Bad request: a blank name, a new expiry in the past (the key's current expiry may be sent back unchanged), a removed expiry, or permissions that differ from the key's (they cannot change after creation)"
           },
           "401": {
             "description": "Unauthorized"
@@ -119335,19 +119424,6 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "in": "query",
-            "name": "percentile",
-            "required": false,
-            "schema": {
-              "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
             }
           },
           {
@@ -125834,7 +125910,7 @@
             "description": "Service or member not found"
           },
           "409": {
-            "description": "This process has no local Docker daemon to run the promotion on"
+            "description": "This process has no local Docker daemon to run the promotion on, or the member's node stayed busy (another operation owned its container) and ran nothing: retry"
           },
           "500": {
             "description": "pg_autoctl perform promotion failed"
@@ -125853,7 +125929,6 @@
     },
     "/external-services/{id}/metrics": {
       "get": {
-        "description": "Pass `percentile` to compute a histogram quantile instead of a plain\ngauge/counter average.",
         "operationId": "ExternalServiceMetricsGetRange",
         "parameters": [
           {
@@ -125882,19 +125957,6 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "in": "query",
-            "name": "percentile",
-            "required": false,
-            "schema": {
-              "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
             }
           },
           {
@@ -136300,7 +136362,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/BuildLimits"
+                "$ref": "#/components/schemas/SetNodeBuildLimitsRequest"
               }
             }
           },
@@ -136311,10 +136373,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BuildLimits"
+                  "$ref": "#/components/schemas/NodeBuildLimitsResponse"
                 }
               }
-            }
+            },
+            "description": "The saved limits and their new revision"
           },
           "400": {
             "description": "Invalid limits, node role, or the control plane (node 0)"
@@ -136327,6 +136390,9 @@
           },
           "404": {
             "description": "Node not found"
+          },
+          "409": {
+            "description": "`expected_revision` is stale: the limits changed since they were read; nothing was saved"
           },
           "500": {
             "description": "Storage failed"
@@ -137061,6 +137127,9 @@
           },
           "404": {
             "description": "Node not found"
+          },
+          "409": {
+            "description": "The worker does not allow this change, or `expected_revision` is stale: the settings changed since they were read; nothing was saved"
           }
         },
         "security": [
@@ -142023,19 +142092,6 @@
             "required": false,
             "schema": {
               "type": "string"
-            }
-          },
-          {
-            "description": "Optional histogram percentile (0–100).  When provided, the endpoint\nfetches histogram buckets and computes the requested quantile.",
-            "in": "query",
-            "name": "percentile",
-            "required": false,
-            "schema": {
-              "format": "double",
-              "type": [
-                "number",
-                "null"
-              ]
             }
           },
           {
@@ -162473,13 +162529,16 @@
             "description": "Deployment token created successfully"
           },
           "400": {
-            "description": "Invalid request"
+            "description": "Invalid request: blank name, empty permissions, an expiry in the past, or a deployment of another environment"
           },
           "401": {
             "description": "Unauthorized"
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "The project, or the requested environment or deployment in it, was not found"
           },
           "409": {
             "description": "Token with this name already exists"
@@ -162655,7 +162714,7 @@
             "description": "Deployment token updated successfully"
           },
           "400": {
-            "description": "Invalid request"
+            "description": "Invalid request: blank name, empty permissions or a new expiry in the past (the token's current expiry may be sent back unchanged)"
           },
           "401": {
             "description": "Unauthorized"
@@ -164764,7 +164823,7 @@
                 }
               }
             },
-            "description": "Invalid rule; `issues` lists each problem"
+            "description": "Invalid rule (`issues` lists each problem; a rule needs at least one condition), or a position outside the project's rules (`max_position` is the last valid one)"
           },
           "401": {
             "content": {
@@ -184499,10 +184558,13 @@
             "description": "Secret updated"
           },
           "400": {
-            "description": "Value too large"
+            "description": "Value too large or an invalid compose service name"
           },
           "404": {
-            "description": "Secret not found"
+            "description": "The secret, or a requested environment, was not found in the project"
+          },
+          "409": {
+            "description": "Another secret with the same key already applies to one of the requested environments"
           },
           "500": {
             "description": "Internal server error"
@@ -184513,7 +184575,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Update a project secret. Value rotation requires a redeploy to take effect —\nrunning containers keep their currently-mounted values until the next\ndeployment.",
+        "summary": "Update a project secret. Only the fields in the body change: a field left\nout keeps its stored value, so rotating the value alone keeps the secret's\nenvironments, preview flag and compose services. Value rotation requires a\nredeploy to take effect — running containers keep their currently-mounted\nvalues until the next deployment.",
         "tags": [
           "Secrets"
         ]
@@ -192145,7 +192207,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AppSettings"
+                "$ref": "#/components/schemas/UpdateSettingsRequest"
               }
             }
           },
@@ -192167,6 +192229,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "409": {
+            "description": "`expected_revision` is stale (the settings changed since they were read), or the public ingress hostname is in use; nothing was saved"
           },
           "500": {
             "description": "Internal server error"

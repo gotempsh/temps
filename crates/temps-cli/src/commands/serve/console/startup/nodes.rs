@@ -179,5 +179,35 @@ pub(super) fn start_node_control(
         debug!("Node health check scheduler with failover started (every 60s)");
     }
 
+    // Remove containers of superseded deployments that their deploy could
+    // not remove because the node was down, now that it is back: Docker's
+    // restart policy starts them again, and nothing else would remove them
+    // before the next deploy. Its own task, so a slow teardown (stop grace,
+    // lifecycle locks) never delays the health check's offline detection and
+    // failover; one loop awaiting each pass, so passes never overlap, and a
+    // pass is never cancelled half way through a claimed container.
+    if let Some(workflow_service) =
+        service_context.get_service::<temps_deployments::WorkflowExecutionService>()
+    {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut cursor = 0;
+            loop {
+                interval.tick().await;
+                let pass = workflow_service.remove_superseded_containers(cursor).await;
+                cursor = pass.next_cursor;
+                if pass.environments > 0 {
+                    tracing::info!(
+                        environments = pass.environments,
+                        removed = pass.removed,
+                        "Removed containers of superseded deployments left on nodes that are back"
+                    );
+                }
+            }
+        });
+        debug!("Superseded container cleanup started (every 60s)");
+    }
+
     node_routes
 }

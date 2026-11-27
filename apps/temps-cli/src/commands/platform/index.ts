@@ -4,6 +4,7 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { settingsWriteBody, settingsWriteError } from '../../lib/settings-revision.js'
 import {
   getPlatformInfo,
   getPlatformFeatures,
@@ -666,13 +667,12 @@ async function updateChannelAction(
     }
     const { error: writeErr } = await updateSettings({
       client,
-      body: {
-        ...current,
+      body: settingsWriteBody(current, {
         self_update: buildSelfUpdateSettings(current, requested, isAuto),
-      } as never,
+      }) as never,
     })
     if (writeErr) {
-      throw new Error(getErrorMessage(writeErr))
+      throw new Error(settingsWriteError(writeErr))
     }
   })
 

@@ -499,6 +499,9 @@ pub struct NodeInfoResponse {
     /// Resource capacity/usage metrics from the latest heartbeat
     pub capacity: serde_json::Value,
     pub build_limits: temps_deployer::build_protocol::BuildLimits,
+    /// Revision of `build_limits`, to send as `expected_revision` when
+    /// saving them (`PUT /internal/nodes/{node_id}/build-limits`).
+    pub build_limits_revision: String,
     /// Container platform this node runs (`linux/amd64`, `linux/arm64`).
     /// `None` until an agent that reports it has heartbeated.
     pub architecture: Option<String>,
@@ -830,6 +833,7 @@ pub struct ClusterDnsStatusResponse {
     components(schemas(
         temps_deployer::build_protocol::BuildLimits,
         NodeBuildLimitsResponse,
+        SetNodeBuildLimitsRequest,
         RegisterNodeApiRequest,
         RegisterNodeResponse,
         MeshEnrollApiRequest,
@@ -2921,6 +2925,8 @@ fn control_plane_node_response(app_state: &NodeAdminState) -> NodeInfoResponse {
         last_heartbeat,
         created_at: chrono::Utc::now().to_rfc3339(),
         build_limits: Default::default(),
+        // The control plane has no per-node build limits.
+        build_limits_revision: "0".to_string(),
         public_ingress_enabled: false,
         public_ingress_running: None,
         public_ingress_last_error: None,
@@ -2996,6 +3002,9 @@ async fn admin_list_nodes(
             status: n.status,
             labels: n.labels,
             capacity: n.capacity,
+            build_limits_revision: crate::services::node_service::build_limits_revision(
+                n.build_limits.as_ref(),
+            ),
             build_limits: n
                 .build_limits
                 .and_then(|v| serde_json::from_value(v).ok())
@@ -3091,6 +3100,9 @@ async fn admin_get_node(
         status: node.status,
         labels: node.labels,
         capacity: node.capacity,
+        build_limits_revision: crate::services::node_service::build_limits_revision(
+            node.build_limits.as_ref(),
+        ),
         build_limits: node
             .build_limits
             .and_then(|v| serde_json::from_value(v).ok())
@@ -3171,6 +3183,35 @@ pub struct NodeBuildLimitsResponse {
     /// True when no limits were saved for the node, so these are the
     /// defaults (and follow a future change of them).
     pub is_default: bool,
+    /// Revision of the stored limits. Send it back as `expected_revision`
+    /// when saving, so a save made by someone else since this read is not
+    /// silently reverted.
+    pub revision: String,
+}
+
+impl NodeBuildLimitsResponse {
+    fn new(node_id: i32, current: crate::services::node_service::NodeBuildLimits) -> Self {
+        Self {
+            node_id,
+            concurrency: current.limits.concurrency,
+            queue_wait_seconds: current.limits.queue_wait_seconds,
+            build_timeout_seconds: current.limits.build_timeout_seconds,
+            is_default: current.is_default,
+            revision: current.revision,
+        }
+    }
+}
+
+/// A worker's new build limits.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetNodeBuildLimitsRequest {
+    #[serde(flatten)]
+    pub limits: temps_deployer::build_protocol::BuildLimits,
+    /// The `revision` the limits were read with. When set and the stored
+    /// limits have changed since, the save is refused with 409 and nothing
+    /// changes. When omitted the save is unconditional (older clients).
+    #[serde(default)]
+    pub expected_revision: Option<String>,
 }
 
 /// Read a worker node's effective build limits, and whether they are the
@@ -3196,36 +3237,33 @@ async fn admin_get_node_build_limits(
     // settings, read back to confirm a change.
     permission_guard!(auth, SettingsWrite);
     let current = app_state.node_service.get_build_limits(node_id).await?;
-    Ok(Json(NodeBuildLimitsResponse {
-        node_id,
-        concurrency: current.limits.concurrency,
-        queue_wait_seconds: current.limits.queue_wait_seconds,
-        build_timeout_seconds: current.limits.build_timeout_seconds,
-        is_default: current.is_default,
-    }))
+    Ok(Json(NodeBuildLimitsResponse::new(node_id, current)))
 }
 
 #[utoipa::path(
     tag = "Nodes", put, path = "/internal/nodes/{node_id}/build-limits",
     operation_id = "admin_set_node_build_limits",
-    request_body = temps_deployer::build_protocol::BuildLimits,
+    request_body = SetNodeBuildLimitsRequest,
     params(("node_id" = i32, Path, description = "Worker node ID")),
-    responses((status = 200, body = temps_deployer::build_protocol::BuildLimits),
+    responses((status = 200, description = "The saved limits and their new revision", body = NodeBuildLimitsResponse),
         (status = 400, description = "Invalid limits, node role, or the control plane (node 0)"),
         (status = 401, description = "Unauthorized"), (status = 403, description = "Forbidden"),
-        (status = 404, description = "Node not found"), (status = 500, description = "Storage failed")),
+        (status = 404, description = "Node not found"),
+        (status = 409, description = "`expected_revision` is stale: the limits changed since they were read; nothing was saved"),
+        (status = 500, description = "Storage failed")),
     security(("bearer_auth" = []))
 )]
 async fn admin_set_node_build_limits(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<NodeAdminState>>,
     Path(node_id): Path<i32>,
-    Json(limits): Json<temps_deployer::build_protocol::BuildLimits>,
+    Json(request): Json<SetNodeBuildLimitsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
-    app_state
+    let limits = request.limits;
+    let revision = app_state
         .node_service
-        .set_build_limits(node_id, limits)
+        .set_build_limits(node_id, limits, request.expected_revision.as_deref())
         .await?;
     let audit = crate::handlers::audit::NodeBuildLimitsChangedAudit {
         context: AuditContext {
@@ -3239,7 +3277,14 @@ async fn admin_set_node_build_limits(
     if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
         error!(node_id, %error, "Builder limits saved but audit failed");
     }
-    Ok(Json(limits))
+    Ok(Json(NodeBuildLimitsResponse::new(
+        node_id,
+        crate::services::node_service::NodeBuildLimits {
+            limits,
+            is_default: false,
+            revision,
+        },
+    )))
 }
 
 /// Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is
@@ -4488,6 +4533,9 @@ impl From<NodeError> for Problem {
                     .with_detail(error.to_string())
                     .with_value("node_id", node_id)
             }
+            NodeError::StaleRevision(ref stale) => {
+                temps_core::revision::stale_revision_problem(stale)
+            }
             NodeError::InvalidStoredBuildLimits { node_id, .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Stored Build Limits Invalid")
@@ -5017,6 +5065,7 @@ mod tests {
         assert_eq!(body["queue_wait_seconds"], 300);
         assert_eq!(body["build_timeout_seconds"], 1800);
         assert_eq!(body["is_default"], true, "{body}");
+        assert_eq!(body["revision"], "0", "{body}");
 
         let mut saved = sample_node();
         saved.build_limits = Some(serde_json::json!({
@@ -5032,6 +5081,7 @@ mod tests {
         assert_eq!(body["queue_wait_seconds"], 60);
         assert_eq!(body["build_timeout_seconds"], 900);
         assert_eq!(body["is_default"], false, "{body}");
+        assert_eq!(body["revision"], "3", "the stored `_version`");
     }
 
     #[tokio::test]

@@ -261,7 +261,6 @@ fn cluster_parts(
     ClusterMemberSpec,
 ) {
     let name = format!("ha-pg-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
     let config: PostgresClusterConfig = serde_json::from_value(serde_json::json!({
         "password": "cross-host-test-password"
     }))
@@ -279,7 +278,7 @@ fn cluster_parts(
         hostname: Some(address.to_string()),
     };
     (
-        PostgresClusterService::new(name, docker),
+        PostgresClusterService::new(name),
         config,
         ClusterAuthSecrets::generate(),
         monitor,

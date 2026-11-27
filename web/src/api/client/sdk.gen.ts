@@ -4658,9 +4658,6 @@ export const promoteClusterMember = <ThrowOnError extends boolean = false>(optio
 
 /**
  * Fetch a time-series range for a single metric on an external service.
- *
- * Pass `percentile` to compute a histogram quantile instead of a plain
- * gauge/counter average.
  */
 export const externalServiceMetricsGetRange = <ThrowOnError extends boolean = false>(options: Options<ExternalServiceMetricsGetRangeData, ThrowOnError>): RequestResult<ExternalServiceMetricsGetRangeResponses, ExternalServiceMetricsGetRangeErrors, ThrowOnError> => (options.client ?? client).get<ExternalServiceMetricsGetRangeResponses, ExternalServiceMetricsGetRangeErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
@@ -13560,9 +13557,11 @@ export const getProjectSecret = <ThrowOnError extends boolean = false>(options: 
 });
 
 /**
- * Update a project secret. Value rotation requires a redeploy to take effect —
- * running containers keep their currently-mounted values until the next
- * deployment.
+ * Update a project secret. Only the fields in the body change: a field left
+ * out keeps its stored value, so rotating the value alone keeps the secret's
+ * environments, preview flag and compose services. Value rotation requires a
+ * redeploy to take effect — running containers keep their currently-mounted
+ * values until the next deployment.
  */
 export const updateProjectSecret = <ThrowOnError extends boolean = false>(options: Options<UpdateProjectSecretData, ThrowOnError>): RequestResult<UpdateProjectSecretResponses, UpdateProjectSecretErrors, ThrowOnError> => (options.client ?? client).put<UpdateProjectSecretResponses, UpdateProjectSecretErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

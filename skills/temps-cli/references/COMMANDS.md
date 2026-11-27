@@ -1369,7 +1369,6 @@ Fetch a time-series range for a single metric on a deployment
 |------|-------------|---------|----------|
 | `--metric <value>` | Metric name, e.g. '"pg.connections_active"' [required] | - | No |
 | `--range <value>` | Time window: '"1h"' \| '"6h"' \| '"24h"' \| '"7d"' | - | No |
-| `--percentile <number>` | Optional histogram percentile (0–100) | - | No |
 | `--start-time <value>` | Explicit window start (ISO 8601) | - | No |
 | `--end-time <value>` | Explicit window end (ISO 8601) | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -5291,7 +5290,6 @@ Show a time-series range for a single metric
 | `--id <id>` | Service ID | - | Yes |
 | `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
 | `-r, --range <window>` | Time window: 1h, 6h, 24h, 7d (default: 24h) | - | No |
-| `-p, --percentile <n>` | Histogram percentile (0-100) instead of a plain average | - | No |
 | `--json` | Output raw JSON instead of a formatted table | - | No |
 
 #### `services metrics status`
@@ -7515,7 +7513,7 @@ Create a new API key
 | `-n, --name <name>` | API key name | - | No |
 | `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | No |
 | `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | No |
-| `-p, --permissions <permissions>` | Comma-separated list of permissions | - | No |
+| `-p, --permissions <permissions>` | Comma-separated list of the key's exact permissions (the key uses the custom role) | - | No |
 | `--project-id <id>` | Confine to one project’s deployment and environment APIs | - | No |
 | `--environment-id <id>` | Confine to one environment (requires --project-id) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
@@ -10800,7 +10798,6 @@ Time series of one control-plane host metric, e.g. node.cpu_percent or node.netw
 | `--range <range>` | Time window: 1h, 6h, 24h, 7d | `1h` | No |
 | `--start <time>` | Start of an explicit window (ISO 8601); with --end, instead of --range | - | No |
 | `--end <time>` | End of an explicit window (ISO 8601) | - | No |
-| `--percentile <p>` | Aggregate each bucket at this percentile (e.g. 0.95) instead of the mean | - | No |
 | `--node <id>` | Node ID (0 = control plane) | `0` | No |
 | `--json` | Output in JSON format | - | No |
 

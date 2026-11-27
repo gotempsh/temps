@@ -9429,9 +9429,6 @@ export const externalServiceMetricsGetRangeQueryKey = (options: Options<External
 
 /**
  * Fetch a time-series range for a single metric on an external service.
- *
- * Pass `percentile` to compute a histogram quantile instead of a plain
- * gauge/counter average.
  */
 export const externalServiceMetricsGetRangeOptions = (options: Options<ExternalServiceMetricsGetRangeData>) => queryOptions<ExternalServiceMetricsGetRangeResponse, DefaultError, ExternalServiceMetricsGetRangeResponse, ReturnType<typeof externalServiceMetricsGetRangeQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -26814,9 +26811,11 @@ export const getProjectSecretOptions = (options: Options<GetProjectSecretData>) 
 });
 
 /**
- * Update a project secret. Value rotation requires a redeploy to take effect —
- * running containers keep their currently-mounted values until the next
- * deployment.
+ * Update a project secret. Only the fields in the body change: a field left
+ * out keeps its stored value, so rotating the value alone keeps the secret's
+ * environments, preview flag and compose services. Value rotation requires a
+ * redeploy to take effect — running containers keep their currently-mounted
+ * values until the next deployment.
  */
 export const updateProjectSecretMutation = (options?: Partial<Options<UpdateProjectSecretData>>): UseMutationOptions<UpdateProjectSecretResponse, DefaultError, Options<UpdateProjectSecretData>> => {
     const mutationOptions: UseMutationOptions<UpdateProjectSecretResponse, DefaultError, Options<UpdateProjectSecretData>> = {

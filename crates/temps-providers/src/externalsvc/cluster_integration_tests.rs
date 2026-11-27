@@ -11,9 +11,6 @@
 
 #[cfg(test)]
 mod tests {
-    use bollard::Docker;
-    use std::sync::Arc;
-
     use crate::externalsvc::postgres_cluster::PostgresClusterService;
     use crate::externalsvc::{
         ClusterMemberInfo, ClusterMemberSpec, ExternalService, ServiceConfig,
@@ -26,17 +23,13 @@ mod tests {
 
     #[test]
     fn test_postgres_cluster_supports_cluster() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
         assert!(service.supports_cluster());
     }
 
     #[test]
     fn test_postgres_cluster_roles() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
         let roles = service.valid_cluster_roles();
         assert!(roles.contains(&"monitor"));
         assert!(roles.contains(&"primary"));
@@ -45,9 +38,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_cluster_requires_monitor() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
 
         let config = ServiceConfig {
             name: "test".to_string(),
@@ -74,9 +65,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_init_cluster_returns_correct_members() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("mydb".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("mydb".to_string());
 
         let config = ServiceConfig {
             name: "mydb".to_string(),
@@ -126,9 +115,7 @@ mod tests {
 
     #[test]
     fn test_cluster_connection_string_excludes_monitor() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
 
         let members = vec![
             ClusterMemberInfo {
@@ -181,9 +168,7 @@ mod tests {
         // ADR-011: when every data node carries an FQDN under .temps.local,
         // emit the per-service VIP form so apps' next connection lands on
         // whatever the current primary is via the per-node DNS resolver.
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("orders".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("orders".to_string());
 
         let members = vec![
             ClusterMemberInfo {
@@ -239,9 +224,7 @@ mod tests {
 
     #[test]
     fn test_cluster_connection_string_no_running_nodes() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("test".to_string());
 
         let members = vec![ClusterMemberInfo {
             role: "primary".to_string(),
@@ -267,9 +250,7 @@ mod tests {
 
     #[test]
     fn test_build_member_params_generates_correct_monitor_env() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("ha-test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("ha-test".to_string());
 
         let config = crate::externalsvc::postgres_cluster::PostgresClusterConfig {
             database: "mydb".to_string(),
@@ -307,9 +288,7 @@ mod tests {
 
     #[test]
     fn test_build_member_params_data_node_has_monitor_uri() {
-        let docker = Docker::connect_with_defaults()
-            .unwrap_or_else(|_| Docker::connect_with_local_defaults().unwrap());
-        let service = PostgresClusterService::new("ha-test".to_string(), Arc::new(docker));
+        let service = PostgresClusterService::new("ha-test".to_string());
 
         let config = crate::externalsvc::postgres_cluster::PostgresClusterConfig {
             database: "mydb".to_string(),
@@ -1013,7 +992,7 @@ mod tests {
 
             // Verify PostgresClusterService integration
             println!("\n11. Verifying PostgresClusterService integration...");
-            let service = PostgresClusterService::new("itest".to_string(), docker.clone());
+            let service = PostgresClusterService::new("itest".to_string());
             assert!(service.supports_cluster());
             let roles = service.valid_cluster_roles();
             assert!(roles.contains(&"monitor"));
