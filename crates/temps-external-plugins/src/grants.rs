@@ -47,6 +47,8 @@ pub struct StoredServicePlugin {
     pub binding: Option<ServiceBinding>,
     /// The manifest it last answered with.
     pub manifest: Option<temps_plugin_protocol::PluginManifest>,
+    /// Who stands behind the plugin.
+    pub tier: crate::tier::PluginTier,
 }
 
 #[derive(Debug, Error)]
@@ -243,12 +245,13 @@ impl PluginGrantService {
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE external_plugin_actors SET isolation='service',project_id=$2,environment_id=$3,manifest=$4,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
+                "UPDATE external_plugin_actors SET isolation='service',project_id=$2,environment_id=$3,manifest=$4,tier=$5,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
                 [
                     plugin_name.into(),
                     binding.project_id.into(),
                     binding.environment_id.into(),
                     manifest.into(),
+                    crate::tier::PluginTier::of_added_service().as_str().into(),
                 ],
             ))
             .await
@@ -276,7 +279,7 @@ impl PluginGrantService {
             .db
             .query_all(Statement::from_string(
                 DatabaseBackend::Postgres,
-                "SELECT plugin_name, project_id, environment_id, manifest FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
+                "SELECT plugin_name, project_id, environment_id, manifest, tier FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
             ))
             .await
             .map_err(database)?;
@@ -288,7 +291,9 @@ impl PluginGrantService {
                 row.try_get("", "environment_id").map_err(database)?;
             let manifest: Option<serde_json::Value> =
                 row.try_get("", "manifest").map_err(database)?;
+            let tier: String = row.try_get("", "tier").map_err(database)?;
             plugins.push(StoredServicePlugin {
+                tier: crate::tier::PluginTier::from_stored(&tier),
                 binding: project_id
                     .zip(environment_id)
                     .map(|(project_id, environment_id)| ServiceBinding {

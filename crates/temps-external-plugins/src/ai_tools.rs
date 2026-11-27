@@ -434,6 +434,7 @@ mod tests {
             project_id: None,
             environment_id: None,
             manifest: None,
+            tier: "community".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -509,6 +510,7 @@ mod tests {
             project_id: None,
             environment_id: None,
             manifest: None,
+            tier: "community".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -534,6 +536,7 @@ mod tests {
             project_id: None,
             environment_id: None,
             manifest: None,
+            tier: "community".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

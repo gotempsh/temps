@@ -28,6 +28,9 @@ pub struct Model {
     /// listed and routed to while its service is stopped.
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub manifest: Option<Json>,
+    /// Who stands behind the plugin: `community` (anyone; the least access)
+    /// or `verified` (reviewed, from the signed registry).
+    pub tier: String,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

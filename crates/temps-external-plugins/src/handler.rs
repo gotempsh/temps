@@ -1357,6 +1357,7 @@ mod tests {
             project_id: None,
             environment_id: None,
             manifest: None,
+            tier: "community".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

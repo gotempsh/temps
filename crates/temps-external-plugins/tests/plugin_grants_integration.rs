@@ -411,17 +411,24 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         uuid::Uuid::parse_str(&recreated.actor.id).expect("recreated actor has a valid UUID");
     // The entity reads every current column, so bring the table the rest of
     // the way to the current schema before reading through it.
-    for later in [
-        "m20261127_000002_external_plugin_isolation",
-        "m20261127_000003_external_plugin_services",
-    ] {
-        Migrator::migrations()
-            .into_iter()
-            .find(|migration| migration.name() == later)
-            .unwrap_or_else(|| panic!("{later} must be registered"))
+    let mut later = Migrator::migrations()
+        .into_iter()
+        .filter(|migration| {
+            migration.name().contains("external_plugin_")
+                && migration.name() >= "m20261127_000002_external_plugin_isolation"
+        })
+        .collect::<Vec<_>>();
+    later.sort_by(|a, b| a.name().cmp(b.name()));
+    assert!(
+        later.len() >= 3,
+        "the later plugin migrations are registered"
+    );
+    for migration in later {
+        let name = migration.name().to_string();
+        migration
             .up(&manager)
             .await
-            .unwrap_or_else(|error| panic!("apply {later} after the consent schema: {error}"));
+            .unwrap_or_else(|error| panic!("apply {name} after the consent schema: {error}"));
     }
     let persisted = external_plugin_actors::Entity::find_by_id(recreated_id)
         .one(db.as_ref())

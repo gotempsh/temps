@@ -98,7 +98,7 @@ pub enum ServiceAttachError {
         expected: String,
         found: String,
     },
-    #[error("Plugin '{plugin}' asks for {access}, which a plugin running as a Temps service is never given. Remove that request from its manifest; link a database to the service for the plugin's own data")]
+    #[error("Plugin '{plugin}' asks for {access}, which a community plugin is never given. Remove that request from its manifest; link a database to the service for the plugin's own data")]
     PrivilegedAccess {
         plugin: String,
         access: &'static str,

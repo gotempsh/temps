@@ -54,6 +54,8 @@ import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
 import {
   AddServicePluginDialog,
+  PluginOwnStorage,
+  PluginTierBadge,
   RetiredPluginNotice,
   ServicePluginNotice,
   ServicePluginOrigin,
@@ -306,6 +308,7 @@ export function PluginsPage() {
                             <Tag className="size-3" /> v{plugin.version}
                           </span>
                           <PluginRunState service={serviceOf(plugin.name)} />
+                          <PluginTier service={serviceOf(plugin.name)} />
                         </div>
                         {plugin.description && (
                           <p className="mt-1 text-sm text-muted-foreground">
@@ -383,7 +386,22 @@ function PluginServiceOrigin({
   service: ServicePluginResponse | undefined
 }) {
   if (!service) return null
-  return <ServicePluginOrigin plugin={service} />
+  return (
+    <>
+      <ServicePluginOrigin plugin={service} />
+      <PluginOwnStorage plugin={service} />
+    </>
+  )
+}
+
+/** The plugin's tier, once the administrator's view of it has loaded. */
+function PluginTier({
+  service,
+}: {
+  service: ServicePluginResponse | undefined
+}) {
+  if (!service) return null
+  return <PluginTierBadge plugin={service} />
 }
 
 function RunningPluginsSkeleton() {

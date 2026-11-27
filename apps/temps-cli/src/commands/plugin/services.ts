@@ -17,6 +17,10 @@ interface ServicePlugin {
   environment_name?: string | null;
   stops_when_idle: boolean;
   deployment_id?: number | null;
+  /** Who stands behind the plugin; a community plugin has the least access. */
+  tier: "community" | "verified";
+  /** The managed databases linked to the plugin's service: its own data. */
+  own_storage: string[];
 }
 
 /** A plugin an earlier version installed as an executable; it never runs. */

@@ -596,6 +596,7 @@ async fn a_service_never_takes_a_plugin_name_installed_from_somewhere_else() {
         manifest: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
+        ..Default::default()
     }
     .insert(platform.db().as_ref())
     .await

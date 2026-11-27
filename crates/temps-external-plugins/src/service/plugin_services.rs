@@ -9,13 +9,14 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use temps_entities::{environments, projects};
+use temps_entities::{environments, external_services, project_services, projects};
 use temps_plugin_protocol::PluginManifest;
 use tracing::{debug, info};
 
 use super::{ExternalPluginsError, ExternalPluginsService};
 use crate::manager::ServicePluginState;
 use crate::service_runtime::ServiceBinding;
+use crate::tier::PluginTier;
 
 /// One plugin that runs as a service, with the names an administrator knows
 /// the service by.
@@ -36,6 +37,11 @@ pub struct ServicePluginView {
     pub state: ServicePluginState,
     /// Why it is not running, in words an administrator can be shown.
     pub detail: Option<String>,
+    /// Who stands behind the plugin, which bounds what it may ask for.
+    pub tier: PluginTier,
+    /// The managed databases and stores linked to the plugin's service: the
+    /// plugin's own data. Empty when it has none.
+    pub own_storage: Vec<String>,
 }
 
 impl ExternalPluginsService {
@@ -110,6 +116,9 @@ impl ExternalPluginsService {
     /// Every plugin that runs as a service, and how it is doing.
     pub async fn service_plugins(&self) -> Result<Vec<ServicePluginView>, ExternalPluginsError> {
         let statuses = self.manager.service_plugin_statuses().await;
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
         let project_ids: Vec<i32> = statuses
             .iter()
             .filter_map(|status| status.binding.map(|binding| binding.project_id))
@@ -143,6 +152,35 @@ impl ExternalPluginsService {
                 .map(|environment| (environment.id, environment))
                 .collect()
         };
+        // What is linked to each plugin's service, in one query for all of
+        // them: a plugin keeps its own data there, never in Temps's database.
+        let mut own_storage: HashMap<i32, Vec<String>> = HashMap::new();
+        if !projects.is_empty() {
+            let linked = project_services::Entity::find()
+                .filter(project_services::Column::ProjectId.is_in(projects.keys().copied()))
+                .find_also_related(external_services::Entity)
+                .all(self.db.as_ref())
+                .await
+                .map_err(read)?;
+            for (link, store) in linked {
+                if let Some(store) = store {
+                    own_storage
+                        .entry(link.project_id)
+                        .or_default()
+                        .push(store.name);
+                }
+            }
+            for names in own_storage.values_mut() {
+                names.sort();
+            }
+        }
+        let tiers: HashMap<String, PluginTier> =
+            crate::grants::PluginGrantService::new(self.db.clone())
+                .service_plugins()
+                .await?
+                .into_iter()
+                .map(|plugin| (plugin.name, plugin.tier))
+                .collect();
         Ok(statuses
             .into_iter()
             .map(|status| {
@@ -153,6 +191,12 @@ impl ExternalPluginsService {
                     .binding
                     .and_then(|binding| environments.get(&binding.environment_id));
                 ServicePluginView {
+                    tier: tiers.get(&status.name).copied().unwrap_or_default(),
+                    own_storage: status
+                        .binding
+                        .and_then(|binding| own_storage.get(&binding.project_id))
+                        .cloned()
+                        .unwrap_or_default(),
                     service_name: project.map(|project| project.name.clone()),
                     service_slug: project.map(|project| project.slug.clone()),
                     environment_name: environment.map(|environment| environment.name.clone()),

@@ -38,6 +38,12 @@ pub struct ServicePluginResponse {
     /// The deployment Temps is attached to, while the plugin is running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deployment_id: Option<i32>,
+    /// Who stands behind the plugin. A community plugin runs in its own
+    /// container and is never given Temps's database or data directory.
+    pub tier: crate::tier::PluginTier,
+    /// The managed databases and stores linked to the plugin's service,
+    /// where it keeps its own data. Empty when it has none.
+    pub own_storage: Vec<String>,
 }
 
 impl From<ServicePluginView> for ServicePluginResponse {
@@ -53,6 +59,8 @@ impl From<ServicePluginView> for ServicePluginResponse {
             environment_name: view.environment_name,
             stops_when_idle: view.stops_when_idle,
             deployment_id: view.deployment_id,
+            tier: view.tier,
+            own_storage: view.own_storage,
         }
     }
 }
@@ -656,6 +664,32 @@ mod tests {
         assert_eq!(listed.environment_name.as_deref(), Some("production"));
         assert_eq!(listed.deployment_id, Some(deployment_id));
         assert!(!listed.stops_when_idle);
+        // A service an administrator adds is a community plugin, and one
+        // with nothing linked to its service has no storage of its own.
+        assert_eq!(listed.tier, crate::tier::PluginTier::Community);
+        assert!(listed.own_storage.is_empty());
+        assert_eq!(
+            serde_json::to_value(listed).expect("json")["tier"],
+            serde_json::json!("community")
+        );
+
+        // A database linked to the plugin's service is the plugin's own.
+        let db = platform.db();
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(&format!(
+            "WITH store AS (INSERT INTO external_services (name, service_type, status, created_at, updated_at) \
+                 VALUES ('reports-db', 'postgres', 'running', NOW(), NOW()) RETURNING id) \
+             INSERT INTO project_services (project_id, service_id, database_provisioning_mode, env_aliases, created_at, updated_at) \
+                 SELECT {}, id, 'project_environment', '{{}}'::jsonb, NOW(), NOW() FROM store",
+            binding.project_id
+        ))
+        .await
+        .expect("link a database to the plugin's service");
+        let Json(with_storage) =
+            get_plugin_services(user_auth(Role::PlatformAdmin), State(state.clone()))
+                .await
+                .expect("list");
+        assert_eq!(with_storage.plugins[0].own_storage, ["reports-db"]);
 
         // Removing the plugin revokes it and leaves the service alone.
         state

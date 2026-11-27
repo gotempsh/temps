@@ -32,6 +32,7 @@ pub mod retired;
 pub mod service;
 pub mod service_runtime;
 pub mod source_catalog;
+pub mod tier;
 pub mod trust;
 
 pub use channel::PluginChannel;

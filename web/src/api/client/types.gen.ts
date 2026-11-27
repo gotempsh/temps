@@ -28357,6 +28357,11 @@ export type PluginStatusResponse = {
 };
 
 /**
+ * Who stands behind a plugin, and so how much it may ask for.
+ */
+export type PluginTier = 'community' | 'verified';
+
+/**
  * Which policy decided a test.
  */
 export type PolicySource = 'draft' | 'environment' | 'project' | 'none';
@@ -35875,6 +35880,11 @@ export type ServicePluginResponse = {
      */
     name: string;
     /**
+     * The managed databases and stores linked to the plugin's service,
+     * where it keeps its own data. Empty when it has none.
+     */
+    own_storage: Array<string>;
+    /**
      * The service the plugin runs as. Absent once the service was deleted.
      */
     project_id?: number | null;
@@ -35889,6 +35899,11 @@ export type ServicePluginResponse = {
      * so an unused plugin holds no memory.
      */
     stops_when_idle: boolean;
+    /**
+     * Who stands behind the plugin. A community plugin runs in its own
+     * container and is never given Temps's database or data directory.
+     */
+    tier: PluginTier;
 };
 
 /**

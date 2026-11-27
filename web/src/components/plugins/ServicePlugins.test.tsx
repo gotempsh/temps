@@ -10,12 +10,16 @@ import type {
 } from '../../api/client/types.gen'
 import {
   addServiceFailure,
+  pluginTierSummary,
   servicePluginPath,
+  servicePluginStoragePath,
   servicePluginSummary,
   servicePluginsNeedingAttention,
 } from '../../lib/plugin-services'
 import {
   EnvironmentChoice,
+  PluginOwnStorage,
+  PluginTierBadge,
   RetiredPluginNotice,
   ServicePluginNotice,
   ServicePluginOrigin,
@@ -33,6 +37,8 @@ const plugin = (
   service_name: 'Reports',
   service_slug: 'reports',
   environment_name: 'production',
+  tier: 'community',
+  own_storage: [],
   ...overrides,
 })
 
@@ -260,5 +266,41 @@ test('nothing is shown when no plugin was installed as an executable', () => {
   )
   expect(
     render(<RetiredPluginNotice retired={undefined} onRemove={() => {}} />)
+  ).toBe('')
+})
+
+test('a community plugin says what it can never reach', () => {
+  expect(pluginTierSummary('community').label).toBe('Community')
+  expect(pluginTierSummary('community').detail).toContain(
+    "never given Temps's database or data folder"
+  )
+  expect(pluginTierSummary('verified').label).toBe('Verified')
+  const markup = render(<PluginTierBadge plugin={plugin({})} />)
+  expect(markup).toContain('Community')
+  expect(markup).toContain('Runs in its own container')
+})
+
+test("a plugin's own data is the storage linked to its service", () => {
+  expect(servicePluginStoragePath(plugin({}))).toBe('/projects/reports/storage')
+  expect(
+    servicePluginStoragePath(plugin({ service_slug: undefined }))
+  ).toBeUndefined()
+
+  const none = render(<PluginOwnStorage plugin={plugin({})} />)
+  expect(none).toContain('No database of its own')
+  expect(none).toContain('href="/projects/reports/storage"')
+  expect(none).toContain('Link one')
+
+  const linked = render(
+    <PluginOwnStorage
+      plugin={plugin({ own_storage: ['reports-db', 'reports-cache'] })}
+    />
+  )
+  expect(linked).toContain('Own data: reports-db, reports-cache')
+  expect(linked).toContain('Manage')
+
+  // A plugin whose service was deleted has nowhere to link storage.
+  expect(
+    render(<PluginOwnStorage plugin={plugin({ service_slug: undefined })} />)
   ).toBe('')
 })

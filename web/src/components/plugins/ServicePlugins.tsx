@@ -14,6 +14,7 @@ import type {
 } from '@/api/client/types.gen'
 import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -30,7 +31,9 @@ import { useDebounce } from '@/hooks/useDebounce'
 import { useAddServicePlugin } from '@/hooks/usePlugins'
 import {
   addServiceFailure,
+  pluginTierSummary,
   servicePluginPath,
+  servicePluginStoragePath,
   servicePluginSummary,
   servicePluginsNeedingAttention,
 } from '@/lib/plugin-services'
@@ -58,6 +61,40 @@ export function ServicePluginStatus({
     <span title={summary.detail}>
       <Status tone={summary.tone} label={summary.label} />
     </span>
+  )
+}
+
+/** The plugin's tier, with what that tier can and cannot reach. */
+export function PluginTierBadge({ plugin }: { plugin: ServicePluginResponse }) {
+  const summary = pluginTierSummary(plugin.tier)
+  return (
+    <Badge variant="outline" title={summary.detail}>
+      {summary.label}
+    </Badge>
+  )
+}
+
+/**
+ * Where a plugin keeps its own data: the databases linked to its service, or
+ * that it has none and where to link one. Never Temps's own database.
+ */
+export function PluginOwnStorage({
+  plugin,
+}: {
+  plugin: ServicePluginResponse
+}) {
+  const path = servicePluginStoragePath(plugin)
+  if (!path) return null
+  return (
+    <p className="mt-1 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+      {plugin.own_storage.length > 0
+        ? `Own data: ${plugin.own_storage.join(', ')}`
+        : 'No database of its own'}
+      {' · '}
+      <Link to={path} className="font-medium text-foreground underline">
+        {plugin.own_storage.length > 0 ? 'Manage' : 'Link one'}
+      </Link>
+    </p>
   )
 }
 

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ServicePluginResponse } from '@/api/client/types.gen'
+import type { PluginTier, ServicePluginResponse } from '@/api/client/types.gen'
 import type { StatusTone } from '@temps-sdk/ds'
 
 /** What the console says about a plugin that runs as a Temps service. */
@@ -41,6 +41,36 @@ export function servicePluginPath(
   plugin: ServicePluginResponse
 ): string | undefined {
   return plugin.service_slug ? `/projects/${plugin.service_slug}` : undefined
+}
+
+/** Where a plugin's service links the databases the plugin keeps its data in. */
+export function servicePluginStoragePath(
+  plugin: ServicePluginResponse
+): string | undefined {
+  return plugin.service_slug
+    ? `/projects/${plugin.service_slug}/storage`
+    : undefined
+}
+
+/** What a plugin's tier is called and what it means for what it can reach. */
+export function pluginTierSummary(tier: PluginTier): {
+  label: string
+  detail: string
+} {
+  switch (tier) {
+    case 'verified':
+      return {
+        label: 'Verified',
+        detail:
+          'From the signed registry and reviewed. It may be given more than a community plugin.',
+      }
+    case 'community':
+      return {
+        label: 'Community',
+        detail:
+          "Runs in its own container. It is never given Temps's database or data folder, and reaches Temps only with the permissions you grant.",
+      }
+  }
 }
 
 /** The service plugins an administrator has to act on, with the reason. */
