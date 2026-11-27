@@ -10,6 +10,11 @@ import { Readable } from "node:stream";
  *
  * Built for Bun -- compiled to a single binary via `bun build --compile`.
  *
+ * A plugin runs as an ordinary Temps service: with no `--socket-path` it
+ * listens on the service port and waits for Temps to attach (see
+ * `runAsService`). The lifecycle below is the older one, where Temps starts
+ * the plugin as a child process and hands it a socket.
+ *
  * Lifecycle:
  * 1. Parse non-secret CLI arguments (--socket-path, --data-dir)
  * 2. Emit protocol-2 hello and receive private launch configuration on stdin
@@ -41,6 +46,13 @@ import {
   requiresHostAuthentication,
   validateHealthPath,
 } from "./launch.js";
+import {
+  PLUGIN_HELLO_PATH,
+  PlatformChannel,
+  serviceDataDir,
+  serviceEnvironment,
+  startedAsChildProcess,
+} from "./service.js";
 
 /**
  * Run a Temps plugin. This is the main entry point.
@@ -63,8 +75,11 @@ import {
  * ```
  */
 export async function runPlugin(plugin: TempsPlugin): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (!startedAsChildProcess(argv)) return runAsService(plugin);
+
   // 1. Parse CLI arguments
-  const args = parseArgs(process.argv.slice(2));
+  const args = parseArgs(argv);
 
   // Ensure data directory exists
   mkdirSync(args.dataDir, { recursive: true });
@@ -277,6 +292,213 @@ export async function runPlugin(plugin: TempsPlugin): Promise<void> {
   console.error(
     `[temps-plugin] ${manifest.display_name ?? manifest.name} v${manifest.version} running on ${args.socketPath}`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Running as a Temps service
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the plugin as a Temps service.
+ *
+ * The plugin listens on the port its deployment was given and answers only
+ * its health route until Temps presents the secret both sides derive from the
+ * deployment token. Temps reads the manifest from the hello route, then opens
+ * the platform channel; the plugin's own routes are served from then on.
+ *
+ * Temps opens the channel again after it restarts or the network breaks, and
+ * the same client carries on over the new connection. The plugin waits for
+ * the first connection for as long as it takes: its container starts it, not
+ * Temps, and an administrator may add the service as a plugin much later.
+ */
+async function runAsService(plugin: TempsPlugin): Promise<void> {
+  const manifest = plugin.manifest();
+  validateHealthPath(manifest.health_path, manifest.name);
+
+  // A service is never given the control-plane database or the instance data
+  // directory. Say so here instead of starting a plugin that would fail on
+  // its first query.
+  const asksForHostData = (manifest as { requires_host_data_access?: boolean })
+    .requires_host_data_access;
+  if (manifest.requires_db || asksForHostData) {
+    throw new InitializationError(
+      manifest.name,
+      "the manifest asks for the control-plane database or the instance data directory, which a plugin running as a Temps service never receives. Remove requires_db and requires_host_data_access; link a database to the service for the plugin's own data and use the platform API for everything else.",
+    );
+  }
+
+  const environment = serviceEnvironment(process.env);
+  const dataDir = serviceDataDir(manifest.name, environment.dataDir);
+
+  const embeddedAssets = plugin.embeddedUiAssets?.();
+  const hello = {
+    protocol_version: 2,
+    manifest,
+    has_ui: embeddedAssets !== undefined || plugin.uiDistPath?.() !== undefined,
+    openapi: plugin.openapi?.(),
+  };
+
+  // The client exists before the platform connects, and outlives every
+  // connection the platform makes.
+  const channel = new PlatformChannel();
+  const client = new TempsClient(channel);
+  const ctx = new PluginContext({
+    pluginName: manifest.name,
+    dataDir,
+    authSecret: environment.authSecret,
+    client,
+  });
+  client.onEvent((event: PluginEvent) => {
+    plugin.onEvent?.(ctx, event);
+  });
+
+  let platformConnected: (() => void) | undefined;
+  const connected = new Promise<void>((resolve) => {
+    platformConnected = resolve;
+  });
+  let pluginFetch: ((req: Request) => Response | Promise<Response>) | undefined;
+  const sockets = new Map<unknown, BunSocketListeners>();
+
+  const server = Bun.serve({
+    port: environment.port,
+    hostname: "0.0.0.0",
+
+    fetch(req: Request, server) {
+      const url = new URL(req.url);
+
+      // Health discloses no caller data, and the deployment's own health
+      // check has no secret to present. Everything else must carry it.
+      if (
+        requiresHostAuthentication(url.pathname, manifest.health_path) &&
+        !authenticatedHostRequest(req.headers, environment.authSecret)
+      ) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      if (url.pathname === PLUGIN_HELLO_PATH && req.method === "GET") {
+        return Response.json(hello);
+      }
+
+      // The platform connects whenever it needs to; a new connection
+      // replaces the one in use.
+      if (url.pathname === PLUGIN_CHANNEL_PATH) {
+        if (server.upgrade(req)) return undefined as unknown as Response;
+        return new Response("WebSocket upgrade failed", { status: 500 });
+      }
+
+      if (url.pathname === manifest.health_path || url.pathname === "/health") {
+        return Response.json({ status: "ok", plugin: manifest.name });
+      }
+
+      if (!pluginFetch) {
+        return new Response(
+          "Plugin is waiting for Temps to connect the platform channel",
+          { status: 503 },
+        );
+      }
+
+      if (url.pathname === "/_events" && req.method === "POST") {
+        return handleEventDelivery(req, plugin, ctx);
+      }
+
+      if (embeddedAssets) {
+        const uiResponse = handleEmbeddedUi(url, embeddedAssets);
+        if (uiResponse) return uiResponse;
+      }
+
+      return pluginFetch(req);
+    },
+
+    websocket: {
+      open(ws) {
+        const listeners: BunSocketListeners = {
+          message: new Set(),
+          close: new Set(),
+        };
+        sockets.set(ws, listeners);
+        channel.attach(bunSocket(ws, listeners));
+        platformConnected?.();
+      },
+      message(ws, message) {
+        const text = typeof message === "string" ? message : message.toString();
+        for (const fn of sockets.get(ws)?.message ?? []) fn(text);
+      },
+      close(ws) {
+        for (const fn of sockets.get(ws)?.close ?? []) fn();
+        sockets.delete(ws);
+      },
+    },
+  });
+
+  console.error(
+    `[temps-plugin] ${manifest.display_name ?? manifest.name} v${manifest.version} listening on port ${server.port}; waiting for Temps to connect`,
+  );
+
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    console.error(`[temps-plugin] Shutting down ${manifest.name}...`);
+    try {
+      await plugin.onShutdown?.();
+    } catch (err) {
+      console.error("[temps-plugin] Error during shutdown:", err);
+    }
+    client.close();
+    server.stop(true);
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+
+  await connected;
+
+  try {
+    await plugin.onStart?.(ctx);
+  } catch (err) {
+    server.stop(true);
+    throw new InitializationError(
+      manifest.name,
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+
+  const nodeHandler = await plugin.handler(ctx);
+  pluginFetch = (req: Request) => nodeRequestBridge(req, nodeHandler);
+
+  console.error(
+    `[temps-plugin] ${manifest.display_name ?? manifest.name} v${manifest.version} connected to Temps and serving requests`,
+  );
+}
+
+interface BunSocketListeners {
+  message: Set<(data: string) => void>;
+  close: Set<() => void>;
+}
+
+/** One accepted Bun WebSocket as the connection a `PlatformChannel` uses. */
+function bunSocket(
+  ws: { send: (msg: string | Buffer) => unknown; close: () => void },
+  listeners: BunSocketListeners,
+): WsLike {
+  return {
+    on(event: string, fn: (...args: unknown[]) => void) {
+      if (event === "message")
+        listeners.message.add(fn as (data: string) => void);
+      else if (event === "close") listeners.close.add(fn as () => void);
+    },
+    send(data: string, cb?: (err?: Error) => void) {
+      try {
+        ws.send(data);
+        cb?.();
+      } catch (err) {
+        cb?.(err as Error);
+      }
+    },
+    close() {
+      ws.close();
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
