@@ -75,6 +75,8 @@ uuid = { workspace = true }
 temps-test-containers = { path = "../temps-test-containers" }
 temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true }
+# The PowerDNS real-server test pings Docker before deciding to skip.
+bollard = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 sea-orm-migration = { workspace = true }
 temps-projects = { path = "../temps-projects" }

@@ -1942,7 +1942,7 @@ mod api_tests {
 }
 
 /// Against a real PowerDNS Authoritative Server in Docker. Skips (passes)
-/// when Docker is unavailable.
+/// only when no Docker daemon answers a ping; any later setup failure fails.
 #[cfg(test)]
 mod real_server_tests {
     use super::*;
@@ -1953,7 +1953,22 @@ mod real_server_tests {
 
     const API_KEY: &str = "integration-test-key";
 
+    /// Whether a Docker daemon answers. Only an unreachable daemon is a reason
+    /// to skip: once Docker is up, every setup failure (image pull, readiness
+    /// message, startup timeout, port mapping) fails the test instead of
+    /// silently passing it.
+    async fn docker_reachable() -> bool {
+        match bollard::Docker::connect_with_defaults() {
+            Ok(docker) => docker.ping().await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
     async fn start_powerdns() -> Option<(ContainerAsync<GenericImage>, String)> {
+        if !docker_reachable().await {
+            eprintln!("⏭️  Docker unavailable, skipping PowerDNS integration test");
+            return None;
+        }
         let container = match GenericImage::new("powerdns/pdns-auth-49", "4.9.20")
             .with_exposed_port(8081.tcp())
             .with_wait_for(WaitFor::message_on_either_std(
@@ -1966,11 +1981,13 @@ mod real_server_tests {
         {
             Ok(container) => container,
             Err(e) => {
-                eprintln!("⏭️  Docker unavailable, skipping PowerDNS integration test: {e}");
-                return None;
+                panic!("PowerDNS container powerdns/pdns-auth-49:4.9.20 failed to start: {e}")
             }
         };
-        let port = container.get_host_port_ipv4(8081).await.ok()?;
+        let port = match container.get_host_port_ipv4(8081).await {
+            Ok(port) => port,
+            Err(e) => panic!("PowerDNS API port 8081 is not mapped to the host: {e}"),
+        };
         Some((container, format!("http://127.0.0.1:{port}")))
     }
 
