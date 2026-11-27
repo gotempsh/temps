@@ -245,8 +245,7 @@ async fn data_node_switches_to_the_managed_certificate_and_back_while_running() 
     let entropy = uuid::Uuid::new_v4();
     let name = format!("tls-ha-{}", &entropy.simple().to_string()[..8]);
     let base_port = 30000 + u16::try_from(entropy.as_u128() % 2000).unwrap_or(0) * 10;
-    let docker = h.docker.clone();
-    let cluster = PostgresClusterService::new(name, docker);
+    let cluster = PostgresClusterService::new(name);
     let config: PostgresClusterConfig = serde_json::from_value(serde_json::json!({
         "password": "cluster-tls-test-password"
     }))

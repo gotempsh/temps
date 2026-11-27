@@ -47,15 +47,26 @@ pub(crate) fn environment_lifecycle_lock(environment_id: i32) -> Arc<tokio::sync
 /// The deployment as it is now, if a teardown sweep may still remove its
 /// containers. A sweep selects deployments before taking
 /// [`environment_lifecycle_lock`], so it reads this under the lock: a deployment
-/// paused in between must keep its containers for a resume.
+/// paused in between must keep its containers for a resume, and one its
+/// environment serves again (a rollback moved `current_deployment_id` back to
+/// it, keeping a swept state such as `completed`) must keep the containers its
+/// route points at.
 pub(crate) async fn deployment_still_swept(
     db: &sea_orm::DatabaseConnection,
     deployment_id: i32,
 ) -> Result<Option<deployments::Model>, sea_orm::DbErr> {
-    deployments::Entity::find_by_id(deployment_id)
+    let Some(deployment) = deployments::Entity::find_by_id(deployment_id)
         .filter(deployments::Column::State.is_in(TEARDOWN_SWEPT_STATES))
         .one(db)
-        .await
+        .await?
+    else {
+        return Ok(None);
+    };
+    let serving = environments::Entity::find_by_id(deployment.environment_id)
+        .one(db)
+        .await?
+        .and_then(|environment| environment.current_deployment_id);
+    Ok((serving != Some(deployment.id)).then_some(deployment))
 }
 
 /// Why a container of a paused deployment was not stopped. Each of these leaves

@@ -3031,6 +3031,12 @@ export type AppSettingsResponse = {
      * at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
      */
     require_mfa_for_admins: boolean;
+    /**
+     * Revision of these settings. Send it back as `expected_revision` when
+     * saving, so a save made by someone else since this read is not
+     * silently reverted.
+     */
+    revision: string;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
     /**
@@ -23327,11 +23333,6 @@ export type MetricsRangeQuery = {
      */
     metric: string;
     /**
-     * Optional histogram percentile (0–100).  When provided, the endpoint
-     * fetches histogram buckets and computes the requested quantile.
-     */
-    percentile?: number | null;
-    /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
      * Ignored when `start_time` and `end_time` are both set.
      */
@@ -24460,6 +24461,12 @@ export type NodeBuildLimitsResponse = {
      * How long a build may wait for a free slot, in seconds.
      */
     queue_wait_seconds: number;
+    /**
+     * Revision of the stored limits. Send it back as `expected_revision`
+     * when saving, so a save made by someone else since this read is not
+     * silently reverted.
+     */
+    revision: string;
 };
 
 /**
@@ -24751,6 +24758,11 @@ export type NodeInfoResponse = {
      */
     architecture?: string | null;
     build_limits: BuildLimits;
+    /**
+     * Revision of `build_limits`, to send as `expected_revision` when
+     * saving them (`PUT /internal/nodes/{node_id}/build-limits`).
+     */
+    build_limits_revision: string;
     /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
@@ -30206,6 +30218,11 @@ export type PublicIngressSettings = {
      * Configured public address; `None` means the listen address.
      */
     public_address?: string | null;
+    /**
+     * Revision of the settings above that a save writes. Send it back as
+     * `expected_revision`, so a save made since this read is not reverted.
+     */
+    revision: string;
     running?: boolean | null;
 };
 
@@ -35877,6 +35894,18 @@ export type SetManagedRecordRequest = {
     ttl?: number | null;
 };
 
+/**
+ * A worker's new build limits.
+ */
+export type SetNodeBuildLimitsRequest = BuildLimits & {
+    /**
+     * The `revision` the limits were read with. When set and the stored
+     * limits have changed since, the save is refused with 409 and nothing
+     * changes. When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
+};
+
 export type SetNodeNetworkPolicyModeRequest = {
     mode: string;
 };
@@ -36054,6 +36083,11 @@ export type SetWorkloadModeRequest = {
  */
 export type SettingsUpdateResponse = {
     message: string;
+    /**
+     * `PUT /settings`: revision of the saved settings, to send as
+     * `expected_revision` with the next save.
+     */
+    revision?: string | null;
 };
 
 /**
@@ -41782,6 +41816,12 @@ export type UpdateProviderRequest = {
 
 export type UpdatePublicIngressSettingsRequest = {
     enabled: boolean;
+    /**
+     * The `revision` the settings were read with. When set and they have
+     * changed since, the save is refused with 409 and nothing changes.
+     * When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
     http_port?: number | null;
     https_port?: number | null;
     /**
@@ -41919,6 +41959,22 @@ export type UpdateSessionDurationRequest = {
 
 export type UpdateSessionDurationResponse = {
     message: string;
+};
+
+/**
+ * `PUT /settings` body: the settings document (partial documents keep the
+ * omitted fields), plus the revision it was read with.
+ *
+ * Schema only: the handler reads the raw body, because which fields were
+ * sent is information deserialization destroys.
+ */
+export type UpdateSettingsRequest = AppSettings & {
+    /**
+     * The `revision` from `GET /settings`. When set and the settings have
+     * changed since, the save is refused with 409 and nothing changes.
+     * When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
 };
 
 /**
@@ -44966,6 +45022,22 @@ export type SaveAccessServiceWritable = {
      * Add a newly created service to this vault in the same transaction.
      */
     vault_id?: string | null;
+};
+
+/**
+ * `PUT /settings` body: the settings document (partial documents keep the
+ * omitted fields), plus the revision it was read with.
+ *
+ * Schema only: the handler reads the raw body, because which fields were
+ * sent is information deserialization destroys.
+ */
+export type UpdateSettingsRequestWritable = AppSettingsWritable & {
+    /**
+     * The `revision` from `GET /settings`. When set and the settings have
+     * changed since, the save is refused with 409 and nothing changes.
+     * When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
 };
 
 export type GetPlatformInfoData = {
@@ -57789,11 +57861,6 @@ export type DeploymentMetricsGetRangeData = {
          */
         range?: string;
         /**
-         * Optional histogram percentile (0–100).  When provided, the endpoint
-         * fetches histogram buckets and computes the requested quantile.
-         */
-        percentile?: number | null;
-        /**
          * Explicit window start (ISO 8601). Must be paired with `end_time`.
          */
         start_time?: string | null;
@@ -62209,7 +62276,7 @@ export type PromoteClusterMemberErrors = {
      */
     404: unknown;
     /**
-     * This process has no local Docker daemon to run the promotion on
+     * This process has no local Docker daemon to run the promotion on, or the member's node stayed busy (another operation owned its container) and ran nothing: retry
      */
     409: unknown;
     /**
@@ -62243,11 +62310,6 @@ export type ExternalServiceMetricsGetRangeData = {
          * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
-        /**
-         * Optional histogram percentile (0–100).  When provided, the endpoint
-         * fetches histogram buckets and computes the requested quantile.
-         */
-        percentile?: number | null;
         /**
          * Explicit window start (ISO 8601). Must be paired with `end_time`.
          */
@@ -68899,7 +68961,7 @@ export type AdminGetNodeBuildLimitsResponses = {
 export type AdminGetNodeBuildLimitsResponse = AdminGetNodeBuildLimitsResponses[keyof AdminGetNodeBuildLimitsResponses];
 
 export type AdminSetNodeBuildLimitsData = {
-    body: BuildLimits;
+    body: SetNodeBuildLimitsRequest;
     path: {
         /**
          * Worker node ID
@@ -68928,13 +68990,20 @@ export type AdminSetNodeBuildLimitsErrors = {
      */
     404: unknown;
     /**
+     * `expected_revision` is stale: the limits changed since they were read; nothing was saved
+     */
+    409: unknown;
+    /**
      * Storage failed
      */
     500: unknown;
 };
 
 export type AdminSetNodeBuildLimitsResponses = {
-    200: BuildLimits;
+    /**
+     * The saved limits and their new revision
+     */
+    200: NodeBuildLimitsResponse;
 };
 
 export type AdminSetNodeBuildLimitsResponse = AdminSetNodeBuildLimitsResponses[keyof AdminSetNodeBuildLimitsResponses];
@@ -69468,6 +69537,10 @@ export type AdminUpdateNodePublicIngressSettingsErrors = {
      * Node not found
      */
     404: unknown;
+    /**
+     * The worker does not allow this change, or `expected_revision` is stale: the settings changed since they were read; nothing was saved
+     */
+    409: unknown;
 };
 
 export type AdminUpdateNodePublicIngressSettingsResponses = {
@@ -72409,11 +72482,6 @@ export type NodeMetricsGetRangeData = {
          * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
-        /**
-         * Optional histogram percentile (0–100).  When provided, the endpoint
-         * fetches histogram buckets and computes the requested quantile.
-         */
-        percentile?: number | null;
         /**
          * Explicit window start (ISO 8601). Must be paired with `end_time`.
          */
@@ -102487,7 +102555,7 @@ export type GetSettingsResponses = {
 export type GetSettingsResponse = GetSettingsResponses[keyof GetSettingsResponses];
 
 export type UpdateSettingsData = {
-    body: AppSettingsWritable;
+    body: UpdateSettingsRequestWritable;
     path?: never;
     query?: never;
     url: '/settings';
@@ -102502,6 +102570,10 @@ export type UpdateSettingsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * `expected_revision` is stale (the settings changed since they were read), or the public ingress hostname is in use; nothing was saved
+     */
+    409: unknown;
     /**
      * Internal server error
      */

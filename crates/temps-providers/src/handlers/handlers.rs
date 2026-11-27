@@ -2650,7 +2650,7 @@ async fn remove_cluster_member(
         (status = 400, description = "Validation failed (monitor, already primary, not running, etc.)"),
         (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service or member not found"),
-        (status = 409, description = "This process has no local Docker daemon to run the promotion on"),
+        (status = 409, description = "This process has no local Docker daemon to run the promotion on, or the member's node stayed busy (another operation owned its container) and ran nothing: retry"),
         (status = 500, description = "pg_autoctl perform promotion failed")
     ),
     params(
@@ -4769,6 +4769,23 @@ mod tests {
             host: "localhost".to_string(),
             is_secure: false,
         }
+    }
+
+    /// A cluster operation whose node turned the exec away (nothing ran)
+    /// is a 409 "Node Busy" naming the node and why, never a 500.
+    #[test]
+    fn a_busy_member_node_is_a_retryable_conflict_not_a_500() {
+        let error = crate::services::ExternalServiceError::NodeBusy {
+            node: "worker-1".to_string(),
+            route: "/agent/services/exec".to_string(),
+            detail: "Cannot execute command in 'postgres-orders-1': another operation already owns that container".to_string(),
+        };
+        let problem = cluster_operation_problem(&error, "promote cluster member");
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(problem.body["title"], "Node Busy");
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("worker-1"), "{detail}");
+        assert!(detail.contains("already owns that container"), "{detail}");
     }
 
     #[test]

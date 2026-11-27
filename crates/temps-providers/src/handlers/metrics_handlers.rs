@@ -28,8 +28,10 @@
 //! ```
 //!
 //! The `range` query param accepts `"1h"` | `"6h"` | `"24h"` | `"7d"`.
-//! An optional `percentile` param (0–100) switches the range query into
-//! histogram-percentile mode using `service_metrics_histogram`.
+//! No histogram buckets are collected for these metrics, so a range query
+//! cannot compute a quantile; a request that sends `percentile` is refused
+//! (see [`resolve_range_window`]). A percentile that is recorded is a series
+//! of its own, such as `proxy.request_duration_p95_ms`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -127,8 +129,12 @@ pub struct MetricsRangeQuery {
     /// Ignored when `start_time` and `end_time` are both set.
     #[serde(default = "default_range")]
     pub range: String,
-    /// Optional histogram percentile (0–100).  When provided, the endpoint
-    /// fetches histogram buckets and computes the requested quantile.
+    /// Not supported, and not part of the documented API: no histogram
+    /// buckets are collected for these metrics. Read only so a request that
+    /// sends it is refused with the reason instead of silently answered with
+    /// the plain series.
+    #[param(ignore)]
+    #[schema(ignore)]
     pub percentile: Option<f64>,
     /// Explicit window start (ISO 8601). Must be paired with `end_time`.
     #[param(value_type = Option<String>, example = "2026-08-13T00:00:00Z")]
@@ -152,6 +158,18 @@ fn default_range() -> String {
 fn resolve_range_window(
     params: &MetricsRangeQuery,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>, Duration), Problem> {
+    if let Some(percentile) = params.percentile {
+        return Err(bad_request()
+            .detail(format!(
+                "The percentile query parameter is not supported (percentile={percentile}, \
+                 metric '{}'): no histogram buckets are collected for service, deployment or \
+                 node metrics, so a quantile cannot be computed from them. A percentile that is \
+                 recorded is a metric of its own (for example proxy.request_duration_p95_ms); \
+                 query it by name without percentile.",
+                params.metric
+            ))
+            .build());
+    }
     match (params.start_time, params.end_time) {
         (Some(start), Some(end)) => {
             if start >= end {
@@ -329,9 +347,6 @@ pub struct CreateNodeAlertRuleRequest {
 // ---------------------------------------------------------------------------
 
 /// Fetch a time-series range for a single metric on an external service.
-///
-/// Pass `percentile` to compute a histogram quantile instead of a plain
-/// gauge/counter average.
 #[utoipa::path(
     get,
     path = "/external-services/{id}/metrics",
@@ -2998,6 +3013,41 @@ mod tests {
             percentile: None,
             start_time: Some(start),
             end_time: Some(end),
+        }
+    }
+
+    /// Regression: `percentile` was documented as switching to a histogram
+    /// quantile, but every range endpoint ignored it and returned the plain
+    /// series. No histogram buckets are collected, so it is refused with the
+    /// reason, and no longer documented.
+    #[test]
+    fn a_percentile_is_refused_instead_of_silently_ignored() {
+        let start = Utc::now() - Duration::hours(1);
+        let query = MetricsRangeQuery {
+            percentile: Some(95.0),
+            ..range_query(start, Utc::now())
+        };
+        let problem = resolve_range_window(&query).expect_err("percentile is not supported");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("percentile=95"), "{body}");
+        assert!(body.contains("node.cpu_percent"), "{body}");
+        assert!(body.contains("proxy.request_duration_p95_ms"), "{body}");
+
+        let spec = serde_json::to_string(&MetricsApiDoc::openapi()).unwrap();
+        assert!(
+            !spec.contains("\"percentile\""),
+            "percentile must not be documented on the range endpoints"
+        );
+        for path in [
+            "/external-services/{id}/metrics",
+            "/deployments/{id}/metrics",
+            "/nodes/{id}/metrics",
+        ] {
+            assert!(
+                spec.contains(&format!("\"{path}\"")),
+                "{path} missing from the spec"
+            );
         }
     }
 

@@ -108,10 +108,11 @@ impl ExternalServiceManager {
         service_type: ServiceType,
     ) -> Result<Option<Box<dyn ExternalService>>, ExternalServiceError> {
         Ok(match service_type {
-            ServiceType::Postgres => {
-                let docker = self.require_docker()?;
-                Some(Box::new(PostgresClusterService::new(name, docker)))
-            }
+            // No local Docker handle: the cluster service only builds member
+            // specs. Each member's container is created on the engine of its
+            // own node, and the local-member paths require Docker themselves,
+            // so a control-plane-only server can build an all-worker cluster.
+            ServiceType::Postgres => Some(Box::new(PostgresClusterService::new(name))),
             // Future: Redis Sentinel, MongoDB Replica Set, RustFS distributed
             _ => None,
         })
@@ -441,13 +442,9 @@ impl ExternalServiceManager {
 
         // Get the Postgres cluster service for building member params.
         // The guard for local members (LocalWorkloadsDisabled) is below,
-        // where we know each member's placement. Requiring docker here is
-        // safe because create_cluster_service_instance already did so above.
+        // where we know each member's placement.
         let pg_cluster = match service_type {
-            ServiceType::Postgres => {
-                let docker = self.require_docker()?;
-                Some(PostgresClusterService::new(service.name.clone(), docker))
-            }
+            ServiceType::Postgres => Some(PostgresClusterService::new(service.name.clone())),
             _ => None,
         };
 

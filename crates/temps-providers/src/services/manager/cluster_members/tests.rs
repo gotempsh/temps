@@ -1079,3 +1079,74 @@ async fn test_promote_cluster_member_rejects_not_running() {
         msg
     );
 }
+
+// ── a busy member container ───────────────────────────────────────
+
+fn busy(detail: &str) -> ExternalServiceError {
+    ExternalServiceError::NodeBusy {
+        node: "worker-1".to_string(),
+        route: "/agent/services/exec".to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+/// Regression: a switchover failed with a 500 when another operation owned
+/// the member's container for a moment. A busy node ran nothing, so the
+/// exec is tried again after a short wait and succeeds once it is free.
+#[tokio::test(start_paused = true)]
+async fn a_member_exec_waits_out_a_busy_container() {
+    let tries = std::sync::atomic::AtomicU32::new(0);
+    let started = tokio::time::Instant::now();
+    let outcome = retry_node_busy(&MEMBER_EXEC_BUSY_BACKOFF, || async {
+        if tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+            Err(busy("another operation already owns that container"))
+        } else {
+            Ok("promoted")
+        }
+    })
+    .await;
+    assert_eq!(
+        outcome.expect("succeeds once the container is free"),
+        "promoted"
+    );
+    assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(started.elapsed(), std::time::Duration::from_millis(1500));
+}
+
+/// A container that stays busy is reported as busy, typed, after the
+/// bounded waits; any other failure is returned at once, never retried.
+#[tokio::test(start_paused = true)]
+async fn a_member_exec_gives_up_busy_and_never_retries_other_errors() {
+    let tries = std::sync::atomic::AtomicU32::new(0);
+    let started = tokio::time::Instant::now();
+    let outcome: Result<(), _> = retry_node_busy(&MEMBER_EXEC_BUSY_BACKOFF, || async {
+        tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(busy("all exec operation slots are busy"))
+    })
+    .await;
+    match outcome {
+        Err(ExternalServiceError::NodeBusy { detail, .. }) => {
+            assert!(detail.contains("slots are busy"), "{detail}")
+        }
+        other => panic!("expected NodeBusy, got {other:?}"),
+    }
+    assert_eq!(
+        tries.load(std::sync::atomic::Ordering::SeqCst),
+        MEMBER_EXEC_BUSY_BACKOFF.len() as u32 + 1
+    );
+    assert_eq!(started.elapsed(), std::time::Duration::from_millis(7500));
+
+    let tries = std::sync::atomic::AtomicU32::new(0);
+    let outcome: Result<(), _> = retry_node_busy(&MEMBER_EXEC_BUSY_BACKOFF, || async {
+        tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(ExternalServiceError::InternalError {
+            reason: "pg_autoctl failed".to_string(),
+        })
+    })
+    .await;
+    assert!(matches!(
+        outcome,
+        Err(ExternalServiceError::InternalError { .. })
+    ));
+    assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

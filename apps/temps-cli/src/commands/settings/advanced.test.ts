@@ -154,6 +154,29 @@ describe('temps settings (advanced)', () => {
     expect(run.bodies[0]?.body).toEqual({ ...current, external_url: 'https://other.example', trusted_proxy_cidrs: ['10.0.0.0/8'] })
   })
 
+  test('apply sends the revision of the read its body was built from (#2081)', async () => {
+    let reads = 0
+    const run = await runWithApi(registerSettingsCommands, ['settings', 'apply', 'external_url=https://other.example', '--yes'], {
+      'GET /settings': () => ({ ...current, revision: ++reads === 1 ? 'r1' : 'r2' }),
+      'PUT /settings': { success: true, message: 'ok' },
+    })
+    expect(run.error).toBeUndefined()
+    expect((run.bodies[0]?.body as { expected_revision?: string }).expected_revision).toBe('r2')
+  })
+
+  test('apply refused because someone saved meanwhile says to run it again (#2081)', async () => {
+    const run = await runWithApi(registerSettingsCommands, ['settings', 'apply', 'shield.enabled=true'], {
+      'GET /settings': { ...current, revision: 'r1' },
+      'PUT /settings': () =>
+        Response.json(
+          { title: 'Settings Changed Since They Were Read', expected_revision: 'r1', current_revision: 'r2' },
+          { status: 409 },
+        ),
+    })
+    expect((run.bodies[0]?.body as { expected_revision?: string }).expected_revision).toBe('r1')
+    expect(run.error?.message).toMatch(/changed by someone else.*Run the command again/s)
+  })
+
   test('apply reads a secret value from stdin', async () => {
     const run = await runWithApi(
       registerSettingsCommands,

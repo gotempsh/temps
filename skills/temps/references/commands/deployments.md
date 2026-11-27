@@ -280,7 +280,6 @@ Fetch a time-series range for a single metric on a deployment
 |------|-------------|---------|----------|
 | `--metric <value>` | Metric name, e.g. '"pg.connections_active"' [required] | - | No |
 | `--range <value>` | Time window: '"1h"' \| '"6h"' \| '"24h"' \| '"7d"' | - | No |
-| `--percentile <number>` | Optional histogram percentile (0–100) | - | No |
 | `--start-time <value>` | Explicit window start (ISO 8601) | - | No |
 | `--end-time <value>` | Explicit window end (ISO 8601) | - | No |
 | `--json` | Output in JSON format | - | No |
