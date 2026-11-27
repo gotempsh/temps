@@ -52,7 +52,7 @@ import {
   type SVGProps,
 } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate, useSearchParams } from 'react-router'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { useUrlSearchText } from '@temps-sdk/ds'
 import { z } from 'zod'
@@ -65,6 +65,7 @@ import {
   DigitalOceanIcon,
   GoogleCloudIcon,
   NamecheapIcon,
+  PowerDnsIcon,
 } from '@/components/icons/DnsProviderIcons'
 
 type DnsProviderType = Exclude<ApiDnsProviderType, 'manual' | 'pebble'>
@@ -152,6 +153,21 @@ const azureFormSchema = z.object({
 
 type AzureFormData = z.infer<typeof azureFormSchema>
 
+// PowerDNS form schema
+const powerdnsFormSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required'),
+  description: z.string().optional(),
+  api_url: z
+    .string()
+    .trim()
+    .min(1, 'API URL is required')
+    .regex(/^https?:\/\/[^\s/]+/i, 'Use an http:// or https:// URL'),
+  api_key: z.string().trim().min(1, 'API key is required'),
+  server_id: z.string().trim().optional(),
+})
+
+type PowerDnsFormData = z.infer<typeof powerdnsFormSchema>
+
 // Provider data
 const PROVIDERS: ProviderInfo[] = [
   {
@@ -195,6 +211,21 @@ const PROVIDERS: ProviderInfo[] = [
     description: 'DigitalOcean DNS',
     icon: DigitalOceanIcon,
     keywords: ['digitalocean', 'digital ocean', 'do'],
+  },
+  {
+    type: 'powerdns',
+    name: 'PowerDNS',
+    description: 'Self-hosted PowerDNS Authoritative Server',
+    icon: PowerDnsIcon,
+    keywords: [
+      'powerdns',
+      'pdns',
+      'self-hosted',
+      'selfhosted',
+      'authoritative',
+      'on-premise',
+      'private',
+    ],
   },
   {
     type: 'namecheap',
@@ -423,6 +454,17 @@ export function AddDnsProvider() {
     },
   })
 
+  const powerdnsForm = useForm<PowerDnsFormData>({
+    resolver: zodResolver(powerdnsFormSchema),
+    defaultValues: {
+      name: '',
+      description: '',
+      api_url: '',
+      api_key: '',
+      server_id: '',
+    },
+  })
+
   const createProviderMut = useMutation({
     mutationFn: async (request: CreateDnsProviderRequest) => {
       return requireDeliveryData(await createProvider({ body: request }))
@@ -494,6 +536,9 @@ export function AddDnsProvider() {
           break
         case 'azure':
           nameValid = await azureForm.trigger('name')
+          break
+        case 'powerdns':
+          nameValid = await powerdnsForm.trigger('name')
           break
       }
       if (nameValid) {
@@ -623,6 +668,23 @@ export function AddDnsProvider() {
     createProviderMut.mutate(request)
   }
 
+  const onPowerDnsSubmit = (data: PowerDnsFormData) => {
+    setError(null)
+    const credentials: DnsProviderCredentials = {
+      type: 'powerdns',
+      api_url: data.api_url,
+      api_key: data.api_key,
+      server_id: data.server_id || null,
+    }
+    const request: CreateDnsProviderRequest = {
+      name: data.name,
+      provider_type: 'powerdns',
+      description: data.description || null,
+      credentials,
+    }
+    createProviderMut.mutate(request)
+  }
+
   const handleSubmit = () => {
     switch (providerType) {
       case 'cloudflare':
@@ -645,6 +707,9 @@ export function AddDnsProvider() {
         break
       case 'azure':
         azureForm.handleSubmit(onAzureSubmit)()
+        break
+      case 'powerdns':
+        powerdnsForm.handleSubmit(onPowerDnsSubmit)()
         break
     }
   }
@@ -911,6 +976,46 @@ export function AddDnsProvider() {
                     <FormControl>
                       <Textarea
                         placeholder="DNS provider for production domains"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </Form>
+        )
+
+      case 'powerdns':
+        return (
+          <Form {...powerdnsForm}>
+            <div className="space-y-4">
+              <FormField
+                control={powerdnsForm.control}
+                name="name"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Name</FormLabel>
+                    <FormControl>
+                      <Input placeholder="My PowerDNS server" {...field} />
+                    </FormControl>
+                    <FormDescription>
+                      A friendly name to identify this provider
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={powerdnsForm.control}
+                name="description"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Description (optional)</FormLabel>
+                    <FormControl>
+                      <Textarea
+                        placeholder="Authoritative DNS for internal zones"
                         {...field}
                       />
                     </FormControl>
@@ -1314,6 +1419,87 @@ export function AddDnsProvider() {
                     <FormDescription>
                       Create a token with read and write scope at
                       cloud.digitalocean.com/account/api/tokens
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </Form>
+        )
+
+      case 'powerdns':
+        return (
+          <Form {...powerdnsForm}>
+            <div className="space-y-4">
+              <FormField
+                control={powerdnsForm.control}
+                name="api_url"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>API URL</FormLabel>
+                    <FormControl>
+                      <Input
+                        placeholder="http://10.0.0.5:8081"
+                        autoComplete="off"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      The PowerDNS webserver address (default port 8081), with
+                      or without <code>/api/v1</code>. The server needs{' '}
+                      <code>api=yes</code>, <code>webserver=yes</code> and{' '}
+                      <code>webserver-allow-from</code> including this
+                      server&apos;s address. A private or loopback address must
+                      first be added to{' '}
+                      <Link
+                        to="/settings/security"
+                        className="underline hover:text-foreground"
+                      >
+                        Trusted private networks
+                      </Link>
+                      .
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={powerdnsForm.control}
+                name="api_key"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>API Key</FormLabel>
+                    <FormControl>
+                      <Input
+                        type="password"
+                        autoComplete="off"
+                        placeholder="Value of the api-key setting"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      The <code>api-key</code> from your PowerDNS configuration.
+                      Temps checks access and encrypts the key before saving.
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={powerdnsForm.control}
+                name="server_id"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Server ID (optional)</FormLabel>
+                    <FormControl>
+                      <Input placeholder="localhost" {...field} />
+                    </FormControl>
+                    <FormDescription>
+                      Defaults to <code>localhost</code>, the only server ID a
+                      standard PowerDNS install exposes
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

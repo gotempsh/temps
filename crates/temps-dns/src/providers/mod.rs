@@ -4,7 +4,7 @@
 //! DNS provider implementations
 //!
 //! This module contains the DNS provider trait definitions and implementations
-//! for various DNS providers including Cloudflare, Namecheap, Route53, etc.
+//! for various DNS providers including Cloudflare, Namecheap, Route53, PowerDNS, etc.
 
 pub mod azure;
 pub mod bunny;
@@ -14,6 +14,7 @@ pub mod digitalocean;
 pub mod gcp;
 pub mod namecheap;
 pub mod pebble;
+pub mod powerdns;
 pub mod route53;
 pub mod traits;
 
@@ -27,13 +28,14 @@ pub use bunny::BunnyProvider;
 pub use cloudflare::CloudflareProvider;
 pub use credentials::{
     AzureCredentials, BunnyCredentials, CloudflareCredentials, DigitalOceanCredentials,
-    GcpCredentials, NamecheapCredentials, PebbleCredentials, ProviderCredentials,
-    Route53Credentials,
+    GcpCredentials, NamecheapCredentials, PebbleCredentials, PowerDnsCredentials,
+    ProviderCredentials, Route53Credentials,
 };
 pub use digitalocean::DigitalOceanProvider;
 pub use gcp::GcpProvider;
 pub use namecheap::NamecheapProvider;
 pub use pebble::PebbleDnsProvider;
+pub use powerdns::PowerDnsProvider;
 pub use route53::Route53Provider;
 pub use traits::{
     DnsProvider, DnsProviderCapabilities, DnsProviderType, DnsRecord, DnsRecordContent,

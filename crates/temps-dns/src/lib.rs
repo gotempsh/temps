@@ -18,6 +18,7 @@
 //! - **Namecheap**: Support via XML API (requires whitelisted IP)
 //! - **Route53**: (Planned) AWS Route 53 support
 //! - **DigitalOcean**: (Planned) DigitalOcean DNS support
+//! - **PowerDNS**: Self-hosted PowerDNS Authoritative Server via its HTTP API
 //!
 //! # Usage
 //!

@@ -137,6 +137,9 @@ For DNS-01 challenges and wildcard certificates, Temps needs API access to your 
 | **DigitalOcean** | API token |
 | **Azure DNS** | Service principal credentials |
 | **Google Cloud DNS** | Service account key |
+| **PowerDNS** (self-hosted) | API URL and the server's `api-key` (`api=yes`, `webserver=yes`) |
+
+PowerDNS runs on your own network, so its API address is usually private. Add that address under **Settings > Security > Trusted private networks** before connecting it. Temps refuses writes to PowerDNS Secondary zones, because the next zone transfer would discard them; connect the server that holds the primary zone.
 
 Configure DNS providers in **Settings > DNS Providers**. Once configured, Temps can automatically create and remove TXT records for certificate validation.
 

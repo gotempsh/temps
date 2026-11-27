@@ -10,6 +10,7 @@ import {
   AzureIcon,
   DigitalOceanIcon,
   NamecheapIcon,
+  PowerDnsIcon,
 } from './DnsProviderIcons-components'
 
 export type IconProps = { className?: string }
@@ -33,6 +34,8 @@ export function getDnsProviderIcon(
       return <DigitalOceanIcon className={className} />
     case 'namecheap':
       return <NamecheapIcon className={className} />
+    case 'powerdns':
+      return <PowerDnsIcon className={className} />
     default:
       return <Globe className={className} />
   }

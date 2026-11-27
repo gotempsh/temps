@@ -79,7 +79,7 @@ Let's Encrypt needs to verify you control the domain before issuing a certificat
     Let's Encrypt verifies a TXT record in your domain's DNS. Temps creates and removes this record automatically if you have a DNS provider configured.
 
     **Requirements:**
-    - A DNS provider connected in **Settings > DNS Providers** (Cloudflare, Route 53, DigitalOcean, Azure DNS, or Google Cloud DNS)
+    - A DNS provider connected in **Settings > DNS Providers** (Cloudflare, Route 53, DigitalOcean, Azure DNS, Google Cloud DNS, or a self-hosted PowerDNS server)
 
     **Use for:** Wildcard domains (`*.yourdomain.com`) — HTTP-01 does not support wildcards
   </Col>
@@ -109,6 +109,7 @@ Wildcard certificates require DNS-01 validation, which means Temps needs API acc
    - **DigitalOcean** — API token
    - **Azure DNS** — Service principal credentials
    - **Google Cloud DNS** — Service account key
+   - **PowerDNS** — API URL (for example `http://10.0.0.5:8081`) and the server's `api-key`. Add a private API address to **Settings > Security > Trusted private networks** first
 
 ### Step 3: Add the wildcard domain
 

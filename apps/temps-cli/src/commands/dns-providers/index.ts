@@ -35,6 +35,7 @@ const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'DigitalOcean', value: 'digitalocean' },
   { name: 'Google Cloud DNS', value: 'gcp' },
   { name: 'Azure DNS', value: 'azure' },
+  { name: 'PowerDNS (self-hosted)', value: 'powerdns' },
   { name: 'Manual', value: 'manual' },
   { name: 'Pebble (local ACME test server only)', value: 'pebble' },
 ]
@@ -68,6 +69,8 @@ interface CreateOptions {
   subscriptionId?: string
   resourceGroup?: string
   managementUrl?: string
+  apiUrl?: string
+  serverId?: string
   apiKeyStdin?: boolean
   apiTokenStdin?: boolean
   secretAccessKeyStdin?: boolean
@@ -296,6 +299,23 @@ export function resolveDnsProviderCredentials(
       return undefined
     }
 
+    case 'powerdns': {
+      if (options.apiUrl && options.apiKey) {
+        return {
+          type: 'powerdns',
+          api_url: options.apiUrl,
+          api_key: options.apiKey,
+          ...(options.serverId && { server_id: options.serverId }),
+        }
+      }
+      if (options.yes) {
+        throw new Error(
+          '--api-url and --api-key-stdin (recommended) or --api-key are required for PowerDNS when using --yes flag',
+        )
+      }
+      return undefined
+    }
+
     case 'manual':
       return { type: 'manual' }
 
@@ -334,7 +354,7 @@ export function registerDnsProvidersCommands(program: Command): void {
     .alias('add')
     .description('Create a new DNS provider')
     .option('-n, --name <name>', 'Provider name')
-    .option('-t, --type <type>', 'Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual, pebble)')
+    .option('-t, --type <type>', 'Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, powerdns, manual, pebble)')
     .option('-d, --description <description>', 'Provider description')
     .option(
       '--api-token <token>',
@@ -352,9 +372,11 @@ export function registerDnsProvidersCommands(program: Command): void {
     .option('--api-user <user>', 'Namecheap API user')
     .option(
       '--api-key <key>',
-      'API key (Bunny, Namecheap; prefer --api-key-stdin to keep it out of shell history)',
+      'API key (Bunny, Namecheap, PowerDNS; prefer --api-key-stdin to keep it out of shell history)',
     )
-    .option('--api-key-stdin', 'Read the Bunny or Namecheap API key from stdin')
+    .option('--api-key-stdin', 'Read the Bunny, Namecheap or PowerDNS API key from stdin')
+    .option('--api-url <url>', 'PowerDNS webserver URL, e.g. http://10.0.0.5:8081')
+    .option('--server-id <id>', 'PowerDNS server ID (default: localhost)')
     .option('--username <username>', 'Namecheap username')
     .option('--client-ip <ip>', 'Namecheap whitelisted client IP')
     .option('--project-id <id>', 'GCP project ID')
@@ -751,6 +773,37 @@ async function createAction(rawOptions: CreateOptions): Promise<void> {
           client_secret: azClientSecret,
           subscription_id: azSubscriptionId,
           resource_group: azResourceGroup,
+        }
+        break
+      }
+
+      case 'powerdns': {
+        info('\nPowerDNS needs its HTTP API enabled (api=yes, webserver=yes) and the api-key setting.')
+        info('A private or loopback API address must be listed under Settings > Security > Trusted private networks.')
+        newline()
+
+        const pdnsApiUrl =
+          options.apiUrl ??
+          (await promptText({
+            message: 'API URL',
+            required: true,
+            default: 'http://127.0.0.1:8081',
+          }))
+
+        const pdnsApiKey = options.apiKey ?? (await promptPassword({ message: 'API Key' }))
+
+        const pdnsServerId =
+          options.serverId ??
+          (await promptText({
+            message: 'Server ID',
+            default: 'localhost',
+          }))
+
+        credentials = {
+          type: 'powerdns',
+          api_url: pdnsApiUrl,
+          api_key: pdnsApiKey,
+          ...(pdnsServerId && { server_id: pdnsServerId }),
         }
         break
       }

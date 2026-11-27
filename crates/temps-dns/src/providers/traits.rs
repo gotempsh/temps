@@ -33,6 +33,9 @@ pub enum DnsProviderType {
     Gcp,
     /// Azure DNS (Service Principal)
     Azure,
+    /// PowerDNS Authoritative Server (HTTP API URL + API key)
+    #[serde(rename = "powerdns")]
+    PowerDns,
     /// Manual DNS (user sets records manually)
     Manual,
     /// Pebble challtestsrv mock DNS (LOCAL DEV/TEST ONLY -- publishes to
@@ -52,6 +55,7 @@ impl std::fmt::Display for DnsProviderType {
             DnsProviderType::DigitalOcean => write!(f, "digitalocean"),
             DnsProviderType::Gcp => write!(f, "gcp"),
             DnsProviderType::Azure => write!(f, "azure"),
+            DnsProviderType::PowerDns => write!(f, "powerdns"),
             DnsProviderType::Manual => write!(f, "manual"),
             DnsProviderType::Pebble => write!(f, "pebble"),
         }
@@ -69,6 +73,7 @@ impl DnsProviderType {
             "digitalocean" | "do" => Ok(DnsProviderType::DigitalOcean),
             "gcp" | "google" | "googlecloud" | "google-cloud" => Ok(DnsProviderType::Gcp),
             "azure" | "az" => Ok(DnsProviderType::Azure),
+            "powerdns" | "pdns" => Ok(DnsProviderType::PowerDns),
             "manual" => Ok(DnsProviderType::Manual),
             "pebble" | "challtestsrv" => Ok(DnsProviderType::Pebble),
             _ => Err(DnsError::InvalidProviderType(s.to_string())),
@@ -93,6 +98,7 @@ impl DnsProviderType {
                     "resource_group",
                 ]
             }
+            DnsProviderType::PowerDns => vec!["api_url", "api_key"],
             DnsProviderType::Manual => vec![],
             DnsProviderType::Pebble => vec!["management_url"],
         }
@@ -108,6 +114,7 @@ impl DnsProviderType {
             DnsProviderType::DigitalOcean => vec![],
             DnsProviderType::Gcp => vec![],
             DnsProviderType::Azure => vec![],
+            DnsProviderType::PowerDns => vec!["server_id"],
             DnsProviderType::Manual => vec![],
             DnsProviderType::Pebble => vec![],
         }
@@ -137,6 +144,10 @@ impl DnsProviderType {
             | DnsProviderType::Gcp
             | DnsProviderType::Azure
             | DnsProviderType::Pebble => true,
+            // The API replaces one RRset per change; the PowerDNS provider
+            // keeps every other value of that RRset verbatim (disabled ones
+            // included) and never sends `comments`, so they are kept too.
+            DnsProviderType::PowerDns => true,
             // Namecheap's only write API is `setHosts`, which replaces the
             // entire host list; writes are a read-modify-write of the whole
             // zone, and the `getHosts` parser cannot round-trip every host

@@ -34,7 +34,7 @@ use crate::errors::{DnsError, HostnameModeSaved};
 use crate::providers::{
     AzureCredentials, BunnyCredentials, CloudflareCredentials, DigitalOceanCredentials,
     DnsProviderType, DnsRecord, DnsZone, GcpCredentials, NamecheapCredentials, PebbleCredentials,
-    ProviderCredentials, Route53Credentials,
+    PowerDnsCredentials, ProviderCredentials, Route53Credentials,
 };
 use crate::services::hostname_sync::{
     AdoptRecordDecision, ConflictDecisions, HostnameModeResult, SkipRecordDecision,
@@ -244,6 +244,18 @@ pub enum DnsProviderCredentials {
         #[schema(example = "my-resource-group")]
         resource_group: String,
     },
+    /// PowerDNS Authoritative Server HTTP API
+    #[serde(rename = "powerdns")]
+    PowerDns {
+        /// PowerDNS webserver URL, with or without the `/api/v1` path
+        #[schema(example = "http://127.0.0.1:8081")]
+        api_url: String,
+        /// Value of the server's `api-key` setting
+        api_key: SecretString,
+        /// Server ID (defaults to `localhost`)
+        #[schema(example = "localhost")]
+        server_id: Option<String>,
+    },
     /// Pebble challtestsrv mock DNS (LOCAL DEV/TEST ONLY)
     Pebble {
         #[schema(example = "http://localhost:8055")]
@@ -320,6 +332,15 @@ impl From<DnsProviderCredentials> for ProviderCredentials {
                 client_secret: client_secret.into_exposed(),
                 subscription_id,
                 resource_group,
+            }),
+            DnsProviderCredentials::PowerDns {
+                api_url,
+                api_key,
+                server_id,
+            } => ProviderCredentials::PowerDns(PowerDnsCredentials {
+                api_url,
+                api_key: api_key.into_exposed(),
+                server_id,
             }),
             DnsProviderCredentials::Pebble { management_url } => {
                 ProviderCredentials::Pebble(PebbleCredentials { management_url })

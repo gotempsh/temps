@@ -102,6 +102,42 @@ describe('resolveDnsProviderCredentials', () => {
     })
   })
 
+  describe('powerdns', () => {
+    test('builds credentials from the api url and key', () => {
+      expect(
+        resolveDnsProviderCredentials('powerdns', {
+          apiUrl: 'http://10.0.0.5:8081',
+          apiKey: 'pdns-key',
+        }),
+      ).toEqual({ type: 'powerdns', api_url: 'http://10.0.0.5:8081', api_key: 'pdns-key' })
+    })
+
+    test('passes the server id through when given', () => {
+      expect(
+        resolveDnsProviderCredentials('powerdns', {
+          apiUrl: 'http://10.0.0.5:8081',
+          apiKey: 'pdns-key',
+          serverId: 'ns1',
+        }),
+      ).toEqual({
+        type: 'powerdns',
+        api_url: 'http://10.0.0.5:8081',
+        api_key: 'pdns-key',
+        server_id: 'ns1',
+      })
+    })
+
+    test('falls back to prompts without the url', () => {
+      expect(resolveDnsProviderCredentials('powerdns', { apiKey: 'pdns-key' })).toBeUndefined()
+    })
+
+    test('throws under --yes without the url or key', () => {
+      expect(() =>
+        resolveDnsProviderCredentials('powerdns', { apiUrl: 'http://10.0.0.5:8081', yes: true }),
+      ).toThrow('--api-url and --api-key-stdin (recommended) or --api-key are required for PowerDNS')
+    })
+  })
+
   describe('namecheap', () => {
     const full = { apiUser: 'user', apiKey: 'key', username: 'uname', clientIp: '1.2.3.4' }
 

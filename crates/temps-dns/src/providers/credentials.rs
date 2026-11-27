@@ -149,6 +149,37 @@ pub struct AzureCredentials {
     pub resource_group: String,
 }
 
+/// PowerDNS Authoritative Server credentials
+///
+/// PowerDNS authenticates API calls with the static key set by the server's
+/// `api-key` setting (`api=yes` and `webserver=yes` must also be enabled).
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+pub struct PowerDnsCredentials {
+    /// PowerDNS webserver URL, with or without the `/api/v1` path
+    #[schema(example = "http://127.0.0.1:8081")]
+    pub api_url: String,
+
+    /// Value of the server's `api-key` setting
+    #[schema(example = "your-api-key")]
+    pub api_key: String,
+
+    /// Server ID in the API path (defaults to `localhost`, the only one a
+    /// stock install exposes)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "localhost")]
+    pub server_id: Option<String>,
+}
+
+impl std::fmt::Debug for PowerDnsCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PowerDnsCredentials")
+            .field("api_url", &self.api_url)
+            .field("api_key", &"[REDACTED]")
+            .field("server_id", &self.server_id)
+            .finish()
+    }
+}
+
 /// Pebble challtestsrv credentials (LOCAL DEV/TEST ONLY)
 ///
 /// `pebble-challtestsrv` has no authentication -- the only thing needed is
@@ -174,6 +205,8 @@ pub enum ProviderCredentials {
     DigitalOcean(DigitalOceanCredentials),
     Gcp(GcpCredentials),
     Azure(AzureCredentials),
+    #[serde(rename = "powerdns")]
+    PowerDns(PowerDnsCredentials),
     Pebble(PebbleCredentials),
 }
 
@@ -228,6 +261,15 @@ impl ProviderCredentials {
                     "client_secret": "***",
                     "subscription_id": mask_string(&c.subscription_id),
                     "resource_group": c.resource_group.clone(),
+                })
+            }
+            ProviderCredentials::PowerDns(c) => {
+                // The URL is configuration, not a secret; the key always is.
+                serde_json::json!({
+                    "type": "powerdns",
+                    "api_url": c.api_url.clone(),
+                    "api_key": "***",
+                    "server_id": c.server_id.clone(),
                 })
             }
             ProviderCredentials::Pebble(c) => {
@@ -301,6 +343,39 @@ mod tests {
         assert_eq!(parsed.api_key, "test-api-key");
         assert_eq!(parsed.client_ip, Some("1.2.3.4".to_string()));
         assert!(parsed.sandbox);
+    }
+
+    #[test]
+    fn powerdns_credentials_mask_the_key_and_keep_the_url() {
+        let creds = ProviderCredentials::PowerDns(PowerDnsCredentials {
+            api_url: "http://10.0.0.5:8081".to_string(),
+            api_key: "super-secret-powerdns-key".to_string(),
+            server_id: Some("localhost".to_string()),
+        });
+
+        let masked = creds.masked();
+        assert_eq!(masked["type"], "powerdns");
+        assert_eq!(masked["api_url"], "http://10.0.0.5:8081");
+        assert_eq!(masked["api_key"], "***");
+        assert_eq!(masked["server_id"], "localhost");
+        assert!(!masked.to_string().contains("super-secret"));
+        assert!(!format!("{creds:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn powerdns_credentials_round_trip_with_the_powerdns_tag() {
+        let json = r#"{"type":"powerdns","api_url":"http://pdns:8081","api_key":"k"}"#;
+        let parsed: ProviderCredentials = serde_json::from_str(json).unwrap();
+        match &parsed {
+            ProviderCredentials::PowerDns(c) => {
+                assert_eq!(c.api_url, "http://pdns:8081");
+                assert_eq!(c.server_id, None);
+            }
+            other => panic!("Expected PowerDNS credentials, got {other:?}"),
+        }
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(serialized.contains("\"type\":\"powerdns\""));
+        assert!(!serialized.contains("server_id"));
     }
 
     #[test]

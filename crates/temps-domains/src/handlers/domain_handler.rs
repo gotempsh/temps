@@ -2869,17 +2869,21 @@ async fn cleanup_dns_txt_records(
     plan: &DnsCleanupPlan,
 ) -> Result<DnsCleanupOutcome, DnsCleanupError> {
     // Cloudflare and DigitalOcean expose a distinct ID for each TXT value.
-    // Pebble is the explicitly gated, local-test-only exception: its synthetic
-    // ID is the challenge FQDN and delete_record calls challtestsrv's
-    // post-validation clear-txt endpoint. Azure, GCP, Route53, and Namecheap
-    // expose one synthetic ID per RRset/name in real user-controlled zones, so
-    // calling their delete_record implementation could remove a sibling ACME
-    // order's value even after our exact-value filter succeeds.
+    // PowerDNS's API is RRset-based, but its provider issues per-value IDs
+    // (`fqdn::TXT::value`) and its delete_record removes only that value,
+    // keeping the RRset's other values. Pebble is the explicitly gated,
+    // local-test-only exception: its synthetic ID is the challenge FQDN and
+    // delete_record calls challtestsrv's post-validation clear-txt endpoint.
+    // Azure, GCP, Route53, and Namecheap expose one synthetic ID per
+    // RRset/name in real user-controlled zones, so calling their
+    // delete_record implementation could remove a sibling ACME order's value
+    // even after our exact-value filter succeeds.
     let provider_type = provider.provider_type();
     if !matches!(
         provider_type,
         temps_dns::providers::DnsProviderType::Cloudflare
             | temps_dns::providers::DnsProviderType::DigitalOcean
+            | temps_dns::providers::DnsProviderType::PowerDns
             | temps_dns::providers::DnsProviderType::Pebble
     ) {
         return Err(DnsCleanupError::SharedRecordSet {
@@ -4134,6 +4138,43 @@ mod tests {
         assert!(outcome.errors.is_empty());
         assert!(outcome.remaining_records.is_empty());
         assert!(provider.record_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_only_this_orders_value_on_powerdns() {
+        // PowerDNS record IDs name one value of the RRset, so the concurrent
+        // order's value under the same name must survive.
+        let provider = MockDnsProvider::seed(vec![
+            txt_record(
+                "_acme-challenge.example.com::TXT::\"completed-order-token\"",
+                "_acme-challenge",
+                "completed-order-token",
+            ),
+            txt_record(
+                "_acme-challenge.example.com::TXT::\"concurrent-order-token\"",
+                "_acme-challenge",
+                "concurrent-order-token",
+            ),
+        ])
+        .with_provider_type(DnsProviderType::PowerDns);
+        let plan = dns_cleanup_plan(
+            42,
+            "example.com",
+            vec![DnsCleanupRecord {
+                name: "_acme-challenge".to_string(),
+                value: "completed-order-token".to_string(),
+                record_id: "_acme-challenge.example.com::TXT::\"completed-order-token\""
+                    .to_string(),
+            }],
+        );
+
+        let outcome = cleanup_dns_txt_records(&provider, &plan)
+            .await
+            .expect("PowerDNS exposes per-value record IDs, so cleanup is automatic");
+
+        assert_eq!(outcome.deleted, 1);
+        assert!(outcome.errors.is_empty());
+        assert_eq!(provider.record_names().len(), 1);
     }
 
     #[tokio::test]
