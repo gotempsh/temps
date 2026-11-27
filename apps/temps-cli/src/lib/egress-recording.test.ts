@@ -41,4 +41,9 @@ describe('describeDestination', () => {
     expect(describeDestination(record({ relay: 'model' }))).toBe('model relay')
     expect(describeDestination(record({}))).toBe('(no destination)')
   })
+
+  test('an IPv6 host keeps its brackets, so its port reads apart', () => {
+    expect(describeDestination(record({ host: '2001:db8::1', port: 443 }))).toBe('[2001:db8::1]:443')
+    expect(describeDestination(record({ host: '2001:db8::1' }))).toBe('[2001:db8::1]')
+  })
 })

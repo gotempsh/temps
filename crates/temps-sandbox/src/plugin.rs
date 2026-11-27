@@ -563,6 +563,7 @@ async fn wire_egress_recording(context: &PluginContext) {
         service.set_egress_observer(Arc::new(
             crate::services::egress_recording::RecorderPolicyRefresh {
                 recorder: Arc::downgrade(&recorder),
+                traffic: Arc::downgrade(&traffic),
             },
         ));
     }

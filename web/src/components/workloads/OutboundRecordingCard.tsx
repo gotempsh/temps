@@ -28,6 +28,7 @@ import {
   egressRecordsKey,
   egressStatusKey,
   EXAMPLE_RECORDS,
+  toggleToast,
   type EgressWorkload,
 } from './egress-recording'
 
@@ -58,11 +59,12 @@ export function OutboundRecordingCard({
       for (const queryKey of workload.invalidates ?? []) {
         queryClient.invalidateQueries({ queryKey })
       }
-      toast.success(
-        next.enabled
-          ? 'Outbound connections are now recorded'
-          : 'Outbound connections are no longer recorded'
-      )
+      const answer = toggleToast(next)
+      if (answer.kind === 'warning') {
+        toast.warning(answer.title, { description: answer.description })
+      } else {
+        toast.success(answer.title)
+      }
     },
   })
 

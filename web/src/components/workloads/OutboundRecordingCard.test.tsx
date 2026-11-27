@@ -14,6 +14,7 @@ import {
   environmentEgress,
   EXAMPLE_RECORDS,
   sandboxEgress,
+  toggleToast,
 } from './egress-recording'
 import { OutboundRecordingCard } from './OutboundRecordingCard'
 
@@ -218,4 +219,26 @@ test('a workload that is gone says so instead of offering the switch', () => {
   expect(card.container.textContent).toContain(
     'A destroyed sandbox makes no connections.'
   )
+})
+
+test('a switch that did not take answers with a warning, not "now recorded"', () => {
+  const reason = 'the sandbox egress proxy could not be switched yet'
+  expect(
+    toggleToast(
+      status({
+        enabled: true,
+        configured: false,
+        reason_code: 'not_applied',
+        reason,
+      })
+    )
+  ).toEqual({
+    kind: 'warning',
+    title: 'Recording is on, but nothing is recorded yet',
+    description: reason,
+  })
+  expect(toggleToast(status({ enabled: true })).title).toBe(
+    'Outbound connections are now recorded'
+  )
+  expect(toggleToast(status({ enabled: false })).kind).toBe('success')
 })

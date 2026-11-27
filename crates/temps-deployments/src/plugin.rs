@@ -1724,6 +1724,9 @@ async fn wire_egress_recording(context: &PluginContext) {
     context
         .require_service::<WorkflowExecutionService>()
         .set_egress_recorder(recorder.clone());
+    context
+        .require_service::<DeploymentService>()
+        .set_egress_recorder(recorder.clone());
     recorder
         .add_source(Arc::new(DeploymentTraffic::new(
             db,

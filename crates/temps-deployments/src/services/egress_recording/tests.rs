@@ -582,24 +582,42 @@ async fn a_deployment_goes_through_the_recorder_only_when_its_environment_record
     .into_iter()
     .map(|(name, value)| (name.to_string(), value.to_string()))
     .collect();
-    assert_eq!(RecordedEgress::Off.variables(&existing), None);
-    assert_eq!(RecordedEgress::NotServing.variables(&existing), None);
+    let none = HashMap::new();
+    assert_eq!(RecordedEgress::Off.variables(&existing, &none), None);
+    assert_eq!(RecordedEgress::NotServing.variables(&existing, &none), None);
 
     let steering = RecordedEgress::Proxy(
         "172.18.0.1:13128".parse().unwrap(),
         temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
     )
-    .variables(&existing)
+    .variables(
+        &existing,
+        &[("INVENTORY_URL", "https://inventory")]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+    )
     .expect("steered");
     assert!(steering.steers());
     assert_eq!(steering.variables["HTTPS_PROXY"], "http://172.18.0.1:13128");
     let direct: Vec<&str> = steering.variables["NO_PROXY"].split(',').collect();
-    for host in ["postgres-main", "console.example.com", "errors.example.com"] {
+    for host in ["console.example.com", "errors.example.com", "inventory"] {
         assert!(
             direct.contains(&host),
-            "{host} stays direct: a linked service or the platform's own endpoint"
+            "{host} stays direct: the platform's own endpoint or an internal HTTPS host \
+             the image names"
         );
     }
+    assert!(
+        !direct.contains(&"postgres-main"),
+        "a database driver never goes through the proxy: its single-label host is not \
+         a NO_PROXY suffix"
+    );
+    assert_eq!(
+        steering.bare_name_variables,
+        ["INVENTORY_URL"],
+        "named by variable, never by value"
+    );
     assert!(
         !direct.contains(&"api.example.com"),
         "a public API the application calls is what gets recorded"
@@ -772,9 +790,40 @@ async fn a_static_site_says_it_cannot_record() {
         Some("not_recordable"),
         "an image deployment of a static project runs a replica: {with_replica:?}"
     );
-    // Files alone: no running replica.
+    // Its last image replica stopped: still an image deployment (the
+    // stopped replica is its current deployment's), so it can opt in
+    // before its next deployment.
     f.db.connection()
         .execute_unprepared("UPDATE deployment_containers SET status = 'stopped'")
+        .await
+        .unwrap();
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE environments SET current_deployment_id = (\
+                 SELECT dc.deployment_id FROM deployment_containers dc \
+                 JOIN deployments d ON d.id = dc.deployment_id \
+                 WHERE d.environment_id = {PRODUCTION} LIMIT 1) \
+             WHERE id = {PRODUCTION}"
+        ))
+        .await
+        .unwrap();
+    let stopped = wired
+        .environments
+        .status(PROJECT, PRODUCTION)
+        .await
+        .unwrap();
+    assert_ne!(
+        stopped.reason_code.as_deref(),
+        Some("not_recordable"),
+        "a stopped image replica is not files: {stopped:?}"
+    );
+    // Files alone: the stopped container is not the current deployment's
+    // (a failed image candidate kept for inspection), so it says nothing
+    // about what is served.
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE environments SET current_deployment_id = NULL WHERE id = {PRODUCTION}"
+        ))
         .await
         .unwrap();
     // A preset that builds static output: published as files, no replica.

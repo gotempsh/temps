@@ -62,7 +62,47 @@ pub trait SidecarRefresh: Send + Sync {
     async fn serialize(&self, id: i32) -> Box<dyn std::any::Any + Send>;
 
     /// Re-applies `row`'s stored policy, read under that claim.
-    async fn apply(&self, row: &sandboxes::Model) -> Result<(), String>;
+    async fn apply(&self, row: &sandboxes::Model) -> Result<(), SidecarFailure>;
+}
+
+/// Why a sidecar refresh failed, and whether trying again can help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarFailure {
+    pub reason: String,
+    /// False when the provider refused the stored policy itself (it is not
+    /// valid for this sandbox): retrying writes the same refused policy, so
+    /// it is not retried until the policy or the opt-in changes again.
+    pub retry: bool,
+}
+
+impl std::fmt::Display for SidecarFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl SidecarFailure {
+    /// A failure that may pass on a later attempt.
+    pub fn transient(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retry: true,
+        }
+    }
+}
+
+impl From<temps_agent_core::error::AgentError> for SidecarFailure {
+    fn from(error: temps_agent_core::error::AgentError) -> Self {
+        let retry = !matches!(
+            error,
+            temps_agent_core::error::AgentError::Validation { .. }
+                | temps_agent_core::error::AgentError::SandboxEgressPolicyUnsupported { .. }
+        );
+        Self {
+            reason: error.to_string(),
+            retry,
+        }
+    }
 }
 
 #[async_trait]
@@ -71,10 +111,20 @@ impl SidecarRefresh for crate::services::registry::StandaloneSandboxRegistry {
         Box::new(self.begin_planned_downtime(id).await)
     }
 
-    async fn apply(&self, row: &sandboxes::Model) -> Result<(), String> {
-        self.set_egress_policy(row.id, &row.public_id, &row.egress_policy.0)
-            .await
-            .map_err(|e| e.to_string())
+    async fn apply(&self, row: &sandboxes::Model) -> Result<(), SidecarFailure> {
+        // An agent run's container is named after the run (see
+        // `row_container_name`): reached by that name, not the public id.
+        match row.agent_run_id {
+            Some(run_id) => {
+                self.set_agent_run_egress_policy(row.id, run_id, &row.egress_policy.0)
+                    .await
+            }
+            None => {
+                self.set_egress_policy(row.id, &row.public_id, &row.egress_policy.0)
+                    .await
+            }
+        }
+        .map_err(SidecarFailure::from)
     }
 }
 
@@ -265,6 +315,11 @@ pub struct SandboxTraffic {
     /// refresh until it works, so a failed replacement never leaves a
     /// sandbox without a way out for long.
     pending: std::sync::Mutex<HashSet<i32>>,
+    /// Why each sandbox's sidecar last failed to follow its opt-in, until
+    /// a refresh of it works: what its recording status reports, so a
+    /// switch that did not take is never shown as working. Holds only
+    /// sandboxes whose refresh failed.
+    failures: std::sync::Mutex<HashMap<i32, SidecarFailure>>,
     /// Set when the recorder started or stopped but the sandboxes to
     /// re-point could not be read: every recorded sidecar is refreshed on
     /// the next [`LocalTraffic::maintain`] until the read works.
@@ -297,6 +352,7 @@ impl SandboxTraffic {
             installation,
             sidecars,
             pending: std::sync::Mutex::new(HashSet::new()),
+            failures: std::sync::Mutex::new(HashMap::new()),
             resync: std::sync::atomic::AtomicBool::new(false),
             published: std::sync::atomic::AtomicBool::new(false),
             rows: std::sync::Mutex::new(None),
@@ -314,7 +370,67 @@ impl SandboxTraffic {
 
     /// Notes that `sandbox`'s sidecar could not be refreshed, or that it
     /// now has been.
-    fn mark_pending(&self, sandbox: i32, failed: bool) {
+    /// Why sandbox `id`'s sidecar does not follow its opt-in yet, if it
+    /// does not.
+    pub fn failure_of(&self, id: i32) -> Option<SidecarFailure> {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+    }
+
+    /// Forgets why sandbox `id`'s sidecar last failed: its sidecar was just
+    /// given its stored policy some other way (a policy update applied it).
+    /// A pending retry is kept: the update did not necessarily switch the
+    /// hand-off, and the retry is what does.
+    pub fn forget_failure(&self, id: i32) {
+        self.note_failure(id, None);
+    }
+
+    /// Remembers a refused policy for sandbox `id`, as a failed refresh
+    /// would.
+    #[cfg(test)]
+    pub(crate) fn note_refusal_for_tests(&self, id: i32) {
+        self.note_failure(
+            id,
+            Some(SidecarFailure {
+                reason: "the stored policy is not valid for this sandbox".into(),
+                retry: false,
+            }),
+        );
+    }
+
+    /// Marks the recorded set as published, as after a refresh that read
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn set_published(&self) {
+        self.published
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note_failure(&self, id: i32, failure: Option<SidecarFailure>) {
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        match failure {
+            Some(failure) => {
+                failures.insert(id, failure);
+            }
+            None => {
+                failures.remove(&id);
+            }
+        }
+    }
+
+    /// Whether sandbox `id` is kept for a sidecar retry.
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, id: i32) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&id)
+    }
+
+    pub(crate) fn mark_pending(&self, sandbox: i32, failed: bool) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if failed {
             pending.insert(sandbox);
@@ -487,12 +603,16 @@ impl SandboxTraffic {
     /// holding the claim a policy update holds, and with the policy stored
     /// for it once that claim is held. `Ok` also when there is nothing to
     /// do (gone, on a worker, not running or stopped).
-    async fn refresh_sidecar(&self, sidecars: &dyn SidecarRefresh, id: i32) -> Result<(), String> {
+    async fn refresh_sidecar(
+        &self,
+        sidecars: &dyn SidecarRefresh,
+        id: i32,
+    ) -> Result<(), SidecarFailure> {
         let _claim = sidecars.serialize(id).await;
         let row = sandboxes::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await
-            .map_err(|e| format!("could not read sandbox {id}: {e}"))?;
+            .map_err(|e| SidecarFailure::transient(format!("could not read sandbox {id}: {e}")))?;
         match row {
             Some(row) if steerable(&row) => sidecars.apply(&row).await,
             _ => Ok(()),
@@ -502,6 +622,11 @@ impl SandboxTraffic {
     /// Refreshes the sidecars of `ids`, keeping each failure for a retry.
     async fn refresh_sidecars(&self, ids: impl IntoIterator<Item = i32>, why: &str) {
         let Some(sidecars) = &self.sidecars else {
+            // Nothing to replace here: sidecars pick the hand-off up when
+            // they are next reconciled, and nothing is kept for a retry.
+            for id in ids {
+                self.mark_pending(id, false);
+            }
             return;
         };
         if !self.published.load(std::sync::atomic::Ordering::Relaxed) {
@@ -509,23 +634,40 @@ impl SandboxTraffic {
             // that publishes, then the retry replaces them.
             for id in ids {
                 self.mark_pending(id, true);
+                self.note_failure(
+                    id,
+                    Some(SidecarFailure::transient(
+                        "the recorded sandboxes could not be read for the egress proxy yet",
+                    )),
+                );
             }
             warn!(why, "egress recording: the recorded sandboxes could not be published; their egress proxies are replaced once they are");
             return;
         }
         for id in ids {
             let result = self.refresh_sidecar(sidecars.as_ref(), id).await;
-            if let Err(error) = &result {
-                warn!(sandbox = id, %error, why, "egress recording: the sandbox's egress proxy could not be refreshed; retrying");
-            }
-            self.mark_pending(id, result.is_err());
+            self.note_failure(id, result.as_ref().err().cloned());
+            let retry = match &result {
+                Ok(()) => false,
+                Err(error) if error.retry => {
+                    warn!(sandbox = id, %error, why, "egress recording: the sandbox's egress proxy could not be refreshed; retrying");
+                    true
+                }
+                Err(error) => {
+                    warn!(sandbox = id, %error, why, "egress recording: the sandbox's stored egress policy was refused; not retried until it changes");
+                    false
+                }
+            };
+            self.mark_pending(id, retry);
         }
     }
 
     /// The opt-in of sandbox `id` changed: recreate its sidecar with or
-    /// without the hand-off, when it is this host's and can be.
-    pub async fn steer(&self, id: i32) {
+    /// without the hand-off, when it is this host's and can be. Returns why
+    /// it did not take, if it did not (it is retried unless refused).
+    pub async fn steer(&self, id: i32) -> Option<SidecarFailure> {
         self.refresh_sidecars([id], "its recording changed").await;
+        self.failure_of(id)
     }
 
     /// Refreshes again the sidecars whose refresh failed.
@@ -694,6 +836,8 @@ mod tests {
     /// sandbox got which policy mode. Its claim is one lock for all.
     struct FlakySidecars {
         failures: std::sync::Mutex<u32>,
+        /// Refuses every policy as invalid (counted as applied attempts).
+        refused: std::sync::Mutex<bool>,
         applied: std::sync::Mutex<Vec<(String, EgressMode)>>,
         claim: Arc<tokio::sync::Mutex<()>>,
     }
@@ -702,6 +846,7 @@ mod tests {
         fn failing(failures: u32) -> Arc<Self> {
             Arc::new(Self {
                 failures: std::sync::Mutex::new(failures),
+                refused: std::sync::Mutex::new(false),
                 applied: std::sync::Mutex::new(Vec::new()),
                 claim: Arc::new(tokio::sync::Mutex::new(())),
             })
@@ -723,11 +868,23 @@ mod tests {
             Box::new(self.claim.clone().lock_owned().await)
         }
 
-        async fn apply(&self, row: &sandboxes::Model) -> Result<(), String> {
+        async fn apply(&self, row: &sandboxes::Model) -> Result<(), SidecarFailure> {
+            if *self.refused.lock().unwrap() {
+                self.applied
+                    .lock()
+                    .unwrap()
+                    .push((row.public_id.clone(), row.egress_policy.0.mode));
+                return Err(SidecarFailure {
+                    reason: "the stored policy is not valid for this sandbox".into(),
+                    retry: false,
+                });
+            }
             let mut failures = self.failures.lock().unwrap();
             if *failures > 0 {
                 *failures -= 1;
-                return Err("removal of the container is already in progress".into());
+                return Err(SidecarFailure::transient(
+                    "removal of the container is already in progress",
+                ));
             }
             self.applied
                 .lock()
@@ -934,6 +1091,29 @@ mod tests {
         traffic.retry_pending().await;
         assert!(traffic.pending.lock().unwrap().is_empty());
         assert_eq!(sidecars.applied_to(), vec![ON_CONTROL_PLANE.1.to_string()]);
+    }
+
+    /// A policy the provider refuses as invalid is not retried: retrying
+    /// would write the same refused policy on every maintenance pass.
+    #[tokio::test]
+    async fn a_refused_policy_is_not_retried() {
+        let Some(f) = fixture().await else { return };
+        let sidecars = FlakySidecars::failing(0);
+        *sidecars.refused.lock().unwrap() = true;
+        let traffic = traffic(f.db.connection_arc(), sidecars.clone());
+        traffic.steer(ON_CONTROL_PLANE.0).await;
+        assert!(
+            traffic.pending.lock().unwrap().is_empty(),
+            "not kept for a retry"
+        );
+        traffic.retry_pending().await;
+        assert_eq!(sidecars.applied_to().len(), 1, "tried once");
+        assert!(
+            !SidecarFailure::from(temps_agent_core::error::AgentError::Validation {
+                message: "bad".into()
+            })
+            .retry
+        );
     }
 
     /// The recorder started while the recorded sandboxes could not be read:

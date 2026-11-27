@@ -43,7 +43,9 @@ use temps_entities::preset::Preset;
 use temps_entities::{deployment_containers, deployments, environments, projects};
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::LocalEgressRecorder;
-use temps_workload_egress::steering::{proxy_variables, url_hosts, InstallationId, ProxyVariables};
+use temps_workload_egress::steering::{
+    proxy_variables_with_image, url_hosts, InstallationId, ProxyVariables,
+};
 use temps_workload_egress::{
     EgressActivityPage, EgressOutcomeFilter, EgressRecordingError, EgressRecordingService,
     EgressRecordingStatus, RecordedWorkload, WorkloadEgressAdapter, CONTROL_PLANE_NODE_ID,
@@ -107,7 +109,14 @@ impl RecordedEgress {
     }
 
     /// The variables to add to a local replica's, when it is steered.
-    pub fn variables(self, existing: &HashMap<String, String>) -> Option<ProxyVariables> {
+    /// `image` are its image's `ENV` entries that name internal hosts
+    /// ([`temps_workload_egress::steering::image_host_variables`]): kept
+    /// direct unless `existing` replaces them.
+    pub fn variables(
+        self,
+        existing: &HashMap<String, String>,
+        image: &HashMap<String, String>,
+    ) -> Option<ProxyVariables> {
         let Self::Proxy(address, _) = self else {
             return None;
         };
@@ -116,7 +125,9 @@ impl RecordedEgress {
                 .iter()
                 .filter_map(|name| existing.get(*name).map(String::as_str)),
         );
-        Some(proxy_variables(address, existing, &platform))
+        Some(proxy_variables_with_image(
+            address, existing, image, &platform,
+        ))
     }
 }
 
@@ -128,6 +139,11 @@ fn serves_files(project: &projects::Model) -> bool {
         Ok(Some(preset)) => !preset.needs_container_build() || preset.static_output_dir().is_some(),
         _ => false,
     }
+}
+
+/// [`running_container`] for a status already read.
+fn is_running_status(status: Option<&str>) -> bool {
+    matches!(status, None | Some("running"))
 }
 
 /// A container row that runs, or has not said yet: not stopped, exited,
@@ -147,27 +163,43 @@ async fn recorded(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let placements: Vec<(i32, Option<i32>)> = deployment_containers::Entity::find()
-        .select_only()
-        .column(deployments::Column::EnvironmentId)
-        .column(deployment_containers::Column::NodeId)
-        .distinct()
-        .join(
-            JoinType::InnerJoin,
-            deployment_containers::Relation::Deployment.def(),
-        )
-        .filter(deployments::Column::EnvironmentId.is_in(rows.iter().map(|row| row.id)))
-        .filter(deployment_containers::Column::DeletedAt.is_null())
-        // Only a running replica places the environment on a node: one
-        // stopped from the console keeps its row, and neither blocks nor
-        // allows recording on the node it no longer runs on.
-        .filter(running_container())
-        .into_tuple()
-        .all(db)
-        .await
-        .map_err(EgressRecordingError::db(
-            "reading where an environment's containers run",
-        ))?;
+    let current_deployments: Vec<i32> = rows
+        .iter()
+        .filter_map(|row| row.current_deployment_id)
+        .collect();
+    let placements: Vec<(i32, Option<i32>, Option<String>, i32)> =
+        deployment_containers::Entity::find()
+            .select_only()
+            .column(deployments::Column::EnvironmentId)
+            .column(deployment_containers::Column::NodeId)
+            .column(deployment_containers::Column::Status)
+            .column(deployment_containers::Column::DeploymentId)
+            .distinct()
+            .join(
+                JoinType::InnerJoin,
+                deployment_containers::Relation::Deployment.def(),
+            )
+            .filter(deployments::Column::EnvironmentId.is_in(rows.iter().map(|row| row.id)))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            // Running containers, and those of each environment's current
+            // deployment whatever their status: only a running replica places
+            // the environment on a node (one stopped from the console neither
+            // blocks nor allows recording on the node it no longer runs on),
+            // and whether it runs images is said by a running one or by its
+            // current deployment's (stopped from the console). Other stopped
+            // rows (retained failed candidates, history) say nothing and are
+            // never read, so this stays bounded by what runs now.
+            .filter(
+                sea_orm::Condition::any()
+                    .add(running_container())
+                    .add(deployment_containers::Column::DeploymentId.is_in(current_deployments)),
+            )
+            .into_tuple()
+            .all(db)
+            .await
+            .map_err(EgressRecordingError::db(
+                "reading where an environment's containers run",
+            ))?;
     // A Compose stack's containers are started by Compose, not by the
     // deploy path that steers replicas to the recorder: nothing would ever
     // reach it, so such an environment cannot record at all.
@@ -218,7 +250,19 @@ async fn recorded(
             .collect()
     };
     let mut nodes: HashMap<i32, Vec<i32>> = HashMap::new();
-    for (environment_id, node_id) in placements {
+    let current: HashMap<i32, i32> = rows
+        .iter()
+        .filter_map(|row| row.current_deployment_id.map(|id| (row.id, id)))
+        .collect();
+    let mut runs_images: HashSet<i32> = HashSet::new();
+    for (environment_id, node_id, status, deployment_id) in placements {
+        let running = is_running_status(status.as_deref());
+        if running || current.get(&environment_id) == Some(&deployment_id) {
+            runs_images.insert(environment_id);
+        }
+        if !running {
+            continue;
+        }
         let node_id = node_id.unwrap_or(CONTROL_PLANE_NODE_ID);
         let placed = nodes.entry(environment_id).or_default();
         if !placed.contains(&node_id) {
@@ -230,7 +274,10 @@ async fn recorded(
         .map(|row| {
             let mut placed = nodes.remove(&row.id).unwrap_or_default();
             placed.sort_unstable();
-            let files_only = placed.is_empty();
+            // A static project deployed as an image keeps its containers'
+            // rows when they are stopped: only one whose current deployment
+            // has none (and that runs none) is files alone.
+            let files_only = !runs_images.contains(&row.id);
             RecordedWorkload {
                 workload: workload(row.id),
                 public_id: row.id.to_string(),
@@ -247,8 +294,8 @@ async fn recorded(
                     )
                 } else if static_sites.contains(&row.project_id) && files_only {
                     // A static project can still be deployed as an image,
-                    // which runs a replica like any other: only one with no
-                    // running replica is files alone.
+                    // which runs a replica like any other: only one whose
+                    // current deployment has no container is files alone.
                     Some(
                         "a static site is published as files and served by the proxy: its \
                          deployments start no container to make outbound connections, so \
@@ -376,10 +423,13 @@ impl WorkloadEgressAdapter for EnvironmentEgressAdapter {
 
     /// Containers already going through the recorder start or stop being
     /// recorded at once; the rest follow when they are next deployed.
-    async fn changed(&self, _workload: &RecordedWorkload) {
+    /// Nothing to switch here: a container follows the opt-in when it is
+    /// next deployed, which the status and the handler say.
+    async fn changed(&self, _workload: &RecordedWorkload) -> Option<String> {
         if let Some(recorder) = self.recorder.get().and_then(std::sync::Weak::upgrade) {
             recorder.refresh().await;
         }
+        None
     }
 }
 

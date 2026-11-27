@@ -30369,7 +30369,7 @@
             ]
           },
           "reason_code": {
-            "description": "Why recording cannot work, when `configured` is false:\n`otel_unavailable`; `not_recordable` when nothing routes this\nworkload's traffic to a recorder (a backend or deployment kind it\nhas no route for); or the `reason_code` of the node that cannot\nrecord.",
+            "description": "Why recording cannot work, when `configured` is false:\n`otel_unavailable`; `not_recordable` when nothing routes this\nworkload's traffic to a recorder (a backend or deployment kind it\nhas no route for); `not_applied` when it is on but the workload's\ntraffic could not be switched to the recorder yet (retried); or the\n`reason_code` of the node that cannot record.",
             "type": [
               "string",
               "null"

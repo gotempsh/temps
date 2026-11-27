@@ -130,6 +130,22 @@ pub fn image_routing_variables<'a>(
         .collect()
 }
 
+/// The entries of an image's `ENV` (`NAME=value`) that point at internal
+/// hosts (`INVENTORY_URL=https://inventory`, `DB_HOST=postgres-main`), for
+/// [`proxy_variables_with_image`]: a container reaches them as its image
+/// says unless its own variables replace them, so they stay direct too.
+/// Read the way the workload's own variables are: never a credential, and
+/// only hosts that are internal ([`is_internal`]), so an image cannot
+/// exempt a public destination from recording.
+pub fn image_host_variables<'a>(env: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+    env.into_iter()
+        .filter_map(|entry| entry.split_once('='))
+        .filter(|(name, _)| !ROUTING_VARIABLES.contains(name))
+        .filter(|(name, value)| !direct_hosts_in(name, value).is_empty())
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
 /// Destinations that never go through the recorder: this host, private and
 /// link-local ranges (for the clients that take ranges) and internal name
 /// suffixes.
@@ -157,6 +173,15 @@ pub struct ProxyVariables {
     /// The variables that already route the workload through a proxy of
     /// its own, left alone: nothing is steered then.
     pub kept: Vec<String>,
+    /// The variables naming a single-label host put in `NO_PROXY`
+    /// (`INVENTORY_URL=https://inventory`, a container or alias only the
+    /// workload's network resolves): their names, never their values,
+    /// which may be secret. Clients read such an entry as a domain suffix
+    /// too, so HTTPS to any host under it (`*.inventory`, or `*.dev` for a
+    /// service named `dev`) also goes direct and is not recorded; the
+    /// deploy log names these variables. Kept direct anyway: through the
+    /// recorder, which cannot resolve them, the workload's calls would fail.
+    pub bare_name_variables: Vec<String>,
 }
 
 impl ProxyVariables {
@@ -174,6 +199,19 @@ impl ProxyVariables {
 pub fn proxy_variables(
     proxy: SocketAddr,
     existing: &HashMap<String, String>,
+    direct: &[String],
+) -> ProxyVariables {
+    proxy_variables_with_image(proxy, existing, &HashMap::new(), direct)
+}
+
+/// [`proxy_variables`], also keeping direct the internal hosts the image's
+/// `ENV` names (`image`, from [`image_host_variables`]) that the
+/// workload's own variables do not replace: a variable `existing` sets is
+/// the one the container sees, so the image's value of it is not read.
+pub fn proxy_variables_with_image(
+    proxy: SocketAddr,
+    existing: &HashMap<String, String>,
+    image: &HashMap<String, String>,
     direct: &[String],
 ) -> ProxyVariables {
     let set = |name: &str| existing.get(name).is_some_and(|value| !value.is_empty());
@@ -205,13 +243,27 @@ pub fn proxy_variables(
     }
     ALWAYS_DIRECT.iter().copied().for_each(&mut add);
     direct.iter().map(String::as_str).for_each(&mut add);
-    let mut internal: Vec<String> = existing
-        .iter()
-        .flat_map(|(name, value)| hosts_in(name, value))
-        .filter(|host| is_internal(host))
-        .collect();
+    // What the container sees: its own variables, then the image's that
+    // it does not replace.
+    let effective = existing.iter().chain(
+        image
+            .iter()
+            .filter(|(name, _)| !existing.contains_key(name.as_str())),
+    );
+    let mut internal: Vec<String> = Vec::new();
+    let mut bare_name_variables: Vec<String> = Vec::new();
+    for (name, value) in effective {
+        let hosts = direct_hosts_in(name, value);
+        if hosts.iter().any(|host| is_bare_name(host)) {
+            bare_name_variables.push(name.clone());
+        }
+        internal.extend(hosts);
+    }
     internal.sort();
     internal.iter().map(String::as_str).for_each(&mut add);
+    bare_name_variables.sort();
+    bare_name_variables.dedup();
+    steering.bare_name_variables = bare_name_variables;
 
     let no_proxy = entries.join(",");
     steering
@@ -231,6 +283,12 @@ pub fn url_hosts<'a>(values: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     hosts
 }
 
+/// A single-label name, such as a container name: not an address, not
+/// `localhost`, no dot.
+fn is_bare_name(host: &str) -> bool {
+    host.parse::<IpAddr>().is_err() && host != "localhost" && !host.contains('.')
+}
+
 /// A destination that is inside the platform or this host: a name without
 /// a dot (a container name), an internal suffix, or an address that is not
 /// public.
@@ -245,10 +303,51 @@ pub fn is_internal(host: &str) -> bool {
             .any(|suffix| host.ends_with(suffix))
 }
 
+/// The internal hosts `name=value` names that must stay direct. A dotted
+/// internal name or a private address always does. A single-label name
+/// (`inventory`) only when it is the host of an `https://` or `wss://` URL:
+/// only HTTPS goes through the recorder, and clients read a single-label
+/// `NO_PROXY` entry as a domain suffix too (`dev` would exempt every
+/// `*.dev` host), so a name a database driver or a plain-HTTP call uses
+/// (`DB_HOST=dev`, `postgres://postgres-main`, `http://inventory`) is
+/// never put there.
+fn direct_hosts_in(name: &str, value: &str) -> Vec<String> {
+    let https = https_hosts_in(value);
+    hosts_in(name, value)
+        .into_iter()
+        .filter(|host| is_internal(host))
+        .filter(|host| !is_bare_name(host) || https.contains(host))
+        .collect()
+}
+
+/// The hosts of the `https://` and `wss://` URLs in `value`.
+fn https_hosts_in(value: &str) -> Vec<String> {
+    let lower = value.to_ascii_lowercase();
+    let mut hosts = Vec::new();
+    for (at, _) in lower.match_indices("://") {
+        let scheme = &lower[..at];
+        if !(scheme.ends_with("https") || scheme.ends_with("wss")) {
+            continue;
+        }
+        let url = &value[at..];
+        let end = url[3..]
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .map_or(url.len(), |end| end + 3);
+        hosts.extend(url_hosts_in(&url[..end]));
+    }
+    hosts
+}
+
 /// The hosts a variable names: every host of a URL in its value (a
 /// connection string may list several), or the value itself when the
 /// variable is a host (`REDIS_HOST=redis-cache`).
 fn hosts_in(name: &str, value: &str) -> Vec<String> {
+    // A credential is never read, whatever its value looks like: a password
+    // such as `prefix://secret` would otherwise be taken for a URL and its
+    // "host" copied into `NO_PROXY`.
+    if is_credential(name) {
+        return Vec::new();
+    }
     let hosts = url_hosts_in(value);
     if !hosts.is_empty() || !names_a_host(name) {
         return hosts;
@@ -276,15 +375,39 @@ const CREDENTIAL_WORDS: [&str; 10] = [
 /// not: its value would otherwise be copied verbatim into `NO_PROXY`,
 /// which diagnostics print.
 fn names_a_host(name: &str) -> bool {
+    if is_credential(name) {
+        return false;
+    }
     let upper = name.to_ascii_uppercase();
     let words: Vec<&str> = upper
         .split(['_', '-', '.'])
         .filter(|w| !w.is_empty())
         .collect();
-    if words.iter().any(|word| CREDENTIAL_WORDS.contains(word)) {
-        return false;
-    }
     matches!(words.last(), Some(&"HOST") | Some(&"HOSTNAME")) || upper.ends_with("HOST")
+}
+
+/// Last words that make a variable a locator, whatever else its name
+/// says: `AUTH_URL`, `TOKEN_ENDPOINT` and `KEY_SERVER_HOST` hold where a
+/// service is, not a secret.
+const LOCATOR_WORDS: [&str; 9] = [
+    "URL", "URI", "ENDPOINT", "HOST", "HOSTNAME", "ADDR", "ADDRESS", "SERVER", "DSN",
+];
+
+/// Whether `name` holds a credential, whose value is never read: a word of
+/// it says credential (`DATABASE_PASSWORD`, `HOSTING_API_TOKEN`,
+/// `HOST_KEY`) and its last word does not make it a locator (`AUTH_URL`,
+/// `OAUTH_TOKEN_URL`, whose hosts are read like any URL's; a URL's
+/// credentials are never taken as its host).
+fn is_credential(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let words: Vec<&str> = upper
+        .split(['_', '-', '.'])
+        .filter(|w| !w.is_empty())
+        .collect();
+    let locator = words
+        .last()
+        .is_some_and(|last| LOCATOR_WORDS.contains(last));
+    !locator && words.iter().any(|word| CREDENTIAL_WORDS.contains(word))
 }
 
 /// Every host after a `://` in `value`: `scheme://[user[:pass]@]host[:port]`,
@@ -354,16 +477,16 @@ mod tests {
             ("HOSTING_API_TOKEN", "abcdef0123456789secret"),
             ("REDIS_HOST_PASSWORD", "hunter2value"),
             ("HOST_KEY", "keyvalue99"),
-            ("REDIS_HOST", "redis-cache"),
-            ("PGHOST", "postgres-main"),
-            ("DB_HOSTNAME", "db-primary"),
+            ("REDIS_HOST", "redis.internal"),
+            ("PGHOST", "postgres-main.temps.local"),
+            ("DB_HOSTNAME", "10.20.0.8"),
         ]);
         let steering = proxy_variables(proxy(), &existing, &[]);
         let entries = no_proxy(&steering);
         for secret in ["abcdef0123456789secret", "hunter2value", "keyvalue99"] {
             assert!(!entries.contains(&secret), "{secret} leaked: {entries:?}");
         }
-        for host in ["redis-cache", "postgres-main", "db-primary"] {
+        for host in ["redis.internal", "postgres-main.temps.local", "10.20.0.8"] {
             assert!(entries.contains(&host), "{host} missing: {entries:?}");
         }
     }
@@ -428,21 +551,22 @@ mod tests {
             ("S3_ENDPOINT", "http://10.20.0.7:9000"),
             ("REDIS_HOST", "redis-cache"),
             ("CACHE_HOSTNAME", "cache.temps.local:6379"),
+            ("INVENTORY_URL", "https://inventory:8443/v1"),
             ("PAYMENTS_API", "https://api.example.com/v1"),
             ("PUBLIC_HOST", "www.example.com"),
             ("NODE_ENV", "production"),
         ]);
         let steering = proxy_variables(proxy(), &existing, &[]);
         let direct = no_proxy(&steering);
-        for host in [
-            "postgres-main",
-            "mongo-a",
-            "mongo-b",
-            "10.20.0.7",
-            "redis-cache",
-            "cache.temps.local",
-        ] {
+        for host in ["10.20.0.7", "cache.temps.local", "inventory"] {
             assert!(direct.contains(&host), "{host} in {direct:?}");
+        }
+        // A single-label name only an HTTPS URL needs direct: a database
+        // driver's (`postgres://postgres-main`, `REDIS_HOST=redis-cache`)
+        // never goes through the proxy, and in NO_PROXY it would exempt
+        // every host under it as a suffix.
+        for not_needed in ["postgres-main", "mongo-a", "mongo-b", "redis-cache"] {
+            assert!(!direct.contains(&not_needed), "{not_needed} in {direct:?}");
         }
         for recorded in ["api.example.com", "www.example.com", "production", "app"] {
             assert!(!direct.contains(&recorded), "{recorded} in {direct:?}");
@@ -524,6 +648,109 @@ mod tests {
         let steering = proxy_variables(proxy(), &image, &[]);
         assert_eq!(steering.kept, ["HTTPS_PROXY"]);
         assert!(!steering.steers());
+    }
+
+    /// An internal host named only in the image's `ENV` stays direct as
+    /// well: a call to `https://inventory` that worked before recording
+    /// keeps working. A public host or a credential in it is never read,
+    /// and an image variable the deployment replaces is not read either:
+    /// the container never sees its value.
+    #[test]
+    fn internal_hosts_the_image_names_stay_direct_unless_replaced() {
+        let image = image_host_variables([
+            "INVENTORY_URL=https://inventory",
+            "DB_HOST=postgres-main.temps.local",
+            "API_URL=https://dev",
+            "PAYMENTS_API=https://api.example.com",
+            "REDIS_HOST_PASSWORD=hunter2value",
+            "PATH=/usr/local/bin:/usr/bin",
+        ]);
+        let mut names: Vec<&str> = image.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["API_URL", "DB_HOST", "INVENTORY_URL"]);
+        // The deployment replaces API_URL with a public host.
+        let existing = variables(&[("API_URL", "https://api.example.dev")]);
+        let steering = proxy_variables_with_image(proxy(), &existing, &image, &[]);
+        let direct = no_proxy(&steering);
+        for host in ["inventory", "postgres-main.temps.local"] {
+            assert!(direct.contains(&host), "{host}: {direct:?}");
+        }
+        for recorded in ["dev", "api.example.dev", "api.example.com"] {
+            assert!(!direct.contains(&recorded), "{recorded}: {direct:?}");
+        }
+    }
+
+    /// A single-label host a database driver or plain HTTP uses
+    /// (`DB_HOST=dev`) is never put in `NO_PROXY`, where clients would also
+    /// read it as a suffix and send every `*.dev` HTTPS call around the
+    /// recorder. One an HTTPS URL names is (the call would fail through
+    /// the recorder), and its variable is reported by name, never value.
+    #[test]
+    fn single_label_hosts_are_kept_direct_only_for_https() {
+        let existing = variables(&[
+            ("DB_HOST", "dev"),
+            ("CACHE_URL", "http://cache"),
+            ("CACHE_HOSTNAME", "cache.temps.local"),
+            ("S3_ENDPOINT", "http://10.20.0.7:9000"),
+        ]);
+        let image = variables(&[("INVENTORY_URL", "https://inventory")]);
+        let steering = proxy_variables_with_image(proxy(), &existing, &image, &[]);
+        let direct = no_proxy(&steering);
+        assert!(!direct.contains(&"dev"), "{direct:?}");
+        assert!(!direct.contains(&"cache"), "{direct:?}");
+        assert!(direct.contains(&"inventory"), "{direct:?}");
+        assert_eq!(steering.bare_name_variables, ["INVENTORY_URL"]);
+        assert_eq!(
+            https_hosts_in("https://inventory:8443/x, http://other"),
+            ["inventory"]
+        );
+        assert_eq!(https_hosts_in("WSS://Feed/live"), ["feed"]);
+        assert!(proxy_variables(proxy(), &HashMap::new(), &[])
+            .bare_name_variables
+            .is_empty());
+    }
+
+    /// A locator whose name mentions a credential word is still read: the
+    /// internal auth service an `AUTH_URL` names stays direct, so turning
+    /// recording on does not break it.
+    #[test]
+    fn a_locator_named_after_auth_or_tokens_is_read() {
+        let existing = variables(&[
+            ("AUTH_URL", "https://auth-service"),
+            ("OAUTH_TOKEN_URL", "https://idp.internal/token"),
+            ("AUTH_SERVER_HOST", "auth-primary.internal"),
+        ]);
+        let steering = proxy_variables(proxy(), &existing, &[]);
+        let direct = no_proxy(&steering);
+        for host in ["auth-service", "idp.internal", "auth-primary.internal"] {
+            assert!(direct.contains(&host), "{host}: {direct:?}");
+        }
+        for credential in [
+            "HOST_KEY",
+            "DATABASE_PASSWORD",
+            "HOSTING_API_TOKEN",
+            "AUTH_SECRET",
+        ] {
+            assert!(is_credential(credential), "{credential}");
+        }
+        for locator in ["AUTH_URL", "TOKEN_ENDPOINT", "REDIS_HOST", "KEYCLOAK_URL"] {
+            assert!(!is_credential(locator), "{locator}");
+        }
+    }
+
+    /// A credential is never read as a URL, whatever its value looks like:
+    /// a password `prefix://secret` puts nothing in `NO_PROXY` and names no
+    /// variable for the deploy log.
+    #[test]
+    fn a_url_shaped_credential_is_never_read() {
+        let existing = variables(&[("DATABASE_PASSWORD", "prefix://privatepassphrase")]);
+        let steering = proxy_variables(proxy(), &existing, &[]);
+        assert!(
+            !steering.variables["NO_PROXY"].contains("privatepassphrase"),
+            "{steering:?}"
+        );
+        assert!(steering.bare_name_variables.is_empty());
+        assert!(image_host_variables(["API_TOKEN=x://privatepassphrase"]).is_empty());
     }
 
     #[test]

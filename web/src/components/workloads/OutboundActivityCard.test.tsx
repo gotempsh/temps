@@ -14,11 +14,13 @@ import type {
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import {
+  activityPages,
   describeDestination,
   environmentEgress,
   EXAMPLE_RECORDS,
   formatDuration,
   outcomeVariant,
+  pageAfterEmpty,
   sandboxEgress,
 } from './egress-recording'
 import { OutboundActivityCard } from './OutboundActivityCard'
@@ -213,6 +215,15 @@ test('destinations read as the workload asked for them', () => {
       record({ kind: 'forward', port: 8080, method: 'GET', path: '/' })
     )
   ).toBe('GET api.example.com:8080/')
+  // IPv6 literals keep their brackets, so the port stays apart.
+  expect(describeDestination(record({ host: '2001:db8::1' }))).toBe(
+    'CONNECT [2001:db8::1]:443'
+  )
+  expect(
+    describeDestination(
+      record({ kind: 'forward', host: '2001:db8::1', port: 80, path: '/' })
+    )
+  ).toBe('GET [2001:db8::1]/')
   expect(describeDestination(record({ kind: 'relay', relay: 'model' }))).toBe(
     'Temps model relay'
   )
@@ -253,5 +264,125 @@ test('a later page emptied by retention goes back to the records left', async ()
   expect(asked).toContain('2')
   expect(asked[asked.length - 1]).toBe('1')
   expect(card.getByText('CONNECT h0.example.com:443')).toBeTruthy()
+  api.restore()
+})
+
+test('a page that says more follow offers the next one, whatever the count says', async () => {
+  // The total is a recent count: it says 20 while a 21st record arrived.
+  const asked: string[] = []
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/egress-recording': () =>
+      jsonResponse(status(true)),
+    'GET /v1/sandboxes/sbx_1/egress-records': (request) => {
+      const query = new URL(request.url).searchParams
+      asked.push(query.get('page') ?? '')
+      if (query.get('page') === '2') {
+        return jsonResponse({
+          ...page([record({ host: 'oldest.example.com' })], 20),
+          page: 2,
+        })
+      }
+      const first = Array.from({ length: 20 }, (_, i) =>
+        record({ host: `h${i}.example.com` })
+      )
+      return jsonResponse({ ...page(first, 20), has_more: true })
+    },
+  })
+  const card = view(<OutboundActivityCard workload={sandboxEgress('sbx_1')} />)
+  await settle()
+  const next = card.getAllByRole('button', { name: /next/i })[0]
+  next.click()
+  await settle()
+  expect(asked).toContain('2')
+  expect(card.getByText('CONNECT oldest.example.com:443')).toBeTruthy()
+  api.restore()
+})
+
+test('a later page keeps its way back when the count lags behind', async () => {
+  // The count says 19 while 21 records exist: page one says more follow,
+  // page two holds one record and says none do.
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/egress-recording': () =>
+      jsonResponse(status(true)),
+    'GET /v1/sandboxes/sbx_1/egress-records': (request) => {
+      const query = new URL(request.url).searchParams
+      if (query.get('page') === '2') {
+        return jsonResponse({
+          ...page([record({ host: 'oldest.example.com' })], 19),
+          page: 2,
+          has_more: false,
+        })
+      }
+      const first = Array.from({ length: 20 }, (_, i) =>
+        record({ host: `h${i}.example.com` })
+      )
+      return jsonResponse({ ...page(first, 19), has_more: true })
+    },
+  })
+  const card = view(<OutboundActivityCard workload={sandboxEgress('sbx_1')} />)
+  await settle()
+  card.getAllByRole('button', { name: /next/i })[0].click()
+  await settle()
+  expect(card.getByText('CONNECT oldest.example.com:443')).toBeTruthy()
+  expect(
+    card.getAllByRole('button', { name: /previous/i }).length
+  ).toBeGreaterThan(0)
+  api.restore()
+})
+
+test('the pager never shows fewer records than the pages seen hold', () => {
+  // Page 2 holds the 21st record while the count still says 19.
+  expect(
+    activityPages({
+      total: 19,
+      page: 2,
+      pageSize: 20,
+      shown: 1,
+      hasMore: false,
+    })
+  ).toEqual({ total: 21, totalPages: 2 })
+  // Page 1 is full and more follow while the count says 20.
+  expect(
+    activityPages({
+      total: 20,
+      page: 1,
+      pageSize: 20,
+      shown: 20,
+      hasMore: true,
+    })
+  ).toEqual({ total: 21, totalPages: 2 })
+  // An exact count is kept as it is.
+  expect(
+    activityPages({
+      total: 45,
+      page: 1,
+      pageSize: 20,
+      shown: 20,
+      hasMore: true,
+    })
+  ).toEqual({ total: 45, totalPages: 3 })
+  expect(
+    activityPages({ total: 0, page: 1, pageSize: 20, shown: 0, hasMore: false })
+  ).toEqual({ total: 0, totalPages: 1 })
+})
+
+test('an emptied deep page goes straight to the last page the count fills', () => {
+  // Page 1000 emptied by retention, one page left: straight to page 1.
+  expect(pageAfterEmpty({ total: 3, page: 1000, pageSize: 20 })).toBe(1)
+  expect(pageAfterEmpty({ total: 0, page: 5, pageSize: 20 })).toBe(1)
+  // Only the last page emptied: one back.
+  expect(pageAfterEmpty({ total: 40, page: 3, pageSize: 20 })).toBe(2)
+})
+
+test('an unknown recording status never says recording is off', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/egress-recording': () =>
+      jsonResponse({ title: 'Unavailable' }, 503),
+    'GET /v1/sandboxes/sbx_1/egress-records': () => jsonResponse(page([])),
+  })
+  const card = view(<OutboundActivityCard workload={sandboxEgress('sbx_1')} />)
+  await settle()
+  expect(card.queryByText('Recording is off')).toBeNull()
+  expect(card.getByText('No connections recorded yet.')).toBeTruthy()
   api.restore()
 })

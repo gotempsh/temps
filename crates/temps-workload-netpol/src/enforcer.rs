@@ -400,6 +400,15 @@ pub trait PolicySource: Send + Sync {
     async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
         self.snapshot().await.map(Some)
     }
+    /// In `off`: [`Self::off_snapshot`], but only when a policy in it
+    /// records, the one case an `off` pass has a use for it. A source that
+    /// holds its snapshot can answer without copying it.
+    async fn off_recording_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        Ok(self
+            .off_snapshot()
+            .await?
+            .filter(|snapshot| snapshot.egress.iter().any(|policy| policy.record)))
+    }
     /// The workloads this node observed on a pass, before remote peers are
     /// merged in: what other nodes need to know about this one. Called on
     /// every pass outside `off`.
@@ -897,15 +906,16 @@ impl NodeEnforcer {
     /// what is observed is reported to no one who reads it: with no policy
     /// that records, the containers are not listed at all, so an idle node
     /// costs nothing per pass whatever it runs.
+    ///
+    /// A pass that observes nothing also reports nothing: what the node last
+    /// observed is cleared, so a node later switched back to `enforce` or
+    /// `shadow` never sends an old map (whose addresses may have passed to
+    /// other containers meanwhile) as if it were fresh.
     async fn observe_only(&mut self) -> Result<(), EnforcerError> {
-        let Some(snapshot) = self.policies.off_snapshot().await? else {
-            self.egress.store(Arc::new(EgressTable::default()));
+        let Some(snapshot) = self.policies.off_recording_snapshot().await? else {
+            self.observe_nothing();
             return Ok(());
         };
-        if !snapshot.egress.iter().any(|policy| policy.record) {
-            self.egress.store(Arc::new(EgressTable::default()));
-            return Ok(());
-        }
         match self.observe(&snapshot).await {
             Ok(observed) => {
                 self.publish_egress(&snapshot, &observed.local, &observed.identities);
@@ -917,10 +927,17 @@ impl NodeEnforcer {
                     "could not observe this node's workloads; the egress-proxy table is empty \
                      until the next pass (nothing is filtered in off)"
                 );
-                self.egress.store(Arc::new(EgressTable::default()));
+                self.observe_nothing();
             }
         }
         Ok(())
+    }
+
+    /// An `off` pass that observed nothing: an empty egress table, and an
+    /// empty observation for the source to report.
+    fn observe_nothing(&self) {
+        self.egress.store(Arc::new(EgressTable::default()));
+        self.policies.observed(&IdentityMap::new());
     }
 
     /// Publishes the egress-proxy table of this node's workloads.
@@ -2171,6 +2188,31 @@ mod tests {
             "no Docker call"
         );
         assert!(h.egress.load().is_empty());
+    }
+
+    /// A node switched to `off` without recording observes nothing, and
+    /// reports nothing either: what it observed while enforcing is cleared,
+    /// so switched back it never republishes addresses that may have
+    /// passed to other containers meanwhile.
+    #[tokio::test]
+    async fn off_without_recording_forgets_what_it_observed() {
+        let mut h = harness(NodeMode::Off);
+        h.enforcer.reconcile().await.unwrap();
+        assert!(
+            h.policies.last_observed().address_count() > 0,
+            "observed while its snapshot records"
+        );
+        let mut snapshot = harness_snapshot();
+        for policy in &mut snapshot.egress {
+            policy.record = false;
+        }
+        h.policies.set_snapshot(snapshot);
+        h.enforcer.reconcile().await.unwrap();
+        assert_eq!(
+            h.policies.last_observed().address_count(),
+            0,
+            "nothing left to republish"
+        );
     }
 
     /// A source with no snapshot in `off`: an older control plane.

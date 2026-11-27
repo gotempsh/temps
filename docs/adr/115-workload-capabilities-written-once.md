@@ -139,9 +139,18 @@ How traffic reaches the proxy is the one part that really differs:
   - only replicas on the control plane are recorded until worker agents
     serve the proxy, and only replicas of image deployments: a Compose
     environment cannot turn recording on;
-  - a first deployment's replicas are let through unrecorded until the
-    deployment is marked complete and the database places them on the node;
-    later replicas of a placed environment are recorded from the start;
+  - a first deployment's replicas are recorded from their first connection,
+    before the deployment is marked complete: ingest takes the control
+    plane's own records for an environment placed nowhere yet (never a
+    worker's, and never for an environment placed on other nodes only);
+  - HTTP clients read a single-label name in `NO_PROXY` as a domain suffix
+    too, so one is put there only when an `https://` (or `wss://`) URL the
+    workload is given names it (`INVENTORY_URL=https://inventory`): through
+    the recorder that call would fail. HTTPS to `*.inventory` then goes
+    direct and unrecorded too, and the deploy log names the variables that
+    hold such a host, never their values. A single-label host a database
+    driver or plain HTTP uses (`DB_HOST=dev`, `postgres://postgres-main`)
+    never goes through the proxy and is never put there;
   - the proxy knows a caller by the address Docker gave its container, so
     the deploy path announces a new replica to the recorder as soon as it is
     created. A connection made in the instant before that is refused.

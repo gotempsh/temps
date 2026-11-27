@@ -1068,7 +1068,18 @@ async fn log_records_are_stored_and_read_per_workload() {
         "the same id of another kind is another workload"
     );
 
-    let unowned = storage.query_logs(of(sandbox(44), 0)).await.expect("query");
+    // Project 0 names no project: nothing, never everything.
+    let none = storage.query_logs(of(sandbox(44), 0)).await.expect("query");
+    assert!(none.is_empty(), "{none:?}");
+    // Only a caller that authorized the workload itself reads it in any
+    // project, or none.
+    let unowned = storage
+        .query_logs(LogQuery {
+            workload_in_any_project: true,
+            ..of(sandbox(44), 0)
+        })
+        .await
+        .expect("query");
     assert_eq!(
         unowned
             .iter()

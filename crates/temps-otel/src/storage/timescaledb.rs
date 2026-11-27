@@ -4401,13 +4401,13 @@ fn parse_span_row(row: &sea_orm::QueryResult) -> Result<SpanRecord, OtelError> {
 /// parameter index. Shared by the query and its count so both always apply
 /// exactly the same filters.
 fn log_filter(query: &LogQuery) -> StorageResult<(String, Vec<sea_orm::Value>, u32)> {
-    // A workload's records are read by the workload: they are its own
-    // whether or not a project owns them, and only the platform fills those
-    // columns. With a project (> 0) they are read within it as well, so a
-    // project-scoped request naming a workload never reaches past its
-    // project. Everything else is read by project.
+    // A workload's records are read by the workload columns, which only the
+    // platform fills, and within the project, whatever its id (a request
+    // naming project 0 or a negative one finds nothing, never everything).
+    // Only a caller that authorized the workload itself reads its records
+    // in any project. Everything else is read by project.
     let (mut where_clauses, mut values, mut param_idx) = match query.workload {
-        Some(workload) if query.project_id > 0 => (
+        Some(workload) if !query.workload_in_any_project => (
             vec![
                 "workload_kind = $1".to_string(),
                 "workload_id = $2".to_string(),
@@ -4646,9 +4646,9 @@ mod tests {
     use chrono::TimeZone;
     use std::collections::BTreeMap;
 
-    /// A workload filter from a project-scoped request reads that
-    /// workload's records within the project only; without a project (a
-    /// caller that authorized the workload itself) by the workload alone.
+    /// A workload filter reads that workload's records within the project,
+    /// whatever the project id; only a caller that authorized the workload
+    /// itself (`workload_in_any_project`) reads them by the workload alone.
     #[test]
     fn a_workload_filter_stays_inside_its_project() {
         let workload = temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 42);
@@ -4665,9 +4665,23 @@ mod tests {
         assert_eq!(values.len(), 3);
         assert_eq!(next, 4);
 
+        // A project id of 0 or below is a project like any other: nothing
+        // is lifted by naming it.
+        for project_id in [0, -1] {
+            let (sql, values, _) = log_filter(&LogQuery {
+                project_id,
+                workload: Some(workload),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(sql.contains("project_id = $3"), "{project_id}: {sql}");
+            assert_eq!(values.len(), 3);
+        }
+
+        // Only an explicit read of the workload in any project lifts it.
         let (sql, values, _) = log_filter(&LogQuery {
-            project_id: 0,
             workload: Some(workload),
+            workload_in_any_project: true,
             ..Default::default()
         })
         .unwrap();

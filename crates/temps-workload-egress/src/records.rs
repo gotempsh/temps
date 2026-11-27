@@ -23,7 +23,7 @@ use temps_otel::platform_logs::PLATFORM_SOURCE_ATTRIBUTE;
 use temps_otel::types::{AttributeValue, LogAttributeType, LogRecord, LogSeverity, ResourceInfo};
 use temps_workload::WorkloadRef;
 use temps_workload_netpol::{
-    egress::record::{MAX_RECORDED_HOST, MAX_RECORDED_METHOD, MAX_RECORDED_PATH},
+    egress::record::{recorded_path, MAX_RECORDED_HOST, MAX_RECORDED_METHOD, MAX_RECORDED_PATH},
     ConnectionKind, ConnectionOutcome, ConnectionRecord,
 };
 
@@ -129,9 +129,16 @@ fn size(bytes: u64) -> String {
 }
 
 /// The destination as a person reads it: `CONNECT api.example.com:443`,
-/// `GET http://api.example.com/v1/items`, `relay model`.
-fn destination(record: &ConnectionRecord) -> String {
-    let host = record.host.as_deref().unwrap_or("?");
+/// `GET http://api.example.com/v1/items`, `relay model`. `path` is the
+/// record's path as stored (redacted), not the one the node sent.
+fn destination(record: &ConnectionRecord, path: Option<&str>) -> String {
+    let host = match record.host.as_deref() {
+        // An IPv6 literal is bracketed, as in a URL authority, so the port
+        // stays apart from its last group.
+        Some(host) if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
+        Some(host) => host.to_string(),
+        None => "?".to_string(),
+    };
     match record.kind {
         ConnectionKind::Tunnel => match record.port {
             Some(port) => format!("CONNECT {host}:{port}"),
@@ -139,13 +146,13 @@ fn destination(record: &ConnectionRecord) -> String {
         },
         ConnectionKind::Forward => {
             let authority = match record.port {
-                Some(80) | None => host.to_string(),
+                Some(80) | None => host,
                 Some(port) => format!("{host}:{port}"),
             };
             format!(
                 "{} http://{authority}{}",
                 record.method.as_deref().unwrap_or("_OTHER"),
-                record.path.as_deref().unwrap_or("/")
+                path.unwrap_or("/")
             )
         }
         ConnectionKind::Relay => format!(
@@ -156,8 +163,8 @@ fn destination(record: &ConnectionRecord) -> String {
     }
 }
 
-fn body(record: &ConnectionRecord) -> String {
-    let destination = destination(record);
+fn body(record: &ConnectionRecord, path: Option<&str>) -> String {
+    let destination = destination(record, path);
     let repeated = if record.count > 1 {
         let window = record
             .last_started_at_ms
@@ -185,6 +192,13 @@ fn body(record: &ConnectionRecord) -> String {
 
 /// The log record for `record`, attributed to `who`.
 pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord {
+    // A node is trusted to say what it saw, not to have redacted it: the
+    // path is cut the way the proxy cuts it, again, so a relay credential
+    // (`/.temps/<relay>/<credential>/...`) never reaches the body or
+    // `url.path`, whatever the node sent. Cut once, borrowed for the body
+    // and moved into `url.path`.
+    let path = record.path.as_deref().map(recorded_path);
+    let body = body(record, path.as_deref());
     let mut attributes = BTreeMap::new();
     let mut types = BTreeMap::new();
     let mut text = |key: &str, value: String| {
@@ -216,8 +230,8 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
     if let Some(method) = &record.method {
         text("http.request.method", method.clone());
     }
-    if let Some(path) = &record.path {
-        text("url.path", path.clone());
+    if let Some(path) = path {
+        text("url.path", path);
     }
     if let Some(relay) = record.relay {
         text("temps.egress.relay", relay.as_str().to_string());
@@ -271,7 +285,7 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
         observed_timestamp: Utc::now(),
         severity,
         severity_text: severity.to_string(),
-        body: body(record),
+        body,
         trace_id: None,
         span_id: None,
         attributes,
@@ -379,6 +393,54 @@ mod tests {
         assert!(log
             .body
             .starts_with("GET http://api.example.com/v1/items allowed"));
+    }
+
+    /// An IPv6 destination keeps its brackets in the body, so its port reads
+    /// apart from the address; `server.address` stays the bare literal.
+    #[test]
+    fn an_ipv6_destination_reads_with_brackets() {
+        let record = ConnectionRecord {
+            host: Some("2001:db8::1".into()),
+            ..tunnel()
+        };
+        let log = to_log_record(&record, &who());
+        assert!(
+            log.body.starts_with("CONNECT [2001:db8::1]:443 allowed"),
+            "{}",
+            log.body
+        );
+        assert_eq!(
+            log.attributes.get("server.address").map(String::as_str),
+            Some("2001:db8::1")
+        );
+    }
+
+    /// A node that sent a relay path unredacted never gets the credential
+    /// into the logs: ingest cuts it the way the proxy does.
+    #[test]
+    fn a_relay_credential_a_node_sent_is_never_stored() {
+        let credential = "tk_0123456789abcdef0123456789abcdef";
+        let record = ConnectionRecord {
+            kind: ConnectionKind::Forward,
+            port: Some(80),
+            method: Some("POST".into()),
+            path: Some(format!("/.temps/model-relay/{credential}/v1/messages")),
+            ..tunnel()
+        };
+        assert!(
+            validate(&record).is_ok(),
+            "a well-formed path passes validation"
+        );
+        let log = to_log_record(&record, &who());
+        assert_eq!(
+            log.attributes.get("url.path").map(String::as_str),
+            Some("/.temps/model-relay/…")
+        );
+        assert!(!log.body.contains(credential), "{}", log.body);
+        assert!(log
+            .attributes
+            .values()
+            .all(|value| !value.contains(credential)));
     }
 
     #[test]

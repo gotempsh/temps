@@ -30,15 +30,22 @@
 //! as soon as it has created a steered container, so the application's
 //! first connection already finds its address in the table.
 //!
-//! **A first deployment is not locked out.** While any environment records,
-//! every refresh lists the steered containers, so a replica is in the table
-//! from its first connection, before its deployment is marked complete. It
-//! is recorded once the database places it on this host; until then it is
-//! let through unrecorded.
+//! **A first deployment is recorded from its first connection.** The deploy
+//! path's refresh lists the steered containers, so a replica is in the
+//! table before its deployment is marked complete, and recorded as soon as
+//! its environment records: ingest takes this process's own records for an
+//! environment placed nowhere yet (see `temps_workload_egress::ingest`).
 //!
-//! **Cost.** Each refresh is one query for the environments that record
-//! and, while any does or any steered container was last seen, one local
-//! container list filtered to the label and one query for where they run.
+//! **Cost.** While a steered container was last seen or an environment
+//! records, each refresh lists the containers (filtered by Docker to this
+//! installation's label value and the deployment network, so another
+//! installation's are never returned) and makes one query, by id, for which
+//! of their environments record now. The list is never reused: an address
+//! Docker freed and gave to another container must stop speaking for the
+//! old environment at the next refresh, which is also what confirms a
+//! recorded connection's caller, and nothing but a fresh list can say who
+//! holds an address now. The recorder rebuilds its table only when what a
+//! refresh read changed. An idle host lists nothing.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
@@ -46,13 +53,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, JoinType, QueryFilter, QuerySelect, RelationTrait,
-};
-use temps_entities::{deployment_containers, deployments, environments};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
+use temps_entities::environments;
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_egress::local::{LocalTraffic, LocalTrafficError, RecordedTraffic};
-use temps_workload_egress::steering::{steered_by, InstallationId, STEERED_LABEL};
+use temps_workload_egress::steering::{steered_by, steered_label, InstallationId, STEERED_LABEL};
 use temps_workload_netpol::rule::{Action, PortRange};
 use temps_workload_netpol::{EgressPolicy, EgressRule, EgressTarget, HostPattern, IdentityMap};
 
@@ -157,15 +162,6 @@ pub fn traffic_of(containers: &[SteeredContainer], recording: &BTreeSet<i32>) ->
     }
 }
 
-/// Whether a refresh must list this host's containers: while an environment
-/// records (a replica of it may have just been steered, before anything
-/// says where it runs) or a steered container was last seen (it keeps its
-/// way out after recording is turned off). Otherwise nothing can be in the
-/// table and the list is skipped.
-fn needs_listing(any_recording: bool, steered_seen: bool) -> bool {
-    any_recording || steered_seen
-}
-
 /// The steered deployment containers of this host.
 pub struct DeploymentTraffic {
     db: Arc<DatabaseConnection>,
@@ -177,6 +173,9 @@ pub struct DeploymentTraffic {
     steered_seen: AtomicBool,
     /// This installation: only the containers it steered are its own.
     installation: InstallationId,
+    /// Container lists a test hands out instead of asking Docker.
+    #[cfg(test)]
+    scripted: std::sync::Mutex<std::collections::VecDeque<Vec<bollard::models::ContainerSummary>>>,
 }
 
 impl DeploymentTraffic {
@@ -192,14 +191,64 @@ impl DeploymentTraffic {
             network,
             steered_seen: AtomicBool::new(true),
             installation,
+            #[cfg(test)]
+            scripted: Default::default(),
         }
     }
 
+    /// The next list a test scripted, if any.
+    #[cfg(test)]
+    fn scripted_list(&self) -> Option<Vec<bollard::models::ContainerSummary>> {
+        self.scripted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+    }
+
+    #[cfg(not(test))]
+    fn scripted_list(&self) -> Option<Vec<bollard::models::ContainerSummary>> {
+        None
+    }
+
+    /// Lists this installation's containers steered to `address` on the
+    /// deployment network. Docker filters by the exact label value and the
+    /// network, so another installation's containers on a shared daemon are
+    /// never even returned.
+    async fn list(&self, address: SocketAddr) -> Result<Vec<SteeredContainer>, LocalTrafficError> {
+        // Not known until a list succeeds: a failed one keeps the next
+        // refreshes listing, so a replica a failed discovery missed is found
+        // once Docker answers again, not only when it calls.
+        self.steered_seen.store(true, Ordering::Relaxed);
+        let label = format!(
+            "{STEERED_LABEL}={}",
+            steered_label(self.installation, address)
+        );
+        let containers = match self.scripted_list() {
+            Some(containers) => containers,
+            None => self
+                .docker
+                .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                    filters: Some(HashMap::from([
+                        ("label".to_string(), vec![label]),
+                        ("network".to_string(), vec![self.network.clone()]),
+                    ])),
+                    ..Default::default()
+                }))
+                .await
+                .map_err(LocalTrafficError::docker(
+                    WorkloadKind::Deployment,
+                    "listing the steered deployment containers",
+                ))?,
+        };
+        let steered = steered_containers(&containers, &self.network, self.installation);
+        self.steered_seen
+            .store(!steered.is_empty(), Ordering::Relaxed);
+        Ok(steered)
+    }
+
     /// Whether any environment records now, whatever runs where. While one
-    /// does, the containers are listed on every refresh: a new replica is
-    /// steered before the database knows where it runs, and must be in the
-    /// table from its first connection. One row at most, whatever the
-    /// number of environments.
+    /// does, an ordinary refresh with no recent list lists the containers.
+    /// One row at most, whatever the number of environments.
     async fn any_recording(&self) -> Result<bool, LocalTrafficError> {
         environments::Entity::find()
             .select_only()
@@ -216,29 +265,24 @@ impl DeploymentTraffic {
             ))
     }
 
-    /// The environments that record now and have a container on this host,
-    /// as the database has them. Only these are recorded: the control plane
-    /// accepts a node's records only for workloads it placed there, so a
-    /// container the database does not place here yet (a first deployment's
-    /// replica before it is ready) or any more (one being torn down) keeps
-    /// its way out and is not recorded, instead of having this host's whole
-    /// batch refused.
-    async fn recorded_here(&self) -> Result<BTreeSet<i32>, LocalTrafficError> {
-        deployment_containers::Entity::find()
+    /// Which of `containers`' environments record now: one query by id,
+    /// bounded by the steered containers of this host, never by how many
+    /// environments exist. Recorded whether or not the database places
+    /// them here yet (a first replica before its deployment is complete):
+    /// ingest takes this process's own records for an environment placed
+    /// nowhere, and drops those of one placed on other nodes only.
+    async fn recording_among(
+        &self,
+        containers: &[SteeredContainer],
+    ) -> Result<BTreeSet<i32>, LocalTrafficError> {
+        let ids: BTreeSet<i32> = containers.iter().map(|c| c.environment_id).collect();
+        if ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        environments::Entity::find()
             .select_only()
-            .column(deployments::Column::EnvironmentId)
-            .distinct()
-            .join(
-                JoinType::InnerJoin,
-                deployment_containers::Relation::Deployment.def(),
-            )
-            .join(
-                JoinType::InnerJoin,
-                deployments::Relation::Environment.def(),
-            )
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .filter(super::running_container())
-            .filter(deployment_containers::Column::NodeId.is_null())
+            .column(environments::Column::Id)
+            .filter(environments::Column::Id.is_in(ids))
             .filter(environments::Column::EgressRecording.eq(true))
             .filter(environments::Column::DeletedAt.is_null())
             .into_tuple::<i32>()
@@ -247,7 +291,7 @@ impl DeploymentTraffic {
             .map(|ids| ids.into_iter().collect())
             .map_err(LocalTrafficError::database(
                 WorkloadKind::Deployment,
-                "reading the environments recorded on this host",
+                "reading which of this host's steered environments record",
             ))
     }
 }
@@ -293,39 +337,20 @@ impl LocalTraffic for DeploymentTraffic {
     /// off mid-deploy) is found all the same.
     async fn refresh(
         &self,
-        _address: SocketAddr,
+        address: SocketAddr,
         discover: bool,
     ) -> Result<RecordedTraffic, LocalTrafficError> {
-        if !discover
-            && !needs_listing(
-                self.any_recording().await?,
-                self.steered_seen.load(Ordering::Relaxed),
-            )
-        {
+        // A refresh lists while a steered container was last seen (it keeps
+        // its way out after recording is turned off) or an environment
+        // records (a replica of it may have just been steered, before
+        // anything says where it runs). The query is asked only when the
+        // last list found nothing: while containers are steered, a refresh
+        // costs the list and one query, not two.
+        if !discover && !self.steered_seen.load(Ordering::Relaxed) && !self.any_recording().await? {
             return Ok(RecordedTraffic::default());
         }
-        // Not known until a list succeeds: a failed one keeps the next
-        // refreshes listing, so a replica a failed discovery missed is found
-        // once Docker answers again, not only when it calls.
-        self.steered_seen.store(true, Ordering::Relaxed);
-        let recording = self.recorded_here().await?;
-        let containers = self
-            .docker
-            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
-                filters: Some(HashMap::from([(
-                    "label".to_string(),
-                    vec![STEERED_LABEL.to_string()],
-                )])),
-                ..Default::default()
-            }))
-            .await
-            .map_err(LocalTrafficError::docker(
-                WorkloadKind::Deployment,
-                "listing the steered deployment containers",
-            ))?;
-        let steered = steered_containers(&containers, &self.network, self.installation);
-        self.steered_seen
-            .store(!steered.is_empty(), Ordering::Relaxed);
+        let steered = self.list(address).await?;
+        let recording = self.recording_among(&steered).await?;
         Ok(traffic_of(&steered, &recording))
     }
 }
@@ -376,6 +401,115 @@ mod tests {
     }
 
     const NETWORK: &str = "temps-network";
+
+    /// While steered containers were last seen, a refresh lists them without
+    /// asking whether any environment records (a database it cannot reach
+    /// does not stop it); with none seen, it asks, and lists only if one
+    /// does.
+    #[tokio::test]
+    async fn a_refresh_asks_whether_anything_records_only_when_nothing_is_steered() {
+        use crate::services::egress_recording::tests::{fixture, PRODUCTION};
+        use sea_orm::ConnectionTrait;
+
+        let Some(f) = fixture().await else { return };
+        let installation = InstallationId::from_bytes([1; 8]);
+        let address: SocketAddr = "172.18.0.1:13128".parse().unwrap();
+        let steered = steered_label(installation, address);
+        let traffic = DeploymentTraffic::new(
+            f.db.connection_arc(),
+            bollard::Docker::connect_with_local_defaults().expect("docker client"),
+            NETWORK.into(),
+            installation,
+        );
+        traffic.scripted.lock().unwrap().push_back(vec![container(
+            &[
+                (STEERED_LABEL, steered.as_str()),
+                (ENVIRONMENT_LABEL, &PRODUCTION.to_string()),
+            ],
+            &[(NETWORK, "172.18.0.5")],
+        )]);
+        // Seen: listed whatever any_recording would say.
+        let listed = traffic.refresh(address, false).await.expect("listed");
+        assert_eq!(listed.policies.len(), 1);
+
+        // Nothing seen and nothing records: no list (the script is not
+        // touched), an empty answer.
+        traffic.scripted.lock().unwrap().push_back(vec![]);
+        traffic
+            .refresh(address, false)
+            .await
+            .expect("listed, empty");
+        assert!(!traffic.steered_seen.load(Ordering::Relaxed));
+        traffic.scripted.lock().unwrap().push_back(vec![]);
+        let idle = traffic.refresh(address, false).await.expect("idle");
+        assert!(idle.policies.is_empty());
+        assert_eq!(
+            traffic.scripted.lock().unwrap().len(),
+            1,
+            "an idle host with nothing recording does not list"
+        );
+
+        // An environment records: listed again.
+        f.db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE environments SET egress_recording = true WHERE id = {PRODUCTION}"
+            ))
+            .await
+            .unwrap();
+        traffic.refresh(address, false).await.expect("listed");
+        assert!(traffic.scripted.lock().unwrap().is_empty());
+    }
+
+    /// An address Docker frees and gives to another container stops
+    /// speaking for the old environment at the very next refresh, after a
+    /// list that succeeded: to another environment's steered replica it
+    /// speaks for that one, to an unsteered container for nobody.
+    #[tokio::test]
+    async fn a_reassigned_address_follows_the_next_successful_list() {
+        use crate::services::egress_recording::tests::{fixture, PRODUCTION, STAGING};
+
+        let Some(f) = fixture().await else { return };
+        let installation = InstallationId::from_bytes([1; 8]);
+        let address: SocketAddr = "172.18.0.1:13128".parse().unwrap();
+        let steered = steered_label(installation, address);
+        let replica = |environment: i32| {
+            container(
+                &[
+                    (STEERED_LABEL, steered.as_str()),
+                    (ENVIRONMENT_LABEL, &environment.to_string()),
+                ],
+                &[(NETWORK, "172.18.0.5")],
+            )
+        };
+        let traffic = DeploymentTraffic::new(
+            f.db.connection_arc(),
+            bollard::Docker::connect_with_local_defaults().expect("docker client"),
+            NETWORK.into(),
+            installation,
+        );
+        traffic.scripted.lock().unwrap().extend([
+            vec![replica(PRODUCTION)],
+            vec![replica(STAGING)],
+            // Given to an unsteered container: Docker's filter returns none.
+            vec![],
+        ]);
+        let owner = |traffic: &RecordedTraffic| {
+            temps_workload_netpol::EgressTable::build(&traffic.policies, &traffic.identities)
+                .lookup("172.18.0.5".parse().unwrap())
+                .map(|rules| rules.workload)
+        };
+
+        let first = traffic.refresh(address, false).await.expect("first list");
+        assert_eq!(owner(&first), Some(super::super::workload(PRODUCTION)));
+        let second = traffic.refresh(address, false).await.expect("second list");
+        assert_eq!(
+            owner(&second),
+            Some(super::super::workload(STAGING)),
+            "the new holder of the address, not the old"
+        );
+        let third = traffic.refresh(address, true).await.expect("third list");
+        assert_eq!(owner(&third), None, "an unsteered holder speaks for nobody");
+    }
 
     fn container(labels: &[(&str, &str)], networks: &[(&str, &str)]) -> ContainerSummary {
         ContainerSummary {
@@ -565,11 +699,11 @@ mod tests {
         }
     }
 
-    /// Only an environment that records and that the database places on
-    /// this host is recorded here: not one that runs only on a worker, and
-    /// not one whose container has been removed.
+    /// Of the environments this host's steered containers belong to, those
+    /// that record now are recorded, placed here or not yet (ingest decides
+    /// placement); one that does not record, or is deleted, is not.
     #[tokio::test]
-    async fn only_environments_placed_on_this_host_are_recorded_here() {
+    async fn the_steered_environments_that_record_are_recorded() {
         use crate::services::egress_recording::tests::{fixture, ELSEWHERE, PRODUCTION, STAGING};
         use sea_orm::ConnectionTrait;
 
@@ -580,8 +714,21 @@ mod tests {
             NETWORK.to_string(),
             InstallationId::from_bytes([1; 8]),
         );
+        let steered = |ids: &[i32]| -> Vec<SteeredContainer> {
+            ids.iter()
+                .map(|id| SteeredContainer {
+                    environment_id: *id,
+                    address: "172.18.0.5".parse().unwrap(),
+                })
+                .collect()
+        };
+        let all = steered(&[PRODUCTION, STAGING, ELSEWHERE]);
         assert!(!traffic.any_recording().await.unwrap());
-        assert!(traffic.recorded_here().await.unwrap().is_empty());
+        assert!(traffic.recording_among(&all).await.unwrap().is_empty());
+        assert!(
+            traffic.recording_among(&[]).await.unwrap().is_empty(),
+            "no container, no query"
+        );
         f.db.connection()
             .execute_unprepared(&format!(
                 "UPDATE environments SET egress_recording = true \
@@ -594,40 +741,52 @@ mod tests {
             "any environment that records keeps the containers listed, placed or not"
         );
         assert_eq!(
-            traffic.recorded_here().await.unwrap(),
-            BTreeSet::from([PRODUCTION]),
-            "staging's container is gone and the other project's is on a worker"
+            traffic.recording_among(&all).await.unwrap(),
+            BTreeSet::from([PRODUCTION, STAGING, ELSEWHERE]),
+        );
+        assert_eq!(
+            traffic.recording_among(&steered(&[STAGING])).await.unwrap(),
+            BTreeSet::from([STAGING]),
+            "only the environments of the containers listed are read"
+        );
+        f.db.connection()
+            .execute_unprepared(&format!(
+                "UPDATE environments SET deleted_at = now() WHERE id = {STAGING}"
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            traffic.recording_among(&all).await.unwrap(),
+            BTreeSet::from([PRODUCTION, ELSEWHERE]),
+            "a deleted environment is not recorded"
         );
     }
 
     /// The first replica of an environment that records is steered before
     /// the database says where it runs. It must be in the table from its
     /// first connection, or a start-up that needs the internet is refused
-    /// and never becomes ready: while anything records, the containers are
-    /// listed, and a replica not placed here yet is let through unrecorded.
+    /// and never becomes ready; and it is recorded from that connection, so
+    /// the calls that explain a failed start are kept.
     #[test]
-    fn a_first_replica_is_let_through_before_it_is_placed() {
-        assert!(
-            needs_listing(true, false),
-            "an idle host lists as soon as an environment records"
-        );
-        assert!(
-            needs_listing(false, true),
-            "a steered container keeps its way out"
-        );
-        assert!(!needs_listing(false, false));
-
+    fn a_first_replica_is_recorded_before_it_is_placed() {
         let first = SteeredContainer {
             environment_id: 7,
             address: "172.18.0.5".parse().unwrap(),
         };
-        let traffic = traffic_of(&[first], &BTreeSet::new());
+        // Its environment records: recorded from its first connection,
+        // whatever the database places yet.
+        let traffic = traffic_of(&[first], &BTreeSet::from([7]));
         let table =
             temps_workload_netpol::EgressTable::build(&traffic.policies, &traffic.identities);
         let rules = table
             .lookup(first.address)
             .expect("the new replica is in the table");
-        assert!(!rules.record, "recorded once it is placed here");
+        assert!(rules.record, "recorded before it is placed");
+        // Its environment does not record: in the table, let through.
+        let traffic = traffic_of(&[first], &BTreeSet::new());
+        let table =
+            temps_workload_netpol::EgressTable::build(&traffic.policies, &traffic.identities);
+        assert!(!table.lookup(first.address).expect("in the table").record);
     }
 
     /// Recording observes: any public destination on any port goes through,

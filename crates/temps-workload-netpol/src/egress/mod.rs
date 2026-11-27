@@ -73,8 +73,17 @@ pub use record::{
 /// these two.
 pub const DEFAULT_PORTS: [u16; 2] = [80, 443];
 
-/// The longest request head the proxy reads.
-pub const MAX_HEAD: usize = 8 * 1024;
+/// The longest request head the proxy reads: 24 KiB. The Node sidecar a
+/// sandbox's direct traffic goes through accepts heads somewhat past its
+/// 16 KiB `maxHeaderSize` (it counts header bytes, not the whole head), and
+/// when recording it hands the request on in absolute form with one more
+/// header: the margin keeps turning recording on from refusing a head that
+/// worked with it off. A smaller `buffer_size` reads at most its own size.
+pub const MAX_HEAD: usize = 24 * 1024;
+
+/// The smallest `buffer_size` accepted: a buffer below it cannot hold an
+/// ordinary request head.
+pub const MIN_BUFFER: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EgressConfigError {
@@ -513,13 +522,14 @@ pub struct EgressProxyConfig {
 }
 
 impl EgressProxyConfig {
-    /// Sized for the 1 vCPU / 2 GB target: 512 connections × 2 × 16 KiB =
-    /// 16 MiB of buffers at saturation.
+    /// Sized for the 1 vCPU / 2 GB target: 512 connections × 2 × 24 KiB =
+    /// 24 MiB of buffers at saturation, each big enough for the longest
+    /// head ([`MAX_HEAD`]).
     pub fn new(listen: SocketAddr) -> Self {
         Self {
             listen,
             max_connections: 512,
-            buffer_size: 16 * 1024,
+            buffer_size: MAX_HEAD,
             head_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(60),
@@ -536,10 +546,10 @@ impl EgressProxyConfig {
                 ),
             });
         }
-        if self.buffer_size < MAX_HEAD || self.buffer_size > 1024 * 1024 {
+        if self.buffer_size < MIN_BUFFER || self.buffer_size > 1024 * 1024 {
             return Err(EgressConfigError::InvalidLimits {
                 reason: format!(
-                    "buffer_size is {}; expected {MAX_HEAD}..=1048576",
+                    "buffer_size is {}; expected {MIN_BUFFER}..=1048576",
                     self.buffer_size
                 ),
             });
@@ -815,11 +825,18 @@ impl EgressProxy {
     }
 
     /// Accepts until the listener fails. Each connection runs on its own
-    /// task, bounded by the connection limit.
+    /// task, bounded by the connection limit. The connection tasks belong to
+    /// this future: when it ends or is aborted (its owner stopped serving)
+    /// they are aborted too, so no tunnel, socket or pooled buffer outlives
+    /// the proxy that served it.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<(), EgressError> {
         let addr = listener.local_addr().unwrap_or(self.config.listen);
         info!(%addr, max_connections = self.config.max_connections, "egress proxy listening");
+        // At most `max_connections` live tasks (each holds a permit), and
+        // finished ones are reaped on every accept.
+        let mut connections = tokio::task::JoinSet::new();
         loop {
+            while connections.try_join_next().is_some() {}
             let (stream, peer) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(e) if is_transient_accept_error(&e) => {
@@ -840,10 +857,17 @@ impl EgressProxy {
                 continue;
             };
             let proxy = self.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
+                // Counted down on every way out, an abort included.
+                struct Active(Arc<EgressStats>);
+                impl Drop for Active {
+                    fn drop(&mut self) {
+                        self.0.active.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
                 proxy.stats.active.fetch_add(1, Ordering::Relaxed);
+                let _active = Active(proxy.stats.clone());
                 proxy.handle(stream, peer, permit).await;
-                proxy.stats.active.fetch_sub(1, Ordering::Relaxed);
             });
         }
     }
@@ -1209,8 +1233,24 @@ impl EgressProxy {
         let (mut client_read, mut client_write) = client.into_split();
         let (mut upstream_read, mut upstream_write) = upstream.into_split();
         let idle = self.config.idle_timeout;
-        let up = pump(&mut client_read, &mut upstream_write, &mut up_buf, idle);
-        let down = pump(&mut upstream_read, &mut client_write, &mut down_buf, idle);
+        // One clock for both directions: a connection is idle only when
+        // neither side moves, so a long upload to a server that answers
+        // only once it has the whole body keeps its response direction.
+        let activity = Activity::new();
+        let up = pump(
+            &mut client_read,
+            &mut upstream_write,
+            &mut up_buf,
+            idle,
+            &activity,
+        );
+        let down = pump(
+            &mut upstream_read,
+            &mut client_write,
+            &mut down_buf,
+            idle,
+            &activity,
+        );
         let (sent, received) = tokio::join!(up, down);
         self.stats.bytes_up.fetch_add(sent, Ordering::Relaxed);
         self.stats.bytes_down.fetch_add(received, Ordering::Relaxed);
@@ -1328,16 +1368,18 @@ impl Ended {
     }
 }
 
-/// A host as recorded: at most [`record::MAX_RECORDED_HOST`] bytes.
-fn recorded_host(mut host: String) -> String {
-    if host.len() > record::MAX_RECORDED_HOST {
-        let mut cut = record::MAX_RECORDED_HOST;
-        while !host.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        host.truncate(cut);
+/// A host as recorded: at most [`record::MAX_RECORDED_HOST`] bytes, in an
+/// allocation of that size. A cut host is copied rather than truncated in
+/// place, so a queued record never keeps a request-sized buffer alive.
+fn recorded_host(host: String) -> String {
+    if host.len() <= record::MAX_RECORDED_HOST {
+        return host;
     }
-    host
+    let mut cut = record::MAX_RECORDED_HOST;
+    while !host.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    host[..cut].to_string()
 }
 
 /// Which relay a rewritten control-plane path goes to.
@@ -1361,25 +1403,71 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
     ) || e.raw_os_error() == Some(24) // EMFILE: back off instead of dying
 }
 
-/// Copies until EOF, an error or `idle` without traffic, then shuts the
-/// writer down so the other side sees the end. Returns bytes copied.
-async fn pump<R, W>(reader: &mut R, writer: &mut W, buf: &mut [u8], idle: Duration) -> u64
+/// When either direction of a spliced connection last moved data, shared
+/// by its two pumps.
+struct Activity {
+    start: Instant,
+    /// Milliseconds after `start`.
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let now = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// How long since either direction moved data.
+    fn idle_for(&self) -> Duration {
+        self.start
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.last_ms.load(Ordering::Relaxed)))
+    }
+}
+
+/// Copies until EOF, an error or `idle` without traffic in either
+/// direction of the connection (`activity`, shared with the other pump),
+/// then shuts the writer down so the other side sees the end. Returns
+/// bytes copied.
+async fn pump<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut [u8],
+    idle: Duration,
+    activity: &Activity,
+) -> u64
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut total = 0u64;
     loop {
-        let read = tokio::time::timeout(idle, reader.read(buf)).await;
+        let since = activity.idle_for();
+        if since >= idle {
+            break;
+        }
+        // Waits only for what is left of the idle window: on timeout the
+        // shared clock is read again, since the other direction may have
+        // moved meanwhile. A read is cancel-safe, so nothing is lost.
+        let read = tokio::time::timeout(idle - since, reader.read(buf)).await;
         let n = match read {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Err(_) => continue,
             Ok(Ok(n)) => n,
         };
+        activity.touch();
         // A side that stops reading would hold the write, and with it the
         // connection's slot and buffers, for ever: it has the same idle
         // deadline as a side that stops sending.
         match tokio::time::timeout(idle, writer.write_all(&buf[..n])).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => activity.touch(),
             Ok(Err(_)) | Err(_) => break,
         }
         total += n as u64;
@@ -1486,9 +1574,38 @@ fn sender_refusal(value: &[u8]) -> EgressReason {
     }
 }
 
+/// The most header fields a request head may carry: what the Node sidecar a
+/// sandbox's direct traffic goes through takes (its default
+/// `maxHeadersCount` of 2000), plus the one it adds when handing a request
+/// to the recorder, with room to spare. Turning recording on never refuses
+/// a request for its number of headers.
+pub const MAX_HEADERS: usize = 2048;
+
+/// Header slots parsed on the stack: an ordinary request fits, so only a
+/// request with more fields pays for a heap array.
+const STACK_HEADERS: usize = 64;
+
 fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut request = httparse::Request::new(&mut headers);
+    // Each field is one line; the request line and the blank line end are
+    // two more.
+    let lines = head.windows(2).filter(|pair| *pair == b"\r\n").count();
+    if lines <= STACK_HEADERS + 2 {
+        let mut headers = [httparse::EMPTY_HEADER; STACK_HEADERS];
+        parse_request_in(head, &mut headers)
+    } else {
+        // One slot per field line, never more than MAX_HEADERS: a request
+        // with more fields fails to parse.
+        let fields = lines.saturating_sub(2).min(MAX_HEADERS);
+        let mut headers = vec![httparse::EMPTY_HEADER; fields];
+        parse_request_in(head, &mut headers)
+    }
+}
+
+fn parse_request_in<'h>(
+    head: &'h [u8],
+    headers: &mut [httparse::Header<'h>],
+) -> Option<ParsedRequest> {
+    let mut request = httparse::Request::new(headers);
     match request.parse(head) {
         Ok(httparse::Status::Complete(_)) => {}
         _ => return None,

@@ -441,9 +441,18 @@ async fn only_the_owner_sees_or_changes_recording() {
             .await
             .map(|_| ()),
         sandboxes.status("sbx_not-an-id", OWNER).await.map(|_| ()),
-        // A destroyed sandbox is gone, even for its owner.
+        // A destroyed sandbox is gone for changes, even for its owner...
         sandboxes
-            .status(ON_CONTROL_PLANE.1, OWNER)
+            .set_enabled(ON_CONTROL_PLANE.1, OWNER, true)
+            .await
+            .map(|_| ()),
+        // ...and for anyone else's reads.
+        sandboxes
+            .status(ON_CONTROL_PLANE.1, STRANGER)
+            .await
+            .map(|_| ()),
+        sandboxes
+            .activity(ON_CONTROL_PLANE.1, STRANGER, None, None, None)
             .await
             .map(|_| ()),
     ] {
@@ -530,6 +539,25 @@ async fn a_sandboxs_records_come_from_its_node_and_are_read_by_its_owner() {
         projectless.records[0].reason.as_deref(),
         Some("no_allow_rule")
     );
+
+    // Destroyed, the sandbox keeps what it recorded: its owner still reads
+    // it (and its status), with or without a project.
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE sandboxes SET status = 'destroyed' WHERE id IN ({}, {})",
+            ON_WORKER.0, PROJECTLESS.0
+        ))
+        .await
+        .unwrap();
+    for id in [ON_WORKER.1, PROJECTLESS.1] {
+        let page = wired
+            .sandboxes
+            .activity(id, OWNER, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1, "{id}");
+        wired.sandboxes.status(id, OWNER).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -646,5 +674,150 @@ async fn the_adapter_never_keeps_the_recorder_alive() {
     assert!(
         weak.upgrade().is_none(),
         "freed with its last outside reference"
+    );
+}
+
+/// A sidecar refresh that counts its applies, each taking a moment, as a
+/// real replacement does.
+#[derive(Default)]
+struct CountingSidecars {
+    applied: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl super::local::SidecarRefresh for CountingSidecars {
+    async fn serialize(&self, _id: i32) -> Box<dyn std::any::Any + Send> {
+        Box::new(())
+    }
+
+    async fn apply(
+        &self,
+        _row: &temps_entities::sandboxes::Model,
+    ) -> Result<(), super::local::SidecarFailure> {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        self.applied
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// The traffic source of this host's sandboxes, with `sidecars`, wired
+/// into the adapter with a live recorder.
+fn steered(
+    f: &Fixture,
+    wired: &Wired,
+    sidecars: Arc<CountingSidecars>,
+) -> (
+    Arc<temps_workload_egress::local::LocalEgressRecorder>,
+    Arc<super::local::SandboxTraffic>,
+) {
+    let recorder = temps_workload_egress::local::LocalEgressRecorder::new(
+        wired.recording.clone(),
+        Arc::new(NoCapability),
+        temps_workload_egress::local::LocalServing::new(),
+        temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
+    );
+    let traffic = Arc::new(super::local::SandboxTraffic::new(
+        f.db.connection_arc(),
+        bollard::Docker::connect_with_local_defaults().expect("docker client"),
+        temps_workload_egress::steering::InstallationId::from_bytes([7; 8]),
+        Some(sidecars as Arc<dyn super::local::SidecarRefresh>),
+    ));
+    traffic.set_published();
+    wired.adapter.set_local(super::LocalSteering {
+        recorder: Arc::downgrade(&recorder),
+        traffic: traffic.clone(),
+    });
+    (recorder, traffic)
+}
+
+async fn row_of(f: &Fixture, id: i32) -> temps_entities::sandboxes::Model {
+    temps_entities::sandboxes::Entity::find_by_id(id)
+        .one(f.db.connection())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// A toggle whose request is dropped part-way still replaces its sandbox's
+/// sidecar: publishing and replacing run on their own task, so nothing is
+/// left for a retry that maintenance could consume against the old
+/// publication.
+#[tokio::test]
+async fn a_toggle_cut_short_still_replaces_its_sidecar() {
+    use temps_workload_egress::adapter::WorkloadEgressAdapter;
+
+    let Some(f) = fixture().await else { return };
+    let (wired, _) = f.collecting();
+    let sidecars = Arc::new(CountingSidecars::default());
+    let (_recorder, traffic) = steered(&f, &wired, sidecars.clone());
+    let row = row_of(&f, ON_CONTROL_PLANE.0).await;
+    let workload = super::recorded(&row);
+    // Dropped after its first poll, as a cancelled request is.
+    let cut =
+        tokio::time::timeout(std::time::Duration::ZERO, wired.adapter.changed(&workload)).await;
+    assert!(cut.is_err(), "the request was cut short");
+    for _ in 0..100 {
+        if sidecars.applied.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        sidecars.applied.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(!traffic.is_pending(ON_CONTROL_PLANE.0));
+}
+
+/// A sandbox on a worker is that worker's to steer: a toggle neither
+/// replaces anything here nor reports it as not switched.
+#[tokio::test]
+async fn a_worker_sandbox_is_not_steered_or_reported_here() {
+    use temps_workload_egress::adapter::WorkloadEgressAdapter;
+
+    let Some(f) = fixture().await else { return };
+    let (wired, _) = f.collecting();
+    let sidecars = Arc::new(CountingSidecars::default());
+    let (_recorder, traffic) = steered(&f, &wired, sidecars.clone());
+    let workload = super::recorded(&row_of(&f, ON_WORKER.0).await);
+    assert_eq!(wired.adapter.changed(&workload).await, None);
+    assert_eq!(wired.adapter.not_applied(&workload), None);
+    assert_eq!(
+        sidecars.applied.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(!traffic.is_pending(ON_WORKER.0));
+}
+
+/// A policy update that applied the new policy to the sidecar clears the
+/// failure remembered from the old one, so the sandbox's status stops
+/// reporting it, but keeps a pending retry: the update did not switch the
+/// hand-off.
+#[tokio::test]
+async fn a_policy_update_clears_a_remembered_refusal() {
+    use crate::services::sandbox_service::EgressPolicyObserver;
+    use temps_workload_egress::adapter::WorkloadEgressAdapter;
+
+    let Some(f) = fixture().await else { return };
+    let (wired, _) = f.collecting();
+    let sidecars = Arc::new(CountingSidecars::default());
+    let (recorder, traffic) = steered(&f, &wired, sidecars);
+    traffic.note_refusal_for_tests(ON_CONTROL_PLANE.0);
+    traffic.mark_pending(ON_CONTROL_PLANE.0, true);
+    let row = row_of(&f, ON_CONTROL_PLANE.0).await;
+    let workload = super::recorded(&row);
+    assert!(wired.adapter.not_applied(&workload).is_some());
+
+    super::RecorderPolicyRefresh {
+        recorder: Arc::downgrade(&recorder),
+        traffic: Arc::downgrade(&traffic),
+    }
+    .policy_changed(&row)
+    .await;
+    assert_eq!(wired.adapter.not_applied(&workload), None);
+    assert!(
+        traffic.is_pending(ON_CONTROL_PLANE.0),
+        "the pending retry of the hand-off is kept"
     );
 }

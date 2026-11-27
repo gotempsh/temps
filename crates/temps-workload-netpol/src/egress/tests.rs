@@ -523,6 +523,12 @@ fn limits_are_validated() {
     config.max_connections = 4;
     config.buffer_size = 100;
     assert!(config.validate().is_err());
+    // A smaller buffer than the longest head is still a valid one: it
+    // reads at most its own size.
+    for buffer_size in [MIN_BUFFER, 16 * 1024] {
+        config.buffer_size = buffer_size;
+        assert!(config.validate().is_ok(), "{buffer_size}");
+    }
 }
 
 async fn echo_server() -> SocketAddr {
@@ -910,6 +916,131 @@ fn echo_rule(port: u16) -> EgressRule {
     cidr_rule(1, "127.0.0.1/32", Some(port), Action::Allow)
 }
 
+/// A tunnel is idle only when neither direction moves: an upload that
+/// outlasts the idle timeout, to a server that answers only once it has
+/// the whole body, still gets its response.
+#[tokio::test]
+async fn a_long_upload_keeps_its_response_direction_open() {
+    const CHUNKS: usize = 12;
+    // Reads the whole upload, silent meanwhile, then answers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut got = vec![0u8; CHUNKS];
+        stream.read_exact(&mut got).await.unwrap();
+        stream.write_all(b"done").await.unwrap();
+    });
+    let (_proxy, addr, _records) =
+        start_recording(vec![echo_rule(origin.port())], true, 16, |config| {
+            config.idle_timeout = Duration::from_millis(300);
+        })
+        .await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", origin.port()).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        status_line(&mut client).await,
+        "HTTP/1.1 200 Connection Established"
+    );
+    // 12 × 100 ms: four times the idle timeout with nothing coming back.
+    for _ in 0..CHUNKS {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client.write_all(b"x").await.unwrap();
+    }
+    let mut answer = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut answer))
+        .await
+        .expect("answered")
+        .expect("the response direction is still open");
+    assert_eq!(&answer, b"done");
+}
+
+/// A proxy that stops serving (its task aborted, as a recorder that is
+/// dropped aborts it) takes its live tunnels with it, even one that keeps
+/// exchanging data: nothing it served outlives it.
+#[tokio::test]
+async fn aborting_serve_ends_its_live_tunnels() {
+    let echo = echo_server().await;
+    let identities = IdentityMap::new().with(sandbox(1), "127.0.0.1".parse().unwrap());
+    let table = EgressTable::build(
+        &[EgressPolicy {
+            subject: sandbox(1),
+            rules: vec![echo_rule(echo.port())],
+            record: false,
+            public_only: false,
+        }],
+        &identities,
+    );
+    let proxy = EgressProxy::with_recorder(
+        EgressProxyConfig::new("127.0.0.1:0".parse().unwrap()),
+        Arc::new(ArcSwap::from_pointee(table)),
+        None,
+    )
+    .unwrap();
+    let listener = proxy.bind().await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = tokio::spawn(proxy.clone().serve(listener));
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        status_line(&mut client).await,
+        "HTTP/1.1 200 Connection Established"
+    );
+    client.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    client.read_exact(&mut got).await.unwrap();
+    assert_eq!(proxy.stats().snapshot().active, 1);
+
+    serving.abort();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+        .await
+        .expect("the tunnel is closed with the proxy")
+        .ok();
+    for _ in 0..50 {
+        if proxy.stats().snapshot().active == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(proxy.stats().snapshot().active, 0, "counted down on abort");
+}
+
+/// With neither direction moving, a tunnel still ends after the idle
+/// timeout.
+#[tokio::test]
+async fn a_tunnel_idle_both_ways_is_closed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(stream);
+    });
+    let (_proxy, addr, _records) =
+        start_recording(vec![echo_rule(origin.port())], true, 16, |config| {
+            config.idle_timeout = Duration::from_millis(200);
+        })
+        .await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", origin.port()).as_bytes())
+        .await
+        .unwrap();
+    status_line(&mut client).await;
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest))
+        .await
+        .expect("closed once idle both ways")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn an_allowed_tunnel_is_recorded_with_its_destination_and_bytes() {
     let echo = echo_server().await;
@@ -982,6 +1113,47 @@ async fn a_forward_is_recorded_with_method_and_path_but_never_the_query() {
         !json.contains("secret"),
         "no query string or header reaches a record: {json}"
     );
+}
+
+/// A request head past 16 KiB (a 16,500-byte cookie) is forwarded whole
+/// when recorded, not refused: recording never fails a
+/// request that works without it.
+#[tokio::test]
+async fn a_large_request_head_is_forwarded_when_recorded() {
+    let echo = echo_server().await;
+    let (_proxy, addr, mut records) =
+        start_recording(vec![echo_rule(echo.port())], true, 16, |_| {}).await;
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    // Past what the direct sidecar's parser takes once the recorded path
+    // adds its absolute URL and header: more than the old 16 KiB limit.
+    let cookie = "c".repeat(16_500);
+    let head = format!(
+        "GET http://127.0.0.1:{}/v1/items HTTP/1.1\r\nHost: x\r\nCookie: {cookie}\r\n\r\n",
+        echo.port()
+    );
+    assert!(head.len() > 16 * 1024, "the head is past the old limit");
+    assert!(head.len() < MAX_HEAD);
+    client.write_all(head.as_bytes()).await.unwrap();
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        seen.extend_from_slice(&buf[..n]);
+    }
+    let echoed = String::from_utf8_lossy(&seen);
+    assert!(
+        echoed.starts_with("GET /v1/items HTTP/1.1"),
+        "{}",
+        &echoed[..64.min(echoed.len())]
+    );
+    assert!(
+        echoed.contains(&cookie),
+        "the whole cookie reaches the origin"
+    );
+    client.shutdown().await.unwrap();
+    let record = next_record(&mut records).await;
+    assert_eq!(record.outcome, ConnectionOutcome::Allowed);
 }
 
 #[tokio::test]
@@ -1242,12 +1414,44 @@ async fn a_full_recording_channel_drops_records_and_never_blocks_connections() {
     assert_eq!(stats.records_dropped, 4);
 }
 
+/// A request with more header fields than fit on the stack (65, as the
+/// direct sidecar would pass on) is parsed whole, every field kept; one
+/// past [`MAX_HEADERS`] is not.
+#[test]
+fn a_request_with_many_headers_is_parsed() {
+    let head = |fields: usize| {
+        let mut head = String::from("GET http://api.example.com/v1 HTTP/1.1\r\nHost: x\r\n");
+        for n in 0..fields {
+            head.push_str(&format!("X-Field-{n}: {n}\r\n"));
+        }
+        head.push_str("\r\n");
+        head
+    };
+    let request = parse_request(head(65).as_bytes()).expect("65 fields parse");
+    assert_eq!(request.headers.len(), 65, "every field but Host is kept");
+    // `head(n)` carries Host as well: n + 1 fields in all.
+    let at_limit = parse_request(head(MAX_HEADERS - 1).as_bytes()).expect("MAX_HEADERS fields");
+    assert_eq!(at_limit.headers.len(), MAX_HEADERS - 1);
+    for over in [MAX_HEADERS, MAX_HEADERS + 1, MAX_HEADERS + 10] {
+        assert!(
+            parse_request(head(over).as_bytes()).is_none(),
+            "{} fields are refused",
+            over + 1
+        );
+    }
+    let ordinary = parse_request(head(3).as_bytes()).expect("a few fields parse");
+    assert_eq!(ordinary.headers.len(), 3);
+}
+
 #[test]
 fn hosts_in_records_are_bounded() {
     assert_eq!(recorded_host("api.example.com".into()), "api.example.com");
-    assert_eq!(
-        recorded_host("a".repeat(5000)).len(),
-        record::MAX_RECORDED_HOST
+    let cut = recorded_host("a".repeat(20_000));
+    assert_eq!(cut.len(), record::MAX_RECORDED_HOST);
+    assert!(
+        cut.capacity() < 1024,
+        "a cut host does not keep the request-sized buffer: {}",
+        cut.capacity()
     );
 }
 
@@ -1293,7 +1497,14 @@ async fn a_side_that_stops_reading_releases_the_pump_at_the_idle_deadline() {
     source.write_all(&[7u8; 64]).await.unwrap();
     let task = tokio::spawn(async move {
         let mut buf = vec![0u8; 64];
-        pump(&mut reader, &mut writer, &mut buf, Duration::from_secs(5)).await
+        pump(
+            &mut reader,
+            &mut writer,
+            &mut buf,
+            Duration::from_secs(5),
+            &Activity::new(),
+        )
+        .await
     });
     tokio::time::sleep(Duration::from_secs(6)).await;
     assert!(task.is_finished(), "still blocked on a write nobody reads");

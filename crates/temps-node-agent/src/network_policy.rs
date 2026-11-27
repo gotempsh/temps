@@ -64,6 +64,17 @@ pub struct AgentPolicySource {
     /// The control plane's digest of `last`, sent back so an unchanged
     /// pass costs no snapshot.
     last_digest: Mutex<Option<String>>,
+    /// The mode of the last answer, so an answer that changes neither the
+    /// snapshot nor the mode is taken without copying or re-encoding the
+    /// held snapshot.
+    last_mode: Mutex<Option<NodeMode>>,
+    /// Whether a policy in `last` records, worked out once when `last`
+    /// changes, so an idle `off` pass checks a flag, not every policy.
+    last_records: std::sync::atomic::AtomicBool,
+    /// Whether the cache holds the policy last taken: false after a write
+    /// failed, so the next answer is cached again (whether or not it
+    /// changed) until a write works.
+    cache_current: std::sync::atomic::AtomicBool,
     observed: Mutex<IdentityMap>,
     /// Where the last policy received is kept, so an agent that boots while
     /// the control plane is unreachable enforces it instead of nothing.
@@ -107,6 +118,9 @@ impl AgentPolicySource {
             backend,
             last: Mutex::new(None),
             last_digest: Mutex::new(None),
+            last_mode: Mutex::new(None),
+            last_records: std::sync::atomic::AtomicBool::new(false),
+            cache_current: std::sync::atomic::AtomicBool::new(true),
             observed: Mutex::new(IdentityMap::new()),
             cache: None,
             cached: Mutex::new(None),
@@ -128,27 +142,40 @@ impl AgentPolicySource {
     }
 
     fn store_cache(&self, policy: &NodePolicy) {
-        let Some(path) = &self.cache else { return };
+        let current = self.write_cache(policy);
+        self.cache_current
+            .store(current, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Writes `policy` to the cache; whether the cache holds it now.
+    fn write_cache(&self, policy: &NodePolicy) -> bool {
+        let Some(path) = &self.cache else { return true };
         let encoded = match serde_json::to_string(policy) {
             Ok(encoded) => encoded,
             Err(error) => {
                 warn!(node = %self.node, %error, "could not encode the network policy for its cache");
-                return;
+                return false;
             }
         };
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         if cached.as_deref() == Some(encoded.as_str()) {
-            return;
+            return true;
         }
         match write_private(path, &encoded) {
-            Ok(()) => *cached = Some(encoded),
-            Err(error) => warn!(
-                node = %self.node,
-                path = %path.display(),
-                %error,
-                "could not cache the network policy; a reboot during a control plane outage \
-                 would leave this node without it"
-            ),
+            Ok(()) => {
+                *cached = Some(encoded);
+                true
+            }
+            Err(error) => {
+                warn!(
+                    node = %self.node,
+                    path = %path.display(),
+                    %error,
+                    "could not cache the network policy; a reboot during a control plane outage \
+                     would leave this node without it. Retried on the next answer"
+                );
+                false
+            }
         }
     }
 
@@ -210,6 +237,12 @@ impl PolicySource for AgentPolicySource {
             held_snapshot,
         };
         let policy = match self.fetch(&report).await {
+            Ok(policy) if self.nothing_changed(&policy) => {
+                // The held snapshot, its digest, the mode and the cache are
+                // all current (a failed cache write is not: see
+                // `nothing_changed`): an idle node's pass copies nothing.
+                return Ok(policy.mode);
+            }
             Ok(policy) => {
                 let policy = self.resolve_unchanged(policy);
                 self.store_cache(&policy);
@@ -232,9 +265,25 @@ impl PolicySource for AgentPolicySource {
         // Observations are reported in every mode: knowing its workloads
         // does not depend on whether the node filters.
         *self.last_digest.lock().unwrap_or_else(|e| e.into_inner()) = policy.snapshot_digest;
+        *self.last_mode.lock().unwrap_or_else(|e| e.into_inner()) = Some(policy.mode);
+        let records = policy
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.egress.iter().any(|policy| policy.record));
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         *last = policy.snapshot;
+        self.last_records
+            .store(records, std::sync::atomic::Ordering::Relaxed);
         Ok(policy.mode)
+    }
+
+    async fn off_recording_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        // A flag worked out when the snapshot changed: an idle `off` pass
+        // neither scans nor copies the snapshot.
+        if !self.last_records.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(self.last.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
@@ -262,6 +311,21 @@ impl PolicySource for AgentPolicySource {
 }
 
 impl AgentPolicySource {
+    /// Whether `policy` says the held snapshot is current and the mode is
+    /// the one last taken: then nothing held needs to change.
+    fn nothing_changed(&self, policy: &NodePolicy) -> bool {
+        policy.unchanged
+            && self
+                .cache_current
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            && *self.last_mode.lock().unwrap_or_else(|e| e.into_inner()) == Some(policy.mode)
+    }
+
     /// An `unchanged` answer means "keep the snapshot you hold": it becomes
     /// that snapshot, so the cache and the pass see a complete policy.
     fn resolve_unchanged(&self, mut policy: NodePolicy) -> NodePolicy {
@@ -480,6 +544,83 @@ mod tests {
             "token".into(),
             "nftables",
         )
+    }
+
+    /// An `off` pass gets the held snapshot only when a policy in it
+    /// records; otherwise it is not copied. An answer that changes neither
+    /// the snapshot nor the mode is recognised as such.
+    #[tokio::test]
+    async fn an_idle_off_pass_copies_nothing() {
+        let source = source("127.0.0.1:9".parse().unwrap());
+        let subject = temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 1);
+        let mut snapshot = PolicySnapshot::default();
+        snapshot.egress.push(temps_workload_netpol::EgressPolicy {
+            subject,
+            rules: Vec::new(),
+            record: false,
+            public_only: false,
+        });
+        *source.last.lock().unwrap() = Some(snapshot.clone());
+        assert!(source.off_recording_snapshot().await.unwrap().is_none());
+        snapshot.egress[0].record = true;
+        *source.last.lock().unwrap() = Some(snapshot);
+        source
+            .last_records
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(source.off_recording_snapshot().await.unwrap().is_some());
+
+        *source.last_mode.lock().unwrap() = Some(NodeMode::Off);
+        let unchanged = |mode| NodePolicy {
+            mode,
+            snapshot: None,
+            snapshot_digest: Some("d1".into()),
+            unchanged: true,
+            protocol: temps_workload_netpol::POLICY_PROTOCOL,
+        };
+        assert!(source.nothing_changed(&unchanged(NodeMode::Off)));
+        assert!(
+            !source.nothing_changed(&unchanged(NodeMode::Enforce)),
+            "a new mode is taken the full way"
+        );
+
+        // A cache write that failed: the next answer is taken the full way,
+        // so the cache is written again even though nothing changed.
+        source
+            .cache_current
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!source.nothing_changed(&unchanged(NodeMode::Off)));
+    }
+
+    /// A cache write that fails leaves the cache stale until a write works:
+    /// an unchanged answer after it is written again, not skipped.
+    #[test]
+    fn a_failed_cache_write_is_retried_on_the_next_answer() {
+        let dir = std::env::temp_dir().join(format!(
+            "temps-netpol-cache-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A directory that does not exist: the write fails.
+        let source = source("127.0.0.1:9".parse().unwrap()).with_cache(dir.join("policy.json"));
+        let policy = NodePolicy {
+            mode: NodeMode::Off,
+            snapshot: Some(PolicySnapshot::default()),
+            snapshot_digest: Some("d1".into()),
+            unchanged: false,
+            protocol: temps_workload_netpol::POLICY_PROTOCOL,
+        };
+        source.store_cache(&policy);
+        assert!(!source
+            .cache_current
+            .load(std::sync::atomic::Ordering::Relaxed));
+        std::fs::create_dir_all(&dir).unwrap();
+        source.store_cache(&policy);
+        assert!(source
+            .cache_current
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(dir.join("policy.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A new agent asks with its protocol, holds the snapshot it gets in

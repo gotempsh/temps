@@ -1257,6 +1257,14 @@ pub async fn query_logs(
     Query(params): Query<LogQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    // No project has an id of 0 or below: such a request names no project,
+    // and is refused before any access check could pass for it.
+    if params.project_id <= 0 {
+        return Err(OtelError::Validation {
+            message: format!("project_id must name a project, got {}", params.project_id),
+        }
+        .into());
+    }
     // Confine a project-scoped deployment token to its own project (no-op for
     // user/API-key/session auth).
     project_scope_guard!(auth, params.project_id);
@@ -1309,6 +1317,8 @@ pub async fn query_logs(
     // set, the store applies both.
     let query = LogQuery {
         workload,
+        // A request never lifts the project: the store applies both.
+        workload_in_any_project: false,
         project_id: params.project_id,
         attribute_filter,
         severity,

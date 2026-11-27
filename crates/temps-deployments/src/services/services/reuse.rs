@@ -388,6 +388,15 @@ impl DeploymentService {
         if let Some(scheduler) = self.node_scheduler.get() {
             builder = builder.node_scheduler(scheduler.clone());
         }
+        // The destination environment's own recording opt-in, as a normal
+        // deployment reads it: a promoted or rolled-back image's replicas
+        // are recorded exactly when a fresh deployment's would be.
+        builder = builder
+            .recorded_egress(crate::services::egress_recording::RecordedEgress::plan(
+                environment,
+                self.egress_recorder.get().map(Arc::as_ref),
+            ))
+            .egress_recorder(self.egress_recorder.get().cloned());
         builder = builder
             .encryption_service(self.encryption_service.clone())
             .config_service(self.config_service.clone())

@@ -41,12 +41,14 @@ import { problemDetail } from '@/lib/api-problem'
 import { formatBytes } from '@/lib/utils'
 
 import {
+  activityPages,
   describeDestination,
   egressRecordsKey,
   egressStatusKey,
   EXAMPLE_RECORDS,
   formatDuration,
   outcomeVariant,
+  pageAfterEmpty,
   type EgressRecordsQuery,
   type EgressWorkload,
 } from './egress-recording'
@@ -82,17 +84,23 @@ export function OutboundActivityCard({
     queryFn: ({ signal }) => workload.records(query, signal),
     refetchInterval: recording && page === 1 && !disabled ? REFRESH_MS : false,
   })
-  const total = records.data?.total ?? 0
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const counted = records.data?.total ?? 0
+  const { total, totalPages } = activityPages({
+    total: counted,
+    page,
+    pageSize: PAGE_SIZE,
+    shown: records.data?.records.length ?? 0,
+    hasMore: records.data?.has_more ?? false,
+  })
   // Retention can empty a later page while it is open (its last records
   // expired): go back to the last page that still has records, instead of
   // showing nothing with no way back. Adjusted while rendering, not in an
   // effect: the new page's query has no data yet, so this runs once per
-  // emptied page.
+  // emptied page, and goes straight to a page the count still fills.
   const emptyLaterPage =
     records.data !== undefined && records.data.records.length === 0 && page > 1
   if (emptyLaterPage) {
-    setPage(Math.max(1, Math.min(page - 1, totalPages)))
+    setPage(pageAfterEmpty({ total: counted, page, pageSize: PAGE_SIZE }))
   }
 
   return (
@@ -197,7 +205,9 @@ function EmptyActivity({
       </p>
     )
   }
-  if (status?.enabled || disabled) {
+  // Only a status that says recording is off may say so: while it is
+  // loading or could not be read, nothing is claimed either way.
+  if (status === undefined || status.enabled || disabled) {
     return (
       <p className="text-sm text-muted-foreground">
         No connections recorded yet.

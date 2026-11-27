@@ -216,6 +216,8 @@ impl EgressRecordingService {
             // Read by the workload alone; the project is not applied.
             project_id: workload.project_id.unwrap_or_default(),
             workload: Some(workload.workload),
+            // The caller authorized this workload itself.
+            workload_in_any_project: true,
             attribute_filter: outcome.map(|outcome| LogAttributeFilter {
                 key: "temps.egress.outcome".to_string(),
                 ty: None,

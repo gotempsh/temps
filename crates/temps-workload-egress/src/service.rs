@@ -124,8 +124,9 @@ pub struct EgressRecordingStatus {
     /// Why recording cannot work, when `configured` is false:
     /// `otel_unavailable`; `not_recordable` when nothing routes this
     /// workload's traffic to a recorder (a backend or deployment kind it
-    /// has no route for); or the `reason_code` of the node that cannot
-    /// record.
+    /// has no route for); `not_applied` when it is on but the workload's
+    /// traffic could not be switched to the recorder yet (retried); or the
+    /// `reason_code` of the node that cannot record.
     pub reason_code: Option<String>,
     /// The same, in a sentence that names what is missing.
     pub reason: Option<String>,
@@ -419,7 +420,9 @@ impl EgressRecordingService {
     ) -> Result<EgressRecordingStatus, EgressRecordingError> {
         let adapter = self.adapter(workload.workload.kind)?;
         let nodes = self.nodes_of(adapter.as_ref(), workload).await?;
-        self.status_of(workload, nodes).await
+        let mut status = self.status_of(workload, nodes).await?;
+        not_applied(&mut status, adapter.not_applied(workload));
+        Ok(status)
     }
 
     /// Turns recording on or off for `workload`, which the caller has
@@ -464,13 +467,13 @@ impl EgressRecordingService {
             enabled,
             ..workload.clone()
         };
-        let status = self.status_of(&now, nodes).await?;
+        let mut status = self.status_of(&now, nodes).await?;
         // What the row held before is what this write found, not what the
         // caller read earlier: a request racing another to the same value
         // changes nothing, and is audited as no change.
         let changed = adapter.set_enabled(workload.workload, enabled).await?;
         let previous = if changed { !enabled } else { enabled };
-        adapter.changed(&now).await;
+        not_applied(&mut status, adapter.changed(&now).await);
         tracing::info!(
             workload = %workload.workload,
             id = %workload.public_id,
@@ -482,6 +485,24 @@ impl EgressRecordingService {
         Ok((previous, status))
     }
 }
+
+/// Marks `status` as not recording when the workload's traffic does not
+/// follow its opt-in yet (`reason`, from its adapter): recording is on, but
+/// nothing goes through the recorder, which the status says rather than
+/// reporting it working. A status that already cannot record keeps its
+/// own reason.
+fn not_applied(status: &mut EgressRecordingStatus, reason: Option<String>) {
+    let Some(reason) = reason else { return };
+    if status.enabled && status.configured {
+        status.configured = false;
+        status.reason_code = Some(NOT_APPLIED.to_string());
+        status.reason = Some(reason);
+    }
+}
+
+/// The `reason_code` of a workload whose opt-in is stored but whose
+/// traffic does not follow it yet.
+pub const NOT_APPLIED: &str = "not_applied";
 
 /// The console path of a project's logs filtered to one workload's
 /// recorded connections: by the workload columns, which only the platform

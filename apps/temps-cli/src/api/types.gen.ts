@@ -14485,8 +14485,9 @@ export type EgressRecordingStatus = {
      * Why recording cannot work, when `configured` is false:
      * `otel_unavailable`; `not_recordable` when nothing routes this
      * workload's traffic to a recorder (a backend or deployment kind it
-     * has no route for); or the `reason_code` of the node that cannot
-     * record.
+     * has no route for); `not_applied` when it is on but the workload's
+     * traffic could not be switched to the recorder yet (retried); or the
+     * `reason_code` of the node that cannot record.
      */
     reason_code?: string | null;
     /**

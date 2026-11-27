@@ -36,7 +36,10 @@ export function recordingChange(options: { on?: boolean; off?: boolean }): boole
 /** The destination of a record as a person reads it. */
 export function describeDestination(record: EgressActivityRecord): string {
   if (record.relay) return `${record.relay} relay`
-  const host = record.host ?? '(no destination)'
+  // An IPv6 literal is bracketed, as in a URL authority: otherwise its last
+  // group and the port read as one address.
+  const bare = record.host ?? '(no destination)'
+  const host = bare.includes(':') && !bare.startsWith('[') ? `[${bare}]` : bare
   const where = record.port ? `${host}:${record.port}` : host
   return record.method && record.path ? `${record.method} ${where}${record.path}` : where
 }

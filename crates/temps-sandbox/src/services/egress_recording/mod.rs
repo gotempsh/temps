@@ -77,6 +77,9 @@ pub struct RecorderPolicyRefresh {
     /// Weak: the sandbox service holds this observer, and nothing it
     /// registers may keep the recorder alive.
     pub recorder: std::sync::Weak<LocalEgressRecorder>,
+    /// The sandboxes' traffic source, whose remembered sidecar failure a
+    /// successful policy update clears. Weak for the same reason.
+    pub traffic: std::sync::Weak<local::SandboxTraffic>,
 }
 
 #[async_trait]
@@ -100,6 +103,12 @@ impl crate::services::sandbox_service::EgressPolicyObserver for RecorderPolicyRe
             // A policy change does not move the revision the rows are
             // cached at: read them again.
             recorder.rediscover().await;
+            // The update applied the new policy to the sidecar before it
+            // called this: a failure remembered from the old one (a refused
+            // policy) no longer holds, and its status stops reporting it.
+            if let Some(traffic) = self.traffic.upgrade() {
+                traffic.forget_failure(row.id);
+            }
         }
     }
 }
@@ -216,19 +225,71 @@ impl WorkloadEgressAdapter for SandboxEgressAdapter {
 
     /// The table and the published set follow at once, and a sandbox of
     /// this host gets its sidecar recreated with or without the hand-off.
-    async fn changed(&self, workload: &RecordedWorkload) {
-        let Some(local) = self.local.get() else {
-            return;
-        };
-        let Some(recorder) = local.recorder.upgrade() else {
-            return;
-        };
-        recorder.rediscover().await;
-        let Ok(id) = i32::try_from(workload.workload.id) else {
-            return;
-        };
-        local.traffic.steer(id).await;
-        recorder.wake();
+    /// A sandbox on a worker is that worker's to steer: nothing is done or
+    /// reported for it here.
+    ///
+    /// Both run on their own task, in order (publish, then replace): a
+    /// request dropped part-way, after the opt-in is stored, does not stop
+    /// them, so the sidecar always follows the stored opt-in and is never
+    /// replaced against what was published before it. A replacement that
+    /// fails is reported, and stays reported (see [`Self::not_applied`])
+    /// until one works.
+    async fn changed(&self, workload: &RecordedWorkload) -> Option<String> {
+        let local = self.local.get()?;
+        if !on_this_host(workload) {
+            return None;
+        }
+        let id = i32::try_from(workload.workload.id).ok()?;
+        let recorder = local.recorder.upgrade()?;
+        let traffic = local.traffic.clone();
+        let steering = tokio::spawn(async move {
+            recorder.rediscover().await;
+            let failure = traffic.steer(id).await;
+            recorder.wake();
+            failure
+        });
+        match steering.await {
+            Ok(failure) => failure.map(|failure| not_applied_reason(&failure)),
+            Err(error) => Some(format!(
+                "switching the sandbox's egress proxy to the recorder stopped unexpectedly \
+                 ({error}); turn recording off and on again"
+            )),
+        }
+    }
+
+    fn not_applied(&self, workload: &RecordedWorkload) -> Option<String> {
+        let local = self.local.get()?;
+        if !on_this_host(workload) {
+            return None;
+        }
+        let id = i32::try_from(workload.workload.id).ok()?;
+        local
+            .traffic
+            .failure_of(id)
+            .map(|failure| not_applied_reason(&failure))
+    }
+}
+
+/// Whether `workload` runs on this host (node 0), whose sidecars this
+/// process replaces.
+fn on_this_host(workload: &RecordedWorkload) -> bool {
+    workload.nodes.as_slice() == [CONTROL_PLANE_NODE_ID]
+}
+
+/// What a sandbox's status says while its sidecar does not follow its
+/// opt-in.
+fn not_applied_reason(failure: &local::SidecarFailure) -> String {
+    if failure.retry {
+        format!(
+            "the sandbox's egress proxy could not be switched to the recorder yet \
+             ({failure}); it is retried, and its connections are recorded once it is"
+        )
+    } else {
+        format!(
+            "the sandbox's egress proxy refused its stored policy ({failure}), so it was \
+             not switched to the recorder; change the sandbox's network policy, or turn \
+             recording off and on again"
+        )
     }
 }
 
@@ -239,16 +300,28 @@ pub struct SandboxEgress {
     recording: Arc<EgressRecordingService>,
 }
 
+/// What a caller does with a sandbox's recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Its status and recorded connections: also once it is destroyed.
+    Read,
+    /// Turning recording on or off: only while it exists.
+    Change,
+}
+
 impl SandboxEgress {
     pub fn new(db: Arc<DatabaseConnection>, recording: Arc<EgressRecordingService>) -> Self {
         Self { db, recording }
     }
 
-    /// The caller's live sandbox `public_id_value`, or not found.
+    /// The caller's sandbox `public_id_value`, or not found. A destroyed
+    /// sandbox is still its owner's to read (what it recorded is kept until
+    /// retention removes it) but no longer theirs to change.
     async fn owned(
         &self,
         public_id_value: &str,
         user_id: i32,
+        access: Access,
     ) -> Result<RecordedWorkload, EgressRecordingError> {
         let not_found = || EgressRecordingError::NotFound {
             noun: NOUN,
@@ -263,8 +336,9 @@ impl SandboxEgress {
             .await
             .map_err(EgressRecordingError::db("looking up a sandbox"))?
             .ok_or_else(not_found)?;
-        // Don't leak existence to non-owners; a destroyed sandbox is gone.
-        if row.user_id != Some(user_id) || row.status == "destroyed" {
+        // Don't leak existence to non-owners; a destroyed sandbox is gone
+        // for anything but reading its history.
+        if row.user_id != Some(user_id) || (access == Access::Change && row.status == "destroyed") {
             return Err(not_found());
         }
         Ok(recorded(&row))
@@ -277,7 +351,7 @@ impl SandboxEgress {
         public_id_value: &str,
         user_id: i32,
     ) -> Result<EgressRecordingStatus, EgressRecordingError> {
-        let sandbox = self.owned(public_id_value, user_id).await?;
+        let sandbox = self.owned(public_id_value, user_id, Access::Read).await?;
         self.recording.status(&sandbox).await
     }
 
@@ -289,7 +363,7 @@ impl SandboxEgress {
         user_id: i32,
         enabled: bool,
     ) -> Result<(bool, EgressRecordingStatus), EgressRecordingError> {
-        let sandbox = self.owned(public_id_value, user_id).await?;
+        let sandbox = self.owned(public_id_value, user_id, Access::Change).await?;
         self.recording.set_enabled(&sandbox, enabled).await
     }
 
@@ -303,7 +377,7 @@ impl SandboxEgress {
         per_page: Option<u64>,
         outcome: Option<EgressOutcomeFilter>,
     ) -> Result<EgressActivityPage, EgressRecordingError> {
-        let sandbox = self.owned(public_id_value, user_id).await?;
+        let sandbox = self.owned(public_id_value, user_id, Access::Read).await?;
         self.recording
             .activity(&sandbox, page, per_page, outcome)
             .await

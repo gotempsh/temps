@@ -149,6 +149,22 @@ pub struct StandaloneSandboxRegistry {
     nodes: Arc<dyn SandboxNodeLookup>,
 }
 
+/// The handle of agent run `run_id`'s Docker container on `node_id`, by its
+/// name (`temps-sandbox-<run>`), which Docker resolves to the container
+/// holding it now.
+fn agent_run_handle(node_id: Option<i32>, run_id: i32) -> SandboxHandle {
+    let name = format!("temps-sandbox-{run_id}");
+    SandboxHandle {
+        node_id,
+        sandbox_id: name.clone(),
+        sandbox_name: name,
+        work_dir: std::path::PathBuf::from("/home/temps/workspace"),
+        backend: temps_sandbox_providers::SandboxBackend::Docker,
+        image: String::new(),
+        conditions: Vec::new(),
+    }
+}
+
 /// Which node hosts a sandbox, by its internal id (ADR-048).
 #[async_trait::async_trait]
 pub trait SandboxNodeLookup: Send + Sync {
@@ -699,6 +715,26 @@ impl StandaloneSandboxRegistry {
         self.provider.set_egress_policy(&handle, policy).await
     }
 
+    /// [`Self::set_egress_policy`] for sandbox `id` that agent run `run_id`
+    /// started on the Docker backend. Its container is named after the run,
+    /// not the public id, and its handle lives with the run rather than in
+    /// this registry, so the container is reached by that name: Docker
+    /// resolves a name to whatever container holds it now, so a replaced
+    /// container is never mistaken for the old one. Nothing is recovered
+    /// (recovery walks the workspace) and nothing is kept here, so this
+    /// registry's own lifecycle calls never take it for a standalone
+    /// sandbox. Callers serialize it as for [`Self::set_egress_policy`].
+    pub async fn set_agent_run_egress_policy(
+        &self,
+        id: i32,
+        run_id: i32,
+        policy: &temps_sandbox_providers::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let node_id = self.node_of(id).await?;
+        let handle = agent_run_handle(node_id, run_id);
+        self.provider.set_egress_policy(&handle, policy).await
+    }
+
     /// Grow the sandbox's root disk (Firecracker only). Same recovery.
     pub async fn resize_disk(
         &self,
@@ -878,6 +914,10 @@ mod tests {
         released: std::sync::Mutex<Vec<(Option<i32>, String)>>,
         /// Whether releasing leftovers fails, like a daemon that is down.
         release_fails: bool,
+        /// `(node, sandbox id)` of every egress policy applied.
+        egress_applied: std::sync::Mutex<Vec<(Option<i32>, String)>>,
+        /// How many egress policy changes fail before they succeed.
+        egress_failures_remaining: AtomicUsize,
     }
 
     impl FakeProvider {
@@ -898,6 +938,8 @@ mod tests {
                 recovered_on: std::sync::Mutex::new(Vec::new()),
                 released: std::sync::Mutex::new(Vec::new()),
                 release_fails: false,
+                egress_applied: std::sync::Mutex::new(Vec::new()),
+                egress_failures_remaining: AtomicUsize::new(0),
             }
         }
 
@@ -1149,6 +1191,28 @@ mod tests {
             Ok(recovered.map(|h| SandboxHandle { node_id, ..h }))
         }
 
+        async fn set_egress_policy(
+            &self,
+            handle: &SandboxHandle,
+            _policy: &temps_sandbox_providers::SandboxEgressPolicy,
+        ) -> Result<(), AgentError> {
+            if self
+                .egress_failures_remaining
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "fake".into(),
+                    reason: "container replaced".into(),
+                });
+            }
+            self.egress_applied
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((handle.node_id, handle.sandbox_id.clone()));
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "fake"
         }
@@ -1196,6 +1260,53 @@ mod tests {
             vec![Some(7)]
         );
         assert_eq!(provider.stops.load(Ordering::SeqCst), 1);
+    }
+
+    /// An agent run's sandbox is reached by its run's container name, on
+    /// the node its row names, without a recovery (which walks the
+    /// workspace) and without keeping a handle here: each change names the
+    /// container afresh, so a replaced one is never confused with the old.
+    #[tokio::test]
+    async fn an_agent_run_sandbox_is_reached_by_its_runs_container_name() {
+        let provider = Arc::new(FakeProvider::new());
+        let reg =
+            StandaloneSandboxRegistry::new(provider.clone(), Arc::new(FixedNode(Ok(Some(7)))));
+        let policy = temps_sandbox_providers::SandboxEgressPolicy::internet();
+
+        for _ in 0..2 {
+            reg.set_agent_run_egress_policy(42, 17, &policy)
+                .await
+                .expect("applied");
+        }
+        assert_eq!(
+            *provider.egress_applied.lock().expect("egress_applied"),
+            vec![
+                (Some(7), "temps-sandbox-17".to_string()),
+                (Some(7), "temps-sandbox-17".to_string())
+            ],
+            "applied to the run's container on its node, each time by name"
+        );
+        assert!(
+            provider
+                .recovered_on
+                .lock()
+                .expect("recovered_on")
+                .is_empty(),
+            "nothing recovered"
+        );
+        assert!(
+            reg.handles.read().await.get(&42).is_none(),
+            "not taken for a standalone sandbox"
+        );
+
+        // A failure is the provider's, returned as it is.
+        provider
+            .egress_failures_remaining
+            .store(1, Ordering::SeqCst);
+        assert!(matches!(
+            reg.set_agent_run_egress_policy(42, 17, &policy).await,
+            Err(AgentError::SandboxProviderUnavailable { .. })
+        ));
     }
 
     /// Requests that reach a sandbox together after a restart share one

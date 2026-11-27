@@ -98,7 +98,7 @@ export function environmentEgress(
     key: [projectId, environmentId],
     noun: 'environment',
     appliesNote:
-      'Applies to containers started after it is turned on: redeploy to start recording. Only HTTPS to public destinations goes through the recorder (plain HTTP stays direct, and a proxy the deployment or its image sets is kept), and while it is on those requests depend on the node being up.',
+      'Applies to containers started after it is turned on: redeploy to start recording. Only HTTPS to public destinations goes through the recorder (plain HTTP stays direct, and a proxy the deployment or its image sets is kept), and those requests depend on the recorder on the node being up until the containers started while recording was on are replaced, even after it is turned off.',
     status: async (signal) =>
       (
         await getEnvironmentEgressRecording({
@@ -180,7 +180,14 @@ export function describeDestination(record: {
   path?: string | null
   relay?: string | null
 }): string {
-  const host = record.host ?? 'unknown host'
+  // An IPv6 literal is bracketed, as in a URL authority: otherwise its last
+  // group and the port read as one address.
+  const host =
+    record.host == null
+      ? 'unknown host'
+      : record.host.includes(':') && !record.host.startsWith('[')
+        ? `[${record.host}]`
+        : record.host
   const hostPort = record.port == null ? host : `${host}:${record.port}`
   switch (record.kind) {
     case 'tunnel':
@@ -204,4 +211,78 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60_000)
   const seconds = Math.round((ms % 60_000) / 1000)
   return seconds === 0 ? `${minutes} min` : `${minutes} min ${seconds} s`
+}
+
+/**
+ * What the activity pager shows for a page. `total` is a recent count, not
+ * an exact one (the server reuses it for a short while), while the page's
+ * records and `hasMore` are fresh: the pager never shows fewer records than
+ * the pages already seen hold, so a later page keeps its way back, a page
+ * that says more follow gets a next one, and "Showing X–Y of Z" never runs
+ * backwards.
+ */
+export function activityPages({
+  total,
+  page,
+  pageSize,
+  shown,
+  hasMore,
+}: {
+  total: number
+  page: number
+  pageSize: number
+  /** Records on this page. */
+  shown: number
+  hasMore: boolean
+}): { total: number; totalPages: number } {
+  const seen = shown > 0 ? (page - 1) * pageSize + shown : 0
+  const atLeast = Math.max(total, seen + (hasMore ? 1 : 0))
+  return {
+    total: atLeast,
+    totalPages: Math.max(1, Math.ceil(atLeast / pageSize)),
+  }
+}
+
+/**
+ * The page to go to when a later page came back empty (retention removed
+ * its records while it was open): straight to the last page the count
+ * still fills, never through every page in between.
+ */
+export function pageAfterEmpty({
+  total,
+  page,
+  pageSize,
+}: {
+  total: number
+  page: number
+  pageSize: number
+}): number {
+  return Math.max(1, Math.min(page - 1, Math.ceil(total / pageSize)))
+}
+
+/**
+ * The toast a recording switch answers with. A switch that was stored but
+ * whose traffic does not go through the recorder yet (`enabled` but not
+ * `configured`, e.g. `not_applied`) is a warning naming why, never
+ * "now recorded".
+ */
+export function toggleToast(next: {
+  enabled: boolean
+  configured: boolean
+  reason?: string | null
+}): { kind: 'success' | 'warning'; title: string; description?: string } {
+  if (!next.enabled) {
+    return {
+      kind: 'success',
+      title: 'Outbound connections are no longer recorded',
+    }
+  }
+  if (!next.configured) {
+    return {
+      kind: 'warning',
+      title: 'Recording is on, but nothing is recorded yet',
+      description: next.reason ?? undefined,
+    }
+  }
+  return { kind: 'success', title: 'Outbound connections are now recorded' }
 }

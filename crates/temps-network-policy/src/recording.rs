@@ -98,9 +98,14 @@ impl NetworkPolicyService {
     ) {
         let mut reports = self.recording.lock().unwrap_or_else(|e| e.into_inner());
         // A report past its TTL is never read again (a removed worker's,
-        // one that stopped polling): dropped here, so worker churn leaves
-        // nothing behind. O(nodes) per poll.
-        reports.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+        // one that stopped polling): dropped when a node not yet in the map
+        // reports, so worker churn leaves nothing behind (the map holds at
+        // most the nodes reporting plus those that left since the last new
+        // one, or a TTL ago at most: `SweepClock`) while a steady heartbeat
+        // stays O(1) amortized.
+        if self.swept.recording.due(!reports.contains_key(&node_id)) {
+            reports.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+        }
         reports.insert(
             node_id,
             RecordingReport {
@@ -168,6 +173,40 @@ mod tests {
         service.record_egress_recording(3, Some(EgressRecordingCapability::Available));
         service.recording.lock().unwrap().get_mut(&3).unwrap().seen =
             Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.record_egress_recording(4, Some(EgressRecordingCapability::Available));
+        let kept: Vec<i32> = service.recording.lock().unwrap().keys().copied().collect();
+        assert_eq!(kept, [4]);
+    }
+
+    /// A heartbeat from a node already known scans nothing: an expired
+    /// entry waits for the next new node, so N steady workers cost O(N)
+    /// per round, not O(N²).
+    #[test]
+    fn a_known_nodes_heartbeat_does_not_scan_the_others() {
+        let service = service();
+        for node in [3, 4] {
+            service.record_egress_recording(node, Some(EgressRecordingCapability::Available));
+        }
+        service.recording.lock().unwrap().get_mut(&3).unwrap().seen =
+            Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.record_egress_recording(4, Some(EgressRecordingCapability::Available));
+        let mut kept: Vec<i32> = service.recording.lock().unwrap().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [3, 4], "no sweep on a known node's heartbeat");
+        assert!(
+            !service.egress_recording_status(3).is_available(),
+            "an expired entry is still never read"
+        );
+        service.record_egress_recording(5, Some(EgressRecordingCapability::Available));
+        let mut kept: Vec<i32> = service.recording.lock().unwrap().keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, [4, 5], "a new node sweeps");
+
+        // With no new node, a known node's heartbeat sweeps once a TTL has
+        // passed since the last sweep: a worker that left is released.
+        service.recording.lock().unwrap().get_mut(&5).unwrap().seen =
+            Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.swept.recording.expire();
         service.record_egress_recording(4, Some(EgressRecordingCapability::Available));
         let kept: Vec<i32> = service.recording.lock().unwrap().keys().copied().collect();
         assert_eq!(kept, [4]);

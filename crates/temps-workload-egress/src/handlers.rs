@@ -96,7 +96,8 @@ impl From<EgressRecordingError> for Problem {
                     .with_title("Invalid Egress Record")
                     .with_detail(detail)
             }
-            EgressRecordingError::IngestUnavailable { .. } => {
+            EgressRecordingError::IngestUnavailable { .. }
+            | EgressRecordingError::IngestDisabled { .. } => {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("OpenTelemetry Storage Unavailable")
                     .with_detail(detail)

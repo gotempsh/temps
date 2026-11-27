@@ -61,6 +61,8 @@ pub(crate) fn public_id(id: i64) -> String {
 pub(crate) struct FakeAdapter {
     pub rows: Mutex<HashMap<i64, RecordedWorkload>>,
     pub changed: Mutex<Vec<(i64, bool)>>,
+    /// What `changed` and `not_applied` answer.
+    pub not_applied: Mutex<Option<String>>,
 }
 
 impl FakeAdapter {
@@ -102,11 +104,16 @@ impl WorkloadEgressAdapter for FakeAdapter {
         })
     }
 
-    async fn changed(&self, workload: &RecordedWorkload) {
+    async fn changed(&self, workload: &RecordedWorkload) -> Option<String> {
         self.changed
             .lock()
             .unwrap()
             .push((workload.workload.id, workload.enabled));
+        self.not_applied.lock().unwrap().clone()
+    }
+
+    fn not_applied(&self, _workload: &RecordedWorkload) -> Option<String> {
+        self.not_applied.lock().unwrap().clone()
     }
 }
 
@@ -538,6 +545,32 @@ async fn a_linux_node_whose_proxy_is_not_serving_cannot_record_yet() {
     );
 }
 
+/// A switch the workload's traffic did not follow (its sidecar could not be
+/// replaced) is reported as on but not recording, by the toggle and by
+/// every status read after it, until the adapter says it took.
+#[tokio::test]
+async fn a_switch_that_did_not_take_is_never_reported_working() {
+    let Some(f) = fixture().await else { return };
+    let (service, _) = f.service();
+    *f.adapter.not_applied.lock().unwrap() =
+        Some("the sandbox's egress proxy could not be replaced yet".to_string());
+    let (_, toggled) = service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
+    assert!(toggled.enabled && !toggled.configured, "{toggled:?}");
+    assert_eq!(
+        toggled.reason_code.as_deref(),
+        Some(crate::service::NOT_APPLIED)
+    );
+    let read = service.status(&f.row(ON_WORKER)).await.unwrap();
+    assert_eq!(
+        read.reason_code.as_deref(),
+        Some(crate::service::NOT_APPLIED)
+    );
+
+    *f.adapter.not_applied.lock().unwrap() = None;
+    let read = service.status(&f.row(ON_WORKER)).await.unwrap();
+    assert!(read.enabled && read.configured, "{read:?}");
+}
+
 #[tokio::test]
 async fn without_otel_storage_recording_says_so() {
     let Some(f) = fixture().await else { return };
@@ -724,6 +757,52 @@ async fn ingest_drops_only_the_records_of_workloads_not_placed_on_the_worker() {
         (0, 1, 0),
         "a deleted workload's record is dropped as no longer recording"
     );
+}
+
+/// A workload placed nowhere yet (a first deployment's replica before it is
+/// marked complete) is recorded by this process's own recorder, node 0,
+/// which started it; a worker cannot claim it, and node 0 cannot claim a
+/// workload placed on a worker.
+#[tokio::test]
+async fn the_control_plane_records_a_workload_not_placed_yet() {
+    let Some(f) = fixture().await else { return };
+    let (service, store) = f.service();
+    service
+        .set_enabled(&f.row(NOT_RUNNING), true)
+        .await
+        .unwrap();
+    service.set_enabled(&f.row(ON_WORKER), true).await.unwrap();
+
+    let local = service
+        .ingest(
+            CONTROL_PLANE_NODE_ID,
+            batch(vec![
+                record(NOT_RUNNING, "api.example.com", ConnectionOutcome::Allowed),
+                record(ON_WORKER, "api.example.com", ConnectionOutcome::Allowed),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (local.stored, local.not_placed),
+        (1, 1),
+        "the unplaced workload is stored, the worker's refused"
+    );
+    let worker = service
+        .ingest(
+            f.worker_a,
+            batch(vec![record(
+                NOT_RUNNING,
+                "api.example.com",
+                ConnectionOutcome::Allowed,
+            )]),
+        )
+        .await
+        .unwrap();
+    assert_eq!((worker.stored, worker.not_placed), (0, 1));
+    let stored = store.0.lock().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].workload, Some(workload(NOT_RUNNING)));
 }
 
 const MAX_BATCH: usize = temps_workload_netpol::egress::record::MAX_BATCH_RECORDS;
@@ -1248,6 +1327,88 @@ async fn the_node_endpoint_refuses_batches_while_telemetry_ingest_is_saturated()
     drop(held);
     let accepted = post().await.unwrap();
     assert_eq!(accepted.status(), StatusCode::OK);
+    assert_eq!(store.inner.0.lock().unwrap().len(), 1);
+    assert_eq!(permits.available_permits(), 1, "the slot is given back");
+}
+
+/// Without OpenTelemetry storage nothing a node sends could be stored: its
+/// batch is refused with a 503 before the body is read, so concurrent
+/// uploads neither buffer bodies nor reach the database.
+#[tokio::test]
+async fn without_otel_storage_a_node_batch_is_refused_before_its_body() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use tower::ServiceExt;
+
+    let Some(f) = fixture().await else { return };
+    let service = f.with_store(None);
+    let app = crate::handlers::node_routes(Arc::new(crate::handlers::EgressRecordingNodeState {
+        service: service.clone(),
+    }));
+    // A body that never ends: answered at all only if it is never read.
+    let endless = futures::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/internal/nodes/{}/egress-records", f.worker_a))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {NODE_TOKEN}"))
+                .body(Body::from_stream(endless.boxed()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("answered without reading the body")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(matches!(
+        service.try_acquire_ingest_permit(f.worker_a),
+        Err(EgressRecordingError::IngestDisabled { node_id }) if node_id == f.worker_a
+    ));
+}
+
+/// The control plane's own recording holds a slot of the telemetry ingest
+/// limit while it stores, as OTLP and worker batches do: with every slot
+/// taken it waits, gives up once its wait is over (nothing stored), and
+/// stores as soon as a slot is free, giving it back.
+#[tokio::test]
+async fn the_local_sink_takes_an_ingest_slot() {
+    let Some(f) = fixture().await else { return };
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let store = Arc::new(OverQuota {
+        inner: CollectStore::default(),
+        over: -1,
+        unchecked: false,
+        permits: Some(permits.clone()),
+    });
+    let service = f.with_store(Some(store.clone()));
+    service
+        .set_enabled(&f.row(ON_CONTROL_PLANE), true)
+        .await
+        .unwrap();
+    let sink = LocalRecordSink::with_permit_wait(service, std::time::Duration::from_millis(200));
+    let one = || {
+        batch(vec![record(
+            ON_CONTROL_PLANE,
+            "api.example.com",
+            ConnectionOutcome::Allowed,
+        )])
+    };
+
+    let held = permits.clone().try_acquire_owned().unwrap();
+    assert!(
+        sink.deliver(one()).await.is_err(),
+        "no slot within the wait"
+    );
+    assert!(store.inner.0.lock().unwrap().is_empty());
+
+    drop(held);
+    sink.deliver(one())
+        .await
+        .expect("stored once a slot is free");
     assert_eq!(store.inner.0.lock().unwrap().len(), 1);
     assert_eq!(permits.available_permits(), 1, "the slot is given back");
 }

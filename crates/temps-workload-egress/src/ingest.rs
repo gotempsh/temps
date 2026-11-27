@@ -29,7 +29,7 @@ use utoipa::ToSchema;
 use crate::adapter::RecordedWorkload;
 use crate::error::EgressRecordingError;
 use crate::records::{self, Attribution};
-use crate::service::EgressRecordingService;
+use crate::service::{EgressRecordingService, CONTROL_PLANE_NODE_ID};
 
 /// What happened to a batch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ToSchema)]
@@ -61,14 +61,15 @@ enum Quota {
 
 impl EgressRecordingService {
     /// A slot of the telemetry ingest limit for a batch from `node_id`,
-    /// taken before its body is read. None when there is no limit (or no
-    /// store: [`Self::ingest`] then says so).
+    /// taken before its body is read. None when the store sets no limit.
+    /// Without a store nothing could be stored, so the batch is refused
+    /// here, before any body is buffered or any database read is made.
     pub fn try_acquire_ingest_permit(
         &self,
         node_id: i32,
     ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, EgressRecordingError> {
         let Some(store) = self.store.as_ref() else {
-            return Ok(None);
+            return Err(EgressRecordingError::IngestDisabled { node_id });
         };
         store
             .try_acquire_ingest_permit()
@@ -152,10 +153,18 @@ impl EgressRecordingService {
         }
 
         // Placement, for every workload: a record of one the node does not
-        // host now is never stored, whatever else the batch holds.
+        // host now is never stored, whatever else the batch holds. One
+        // exception: this process's own recorder (node 0) for a workload
+        // placed nowhere yet, such as a first deployment's replica before
+        // the deployment is marked complete. Node 0 is not a remote node
+        // vouching for itself: its table comes from the containers this
+        // process steered, labelled with this installation's secret-derived
+        // id, so a workload it records is one it started here. A workload
+        // placed on other nodes only is still refused from node 0.
         let mut not_placed: BTreeSet<WorkloadRef> = BTreeSet::new();
         for (workload, (row, _)) in &rows {
-            if !row.nodes.contains(&node_id) {
+            let unplaced_here = node_id == CONTROL_PLANE_NODE_ID && row.nodes.is_empty();
+            if !unplaced_here && !row.nodes.contains(&node_id) {
                 tracing::warn!(
                     node_id,
                     %workload,

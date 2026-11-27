@@ -561,8 +561,8 @@ impl DeployImageJob {
         // The container starts with its image's `ENV` under its own
         // variables: a proxy the image sets is the workload's own route,
         // which a steered HTTPS_PROXY would replace.
-        let image_routing = match self.image_routing_variables(image_tag).await {
-            Ok(routing) => routing,
+        let (image_routing, image_hosts) = match self.image_routing_variables(image_tag).await {
+            Ok(image) => image,
             Err(unknown) => {
                 return self
                     .log(
@@ -583,7 +583,7 @@ impl DeployImageJob {
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
         );
-        let Some(steering) = recorded.variables(&existing) else {
+        let Some(steering) = recorded.variables(&existing, &image_hosts) else {
             return Ok(());
         };
         if !steering.steers() {
@@ -599,6 +599,7 @@ impl DeployImageJob {
                 )
                 .await;
         }
+        let bare_name_variables = steering.bare_name_variables.clone();
         environment_vars.extend(steering.variables);
         labels.insert(
             STEERED_LABEL.to_string(),
@@ -612,16 +613,35 @@ impl DeployImageJob {
                  direct"
             ),
         )
+        .await?;
+        if bare_name_variables.is_empty() {
+            return Ok(());
+        }
+        // Clients read a single-label NO_PROXY entry as a suffix as well:
+        // said, so a gap in the record is never silent. Named by variable,
+        // never by value: a resolved value may be secret.
+        self.log(
+            context,
+            format!(
+                "Kept direct because only this replica's network resolves them: the \
+                 single-label hosts named by {}. HTTP clients also treat a single-label \
+                 host as a domain suffix, so HTTPS to any host ending in .<that name> goes \
+                 direct too and is not recorded",
+                bare_name_variables.join(", ")
+            ),
+        )
         .await
     }
 
     /// The proxy variables `image_tag` sets in its own `ENV`
-    /// ([`temps_workload_egress::steering::ROUTING_VARIABLES`]), read from
-    /// this host's image store: a steered replica always runs here.
+    /// ([`temps_workload_egress::steering::ROUTING_VARIABLES`]) and its
+    /// entries naming internal hosts
+    /// ([`temps_workload_egress::steering::image_host_variables`]), read
+    /// from this host's image store: a steered replica always runs here.
     async fn image_routing_variables(
         &self,
         image_tag: &str,
-    ) -> Result<HashMap<String, String>, ImageRoutingUnknown> {
+    ) -> Result<(HashMap<String, String>, HashMap<String, String>), ImageRoutingUnknown> {
         let builder = self
             .image_builder
             .as_ref()
@@ -631,8 +651,10 @@ impl DeployImageJob {
             .await
             .map_err(ImageRoutingUnknown::Inspect)?;
         let config = image.config.ok_or(ImageRoutingUnknown::NotReported)?;
-        Ok(temps_workload_egress::steering::image_routing_variables(
-            config.env.iter().map(String::as_str),
+        let env = || config.env.iter().map(String::as_str);
+        Ok((
+            temps_workload_egress::steering::image_routing_variables(env()),
+            temps_workload_egress::steering::image_host_variables(env()),
         ))
     }
 
@@ -2074,11 +2096,19 @@ mod tests {
             !env.contains_key("PATH"),
             "nothing of the image's own ENV is copied"
         );
+        // A database driver never goes through the HTTPS proxy: its linked
+        // service's single-label name is not put in NO_PROXY, where clients
+        // would also read it as a suffix.
         assert!(
-            env["NO_PROXY"]
+            !env["NO_PROXY"]
                 .split(',')
                 .any(|host| host == "postgres-main"),
-            "its linked service stays direct: {}",
+            "a single-label host only a database URL names is not a NO_PROXY entry: {}",
+            env["NO_PROXY"]
+        );
+        assert!(
+            env["NO_PROXY"].split(',').any(|host| host == "10.0.0.0/8"),
+            "private ranges stay direct: {}",
             env["NO_PROXY"]
         );
         assert_eq!(

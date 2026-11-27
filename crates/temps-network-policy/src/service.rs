@@ -235,6 +235,9 @@ pub struct NetworkPolicyService {
     /// Worker id → what its agent said about recording outbound
     /// connections ([`crate::recording`]).
     pub(crate) recording: crate::recording::RecordingReports,
+    /// When each report map was last swept of expired entries (see
+    /// [`SweepClock`]).
+    pub(crate) swept: SweepClocks,
     /// Whether node 0 (this process) can record.
     pub(crate) local_recording: std::sync::Mutex<temps_workload_netpol::EgressRecordingCapability>,
     /// Built snapshots of `off` nodes ([`crate::idle`]).
@@ -249,6 +252,47 @@ pub(crate) fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkP
         })
 }
 
+/// When a report map was last swept of entries past
+/// [`ENFORCER_REPORT_TTL`]. A map is swept when a node it does not hold yet
+/// reports (worker churn) and otherwise at most once per TTL, so a steady
+/// heartbeat costs O(1) amortized while a worker that left (no new node
+/// needed) is released within two TTLs.
+pub(crate) struct SweepClock(std::sync::Mutex<std::time::Instant>);
+
+impl Default for SweepClock {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(std::time::Instant::now()))
+    }
+}
+
+impl SweepClock {
+    /// Whether a sweep is due now: `new_node` reports, or the last sweep is
+    /// a TTL old. Restarts the clock when it is.
+    pub(crate) fn due(&self, new_node: bool) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if new_node || last.elapsed() >= ENFORCER_REPORT_TTL {
+            *last = std::time::Instant::now();
+            return true;
+        }
+        false
+    }
+
+    /// Makes the next [`Self::due`] true, for tests.
+    #[cfg(test)]
+    pub(crate) fn expire(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+    }
+}
+
+/// One [`SweepClock`] per report map.
+#[derive(Default)]
+pub(crate) struct SweepClocks {
+    pub(crate) reports: SweepClock,
+    pub(crate) observed: SweepClock,
+    pub(crate) recording: SweepClock,
+}
+
 impl NetworkPolicyService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
@@ -256,6 +300,7 @@ impl NetworkPolicyService {
             reports: std::sync::Mutex::new(HashMap::new()),
             observed: std::sync::Mutex::new(HashMap::new()),
             recording: std::sync::Mutex::new(HashMap::new()),
+            swept: SweepClocks::default(),
             local_recording: std::sync::Mutex::new(
                 temps_workload_netpol::EgressRecordingCapability::detect(false),
             ),
@@ -270,9 +315,11 @@ impl NetworkPolicyService {
             _ => "unknown".to_string(),
         };
         let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
-        // Expired reports are never read again: dropped, so worker churn
-        // leaves nothing behind.
-        reports.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+        // Expired reports are never read again: swept when a node not yet
+        // in the map reports, and at least once per TTL (SweepClock).
+        if self.swept.reports.due(!reports.contains_key(&node_id)) {
+            reports.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+        }
         reports.insert(
             node_id,
             EnforcerReport {
@@ -298,6 +345,19 @@ impl NetworkPolicyService {
     }
 
     pub fn record_observed(&self, node_id: i32, identities: IdentityMap, mode: NodeMode) {
+        if mode == NodeMode::Off {
+            // Nothing reads an `off` node's workloads: other nodes take
+            // only workloads of nodes outside `off` as peers. Dropped before
+            // anything is counted or hashed, so an idle node's report costs
+            // nothing; it still sweeps when a sweep is due, so retired
+            // nodes are released when only `off` nodes are left reporting.
+            let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+            observed.remove(&node_id);
+            if self.swept.observed.due(false) {
+                observed.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
+            }
+            return;
+        }
         let count = identities.address_count();
         if count > MAX_REPORTED_ADDRESSES {
             tracing::warn!(
@@ -316,14 +376,12 @@ impl NetworkPolicyService {
         };
         let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
         // Reports from nodes that stopped reporting are never read again
-        // (readers skip anything older than ENFORCER_REPORT_TTL): dropped
-        // here, so retired nodes hold no memory.
-        observed.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
-        if mode == NodeMode::Off {
-            // Nothing reads an `off` node's workloads: other nodes take
-            // only workloads of nodes outside `off` as peers.
-            observed.remove(&node_id);
-            return;
+        // (readers skip anything older than ENFORCER_REPORT_TTL): swept when
+        // a node not yet in the map reports, and at least once per TTL
+        // (SweepClock), so a retired node's map is released even when no
+        // new node ever reports.
+        if self.swept.observed.due(!observed.contains_key(&node_id)) {
+            observed.retain(|_, report| report.seen.elapsed() <= ENFORCER_REPORT_TTL);
         }
         observed.insert(
             node_id,
@@ -1661,6 +1719,35 @@ mod remote_tests {
         service.record_observed(6, report(), NodeMode::Enforce);
         let kept: Vec<i32> = service.observed.lock().unwrap().keys().copied().collect();
         assert_eq!(kept, [6], "the expired report of node 5 is swept");
+
+        // A scale-down: node 6 is the only one left reporting. Its own
+        // heartbeat releases node 7's expired map once a sweep is due.
+        service.record_observed(7, report(), NodeMode::Enforce);
+        service.observed.lock().unwrap().get_mut(&7).unwrap().seen =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.record_observed(6, report(), NodeMode::Enforce);
+        assert!(
+            service.observed.lock().unwrap().contains_key(&7),
+            "not swept on every heartbeat"
+        );
+        service.swept.observed.expire();
+        service.record_observed(6, report(), NodeMode::Enforce);
+        let kept: Vec<i32> = service.observed.lock().unwrap().keys().copied().collect();
+        assert_eq!(
+            kept,
+            [6],
+            "a known node's heartbeat sweeps once a TTL has passed"
+        );
+
+        // Only an `off` node left reporting: its heartbeats sweep too.
+        service.observed.lock().unwrap().get_mut(&6).unwrap().seen =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        service.swept.observed.expire();
+        service.record_observed(8, report(), NodeMode::Off);
+        assert!(
+            service.observed.lock().unwrap().is_empty(),
+            "the expired map of node 6 is released by an off heartbeat"
+        );
     }
 
     /// Only addresses inside the reporting node's own compute subnet are

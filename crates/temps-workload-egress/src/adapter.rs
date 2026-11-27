@@ -68,7 +68,20 @@ pub trait WorkloadEgressAdapter: Send + Sync {
     /// workload as it is now: the place to steer its traffic to or away
     /// from the recorder on this host. It must be safe to repeat: setting
     /// the same value again repairs a change that was stored but not
-    /// followed (the control plane stopped in between). Nothing by
+    /// followed (the control plane stopped in between). It must also
+    /// survive being cancelled part-way (the request that called it
+    /// dropped): whatever it has not done yet is left for a retry it
+    /// arranges before it awaits anything. Returns why the workload's
+    /// traffic does not follow the change yet, when it does not. Nothing by
     /// default.
-    async fn changed(&self, _workload: &RecordedWorkload) {}
+    async fn changed(&self, _workload: &RecordedWorkload) -> Option<String> {
+        None
+    }
+
+    /// Why `workload`'s traffic does not follow its opt-in yet, when an
+    /// earlier [`Self::changed`] could not make it: reported by its status
+    /// until it does. `None` by default.
+    fn not_applied(&self, _workload: &RecordedWorkload) -> Option<String> {
+        None
+    }
 }

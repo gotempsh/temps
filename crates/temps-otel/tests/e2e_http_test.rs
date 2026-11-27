@@ -942,6 +942,28 @@ async fn test_e2e_ingest_logs_and_query_back() {
         let response = get(half.into()).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{half}");
     }
+    // A project id of 0 or below names no project: refused, never read as
+    // "the workload in any project".
+    for project in [0, -1] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/otel/logs?project_id={project}&workload_kind=sandbox&workload_id=1"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "project {project}"
+        );
+    }
 }
 
 // ── Auth failure E2E tests ──────────────────────────────────────────

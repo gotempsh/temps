@@ -59,6 +59,12 @@ pub enum EgressRecordingError {
     IngestUnavailable { node_id: i32, records: usize },
 
     #[error(
+        "OpenTelemetry storage is not enabled on this control plane; the egress record batch \
+         from node {node_id} was refused before its body was read"
+    )]
+    IngestDisabled { node_id: i32 },
+
+    #[error(
         "egress records from node {node_id} not accepted: telemetry ingest is at its limit \
          of {limit} concurrent requests; the node retries with its next batch"
     )]
