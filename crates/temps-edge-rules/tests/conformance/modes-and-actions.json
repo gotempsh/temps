@@ -4,7 +4,7 @@
     {
       "id": 20,
       "enabled": false,
-      "expression": { "combinator": "all", "children": [] },
+      "expression": { "combinator": "all", "children": [ { "kind": "condition", "field": "path", "op": "starts_with", "values": ["/"] } ] },
       "action": { "type": "block", "status": 410 }
     },
     {

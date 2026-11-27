@@ -198,6 +198,20 @@ pub struct ApiKeyRotatedAudit {
     pub api_key_name: String,
 }
 
+// API key update audit. A rename, deactivation or new expiry changes how
+// long and whether a credential works; the changed fields and the result tie
+// the event to the key without exposing its secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKeyUpdatedAudit {
+    pub context: AuditContext,
+    pub api_key_id: i32,
+    pub api_key_name: String,
+    /// The fields the request set: `name`, `is_active`, `expires_at`.
+    pub changed_fields: Vec<&'static str>,
+    pub is_active: bool,
+    pub expires_at: Option<temps_core::UtcDateTime>,
+}
+
 // API key deletion audit. Deleting a key revokes it permanently; the id, name
 // and prefix tie the event to the credential without exposing its secret.
 #[derive(Debug, Clone, Serialize)]
@@ -741,6 +755,28 @@ impl AuditOperation for ApiKeyCreatedAudit {
 impl AuditOperation for ApiKeyRotatedAudit {
     fn operation_type(&self) -> String {
         "API_KEY_ROTATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for ApiKeyUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "API_KEY_UPDATED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

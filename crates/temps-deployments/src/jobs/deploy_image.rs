@@ -3641,6 +3641,9 @@ impl DeployImageJob {
             }
             match placement_result {
                 Ok(outcome) => {
+                    // This deploy starts these replicas: a deploy placed
+                    // before their containers are registered counts them.
+                    scheduler.record_placed(&outcome.assignments);
                     // Say which nodes were passed over and why. The scheduler
                     // only had `tracing` for this, which the user never sees —
                     // a node they are paying for would silently not be used,

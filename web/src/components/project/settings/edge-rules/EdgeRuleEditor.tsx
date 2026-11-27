@@ -46,6 +46,7 @@ import {
   describeAction,
   emptyDraft,
   ruleWarnings,
+  updatePatch,
   validateRule,
   withAutoName,
 } from './expression'
@@ -55,6 +56,7 @@ import { edgeRulesOptions, useCreateEdgeRule, useUpdateEdgeRule } from './store'
 import { TestRequestSheet, type EnvironmentOption } from './TestRequestSheet'
 import type {
   ActionType,
+  ConditionGroup,
   EdgeRule,
   EdgeRuleDraft,
   RedirectStatus,
@@ -106,26 +108,30 @@ function toDraft(rule: EdgeRule): EdgeRuleDraft {
 }
 
 // Naming is optional: a blank name becomes a description of the rule.
-const resolver: Resolver<EdgeRuleDraft> = async (raw) => {
-  const values = withAutoName(raw)
-  const issues = validateRule(values)
-  if (issues.length === 0) return { values, errors: {} }
-  const errors: Record<string, FieldError> = {}
-  const nameIssue = issues.find((i) => i.target === 'name')
-  if (nameIssue) errors.name = { type: 'validate', message: nameIssue.message }
-  const actionIssues = issues.filter((i) => i.target === 'action')
-  if (actionIssues.length)
-    errors.action = {
-      type: 'validate',
-      message: actionIssues.map((i) => i.message).join(' '),
-    }
-  if (issues.some((i) => i.target !== 'name' && i.target !== 'action'))
-    errors.expression = {
-      type: 'validate',
-      message: 'Fix the highlighted conditions.',
-    }
-  return { values: {}, errors: errors as FieldErrors<EdgeRuleDraft> }
-}
+// `stored` is the expression the rule was loaded with (see `validateRule`).
+const resolverFor =
+  (stored: ConditionGroup | undefined): Resolver<EdgeRuleDraft> =>
+  async (raw) => {
+    const values = withAutoName(raw)
+    const issues = validateRule(values, stored)
+    if (issues.length === 0) return { values, errors: {} }
+    const errors: Record<string, FieldError> = {}
+    const nameIssue = issues.find((i) => i.target === 'name')
+    if (nameIssue)
+      errors.name = { type: 'validate', message: nameIssue.message }
+    const actionIssues = issues.filter((i) => i.target === 'action')
+    if (actionIssues.length)
+      errors.action = {
+        type: 'validate',
+        message: actionIssues.map((i) => i.message).join(' '),
+      }
+    if (issues.some((i) => i.target !== 'name' && i.target !== 'action'))
+      errors.expression = {
+        type: 'validate',
+        message: 'Fix the highlighted conditions.',
+      }
+    return { values: {}, errors: errors as FieldErrors<EdgeRuleDraft> }
+  }
 
 interface EdgeRuleEditorProps {
   project: ProjectResponse
@@ -235,6 +241,10 @@ function RuleForm({
   // `existing` a newer one; saving against that would silently overwrite
   // someone else's change instead of getting the server's 409.
   const [baseRevision] = useState(() => existing?.revision ?? 0)
+  // The expression it was loaded with: saving it unchanged leaves it out of
+  // the update, so a disabled rule stored without conditions can be renamed.
+  const [baseExpression] = useState(() => existing?.expression)
+  const resolver = useMemo(() => resolverFor(baseExpression), [baseExpression])
   const defaults = useMemo(
     () => (existing ? toDraft(existing) : emptyDraft()),
     [existing]
@@ -249,7 +259,10 @@ function RuleForm({
   } = useForm<EdgeRuleDraft>({ defaultValues: defaults, resolver })
   // useWatch, unlike watch(), returns a stable value React can memoize on.
   const values = useWatch({ control }) as EdgeRuleDraft
-  const issues = useMemo(() => validateRule(withAutoName(values)), [values])
+  const issues = useMemo(
+    () => validateRule(withAutoName(values), baseExpression),
+    [values, baseExpression]
+  )
   const nodeIssues = useMemo(() => {
     const map = new Map<string, string[]>()
     if (submitCount === 0) return map
@@ -284,7 +297,7 @@ function RuleForm({
         ? await updateRule.mutateAsync({
             ruleId: existing.id,
             revision: baseRevision,
-            patch: draft,
+            patch: updatePatch(draft, baseExpression),
           })
         : await createRule.mutateAsync(draft)
     } catch {

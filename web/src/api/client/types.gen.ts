@@ -3031,6 +3031,12 @@ export type AppSettingsResponse = {
      * at password login (bherila/temps#32). SSO/OIDC logins are unaffected.
      */
     require_mfa_for_admins: boolean;
+    /**
+     * Revision of these settings. Send it back as `expected_revision` when
+     * saving, so a save made by someone else since this read is not
+     * silently reverted.
+     */
+    revision: string;
     screenshots: ScreenshotSettings;
     security_headers: SecurityHeadersSettings;
     /**
@@ -8714,13 +8720,31 @@ export type CreateAnalyticsIngestKeyRequest = {
 
 export type CreateApiKeyRequest = {
     environment_id?: number | null;
+    /**
+     * When the key stops working. Must be in the future. Defaults to one
+     * year after creation when left out: API keys always expire.
+     */
     expires_at?: string | null;
+    /**
+     * Up to 255 characters, unique among the caller's keys. Surrounding
+     * whitespace is trimmed; a blank name is refused.
+     */
     name: string;
+    /**
+     * The key's permissions, required with `role_type: custom`. Any other
+     * role carries its own: a non-empty list with it is refused, while an
+     * empty list or none gives the role's permissions. Fixed once the key is
+     * created.
+     */
     permissions?: Array<string> | null;
     /**
      * Immutable optional deployment resource scope.
      */
     project_id?: number | null;
+    /**
+     * A predefined role (`admin`, `platform_admin`, `user`, `reader`,
+     * `api_reader`) or `custom` for an explicit permission list.
+     */
     role_type: string;
 };
 
@@ -8999,18 +9023,29 @@ export type CreateDeliveryProfileRequest = {
 
 export type CreateDeploymentTokenRequest = {
     /**
-     * Optional deployment ID - if set, token is scoped to a specific deployment
+     * Optional deployment of this project (and of `environment_id`, when
+     * set) - if set, token is scoped to a specific deployment.
      */
     deployment_id?: number | null;
     /**
-     * Optional environment ID - if not set, token applies to all environments
+     * Optional environment of this project - if not set, token applies to
+     * all environments. An environment of another project is refused.
      */
     environment_id?: number | null;
+    /**
+     * When the token stops working. Must be in the future; leave it out for
+     * a token that does not expire.
+     */
     expires_at?: string | null;
+    /**
+     * Up to 255 characters, unique within the project. Surrounding
+     * whitespace is trimmed; a blank name is refused.
+     */
     name: string;
     /**
-     * List of permissions (e.g., ["visitors:enrich", "emails:send"])
-     * If not provided, defaults to full access
+     * List of permissions (e.g., ["visitors:enrich", "emails:send"]).
+     * If not provided, defaults to full access (`["*"]`). An empty list is
+     * refused: the token could do nothing.
      */
     permissions?: Array<string> | null;
 };
@@ -9080,7 +9115,9 @@ export type CreateEdgeRuleRequest = {
      */
     name?: string | null;
     /**
-     * Where to insert the rule (0 = first). Defaults to the end.
+     * Where to insert the rule: 0 is first, and the number of rules the
+     * project has is after the last one. Defaults to the end. A position
+     * outside that range is refused.
      */
     position?: number | null;
 };
@@ -23514,11 +23551,6 @@ export type MetricsRangeQuery = {
      */
     metric: string;
     /**
-     * Optional histogram percentile (0–100).  When provided, the endpoint
-     * fetches histogram buckets and computes the requested quantile.
-     */
-    percentile?: number | null;
-    /**
      * Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
      * Ignored when `start_time` and `end_time` are both set.
      */
@@ -24678,6 +24710,12 @@ export type NodeBuildLimitsResponse = {
      * How long a build may wait for a free slot, in seconds.
      */
     queue_wait_seconds: number;
+    /**
+     * Revision of the stored limits. Send it back as `expected_revision`
+     * when saving, so a save made by someone else since this read is not
+     * silently reverted.
+     */
+    revision: string;
 };
 
 /**
@@ -24969,6 +25007,11 @@ export type NodeInfoResponse = {
      */
     architecture?: string | null;
     build_limits: BuildLimits;
+    /**
+     * Revision of `build_limits`, to send as `expected_revision` when
+     * saving them (`PUT /internal/nodes/{node_id}/build-limits`).
+     */
+    build_limits_revision: string;
     /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
@@ -30624,6 +30667,11 @@ export type PublicIngressSettings = {
      * Configured public address; `None` means the listen address.
      */
     public_address?: string | null;
+    /**
+     * Revision of the settings above that a save writes. Send it back as
+     * `expected_revision`, so a save made since this read is not reverted.
+     */
+    revision: string;
     running?: boolean | null;
 };
 
@@ -36402,6 +36450,18 @@ export type SetManagedRecordRequest = {
     ttl?: number | null;
 };
 
+/**
+ * A worker's new build limits.
+ */
+export type SetNodeBuildLimitsRequest = BuildLimits & {
+    /**
+     * The `revision` the limits were read with. When set and the stored
+     * limits have changed since, the save is refused with 409 and nothing
+     * changes. When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
+};
+
 export type SetNodeNetworkPolicyModeRequest = {
     /**
      * `off`, `shadow` or `enforce`. `legacy`, the former name of `off`, is
@@ -36583,6 +36643,11 @@ export type SetWorkloadModeRequest = {
  */
 export type SettingsUpdateResponse = {
     message: string;
+    /**
+     * `PUT /settings`: revision of the saved settings, to send as
+     * `expected_revision` with the next save.
+     */
+    revision?: string | null;
 };
 
 /**
@@ -40964,9 +41029,25 @@ export type UpdateAnalyticsIngestKeyRequest = {
 };
 
 export type UpdateApiKeyRequest = {
+    /**
+     * A new expiry, which must be in the future. Leave it out, or send the
+     * key's current expiry back unchanged (even one that has passed), to
+     * keep it: an expired key can be renamed or deactivated without
+     * extending it. API keys always expire, so `null` is refused for a key
+     * that has an expiry.
+     */
     expires_at?: string | null;
     is_active?: boolean | null;
+    /**
+     * New name, trimmed; a blank name is refused. Leave it out to keep the
+     * current one.
+     */
     name?: string | null;
+    /**
+     * A key's permissions are fixed when it is created. The key's current
+     * permissions are accepted unchanged; any other list is refused with 400.
+     * To change them, create a new key and delete this one.
+     */
     permissions?: Array<string> | null;
 };
 
@@ -41358,9 +41439,21 @@ export type UpdateDeploymentConfigRequest = {
 };
 
 export type UpdateDeploymentTokenRequest = {
+    /**
+     * A future time sets a new expiry, `null` removes it (the token no
+     * longer expires), and leaving the field out, or sending the current
+     * expiry back unchanged (even one that has passed), keeps it.
+     */
     expires_at?: string | null;
     is_active?: boolean | null;
+    /**
+     * New name. Leave it out to keep the current one.
+     */
     name?: string | null;
+    /**
+     * Replaces the token's permissions. Leave it out to keep them; an empty
+     * list is refused.
+     */
     permissions?: Array<string> | null;
 };
 
@@ -42103,22 +42196,34 @@ export type UpdateProjectGroupRequest = {
 };
 
 /**
- * Request to update a project secret. The `value` field is optional — omit it
- * to rotate only the environment scoping / preview flag without touching the
- * ciphertext.
+ * Request to update a project secret. Every field is optional, and a field
+ * that is left out (or `null`) keeps its stored value: rotating only the
+ * `value` keeps the secret's environments, preview flag and compose services
+ * exactly as they are.
  */
 export type UpdateProjectSecretRequest = {
     /**
-     * Docker Compose services allowed to read this secret, by compose
-     * service name. Empty (the default) delivers it to every service in the
-     * stack, which is how secrets behaved before scoping existed.
+     * Replaces the Docker Compose services allowed to read this secret, by
+     * compose service name. An empty list delivers it to every service in
+     * the stack. Omit to keep the current services.
      *
      * Ignored by non-Compose presets: those deploy a single container, which
      * always receives every secret in scope for its environment.
      */
-    compose_services?: Array<string>;
-    environment_ids?: Array<number>;
-    include_in_preview?: boolean;
+    compose_services?: Array<string> | null;
+    /**
+     * Replaces the environments the secret applies to. Omit to keep the
+     * current environments. Bindings to deleted environments are always
+     * kept, so an empty list applies the secret to every environment of the
+     * project only when it has none; a secret still bound to a deleted
+     * environment stays limited to it.
+     */
+    environment_ids?: Array<number> | null;
+    /**
+     * Whether preview environments receive the secret. Omit to keep the
+     * current setting.
+     */
+    include_in_preview?: boolean | null;
     /**
      * New plaintext value, <= 1 MiB. Omit to keep the existing value.
      */
@@ -42309,6 +42414,12 @@ export type UpdateProviderRequest = {
 
 export type UpdatePublicIngressSettingsRequest = {
     enabled: boolean;
+    /**
+     * The `revision` the settings were read with. When set and they have
+     * changed since, the save is refused with 409 and nothing changes.
+     * When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
     http_port?: number | null;
     https_port?: number | null;
     /**
@@ -42450,6 +42561,22 @@ export type UpdateSessionDurationRequest = {
 
 export type UpdateSessionDurationResponse = {
     message: string;
+};
+
+/**
+ * `PUT /settings` body: the settings document (partial documents keep the
+ * omitted fields), plus the revision it was read with.
+ *
+ * Schema only: the handler reads the raw body, because which fields were
+ * sent is information deserialization destroys.
+ */
+export type UpdateSettingsRequest = AppSettings & {
+    /**
+     * The `revision` from `GET /settings`. When set and the settings have
+     * changed since, the save is refused with 409 and nothing changes.
+     * When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
 };
 
 /**
@@ -45497,6 +45624,22 @@ export type SaveAccessServiceWritable = {
      * Add a newly created service to this vault in the same transaction.
      */
     vault_id?: string | null;
+};
+
+/**
+ * `PUT /settings` body: the settings document (partial documents keep the
+ * omitted fields), plus the revision it was read with.
+ *
+ * Schema only: the handler reads the raw body, because which fields were
+ * sent is information deserialization destroys.
+ */
+export type UpdateSettingsRequestWritable = AppSettingsWritable & {
+    /**
+     * The `revision` from `GET /settings`. When set and the settings have
+     * changed since, the save is refused with 409 and nothing changes.
+     * When omitted the save is unconditional (older clients).
+     */
+    expected_revision?: string | null;
 };
 
 export type GetPlatformInfoData = {
@@ -54452,7 +54595,7 @@ export type CreateApiKeyData = {
 
 export type CreateApiKeyErrors = {
     /**
-     * Bad request
+     * Bad request: a blank name, an expiry in the past, permissions with a role other than custom, or an invalid scope
      */
     400: unknown;
     /**
@@ -54638,7 +54781,7 @@ export type UpdateApiKeyData = {
 
 export type UpdateApiKeyErrors = {
     /**
-     * Bad request
+     * Bad request: a blank name, a new expiry in the past (the key's current expiry may be sent back unchanged), a removed expiry, or permissions that differ from the key's (they cannot change after creation)
      */
     400: unknown;
     /**
@@ -58319,11 +58462,6 @@ export type DeploymentMetricsGetRangeData = {
          * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
-        /**
-         * Optional histogram percentile (0–100).  When provided, the endpoint
-         * fetches histogram buckets and computes the requested quantile.
-         */
-        percentile?: number | null;
         /**
          * Explicit window start (ISO 8601). Must be paired with `end_time`.
          */
@@ -62740,7 +62878,7 @@ export type PromoteClusterMemberErrors = {
      */
     404: unknown;
     /**
-     * This process has no local Docker daemon to run the promotion on
+     * This process has no local Docker daemon to run the promotion on, or the member's node stayed busy (another operation owned its container) and ran nothing: retry
      */
     409: unknown;
     /**
@@ -62774,11 +62912,6 @@ export type ExternalServiceMetricsGetRangeData = {
          * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
-        /**
-         * Optional histogram percentile (0–100).  When provided, the endpoint
-         * fetches histogram buckets and computes the requested quantile.
-         */
-        percentile?: number | null;
         /**
          * Explicit window start (ISO 8601). Must be paired with `end_time`.
          */
@@ -69430,7 +69563,7 @@ export type AdminGetNodeBuildLimitsResponses = {
 export type AdminGetNodeBuildLimitsResponse = AdminGetNodeBuildLimitsResponses[keyof AdminGetNodeBuildLimitsResponses];
 
 export type AdminSetNodeBuildLimitsData = {
-    body: BuildLimits;
+    body: SetNodeBuildLimitsRequest;
     path: {
         /**
          * Worker node ID
@@ -69459,13 +69592,20 @@ export type AdminSetNodeBuildLimitsErrors = {
      */
     404: unknown;
     /**
+     * `expected_revision` is stale: the limits changed since they were read; nothing was saved
+     */
+    409: unknown;
+    /**
      * Storage failed
      */
     500: unknown;
 };
 
 export type AdminSetNodeBuildLimitsResponses = {
-    200: BuildLimits;
+    /**
+     * The saved limits and their new revision
+     */
+    200: NodeBuildLimitsResponse;
 };
 
 export type AdminSetNodeBuildLimitsResponse = AdminSetNodeBuildLimitsResponses[keyof AdminSetNodeBuildLimitsResponses];
@@ -69999,6 +70139,10 @@ export type AdminUpdateNodePublicIngressSettingsErrors = {
      * Node not found
      */
     404: unknown;
+    /**
+     * The worker does not allow this change, or `expected_revision` is stale: the settings changed since they were read; nothing was saved
+     */
+    409: unknown;
 };
 
 export type AdminUpdateNodePublicIngressSettingsResponses = {
@@ -72940,11 +73084,6 @@ export type NodeMetricsGetRangeData = {
          * Ignored when `start_time` and `end_time` are both set.
          */
         range?: string;
-        /**
-         * Optional histogram percentile (0–100).  When provided, the endpoint
-         * fetches histogram buckets and computes the requested quantile.
-         */
-        percentile?: number | null;
         /**
          * Explicit window start (ISO 8601). Must be paired with `end_time`.
          */
@@ -85042,7 +85181,7 @@ export type CreateDeploymentTokenData = {
 
 export type CreateDeploymentTokenErrors = {
     /**
-     * Invalid request
+     * Invalid request: blank name, empty permissions, an expiry in the past, or a deployment of another environment
      */
     400: unknown;
     /**
@@ -85053,6 +85192,10 @@ export type CreateDeploymentTokenErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * The project, or the requested environment or deployment in it, was not found
+     */
+    404: unknown;
     /**
      * Token with this name already exists
      */
@@ -85178,7 +85321,7 @@ export type UpdateDeploymentTokenData = {
 
 export type UpdateDeploymentTokenErrors = {
     /**
-     * Invalid request
+     * Invalid request: blank name, empty permissions or a new expiry in the past (the token's current expiry may be sent back unchanged)
      */
     400: unknown;
     /**
@@ -86463,7 +86606,7 @@ export type CreateEdgeRuleData = {
 
 export type CreateEdgeRuleErrors = {
     /**
-     * Invalid rule; `issues` lists each problem
+     * Invalid rule (`issues` lists each problem; a rule needs at least one condition), or a position outside the project's rules (`max_position` is the last valid one)
      */
     400: ProblemDetails;
     /**
@@ -98811,13 +98954,17 @@ export type UpdateProjectSecretData = {
 
 export type UpdateProjectSecretErrors = {
     /**
-     * Value too large
+     * Value too large or an invalid compose service name
      */
     400: unknown;
     /**
-     * Secret not found
+     * The secret, or a requested environment, was not found in the project
      */
     404: unknown;
+    /**
+     * Another secret with the same key already applies to one of the requested environments
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -103143,7 +103290,7 @@ export type GetSettingsResponses = {
 export type GetSettingsResponse = GetSettingsResponses[keyof GetSettingsResponses];
 
 export type UpdateSettingsData = {
-    body: AppSettingsWritable;
+    body: UpdateSettingsRequestWritable;
     path?: never;
     query?: never;
     url: '/settings';
@@ -103158,6 +103305,10 @@ export type UpdateSettingsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * `expected_revision` is stale (the settings changed since they were read), or the public ingress hostname is in use; nothing was saved
+     */
+    409: unknown;
     /**
      * Internal server error
      */

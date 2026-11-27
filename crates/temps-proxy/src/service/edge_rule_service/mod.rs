@@ -26,8 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use temps_edge_rules::describe::describe_rule;
 use temps_edge_rules::{
-    auto_name, limits, prepare_expression, validate_rule, Action, Decision, Group, Mode,
-    ParsedSample, PatternUsage, Program, RuleDefinition, RuleIssue, RuleOutcome, SampleRequest,
+    auto_name, limits, prepare_expression, validate_rule_with, Action, Decision, EmptyExpression,
+    Group, Mode, ParsedSample, PatternUsage, Program, RuleDefinition, RuleIssue, RuleOutcome,
+    SampleRequest,
 };
 use temps_entities::{environments, project_edge_rules, projects};
 use thiserror::Error;
@@ -49,13 +50,24 @@ pub enum EdgeRuleServiceError {
     RuleNotFound { project_id: i32, rule_id: i32 },
 
     #[error(
-        "Edge rule '{rule}' in project {project_id} is invalid: {}",
+        "Edge rule '{}' in project {project_id} is invalid: {}",
+        echoed_name(rule),
         summarize(issues)
     )]
     Invalid {
         project_id: i32,
         rule: String,
         issues: Vec<RuleIssue>,
+    },
+
+    #[error(
+        "Position {position} is outside the edge rules of project {project_id}: use 0 (first) \
+         to {max} (after the last rule), or leave position out to add the rule last"
+    )]
+    InvalidPosition {
+        project_id: i32,
+        position: i32,
+        max: i32,
     },
 
     #[error("Project {project_id} already has {max} edge rules, the maximum")]
@@ -91,6 +103,21 @@ pub enum EdgeRuleServiceError {
         #[source]
         source: sea_orm::DbErr,
     },
+}
+
+/// Longest part of a rule name an error repeats. A refused name can be as long
+/// as the request body, and the error must not echo all of it.
+const MAX_ECHOED_NAME_CHARS: usize = limits::NAME_LENGTH;
+
+/// `name` as an error repeats it: whole up to the name limit, otherwise cut
+/// there and followed by `…`.
+fn echoed_name(name: &str) -> String {
+    if name.chars().count() <= MAX_ECHOED_NAME_CHARS {
+        return name.to_string();
+    }
+    let mut shown: String = name.chars().take(MAX_ECHOED_NAME_CHARS).collect();
+    shown.push('…');
+    shown
 }
 
 fn summarize(issues: &[RuleIssue]) -> String {
@@ -175,7 +202,9 @@ pub struct CreateEdgeRuleRequest {
     pub environment_id: Option<i32>,
     pub expression: Group,
     pub action: Action,
-    /// Where to insert the rule (0 = first). Defaults to the end.
+    /// Where to insert the rule: 0 is first, and the number of rules the
+    /// project has is after the last one. Defaults to the end. A position
+    /// outside that range is refused.
     #[serde(default)]
     pub position: Option<i32>,
 }
@@ -442,13 +471,14 @@ impl EdgeRuleService {
         name: Option<&str>,
         mut expression: Group,
         action: Action,
+        empty: EmptyExpression,
     ) -> Result<Prepared, EdgeRuleServiceError> {
         prepare_expression(&mut expression);
         let name = match name.map(str::trim) {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => auto_name(&expression, &action),
         };
-        let issues = validate_rule(&name, &expression, &action);
+        let issues = validate_rule_with(&name, &expression, &action, empty);
         if !issues.is_empty() {
             return Err(EdgeRuleServiceError::Invalid {
                 project_id,
@@ -568,7 +598,13 @@ impl EdgeRuleService {
         expression: Group,
         action: Action,
     ) -> Result<(String, String), EdgeRuleServiceError> {
-        let prepared = Self::prepare(project_id, name, expression, action)?;
+        let prepared = Self::prepare(
+            project_id,
+            name,
+            expression,
+            action,
+            EmptyExpression::Refuse,
+        )?;
         let summary = describe_rule(&prepared.expression, &prepared.action);
         Ok((prepared.name, summary))
     }
@@ -616,6 +652,7 @@ impl EdgeRuleService {
             request.name.as_deref(),
             request.expression,
             request.action,
+            EmptyExpression::Refuse,
         )?;
         let txn = self.db.begin().await.map_err(db_error(project_id))?;
         self.ensure_project(&txn, project_id).await?;
@@ -642,7 +679,17 @@ impl EdgeRuleService {
         Self::check_pattern_budget(&txn, project_id, None, &prepared.name, &prepared.expression)
             .await?;
         let end = i32::try_from(count).unwrap_or(i32::MAX);
-        let position = request.position.map_or(end, |p| p.clamp(0, end));
+        let position = match request.position {
+            None => end,
+            Some(position) if (0..=end).contains(&position) => position,
+            Some(position) => {
+                return Err(EdgeRuleServiceError::InvalidPosition {
+                    project_id,
+                    position,
+                    max: end,
+                })
+            }
+        };
         if position < end {
             // Make room. The position constraint is deferred, so the
             // transient duplicates are fine until commit.
@@ -705,13 +752,27 @@ impl EdgeRuleService {
         let stats = Self::stats(&txn, project_id).await?;
         let before = Self::to_response(&current, stats.get(&rule_id))?;
 
-        let expression_changed = request.expression.is_some();
+        // An editor that saves the whole rule resends its expression; one
+        // equal to the stored expression is not a change.
+        let expression_changed = request
+            .expression
+            .as_ref()
+            .is_some_and(|expression| expression != &before.expression);
         let expression = request
             .expression
             .unwrap_or_else(|| before.expression.clone());
         let action = request.action.unwrap_or_else(|| before.action.clone());
         let name = request.name.as_deref().or(Some(before.name.as_str()));
-        let prepared = Self::prepare(project_id, name, expression, action)?;
+        let enabled = request.enabled.unwrap_or(current.enabled);
+        // A rule stored before empty expressions were refused can still be
+        // turned off or renamed while off; enabling it, or writing a new
+        // expression, needs a condition.
+        let empty = if expression_changed || enabled {
+            EmptyExpression::Refuse
+        } else {
+            EmptyExpression::Allow
+        };
+        let prepared = Self::prepare(project_id, name, expression, action, empty)?;
         if expression_changed {
             Self::check_pattern_budget(
                 &txn,
@@ -728,7 +789,7 @@ impl EdgeRuleService {
 
         let mut active: project_edge_rules::ActiveModel = current.clone().into();
         active.name = Set(prepared.name);
-        active.enabled = Set(request.enabled.unwrap_or(current.enabled));
+        active.enabled = Set(enabled);
         active.mode = Set(request.mode.unwrap_or(before.mode).as_str().to_string());
         active.environment_id = Set(environment_id);
         active.expression = Set(to_json(project_id, &prepared.expression)?);
@@ -884,6 +945,7 @@ impl EdgeRuleService {
                         input.name.as_deref(),
                         input.expression,
                         input.action,
+                        EmptyExpression::Refuse,
                     )?;
                     out.push(RuleDefinition {
                         id,
@@ -1008,618 +1070,4 @@ fn summarize_decision(decision: &Decision, names: &HashMap<i32, String>) -> Stri
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
-
-    pub(crate) async fn database() -> Option<TestDatabase> {
-        match TestDatabase::with_migrations().await {
-            Ok(db) => Some(db),
-            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
-                eprintln!("Docker not available, skipping edge rule database test");
-                None
-            }
-            Err(error) => panic!("test database: {error}"),
-        }
-    }
-
-    /// A project with one environment; returns `(project_id, environment_id)`.
-    pub(crate) async fn project(db: &TestDatabase, slug: &str) -> (i32, i32) {
-        let rows = db
-            .query_sql(&format!(
-                "WITH p AS (INSERT INTO projects (name, repo_name, repo_owner, directory, \
-                 main_branch, preset, slug, created_at, updated_at) VALUES ('{slug}', '{slug}', \
-                 'owner', '.', 'main', 'dockerfile', '{slug}', NOW(), NOW()) RETURNING id) \
-                 INSERT INTO environments (name, slug, subdomain, host, upstreams, project_id, \
-                 created_at, updated_at) SELECT 'production', 'production', '{slug}', \
-                 '{slug}.example.test', '[]'::json, p.id, NOW(), NOW() FROM p \
-                 RETURNING project_id, id"
-            ))
-            .await
-            .expect("insert project and environment");
-        let row = rows.first().expect("one environment row");
-        (
-            row.try_get("", "project_id").expect("project_id"),
-            row.try_get("", "id").expect("environment id"),
-        )
-    }
-
-    pub(crate) fn block_admin() -> CreateEdgeRuleRequest {
-        serde_json::from_value(serde_json::json!({
-            "mode": "enforce",
-            "expression": {"combinator": "all", "children": [
-                {"kind": "condition", "field": "path", "op": "starts_with",
-                 "values": ["/admin"], "case_insensitive": true}
-            ]},
-            "action": {"type": "block", "status": 403}
-        }))
-        .expect("valid request")
-    }
-
-    fn rule_on(path: &str, action: serde_json::Value) -> CreateEdgeRuleRequest {
-        serde_json::from_value(serde_json::json!({
-            "mode": "enforce",
-            "expression": {"combinator": "all", "children": [
-                {"kind": "condition", "field": "path", "op": "starts_with", "values": [path]}
-            ]},
-            "action": action
-        }))
-        .expect("valid request")
-    }
-
-    fn sample(url: &str) -> SampleRequest {
-        SampleRequest {
-            url: url.into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn invalid_rules_are_refused_with_every_issue() {
-        let request: CreateEdgeRuleRequest = serde_json::from_value(serde_json::json!({
-            "expression": {"combinator": "all", "children": [
-                {"kind": "condition", "field": "ip", "op": "in_cidr", "values": ["not-an-ip"]},
-                {"kind": "condition", "field": "path", "op": "regex", "values": ["("]}
-            ]},
-            "action": {"type": "block", "status": 200}
-        }))
-        .expect("parses");
-        match EdgeRuleService::prepare(7, None, request.expression, request.action) {
-            Err(EdgeRuleServiceError::Invalid {
-                project_id: 7,
-                issues,
-                ..
-            }) => {
-                assert!(issues.len() >= 3, "{issues:?}");
-                assert!(issues.iter().any(|i| i.target == "action"));
-            }
-            Err(other) => panic!("expected Invalid, got {other}"),
-            Ok(_) => panic!("expected Invalid, got a prepared rule"),
-        }
-    }
-
-    #[test]
-    fn an_empty_name_is_generated_from_the_rule() {
-        let request = block_admin();
-        let prepared = EdgeRuleService::prepare(1, Some("  "), request.expression, request.action)
-            .unwrap_or_else(|e| panic!("valid rule: {e}"));
-        assert_eq!(
-            prepared.name,
-            "Block when path starts with /admin (ignoring case)"
-        );
-        // Node ids are assigned so issues and the editor can address them.
-        assert!(!prepared.expression.id.is_empty());
-    }
-
-    #[test]
-    fn update_distinguishes_a_null_environment_from_an_absent_one() {
-        let absent: UpdateEdgeRuleRequest =
-            serde_json::from_str(r#"{"enabled": false}"#).expect("parses");
-        assert_eq!(absent.environment_id, None);
-        let null: UpdateEdgeRuleRequest =
-            serde_json::from_str(r#"{"environment_id": null}"#).expect("parses");
-        assert_eq!(null.environment_id, Some(None));
-        let set: UpdateEdgeRuleRequest =
-            serde_json::from_str(r#"{"environment_id": 4}"#).expect("parses");
-        assert_eq!(set.environment_id, Some(Some(4)));
-    }
-
-    /// The `project_route_change` notifications naming `project_id`'s
-    /// edge rules that arrive within a short window.
-    async fn route_announcements(
-        listener: &mut sqlx::postgres::PgListener,
-        project_id: i32,
-    ) -> usize {
-        let mut count = 0;
-        while let Ok(received) =
-            tokio::time::timeout(std::time::Duration::from_millis(400), listener.recv()).await
-        {
-            let notification = received.unwrap_or_else(|e| panic!("receive notification: {e}"));
-            let payload: serde_json::Value = serde_json::from_str(notification.payload())
-                .unwrap_or_else(|e| panic!("route change payload: {e}"));
-            if payload["field"] == "edge_rules.enabled" && payload["project_id"] == project_id {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    #[tokio::test]
-    async fn writes_that_change_enabled_rules_wake_the_worker_route_sync() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_id, _) = project(&test_db, "edge-notify").await;
-        let mut listener = sqlx::postgres::PgListener::connect(&test_db.database_url)
-            .await
-            .unwrap_or_else(|e| panic!("connect listener: {e}"));
-        listener
-            .listen("project_route_change")
-            .await
-            .unwrap_or_else(|e| panic!("listen: {e}"));
-
-        // A disabled rule does not change what workers may serve.
-        let mut disabled = block_admin();
-        disabled.enabled = false;
-        let disabled = service
-            .create(project_id, disabled, None)
-            .await
-            .unwrap_or_else(|e| panic!("create disabled: {e}"));
-        assert_eq!(route_announcements(&mut listener, project_id).await, 0);
-        let update = |patch: serde_json::Value| -> UpdateEdgeRuleRequest {
-            serde_json::from_value(patch).unwrap_or_else(|e| panic!("update request: {e}"))
-        };
-        service
-            .update(
-                project_id,
-                disabled.id,
-                update(serde_json::json!({"name": "Renamed"})),
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("rename: {e}"));
-        assert_eq!(route_announcements(&mut listener, project_id).await, 0);
-
-        // Enabling, creating enabled, and deleting an enabled rule all do.
-        service
-            .update(
-                project_id,
-                disabled.id,
-                update(serde_json::json!({"enabled": true})),
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("enable: {e}"));
-        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
-        let enabled = service
-            .create(
-                project_id,
-                rule_on("/api", serde_json::json!({"type": "log"})),
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("create enabled: {e}"));
-        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
-        service
-            .delete(project_id, enabled.id, None)
-            .await
-            .unwrap_or_else(|e| panic!("delete enabled: {e}"));
-        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
-        service
-            .update(
-                project_id,
-                disabled.id,
-                update(serde_json::json!({"enabled": false})),
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("disable: {e}"));
-        assert_eq!(route_announcements(&mut listener, project_id).await, 1);
-
-        // A refused write announces nothing: the NOTIFY rolls back with it.
-        let refused = service
-            .update(
-                project_id,
-                disabled.id,
-                update(serde_json::json!({"enabled": true, "revision": 1})),
-                None,
-            )
-            .await;
-        assert!(matches!(
-            refused,
-            Err(EdgeRuleServiceError::RevisionConflict { .. })
-        ));
-        service
-            .delete(project_id, disabled.id, None)
-            .await
-            .unwrap_or_else(|e| panic!("delete disabled: {e}"));
-        assert_eq!(route_announcements(&mut listener, project_id).await, 0);
-    }
-
-    #[tokio::test]
-    async fn rules_are_created_ordered_updated_and_deleted() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_id, environment_id) = project(&test_db, "edge-crud").await;
-
-        let first = service
-            .create(project_id, block_admin(), None)
-            .await
-            .unwrap_or_else(|e| panic!("create: {e}"));
-        assert_eq!(first.position, 0);
-        assert_eq!(first.revision, 1);
-        assert_eq!(
-            first.summary,
-            "Block with 403 when path starts with /admin (ignoring case)"
-        );
-
-        let mut second = rule_on("/api", serde_json::json!({"type": "log"}));
-        second.position = Some(0);
-        second.environment_id = Some(environment_id);
-        let second = service
-            .create(project_id, second, None)
-            .await
-            .unwrap_or_else(|e| panic!("create at the top: {e}"));
-        let listed = service
-            .list(project_id)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let order: Vec<i32> = listed.rules.iter().map(|r| r.id).collect();
-        assert_eq!(order, vec![second.id, first.id]);
-        assert_eq!(listed.max_rules, 100);
-
-        // A stale revision is refused; the current one applies.
-        let stale = service
-            .update(
-                project_id,
-                first.id,
-                UpdateEdgeRuleRequest {
-                    revision: Some(0),
-                    enabled: Some(false),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await;
-        assert!(matches!(
-            stale,
-            Err(EdgeRuleServiceError::RevisionConflict {
-                expected: 0,
-                current: 1,
-                ..
-            })
-        ));
-        let (before, after) = service
-            .update(
-                project_id,
-                first.id,
-                UpdateEdgeRuleRequest {
-                    revision: Some(1),
-                    mode: Some(Mode::LogOnly),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("update: {e}"));
-        assert_eq!(before.mode, Mode::Enforce);
-        assert_eq!(after.mode, Mode::LogOnly);
-        assert_eq!(after.revision, 2);
-        assert_eq!(after.name, before.name);
-
-        let reordered = service
-            .reorder(
-                project_id,
-                ReorderEdgeRulesRequest {
-                    rule_ids: vec![first.id, second.id],
-                },
-            )
-            .await
-            .unwrap_or_else(|e| panic!("reorder: {e}"));
-        let order: Vec<(i32, i32)> = reordered.rules.iter().map(|r| (r.id, r.position)).collect();
-        assert_eq!(order, vec![(first.id, 0), (second.id, 1)]);
-
-        let incomplete = service
-            .reorder(
-                project_id,
-                ReorderEdgeRulesRequest {
-                    rule_ids: vec![first.id],
-                },
-            )
-            .await;
-        assert!(matches!(
-            incomplete,
-            Err(EdgeRuleServiceError::InvalidOrder { .. })
-        ));
-
-        // A deletion bound to a revision refuses a rule that changed since.
-        let current = service
-            .get(project_id, first.id)
-            .await
-            .unwrap_or_else(|e| panic!("get: {e}"));
-        let stale = service
-            .delete(project_id, first.id, Some(current.revision - 1))
-            .await;
-        assert!(matches!(
-            stale,
-            Err(EdgeRuleServiceError::RevisionConflict { .. })
-        ));
-        service
-            .delete(project_id, first.id, Some(current.revision))
-            .await
-            .unwrap_or_else(|e| panic!("delete: {e}"));
-        let listed = service
-            .list(project_id)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(listed.rules.len(), 1);
-        assert_eq!(listed.rules[0].position, 0, "the gap is closed");
-
-        let missing = service.delete(project_id, first.id, None).await;
-        assert!(matches!(
-            missing,
-            Err(EdgeRuleServiceError::RuleNotFound { rule_id, .. }) if rule_id == first.id
-        ));
-    }
-
-    #[tokio::test]
-    async fn writes_are_scoped_to_the_project_and_its_environments() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_a, _) = project(&test_db, "edge-scope-a").await;
-        let (project_b, environment_b) = project(&test_db, "edge-scope-b").await;
-
-        let mut foreign_env = block_admin();
-        foreign_env.environment_id = Some(environment_b);
-        assert!(matches!(
-            service.create(project_a, foreign_env, None).await,
-            Err(EdgeRuleServiceError::EnvironmentNotFound { .. })
-        ));
-
-        let rule = service
-            .create(project_b, block_admin(), None)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        assert!(matches!(
-            service.get(project_a, rule.id).await,
-            Err(EdgeRuleServiceError::RuleNotFound { .. })
-        ));
-        assert!(matches!(
-            service.list(999_999).await,
-            Err(EdgeRuleServiceError::ProjectNotFound {
-                project_id: 999_999
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn the_rule_limit_is_enforced() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_id, _) = project(&test_db, "edge-limit").await;
-        for _ in 0..limits::RULES_PER_PROJECT {
-            service
-                .create(project_id, block_admin(), None)
-                .await
-                .unwrap_or_else(|e| panic!("{e}"));
-        }
-        assert!(matches!(
-            service.create(project_id, block_admin(), None).await,
-            Err(EdgeRuleServiceError::TooManyRules { max: 100, .. })
-        ));
-    }
-
-    /// Regex conditions cost memory in every proxy, so a project has a
-    /// budget across all of its rules, counted through nested groups.
-    #[tokio::test]
-    async fn regex_conditions_are_capped_per_project() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_id, _) = project(&test_db, "edge-regex").await;
-        let regexes = |n: usize| -> CreateEdgeRuleRequest {
-            let children: Vec<serde_json::Value> = (0..n)
-                .map(|i| serde_json::json!({"kind": "condition", "field": "path", "op": "regex", "values": [format!("^/r{i}/")]}))
-                .collect();
-            serde_json::from_value(serde_json::json!({
-                "expression": {"combinator": "any", "children": [
-                    {"kind": "group", "combinator": "any", "children": children}
-                ]},
-                "action": {"type": "log"}
-            }))
-            .expect("valid request")
-        };
-        let per_rule = limits::REGEX_CONDITIONS_PER_PROJECT / 2;
-        let first = service
-            .create(project_id, regexes(per_rule), None)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(first.mode, Mode::LogOnly, "new rules start log-only");
-        service
-            .create(project_id, regexes(per_rule), None)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        match service.create(project_id, regexes(1), None).await {
-            Err(EdgeRuleServiceError::Invalid { issues, .. }) => {
-                assert!(issues[0].message.contains("regex conditions"), "{issues:?}");
-            }
-            other => panic!("expected the regex budget to refuse it, got {other:?}"),
-        }
-        // Rules without a regex are unaffected, and so is a change that
-        // keeps a rule's own regex count.
-        service
-            .create(project_id, block_admin(), None)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let same = regexes(per_rule);
-        service
-            .update(
-                project_id,
-                first.id,
-                UpdateEdgeRuleRequest {
-                    expression: Some(same.expression),
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("an update replaces the rule's own budget: {e}"));
-    }
-
-    fn conditions(field_op: (&str, &str), n: usize, offset: usize) -> serde_json::Value {
-        let (field, op) = field_op;
-        let children: Vec<serde_json::Value> = (0..n)
-            .map(|i| serde_json::json!({"kind": "condition", "field": field, "op": op, "values": [format!("/p{}/*", i + offset)]}))
-            .collect();
-        serde_json::json!({"combinator": "any", "children": children})
-    }
-
-    #[tokio::test]
-    async fn globs_and_case_insensitive_matches_share_a_pattern_budget() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_id, _) = project(&test_db, "edge-patterns").await;
-        let per_rule = limits::CONDITIONS_PER_RULE;
-        let full_rules = limits::PATTERN_CONDITIONS_PER_PROJECT / per_rule;
-        let rule = |n: usize, offset: usize| -> CreateEdgeRuleRequest {
-            serde_json::from_value(serde_json::json!({
-                "expression": conditions(("path", "glob"), n, offset),
-                "action": {"type": "log"}
-            }))
-            .expect("valid request")
-        };
-        for r in 0..full_rules {
-            service
-                .create(project_id, rule(per_rule, r * per_rule), None)
-                .await
-                .unwrap_or_else(|e| panic!("rule {r} is within the budget: {e}"));
-        }
-        match service.create(project_id, rule(1, 10_000), None).await {
-            Err(EdgeRuleServiceError::Invalid { issues, .. }) => {
-                assert!(
-                    issues[0].message.contains("pattern conditions"),
-                    "{issues:?}"
-                );
-            }
-            other => panic!("expected the pattern budget to refuse it, got {other:?}"),
-        }
-        // `in` compares strings without an automaton, so it is not budgeted.
-        let exact: CreateEdgeRuleRequest = serde_json::from_value(serde_json::json!({
-            "expression": {"combinator": "all", "children": [
-                {"kind": "condition", "field": "path", "op": "in", "values": ["/a", "/b"]}
-            ]},
-            "action": {"type": "log"}
-        }))
-        .expect("valid request");
-        service
-            .create(project_id, exact, None)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-    }
-
-    #[tokio::test]
-    async fn the_dry_run_refuses_drafts_over_the_pattern_budget() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_id, _) = project(&test_db, "edge-dry-run-budget").await;
-        let half = limits::REGEX_CONDITIONS_PER_PROJECT / 2 + 1;
-        let drafts: Vec<EvaluateRuleInput> = serde_json::from_value(serde_json::json!([
-            {"expression": conditions(("path", "regex"), half, 0), "action": {"type": "log"}},
-            {"expression": conditions(("path", "regex"), half, half), "action": {"type": "log"}}
-        ]))
-        .expect("drafts parse");
-        match service
-            .evaluate(
-                project_id,
-                EvaluateEdgeRulesRequest {
-                    request: sample("https://app.example.test/"),
-                    rules: Some(drafts),
-                },
-            )
-            .await
-        {
-            Err(EdgeRuleServiceError::Invalid { issues, .. }) => {
-                assert!(issues[0].message.contains("regex conditions"), "{issues:?}");
-            }
-            other => panic!("expected the dry run to refuse the drafts, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn the_dry_run_evaluates_saved_rules_and_drafts() {
-        let Some(test_db) = database().await else {
-            return;
-        };
-        let service = EdgeRuleService::new(test_db.connection_arc());
-        let (project_id, _) = project(&test_db, "edge-dry-run").await;
-        let saved = service
-            .create(project_id, block_admin(), None)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-
-        // Paths ignore case by default for this rule.
-        let result = service
-            .evaluate(
-                project_id,
-                EvaluateEdgeRulesRequest {
-                    request: sample("https://app.example.test/ADMIN/users"),
-                    rules: None,
-                },
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            result.decision,
-            Decision::Block {
-                rule_id: saved.id,
-                status: 403,
-                body: String::new()
-            }
-        );
-        assert_eq!(result.matched_rule_id, Some(saved.id));
-        assert!(
-            result.summary.starts_with("Blocked with 403"),
-            "{}",
-            result.summary
-        );
-
-        let drafts: Vec<EvaluateRuleInput> = serde_json::from_value(serde_json::json!([
-            {"expression": {"combinator": "all", "children": [
-                {"kind": "condition", "field": "path", "op": "eq", "values": ["/old"]}
-            ]}, "action": {"type": "redirect", "target": "/new?{query}", "status": 308}}
-        ]))
-        .expect("drafts parse");
-        let result = service
-            .evaluate(
-                project_id,
-                EvaluateEdgeRulesRequest {
-                    request: sample("https://app.example.test/old?x=1"),
-                    rules: Some(drafts),
-                },
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(
-            result.decision,
-            Decision::Redirect {
-                rule_id: -1,
-                status: 308,
-                location: "/new?x=1".into()
-            }
-        );
-        assert_eq!(result.trace.len(), 1);
-        assert_eq!(result.trace[0].outcome, RuleOutcome::Decided);
-    }
-}
+pub(crate) mod tests;

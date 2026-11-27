@@ -197,6 +197,22 @@ pub fn parse_log_line(
     stream: LogStream,
     ctx: &ContainerContext,
 ) -> LogLine {
+    // A managed service's own tooling can print a connection URI with its
+    // password (pg_autoctl does when it cannot reach its monitor). Those
+    // logs are ingested by default and readable by anyone who can view the
+    // service, so the password is masked before the line is stored.
+    let masked;
+    let raw = if ctx.external_service_id.is_some() {
+        match mask_uri_passwords(raw) {
+            std::borrow::Cow::Borrowed(raw) => raw,
+            std::borrow::Cow::Owned(line) => {
+                masked = line;
+                masked.as_str()
+            }
+        }
+    } else {
+        raw
+    };
     let trimmed = raw.trim();
 
     // Try JSON parse first
@@ -227,6 +243,89 @@ pub fn parse_log_line(
         deploy_id: ctx.deploy_id,
         node_id: None,
         node_name: None,
+    }
+}
+
+/// What replaces the password of a `scheme://user:password@host` URI.
+const MASKED_PASSWORD: &str = "****";
+
+/// How a JSON encoder may write the `://` of a URI: JSON allows `\/` for `/`.
+const ESCAPED_SCHEME_SEPARATOR: &str = ":\\/\\/";
+
+/// Where the authority of the next URI at or after `from` starts, after its
+/// `://` or its JSON-escaped `:\/\/`.
+fn next_authority_start(line: &str, from: usize) -> Option<usize> {
+    let plain = line[from..].find("://").map(|i| from + i + 3);
+    let escaped = line[from..]
+        .find(ESCAPED_SCHEME_SEPARATOR)
+        .map(|i| from + i + ESCAPED_SCHEME_SEPARATOR.len());
+    match (plain, escaped) {
+        (Some(plain), Some(escaped)) => Some(plain.min(escaped)),
+        (plain, escaped) => plain.or(escaped),
+    }
+}
+
+/// `line` with the password of every `scheme://user:password@host` URI
+/// replaced by [`MASKED_PASSWORD`]; borrowed (no allocation) when it holds
+/// none, which is every line without `://` (or its JSON-escaped `:\/\/`, so
+/// a JSON log line is masked before it is decoded).
+///
+/// The authority ends at the first `/`, `?`, `#`, `\`, whitespace, `"`, `` ` ``,
+/// `<` or `>` after `://`: none of them can appear unencoded in a userinfo.
+/// Its userinfo is everything before the last `@` in it, and the password
+/// whatever follows the first `:` of the userinfo, so a password holding
+/// characters a userinfo allows (`,`, `'`, `(`, `)`) is masked whole, and
+/// punctuation around the URI (`'postgres://u:p@h',`) stays outside it. A
+/// URI without a password (`postgres://user@host`) is left as it is.
+pub fn mask_uri_passwords(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains("://") && !line.contains(ESCAPED_SCHEME_SEPARATOR) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let bytes = line.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(authority_start) = next_authority_start(line, search) {
+        let authority_end = bytes[authority_start..]
+            .iter()
+            .position(|b| {
+                matches!(b, b'/' | b'?' | b'#' | b'\\' | b'"' | b'`' | b'<' | b'>')
+                    || b.is_ascii_whitespace()
+            })
+            .map_or(bytes.len(), |end| authority_start + end);
+        let authority = &line[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            if let Some(colon) = authority[..at].find(':') {
+                let password_start = authority_start + colon + 1;
+                let password_end = authority_start + at;
+                if password_end > password_start
+                    && &line[password_start..password_end] != MASKED_PASSWORD
+                {
+                    let out = out.get_or_insert_with(|| String::with_capacity(line.len()));
+                    out.push_str(&line[copied..password_start]);
+                    out.push_str(MASKED_PASSWORD);
+                    copied = password_end;
+                }
+            }
+        }
+        // An authority that ends at the slash of the next URI's `://`
+        // (`…@db,postgres://v:q@db2`) holds that separator's colon: resume
+        // on the colon so the next URI is still found. Only then, as any
+        // other byte before the end may be inside a multi-byte character
+        // (`https://例え`), where slicing the line would panic. The next
+        // match still starts past this authority, so the scan moves on.
+        search = if authority_end > authority_start && bytes[authority_end - 1] == b':' {
+            authority_end - 1
+        } else {
+            authority_end
+        };
+    }
+    match out {
+        Some(mut out) => {
+            out.push_str(&line[copied..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(line),
     }
 }
 
@@ -839,6 +938,116 @@ mod tests {
             container_id: "abc123".to_string(),
             deploy_id: None,
         }
+    }
+
+    #[test]
+    fn mask_uri_passwords_hides_the_password_and_keeps_the_rest() {
+        let cases = [
+            (
+                r#"ERROR Failed to connect to monitor database at "postgresql://autoctl_node:Zq81secret@10.0.0.3:6000/pg_auto_failover", see above for details"#,
+                r#"ERROR Failed to connect to monitor database at "postgresql://autoctl_node:****@10.0.0.3:6000/pg_auto_failover", see above for details"#,
+            ),
+            (
+                "postgres://u:p4ss@[fd00::10]:6030/db?sslmode=require and redis://:r3dis@cache:6379/0",
+                "postgres://u:****@[fd00::10]:6030/db?sslmode=require and redis://:****@cache:6379/0",
+            ),
+            ("mongodb://admin:pw@db1,db2/admin", "mongodb://admin:****@db1,db2/admin"),
+            ("postgresql://user:pw@host", "postgresql://user:****@host"),
+            // `,`, `'`, `(` and `)` are valid in a userinfo: the whole password goes.
+            (
+                "postgres://u:se,cr'et(1)@db/app",
+                "postgres://u:****@db/app",
+            ),
+            // ... while punctuation around the URI stays where it was.
+            (
+                "dsn='postgres://u:pw@db', retry (postgres://v:pw2@db2)",
+                "dsn='postgres://u:****@db', retry (postgres://v:****@db2)",
+            ),
+            // A JSON encoder may escape the slashes.
+            (
+                r#"{"msg":"postgres:\/\/u:secret@db\/app"}"#,
+                r#"{"msg":"postgres:\/\/u:****@db\/app"}"#,
+            ),
+            // URIs one after another, with nothing that ends the first one
+            // before the next one's `://`.
+            (
+                "postgres://u:pw@db,postgres://v:pw2@db2",
+                "postgres://u:****@db,postgres://v:****@db2",
+            ),
+            (
+                r#"{"dsns":"postgres:\/\/u:pw@db,postgres:\/\/v:pw2@db2"}"#,
+                r#"{"dsns":"postgres:\/\/u:****@db,postgres:\/\/v:****@db2"}"#,
+            ),
+            (
+                "file:///tmp/x then postgres://u:pw@db",
+                "file:///tmp/x then postgres://u:****@db",
+            ),
+            // A host that ends in a multi-byte character, at the end of the
+            // line or before a path.
+            ("connecting to https://例え.テスト", "connecting to https://例え.テスト"),
+            (
+                "https://u:pw@例え/x then postgres://v:pw2@db",
+                "https://u:****@例え/x then postgres://v:****@db",
+            ),
+        ];
+        for (raw, wanted) in cases {
+            assert_eq!(mask_uri_passwords(raw), wanted, "{raw}");
+        }
+    }
+
+    #[test]
+    fn mask_uri_passwords_leaves_lines_without_a_password_borrowed() {
+        for raw in [
+            "plain line without any uri",
+            r#"Failed to connect to "postgres://autoctl_node@monitor:6000/pg_auto_failover?password=****""#,
+            "see https://example.com/docs:install@anchor",
+            "already masked postgres://u:****@h/db",
+            "dangling postgres://",
+            "empty password postgres://u:@h/db",
+        ] {
+            assert!(
+                matches!(mask_uri_passwords(raw), std::borrow::Cow::Borrowed(_)),
+                "{raw}"
+            );
+        }
+    }
+
+    /// A managed service's container log keeps no connection password; an
+    /// application's own log is stored as it was written.
+    #[test]
+    fn service_container_lines_are_stored_without_uri_passwords() {
+        let raw = r#"ERROR Failed to connect to monitor database at "postgresql://autoctl_node:Zq81secret@10.0.0.3:6000/pg_auto_failover""#;
+        let service_ctx = ContainerContext {
+            external_service_id: Some(7),
+            ..test_ctx()
+        };
+        let line = parse_log_line(raw, Utc::now(), LogStream::Stderr, &service_ctx);
+        assert!(!line.msg.contains("Zq81secret"), "{}", line.msg);
+        assert!(
+            line.msg.contains("autoctl_node:****@10.0.0.3"),
+            "{}",
+            line.msg
+        );
+        assert!(!format!("{:?}", line.fields).contains("Zq81secret"));
+
+        let json = r#"{"level":"error","msg":"dial postgres://app:Zq81secret@db/app failed"}"#;
+        let line = parse_log_line(json, Utc::now(), LogStream::Stderr, &service_ctx);
+        assert!(!line.msg.contains("Zq81secret"), "{}", line.msg);
+
+        // Escaped slashes decode to a plain URI after the line is parsed, in
+        // the message and in any other field.
+        let escaped = r#"{"level":"error","msg":"dial postgres:\/\/app:Zq81secret@db\/app failed","conn":{"dsn":"postgres:\/\/app:Zq81secret@db\/app"}}"#;
+        let line = parse_log_line(escaped, Utc::now(), LogStream::Stderr, &service_ctx);
+        assert!(!line.msg.contains("Zq81secret"), "{}", line.msg);
+        assert!(
+            line.msg.contains("postgres://app:****@db/app"),
+            "{}",
+            line.msg
+        );
+        assert!(!format!("{:?}", line.fields).contains("Zq81secret"));
+
+        let app = parse_log_line(raw, Utc::now(), LogStream::Stderr, &test_ctx());
+        assert!(app.msg.contains("Zq81secret"));
     }
 
     #[test]

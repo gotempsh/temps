@@ -212,9 +212,10 @@ async fn list_deployment_tokens(
     request_body = CreateDeploymentTokenRequest,
     responses(
         (status = 201, description = "Deployment token created successfully", body = CreateDeploymentTokenResponse),
-        (status = 400, description = "Invalid request"),
+        (status = 400, description = "Invalid request: blank name, empty permissions, an expiry in the past, or a deployment of another environment"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "The project, or the requested environment or deployment in it, was not found"),
         (status = 409, description = "Token with this name already exists"),
         (status = 500, description = "Internal server error")
     ),
@@ -292,7 +293,7 @@ async fn get_deployment_token(
     request_body = UpdateDeploymentTokenRequest,
     responses(
         (status = 200, description = "Deployment token updated successfully", body = DeploymentTokenResponse),
-        (status = 400, description = "Invalid request"),
+        (status = 400, description = "Invalid request: blank name, empty permissions or a new expiry in the past (the token's current expiry may be sent back unchanged)"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Deployment token not found"),

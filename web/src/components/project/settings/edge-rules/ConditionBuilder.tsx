@@ -201,7 +201,7 @@ function GroupEditor({
       {group.children.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           {isRoot
-            ? 'No conditions: the rule applies to every request.'
+            ? 'No conditions yet. A rule needs at least one.'
             : 'This group is empty.'}
         </p>
       ) : (

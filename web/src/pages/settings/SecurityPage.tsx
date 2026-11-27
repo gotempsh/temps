@@ -26,6 +26,7 @@ import { ShieldPlatformSettings } from '@/components/settings/ShieldPlatformSett
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import { useFormBaseRevision } from '@/hooks/useFormBaseRevision'
 import { AlertCircle, LockKeyhole, Network, Shield } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
@@ -40,7 +41,6 @@ function parseNetworkLines(text: string): string[] {
 export function SecurityPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
-  const updateSettings = useUpdateSettings()
 
   const {
     register,
@@ -70,6 +70,20 @@ export function SecurityPage() {
       trusted_private_networks_text: '',
       trusted_proxy_cidrs_text: '',
     },
+  })
+
+  // A refetch merges into unsaved edits (below); the save still sends the
+  // revision those edits started from, so it cannot overwrite another
+  // admin's change to the same field.
+  const { baseRevision, adopt } = useFormBaseRevision(
+    isDirty,
+    settings?.revision
+  )
+  // After a refused save, "Load latest" keeps the edits (the refetch below
+  // merges around them) and bases them on the settings just loaded.
+  const updateSettings = useUpdateSettings({
+    baseRevision,
+    onLatestLoaded: (latest) => adopt(latest.revision),
   })
 
   const exposePlatformIdentity = useWatch({

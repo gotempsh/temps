@@ -25,7 +25,12 @@ import {
   adminUndrainNode,
   adminUpdateNodePublicIngressSettings,
 } from '../../api/sdk.gen.js'
-import type { BuildLimits, EnvironmentWorkloadMode, UpdatePublicIngressSettingsRequest } from '../../api/types.gen.js'
+import type {
+  BuildLimits,
+  EnvironmentWorkloadMode,
+  SetNodeBuildLimitsRequest,
+  UpdatePublicIngressSettingsRequest,
+} from '../../api/types.gen.js'
 import { call, confirmRisk, connect, output, parseIntegerFlag, type JsonOption } from '../../lib/command-kit.js'
 import { ValidationError } from '../../utils/errors.js'
 
@@ -41,10 +46,19 @@ export interface BuildLimitFlags {
   queueWait?: string
 }
 
+/** A read's `revision`, sent back as `expected_revision` so the server refuses the write (409) when someone saved in between. */
+function expectedRevision(current: { revision?: string }): { expected_revision?: string } {
+  return typeof current.revision === 'string' ? { expected_revision: current.revision } : {}
+}
+
 /** Build limits from flags over the current ones; `null` when no flag was given. */
-export function buildLimitsRequest(current: BuildLimits, flags: BuildLimitFlags): BuildLimits | null {
+export function buildLimitsRequest(
+  current: BuildLimits & { revision?: string },
+  flags: BuildLimitFlags,
+): SetNodeBuildLimitsRequest | null {
   if (flags.timeout === undefined && flags.concurrency === undefined && flags.queueWait === undefined) return null
   return {
+    ...expectedRevision(current),
     build_timeout_seconds:
       flags.timeout === undefined ? current.build_timeout_seconds : parseIntegerFlag(flags.timeout, '--timeout', 1),
     concurrency: flags.concurrency === undefined ? current.concurrency : parseIntegerFlag(flags.concurrency, '--concurrency', 1),
@@ -64,7 +78,7 @@ export interface IngressFlags {
 
 /** The public-ingress settings to save; `null` when no flag was given. Empty addresses mean automatic. */
 export function ingressSettingsRequest(
-  current: UpdatePublicIngressSettingsRequest,
+  current: UpdatePublicIngressSettingsRequest & { revision?: string },
   flags: IngressFlags,
 ): UpdatePublicIngressSettingsRequest | null {
   if (flags.enable && flags.disable) throw new ValidationError('Pass --enable or --disable, not both')
@@ -75,6 +89,7 @@ export function ingressSettingsRequest(
   const address = (raw: string | undefined, fallback: string | null | undefined) =>
     raw === undefined ? (fallback ?? null) : raw.trim() || null
   return {
+    ...expectedRevision(current),
     enabled: flags.enable ? true : flags.disable ? false : current.enabled,
     http_port: port(flags.httpPort, '--http-port', current.http_port),
     https_port: port(flags.httpsPort, '--https-port', current.https_port),

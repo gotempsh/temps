@@ -68,6 +68,63 @@ pub const DEDICATED_ROLE: &str = "dedicated";
 
 const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
 
+/// Load scores within this distance of the least-loaded node's count as the
+/// same load when ranking (see [`pick_least_loaded`]).
+///
+/// On idle nodes the differences between load scores are noise, and the
+/// replicas just placed do not show in them until their nodes' next capacity
+/// reports (every ~30 s), and barely then when the app is idle. Ranking on
+/// the raw score alone sent consecutive single-replica deployments to the
+/// same "least loaded" node.
+pub const LOAD_TIE_TOLERANCE: f64 = 0.10;
+
+/// The load score the control plane ranks with when it reports none.
+pub const NEUTRAL_LOAD: f64 = 0.5;
+
+/// The load each node ranks with: its own score, or for one that reported
+/// none, the least-loaded score among those that did when it is a worker (a
+/// worker that has just joined has sent no capacity report yet, and ranking
+/// it at [`NEUTRAL_LOAD`] kept it out of every placement until it did), and
+/// [`NEUTRAL_LOAD`] for the control plane or when no node reported.
+pub fn ranking_loads(nodes: &[(Option<f64>, bool)]) -> Vec<f64> {
+    let least_reported = nodes
+        .iter()
+        .filter_map(|(load, _)| *load)
+        .min_by(f64::total_cmp);
+    nodes
+        .iter()
+        .map(|&(load, is_control_plane)| match load {
+            Some(load) => load,
+            None if is_control_plane => NEUTRAL_LOAD,
+            None => least_reported.map_or(NEUTRAL_LOAD, |least| least.min(NEUTRAL_LOAD)),
+        })
+        .collect()
+}
+
+/// The node to place the next replica on, among the indexes `candidate`
+/// admits: of those whose load is within [`LOAD_TIE_TOLERANCE`] of the
+/// lowest, the one running the fewest replicas (`running`, counting the ones
+/// this call already placed), then the lowest load, then the first. `None`
+/// when no index is a candidate.
+pub fn pick_least_loaded(
+    loads: &[f64],
+    running: &[u32],
+    candidate: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let lowest = (0..loads.len())
+        .filter(|i| candidate(*i))
+        .map(|i| loads[i])
+        .min_by(f64::total_cmp)?;
+    (0..loads.len())
+        .filter(|i| candidate(*i) && loads[*i] <= lowest + LOAD_TIE_TOLERANCE)
+        .min_by(|a, b| {
+            let running_of = |i: usize| running.get(i).copied().unwrap_or(0);
+            running_of(*a)
+                .cmp(&running_of(*b))
+                .then_with(|| loads[*a].total_cmp(&loads[*b]))
+        })
+}
+
 /// A node's scheduling role, from its `temps.sh/role` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1247,7 +1304,7 @@ impl UnifiedScheduler {
                 request.affinity_nodes,
                 spread,
             ),
-            _ => self.rank_load(&pool, replicas, need, &mut room, spread),
+            _ => self.rank_load(nodes, &pool, replicas, need, &mut room, spread),
         };
         let placed = chosen.len() as u32;
         if placed < replicas {
@@ -1279,6 +1336,7 @@ impl UnifiedScheduler {
     /// `replicas` when enforcing nodes fill up.
     fn rank_load(
         &self,
+        nodes: &[NodeFacts],
         pool: &[PoolEntry],
         replicas: u32,
         need: Reservation,
@@ -1293,7 +1351,13 @@ impl UnifiedScheduler {
         } else {
             1.0 / pool.len() as f64
         };
-        let mut scores: Vec<f64> = pool.iter().map(|e| e.load.unwrap_or(0.5)).collect();
+        let mut scores = ranking_loads(
+            &pool
+                .iter()
+                .map(|e| (e.load, nodes[e.node].is_control_plane()))
+                .collect::<Vec<_>>(),
+        );
+        let mut running: Vec<u32> = pool.iter().map(|e| nodes[e.node].live_instances).collect();
         if spread && pool.len() > 1 {
             let mut used = vec![false; pool.len()];
             let mut used_count = 0;
@@ -1303,18 +1367,12 @@ impl UnifiedScheduler {
                     used_count = 0;
                 }
                 let pick = if has_load {
-                    scores
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| !used[*i] && fits(room, *i))
-                        .min_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(i, _)| i)
-                        .or_else(|| {
+                    pick_least_loaded(&scores, &running, |i| !used[i] && fits(room, i)).or_else(
+                        || {
                             // Every unused node is full: any node with room.
                             (0..pool.len()).find(|i| fits(room, *i))
-                        })
+                        },
+                    )
                 } else {
                     let start = replica % pool.len();
                     (0..pool.len())
@@ -1328,6 +1386,7 @@ impl UnifiedScheduler {
                     used_count += 1;
                 }
                 scores[i] += bump;
+                running[i] += 1;
                 if let Some(r) = room[i].as_mut() {
                     r.take(need);
                 }
@@ -1336,12 +1395,7 @@ impl UnifiedScheduler {
         }
         for _ in 0..replicas {
             let pick = if has_load {
-                scores
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| fits(room, *i))
-                    .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i)
+                pick_least_loaded(&scores, &running, |i| fits(room, i))
             } else {
                 let start = self.cursor.fetch_add(1, Ordering::Relaxed) % pool.len().max(1);
                 (0..pool.len())
@@ -1351,6 +1405,7 @@ impl UnifiedScheduler {
             let Some(i) = pick else { break };
             chosen.push(i);
             scores[i] += bump;
+            running[i] += 1;
             if let Some(r) = room[i].as_mut() {
                 r.take(need);
             }
@@ -1416,7 +1471,7 @@ impl UnifiedScheduler {
                     }
                 }
                 None => {
-                    let rest = self.rank_load(pool, 1, need, room, false);
+                    let rest = self.rank_load(nodes, pool, 1, need, room, false);
                     let Some(i) = rest.first().copied() else {
                         break;
                     };
@@ -1665,6 +1720,52 @@ pub fn recommend_pinning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nodes_of_about_the_same_load_are_ranked_by_the_replicas_they_run() {
+        // Within the tolerance: fewest replicas wins over the lowest load.
+        assert_eq!(
+            pick_least_loaded(&[0.03, 0.05, 0.06], &[2, 0, 1], |_| true),
+            Some(1)
+        );
+        // Equal replicas: the lowest load.
+        assert_eq!(
+            pick_least_loaded(&[0.06, 0.05, 0.03], &[1, 1, 1], |_| true),
+            Some(2)
+        );
+        // Beyond the tolerance the load decides, whatever runs there.
+        assert_eq!(pick_least_loaded(&[0.40, 0.05], &[0, 9], |_| true), Some(1));
+        // Only candidates are considered; none is None.
+        assert_eq!(
+            pick_least_loaded(&[0.03, 0.05], &[0, 3], |i| i == 1),
+            Some(1)
+        );
+        assert_eq!(pick_least_loaded(&[0.03], &[0], |_| false), None);
+        // Full nodes (an infinite score) still rank among themselves.
+        assert_eq!(
+            pick_least_loaded(&[f64::INFINITY, f64::INFINITY], &[3, 1], |_| true),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_worker_without_a_report_ranks_with_the_least_loaded_one() {
+        assert_eq!(
+            ranking_loads(&[(Some(0.2), false), (None, false), (Some(0.05), false)]),
+            vec![0.2, 0.05, 0.05]
+        );
+        // The control plane reports none and stays neutral.
+        assert_eq!(
+            ranking_loads(&[(None, true), (Some(0.05), false)]),
+            vec![NEUTRAL_LOAD, 0.05]
+        );
+        // Nothing reported anywhere: neutral, and never above it.
+        assert_eq!(ranking_loads(&[(None, false)]), vec![NEUTRAL_LOAD]);
+        assert_eq!(
+            ranking_loads(&[(Some(0.8), false), (None, false)]),
+            vec![0.8, NEUTRAL_LOAD]
+        );
+    }
     use temps_workload::{LabelValues, ResourceAmounts};
 
     fn worker(id: i32, name: &str) -> NodeFacts {

@@ -4,6 +4,7 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { settingsWriteBody, settingsWriteError } from '../../lib/settings-revision.js'
 import {
   getGeoDatabaseStatus,
   getSettings,
@@ -827,10 +828,10 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
     // above so a change to one setting can never clobber another.
     const { error } = await updateSettings({
       client,
-      body: { ...currentSettings, ...updates } as AppSettings,
+      body: settingsWriteBody(currentSettings, updates) as AppSettings,
     })
     if (error) {
-      throw new Error(getErrorMessage(error))
+      throw new Error(settingsWriteError(error))
     }
   })
 
@@ -851,10 +852,10 @@ async function setExternalUrl(options: SetExternalUrlOptions): Promise<void> {
     }
     const { error } = await updateSettings({
       client,
-      body: { ...currentSettings, external_url: options.url } as AppSettings,
+      body: settingsWriteBody(currentSettings, { external_url: options.url }) as AppSettings,
     })
     if (error) {
-      throw new Error(getErrorMessage(error))
+      throw new Error(settingsWriteError(error))
     }
   })
 
@@ -875,10 +876,10 @@ async function setPreviewDomain(options: SetPreviewDomainOptions): Promise<void>
     }
     const { error } = await updateSettings({
       client,
-      body: { ...currentSettings, preview_domain: options.domain } as AppSettings,
+      body: settingsWriteBody(currentSettings, { preview_domain: options.domain }) as AppSettings,
     })
     if (error) {
-      throw new Error(getErrorMessage(error))
+      throw new Error(settingsWriteError(error))
     }
   })
 

@@ -416,6 +416,88 @@ impl AuditOperation for PlatformUpdateStartedAudit {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SettingsUpdateResponse {
     pub message: String,
+    /// `PUT /settings`: revision of the saved settings, to send as
+    /// `expected_revision` with the next save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+/// `PUT /settings` body: the settings document (partial documents keep the
+/// omitted fields), plus the revision it was read with.
+///
+/// Schema only: the handler reads the raw body, because which fields were
+/// sent is information deserialization destroys.
+#[derive(Debug, Deserialize, ToSchema)]
+#[allow(
+    dead_code,
+    reason = "documents the body for OpenAPI; the handler reads the raw JSON"
+)]
+pub struct UpdateSettingsRequest {
+    #[serde(flatten)]
+    pub settings: AppSettings,
+    /// The `revision` from `GET /settings`. When set and the settings have
+    /// changed since, the save is refused with 409 and nothing changes.
+    /// When omitted the save is unconditional (older clients).
+    #[serde(default)]
+    pub expected_revision: Option<String>,
+}
+
+/// Keys of the masked settings view a `PUT /settings` never writes: they
+/// have dedicated writers (or are recorded by a background job), and the
+/// generic save keeps their stored values, so a change to them cannot be
+/// lost and must not make an open settings form stale.
+const REVISION_EXCLUDED_KEYS: [&str; 3] = [
+    "revision",
+    "plugin_installation_reporting_enabled",
+    "preview_gateway",
+];
+/// The geo refresh job's recorded state, kept from the stored row by every
+/// generic save (`GeoSettings::preserve_recorded_state`).
+const REVISION_EXCLUDED_GEO_KEYS: [&str; 5] = [
+    "last_refreshed_at",
+    "source",
+    "last_check_at",
+    "last_check_status",
+    "last_error",
+];
+
+/// Settings a `PUT /settings` writes that the masked view leaves out. None
+/// is a credential, so they are added to the revision as stored.
+const REVISION_WRITABLE_OUTSIDE_THE_VIEW: [&str; 3] = [
+    "environment_hostname_template",
+    "production_hostname_template",
+    "control_plane_resources",
+];
+
+/// Revision of the platform settings (#2081), over the masked view a reader
+/// sees, never the stored secrets: a hash of a stored credential would let
+/// anyone who can read the settings guess it offline. Every other setting a
+/// save writes is covered too ([`REVISION_WRITABLE_OUTSIDE_THE_VIEW`]); a
+/// change to a credential alone does not change it, which the service's merge
+/// base check covers instead.
+pub(crate) fn settings_revision(settings: &AppSettings) -> String {
+    let mut view = serde_json::to_value(AppSettingsResponse::from(settings.clone()))
+        // Serializing a plain struct does not fail; if it ever did, every
+        // revision would be the same and saves would be unconditional, as
+        // they were before revisions existed.
+        .unwrap_or_default();
+    let stored = serde_json::to_value(settings).unwrap_or_default();
+    if let Some(view) = view.as_object_mut() {
+        for key in REVISION_EXCLUDED_KEYS {
+            view.remove(key);
+        }
+        for key in REVISION_WRITABLE_OUTSIDE_THE_VIEW {
+            if let Some(value) = stored.get(key) {
+                view.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(geo) = view.get_mut("geo").and_then(|geo| geo.as_object_mut()) {
+            for key in REVISION_EXCLUDED_GEO_KEYS {
+                geo.remove(key);
+            }
+        }
+    }
+    temps_core::revision::document_revision(&view)
 }
 
 /// Response returned when a join token is generated (plaintext shown once)
@@ -618,6 +700,10 @@ pub struct AppSettingsResponse {
     /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
     /// content — passed through as-is so the settings UI can show and edit it.
     pub mcp_server: temps_config::McpServerSettings,
+    /// Revision of these settings. Send it back as `expected_revision` when
+    /// saving, so a save made by someone else since this read is not
+    /// silently reverted.
+    pub revision: String,
 }
 
 fn conflicting_delivery_defaults(settings: &AppSettings) -> bool {
@@ -1279,11 +1365,17 @@ impl From<AppSettings> for AppSettingsResponse {
             self_update,
             image_retention: settings.image_retention,
             mcp_server: settings.mcp_server,
+            revision: String::new(),
         }
     }
 }
 
 impl AppSettingsResponse {
+    fn with_revision(mut self, revision: String) -> Self {
+        self.revision = revision;
+        self
+    }
+
     fn with_cluster_network_state(
         mut self,
         state: Option<temps_config::ClusterNetworkState>,
@@ -1434,6 +1526,7 @@ impl AppSettingsResponse {
         temps_config::ClickHouseSettings,
         MetricsStoreKind,
         SettingsUpdateResponse,
+        UpdateSettingsRequest,
         GenerateJoinTokenResponse,
         JoinTokenStatusResponse,
         MintEnrollmentTokenRequest,
@@ -1904,6 +1997,7 @@ async fn revoke_enrollment_token(
 
     Ok(Json(SettingsUpdateResponse {
         message: format!("Enrollment token {} revoked", id),
+        revision: None,
     }))
 }
 
@@ -2419,7 +2513,9 @@ async fn get_settings(
                     );
                 })
                 .ok();
+            let revision = settings_revision(&settings);
             let response = AppSettingsResponse::from(settings)
+                .with_revision(revision)
                 .with_effective_store(app_state.config_service.is_clickhouse_enabled())
                 .with_clickhouse_runtime_state(
                     app_state.config_service.is_clickhouse_enabled(),
@@ -3579,16 +3675,39 @@ fn fill_omitted_settings(submitted: &mut serde_json::Value, stored: serde_json::
     }
 }
 
+/// Remove `expected_revision` from a `PUT /settings` body: a string, or
+/// absent/null for an unconditional save.
+fn take_expected_revision(body: &mut serde_json::Value) -> Result<Option<String>, Problem> {
+    let Some(value) = body
+        .as_object_mut()
+        .and_then(|fields| fields.remove("expected_revision"))
+    else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(revision) => Ok(Some(revision)),
+        other => Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Settings Payload")
+            .detail(format!(
+                "`expected_revision` must be the `revision` string from GET /settings, not {other}. Nothing was saved."
+            ))
+            .value("field", "expected_revision")
+            .build()),
+    }
+}
+
 /// Update application settings
 #[utoipa::path(
     tag = "Settings",
     put,
     path = "/settings",
-    request_body = AppSettings,
+    request_body = UpdateSettingsRequest,
     responses(
         (status = 200, description = "Settings updated successfully", body = SettingsUpdateResponse),
         (status = 401, description = "Unauthorized"),
         (status = 400, description = "Bad request - invalid settings"),
+        (status = 409, description = "`expected_revision` is stale (the settings changed since they were read), or the public ingress hostname is in use; nothing was saved"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -3602,6 +3721,9 @@ async fn update_settings(
     Json(mut body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Not a setting: the optimistic-concurrency precondition (#2081).
+    let expected_revision = take_expected_revision(&mut body)?;
 
     // Taken as raw JSON first, and only then turned into an `AppSettings`,
     // because which `cloud.*` keys the client sent is information
@@ -3648,7 +3770,11 @@ async fn update_settings(
     // possibly-widened spend ceiling with neither the check nor the record that
     // are supposed to accompany it.
     validate_bulk_activation_guards(&settings.cloud)?;
-    let stored_settings = match app_state.config_service.get_settings().await {
+    // The document omitted fields and masked secrets are filled from: read
+    // now, not from the cache, which may be seconds old or predate another
+    // process's save; the service refuses a revision-checked save whose base
+    // the locked row has moved past.
+    let stored_settings = match app_state.config_service.get_settings_uncached().await {
         Ok(current) => current,
         Err(e) => {
             error!(
@@ -3931,7 +4057,7 @@ async fn update_settings(
     let body_proxy_cidrs = settings.trusted_proxy_cidrs.clone();
     match app_state
         .config_service
-        .update_settings_with_proxy_intent(
+        .update_settings_checked(
             settings,
             geo_license_key_intent,
             trusted_private_networks_intent,
@@ -3940,10 +4066,16 @@ async fn update_settings(
             } else {
                 TrustedProxyRangesIntent::Unchanged
             },
+            Some(temps_config::SettingsRevisionCheck {
+                expected: expected_revision,
+                revision_of: settings_revision,
+                merge_base: Some(stored_settings.clone()),
+            }),
         )
         .await
     {
         Ok(saved) => {
+            let saved_revision = saved.revision;
             let previous_trusted_private_networks = saved.previous_trusted_private_networks;
             let next_trusted_private_networks = saved.trusted_private_networks;
             let audit = SettingsUpdatedAudit {
@@ -4176,8 +4308,12 @@ async fn update_settings(
                 StatusCode::OK,
                 Json(SettingsUpdateResponse {
                     message: "Settings updated successfully".to_string(),
+                    revision: saved_revision,
                 }),
             ))
+        }
+        Err(temps_config::ConfigServiceError::StaleRevision(stale)) => {
+            Err(temps_core::revision::stale_revision_problem(&stale))
         }
         Err(temps_config::ConfigServiceError::InvalidConfiguration { details }) => {
             Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -4387,6 +4523,7 @@ async fn revoke_join_token(
 
     Ok(Json(SettingsUpdateResponse {
         message: "Join token revoked successfully".to_string(),
+        revision: None,
     }))
 }
 
@@ -7571,6 +7708,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// #2081: admin A reads the settings, admin B saves a change, then A
+    /// saves what it read with another field changed. A's save is refused
+    /// with a 409 naming both revisions instead of reverting B's change.
+    #[test]
+    fn the_settings_revision_follows_every_setting_a_save_writes_but_no_credential() {
+        let base = AppSettings::default();
+        let revision = settings_revision(&base);
+        let mut templated = base.clone();
+        templated.environment_hostname_template = Some("{env}-{project}".to_string());
+        assert_ne!(settings_revision(&templated), revision);
+        let mut production = base.clone();
+        production.production_hostname_template = Some("{project}".to_string());
+        assert_ne!(settings_revision(&production), revision);
+        let mut reserved = base.clone();
+        reserved.control_plane_resources.enforce_reservations =
+            !reserved.control_plane_resources.enforce_reservations;
+        assert_ne!(settings_revision(&reserved), revision);
+
+        // A stored credential never reaches the revision (it is masked).
+        let mut with_password = base.clone();
+        with_password.docker_registry.password = Some("first".to_string());
+        let mut rotated = base.clone();
+        rotated.docker_registry.password = Some("second".to_string());
+        assert_eq!(
+            settings_revision(&with_password),
+            settings_revision(&rotated)
+        );
+    }
+
+    /// Every top-level setting is either in the revision or one a
+    /// `PUT /settings` never writes, so a new setting cannot be left out of
+    /// it unnoticed (and a save of it reverted without a conflict).
+    #[test]
+    fn every_setting_is_in_the_revision_or_kept_from_the_stored_row() {
+        // Written by their own endpoints or by the system; the generic save
+        // keeps the stored values (`update_settings_checked`,
+        // `preserve_self_recorded_fields`).
+        const NOT_WRITTEN_BY_A_SETTINGS_SAVE: [&str; 6] = [
+            "anonymous_telemetry_enabled",
+            "blob",
+            "console_version",
+            "kv",
+            "managed_service_healthchecks",
+            "shield",
+        ];
+        let schema = <AppSettings as utoipa::PartialSchema>::schema();
+        let response = <AppSettingsResponse as utoipa::PartialSchema>::schema();
+        let properties = |schema: utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>| {
+            match serde_json::to_value(schema).unwrap_or_default()["properties"].as_object() {
+                Some(properties) => properties.keys().cloned().collect::<Vec<_>>(),
+                None => Vec::new(),
+            }
+        };
+        let in_view = properties(response);
+        let settings = properties(schema);
+        assert!(
+            in_view.len() > 10 && settings.len() > 10,
+            "the schemas list their properties"
+        );
+        let missing: Vec<String> = settings
+            .into_iter()
+            .filter(|key| {
+                !in_view.contains(key)
+                    && !REVISION_WRITABLE_OUTSIDE_THE_VIEW.contains(&key.as_str())
+                    && !NOT_WRITTEN_BY_A_SETTINGS_SAVE.contains(&key.as_str())
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "settings outside the revision: {missing:?}; add each to \
+             REVISION_WRITABLE_OUTSIDE_THE_VIEW, or, if a settings save keeps its stored \
+             value, to NOT_WRITTEN_BY_A_SETTINGS_SAVE"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settings_save_from_a_stale_read_is_refused() {
+        use tower::ServiceExt;
+        if !temps_test_utils::docker_available().await {
+            eprintln!("Skipping stale settings save test: Docker unavailable");
+            return;
+        }
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
+            .await
+            .expect("test database");
+        let state = settings_test_state(test_db.connection_arc(), Arc::new(NoopAuditLogger));
+        let call = |method: &str, body: Option<serde_json::Value>| {
+            let state = state.clone();
+            let request = axum::http::Request::builder()
+                .method(method)
+                .uri("/settings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .extension(guard_principal(temps_auth::Role::Admin))
+                .extension(RequestMetadata {
+                    ip_address: "127.0.0.1".to_string(),
+                    user_agent: "test".to_string(),
+                    headers: Default::default(),
+                    visitor_id_cookie: None,
+                    session_id_cookie: None,
+                    base_url: "http://localhost".to_string(),
+                    scheme: "http".to_string(),
+                    host: "localhost".to_string(),
+                    is_secure: false,
+                })
+                .body(match body {
+                    Some(body) => axum::body::Body::from(body.to_string()),
+                    None => axum::body::Body::empty(),
+                })
+                .unwrap();
+            async move {
+                let response = configure_routes()
+                    .with_state(state)
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                (status, body)
+            }
+        };
+
+        let (status, read_by_a) = call("GET", None).await;
+        assert_eq!(status, StatusCode::OK, "{read_by_a}");
+        let revision_a = read_by_a["revision"]
+            .as_str()
+            .expect("revision")
+            .to_string();
+        let (_, read_by_b) = call("GET", None).await;
+        assert_eq!(read_by_b["revision"], revision_a, "reading changes nothing");
+
+        let (status, saved_by_b) = call(
+            "PUT",
+            Some(serde_json::json!({
+                "preview_domain": "preview-b.example.test",
+                "expected_revision": revision_a,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved_by_b}");
+        let revision_b = saved_by_b["revision"]
+            .as_str()
+            .expect("new revision")
+            .to_string();
+        assert_ne!(revision_b, revision_a, "a save changes the revision");
+        let (_, after_b) = call("GET", None).await;
+        assert_eq!(
+            after_b["revision"], revision_b,
+            "the save returns what a read sees"
+        );
+
+        let (status, refused) = call(
+            "PUT",
+            Some(serde_json::json!({
+                "preview_domain": read_by_a["preview_domain"],
+                "require_mfa_for_admins": true,
+                "expected_revision": revision_a,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["expected_revision"], revision_a);
+        assert_eq!(refused["current_revision"], revision_b);
+        let (_, after_refusal) = call("GET", None).await;
+        assert_eq!(after_refusal["preview_domain"], "preview-b.example.test");
+        assert_eq!(
+            after_refusal["require_mfa_for_admins"], false,
+            "nothing was saved"
+        );
+        assert_eq!(after_refusal["revision"], revision_b);
+
+        let (status, invalid) = call(
+            "PUT",
+            Some(serde_json::json!({"require_mfa_for_admins": true, "expected_revision": 7})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+
+        // Without a revision the save is unconditional (older clients).
+        let (status, unconditional) = call(
+            "PUT",
+            Some(serde_json::json!({"require_mfa_for_admins": true})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{unconditional}");
     }
 
     #[tokio::test]

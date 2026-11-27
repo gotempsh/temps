@@ -9,7 +9,9 @@ import {
   updatePlatformSettings as updateSettingsApi,
   type PlatformSettings,
 } from '@/api/platformSettings'
+import { problemDetail } from '@/lib/api-problem'
 import { shouldRetryQuery } from '@/lib/query-retry'
+import { isStaleRevision, STALE_REVISION_MESSAGE } from '@/lib/stale-revision'
 import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 
 // Re-export types for backward compatibility
@@ -66,11 +68,65 @@ export function useSettingsPage() {
   }
 }
 
-export function useUpdateSettings() {
+/**
+ * Re-read the settings after a save was refused as stale, and hand the
+ * stored document to `onLatestLoaded` (rejecting, without calling it, when
+ * the read fails) (a form that keeps its unsaved edits
+ * across refetches adopts its revision, so saving again applies the edits
+ * on top of the other save).
+ */
+export async function loadLatestSettings(
+  queryClient: ReturnType<typeof useQueryClient>,
+  onLatestLoaded?: (latest: PlatformSettings) => void
+) {
+  // A failed read rejects instead of leaving the old document in the cache
+  // to be adopted as if it were the latest.
+  await queryClient.refetchQueries(
+    { queryKey: ['platform-settings'], exact: true },
+    { throwOnError: true }
+  )
+  const latest = queryClient.getQueryData<PlatformSettings>([
+    'platform-settings',
+  ])
+  if (latest) onLatestLoaded?.(latest)
+}
+
+/**
+ * `baseRevision` is the revision the page's form values are based on
+ * (`useFormBaseRevision`); a form that merges refetches into unsaved edits
+ * passes it, so a refetch does not make a save of those edits unconditional.
+ * Without it, the revision of the cached read is sent. `onLatestLoaded`
+ * runs when the operator loads the latest settings after a refused save.
+ */
+export function useUpdateSettings(
+  options: {
+    baseRevision?: string
+    onLatestLoaded?: (latest: PlatformSettings) => void
+  } = {}
+) {
   const queryClient = useQueryClient()
+  const loadLatest = async () => {
+    try {
+      await loadLatestSettings(queryClient, options.onLatestLoaded)
+    } catch (error) {
+      // The form and the revision its edits are based on stay as they were.
+      toast.error('Could not load the latest settings', {
+        description: `${problemDetail(error, 'The server did not answer.')} Your unsaved changes are kept.`,
+        action: { label: 'Retry', onClick: () => void loadLatest() },
+      })
+    }
+  }
 
   return useMutation({
-    mutationFn: updateSettingsApi,
+    // The revision the page was rendered from, not a fresh read: a save made
+    // by someone else since this page loaded is refused instead of reverted.
+    mutationFn: (changes: Partial<PlatformSettings>) =>
+      updateSettingsApi(changes, {
+        expectedRevision:
+          options.baseRevision ??
+          queryClient.getQueryData<PlatformSettings>(['platform-settings'])
+            ?.revision,
+      }),
     onSuccess: (data, changes) => {
       if (changes.agent_sandbox) {
         void queryClient.invalidateQueries({
@@ -81,6 +137,19 @@ export function useUpdateSettings() {
       queryClient.invalidateQueries({ queryKey: ['platform-settings'] })
     },
     onError: (error) => {
+      if (isStaleRevision(error)) {
+        // Re-read in place, not a page reload: a form that keeps unsaved
+        // edits across refetches keeps them, shows the other save in the
+        // fields it did not touch, and adopts its revision.
+        toast.error('Settings were changed by someone else', {
+          description: STALE_REVISION_MESSAGE,
+          action: {
+            label: 'Load latest',
+            onClick: () => void loadLatest(),
+          },
+        })
+        return
+      }
       toast.error('Failed to update settings', {
         description: error instanceof Error ? error.message : 'Unknown error',
       })

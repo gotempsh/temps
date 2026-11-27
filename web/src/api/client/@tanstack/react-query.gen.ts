@@ -9429,9 +9429,6 @@ export const externalServiceMetricsGetRangeQueryKey = (options: Options<External
 
 /**
  * Fetch a time-series range for a single metric on an external service.
- *
- * Pass `percentile` to compute a histogram quantile instead of a plain
- * gauge/counter average.
  */
 export const externalServiceMetricsGetRangeOptions = (options: Options<ExternalServiceMetricsGetRangeData>) => queryOptions<ExternalServiceMetricsGetRangeResponse, DefaultError, ExternalServiceMetricsGetRangeResponse, ReturnType<typeof externalServiceMetricsGetRangeQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -22211,19 +22208,20 @@ export const getEnvironmentEgressRecordingOptions = (options: Options<GetEnviron
  * Turn recording of the environment's outbound connections on or off.
  *
  * With recording on, containers of the environment's deployments are
- * started with the per-node egress proxy as their HTTP(S) proxy, and
- * every connection they make through it produces one OpenTelemetry log
- * record when it ends, allowed or refused: destination (`server.address`,
- * `server.port`; method and path without the query for plain HTTP),
- * outcome and refusal reason, bytes each way and duration. Never headers,
- * bodies or query strings. Off by default.
+ * started with the per-node egress proxy as their HTTPS proxy, and every
+ * connection they make through it produces one OpenTelemetry log record
+ * when it ends, allowed or refused: destination (`server.address`,
+ * `server.port`), outcome and refusal reason, bytes each way and duration.
+ * Never headers, bodies or query strings. Off by default.
  *
  * It applies to containers started after it is turned on: redeploy the
  * environment to start recording. Turning it off stops recording at once.
  * Only clients that honour the proxy variables are recorded, and only
- * public destinations go through the proxy: internal addresses and names
- * stay direct. While it is on, the environment's outbound HTTP(S) depends
- * on the node's egress proxy being up. Turning it on fails with 422 when
+ * HTTPS to public destinations goes through the proxy: plain HTTP,
+ * internal addresses and names stay direct, and a deployment (or image)
+ * that sets its own `HTTPS_PROXY` or `ALL_PROXY` keeps it and is not
+ * recorded. While it is on, the environment's outbound HTTPS depends on
+ * the node's egress proxy being up. Turning it on fails with 422 when
  * no node the environment runs on can record, naming the environment, the
  * node and what is missing, or when it is a Docker Compose environment,
  * whose containers are never sent through the proxy (`reason_code` is then
@@ -26915,9 +26913,11 @@ export const getProjectSecretOptions = (options: Options<GetProjectSecretData>) 
 });
 
 /**
- * Update a project secret. Value rotation requires a redeploy to take effect —
- * running containers keep their currently-mounted values until the next
- * deployment.
+ * Update a project secret. Only the fields in the body change: a field left
+ * out keeps its stored value, so rotating the value alone keeps the secret's
+ * environments, preview flag and compose services. Value rotation requires a
+ * redeploy to take effect — running containers keep their currently-mounted
+ * values until the next deployment.
  */
 export const updateProjectSecretMutation = (options?: Partial<Options<UpdateProjectSecretData>>): UseMutationOptions<UpdateProjectSecretResponse, DefaultError, Options<UpdateProjectSecretData>> => {
     const mutationOptions: UseMutationOptions<UpdateProjectSecretResponse, DefaultError, Options<UpdateProjectSecretData>> = {
