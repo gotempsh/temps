@@ -2700,9 +2700,11 @@ async fn record_secret_write(
     }
 }
 
-/// Update a project secret. Value rotation requires a redeploy to take effect —
-/// running containers keep their currently-mounted values until the next
-/// deployment.
+/// Update a project secret. Only the fields in the body change: a field left
+/// out keeps its stored value, so rotating the value alone keeps the secret's
+/// environments, preview flag and compose services. Value rotation requires a
+/// redeploy to take effect — running containers keep their currently-mounted
+/// values until the next deployment.
 #[utoipa::path(
     put,
     path = "/projects/{project_id}/secrets/{secret_id}",
@@ -2711,8 +2713,9 @@ async fn record_secret_write(
     request_body = UpdateProjectSecretRequest,
     responses(
         (status = 200, description = "Secret updated", body = ProjectSecretResponse),
-        (status = 400, description = "Value too large"),
-        (status = 404, description = "Secret not found"),
+        (status = 400, description = "Value too large or an invalid compose service name"),
+        (status = 404, description = "The secret, or a requested environment, was not found in the project"),
+        (status = 409, description = "Another secret with the same key already applies to one of the requested environments"),
         (status = 500, description = "Internal server error")
     ),
     params(

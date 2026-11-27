@@ -551,7 +551,7 @@ describe('folder deployments run one at a time', () => {
     for (const done of [first, second, third]) {
       while (releases.length === 0) await Bun.sleep(1)
       releases.shift()!()
-      order.push(await done)
+      order.push((await done) ?? 'withdrawn')
     }
     expect(order).toEqual(['first', 'second', 'third'])
     expect(most).toBe(1)
