@@ -234,7 +234,7 @@ function bracketToRegex(glob, start) {
 
 /** One literal character inside a regular expression class. */
 function classMember(char) {
-  return /[\\\]\[^-]/.test(char) ? `\\${char}` : char
+  return /[\\\][^-]/.test(char) ? `\\${char}` : char
 }
 
 /** A `.gitignore` glob as a regular expression body. */
@@ -547,7 +547,8 @@ async function localIgnore(directory, base, limits) {
   } catch (error) {
     if (error && error.code === 'ENOENT') return { rules: [], read: null }
     throw new Error(
-      `${file} could not be read (${error && error.code ? error.code : error}), so what it leaves out is unknown. Try again.`
+      `${file} could not be read (${error && error.code ? error.code : error}), so what it leaves out is unknown. Try again.`,
+      { cause: error }
     )
   }
   if (!stat.isFile()) return { rules: [], read: null }
