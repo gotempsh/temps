@@ -26,8 +26,9 @@ import { Input } from '@/components/ui/input'
 import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { canDeleteProjects } from '@/lib/instance-admin'
+import { invalidateListsAfterServiceDelete } from '@/lib/project-list-cache'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { useNavigate } from 'react-router'
@@ -209,11 +210,15 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   const role = useCurrentUserRole()
   const canDeleteProject = canDeleteProjects(role)
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
+  const queryClient = useQueryClient()
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
     meta: {
       errorTitle: 'Failed to delete service',
     },
+    // The sidebar outlives this page: refresh the lists it shows, or the
+    // deleted service stays listed there.
+    onSuccess: () => invalidateListsAfterServiceDelete(queryClient),
   })
 
   const handleDeleteProject = async () => {
