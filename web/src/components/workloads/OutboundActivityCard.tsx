@@ -10,7 +10,7 @@
  */
 import { useQuery } from '@tanstack/react-query'
 import { Activity } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 import type {
   EgressActivityRecord,
@@ -86,12 +86,14 @@ export function OutboundActivityCard({
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   // Retention can empty a later page while it is open (its last records
   // expired): go back to the last page that still has records, instead of
-  // showing nothing with no way back.
+  // showing nothing with no way back. Adjusted while rendering, not in an
+  // effect: the new page's query has no data yet, so this runs once per
+  // emptied page.
   const emptyLaterPage =
     records.data !== undefined && records.data.records.length === 0 && page > 1
-  useEffect(() => {
-    if (emptyLaterPage) setPage((current) => Math.min(current - 1, totalPages))
-  }, [emptyLaterPage, totalPages])
+  if (emptyLaterPage) {
+    setPage(Math.max(1, Math.min(page - 1, totalPages)))
+  }
 
   return (
     <Card>
