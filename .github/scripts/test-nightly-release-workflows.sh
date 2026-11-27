@@ -161,6 +161,23 @@ end
 abort "the server image can be pushed before the test gate passes" unless
   Array(release.dig("jobs", "build-and-push-docker", "needs")).include?("create-release")
 
+# crates.io trusted publishing: the token the auth step mints must reach
+# Cargo under the only name it reads for crates.io (`registry.token`).
+# CARGO_REGISTRIES_CRATES_IO_TOKEN is the alternate-registry form and is
+# ignored, which left `cargo publish` with "no token found".
+publish_steps = release.dig("jobs", "publish-sdks", "steps")
+crates_auth = publish_steps.find { |step| step.fetch("uses", "").start_with?("rust-lang/crates-io-auth-action@") }
+crate_publish = publish_steps.find { |step| step["name"] == "Publish verified Rust packages" }
+abort "crates.io publication must take its token from the trusted-publishing step" unless
+  crates_auth && crate_publish && crates_auth["id"] == "crates-auth" &&
+  publish_steps.index(crates_auth) < publish_steps.index(crate_publish) &&
+  crate_publish["env"] == {"CARGO_REGISTRY_TOKEN" => "${{ steps.crates-auth.outputs.token }}"} &&
+  crate_publish.fetch("run").include?("sdk_release.py publish --tag \"$RELEASE_TAG\" --kind crate")
+Dir.glob(File.join(repository_root, ".github/workflows/*.{yml,yaml}")).each do |path|
+  abort "#{File.basename(path)} sets CARGO_REGISTRIES_CRATES_IO_TOKEN, which Cargo ignores; use CARGO_REGISTRY_TOKEN" if
+    File.read(path).match?(/^\s*(?:-\s+)?(?:export\s+)?CARGO_REGISTRIES_CRATES[_-]IO_TOKEN\s*[:=]/i)
+end
+
 # Libraries-only tags (libraries/v*) publish SDKs and nothing of the server.
 release_on = release["on"] || release[true]
 abort "release.yml must run for libraries-only tags next to the server tags" unless
