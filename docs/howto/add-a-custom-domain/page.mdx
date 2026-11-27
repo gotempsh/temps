@@ -109,7 +109,7 @@ Wildcard certificates require DNS-01 validation, which means Temps needs API acc
    - **DigitalOcean** — API token
    - **Azure DNS** — Service principal credentials
    - **Google Cloud DNS** — Service account key
-   - **PowerDNS** — API URL (for example `http://10.0.0.5:8081`) and the server's `api-key`. Add a private API address to **Settings > Security > Trusted private networks** first. The PowerDNS API serves plain HTTP, so the key travels unencrypted: reach it only over a private network or VPN, or put a TLS reverse proxy in front and use its `https://` URL. The ACME CA must also resolve the challenge through this server, so the domain has to be delegated to it (its NS records point at PowerDNS)
+   - **PowerDNS** — API URL (for example `http://10.0.0.5:8081`) and the server's `api-key`. Add a private API address to **Settings > Security > Trusted private networks** first. The PowerDNS API serves plain HTTP, so the key travels unencrypted: reach it only over a private network or VPN, or put a TLS reverse proxy in front and use its `https://` URL. The domain must also be delegated to this server in public DNS (its NS records point at PowerDNS), because Temps waits for public resolvers to see the challenge record before validation
 
 ### Step 3: Add the wildcard domain
 
