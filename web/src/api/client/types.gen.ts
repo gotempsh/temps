@@ -10973,6 +10973,7 @@ export type CurrentStatusResponse = {
      * Seconds of the window covered by a non-operational check result.
      */
     downtime_seconds: number;
+    ip_access_block?: UptimeMonitorIpBlock | null;
     last_check_at?: string | null;
     monitor_id: number;
     /**
@@ -21585,6 +21586,11 @@ export type IpAccessControlResponse = {
 export type IpAccessMode = 'disabled' | 'allow' | 'deny';
 
 /**
+ * Where the policy that applies is stored.
+ */
+export type IpAccessPolicyScope = 'project' | 'environment';
+
+/**
  * The issues of a group.
  */
 export type IssueLinkList = {
@@ -29469,9 +29475,11 @@ export type ProjectIpAccessResponse = {
     mode: IpAccessMode;
     project_id: number;
     updated_at?: string | null;
+    uptime_monitor_block?: UptimeMonitorIpBlock | null;
     /**
      * Things the operator should know about the saved policy, such as Temps
-     * not being able to tell how visitors arrive (ADR 064 D9).
+     * not being able to tell how visitors arrive (ADR 064 D9), or the policy
+     * refusing Temps' own uptime monitor.
      */
     warnings?: Array<string>;
 };
@@ -43167,6 +43175,56 @@ export type UptimeHistoryResponse = {
      */
     truncated: boolean;
     uptime_data: Array<UptimeDataPoint>;
+};
+
+/**
+ * Why the policy refuses the monitor.
+ */
+export type UptimeMonitorBlockReason = 'not_allow_listed' | 'deny_listed' | 'unreadable';
+
+/**
+ * A saved IP access policy refuses Temps' managed uptime monitor, so the
+ * monitor sees a 403 instead of the app.
+ */
+export type UptimeMonitorIpBlock = {
+    /**
+     * The monitor addresses the policy refuses.
+     */
+    blocked_addresses: Array<string>;
+    /**
+     * The environment the evaluation was for; `null` when the project-wide
+     * list was evaluated on its own.
+     */
+    environment_id?: number | null;
+    /**
+     * For a deny list: the entries that cover a monitor address.
+     */
+    matched_cidrs: Array<string>;
+    /**
+     * One-paragraph explanation suitable for display and for a check result.
+     */
+    message: string;
+    mode: IpAccessMode;
+    /**
+     * Every address Temps' uptime monitor connects from on this server.
+     */
+    monitor_addresses: Array<string>;
+    /**
+     * Which list refuses the monitor. With `environment`, the fix belongs
+     * on `environment_id`'s own list; with `project`, on the project list.
+     */
+    policy_scope: IpAccessPolicyScope;
+    project_id: number;
+    reason: UptimeMonitorBlockReason;
+    /**
+     * For an allow list: the entries that, added to it, let the monitor
+     * through. Empty when the fix is to remove entries or save the list.
+     */
+    suggested_cidrs: Array<string>;
+    /**
+     * The description to give the suggested entries.
+     */
+    suggested_description: string;
 };
 
 /**

@@ -611,6 +611,9 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             IpAccessCidrEntry,
             IpAccessMode,
             PolicySource,
+            temps_core::uptime_monitor_ip_access::UptimeMonitorIpBlock,
+            temps_core::uptime_monitor_ip_access::IpAccessPolicyScope,
+            temps_core::uptime_monitor_ip_access::UptimeMonitorBlockReason,
         )),
         tags(
             (name = "Project IP Access", description = "Per-project and per-environment client IP allow/deny lists")

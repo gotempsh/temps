@@ -8,8 +8,11 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use temps_config::ConfigService;
+use temps_core::uptime_monitor_ip_access::{
+    monitor_source_addresses, UptimeMonitorIpAccessSlot, UptimeMonitorIpBlock,
+};
 use temps_core::{Job, JobQueue, MonitorCreatedJob, UtcDateTime};
 use temps_entities::{environments, status_checks, status_monitors};
 use tracing::{debug, warn};
@@ -272,6 +275,9 @@ pub struct MonitorService {
     db: Arc<DatabaseConnection>,
     config_service: Arc<ConfigService>,
     job_queue: Option<Arc<dyn JobQueue>>,
+    /// Tells whether the project's own IP access policy refuses the managed
+    /// monitor. Attached by the plugin; filled by the proxy plugin.
+    monitor_ip_access: OnceLock<Arc<UptimeMonitorIpAccessSlot>>,
 }
 
 /// Cut newest-first rows down to `limit`, saying whether any were left out.
@@ -288,6 +294,7 @@ impl MonitorService {
             db,
             config_service,
             job_queue: None,
+            monitor_ip_access: OnceLock::new(),
         }
     }
 
@@ -301,6 +308,48 @@ impl MonitorService {
             db,
             config_service,
             job_queue: Some(job_queue),
+            monitor_ip_access: OnceLock::new(),
+        }
+    }
+
+    /// Let the status say when the project's IP access policy refuses the
+    /// managed monitor. Later calls are ignored.
+    pub fn attach_monitor_ip_access(&self, slot: Arc<UptimeMonitorIpAccessSlot>) {
+        let _ = self.monitor_ip_access.set(slot);
+    }
+
+    /// Whether the policy governing `monitor`'s environment refuses any
+    /// address Temps' monitor connects from on this server. Only a managed
+    /// environment monitor goes through the local proxy, so only it can be
+    /// refused this way. A policy that cannot be read is logged and reported
+    /// as no block: the status itself still loads.
+    async fn ip_access_block(
+        &self,
+        monitor: &status_monitors::Model,
+    ) -> Option<UptimeMonitorIpBlock> {
+        if !monitor.is_managed
+            || super::checks::MonitorCheckKind::from_stored(&monitor.check_kind)
+                != super::checks::MonitorCheckKind::Environment
+        {
+            return None;
+        }
+        let environment_id = monitor.environment_id?;
+        let access = self.monitor_ip_access.get()?.get()?;
+        let server = self.config_service.get_server_config();
+        let addresses = monitor_source_addresses(&server.address, server.tls_address.as_deref());
+        match access
+            .monitor_block(monitor.project_id, environment_id, &addresses)
+            .await
+        {
+            Ok(block) => block,
+            Err(error) => {
+                warn!(
+                    monitor_id = monitor.id,
+                    %error,
+                    "Could not tell whether the IP access policy refuses the monitor"
+                );
+                None
+            }
         }
     }
 
@@ -1577,6 +1626,13 @@ impl MonitorService {
         let current_status = stats
             .last_check_status
             .unwrap_or_else(|| "unknown".to_string());
+        // Asked only while the monitor is not operational: a refused
+        // monitor never is, and a healthy one costs no lookup.
+        let ip_access_block = if current_status == "operational" {
+            None
+        } else {
+            self.ip_access_block(&monitor).await
+        };
 
         let decimal_to_f64 = |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
 
@@ -1589,6 +1645,7 @@ impl MonitorService {
             monitored_seconds: coverage.monitored_secs.round() as i64,
             downtime_seconds: coverage.downtime_secs().round() as i64,
             unknown_seconds: coverage.unknown_secs().round() as i64,
+            ip_access_block,
         })
     }
 }

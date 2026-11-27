@@ -157,7 +157,27 @@ impl TempsPlugin for ProxyPlugin {
 
             // Per-project / per-environment IP allow/deny lists (management
             // side; enforcement is the gate installed in the proxy slot).
-            let project_ip_access_service = Arc::new(ProjectIpAccessService::new(db.clone()));
+            // Every policy is also checked against the addresses Temps' own
+            // uptime monitor connects from, so a list that refuses it says so
+            // instead of the monitor reporting a bare 403.
+            let monitor_addresses = server_config
+                .as_ref()
+                .map(|config| {
+                    temps_core::uptime_monitor_ip_access::monitor_source_addresses(
+                        &config.address,
+                        config.tls_address.as_deref(),
+                    )
+                })
+                .unwrap_or_default();
+            let project_ip_access_service = Arc::new(
+                ProjectIpAccessService::new(db.clone()).with_monitor_addresses(monitor_addresses),
+            );
+            // The status page registers before this plugin and reads the
+            // slot when a managed check is refused.
+            temps_core::uptime_monitor_ip_access::UptimeMonitorIpAccessSlot::get_or_register(
+                context,
+            )
+            .set(project_ip_access_service.clone());
 
             // Project edge rules (ADR-089), management side; the proxy's
             // EdgeRuleGate picks writes up from the change feed.

@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
+use temps_core::uptime_monitor_ip_access::{IpAccessPolicyScope, UptimeMonitorIpBlock};
 use temps_core::ways_in::{private_allow_list_message, AddressWayIn, EnvironmentWaysIn};
 use temps_entities::project_ip_access_rules::{self, IpAccessCidrEntry, IpAccessCidrs};
 use temps_entities::{environments, projects};
@@ -189,9 +190,15 @@ pub struct ProjectIpAccessResponse {
     #[schema(value_type = Option<String>, format = "date-time", example = "2026-10-13T09:30:00Z")]
     pub updated_at: Option<DateTime<Utc>>,
     /// Things the operator should know about the saved policy, such as Temps
-    /// not being able to tell how visitors arrive (ADR 064 D9).
+    /// not being able to tell how visitors arrive (ADR 064 D9), or the policy
+    /// refusing Temps' own uptime monitor.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Set when the policy that governs this scope (for an environment
+    /// without a list of its own, the project's) refuses Temps' managed
+    /// uptime monitor, with the entries that would let it through.
+    #[serde(default)]
+    pub uptime_monitor_block: Option<UptimeMonitorIpBlock>,
 }
 
 impl ProjectIpAccessResponse {
@@ -205,6 +212,7 @@ impl ProjectIpAccessResponse {
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: None,
             warnings: Vec::new(),
+            uptime_monitor_block: None,
         }
     }
 }
@@ -222,6 +230,7 @@ impl From<project_ip_access_rules::Model> for ProjectIpAccessResponse {
             max_cidrs: MAX_CIDRS_PER_POLICY,
             updated_at: Some(model.updated_at),
             warnings: Vec::new(),
+            uptime_monitor_block: None,
         }
     }
 }
@@ -372,7 +381,9 @@ fn evaluate(
 
 /// Pair each stored entry with its parsed network, dropping any entry that no
 /// longer parses (the gate skips those too), so indexes stay aligned.
-fn aligned_policy(stored: Vec<IpAccessCidrEntry>) -> (Vec<IpAccessCidrEntry>, Vec<IpNetwork>) {
+pub(crate) fn aligned_policy(
+    stored: Vec<IpAccessCidrEntry>,
+) -> (Vec<IpAccessCidrEntry>, Vec<IpNetwork>) {
     stored
         .into_iter()
         .filter_map(|entry| parse_cidr(&entry.cidr).ok().map(|network| (entry, network)))
@@ -381,7 +392,7 @@ fn aligned_policy(stored: Vec<IpAccessCidrEntry>) -> (Vec<IpAccessCidrEntry>, Ve
 
 /// The verdict through the production matcher, so the test endpoint cannot
 /// drift from what the proxy does.
-fn evaluate_with_set(mode: IpAccessMode, networks: &[IpNetwork], ip: IpAddr) -> bool {
+pub(crate) fn evaluate_with_set(mode: IpAccessMode, networks: &[IpNetwork], ip: IpAddr) -> bool {
     let set = CidrSet::from_networks(networks);
     match mode {
         IpAccessMode::Disabled => true,
@@ -424,6 +435,10 @@ pub struct ProjectIpAccessService {
     /// How visitors reach each address, for the D9 check. Attached once the
     /// ingress plugin has registered it; without it the check is skipped.
     ways_in: OnceLock<Arc<dyn EnvironmentWaysIn>>,
+    /// The addresses Temps' managed uptime monitor connects from on this
+    /// server, from the configured proxy listeners. Empty when they are not
+    /// known, which skips the monitor check.
+    monitor_addresses: Vec<IpAddr>,
 }
 
 impl ProjectIpAccessService {
@@ -431,7 +446,60 @@ impl ProjectIpAccessService {
         Self {
             db,
             ways_in: OnceLock::new(),
+            monitor_addresses: Vec::new(),
         }
+    }
+
+    /// Check every policy against the addresses Temps' uptime monitor
+    /// connects from (see
+    /// [`temps_core::uptime_monitor_ip_access::monitor_source_addresses`]).
+    pub fn with_monitor_addresses(mut self, addresses: Vec<IpAddr>) -> Self {
+        self.monitor_addresses = addresses;
+        self
+    }
+
+    /// Record on `response` whether `governing` (the policy in force for the
+    /// scope, and where it is stored) refuses the uptime monitor.
+    fn attach_monitor_block(
+        &self,
+        response: &mut ProjectIpAccessResponse,
+        project_id: i32,
+        environment_id: Option<i32>,
+        governing: Option<(IpAccessPolicyScope, &project_ip_access_rules::Model)>,
+    ) {
+        let Some((scope, row)) = governing else {
+            return;
+        };
+        let block = super::uptime_monitor_ip_access::evaluate_monitor_access(
+            project_id,
+            environment_id,
+            scope,
+            &row.mode,
+            row.cidrs.0.clone(),
+            &self.monitor_addresses,
+        );
+        if let Some(block) = block {
+            response.warnings.push(block.message.clone());
+            response.uptime_monitor_block = Some(block);
+        }
+    }
+
+    /// The policy in force for a scope and where it is stored: an
+    /// environment's own list, else the project's (replace, not merge).
+    pub(crate) async fn governing_policy(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+    ) -> Result<Option<(IpAccessPolicyScope, project_ip_access_rules::Model)>, sea_orm::DbErr> {
+        if environment_id.is_some() {
+            if let Some(row) = self.find_row(project_id, environment_id).await? {
+                return Ok(Some((IpAccessPolicyScope::Environment, row)));
+            }
+        }
+        Ok(self
+            .find_row(project_id, None)
+            .await?
+            .map(|row| (IpAccessPolicyScope::Project, row)))
     }
 
     /// Lets `set` check an allow list against how visitors arrive (ADR 064
@@ -545,10 +613,29 @@ impl ProjectIpAccessService {
         environment_id: Option<i32>,
     ) -> Result<ProjectIpAccessResponse, ProjectIpAccessError> {
         self.ensure_scope_exists(project_id, environment_id).await?;
-        Ok(match self.find_row(project_id, environment_id).await? {
-            Some(row) => ProjectIpAccessResponse::from(row),
+        let own = self.find_row(project_id, environment_id).await?;
+        let mut response = match &own {
+            Some(row) => ProjectIpAccessResponse::from(row.clone()),
             None => ProjectIpAccessResponse::unconfigured(project_id, environment_id),
-        })
+        };
+        if self.monitor_addresses.is_empty() {
+            return Ok(response);
+        }
+        // An environment without a list of its own is governed by the
+        // project's, so that is the list that may refuse its monitor.
+        let inherited = match (&own, environment_id) {
+            (None, Some(_)) => self.find_row(project_id, None).await?,
+            _ => None,
+        };
+        let governing = match (&own, environment_id) {
+            (Some(row), Some(_)) => Some((IpAccessPolicyScope::Environment, row)),
+            (Some(row), None) => Some((IpAccessPolicyScope::Project, row)),
+            (None, _) => inherited
+                .as_ref()
+                .map(|row| (IpAccessPolicyScope::Project, row)),
+        };
+        self.attach_monitor_block(&mut response, project_id, environment_id, governing);
+        Ok(response)
     }
 
     /// Validate and store the complete policy for one scope.
@@ -620,8 +707,19 @@ impl ProjectIpAccessService {
             other => other,
         })?;
 
-        let mut response = ProjectIpAccessResponse::from(saved);
+        let scope_of_saved = if environment_id.is_some() {
+            IpAccessPolicyScope::Environment
+        } else {
+            IpAccessPolicyScope::Project
+        };
+        let mut response = ProjectIpAccessResponse::from(saved.clone());
         response.warnings = warnings;
+        self.attach_monitor_block(
+            &mut response,
+            project_id,
+            environment_id,
+            Some((scope_of_saved, &saved)),
+        );
         Ok(response)
     }
 

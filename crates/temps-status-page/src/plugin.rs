@@ -266,6 +266,13 @@ impl TempsPlugin for StatusPagePlugin {
             ));
             context.register_service(status_page_service.clone());
             let monitor_service = status_page_service.monitor_service_arc();
+            // Filled by the proxy plugin, which owns IP access policies and
+            // registers after this one.
+            let monitor_ip_access =
+                temps_core::uptime_monitor_ip_access::UptimeMonitorIpAccessSlot::get_or_register(
+                    context,
+                );
+            monitor_service.attach_monitor_ip_access(monitor_ip_access.clone());
 
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection
@@ -294,7 +301,8 @@ impl TempsPlugin for StatusPagePlugin {
             .map_err(|error| PluginError::PluginRegistrationFailed {
                 plugin_name: "status-page".to_string(),
                 error: error.to_string(),
-            })?;
+            })?
+            .with_monitor_ip_access(monitor_ip_access);
             // ADR 068 D4: probe each environment's primary address.
             if let Some(slot) =
                 context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>()
