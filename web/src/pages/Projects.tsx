@@ -22,7 +22,7 @@ import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
-import { useQuery } from '@tanstack/react-query'
+import { useQueries, type UseQueryResult } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import {
   AlertTriangle,
@@ -40,10 +40,14 @@ import {
 } from '@/components/imports/migration-sources'
 import { CreateProjectGroupDialog } from '@/components/project-groups/CreateProjectGroupDialog'
 import { ProjectGroupCard } from '@/components/project-groups/ProjectGroupCard'
-import { projectListItems } from '@/components/project-groups/project-list-items'
+import { projectListItemsPage } from '@/components/project-groups/project-list-items'
 import { useProjectGroups } from '@/components/project-groups/useProjectGroups'
 import { groupServiceLive } from '@/components/project-groups/group-service-live'
-import type { ProjectGroupResponse, ProjectResponse } from '@/api/client'
+import type {
+  PaginatedProjectList,
+  ProjectGroupResponse,
+  ProjectResponse,
+} from '@/api/client'
 import {
   PROJECT_PAGE_SIZE_OPTIONS,
   projectPageCount,
@@ -52,6 +56,7 @@ import {
   withProjectPagination,
   withProjectSearch,
 } from '@/lib/project-list-pagination'
+import { serviceWindow } from '@/lib/project-list-page'
 import { serviceCount } from '@/lib/terminology'
 import { welcomeProjectCount } from '@/components/welcome/onboarding'
 import { useWelcomeRedirect } from '@/components/welcome/useWelcomeRedirect'
@@ -108,9 +113,27 @@ export function Projects() {
     [groups]
   )
   // With at least one project (group), its services show inside its card
-  // and only the rest are listed (and paged) on their own.
+  // and only the rest are listed on their own.
   const grouped = groupsLoaded && groups.length > 0
 
+  // The server filters services; projects are filtered here by their own
+  // name or any of their services' names.
+  const visibleGroups = useMemo(
+    () =>
+      visibleAllGroups.filter(
+        (group) =>
+          !normalizedProjectSearch ||
+          groupMatches(group, normalizedProjectSearch)
+      ),
+    [normalizedProjectSearch, visibleAllGroups]
+  )
+  // Projects and services are paged together, `pageSize` cards a page: the
+  // services that can land on this page are read (see serviceWindow).
+  const pageGroups = useMemo(
+    () => (grouped ? visibleGroups : []),
+    [grouped, visibleGroups]
+  )
+  const servicesWindow = serviceWindow(page, pageSize, pageGroups.length)
   const {
     data: rawProjectsData,
     isLoading: servicesLoading,
@@ -118,22 +141,25 @@ export function Projects() {
     error: servicesError,
     isFetching,
     refetch,
-  } = useQuery({
-    ...getProjectsOptions({
-      query: {
-        page,
-        per_page: pageSize,
-        search: normalizedProjectSearch || undefined,
-        ungrouped: grouped ? true : undefined,
-      },
-    }),
-    // Which list to ask for depends on the groups: wait for them rather than
-    // render one layout and swap it for another. If they fail, every
-    // service is listed, with the failure said above it. Once they have
-    // failed a first time they are being retried, so the list is asked for
-    // alongside the retries instead of after them: the two outages are one
-    // wait, not two.
-    enabled: !groupsQuery.isLoading || groupsQuery.failureCount > 0,
+  } = useQueries({
+    queries: servicesWindow.pages.map((servicePage) => ({
+      ...getProjectsOptions({
+        query: {
+          page: servicePage,
+          per_page: servicesWindow.perPage,
+          search: normalizedProjectSearch || undefined,
+          ungrouped: grouped ? true : undefined,
+        },
+      }),
+      // Which list to ask for depends on the groups: wait for them rather
+      // than render one layout and swap it for another. If they fail, every
+      // service is listed, with the failure said above it. Once they have
+      // failed a first time they are being retried, so the list is asked
+      // for alongside the retries instead of after them: the two outages
+      // are one wait, not two.
+      enabled: !groupsQuery.isLoading || groupsQuery.failureCount > 0,
+    })),
+    combine: combineServicePages,
   })
 
   // TEMP: force an empty (brand-new install) dashboard while iterating on the
@@ -155,8 +181,13 @@ export function Projects() {
       }
     )
   )
-  const totalPages = projectPageCount(standaloneTotal, pageSize)
-  const isPageOutOfRange = Boolean(standaloneTotal) && page > totalPages
+  // Every card: the projects shown and the services in none.
+  const itemTotal = pageGroups.length + standaloneTotal
+  const totalPages = projectPageCount(itemTotal, pageSize)
+  // Only known once the services have answered: before, the projects alone
+  // would put a later page out of range.
+  const isPageOutOfRange =
+    projectsData !== undefined && itemTotal > 0 && page > totalPages
 
   const setPagination = useCallback(
     (nextPage: number, nextPageSize = pageSize, replace = false) => {
@@ -197,29 +228,23 @@ export function Projects() {
     markReadFailureHandled(servicesFailure)
   }, [servicesFailure])
 
-  // The server filters services; projects are filtered here by their own
-  // name or any of their services' names.
-  const visibleGroups = useMemo(
-    () =>
-      visibleAllGroups.filter(
-        (group) =>
-          !normalizedProjectSearch ||
-          groupMatches(group, normalizedProjectSearch)
-      ),
-    [normalizedProjectSearch, visibleAllGroups]
-  )
-  const standaloneProjects = useMemo(
-    () => projectsData?.projects ?? [],
-    [projectsData?.projects]
-  )
-  // Projects sit on the first page, ordered among its services.
+  const windowOffset = servicesWindow.offset
   const listItems = useMemo(
     () =>
-      projectListItems(
-        grouped && page === 1 ? visibleGroups : [],
-        standaloneProjects
+      projectListItemsPage(pageGroups, projectsData?.projects ?? [], {
+        offset: windowOffset,
+        page,
+        pageSize,
+      }),
+    [pageGroups, projectsData?.projects, windowOffset, page, pageSize]
+  )
+  // The services on this page with a card of their own.
+  const standaloneProjects = useMemo(
+    () =>
+      listItems.flatMap((item) =>
+        item.kind === 'service' ? [item.project] : []
       ),
-    [grouped, page, standaloneProjects, visibleGroups]
+    [listItems]
   )
 
   const memberTotal = useMemo(
@@ -255,8 +280,10 @@ export function Projects() {
   // so a project card shows each service's health and traffic too.
   const shownGroupMembers = useMemo(
     () =>
-      grouped && page === 1 ? visibleGroups.flatMap((g) => g.projects) : [],
-    [grouped, page, visibleGroups]
+      listItems.flatMap((item) =>
+        item.kind === 'group' ? item.group.projects : []
+      ),
+    [listItems]
   )
 
   const projectIds = useMemo(
@@ -513,18 +540,18 @@ export function Projects() {
         </>
       )}
 
-      {/* Pagination of the services listed on their own. */}
+      {/* Projects and services are paged together. */}
       {projectsData &&
-        showsProjectPagination(standaloneTotal, page) &&
+        showsProjectPagination(itemTotal, page) &&
         !isPageOutOfRange && (
           <ResponsivePagination
             page={page}
             pageSize={pageSize}
-            total={standaloneTotal}
+            total={itemTotal}
             totalPages={totalPages}
             pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
-            ariaLabel="Service list pagination"
-            pageSizeAriaLabel="Services per page"
+            ariaLabel="Projects and services pagination"
+            pageSizeAriaLabel="Projects and services per page"
             className="pt-2"
             onPageChange={(nextPage) => setPagination(nextPage)}
             onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
@@ -532,6 +559,28 @@ export function Projects() {
         )}
     </PageContainer>
   )
+}
+
+/**
+ * The pages of services one page of the list read, as one answer: their
+ * services in order and the server's total, once every page has answered.
+ */
+function combineServicePages(results: UseQueryResult<PaginatedProjectList>[]) {
+  const pages = results.map((result) => result.data)
+  const data = pages.every((page) => page !== undefined)
+    ? {
+        projects: pages.flatMap((page) => page?.projects ?? []),
+        total: pages[0]?.total ?? 0,
+      }
+    : undefined
+  return {
+    data,
+    isLoading: results.some((result) => result.isLoading),
+    isError: results.some((result) => result.isError),
+    error: results.find((result) => result.error)?.error ?? null,
+    isFetching: results.some((result) => result.isFetching),
+    refetch: () => Promise.all(results.map((result) => result.refetch())),
+  }
 }
 
 function listSummary({
