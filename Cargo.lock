@@ -14866,7 +14866,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-protocol"
-version = "0.1.0-beta.64"
+version = "0.1.0-beta.65"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -14878,7 +14878,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-sdk"
-version = "0.1.0-beta.64"
+version = "0.1.0-beta.65"
 dependencies = [
  "axum",
  "chrono",
@@ -16049,7 +16049,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workflows-sdk"
-version = "0.1.0-beta.64"
+version = "0.1.0-beta.65"
 dependencies = [
  "async-trait",
  "axum",
