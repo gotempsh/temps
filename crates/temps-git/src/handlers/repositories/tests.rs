@@ -557,8 +557,8 @@ mod branch_lookup_handler_tests {
             ]
         };
         for step in [
-            super::super::BranchLookupStep::ReadBranch,
-            super::super::BranchLookupStep::ConfirmRepository,
+            crate::services::git_provider_manager::BranchLookupStep::ReadBranch,
+            crate::services::git_provider_manager::BranchLookupStep::ConfirmRepository,
         ] {
             for error in variants() {
                 let label = format!("{error:?}");

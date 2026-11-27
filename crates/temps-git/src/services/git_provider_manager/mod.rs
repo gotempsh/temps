@@ -25,6 +25,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+mod branch_lookup;
 mod connections;
 mod credentials;
 mod error;
@@ -48,6 +49,7 @@ mod tokens;
 mod types;
 mod validation;
 
+pub use branch_lookup::{BranchLookupError, BranchLookupOutcome, BranchLookupStep};
 pub use credentials::{CredentialsUpdated, ProviderCredentialsUpdate};
 pub use error::GitProviderManagerError;
 pub(crate) use git_push::CommitCancellation;

@@ -17,6 +17,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use crate::services::{
     cache::CommitCacheKey,
     git_provider::{BranchList, Commit, GitProviderError},
+    git_provider_manager::{BranchLookupError, BranchLookupOutcome, BranchLookupStep},
 };
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -350,125 +351,34 @@ pub async fn get_repository_branch(
                 .build()
         })?;
 
-    let repository = state
+    match state
         .git_provider_manager
-        .get_repository_by_owner_and_name_in_connection(&owner, &repo, params.connection_id)
-        .await?;
-
-    let connection_id = params.connection_id;
-
-    let connection = state
-        .git_provider_manager
-        .get_connection(connection_id)
+        .look_up_branch(params.connection_id, &owner, &repo, &branch_name)
         .await
-        .map_err(|e| {
-            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .title("Failed to get git provider connection")
-                .detail(format!("Error: {}", e))
-                .build()
-        })?;
-
-    let provider_service = state
-        .git_provider_manager
-        .get_provider_service(connection.provider_id)
-        .await?;
-
-    let access_token = state
-        .git_provider_manager
-        .get_connection_token(connection_id)
-        .await?;
-
-    let found = provider_service
-        .get_branch(&access_token, &owner, &repo, &branch_name)
-        .await;
-
-    match found {
-        Ok(Some(branch)) => {
-            // Report is_default from the provider's live default branch, as
-            // the list handler does, falling back to our DB-synced copy when
-            // the provider cannot be reached for it.
-            let default_branch = match provider_service
-                .get_repository(&access_token, &owner, &repo)
-                .await
-            {
-                Ok(info) => info.default_branch,
-                Err(_) => repository.default_branch.clone(),
-            };
-            Ok(Json(BranchInfo {
-                is_default: branch.name == default_branch,
-                name: branch.name,
-                commit_sha: branch.commit_sha,
-                protected: branch.protected,
-            }))
-        }
-        Ok(None) => {
-            // A 404 for the branch is only proof of absence if the connection
-            // can still read the repository: GitHub, GitLab, Gitea and
-            // Bitbucket all answer 404 for a private repository the
-            // credential cannot see (a fine-grained token whose repository
-            // selection no longer includes it, a revoked membership), and the
-            // token check passes regardless.
-            match provider_service
-                .get_repository(&access_token, &owner, &repo)
-                .await
-            {
-                Ok(_) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                    .title("Branch Not Found")
-                    .detail(format!(
-                        "Repository {}/{} has no branch named '{}'.",
-                        owner, repo, branch_name
-                    ))
-                    .value("branch", branch_name)
-                    .build()),
-                Err(error) => {
-                    warn!(
-                        repository_id = repository.id,
-                        connection_id,
-                        owner = %owner,
-                        repository = %repo,
-                        branch = %branch_name,
-                        error = %error,
-                        "Branch not found, and the repository could not be read to confirm it"
-                    );
-                    Err(branch_lookup_problem(
-                        error,
-                        BranchLookupStep::ConfirmRepository,
-                        &owner,
-                        &repo,
-                        &branch_name,
-                    ))
-                }
-            }
-        }
-        Err(error) => {
-            warn!(
-                repository_id = repository.id,
-                connection_id,
-                owner = %owner,
-                repository = %repo,
-                branch = %branch_name,
-                error = %error,
-                "Git provider branch lookup failed"
-            );
-            Err(branch_lookup_problem(
-                error,
-                BranchLookupStep::ReadBranch,
-                &owner,
-                &repo,
-                &branch_name,
+    {
+        Ok(BranchLookupOutcome::Found { branch, is_default }) => Ok(Json(BranchInfo {
+            is_default,
+            name: branch.name,
+            commit_sha: branch.commit_sha,
+            protected: branch.protected,
+        })),
+        Ok(BranchLookupOutcome::Missing) => Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .title("Branch Not Found")
+            .detail(format!(
+                "Repository {}/{} has no branch named '{}'.",
+                owner, repo, branch_name
             ))
-        }
+            .value("branch", branch_name)
+            .build()),
+        Err(BranchLookupError::Connection { source, .. }) => Err((*source).into()),
+        Err(BranchLookupError::Provider { step, source, .. }) => Err(branch_lookup_problem(
+            *source,
+            step,
+            &owner,
+            &repo,
+            &branch_name,
+        )),
     }
-}
-
-/// Which provider request of a branch lookup failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BranchLookupStep {
-    /// Reading the branch itself.
-    ReadBranch,
-    /// Reading the repository after the branch came back 404, to tell a
-    /// missing branch from a repository the connection cannot see.
-    ConfirmRepository,
 }
 
 /// The response for a branch lookup the provider did not answer.
