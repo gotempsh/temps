@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::Serialize;
 use temps_auth::permissions::Role;
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 
@@ -158,6 +158,7 @@ pub async fn list_project_access(
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
     // Who a project is shared with is part of that project's data: a user
     // with no access to it must not be able to enumerate its teams.
     let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(state.checker.clone());
@@ -192,6 +193,7 @@ pub async fn grant_project_access(
     Json(req): Json<CreateProjectAccessRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
     // Without this, a user gated out of a project could still hand their
     // own team access to it — writing themselves back in.
     let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(state.checker.clone());
@@ -243,6 +245,7 @@ pub async fn get_project_access(
     Path((project_id, team_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
     let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(state.checker.clone());
     project_access_guard!(auth, project_id, checker);
     let grant = state
@@ -278,6 +281,7 @@ pub async fn update_project_access(
     Json(req): Json<UpdateProjectAccessRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
     let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(state.checker.clone());
     project_access_guard!(auth, project_id, checker);
     let authz = grant_authz(&auth);
@@ -323,6 +327,7 @@ pub async fn revoke_project_access(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
     let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> = Some(state.checker.clone());
     project_access_guard!(auth, project_id, checker);
     let authz = grant_authz(&auth);
@@ -382,6 +387,140 @@ mod tests {
             assert!(
                 grant_authz(&auth).is_instance_admin,
                 "{role:?} is an instance administrator"
+            );
+        }
+    }
+
+    struct NoAudit;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Ok(())
+        }
+    }
+
+    struct AllowSensitive;
+
+    #[async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowSensitive {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
+    /// No query results: a handler that reached the database would fail on
+    /// it, so a 403 here can only come from the guard.
+    fn state() -> Arc<TeamsAppState> {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        Arc::new(TeamsAppState::new(
+            Arc::new(crate::service::DefaultTeamService::new(db.clone())),
+            Arc::new(NoAudit),
+            Arc::new(crate::checker::TeamProjectAccessChecker::new(db)),
+            Arc::new(AllowSensitive),
+        ))
+    }
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".into(),
+            user_agent: "test".into(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".into(),
+            scheme: "http".into(),
+            host: "localhost".into(),
+            is_secure: false,
+        }
+    }
+
+    /// A deployment token never reaches another project's grants. Today the
+    /// permission check refuses it first (deployment tokens do not map to
+    /// `ProjectsRead`/`ProjectsWrite`); the project scope guard behind it
+    /// keeps the refusal if that mapping ever changes.
+    #[tokio::test]
+    async fn a_deployment_token_cannot_touch_another_projects_grants() {
+        use temps_entities::TeamRole;
+        let token = || {
+            AuthContext::new_deployment_token(
+                1,
+                None,
+                None,
+                9,
+                "deploy".into(),
+                vec![temps_entities::deployment_tokens::DeploymentTokenPermission::FullAccess],
+            )
+        };
+        let other = 2;
+        let statuses = [
+            list_project_access(RequireAuth(token()), State(state()), Path(other))
+                .await
+                .map(|_| ())
+                .expect_err("list"),
+            grant_project_access(
+                RequireAuth(token()),
+                State(state()),
+                Path(other),
+                Extension(metadata()),
+                Json(CreateProjectAccessRequest {
+                    team_id: 3,
+                    role: TeamRole::Viewer,
+                }),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("grant"),
+            get_project_access(RequireAuth(token()), State(state()), Path((other, 3)))
+                .await
+                .map(|_| ())
+                .expect_err("get"),
+            update_project_access(
+                RequireAuth(token()),
+                State(state()),
+                Path((other, 3)),
+                Extension(metadata()),
+                Json(UpdateProjectAccessRequest {
+                    role: TeamRole::Viewer,
+                }),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("update"),
+            revoke_project_access(
+                RequireAuth(token()),
+                State(state()),
+                Path((other, 3)),
+                Extension(metadata()),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("revoke"),
+        ];
+        for problem in statuses {
+            assert_eq!(problem.status_code, axum::http::StatusCode::FORBIDDEN);
+            let kind = problem.body.get("type").and_then(|v| v.as_str());
+            assert!(
+                matches!(
+                    kind,
+                    Some(
+                        "https://temps.sh/probs/insufficient-permissions"
+                            | "https://temps.sh/probs/cross-project-access-denied"
+                    )
+                ),
+                "{kind:?}"
             );
         }
     }
