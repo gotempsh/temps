@@ -993,6 +993,16 @@ jobs:
           cp artifacts/runtime-image-manifest/runtime-images.json release/
           ls -lh release/
 
+      # Claude Desktop extension (packages/temps-mcpb). Plain `zip` of an
+      # explicit file list: no third-party packer runs in this job, which
+      # holds contents:write and the signing identity. The manifest itself is
+      # validated by the Release Workflow Contracts job in rust-tests.yml.
+      - name: Build Claude Desktop extension
+        run: |
+          bash packages/temps-mcpb/pack.sh
+          cp packages/temps-mcpb/dist/temps.mcpb release/temps.mcpb
+          (cd release && sha256sum temps.mcpb > temps.mcpb.sha256)
+
       - name: Create combined checksums file
         run: |
           cd release
@@ -1000,6 +1010,7 @@ jobs:
             cat temps-linux-amd64.tar.gz.sha256 temps-linux-arm64.tar.gz.sha256 \
               temps-darwin-amd64.tar.gz.sha256 temps-darwin-arm64.tar.gz.sha256
             sha256sum runtime-images.json
+            cat temps.mcpb.sha256
           } > checksums.txt
           echo "Combined checksums:"
           cat checksums.txt
@@ -1046,6 +1057,7 @@ jobs:
           subject-path: |
             release/temps-*.tar.gz
             release/runtime-images.json
+            release/temps.mcpb
 
       - name: Attest SBOM for release tarballs
         if: inputs.dry_run != true
@@ -1357,6 +1369,8 @@ jobs:
             release/temps-*.tar.gz.sigstore.json
             release/checksums.txt
             release/runtime-images.json
+            release/temps.mcpb
+            release/temps.mcpb.sha256
             release/install.sh
             release/temps.rb
             release/CHANGELOG.md

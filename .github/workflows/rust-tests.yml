@@ -250,6 +250,24 @@ jobs:
       - name: Verify source attribution headers
         run: python3 scripts/source_attribution.py check
 
+      # The Claude Desktop extension (packages/temps-mcpb) is a release asset:
+      # release.yml zips it with pack.sh. Steps here rather than a job: they
+      # reuse this checkout, and the manifest validator (a third-party npm
+      # package) runs without any write permission.
+      - name: Install Bun for the Claude Desktop extension
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+          no-cache: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Test, validate and pack the Claude Desktop extension
+        working-directory: packages/temps-mcpb
+        run: |
+          bun test
+          bun run validate
+          bash pack.sh
+          unzip -l dist/temps.mcpb
+
   otel-protobuf-compat:
     name: OTEL protobuf compatibility (Ubuntu 22.04)
     needs: changes
