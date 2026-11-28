@@ -25,6 +25,7 @@ import {
   updateBackupScheduleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { UpdateBackupScheduleRequest } from '@/api/client/types.gen'
+import { BackupCoverageOptions } from '@/components/backups/BackupCoverageOptions'
 import { ScheduleServicesSelector } from '@/components/backups/ScheduleServicesSelector'
 import { Button } from '@/components/ui/button'
 import {
@@ -41,9 +42,14 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
 import { isVerifiedNotFound } from '@/lib/read-failure'
-import { Switch } from '@/components/ui/switch'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  type BackupCoverageMode,
+  coverageError,
+  coverageModeOf,
+  coverageRequest,
+} from '@/lib/backup-coverage'
 import { scheduleOptions } from '@/lib/schedule-options'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
@@ -89,10 +95,12 @@ export function EditBackupSchedule() {
   )
   const [customCron, setCustomCron] = useState('')
   // Backup targets: 'all' covers every DB (including future ones);
-  // 'specific' uses the explicit selection below.
-  const [backupMode, setBackupMode] = useState<'all' | 'specific'>('all')
+  // 'specific' uses the explicit selection below; 'control_plane' backs up
+  // only Temps's own database.
+  const [backupMode, setBackupMode] = useState<BackupCoverageMode>('all')
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>([])
   const [includeControlPlane, setIncludeControlPlane] = useState(true)
+  const [coverageMessage, setCoverageMessage] = useState<string>()
   const [seeded, setSeeded] = useState(false)
 
   // Load the current explicit membership so we can diff it on save.
@@ -124,10 +132,13 @@ export function EditBackupSchedule() {
   }
 
   // Once we know the current explicit list, seed the picker with it. We
-  // only do this the first time the list arrives so user edits stick.
+  // only do this the first time the list arrives so user edits stick. The
+  // list also tells a control-plane-only schedule (no databases attached)
+  // from one with specific databases.
   const [seededServices, setSeededServices] = useState(false)
-  if (!seededServices && attachedServices) {
+  if (!seededServices && attachedServices && schedule) {
     setSelectedServiceIds(attachedServices.map((s) => s.id))
+    setBackupMode(coverageModeOf(schedule, attachedServices.length))
     setSeededServices(true)
   }
 
@@ -228,32 +239,43 @@ export function EditBackupSchedule() {
       body.max_runtime_secs = newMaxSecs
     }
 
-    const desiredAll = backupMode === 'all'
-    if (desiredAll !== schedule.target_all_services) {
-      body.target_all_services = desiredAll
-    }
-    if (includeControlPlane !== schedule.include_control_plane) {
-      body.include_control_plane = includeControlPlane
+    // Only a schedule that would back up nothing is refused: no databases
+    // and no control plane. Control plane alone is a valid schedule.
+    const invalidCoverage = coverageError(
+      backupMode,
+      selectedServiceIds,
+      includeControlPlane
+    )
+    if (invalidCoverage) {
+      setCoverageMessage(invalidCoverage)
+      document.getElementById('edit-schedule-services')?.focus()
+      return
     }
 
-    if (backupMode === 'specific') {
+    const coverage = coverageRequest(
+      backupMode,
+      selectedServiceIds,
+      includeControlPlane
+    )
+    if (coverage.target_all_services !== schedule.target_all_services) {
+      body.target_all_services = coverage.target_all_services
+    }
+    if (coverage.include_control_plane !== schedule.include_control_plane) {
+      body.include_control_plane = coverage.include_control_plane
+    }
+
+    if (!coverage.target_all_services) {
       const currentIds = new Set(
         (attachedServices ?? []).map((service) => service.id)
       )
       const selectionChanged =
-        currentIds.size !== selectedServiceIds.length ||
-        selectedServiceIds.some((serviceId) => !currentIds.has(serviceId))
+        currentIds.size !== coverage.service_ids.length ||
+        coverage.service_ids.some((serviceId) => !currentIds.has(serviceId))
       if (selectionChanged || schedule.target_all_services) {
-        body.service_ids = selectedServiceIds
+        body.service_ids = coverage.service_ids
       }
     }
 
-    if (backupMode === 'specific' && selectedServiceIds.length === 0) {
-      toast.error(
-        'Select at least one database, or switch back to "All databases."'
-      )
-      return
-    }
     mutation.mutate({ path: { id: scheduleIdNum! }, body })
   }
 
@@ -387,76 +409,31 @@ export function EditBackupSchedule() {
                 )}
               </div>
 
-              <div className="grid gap-2">
-                <Label>Backup targets</Label>
-                <RadioGroup
-                  value={backupMode}
-                  onValueChange={(v) => setBackupMode(v as 'all' | 'specific')}
-                  className="gap-4"
-                >
-                  <div className="flex items-start space-x-3 space-y-0">
-                    <RadioGroupItem value="all" id="edit-mode-all" />
-                    <div className="grid gap-1 leading-none">
-                      <Label
-                        htmlFor="edit-mode-all"
-                        className="text-sm font-medium leading-none"
-                      >
-                        All databases (recommended)
-                      </Label>
-                      <p className="text-sm text-muted-foreground">
-                        Back up every database currently on the host — and any
-                        new database you create later, automatically.
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-start space-x-3 space-y-0">
-                    <RadioGroupItem value="specific" id="edit-mode-specific" />
-                    <div className="grid gap-1 leading-none">
-                      <Label
-                        htmlFor="edit-mode-specific"
-                        className="text-sm font-medium leading-none"
-                      >
-                        Specific databases
-                      </Label>
-                      <p className="text-sm text-muted-foreground">
-                        Pick the databases this schedule should back up. New
-                        databases are not included unless you attach them.
-                      </p>
-                    </div>
-                  </div>
-                </RadioGroup>
-                {backupMode === 'specific' && (
-                  <div className="mt-2 rounded-md border p-2">
-                    <ScheduleServicesSelector
-                      value={selectedServiceIds}
-                      onChange={setSelectedServiceIds}
-                      disabled={mutation.isPending || !seededServices}
-                    />
-                  </div>
-                )}
-                <div className="mt-3 flex items-start justify-between gap-3 rounded-md border p-3">
-                  <div className="grid gap-1 leading-tight">
-                    <Label
-                      htmlFor="edit-include-control-plane"
-                      className="text-sm font-medium"
-                    >
-                      Also back up the Temps control plane
-                    </Label>
-                    <p className="text-xs text-muted-foreground">
-                      Includes Temps&apos;s own database (users, projects,
-                      service configs, audit logs, error groups). Recommended
-                      unless you use Temps purely as a backup orchestrator for
-                      external databases.
-                    </p>
-                  </div>
-                  <Switch
-                    id="edit-include-control-plane"
-                    checked={includeControlPlane}
-                    onCheckedChange={setIncludeControlPlane}
-                    disabled={mutation.isPending}
+              <BackupCoverageOptions
+                idPrefix="edit-"
+                mode={backupMode}
+                onModeChange={(mode) => {
+                  setCoverageMessage(undefined)
+                  setBackupMode(mode)
+                }}
+                includeControlPlane={includeControlPlane}
+                onIncludeControlPlaneChange={(include) => {
+                  setCoverageMessage(undefined)
+                  setIncludeControlPlane(include)
+                }}
+                error={coverageMessage}
+                disabled={mutation.isPending}
+                servicesSelector={
+                  <ScheduleServicesSelector
+                    value={selectedServiceIds}
+                    onChange={(next) => {
+                      setCoverageMessage(undefined)
+                      setSelectedServiceIds(next)
+                    }}
+                    disabled={mutation.isPending || !seededServices}
                   />
-                </div>
-              </div>
+                }
+              />
 
               <div className="grid gap-2">
                 <Label htmlFor="edit-retention">Retention Period (days)</Label>

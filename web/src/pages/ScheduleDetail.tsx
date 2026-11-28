@@ -77,6 +77,7 @@ import {
   type DetailFact,
   type StatusTone,
 } from '@temps-sdk/ds'
+import { coverageSummary } from '@/lib/backup-coverage'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -466,6 +467,16 @@ export function ScheduleDetail() {
                 </dd>
               </div>
             )}
+            {(s.target_all_services || attachedServices) && (
+              <div className="sm:col-span-2">
+                <dt className="text-base font-medium text-muted-foreground sm:text-sm">
+                  Backs up
+                </dt>
+                <dd className="text-base sm:text-sm">
+                  {coverageSummary(s, attachedServices?.length ?? 0)}
+                </dd>
+              </div>
+            )}
             <div>
               <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                 Control plane backup
@@ -839,19 +850,40 @@ export function ScheduleDetail() {
                       <Skeleton className="h-10 w-full" />
                     </div>
                   ) : !attachedServices || attachedServices.length === 0 ? (
-                    <EmptyState
-                      icon={Database}
-                      title="No services attached yet"
-                      description={
-                        <>
-                          Click <strong>Attach service</strong> to add Postgres,
-                          Redis, MongoDB, or RustFS targets.
-                        </>
-                      }
-                    />
+                    schedule.include_control_plane ? (
+                      <EmptyState
+                        icon={Database}
+                        title="Control plane only"
+                        description={
+                          <>
+                            Every run backs up Temps&apos;s own database and no
+                            other databases. Click{' '}
+                            <strong>Attach service</strong> to add some.
+                          </>
+                        }
+                      />
+                    ) : (
+                      <EmptyState
+                        icon={Database}
+                        title="Nothing to back up"
+                        description={
+                          <>
+                            No databases are attached and the control plane is
+                            off. Click <strong>Attach service</strong>, or edit
+                            the schedule to include the control plane.
+                          </>
+                        }
+                      />
+                    )
                   ) : (
                     <ul className="divide-y rounded-md border">
                       {attachedServices.map((svc) => {
+                        // Without the control plane, the last database is
+                        // all the schedule backs up; the server refuses to
+                        // detach it.
+                        const lastRequiredTarget =
+                          !schedule.include_control_plane &&
+                          attachedServices.length === 1
                         const Icon =
                           svc.service_type === 's3' ? HardDrive : Database
                         return (
@@ -871,7 +903,14 @@ export function ScheduleDetail() {
                               variant="ghost"
                               size="icon"
                               className="h-7 w-7 text-muted-foreground hover:text-destructive"
-                              disabled={detachMutation.isPending}
+                              disabled={
+                                detachMutation.isPending || lastRequiredTarget
+                              }
+                              title={
+                                lastRequiredTarget
+                                  ? 'This is the only thing the schedule backs up. Attach another database or include the control plane first.'
+                                  : undefined
+                              }
                               onClick={() => setDetachTarget(svc)}
                               aria-label={`Detach ${svc.name}`}
                             >
