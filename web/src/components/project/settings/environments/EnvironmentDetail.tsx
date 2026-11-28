@@ -283,6 +283,7 @@ export function EnvironmentDetail({
       <ProjectIpAccessCard
         key={`ip-access:${environment.id}`}
         projectId={project.id}
+        projectSlug={project.slug}
         environmentId={environment.id}
         scopeName={environment.name}
       />

@@ -518,6 +518,12 @@ pub struct CurrentStatusResponse {
     /// Seconds of the window (after the monitor was created, up to now) that
     /// no check covered, so Temps cannot say whether the endpoint was up.
     pub unknown_seconds: i64,
+    /// Set when the project's own IP access policy refuses Temps' managed
+    /// uptime monitor, so its checks see a 403 instead of the app. Carries
+    /// the addresses the monitor connects from and the entries that would
+    /// let it through. Only looked up while the monitor is not operational.
+    #[serde(default)]
+    pub ip_access_block: Option<temps_core::uptime_monitor_ip_access::UptimeMonitorIpBlock>,
 }
 
 /// Health summary for a single project based on its production monitors

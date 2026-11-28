@@ -22729,6 +22729,17 @@
             "format": "int64",
             "type": "integer"
           },
+          "ip_access_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UptimeMonitorIpBlock",
+                "description": "Set when the project's own IP access policy refuses Temps' managed\nuptime monitor, so its checks see a 403 instead of the app. Carries\nthe addresses the monitor connects from and the entries that would\nlet it through. Only looked up while the monitor is not operational."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "last_check_at": {
             "format": "date-time",
             "type": [
@@ -46427,6 +46438,14 @@
         ],
         "type": "string"
       },
+      "IpAccessPolicyScope": {
+        "description": "Where the policy that applies is stored.",
+        "enum": [
+          "project",
+          "environment"
+        ],
+        "type": "string"
+      },
       "IssueLinkList": {
         "description": "The issues of a group.",
         "properties": {
@@ -62576,6 +62595,11 @@
             "format": "int32",
             "type": "integer"
           },
+          "revision": {
+            "description": "Changes on every save of this scope's policy; `0` when nothing is\nstored. Send it back as `expected_revision` to save only if nobody\nsaved in between.",
+            "format": "int64",
+            "type": "integer"
+          },
           "updated_at": {
             "example": "2026-10-13T09:30:00Z",
             "format": "date-time",
@@ -62584,8 +62608,19 @@
               "null"
             ]
           },
+          "uptime_monitor_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/UptimeMonitorIpBlock",
+                "description": "Set when the policy that governs this scope (for an environment\nwithout a list of its own, the project's) refuses Temps' managed\nuptime monitor, with the entries that would let it through."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "warnings": {
-            "description": "Things the operator should know about the saved policy, such as Temps\nnot being able to tell how visitors arrive (ADR 064 D9).",
+            "description": "Things the operator should know about the saved policy, such as Temps\nnot being able to tell how visitors arrive (ADR 064 D9), or the policy\nrefusing Temps' own uptime monitor.",
             "items": {
               "type": "string"
             },
@@ -78411,6 +78446,14 @@
             },
             "type": "array"
           },
+          "expected_revision": {
+            "description": "The `revision` of the policy this list was built from (`0` when\nnothing was stored). When set, the save is refused with 409 if the\nstored policy changed since, so a read-modify-write never overwrites\na save made in between. Omit it to replace the list unconditionally.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "mode": {
             "$ref": "#/components/schemas/IpAccessMode",
             "description": "`disabled` keeps the list but enforces nothing; `allow` admits only\nlisted clients; `deny` blocks listed clients."
@@ -91827,6 +91870,102 @@
           "monitor_id",
           "truncated",
           "uptime_data"
+        ],
+        "type": "object"
+      },
+      "UptimeMonitorBlockReason": {
+        "description": "Why the policy refuses the monitor.",
+        "enum": [
+          "not_allow_listed",
+          "deny_listed",
+          "unreadable"
+        ],
+        "type": "string"
+      },
+      "UptimeMonitorIpBlock": {
+        "description": "A saved IP access policy refuses Temps' managed uptime monitor, so the\nmonitor sees a 403 instead of the app.",
+        "properties": {
+          "blocked_addresses": {
+            "description": "The monitor addresses the policy refuses.",
+            "example": [
+              "203.0.113.10"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "environment_id": {
+            "description": "The environment the evaluation was for; `null` when the project-wide\nlist was evaluated on its own.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "matched_cidrs": {
+            "description": "For a deny list: the entries that cover a monitor address.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "One-paragraph explanation suitable for display and for a check result.",
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IpAccessMode"
+          },
+          "monitor_addresses": {
+            "description": "Every address Temps' uptime monitor connects from on this server.",
+            "example": [
+              "127.0.0.1",
+              "203.0.113.10"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "policy_scope": {
+            "$ref": "#/components/schemas/IpAccessPolicyScope",
+            "description": "Which list refuses the monitor. With `environment`, the fix belongs\non `environment_id`'s own list; with `project`, on the project list."
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/UptimeMonitorBlockReason"
+          },
+          "suggested_cidrs": {
+            "description": "For an allow list: the entries that, added to it, let the monitor\nthrough. Empty when the fix is to remove entries or save the list.",
+            "example": [
+              "203.0.113.10/32"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "suggested_description": {
+            "description": "The description to give the suggested entries.",
+            "example": "Temps uptime monitor",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "policy_scope",
+          "mode",
+          "reason",
+          "monitor_addresses",
+          "blocked_addresses",
+          "matched_cidrs",
+          "suggested_cidrs",
+          "suggested_description",
+          "message"
         ],
         "type": "object"
       },
@@ -170479,7 +170618,7 @@
                 }
               }
             },
-            "description": "Policy would lock out the caller"
+            "description": "Policy would lock out the caller, or the stored policy is no longer at `expected_revision`"
           },
           "500": {
             "content": {
@@ -181753,7 +181892,7 @@
                 }
               }
             },
-            "description": "Policy would lock out the caller"
+            "description": "Policy would lock out the caller, or the stored policy is no longer at `expected_revision`"
           },
           "500": {
             "content": {

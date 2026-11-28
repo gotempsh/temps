@@ -15,3 +15,4 @@ pub mod proxy_log_batch_writer;
 pub mod proxy_log_service;
 pub mod shield_console_service;
 pub mod static_asset_lookup;
+pub mod uptime_monitor_ip_access;

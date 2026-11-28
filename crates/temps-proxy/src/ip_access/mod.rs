@@ -24,38 +24,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use cidr_set::{parse_cidr, CidrError, CidrSet, MAX_CIDRS_PER_POLICY, MAX_DESCRIPTION_LEN};
 pub use gate::{IpAccessGateError, ProjectIpAccessGate};
 
-/// How a scope's CIDR list is applied.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum IpAccessMode {
-    /// Entries are kept but nothing is enforced.
-    Disabled,
-    /// Only clients inside a listed CIDR may reach the scope.
-    Allow,
-    /// Clients inside a listed CIDR are blocked; everyone else is allowed.
-    Deny,
-}
-
-impl IpAccessMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            IpAccessMode::Disabled => "disabled",
-            IpAccessMode::Allow => "allow",
-            IpAccessMode::Deny => "deny",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "disabled" => Some(IpAccessMode::Disabled),
-            "allow" => Some(IpAccessMode::Allow),
-            "deny" => Some(IpAccessMode::Deny),
-            _ => None,
-        }
-    }
-}
+/// How a scope's CIDR list is applied. Defined in `temps-core` so the
+/// uptime monitor can name it without depending on the proxy.
+pub use temps_core::uptime_monitor_ip_access::IpAccessMode;
 
 /// Lock-free "log at most `max_per_window` per `window_secs`" limiter for the
 /// denial log line, so a flood from a blocked network cannot turn the log into
@@ -110,19 +81,6 @@ impl DenyLogLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn mode_round_trips() {
-        for mode in [
-            IpAccessMode::Disabled,
-            IpAccessMode::Allow,
-            IpAccessMode::Deny,
-        ] {
-            assert_eq!(IpAccessMode::parse(mode.as_str()), Some(mode));
-        }
-        assert_eq!(IpAccessMode::parse("block"), None);
-        assert_eq!(IpAccessMode::parse(""), None);
-    }
 
     #[test]
     fn limiter_caps_a_window_and_reports_suppressed_count() {

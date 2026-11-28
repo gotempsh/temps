@@ -309,3 +309,133 @@ export function policySummary(mode: IpAccessMode, count: number): string {
       return 'Open to everyone'
   }
 }
+
+/** What the monitor-block fix needs from `UptimeMonitorIpBlock`. */
+function problemIs(error: unknown, status: number, title: string): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const problem = error as { status?: unknown; title?: unknown }
+  return problem.status === status && problem.title === title
+}
+
+/**
+ * The 409 for "this save would lock you out". Another 409 (a concurrent
+ * update) must not offer the "Save anyway" override, so the title decides.
+ */
+export function isLockoutError(error: unknown): boolean {
+  return problemIs(error, 409, 'Policy Would Lock You Out')
+}
+
+/**
+ * The 409 for a save sent with `expected_revision` after someone else saved
+ * the list: re-read it and decide again, never resend the old list.
+ */
+export function isRevisionConflict(error: unknown): boolean {
+  return problemIs(error, 409, 'Policy Changed Since Read')
+}
+
+export interface MonitorBlockFix {
+  policy_scope: 'project' | 'environment'
+  environment_id?: number | null
+  reason?: string
+  suggested_cidrs: string[]
+  suggested_description: string
+}
+
+/** What a scope's IP access GET says, as far as allowing the monitor goes. */
+export interface MonitorFixPolicy {
+  mode: string
+  cidrs: CidrEntry[]
+  max_cidrs: number
+  /** `0` (or absent) when nothing is stored for the scope. */
+  revision?: number
+  uptime_monitor_block?: MonitorBlockFix | null
+}
+
+/** What "Allow monitor" should do, decided on a fresh read of the list. */
+export type MonitorFixPlan =
+  /** Save `cidrs`, provided the list is still at `revision`. */
+  | { kind: 'save'; cidrs: CidrEntry[]; revision: number }
+  /** The list no longer refuses the addresses the warning was about. */
+  | { kind: 'already-allowed' }
+  /**
+   * The list was changed in a way the warning did not describe (another
+   * mode, a deny entry, the environment's own list added or removed).
+   */
+  | { kind: 'changed' }
+  /** Adding the monitor would take the list past its limit. */
+  | { kind: 'full'; needed: number; max: number }
+
+/**
+ * Plan "Allow monitor" from `fresh`, the policy re-read right before the
+ * save, so it never adds what the earlier warning suggested to a list that
+ * changed since. Only the warning's addresses that the list still refuses
+ * are added.
+ */
+export function planMonitorFix(
+  warning: Pick<MonitorBlockFix, 'policy_scope' | 'suggested_cidrs'>,
+  fresh: MonitorFixPolicy
+): MonitorFixPlan {
+  const block = fresh.uptime_monitor_block ?? null
+  if (block === null) return { kind: 'already-allowed' }
+  if (
+    block.policy_scope !== warning.policy_scope ||
+    fresh.mode !== 'allow' ||
+    block.reason !== 'not_allow_listed'
+  ) {
+    return { kind: 'changed' }
+  }
+  const missing = block.suggested_cidrs.filter((cidr) =>
+    warning.suggested_cidrs.includes(cidr)
+  )
+  if (missing.length === 0) return { kind: 'already-allowed' }
+  const cidrs = withMonitorEntries(fresh.cidrs, {
+    suggested_cidrs: missing,
+    suggested_description: block.suggested_description,
+  })
+  if (cidrs.length > fresh.max_cidrs) {
+    return { kind: 'full', needed: cidrs.length, max: fresh.max_cidrs }
+  }
+  return { kind: 'save', cidrs, revision: fresh.revision ?? 0 }
+}
+
+/**
+ * The list with the entries that let Temps' uptime monitor through appended,
+ * keeping every entry the operator has. Entries already listed are not
+ * added twice.
+ */
+export function withMonitorEntries(
+  current: CidrEntry[],
+  block: Pick<MonitorBlockFix, 'suggested_cidrs' | 'suggested_description'>
+): CidrEntry[] {
+  return withPresets(
+    current,
+    block.suggested_cidrs.map((cidr) => ({
+      cidr,
+      description: block.suggested_description,
+    }))
+  )
+}
+
+/** Where the list that refuses the monitor is edited. */
+export function monitorBlockSettingsPath(
+  projectSlug: string,
+  block: Pick<MonitorBlockFix, 'policy_scope' | 'environment_id'>
+): string {
+  const slug = encodeURIComponent(projectSlug)
+  if (block.policy_scope === 'environment' && block.environment_id != null) {
+    return `/projects/${slug}/environments/${block.environment_id}?view=settings#ip-access`
+  }
+  return `/projects/${slug}/settings/security#ip-access`
+}
+
+/**
+ * Whether a card for one scope can apply the fix itself: only when the list
+ * that refuses the monitor is the one the card edits. An environment that
+ * follows the project list is fixed on the project list.
+ */
+export function fixesOwnList(
+  block: Pick<MonitorBlockFix, 'policy_scope'>,
+  isEnvironment: boolean
+): boolean {
+  return block.policy_scope === (isEnvironment ? 'environment' : 'project')
+}
