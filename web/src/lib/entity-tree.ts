@@ -11,6 +11,7 @@
 
 import { resolveConsoleScope } from '@/lib/console-scope'
 import { resolveServerLocation } from '@/lib/server-navigation'
+import { orderProjectList, type Deployed } from '@/lib/project-order'
 
 /**
  * Where a page sits: under Projects, or one of the Server page's tabs
@@ -220,7 +221,7 @@ export function countedState(
   return state(worst.tone, `${count} ${label}`)
 }
 
-export interface ServiceNode {
+export interface ServiceNode extends Deployed {
   id: number
   name: string
   slug: string
@@ -241,8 +242,8 @@ export type ProjectNode =
   | { kind: 'service'; key: string; service: ServiceNode }
 
 /**
- * The rows under Projects: every project with its services, then the
- * services that are in none.
+ * The rows under Projects: every project with its services and the services
+ * that are in none, in the Projects page's order (`orderProjectList`).
  */
 export function projectNodes(
   groups: readonly {
@@ -256,23 +257,26 @@ export function projectNodes(
   const grouped = new Set<number>()
   for (const group of groups)
     for (const member of group.projects) grouped.add(member.id)
-  return [
-    ...groups.map((group): ProjectNode => ({
-      kind: 'project',
-      key: `project:${group.id}`,
-      id: group.id,
-      name: group.name,
-      slug: group.slug,
-      services: [...group.projects],
-    })),
-    ...services
-      .filter((service) => !grouped.has(service.id))
-      .map((service): ProjectNode => ({
+  // The Projects page's order, so the sidebar lists them the same way.
+  return orderProjectList(
+    groups,
+    services.filter((service) => !grouped.has(service.id)),
+    {
+      group: (group): ProjectNode => ({
+        kind: 'project',
+        key: `project:${group.id}`,
+        id: group.id,
+        name: group.name,
+        slug: group.slug,
+        services: [...group.projects],
+      }),
+      service: (service): ProjectNode => ({
         kind: 'service',
         key: `service:${service.id}`,
         service,
-      })),
-  ]
+      }),
+    }
+  )
 }
 
 /**
@@ -347,9 +351,11 @@ export function databaseRequests(
 /**
  * The projects listed on a server with more than `limit`: the one shown,
  * those in trouble, those opened recently (most recent first), then the
- * rest in their order, up to `limit`. Trouble is listed first; the others
- * keep their order in the full list, so a row does not move as the user
- * opens another. With `limit` or fewer, every project is listed as it is.
+ * rest in their order, up to `limit`. Those picked keep their order in the
+ * full list (the Projects page's order), so the sidebar never disagrees
+ * with the page and a row does not move as the user opens another; trouble
+ * shows on the row's badge. With `limit` or fewer, every project is listed
+ * as it is.
  */
 export function pickProjects<T extends { key: string }>(
   nodes: readonly T[],
@@ -374,11 +380,7 @@ export function pickProjects<T extends { key: string }>(
     if (node) add(node)
   }
   nodes.forEach(add)
-  const picked = nodes.filter((node) => chosen.has(node.key))
-  const shown = [
-    ...picked.filter(rules.inTrouble),
-    ...picked.filter((node) => !rules.inTrouble(node)),
-  ]
+  const shown = nodes.filter((node) => chosen.has(node.key))
   return { shown, more: nodes.length - shown.length }
 }
 

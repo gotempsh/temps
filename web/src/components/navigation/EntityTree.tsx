@@ -58,6 +58,7 @@ import {
 } from '@/lib/entity-tree'
 import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 import { serverDatabasesQuery } from '@/lib/server-databases'
+import { DEFAULT_PROJECT_PAGE_SIZE } from '@/lib/project-list-pagination'
 import { projectRoot } from '@/lib/project-navigation'
 import { SERVER_HOME, SERVER_PAGE } from '@/lib/server-navigation'
 import { groupHref } from '@/lib/terminology'
@@ -81,9 +82,10 @@ const TREE_QUERY = {
 } as const
 /**
  * Projects listed on a large server; the Projects page, with search, has
- * the rest. Few enough that the tree never grows with the server.
+ * the rest. Few enough that the tree never grows with the server, and as
+ * many as the Projects page's first page, so the two list the same rows.
  */
-const PROJECT_ROWS = 8
+const PROJECT_ROWS = DEFAULT_PROJECT_PAGE_SIZE
 /** Services listed under a project; its own page has the rest. */
 const SERVICE_ROWS = 20
 /** Services a monitor answer is asked for in one request. */
@@ -301,10 +303,19 @@ export function EntityTree() {
   const projectsOpen = !compact && fold.isOpen('tree:projects', true)
 
   const groupList = useProjectGroups()
+  // With projects, only the services in none are read, as the Projects page
+  // reads them: services inside projects come with their project, and a page
+  // of every service could leave out a standalone one the page lists first.
+  const grouped = groupList.isSuccess && groupList.groups.length > 0
   const services = useQuery({
-    ...getProjectsOptions({ query: { per_page: 100, page: 1 } }),
+    ...getProjectsOptions({
+      query: { per_page: 100, page: 1, ungrouped: grouped ? true : undefined },
+    }),
     ...TREE_QUERY,
-    enabled: projectsOpen,
+    // Which services to ask for depends on the projects: wait for them, as
+    // the Projects page does, unless they keep failing.
+    enabled:
+      projectsOpen && (!groupList.isLoading || groupList.failureCount > 0),
   })
 
   const listed = projectNodes(groupList.groups, services.data?.projects ?? [])
@@ -349,7 +360,9 @@ export function EntityTree() {
     }),
     ...TREE_QUERY,
     refetchInterval: 60_000,
-    enabled: projectsOpen && healthIds.length > 0,
+    // Once the services are in: asked with only the projects' services, it
+    // would be asked again as soon as those in none arrive.
+    enabled: projectsOpen && services.isFetched && healthIds.length > 0,
   })
   const stateOf = (service: ServiceNode) => {
     const reported = health.data?.projects[String(service.id)]

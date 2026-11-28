@@ -406,20 +406,20 @@ describe('the Server row', () => {
 })
 
 describe('Projects', () => {
-  /** A server of twelve projects of one service each. */
-  const large = (statuses: Record<number, string> = {}) => {
-    const groups = Array.from({ length: 12 }, (_, index) => ({
+  /** A server of twelve (or `count`) projects of one service each. */
+  const large = (statuses: Record<number, string> = {}, count = 12) => {
+    const groups = Array.from({ length: count }, (_, index) => ({
       id: index + 1,
       name: `Project ${index + 1}`,
       slug: `project-${index + 1}`,
       projects: [service(100 + index, `svc-${index + 1}`)],
     }))
     return {
-      'GET /project-groups': () => jsonResponse({ groups, total: 12 }),
+      'GET /project-groups': () => jsonResponse({ groups, total: count }),
       'GET /projects': () =>
         jsonResponse({
           projects: groups.flatMap((group) => group.projects),
-          total: 12,
+          total: count,
         }),
       'GET /monitors-health/projects': () =>
         jsonResponse({
@@ -439,22 +439,25 @@ describe('Projects', () => {
         .querySelectorAll(':scope > li[data-project]'),
     ].map((row) => row.getAttribute('data-project'))
 
-  test('a large server lists eight: trouble first, then those opened recently', async () => {
+  test('a large server lists nine, as the Projects page: trouble, then those opened recently, in the list order', async () => {
     window.localStorage.setItem(
       RECENT_PROJECTS_KEY,
       JSON.stringify(['tree-key-of-nothing', 'project:12'])
     )
     const { view } = renderAt('/projects', large({ 110: 'down' }))
     await view.findByRole('link', { name: /^Project 1\b/ })
-    await waitFor(() => expect(listed(view)[0]).toBe('project-11'))
+    // Trouble earns its row but is not moved: the tree keeps the Projects
+    // page's order (nothing here has deployed, so the order as read).
+    await waitFor(() => expect(listed(view)).toContain('project-11'))
     expect(listed(view)).toEqual([
-      'project-11',
       'project-1',
       'project-2',
       'project-3',
       'project-4',
       'project-5',
       'project-6',
+      'project-7',
+      'project-11',
       'project-12',
     ])
     const all = view.getByRole('link', { name: 'All projects (12)' })
@@ -464,10 +467,17 @@ describe('Projects', () => {
   test('the project shown is always listed, and remembered as recent', async () => {
     const { view } = renderAt('/p/project-10', large())
     await waitFor(() => expect(listed(view)).toContain('project-10'))
-    expect(listed(view)).toHaveLength(8)
+    expect(listed(view)).toHaveLength(9)
     expect(
       JSON.parse(window.localStorage.getItem(RECENT_PROJECTS_KEY) ?? '[]')
     ).toEqual(['project:10'])
+  })
+
+  test('a server with a page of projects lists them all, with no link to the rest', async () => {
+    const { view } = renderAt('/projects', large({}, 9))
+    await view.findByRole('link', { name: /^Project 9\b/ })
+    expect(listed(view)).toHaveLength(9)
+    expect(view.queryByRole('link', { name: /^All projects/ })).toBeNull()
   })
 
   test('a server with few projects lists them all, with no link to the rest', async () => {
@@ -486,6 +496,40 @@ describe('Projects', () => {
       name: 'Create service',
     })
     expect(add.getAttribute('href')).toBe('/projects/new')
+  })
+
+  test('with projects, it reads the services in none, as the Projects page does', async () => {
+    // A server whose first page of every service is all grouped ones: the
+    // standalone service would be missed unless only those in none are read.
+    const asked: (string | null)[] = []
+    const { view } = renderAt('/projects', {
+      ...projects,
+      'GET /projects': (request) => {
+        const ungrouped = new URL(request.url).searchParams.get('ungrouped')
+        asked.push(ungrouped)
+        return jsonResponse(
+          ungrouped === 'true'
+            ? { projects: [service(9, 'blog')], total: 1 }
+            : { projects: [service(4, 'web'), service(5, 'api')], total: 300 }
+        )
+      },
+    })
+    await view.findByRole('link', { name: /blog/ })
+    expect(asked).toEqual(['true'])
+  })
+
+  test('with no projects, it reads every service', async () => {
+    const asked: (string | null)[] = []
+    const { view } = renderAt('/projects', {
+      ...projects,
+      'GET /project-groups': () => jsonResponse({ groups: [], total: 0 }),
+      'GET /projects': (request) => {
+        asked.push(new URL(request.url).searchParams.get('ungrouped'))
+        return jsonResponse({ projects: [service(9, 'blog')], total: 1 })
+      },
+    })
+    await view.findByRole('link', { name: /blog/ })
+    expect(asked).toEqual([null])
   })
 
   test('a service past the page of services read still lists its views', async () => {
