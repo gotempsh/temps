@@ -601,243 +601,251 @@ export function ProjectIpAccessCard({
           </Alert>
         )}
 
-        <Controller
-          control={form.control}
-          name="mode"
-          render={({ field }) => (
-            <RadioGroup
-              value={field.value}
-              onValueChange={field.onChange}
-              className={
-                isEnvironment
-                  ? 'grid grid-cols-1 gap-2 md:grid-cols-2'
-                  : 'grid grid-cols-1 gap-2 md:grid-cols-3'
-              }
-              aria-label="IP access mode"
-            >
-              {(isEnvironment ? [INHERIT_MODE, ...MODES] : MODES).map(
-                (option) => (
-                  <Label
-                    key={option.value}
-                    htmlFor={`ip-access-mode-${option.value}`}
-                    className="flex cursor-pointer items-start gap-3 rounded-md border p-3 font-normal has-[[data-state=checked]]:border-primary"
-                  >
-                    <RadioGroupItem
-                      id={`ip-access-mode-${option.value}`}
-                      value={option.value}
-                      className="mt-0.5"
-                    />
-                    <span className="space-y-0.5">
-                      <span className="block text-sm font-medium">
-                        {modeLabel(option.value)}
+        {/* Locked while "Allow monitor" saves: its result replaces the form,
+            so an edit made meanwhile would be lost. */}
+        <fieldset
+          disabled={allowMonitorMutation.isPending}
+          className="m-0 min-w-0 space-y-5 border-0 p-0"
+        >
+          <Controller
+            control={form.control}
+            name="mode"
+            render={({ field }) => (
+              <RadioGroup
+                value={field.value}
+                onValueChange={field.onChange}
+                className={
+                  isEnvironment
+                    ? 'grid grid-cols-1 gap-2 md:grid-cols-2'
+                    : 'grid grid-cols-1 gap-2 md:grid-cols-3'
+                }
+                aria-label="IP access mode"
+              >
+                {(isEnvironment ? [INHERIT_MODE, ...MODES] : MODES).map(
+                  (option) => (
+                    <Label
+                      key={option.value}
+                      htmlFor={`ip-access-mode-${option.value}`}
+                      className="flex cursor-pointer items-start gap-3 rounded-md border p-3 font-normal has-[[data-state=checked]]:border-primary"
+                    >
+                      <RadioGroupItem
+                        id={`ip-access-mode-${option.value}`}
+                        value={option.value}
+                        className="mt-0.5"
+                      />
+                      <span className="space-y-0.5">
+                        <span className="block text-sm font-medium">
+                          {modeLabel(option.value)}
+                        </span>
+                        <span className="block text-sm text-muted-foreground">
+                          {option.hint}
+                        </span>
                       </span>
-                      <span className="block text-sm text-muted-foreground">
-                        {option.hint}
-                      </span>
-                    </span>
-                  </Label>
-                )
-              )}
-            </RadioGroup>
-          )}
-        />
+                    </Label>
+                  )
+                )}
+              </RadioGroup>
+            )}
+          />
 
-        {showsEntries(mode) && (
-          <div className="space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <Label>
-                Addresses and ranges{' '}
-                <span className="font-normal text-muted-foreground">
-                  ({fields.length} / {MAX_CIDRS})
-                </span>
-              </Label>
-              <div className="flex flex-wrap gap-2">
-                {yourIp && !yourIpListed && (
+          {showsEntries(mode) && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <Label>
+                  Addresses and ranges{' '}
+                  <span className="font-normal text-muted-foreground">
+                    ({fields.length} / {MAX_CIDRS})
+                  </span>
+                </Label>
+                <div className="flex flex-wrap gap-2">
+                  {yourIp && !yourIpListed && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={atLimit}
+                      onClick={() =>
+                        append({
+                          cidr: hostCidr(yourIp),
+                          description: 'My current address',
+                        })
+                      }
+                    >
+                      <UserRound className="mr-2 h-4 w-4" />
+                      Add my IP ({yourIp})
+                    </Button>
+                  )}
+                  {canAddPresets && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={atLimit || !presetsHaveRoom}
+                      title={
+                        presetsHaveRoom
+                          ? undefined
+                          : `Not enough room: the Tailscale ranges need ${
+                              missingPresets(currentCidrs, TAILSCALE_PRESETS)
+                                .length
+                            } more entries and the list holds at most ${MAX_CIDRS}.`
+                      }
+                      onClick={addPresets}
+                    >
+                      <Network className="mr-2 h-4 w-4" />
+                      Add Tailscale ranges
+                    </Button>
+                  )}
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
                     disabled={atLimit}
-                    onClick={() =>
-                      append({
-                        cidr: hostCidr(yourIp),
-                        description: 'My current address',
-                      })
-                    }
+                    onClick={() => append({ cidr: '', description: '' })}
                   >
-                    <UserRound className="mr-2 h-4 w-4" />
-                    Add my IP ({yourIp})
+                    <Plus className="mr-2 h-4 w-4" />
+                    Add range
                   </Button>
-                )}
-                {canAddPresets && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled={atLimit || !presetsHaveRoom}
-                    title={
-                      presetsHaveRoom
-                        ? undefined
-                        : `Not enough room: the Tailscale ranges need ${
-                            missingPresets(currentCidrs, TAILSCALE_PRESETS)
-                              .length
-                          } more entries and the list holds at most ${MAX_CIDRS}.`
-                    }
-                    onClick={addPresets}
+                </div>
+              </div>
+
+              {fields.length === 0 ? (
+                <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                  {mode === 'allow'
+                    ? 'An allow list needs at least one entry, e.g. 203.0.113.0/24, or 2001:db8::/32 for IPv6. Use "Add Tailscale ranges" to admit your tailnet.'
+                    : 'No addresses yet. Enter a single address (203.0.113.9) or a range (203.0.113.0/24, 2001:db8::/32).'}
+                </p>
+              ) : (
+                <ul className="space-y-2">
+                  {fields.map((field, index) => {
+                    const rowErrors = form.formState.errors.cidrs?.[index]
+                    return (
+                      <li
+                        key={field.id}
+                        className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+                      >
+                        <div className="space-y-1">
+                          <Input
+                            aria-label={`Address or range ${index + 1}`}
+                            aria-invalid={rowErrors?.cidr ? true : undefined}
+                            placeholder="203.0.113.0/24"
+                            className="font-mono"
+                            {...form.register(`cidrs.${index}.cidr` as const)}
+                          />
+                          {rowErrors?.cidr?.message && (
+                            <p className="text-sm text-destructive">
+                              {rowErrors.cidr.message}
+                            </p>
+                          )}
+                        </div>
+                        <div className="space-y-1">
+                          <Input
+                            aria-label={`Note for range ${index + 1}`}
+                            aria-invalid={
+                              rowErrors?.description ? true : undefined
+                            }
+                            placeholder="Note (optional)"
+                            maxLength={MAX_DESCRIPTION_LENGTH}
+                            {...form.register(
+                              `cidrs.${index}.description` as const
+                            )}
+                          />
+                          {rowErrors?.description?.message && (
+                            <p className="text-sm text-destructive">
+                              {rowErrors.description.message}
+                            </p>
+                          )}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          aria-label={`Remove range ${index + 1}`}
+                          onClick={() => remove(index)}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+              {cidrsError && (
+                <p className="text-sm text-destructive" role="alert">
+                  {cidrsError}
+                </p>
+              )}
+            </div>
+          )}
+
+          {mode !== 'disabled' && mode !== 'inherit' && yourIp && (
+            <Alert>
+              <CircleAlert className="h-4 w-4" />
+              <AlertTitle>Your address: {yourIp}</AlertTitle>
+              <AlertDescription>
+                That is how the console sees you. The {scopeNoun} sees clients
+                the same way only when both are reached over the same network
+                path; test an address below before relying on a list. You are
+                asked to confirm if a save would lock this address out.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {/* Off lets every address through: there is nothing to try. */}
+          {mode !== 'disabled' && (
+            <>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                <div className="min-w-0 flex-1 space-y-1">
+                  <Label
+                    htmlFor={`ip-access-probe-${environmentId ?? 'project'}`}
                   >
-                    <Network className="mr-2 h-4 w-4" />
-                    Add Tailscale ranges
-                  </Button>
-                )}
+                    Try an address
+                  </Label>
+                  <Input
+                    id={`ip-access-probe-${environmentId ?? 'project'}`}
+                    value={probe}
+                    placeholder="100.101.102.103"
+                    className="font-mono"
+                    onChange={(event) => setProbe(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        runProbe()
+                      }
+                    }}
+                  />
+                </div>
                 <Button
                   type="button"
                   variant="outline"
-                  size="sm"
-                  disabled={atLimit}
-                  onClick={() => append({ cidr: '', description: '' })}
+                  disabled={probe.trim() === '' || probeMutation.isPending}
+                  onClick={runProbe}
                 >
-                  <Plus className="mr-2 h-4 w-4" />
-                  Add range
+                  <Search className="mr-2 h-4 w-4" />
+                  {probeMutation.isPending ? 'Checking…' : 'Check'}
                 </Button>
               </div>
-            </div>
-
-            {fields.length === 0 ? (
-              <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-                {mode === 'allow'
-                  ? 'An allow list needs at least one entry, e.g. 203.0.113.0/24, or 2001:db8::/32 for IPv6. Use "Add Tailscale ranges" to admit your tailnet.'
-                  : 'No addresses yet. Enter a single address (203.0.113.9) or a range (203.0.113.0/24, 2001:db8::/32).'}
-              </p>
-            ) : (
-              <ul className="space-y-2">
-                {fields.map((field, index) => {
-                  const rowErrors = form.formState.errors.cidrs?.[index]
-                  return (
-                    <li
-                      key={field.id}
-                      className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
-                    >
-                      <div className="space-y-1">
-                        <Input
-                          aria-label={`Address or range ${index + 1}`}
-                          aria-invalid={rowErrors?.cidr ? true : undefined}
-                          placeholder="203.0.113.0/24"
-                          className="font-mono"
-                          {...form.register(`cidrs.${index}.cidr` as const)}
-                        />
-                        {rowErrors?.cidr?.message && (
-                          <p className="text-sm text-destructive">
-                            {rowErrors.cidr.message}
-                          </p>
-                        )}
-                      </div>
-                      <div className="space-y-1">
-                        <Input
-                          aria-label={`Note for range ${index + 1}`}
-                          aria-invalid={
-                            rowErrors?.description ? true : undefined
-                          }
-                          placeholder="Note (optional)"
-                          maxLength={MAX_DESCRIPTION_LENGTH}
-                          {...form.register(
-                            `cidrs.${index}.description` as const
-                          )}
-                        />
-                        {rowErrors?.description?.message && (
-                          <p className="text-sm text-destructive">
-                            {rowErrors.description.message}
-                          </p>
-                        )}
-                      </div>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        aria-label={`Remove range ${index + 1}`}
-                        onClick={() => remove(index)}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </li>
-                  )
-                })}
-              </ul>
-            )}
-            {cidrsError && (
-              <p className="text-sm text-destructive" role="alert">
-                {cidrsError}
-              </p>
-            )}
-          </div>
-        )}
-
-        {mode !== 'disabled' && mode !== 'inherit' && yourIp && (
-          <Alert>
-            <CircleAlert className="h-4 w-4" />
-            <AlertTitle>Your address: {yourIp}</AlertTitle>
-            <AlertDescription>
-              That is how the console sees you. The {scopeNoun} sees clients the
-              same way only when both are reached over the same network path;
-              test an address below before relying on a list. You are asked to
-              confirm if a save would lock this address out.
-            </AlertDescription>
-          </Alert>
-        )}
-
-        {/* Off lets every address through: there is nothing to try. */}
-        {mode !== 'disabled' && (
-          <>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-              <div className="min-w-0 flex-1 space-y-1">
-                <Label
-                  htmlFor={`ip-access-probe-${environmentId ?? 'project'}`}
+              {visibleProbeDraftError && (
+                <p className="text-sm text-destructive" role="alert">
+                  Fix the list before trying an address:{' '}
+                  {visibleProbeDraftError}
+                </p>
+              )}
+              {probeResult && (
+                <p
+                  className={
+                    probeResult.allowed
+                      ? 'text-sm text-foreground'
+                      : 'text-sm text-destructive'
+                  }
+                  role="status"
                 >
-                  Try an address
-                </Label>
-                <Input
-                  id={`ip-access-probe-${environmentId ?? 'project'}`}
-                  value={probe}
-                  placeholder="100.101.102.103"
-                  className="font-mono"
-                  onChange={(event) => setProbe(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault()
-                      runProbe()
-                    }
-                  }}
-                />
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={probe.trim() === '' || probeMutation.isPending}
-                onClick={runProbe}
-              >
-                <Search className="mr-2 h-4 w-4" />
-                {probeMutation.isPending ? 'Checking…' : 'Check'}
-              </Button>
-            </div>
-            {visibleProbeDraftError && (
-              <p className="text-sm text-destructive" role="alert">
-                Fix the list before trying an address: {visibleProbeDraftError}
-              </p>
-            )}
-            {probeResult && (
-              <p
-                className={
-                  probeResult.allowed
-                    ? 'text-sm text-foreground'
-                    : 'text-sm text-destructive'
-                }
-                role="status"
-              >
-                {probeResult.allowed ? 'Allowed' : 'Blocked'} —{' '}
-                {probeResult.reason}
-              </p>
-            )}
-          </>
-        )}
+                  {probeResult.allowed ? 'Allowed' : 'Blocked'} —{' '}
+                  {probeResult.reason}
+                </p>
+              )}
+            </>
+          )}
+        </fieldset>
 
         <div className="flex flex-wrap items-center gap-2">
           <Button
