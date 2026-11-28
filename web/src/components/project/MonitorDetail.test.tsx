@@ -138,3 +138,77 @@ test('the monitor, which carries the latest location answers, refreshes with its
     MONITOR_REFRESH_MS
   )
 })
+
+test('the timeline says what each hour found, successful checks included', async () => {
+  mockApi({
+    'GET /monitors/5': () =>
+      jsonResponse({
+        id: 5,
+        name: 'Homepage check',
+        monitor_type: 'web',
+        monitor_url: 'https://app.example.test/',
+        check_interval_seconds: 60,
+        created_at: '2026-01-01T00:00:00Z',
+        is_active: true,
+        is_managed: false,
+      }),
+    'GET /monitors/5/current-status': () =>
+      jsonResponse({ current_status: 'operational', uptime_percentage: 12 }),
+    // An hour all degraded, then one that recovered part-way through.
+    'GET /monitors/5/bucketed': () =>
+      jsonResponse({
+        interval: 'hourly',
+        monitor_id: 5,
+        buckets: [
+          {
+            bucket_start: '2026-11-27T19:00:00Z',
+            status: 'degraded',
+            total_checks: 49,
+            operational_count: 0,
+            degraded_count: 49,
+            down_count: 0,
+          },
+          {
+            bucket_start: '2026-11-27T20:00:00Z',
+            status: 'degraded',
+            total_checks: 41,
+            operational_count: 5,
+            degraded_count: 36,
+            down_count: 0,
+          },
+        ],
+      }),
+  })
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <MemoryRouter initialEntries={['/monitors/5']}>
+        <Routes>
+          <Route
+            path="/monitors/:monitorId"
+            element={
+              <MonitorDetail
+                project={{ id: 17, slug: 'demo' } as ProjectResponse}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+
+  const recovered = await screen.findByRole('button', {
+    name: /5 successful, 36 degraded of 41 checks$/,
+  })
+  expect(recovered.querySelector('[data-tone="operational"]')).not.toBeNull()
+  const degraded = screen.getByRole('button', {
+    name: /49 checks, all degraded$/,
+  })
+  expect(degraded.querySelector('[data-tone="operational"]')).toBeNull()
+  // The legend names what a check found, as the columns split.
+  for (const label of ['Successful', 'Degraded', 'Failed', 'No checks'])
+    expect(screen.getAllByText(label).length).toBeGreaterThan(0)
+})
