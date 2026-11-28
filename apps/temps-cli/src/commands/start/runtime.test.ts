@@ -15,6 +15,7 @@ import {
   isLocalState,
   localPaths,
   localUrls,
+  parseAdminEmail,
   parseChannel,
   parseChecksum,
   parseJsonOutput,
@@ -269,6 +270,28 @@ describe('parseLocalServerPids', () => {
     ].join('\n')
     expect(parseLocalServerPids(listing, paths)).toEqual([812, 12345])
     expect(parseLocalServerPids('', paths)).toEqual([])
+  })
+})
+
+describe('parseAdminEmail', () => {
+  test('accepts the email the user gives, trimmed, including a local address', () => {
+    expect(parseAdminEmail('  me@example.com ')).toBe('me@example.com')
+    expect(parseAdminEmail('admin@localhost')).toBe('admin@localhost')
+  })
+
+  test('refuses something that is not an email, quoting it', () => {
+    for (const value of ['', 'me', 'me@', '@example.com', 'me @example.com', 'a@b@c']) {
+      const error = (() => {
+        try {
+          parseAdminEmail(value)
+        } catch (e) {
+          return e as { reason?: string; message: string }
+        }
+        return null
+      })()
+      expect(error?.reason).toBe('bad_email')
+      expect(error?.message).toContain(`"${value}"`)
+    }
   })
 })
 

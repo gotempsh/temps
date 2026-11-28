@@ -393,6 +393,23 @@ export function parsePort(value: string): number {
   return port
 }
 
+/**
+ * An `--email` value for the administrator a fresh install creates. Lenient,
+ * like the console's sign-in form: something@something with no spaces, so a
+ * local address such as `admin@localhost` stays valid.
+ */
+export function parseAdminEmail(value: string): string {
+  const email = value.trim()
+  if (!/^[^\s@]+@[^\s@]+$/.test(email)) {
+    throw new StartError(
+      'preflight',
+      'bad_email',
+      `--email must be an email address such as you@example.com (got "${value}").`,
+    )
+  }
+  return email
+}
+
 /** Whether parsed JSON has the shape of a state file this version wrote. */
 export function isLocalState(value: unknown): value is LocalState {
   if (typeof value !== 'object' || value === null) return false
