@@ -26,13 +26,27 @@ bunx --bun @temps-sdk/cli plugin add --image registry.example.com/acme/my-plugin
 
 This creates a service named after the image, deploys the image the way `temps deploy:image` does, waits for it to be live and adds it as a plugin, pinned to that deployment. Name the image by digest (`repository@sha256:...`) to deploy exactly what you reviewed. To release a new version, run the command again with `--project <service>` and the new image: it is deployed and then waits for approval. Use `--name` to choose the service's name, `--port` for the port the plugin listens on and `--health-check-path` when its manifest does not use `/health`.
 
+No registry is needed for an image on your machine. Both upload it to the server the way `temps deploy:local-image` does:
+
+```bash
+# build the Dockerfile in the current directory, then upload and add it
+bunx --bun @temps-sdk/cli plugin add --build
+
+# upload an image your Docker already has
+bunx --bun @temps-sdk/cli plugin add --local-image my-plugin:dev
+```
+
+`--build` takes `--dockerfile` and `--context`, and names the service after the directory it builds. Pass exactly one of `--image`, `--local-image` and `--build`.
+
+Temps records the content each image resolved to and shows it next to the image, for the build a plugin is pinned to and for one that waits. A tag that was moved to other content is therefore visible as the same reference with another content ID, and it never changes a plugin that is already running: restarting or waking it starts the approved container again.
+
 A service that is already deployed, from an image or from a repository, is added by its ids:
 
 ```bash
 bunx --bun @temps-sdk/cli plugin add-service --project 7 --environment 9
 ```
 
-Use the numeric ids shown by `temps projects list` and `temps environments list`. In the console, open **Settings → Plugins → Add plugin**. Temps connects to the service's running deployment; it does not run the plugin's code itself. A newly added plugin has no permissions.
+Use the numeric ids shown by `temps projects list` and `temps environments list`. In the console, **Settings → Plugins → Add plugin** does both: enter an image and it creates the service, deploys the image and adds it in one step, or pick a service that is already deployed. Temps connects to the service's running deployment; it does not run the plugin's code itself. A newly added plugin has no permissions.
 
 `temps plugin services` lists each plugin, the service it runs as and whether it is running, stopped while idle or unavailable, with the reason. It also lists plugins an earlier version of Temps installed as executables: those no longer run. Deploy such a plugin as a service, remove its entry with `temps plugin remove my-plugin`, then add the service. Removing a plugin revokes its permissions; its service and the files it stored are kept.
 

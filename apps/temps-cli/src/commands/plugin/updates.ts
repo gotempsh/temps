@@ -24,6 +24,24 @@ interface ApprovedPluginUpdate {
 }
 
 /**
+ * The image of a build, with the content it resolved to when Temps recorded
+ * it: a tag can be moved, the content is what was deployed. An image
+ * uploaded from a client is named by its content alone. Empty for a build
+ * that is not from an image.
+ */
+export function imagePart(
+  image: string | null | undefined,
+  imageId: string | null | undefined,
+): string {
+  const content = imageId
+    ? ` (content ${imageId.replace(/^sha256:/, "").slice(0, 12)})`
+    : "";
+  // An image uploaded from a client has no reference, only its content.
+  if (!image) return imageId ? `, an uploaded image${content}` : "";
+  return `, image ${image}${content}`;
+}
+
+/**
  * What waits for a plugin, as a person reads it: the build it is pinned to,
  * the build that waits and what that one asks for beyond the approved one.
  */
@@ -31,7 +49,7 @@ export function updateLines(plugin: ServicePlugin): string[] {
   const pinned =
     plugin.pinned_deployment_id == null
       ? "no build recorded yet"
-      : `deployment ${plugin.pinned_deployment_id}${plugin.image ? `, image ${plugin.image}` : ""}`;
+      : `deployment ${plugin.pinned_deployment_id}${imagePart(plugin.image, plugin.image_id)}`;
   const update = plugin.pending_update;
   if (!update)
     return [
@@ -44,7 +62,7 @@ export function updateLines(plugin: ServicePlugin): string[] {
     : difference.version_to;
   const lines = [
     `Plugin ${plugin.name} is pinned to ${pinned}.`,
-    `Deployment ${update.deployment_id} (version ${versions}${update.image ? `, image ${update.image}` : ""}) waits for approval. The plugin is disconnected until then.`,
+    `Deployment ${update.deployment_id} (version ${versions}${imagePart(update.image, update.image_id)}) waits for approval. The plugin is disconnected until then.`,
   ];
   const asked: Array<[string, string[]]> = [
     ["New permissions it asks for", difference.added_permissions],

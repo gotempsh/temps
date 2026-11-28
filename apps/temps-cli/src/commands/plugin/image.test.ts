@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Command } from "commander";
 import { config, credentials } from "../../config/store.js";
 import {
   imageDeployment,
   imageReference,
+  imageSource,
   pinnedByDigest,
   registerPluginImageCommands,
   serviceNameFor,
@@ -41,6 +45,8 @@ test("adding from an image is the first plugin command and says what it does", (
   expect(command.commands.map((c) => c.name())).toEqual(["add"]);
   const help = command.commands[0]?.helpInformation() ?? "";
   expect(help).toContain("--image <image>");
+  expect(help).toContain("--local-image <image>");
+  expect(help).toContain("--build");
   expect(help).toContain("--project <project>");
   expect(command.commands[0]?.description()).toContain(
     "an update that waits for approval",
@@ -84,6 +90,11 @@ interface Fake {
   lists?: ServicePlugin[][];
   live?: boolean;
   refuseDeploy?: boolean;
+  /** Images the Docker on this machine has. */
+  localImages?: string[];
+  /** The upload says why it failed and starts nothing. */
+  refuseUpload?: boolean;
+  failBuild?: boolean;
 }
 
 /** A Temps that knows one service at most, and records every request. */
@@ -101,6 +112,23 @@ function server(fake: Fake) {
         ? { success: false, error: "the container exited" }
         : { success: true };
     },
+  );
+  const uploads: Array<Parameters<typeof imageDeployment.upload>[0]> = [];
+  const upload = spyOn(imageDeployment, "upload").mockImplementation(
+    async (options) => {
+      uploads.push(options);
+      return fake.refuseUpload ? undefined : { id: 43, slug: "deploy-43" };
+    },
+  );
+  const builds: Array<Parameters<typeof imageDeployment.build>[0]> = [];
+  const build = spyOn(imageDeployment, "build").mockImplementation(
+    async (options) => {
+      builds.push(options);
+      if (fake.failBuild) throw new Error("docker build failed with code 1");
+    },
+  );
+  const exists = spyOn(imageDeployment, "exists").mockImplementation(
+    async (image) => (fake.localImages ?? []).includes(image),
   );
   let listed = 0;
   const project = { id: 7, name: "reports", slug: "reports" };
@@ -154,6 +182,8 @@ function server(fake: Fake) {
   return {
     requests,
     watched,
+    uploads,
+    builds,
     posts: () =>
       requests
         .filter(({ method }) => method === "POST")
@@ -162,6 +192,9 @@ function server(fake: Fake) {
     restore() {
       log.mockRestore();
       fetch.mockRestore();
+      exists.mockRestore();
+      build.mockRestore();
+      upload.mockRestore();
       watch.mockRestore();
       apiUrl.mockRestore();
       apiKey.mockRestore();
@@ -296,6 +329,165 @@ test("a refused image, an unknown service or environment and bad options stop be
       /between 1 and 65535/,
     );
     expect(api.posts()).not.toContain("/x/plugins/services");
+  } finally {
+    api.restore();
+  }
+});
+
+test("an image comes from exactly one place", () => {
+  expect(imageSource({ image: IMAGE })).toEqual({
+    kind: "registry",
+    image: IMAGE,
+  });
+  expect(imageSource({ localImage: "reports:dev" })).toEqual({
+    kind: "local",
+    image: "reports:dev",
+  });
+  const built = imageSource({ build: true, context: "/work/reports" });
+  expect(built).toEqual({
+    kind: "build",
+    context: "/work/reports",
+    dockerfile: "/work/reports/Dockerfile",
+  });
+  expect(
+    imageSource({
+      build: true,
+      context: "/work/reports",
+      dockerfile: "/work/Dockerfile.plugin",
+    }),
+  ).toMatchObject({ dockerfile: "/work/Dockerfile.plugin" });
+  for (const options of [
+    {},
+    { image: IMAGE, localImage: "reports:dev" },
+    { image: IMAGE, build: true },
+    { localImage: "reports:dev", build: true },
+  ])
+    expect(() => imageSource(options)).toThrow(/exactly one of/);
+  expect(() => imageSource({ image: IMAGE, context: "." })).toThrow(/--build/);
+  expect(() => imageSource({ localImage: "two words" })).toThrow(
+    /--local-image/,
+  );
+});
+
+test("an image in your Docker is uploaded, deployed and added, with no registry", async () => {
+  const api = server({ localImages: ["reports:dev"] });
+  try {
+    await run(["--local-image", "reports:dev"]);
+    // The upload starts the deployment, so nothing is posted to deploy/image.
+    expect(api.posts()).toEqual(["/projects", "/x/plugins/services"]);
+    expect(api.uploads).toEqual([
+      {
+        imageName: "reports:dev",
+        projectId: 7,
+        environmentId: 9,
+        healthCheckPath: "/health",
+        timeoutSecs: 300,
+      },
+    ]);
+    expect(api.builds).toEqual([]);
+    expect(api.watched).toEqual([43]);
+    const printed = api.printed();
+    expect(printed).toContain("pinned to deployment 43");
+    // What was uploaded is the content itself: there is no tag to move.
+    expect(printed).not.toContain("named by a tag");
+  } finally {
+    api.restore();
+  }
+});
+
+test("an image your Docker does not have stops before anything is created", async () => {
+  const api = server({ localImages: [] });
+  try {
+    await expect(run(["--local-image", "reports:dev"])).rejects.toThrow(
+      /Your Docker has no image reports:dev.*--build/,
+    );
+    expect(api.requests).toEqual([]);
+    expect(api.uploads).toEqual([]);
+  } finally {
+    api.restore();
+  }
+});
+
+test("a plugin is built here, uploaded and added in one command", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "plugin-build-"));
+  const context = join(directory, "Audit_Export");
+  const api = server({});
+  try {
+    await expect(run(["--build", "--context", context])).rejects.toThrow(
+      /No Dockerfile at .*Audit_Export\/Dockerfile/,
+    );
+    expect(api.requests).toEqual([]);
+
+    const dockerfile = join(directory, "Dockerfile.plugin");
+    writeFileSync(dockerfile, "FROM scratch\n");
+    await run(["--build", "--context", context, "--dockerfile", dockerfile]);
+    expect(api.builds).toHaveLength(1);
+    const built = api.builds[0];
+    expect(built).toMatchObject({ dockerfile, context, buildArgs: [] });
+    // Named after the directory, and never the same tag twice.
+    expect(built?.tag).toMatch(/^audit-export:plugin-\d+$/);
+    const created = api.requests.find(
+      ({ method, path }) => method === "POST" && path === "/projects",
+    );
+    expect(created?.body).toMatchObject({ name: "audit-export" });
+    expect(api.uploads[0]).toMatchObject({
+      imageName: built?.tag,
+      projectId: 7,
+      environmentId: 9,
+    });
+    expect(api.posts()).toEqual(["/projects", "/x/plugins/services"]);
+  } finally {
+    api.restore();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a build or an upload that fails adds nothing and says what was left", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "plugin-build-"));
+  writeFileSync(join(directory, "Dockerfile"), "FROM scratch\n");
+  const failing = server({ failBuild: true });
+  try {
+    await expect(
+      run(["--build", "--context", directory, "--name", "reports"]),
+    ).rejects.toThrow(
+      /could not be built, so nothing was created or deployed: docker build failed/,
+    );
+    expect(failing.posts()).toEqual([]);
+    expect(failing.uploads).toEqual([]);
+  } finally {
+    failing.restore();
+    rmSync(directory, { recursive: true, force: true });
+  }
+  const refused = server({ localImages: ["reports:dev"], refuseUpload: true });
+  try {
+    await expect(run(["--local-image", "reports:dev"])).rejects.toThrow(
+      /was not uploaded to reports.*--project reports/,
+    );
+    expect(refused.watched).toEqual([]);
+    expect(refused.posts()).toEqual(["/projects"]);
+  } finally {
+    refused.restore();
+  }
+});
+
+test("an uploaded image deployed to a service that is a plugin is an update that waits", async () => {
+  const uploadedUpdate: ServicePlugin = {
+    ...waiting,
+    pending_update: waiting.pending_update && {
+      ...waiting.pending_update,
+      deployment_id: 43,
+    },
+  };
+  const api = server({
+    existing: true,
+    localImages: ["reports:dev"],
+    lists: [[plugin({})], [uploadedUpdate]],
+  });
+  try {
+    await run(["--local-image", "reports:dev", "--project", "reports"]);
+    expect(api.posts()).toEqual([]);
+    expect(api.uploads).toHaveLength(1);
+    expect(api.printed()).toContain("waits for approval");
   } finally {
     api.restore();
   }

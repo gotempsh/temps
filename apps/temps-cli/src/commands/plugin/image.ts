@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { existsSync } from "node:fs";
+import { basename, resolve } from "node:path";
 import type { Command } from "commander";
 import {
   createProject,
@@ -12,12 +14,27 @@ import { requireAuth } from "../../config/store.js";
 import { client, setupClient, getErrorMessage } from "../../lib/api-client.js";
 import { watchDeployment } from "../../lib/deployment-watcher.jsx";
 import { normalizeEnvironmentsResponse } from "../deploy/deploy-image.js";
+import {
+  checkImageExists,
+  dockerBuild,
+  uploadLocalImage,
+} from "../deploy/deploy-local-image.js";
 import { PluginCommandError } from "./grants.js";
 import type { PluginServicesResponse, ServicePlugin } from "./services.js";
 import { updateLines } from "./updates.js";
 
-/** Replaced in tests: the real one draws the deployment's progress. */
-export const imageDeployment = { watch: watchDeployment };
+/**
+ * Replaced in tests: the real ones draw the deployment's progress and run
+ * Docker on this machine.
+ */
+export const imageDeployment = {
+  watch: watchDeployment,
+  /** Whether the local Docker has this image. */
+  exists: checkImageExists,
+  build: dockerBuild,
+  /** Export an image from the local Docker, upload it and start its deployment. */
+  upload: uploadLocalImage,
+};
 
 /** How long a deployed update is looked for before the command says where to find it. */
 const UPDATE_LOOKUPS = 10;
@@ -32,6 +49,10 @@ interface AddedServicePlugin {
 
 interface PluginImageOptions {
   image?: string;
+  localImage?: string;
+  build?: boolean;
+  dockerfile?: string;
+  context?: string;
   project?: string;
   name?: string;
   environment?: string;
@@ -41,13 +62,55 @@ interface PluginImageOptions {
 }
 
 /** The image reference as given, refusing what cannot be one. */
-export function imageReference(value: string | undefined): string {
+export function imageReference(
+  value: string | undefined,
+  option = "--image",
+): string {
   const image = value?.trim() ?? "";
   if (image === "" || /\s/.test(image))
     throw new PluginCommandError(
-      "Name the plugin's image with --image, for example --image registry.example.com/acme/reports:1.2.0.",
+      `Name the plugin's image with ${option}, for example ${option} registry.example.com/acme/reports:1.2.0.`,
     );
   return image;
+}
+
+/**
+ * Where the plugin's image comes from: a registry the server pulls from, the
+ * Docker on this machine, or a Dockerfile built here first.
+ */
+export type ImageSource =
+  | { kind: "registry"; image: string }
+  | { kind: "local"; image: string }
+  | { kind: "build"; dockerfile: string; context: string };
+
+/** The one source the options name, refusing none and more than one. */
+export function imageSource(options: PluginImageOptions): ImageSource {
+  const named = [
+    options.image !== undefined,
+    options.localImage !== undefined,
+    options.build === true,
+  ].filter(Boolean).length;
+  if (named !== 1)
+    throw new PluginCommandError(
+      "Say where the plugin's image comes from with exactly one of: --image <image> (a registry the server pulls from), --local-image <image> (an image in your Docker) or --build (build the Dockerfile here).",
+    );
+  if (options.build) {
+    const context = resolve(options.context ?? ".");
+    const dockerfile = resolve(
+      options.dockerfile ?? resolve(context, "Dockerfile"),
+    );
+    return { kind: "build", dockerfile, context };
+  }
+  if (options.dockerfile !== undefined || options.context !== undefined)
+    throw new PluginCommandError(
+      "--dockerfile and --context say what --build builds; pass --build with them.",
+    );
+  return options.localImage !== undefined
+    ? {
+        kind: "local",
+        image: imageReference(options.localImage, "--local-image"),
+      }
+    : { kind: "registry", image: imageReference(options.image) };
 }
 
 /** Whether an image reference names exact content instead of a tag that can move. */
@@ -61,13 +124,28 @@ export function pinnedByDigest(image: string): boolean {
  */
 export function serviceNameFor(image: string): string {
   const repository = image.replace(/@.*$/, "").replace(/:[^/:]*$/, "");
-  const name = (repository.split("/").pop() ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+  const name = serviceSlug(repository.split("/").pop() ?? "");
   if (name === "")
     throw new PluginCommandError(
       `No service name can be taken from the image ${image}. Give one with --name.`,
+    );
+  return name;
+}
+
+function serviceSlug(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** The name of the service a source is deployed as, unless one is given. */
+function defaultServiceName(source: ImageSource): string {
+  if (source.kind !== "build") return serviceNameFor(source.image);
+  const name = serviceSlug(basename(source.context));
+  if (name === "")
+    throw new PluginCommandError(
+      `No service name can be taken from the directory ${source.context}. Give one with --name.`,
     );
   return name;
 }
@@ -99,7 +177,7 @@ interface Service {
 /** The service named on the command line, or a new one made for the image. */
 async function service(
   options: PluginImageOptions,
-  image: string,
+  defaultName: string,
 ): Promise<{ found: Service; created: boolean }> {
   if (options.project) {
     const result = /^\d+$/.test(options.project)
@@ -111,7 +189,7 @@ async function service(
       );
     return { found: result.data, created: false };
   }
-  const name = options.name?.trim() || serviceNameFor(image);
+  const name = options.name?.trim() || defaultName;
   // A plugin's image is never deployed over a service that merely shares
   // its name: that has to be asked for with --project.
   const existing = await getProjectBySlug({ client, path: { slug: name } });
@@ -156,6 +234,76 @@ async function environmentOf(
   return { id: environment.id, name: environment.name };
 }
 
+/** The image a source is deployed as, building it here first when asked to. */
+async function builtImage(
+  source: ImageSource,
+  options: PluginImageOptions,
+  defaultName: string,
+): Promise<string> {
+  if (source.kind !== "build") return source.image;
+  const image = `${serviceSlug(options.project ?? "") || defaultName || "plugin"}:plugin-${Date.now()}`;
+  console.log(`Building ${image} from ${source.dockerfile}.`);
+  try {
+    await imageDeployment.build({
+      dockerfile: source.dockerfile,
+      context: source.context,
+      tag: image,
+      buildArgs: [],
+      onOutput: (line) => console.log(`  ${line.trimEnd()}`),
+    });
+  } catch (error) {
+    throw new PluginCommandError(
+      `The image could not be built, so nothing was created or deployed: ${getErrorMessage(error)}`,
+    );
+  }
+  return image;
+}
+
+/** Have the server pull an image from its registry and deploy it. */
+async function pulled(
+  found: Service,
+  environmentId: number,
+  image: string,
+  health: string,
+): Promise<{ id: number }> {
+  if (!pinnedByDigest(image))
+    console.log(
+      "This image is named by a tag, which can be moved to other content. Name it by digest (repository@sha256:...) to deploy exactly what you reviewed.",
+    );
+  const started = await deployFromImage({
+    client,
+    path: { project_id: found.id, environment_id: environmentId },
+    body: { image_ref: image, health_check_path: health },
+  });
+  if (started.error || !started.data)
+    throw new PluginCommandError(
+      `The image could not be deployed to ${found.slug}: ${getErrorMessage(started.error)}`,
+    );
+  return started.data;
+}
+
+/** Upload an image from the Docker on this machine and deploy it. */
+async function uploaded(
+  found: Service,
+  environmentId: number,
+  image: string,
+  health: string,
+  timeoutSecs: number,
+): Promise<{ id: number }> {
+  const started = await imageDeployment.upload({
+    imageName: image,
+    projectId: found.id,
+    environmentId,
+    healthCheckPath: health,
+    timeoutSecs,
+  });
+  if (!started)
+    throw new PluginCommandError(
+      `The image ${image} was not uploaded to ${found.slug}, so nothing was deployed or added as a plugin. Run this again with --project ${found.slug} once the reason above is fixed.`,
+    );
+  return started;
+}
+
 async function servicePlugins(): Promise<ServicePlugin[]> {
   const result = await client.get<
     { 200: PluginServicesResponse },
@@ -170,42 +318,48 @@ async function servicePlugins(): Promise<ServicePlugin[]> {
  * that already is one, deploy the image as its update, which waits.
  */
 async function addFromImage(options: PluginImageOptions) {
-  const image = imageReference(options.image);
+  const source = imageSource(options);
   const health = healthCheckPath(options.healthCheckPath);
   const timeoutSecs = Number.parseInt(options.timeout ?? "300", 10);
   if (!Number.isInteger(timeoutSecs) || timeoutSecs < 1)
     throw new PluginCommandError("--timeout is a number of seconds.");
+  // Refused before anything is created: a service is never left behind for
+  // an image that is not there.
+  const defaultName = options.project ? "" : defaultServiceName(source);
+  if (source.kind === "build" && !existsSync(source.dockerfile))
+    throw new PluginCommandError(
+      `No Dockerfile at ${source.dockerfile}. Run this in the plugin's directory, or name it with --dockerfile and --context.`,
+    );
   await requireAuth();
   await setupClient();
   try {
-    const { found, created } = await service(options, image);
+    if (
+      source.kind === "local" &&
+      !(await imageDeployment.exists(source.image))
+    )
+      throw new PluginCommandError(
+        `Your Docker has no image ${source.image}. List what it has with docker images, build the plugin here with --build, or name a registry image with --image.`,
+      );
+    const image = await builtImage(source, options, defaultName);
+    const { found, created } = await service(options, defaultName);
     const environment = await environmentOf(
       found,
       options.environment ?? "production",
     );
     if (created) console.log(`Created the service ${found.slug}.`);
-    if (!pinnedByDigest(image))
-      console.log(
-        "This image is named by a tag, which can be moved to other content. Name it by digest (repository@sha256:...) to deploy exactly what you reviewed.",
-      );
-    const started = await deployFromImage({
-      client,
-      path: { project_id: found.id, environment_id: environment.id },
-      body: { image_ref: image, health_check_path: health },
-    });
-    if (started.error || !started.data)
-      throw new PluginCommandError(
-        `The image could not be deployed to ${found.slug}: ${getErrorMessage(started.error)}`,
-      );
+    const deployment =
+      source.kind === "registry"
+        ? await pulled(found, environment.id, image, health)
+        : await uploaded(found, environment.id, image, health, timeoutSecs);
     const deployed = await imageDeployment.watch({
       projectId: found.id,
-      deploymentId: started.data.id,
+      deploymentId: deployment.id,
       timeoutSecs,
       projectName: found.slug,
     });
     if (!deployed.success)
       throw new PluginCommandError(
-        `Deployment ${started.data.id} of ${found.slug} did not become live${deployed.error ? `: ${deployed.error}` : ""}. Nothing was added as a plugin. See temps deployments logs, fix the image and run this again with --project ${found.slug}.`,
+        `Deployment ${deployment.id} of ${found.slug} did not become live${deployed.error ? `: ${deployed.error}` : ""}. Nothing was added as a plugin. See temps deployments logs, fix the image and run this again with --project ${found.slug}.`,
       );
 
     const bound = (plugin: ServicePlugin) =>
@@ -224,7 +378,7 @@ async function addFromImage(options: PluginImageOptions) {
         throwOnError: true,
       });
       console.log(
-        `Plugin ${added.data.name} (version ${added.data.version}) was added from ${image} and is pinned to deployment ${started.data.id}.`,
+        `Plugin ${added.data.name} (version ${added.data.version}) was added from ${image} and is pinned to deployment ${deployment.id}.`,
       );
       console.log(
         `It has no permissions yet. See what it asks for with temps plugin grants get ${added.data.name}.`,
@@ -236,7 +390,7 @@ async function addFromImage(options: PluginImageOptions) {
     // update never runs as the plugin until it is approved.
     for (let lookup = 0; lookup < UPDATE_LOOKUPS; lookup++) {
       const plugin = (await servicePlugins()).find(bound);
-      if (plugin?.pending_update?.deployment_id === started.data.id) {
+      if (plugin?.pending_update?.deployment_id === deployment.id) {
         for (const line of updateLines(plugin)) console.log(line);
         return;
       }
@@ -245,7 +399,7 @@ async function addFromImage(options: PluginImageOptions) {
       );
     }
     console.log(
-      `Deployment ${started.data.id} is live. Plugin ${existing.name} stays on the build that was approved until you approve this one: temps plugin update ${existing.name}`,
+      `Deployment ${deployment.id} is live. Plugin ${existing.name} stays on the build that was approved until you approve this one: temps plugin update ${existing.name}`,
     );
   } catch (error) {
     if (error instanceof PluginCommandError) throw error;
@@ -257,11 +411,27 @@ export function registerPluginImageCommands(plugin: Command) {
   plugin
     .command("add")
     .description(
-      "Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval",
+      "Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval. The image comes from a registry (--image), from your Docker (--local-image) or from a Dockerfile built here (--build)",
     )
-    .requiredOption(
+    .option(
       "--image <image>",
-      "Image of the plugin, by digest or tag (e.g. registry.example.com/acme/reports:1.2.0)",
+      "Image of the plugin in a registry the server pulls from, by digest or tag (e.g. registry.example.com/acme/reports:1.2.0)",
+    )
+    .option(
+      "--local-image <image>",
+      "Image of the plugin in your Docker; it is uploaded to the server, no registry needed",
+    )
+    .option(
+      "--build",
+      "Build the plugin's Dockerfile here, then upload the image to the server",
+    )
+    .option(
+      "--dockerfile <path>",
+      "Dockerfile that --build builds (default: Dockerfile in the context)",
+    )
+    .option(
+      "--context <path>",
+      "Directory that --build builds from (default: the current directory)",
     )
     .option(
       "-p, --project <project>",
@@ -269,7 +439,7 @@ export function registerPluginImageCommands(plugin: Command) {
     )
     .option(
       "--name <name>",
-      "Name of the service to create (default: taken from the image)",
+      "Name of the service to create (default: taken from the image, or from the directory that is built)",
     )
     .option("-e, --environment <env>", "Environment name", "production")
     .option(

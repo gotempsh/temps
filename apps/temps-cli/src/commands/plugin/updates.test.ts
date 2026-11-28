@@ -5,6 +5,7 @@ import { Command } from "commander";
 import { config, credentials } from "../../config/store.js";
 import type { ServicePlugin } from "./services.js";
 import {
+  imagePart,
   registerPluginUpdateCommands,
   reviewedDeployment,
   updateLines,
@@ -72,6 +73,33 @@ test("a plugin deployed from an image names the approved image and the one that 
   expect(lines).toContain(
     "Deployment 42 (version 1.0.0 -> 1.1.0, image registry.example.com/acme/reports:1.1.0) waits",
   );
+});
+
+test("the content an image resolved to is named with it, since a tag can move", () => {
+  const held = waiting();
+  const lines = updateLines({
+    ...held,
+    image: "registry.example.com/acme/reports:stable",
+    image_id: `sha256:${"a".repeat(64)}`,
+    pending_update: {
+      ...held.pending_update!,
+      image: "registry.example.com/acme/reports:stable",
+      image_id: `sha256:${"b".repeat(64)}`,
+    },
+  }).join("\n");
+  // The same tag, other content: the difference is visible.
+  expect(lines).toContain(
+    "image registry.example.com/acme/reports:stable (content aaaaaaaaaaaa)",
+  );
+  expect(lines).toContain(
+    "image registry.example.com/acme/reports:stable (content bbbbbbbbbbbb)) waits",
+  );
+  // Uploaded from a client: no reference, only what it is.
+  expect(imagePart(undefined, `sha256:${"a".repeat(64)}`)).toBe(
+    ", an uploaded image (content aaaaaaaaaaaa)",
+  );
+  expect(imagePart(undefined, undefined)).toBe("");
+  expect(imagePart("reports:1", null)).toBe(", image reports:1");
 });
 
 test("a waiting update that asks for nothing more is still called new code", () => {

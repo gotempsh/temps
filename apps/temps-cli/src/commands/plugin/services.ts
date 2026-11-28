@@ -26,6 +26,8 @@ export interface PendingPluginUpdate {
   since?: string | null;
   /** The image that waits, when the deployment was made from an image. */
   image?: string | null;
+  /** The content that image resolved to, when Temps recorded it. */
+  image_id?: string | null;
   difference: AccessDifference;
 }
 
@@ -63,6 +65,8 @@ export interface ServicePlugin {
   resource_limits?: PluginResourceLimits | null;
   /** The image the plugin runs, when its service was deployed from one. */
   image?: string | null;
+  /** The content that image resolved to: what was approved. */
+  image_id?: string | null;
 }
 
 /** A plugin an earlier version installed as an executable; it never runs. */

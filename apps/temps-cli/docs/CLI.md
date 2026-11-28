@@ -5037,7 +5037,7 @@ Add a plugin from its image, approve its updates and manage its permissions; cre
 
 **Subcommands:**
 
-- `add` - Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval
+- `add` - Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval. The image comes from a registry (--image), from your Docker (--local-image) or from a Dockerfile built here (--build)
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
 - `services` - List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason
 - `add-service` - Make a deployed service a plugin; it starts with no permissions
@@ -5054,15 +5054,19 @@ Add a plugin from its image, approve its updates and manage its permissions; cre
 
 ### `plugin add`
 
-Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval
+Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval. The image comes from a registry (--image), from your Docker (--local-image) or from a Dockerfile built here (--build)
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--image <image>` | Image of the plugin, by digest or tag (e.g. registry.example.com/acme/reports:1.2.0) | - | Yes |
+| `--image <image>` | Image of the plugin in a registry the server pulls from, by digest or tag (e.g. registry.example.com/acme/reports:1.2.0) | - | No |
+| `--local-image <image>` | Image of the plugin in your Docker; it is uploaded to the server, no registry needed | - | No |
+| `--build` | Build the plugin's Dockerfile here, then upload the image to the server | - | No |
+| `--dockerfile <path>` | Dockerfile that --build builds (default: Dockerfile in the context) | - | No |
+| `--context <path>` | Directory that --build builds from (default: the current directory) | - | No |
 | `-p, --project <project>` | Slug or id of an existing service to deploy the image to; without it a new service is created | - | No |
-| `--name <name>` | Name of the service to create (default: taken from the image) | - | No |
+| `--name <name>` | Name of the service to create (default: taken from the image, or from the directory that is built) | - | No |
 | `-e, --environment <env>` | Environment name | `production` | No |
 | `--port <port>` | Port the plugin listens on, for a service that is created | `8080` | No |
 | `--health-check-path <path>` | Path the deployment is checked on; a plugin answers /health unless its manifest says otherwise | `/health` | No |

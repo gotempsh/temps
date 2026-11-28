@@ -237,7 +237,7 @@ export async function uploadImageArchive(
   }
 }
 
-interface ResolvedDeployment {
+export interface ResolvedDeployment {
   id: number
   slug: string
 }
@@ -346,6 +346,156 @@ export async function writeArchiveStream(
 
   await pipeline(source, countProgress, createWriteStream(outputPath), { signal })
   return totalBytes
+}
+
+export interface UploadLocalImageOptions {
+  /** An image in the local Docker daemon. */
+  imageName: string
+  projectId: number
+  environmentId: number
+  tag?: string
+  healthCheckPath?: string
+  timeoutSecs: number
+}
+
+/**
+ * Export an image from the local Docker daemon, upload it and start its
+ * deployment. Returns the deployment the server started, or `undefined` after
+ * saying why none was (the image is too large, the export failed, the server
+ * refused it). Shared by `deploy:local-image` and `plugin add`.
+ */
+export async function uploadLocalImage(
+  options: UploadLocalImageOptions
+): Promise<ResolvedDeployment | undefined> {
+  const imageName = options.imageName
+  const tempFilename = `temps-image-${Date.now()}.tar`
+  const tempFilePath = join(tmpdir(), tempFilename)
+  const operationController = new AbortController()
+  const removeInterruptHandlers = installInterruptHandlers(operationController)
+
+  let deployment: ResolvedDeployment | undefined
+  try {
+    deployment = await withTemporaryFileCleanup(tempFilePath, async () => {
+      startSpinner('Exporting image with docker save...')
+
+      let exportedSize: number
+      try {
+        exportedSize = await dockerSaveToFile(
+          imageName,
+          tempFilePath,
+          (progress) => {
+            updateSpinner(`Exporting image... ${formatFileSize(progress)} saved`)
+          },
+          operationController.signal
+        )
+        succeedSpinner(`Image exported: ${formatFileSize(exportedSize)}`)
+      } catch (err) {
+        failSpinner('Failed to export image')
+        if (err instanceof Error) {
+          warning(err.message)
+        }
+        if (operationController.signal.aborted) throw err
+        return undefined
+      }
+
+      const MAX_SIZE = 1024 * 1024 * 1024
+      if (exportedSize > MAX_SIZE) {
+        warning(`Image size (${formatFileSize(exportedSize)}) exceeds maximum allowed (1 GB)`)
+        return undefined
+      }
+
+      startSpinner('Uploading image to server...')
+
+      const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+      const apiKey = await credentials.getApiKey()
+      if (!apiKey) {
+        throw new Error('Cannot upload the local image because no API key is configured')
+      }
+      const uploadUrl = `${apiUrl}/projects/${options.projectId}/environments/${options.environmentId}/deploy/image-upload`
+
+      // Sent with the upload and stored on the resulting deployment so a
+      // lost response (e.g. after `reconcileTimedOutImport`'s wait expires)
+      // can be resolved by exact ID instead of guessing from timing, and so
+      // a literal retry with the same ID reuses that deployment instead of
+      // importing and deploying the image again.
+      const uploadRequestId = randomUUID()
+
+      const queryParams = new URLSearchParams()
+      queryParams.set('upload_request_id', uploadRequestId)
+      if (options.tag) {
+        queryParams.set('tag', options.tag)
+      }
+      const healthCheckPath = options.healthCheckPath?.trim()
+      if (healthCheckPath) {
+        if (!healthCheckPath.startsWith('/')) {
+          throw new Error('--health-check-path must start with "/" (e.g. /api/healthz)')
+        }
+        queryParams.set('health_check_path', healthCheckPath)
+      }
+      const finalUrl = `${uploadUrl}?${queryParams.toString()}`
+
+      const filename = `${imageName.replace(/[/:]/g, '-')}.tar`
+
+      let awaitingServerImport = false
+
+      let response: Response
+      try {
+        response = await uploadImageArchive({
+          url: finalUrl,
+          apiKey,
+          archivePath: tempFilePath,
+          filename,
+          archiveSize: exportedSize,
+          responseTimeoutMs: options.timeoutSecs * 1_000,
+          signal: operationController.signal,
+          onProgress: (uploadedBytes) => {
+            updateSpinner(
+              `Uploading... ${formatFileSize(uploadedBytes)} / ${formatFileSize(exportedSize)}`
+            )
+          },
+          onAwaitingImport: () => {
+            awaitingServerImport = true
+            updateSpinner('Upload complete. Waiting for the server to import the image...')
+          },
+        })
+      } catch (err) {
+        // The archive was already fully sent when this failed, so the server
+        // may still finish importing the image and create a deployment.
+        // Reporting a bare failure would invite a retry that deploys the
+        // same image twice — reconcile before deciding the outcome.
+        if (!awaitingServerImport) throw err
+
+        updateSpinner('Checking whether the server started a deployment before retrying...')
+        const reconciled = await reconcileTimedOutImport({
+          projectId: options.projectId,
+          environmentId: options.environmentId,
+          uploadRequestId,
+        })
+
+        if (reconciled) {
+          succeedSpinner(
+            `Server import continued after the local connection dropped — deployment ${reconciled.id} is running`
+          )
+          return reconciled
+        }
+
+        failSpinner('No confirmation received from the server')
+        if (err instanceof Error) warning(err.message)
+        warning('No deployment was found for this upload yet — it is safe to retry.')
+        if (operationController.signal.aborted) throw err
+        return undefined
+      }
+
+      return await resolveUploadedDeployment(response, finalUrl)
+    })
+  } catch (err) {
+    failSpinner('Deployment failed')
+    throw err
+  } finally {
+    removeInterruptHandlers()
+  }
+
+  return deployment
 }
 
 export async function deployLocalImage(options: DeployLocalImageOptions): Promise<void> {
@@ -619,132 +769,14 @@ export async function deployLocalImage(options: DeployLocalImageOptions): Promis
   newline()
 
   // ─── Step 5: Export, upload, and deploy ──────────────────────────────────
-  const tempFilename = `temps-image-${Date.now()}.tar`
-  const tempFilePath = join(tmpdir(), tempFilename)
-  const operationController = new AbortController()
-  const removeInterruptHandlers = installInterruptHandlers(operationController)
-
-  let deployment: ResolvedDeployment | undefined
-  try {
-    deployment = await withTemporaryFileCleanup(tempFilePath, async () => {
-      startSpinner('Exporting image with docker save...')
-
-      let exportedSize: number
-      try {
-        exportedSize = await dockerSaveToFile(
-          imageName,
-          tempFilePath,
-          (progress) => {
-            updateSpinner(`Exporting image... ${formatFileSize(progress)} saved`)
-          },
-          operationController.signal
-        )
-        succeedSpinner(`Image exported: ${formatFileSize(exportedSize)}`)
-      } catch (err) {
-        failSpinner('Failed to export image')
-        if (err instanceof Error) {
-          warning(err.message)
-        }
-        if (operationController.signal.aborted) throw err
-        return undefined
-      }
-
-      const MAX_SIZE = 1024 * 1024 * 1024
-      if (exportedSize > MAX_SIZE) {
-        warning(`Image size (${formatFileSize(exportedSize)}) exceeds maximum allowed (1 GB)`)
-        return undefined
-      }
-
-      startSpinner('Uploading image to server...')
-
-      const apiUrl = normalizeApiUrl(config.get('apiUrl'))
-      const apiKey = await credentials.getApiKey()
-      if (!apiKey) {
-        throw new Error('Cannot upload the local image because no API key is configured')
-      }
-      const uploadUrl = `${apiUrl}/projects/${projectData.id}/environments/${environmentId}/deploy/image-upload`
-
-      // Sent with the upload and stored on the resulting deployment so a
-      // lost response (e.g. after `reconcileTimedOutImport`'s wait expires)
-      // can be resolved by exact ID instead of guessing from timing, and so
-      // a literal retry with the same ID reuses that deployment instead of
-      // importing and deploying the image again.
-      const uploadRequestId = randomUUID()
-
-      const queryParams = new URLSearchParams()
-      queryParams.set('upload_request_id', uploadRequestId)
-      if (options.tag) {
-        queryParams.set('tag', options.tag)
-      }
-      const healthCheckPath = options.healthCheckPath?.trim()
-      if (healthCheckPath) {
-        if (!healthCheckPath.startsWith('/')) {
-          throw new Error('--health-check-path must start with "/" (e.g. /api/healthz)')
-        }
-        queryParams.set('health_check_path', healthCheckPath)
-      }
-      const finalUrl = `${uploadUrl}?${queryParams.toString()}`
-
-      const filename = `${imageName.replace(/[/:]/g, '-')}.tar`
-
-      let awaitingServerImport = false
-
-      let response: Response
-      try {
-        response = await uploadImageArchive({
-          url: finalUrl,
-          apiKey,
-          archivePath: tempFilePath,
-          filename,
-          archiveSize: exportedSize,
-          responseTimeoutMs: timeoutSecondsValue * 1_000,
-          signal: operationController.signal,
-          onProgress: (uploadedBytes) => {
-            updateSpinner(
-              `Uploading... ${formatFileSize(uploadedBytes)} / ${formatFileSize(exportedSize)}`
-            )
-          },
-          onAwaitingImport: () => {
-            awaitingServerImport = true
-            updateSpinner('Upload complete. Waiting for the server to import the image...')
-          },
-        })
-      } catch (err) {
-        // The archive was already fully sent when this failed, so the server
-        // may still finish importing the image and create a deployment.
-        // Reporting a bare failure would invite a retry that deploys the
-        // same image twice — reconcile before deciding the outcome.
-        if (!awaitingServerImport) throw err
-
-        updateSpinner('Checking whether the server started a deployment before retrying...')
-        const reconciled = await reconcileTimedOutImport({
-          projectId: projectData.id,
-          environmentId: environmentId as number,
-          uploadRequestId,
-        })
-
-        if (reconciled) {
-          succeedSpinner(
-            `Server import continued after the local connection dropped — deployment ${reconciled.id} is running`
-          )
-          return reconciled
-        }
-
-        failSpinner('No confirmation received from the server')
-        if (err instanceof Error) warning(err.message)
-        warning('No deployment was found for this upload yet — it is safe to retry.')
-        if (operationController.signal.aborted) throw err
-        return undefined
-      }
-
-      return await resolveUploadedDeployment(response, finalUrl)
-    })
-  } catch (err) {
-    failSpinner('Deployment failed')
-    throw err
-  } finally {
-    removeInterruptHandlers()
-  }
+  const deployment = await uploadLocalImage({
+    imageName,
+    projectId: projectData.id,
+    environmentId: environmentId as number,
+    tag: options.tag,
+    healthCheckPath: options.healthCheckPath,
+    timeoutSecs: timeoutSecondsValue,
+  })
 
   if (!deployment) return
 
@@ -779,7 +811,7 @@ interface DockerBuildOptions {
   onOutput?: (line: string) => void
 }
 
-async function dockerBuild(options: DockerBuildOptions): Promise<void> {
+export async function dockerBuild(options: DockerBuildOptions): Promise<void> {
   return new Promise((resolve, reject) => {
     const args = [
       'build',
@@ -841,7 +873,7 @@ async function dockerBuild(options: DockerBuildOptions): Promise<void> {
   })
 }
 
-async function checkImageExists(imageName: string): Promise<boolean> {
+export async function checkImageExists(imageName: string): Promise<boolean> {
   return new Promise((resolve) => {
     const docker = spawn('docker', ['image', 'inspect', imageName], {
       stdio: ['ignore', 'pipe', 'pipe'],
