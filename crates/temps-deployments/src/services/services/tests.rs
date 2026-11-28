@@ -871,6 +871,7 @@ pub(super) fn create_deployment_service_for_test(
         compose_executor: std::sync::OnceLock::new(),
         audit_logger: std::sync::OnceLock::new(),
         node_scheduler: std::sync::OnceLock::new(),
+        egress_recorder: std::sync::OnceLock::new(),
         workflow_planner: std::sync::OnceLock::new(),
         workload_plane: std::sync::OnceLock::new(),
     }
@@ -960,6 +961,7 @@ pub(crate) fn create_cleanup_service_for_test(
         compose_executor: std::sync::OnceLock::new(),
         audit_logger: std::sync::OnceLock::new(),
         node_scheduler: std::sync::OnceLock::new(),
+        egress_recorder: std::sync::OnceLock::new(),
         workflow_planner: std::sync::OnceLock::new(),
         workload_plane: std::sync::OnceLock::new(),
     }
@@ -4060,6 +4062,7 @@ fn create_deployment_service_for_rebuild(
         compose_executor: std::sync::OnceLock::new(),
         audit_logger: std::sync::OnceLock::new(),
         node_scheduler: std::sync::OnceLock::new(),
+        egress_recorder: std::sync::OnceLock::new(),
         workflow_planner: std::sync::OnceLock::new(),
         workload_plane: std::sync::OnceLock::new(),
     }
@@ -6889,4 +6892,74 @@ async fn rollback_of_a_build_that_was_not_copied_back_uses_the_worker_and_its_po
         Some(vec![8080])
     );
     Ok(())
+}
+
+/// Promotion and rollback build their deploy jobs inline through
+/// `configure_reuse_deploy_builder`, not the workflow registry: the
+/// destination environment's recording opt-in still reaches the job, so
+/// its replacement replicas are recorded (or, with no recorder serving,
+/// the deploy says why) exactly as a fresh deployment's would be.
+#[tokio::test]
+async fn a_reused_image_deploy_keeps_its_environments_recording() {
+    use crate::services::egress_recording::RecordedEgress;
+
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
+            println!("Docker unavailable; skipping: {error}");
+            return;
+        }
+        Err(error) => panic!("failed to prepare test database: {error}"),
+    };
+    let db = test_db.connection_arc();
+    let (project, environment, _) = setup_test_data(&db).await.expect("test data");
+    let service = create_deployment_service_for_test(db.clone());
+
+    let planned = |environment: environments::Model| {
+        let service = &service;
+        let project = &project;
+        async move {
+            let builder = crate::jobs::DeployImageJobBuilder::new(
+                project.slug.clone(),
+                temps_core::docker_socket_grant::DeployCaller::Platform,
+            )
+            .job_id("deploy".to_string())
+            .build_job_id("build".to_string())
+            .target(crate::jobs::DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name(project.slug.clone());
+            let job = service
+                .configure_reuse_deploy_builder(
+                    builder,
+                    project,
+                    &environment,
+                    "nginx:latest",
+                    &std::collections::HashMap::new(),
+                )
+                .await
+                .build(Arc::new(MockContainerDeployer::new()))
+                .expect("valid deploy job");
+            job.config().recorded_egress
+        }
+    };
+
+    assert_eq!(
+        planned(environments::Model {
+            egress_recording: false,
+            ..environment.clone()
+        })
+        .await,
+        RecordedEgress::Off
+    );
+    // Recording on, no recorder serving on this host: not silently off.
+    assert_eq!(
+        planned(environments::Model {
+            egress_recording: true,
+            ..environment
+        })
+        .await,
+        RecordedEgress::NotServing
+    );
 }

@@ -8,13 +8,13 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 **Status:** Proposed — both steps under Sequencing are implemented
 **Date:** 2026-11-27
 
-**Supersedes in part:** [ADR-118](./118-external-plugins-run-in-containers.md)
+**Supersedes in part:** [ADR-121](./121-external-plugins-run-in-containers.md)
 
 Related: ADR-083 and ADR-112 (a service is one deployable unit), ADR-054 (plugin builds on worker nodes), ADR-092 (plugin AI tools).
 
 ## Context
 
-ADR-118 put a plugin's executable in a hardened container that Temps starts itself. That closed the hole (a plugin could read everything the Temps account could), but it left Temps running a second, private container runtime next to the one it already has for deployments: its own image, storage layout, limits, start and stop, and no logs, previews or rollback. It also could not work where Temps itself runs in a container, and an idle plugin still held memory.
+ADR-121 put a plugin's executable in a hardened container that Temps starts itself. That closed the hole (a plugin could read everything the Temps account could), but it left Temps running a second, private container runtime next to the one it already has for deployments: its own image, storage layout, limits, start and stop, and no logs, previews or rollback. It also could not work where Temps itself runs in a container, and an idle plugin still held memory.
 
 Temps already runs other people's code safely and conveniently: that is what a deployment is. A service (a `projects` row) is built from a repository, runs in a hardened container with its own storage and limits, has logs, previews and rollback, and can stop when idle and start on the next request.
 
@@ -68,7 +68,7 @@ The catalogue on Settings > Plugins is a list of repositories. Each listing link
 
 ## Sequencing
 
-1. Additive: the service runtime described above, next to the executable runtimes of ADR-118.
+1. Additive: the service runtime described above, next to the executable runtimes of ADR-121.
 2. Breaking: the executable runtimes (process, plugin launcher, plugin container) and every path that installed or updated an executable (file upload, repository build, registry download, the isolation setting) are removed, with their API routes, console pages and CLI commands.
 
 ### D8. A plugin installed as an executable is retired, not migrated
@@ -77,7 +77,7 @@ After the upgrade, a plugin an earlier version installed as an executable does n
 
 `--plugin-launcher` is still accepted so an existing unit file does not stop the server from starting; it is ignored with a warning.
 
-ADR-118's reasoning about what a plugin must not reach stands. Its container, image, limits and isolation setting are what step 2 removed.
+ADR-121's reasoning about what a plugin must not reach stands. Its container, image, limits and isolation setting are what step 2 removed.
 
 ## Consequences
 

@@ -661,9 +661,10 @@ fn extract_log_record(
     };
 
     Some(LogRecord {
+        workload: None,
         ingest_identity: None,
         attribute_types: kv_to_log_types(&log.attributes),
-        project_id,
+        project_id: Some(project_id),
         deployment_id,
         resource: resource.clone(),
         timestamp,
@@ -1340,7 +1341,7 @@ mod tests {
             records[0].attribute_types["flag"],
             LogAttributeType::Boolean
         );
-        assert_eq!(records[0].project_id, 10);
+        assert_eq!(records[0].project_id, Some(10));
     }
 
     #[test]

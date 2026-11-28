@@ -1985,6 +1985,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         }
     }

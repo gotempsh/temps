@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/api",
-  "version": "0.1.0-beta.64",
+  "version": "0.1.0-beta.65",
   "description": "Typed OpenAPI client for the Temps platform REST API. Generated from the Temps OpenAPI spec with @hey-api/openapi-ts.",
   "license": "Apache-2.0",
   "type": "module",

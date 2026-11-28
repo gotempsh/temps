@@ -599,6 +599,10 @@ pub struct DeploymentJobConfig {
     /// replicas ignore it entirely: they reach the service by container name
     /// over the shared bridge network exactly as before.
     pub cross_node_service_blockers: Vec<crate::services::CrossNodeServiceBlocker>,
+    /// How this deployment's replicas on this host are sent through the
+    /// egress recorder, from the environment's `egress_recording`. Replicas
+    /// on a worker are never given this host's recorder.
+    pub recorded_egress: crate::services::egress_recording::RecordedEgress,
     /// Anti-affinity: avoid placing two replicas on the same node.
     /// When true, the scheduler spreads replicas across different nodes.
     pub anti_affinity: bool,
@@ -673,6 +677,7 @@ impl Default for DeploymentJobConfig {
             allowed_capabilities: Vec::new(),
             remote_environment_variables: None,
             cross_node_service_blockers: Vec::new(),
+            recorded_egress: Default::default(),
             anti_affinity: true,
             exclude_node_ids: Vec::new(),
             workload_mode: Default::default(),
@@ -713,6 +718,9 @@ pub struct DeployImageJob {
     /// Node scheduler for distributing replicas across the cluster.
     /// When None, all replicas deploy locally (single-node mode).
     node_scheduler: Option<Arc<crate::services::NodeScheduler>>,
+    /// This host's egress recorder, told about a steered replica as soon as
+    /// it is created so its first connection already finds it.
+    egress_recorder: Option<Arc<temps_workload_egress::local::LocalEgressRecorder>>,
     /// ADR-055: set for `shadow`/`enforce` environments only.
     workload_plane: Option<WorkloadPlaneDeploy>,
     log_id: Option<String>,
@@ -1583,6 +1591,7 @@ impl DeployImageJob {
             config: DeploymentJobConfig::default(),
             container_deployer,
             node_scheduler: None,
+            egress_recorder: None,
             workload_plane: None,
             log_id: None,
             log_service: None,
@@ -1660,6 +1669,14 @@ impl DeployImageJob {
 
     pub fn with_node_scheduler(mut self, scheduler: Arc<crate::services::NodeScheduler>) -> Self {
         self.node_scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_egress_recorder(
+        mut self,
+        recorder: Option<Arc<temps_workload_egress::local::LocalEgressRecorder>>,
+    ) -> Self {
+        self.egress_recorder = recorder;
         self
     }
 
@@ -4833,6 +4850,7 @@ pub struct DeployImageJobBuilder {
     target: Option<DeploymentTarget>,
     config: DeploymentJobConfig,
     node_scheduler: Option<Arc<crate::services::NodeScheduler>>,
+    egress_recorder: Option<Arc<temps_workload_egress::local::LocalEgressRecorder>>,
     workload_plane: Option<WorkloadPlaneDeploy>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
@@ -4928,6 +4946,7 @@ impl DeployImageJobBuilder {
                 }
             },
             node_scheduler: None,
+            egress_recorder: None,
             workload_plane: None,
             log_id: None,
             log_service: None,
@@ -5198,6 +5217,25 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// Set how local replicas are sent through the egress recorder.
+    pub fn recorded_egress(
+        mut self,
+        recorded_egress: crate::services::egress_recording::RecordedEgress,
+    ) -> Self {
+        self.config.recorded_egress = recorded_egress;
+        self
+    }
+
+    /// Set this host's egress recorder, which a steered replica is
+    /// announced to when it is created.
+    pub fn egress_recorder(
+        mut self,
+        recorder: Option<Arc<temps_workload_egress::local::LocalEgressRecorder>>,
+    ) -> Self {
+        self.egress_recorder = recorder;
+        self
+    }
+
     /// Set the encryption service for decrypting node tokens during remote deployments
     pub fn encryption_service(mut self, service: Arc<temps_core::EncryptionService>) -> Self {
         self.encryption_service = Some(service);
@@ -5263,6 +5301,7 @@ impl DeployImageJobBuilder {
         if let Some(scheduler) = self.node_scheduler {
             job = job.with_node_scheduler(scheduler);
         }
+        job = job.with_egress_recorder(self.egress_recorder);
         if let Some(workload_plane) = self.workload_plane {
             job = job.with_workload_plane(workload_plane);
         }

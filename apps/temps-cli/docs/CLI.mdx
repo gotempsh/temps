@@ -1089,6 +1089,8 @@ Manage environments and environment variables
 - `isolation` - How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
 - `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
 - `ingress` - Whether visitors must sign in to Temps to open an environment
+- `recording` - Show or set whether the environment's deployments record their outbound connections (destination, outcome, bytes; never headers or bodies). Takes effect on the next deployment
+- `outbound` - List the outbound connections a recording environment's deployments made, newest first
 - `crons` - Manage cron jobs
 
 ### `environments list` (alias: `ls`)
@@ -1458,6 +1460,33 @@ Require visitors to sign in to Temps, or stop requiring it
 | `-p, --project <project>` | Project slug | - | No |
 | `--require-login` | Require sign-in only when ingress mode is enforce. Check login_enforced in JSON output or Enforced now in text output | - | No |
 | `--no-require-login` | Visitors do not need to sign in | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments recording <environment>`
+
+Show or set whether the environment's deployments record their outbound connections (destination, outcome, bytes; never headers or bodies). Takes effect on the next deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--on` | Record outbound connections | - | No |
+| `--off` | Stop recording | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments outbound <environment>`
+
+List the outbound connections a recording environment's deployments made, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | Records per page (default 20, max 100) | - | No |
+| `--outcome <outcome>` | Only allowed, refused or failed connections | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`

@@ -911,6 +911,59 @@ async fn test_e2e_ingest_logs_and_query_back() {
     );
     assert_eq!(logs[0]["body"], "Database connection timeout");
     assert_eq!(logs[0]["severity"], "ERROR");
+
+    // A workload filter reads what the platform recorded about a workload:
+    // the project's own log, whatever it carries, is never among it, and
+    // half a filter (or an unknown kind) is a 400.
+    let get = |query: String| {
+        router.clone().oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/otel/logs?project_id={project_id}&{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+    };
+    let response = get("severity=ERROR&workload_kind=sandbox&workload_id=1".into())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+    let logs_resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    assert!(
+        logs_resp["data"].as_array().unwrap().is_empty(),
+        "an application log is no workload's recorded connection"
+    );
+    for half in [
+        "workload_kind=sandbox",
+        "workload_id=1",
+        "workload_kind=bogus&workload_id=1",
+    ] {
+        let response = get(half.into()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{half}");
+    }
+    // A project id of 0 or below names no project: refused, never read as
+    // "the workload in any project".
+    for project in [0, -1] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/otel/logs?project_id={project}&workload_kind=sandbox&workload_id=1"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "project {project}"
+        );
+    }
 }
 
 // ── Auth failure E2E tests ──────────────────────────────────────────

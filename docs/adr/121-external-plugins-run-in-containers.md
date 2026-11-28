@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-118: External plugins run in containers
+# ADR-121: External plugins run in containers
 
 **Status:** Superseded — the plugin container, image, limits and isolation setting described here were removed by ADR-119; the reasoning about what a plugin must not reach stands
 **Date:** 2026-11-27

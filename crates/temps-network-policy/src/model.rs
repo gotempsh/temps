@@ -373,7 +373,12 @@ pub fn compile_policies(
     }
     compiled.egress = proxy
         .into_iter()
-        .map(|(subject, rules)| EgressPolicy { subject, rules })
+        .map(|(subject, rules)| EgressPolicy {
+            subject,
+            rules,
+            record: false,
+            public_only: false,
+        })
         .collect();
     Ok(compiled)
 }

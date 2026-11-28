@@ -536,6 +536,7 @@ mod tests {
             preview_access: access,
             preview_allowed_cidrs: Vec::new(),
             egress_policy: Default::default(),
+            egress_recording: false,
         }
     }
 

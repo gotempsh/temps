@@ -9,7 +9,7 @@
 //! * `network_policy_profiles`: a subject's egress/ingress profile when it
 //!   differs from its kind's default.
 //! * `nodes.network_policy_mode` (`control_plane_node_settings` for node 0):
-//!   `legacy` (default, today's behaviour), `shadow`, `enforce`.
+//!   `off` (default, today's behaviour), `shadow`, `enforce`.
 //! * `internal_access_grants`: which other projects may call a project's
 //!   `*.temps.local` addresses through the internal proxy (ADR 101).
 //! * The node-0 enforcer: `temps-workload-netpol`'s [`NodeEnforcer`] with the
@@ -19,10 +19,12 @@
 
 pub mod error;
 pub mod handlers;
+pub mod idle;
 pub mod internal_access;
 pub mod model;
 pub mod node_api;
 pub mod plugin;
+pub mod recording;
 pub mod service;
 pub mod source;
 
@@ -31,5 +33,6 @@ pub use handlers::NetworkPolicyApiDoc;
 pub use internal_access::{InternalAccessApiDoc, InternalAccessService};
 pub use node_api::{node_routes, NetworkPolicyNodeState};
 pub use plugin::NetworkPolicyPlugin;
+pub use recording::NodeRecordingStatus;
 pub use service::NetworkPolicyService;
 pub use source::DbPolicySource;

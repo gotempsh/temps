@@ -290,6 +290,11 @@ pub trait OtelStorage: Send + Sync {
     /// Query log records from the fast-query store.
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>>;
 
+    /// How many log records [`OtelStorage::query_logs`] would match without
+    /// its limit and offset, for pagination. Must apply exactly the same
+    /// filters.
+    async fn count_logs(&self, query: LogQuery) -> StorageResult<u64>;
+
     // ── Cross-project trace refs (ADR-027 Phase 0) ──────────────────
 
     /// Record that `project_id` holds spans for each `trace_id` — the

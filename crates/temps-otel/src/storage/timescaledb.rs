@@ -707,7 +707,24 @@ impl TimescaleDbStorage {
 
     /// The caller claims optional adapter identities in the native transaction.
     /// Unidentified OTLP records retain their existing at-least-once semantics.
+    ///
+    /// One statement per [`LOG_ROWS_PER_STATEMENT`] records: PostgreSQL
+    /// binds at most 65,535 parameters in one statement. A caller with more
+    /// than that passes a transaction, so the batch is stored whole or not
+    /// at all.
     async fn batch_insert_logs<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        records: &[LogRecord],
+    ) -> StorageResult<u64> {
+        let mut stored = 0;
+        for chunk in records.chunks(LOG_ROWS_PER_STATEMENT) {
+            stored += self.insert_log_rows(db, chunk).await?;
+        }
+        Ok(stored)
+    }
+
+    async fn insert_log_rows<C: ConnectionTrait>(
         &self,
         db: &C,
         records: &[LogRecord],
@@ -720,7 +737,8 @@ impl TimescaleDbStorage {
             "INSERT INTO otel_log_events (
                 project_id, deployment_id, service_name, service_version,
                 deployment_environment, timestamp, observed_timestamp,
-                severity, severity_text, body, trace_id, span_id, attributes, attribute_types
+                severity, severity_text, body, trace_id, span_id, attributes, attribute_types,
+                workload_kind, workload_id
             ) VALUES ",
         );
 
@@ -732,7 +750,7 @@ impl TimescaleDbStorage {
                 sql.push_str(", ");
             }
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 param_idx,
                 param_idx + 1,
                 param_idx + 2,
@@ -746,9 +764,11 @@ impl TimescaleDbStorage {
                 param_idx + 10,
                 param_idx + 11,
                 param_idx + 12,
-                param_idx + 13
+                param_idx + 13,
+                param_idx + 14,
+                param_idx + 15
             ));
-            param_idx += 14;
+            param_idx += 16;
 
             let attrs_json = serde_json::to_value(&r.attributes).unwrap_or_default();
 
@@ -769,6 +789,10 @@ impl TimescaleDbStorage {
                 serde_json::to_value(&r.attribute_types)
                     .unwrap_or_default()
                     .into(),
+                r.workload
+                    .map(|workload| workload.kind.as_str().to_string())
+                    .into(),
+                r.workload.map(|workload| workload.id).into(),
             ]);
         }
 
@@ -936,15 +960,28 @@ impl OtelStorage for TimescaleDbStorage {
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
         if !records.iter().any(|r| r.ingest_identity.is_some()) {
-            return self.batch_insert_logs(self.db.as_ref(), &records).await;
+            if records.len() <= LOG_ROWS_PER_STATEMENT {
+                return self.batch_insert_logs(self.db.as_ref(), &records).await;
+            }
+            // Several statements: one transaction, so the batch is whole.
+            let tx = self.db.begin().await?;
+            let stored = self.batch_insert_logs(&tx, &records).await?;
+            tx.commit().await?;
+            return Ok(stored);
         }
         let tx = self.db.begin().await?;
         let indices = super::receipts::claim(
             &tx,
             "logs",
+            // A retry identity is claimed per project. A record without a
+            // project is one the platform observed about a projectless
+            // workload; it carries no identity and is always stored.
             &records
                 .iter()
-                .map(|r| (r.project_id, r.ingest_identity.as_ref()))
+                .map(|r| match r.project_id {
+                    Some(project_id) => (project_id, r.ingest_identity.as_ref()),
+                    None => (0, None),
+                })
                 .collect::<Vec<_>>(),
         )
         .await?;
@@ -959,13 +996,13 @@ impl OtelStorage for TimescaleDbStorage {
         match &self.s3_client {
             Some(archiver) => {
                 // Group by project for separate S3 paths
-                let mut by_project: std::collections::HashMap<i32, Vec<LogRecord>> =
-                    std::collections::HashMap::new();
-                for record in records {
-                    by_project
-                        .entry(record.project_id)
-                        .or_default()
-                        .push(record);
+                let (by_project, unowned) = archivable_logs(records);
+                let count = count - unowned;
+                if unowned > 0 {
+                    debug!(
+                        records = unowned,
+                        "log records of workloads without a project are not archived to S3"
+                    );
                 }
                 for (project_id, project_records) in by_project {
                     if let Err(e) = archiver.upload_ndjson(project_id, &project_records).await {
@@ -2352,72 +2389,14 @@ impl OtelStorage for TimescaleDbStorage {
         let limit = query.limit.unwrap_or(100).min(1000);
         let offset = query.offset.unwrap_or(0);
 
-        let mut where_clauses = vec!["project_id = $1".to_string()];
-        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
-        let mut param_idx = 2u32;
-
-        if let Some(sev) = query.severity {
-            where_clauses.push(format!("severity = ${}", param_idx));
-            values.push(sev.to_string().into());
-            param_idx += 1;
-        }
-        if let Some(ref svc) = query.service_name {
-            where_clauses.push(format!("service_name = ${}", param_idx));
-            values.push(svc.clone().into());
-            param_idx += 1;
-        }
-        if let Some(ref search) = query.search {
-            where_clauses.push(format!("body ILIKE ${}", param_idx));
-            values.push(format!("%{}%", search).into());
-            param_idx += 1;
-        }
-        if let Some(ref tid) = query.trace_id {
-            where_clauses.push(format!("trace_id = ${}", param_idx));
-            values.push(tid.clone().into());
-            param_idx += 1;
-        }
-        if let Some(start) = query.start_time {
-            where_clauses.push(format!("timestamp >= ${}", param_idx));
-            values.push(start.into());
-            param_idx += 1;
-        }
-        if let Some(end) = query.end_time {
-            where_clauses.push(format!("timestamp <= ${}", param_idx));
-            values.push(end.into());
-            param_idx += 1;
-        }
-
-        if let Some(filter) = &query.attribute_filter {
-            filter.validate()?;
-            let key_param = param_idx;
-            values.push(filter.key.clone().into());
-            param_idx += 1;
-            if let Some(ty) = filter.ty {
-                where_clauses.push(format!(
-                    "attribute_types->>${key_param}::text = ${param_idx}"
-                ));
-                values.push(ty.as_str().into());
-                param_idx += 1;
-            }
-            let operator = filter.operator.sql();
-            if filter.ty.is_some_and(LogAttributeType::is_numeric) {
-                where_clauses.push(format!("temps_log_numeric(attributes->>${key_param}::text) {operator} temps_log_numeric(${param_idx}::text)"));
-            } else {
-                where_clauses.push(format!(
-                    "attributes->>${key_param}::text {operator} ${param_idx}::text"
-                ));
-            }
-            values.push(filter.value.clone().into());
-            param_idx += 1;
-        }
-
-        let where_sql = where_clauses.join(" AND ");
+        let (where_sql, mut values, param_idx) = log_filter(&query)?;
 
         let sql = format!(
             r#"
             SELECT project_id, deployment_id, service_name, service_version,
                    deployment_environment, timestamp, observed_timestamp,
-                   severity, severity_text, body, trace_id, span_id, attributes, attribute_types
+                   severity, severity_text, body, trace_id, span_id, attributes, attribute_types,
+                   workload_kind, workload_id
             FROM otel_log_events
             WHERE {where_sql}
             ORDER BY timestamp DESC,
@@ -2446,6 +2425,23 @@ impl OtelStorage for TimescaleDbStorage {
             .collect();
 
         Ok(records)
+    }
+
+    async fn count_logs(&self, query: LogQuery) -> StorageResult<u64> {
+        let (where_sql, values, _) = log_filter(&query)?;
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!("SELECT count(*) AS n FROM otel_log_events WHERE {where_sql}"),
+                values,
+            ))
+            .await?;
+        let count: i64 = match row {
+            Some(row) => row.try_get("", "n")?,
+            None => 0,
+        };
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     // ── Cross-project trace refs (ADR-027 Phase 0) ──────────────────────────
@@ -4401,6 +4397,118 @@ fn parse_span_row(row: &sea_orm::QueryResult) -> Result<SpanRecord, OtelError> {
     })
 }
 
+/// The `WHERE` clause of a log query, its bound values, and the next free
+/// parameter index. Shared by the query and its count so both always apply
+/// exactly the same filters.
+fn log_filter(query: &LogQuery) -> StorageResult<(String, Vec<sea_orm::Value>, u32)> {
+    // A workload's records are read by the workload columns, which only the
+    // platform fills, and within the project, whatever its id (a request
+    // naming project 0 or a negative one finds nothing, never everything).
+    // Only a caller that authorized the workload itself reads its records
+    // in any project. Everything else is read by project.
+    let (mut where_clauses, mut values, mut param_idx) = match query.workload {
+        Some(workload) if !query.workload_in_any_project => (
+            vec![
+                "workload_kind = $1".to_string(),
+                "workload_id = $2".to_string(),
+                "project_id = $3".to_string(),
+            ],
+            vec![
+                sea_orm::Value::from(workload.kind.as_str().to_string()),
+                workload.id.into(),
+                sea_orm::Value::from(query.project_id),
+            ],
+            4u32,
+        ),
+        Some(workload) => (
+            vec![
+                "workload_kind = $1".to_string(),
+                "workload_id = $2".to_string(),
+            ],
+            vec![
+                sea_orm::Value::from(workload.kind.as_str().to_string()),
+                workload.id.into(),
+            ],
+            3u32,
+        ),
+        None => (
+            vec!["project_id = $1".to_string()],
+            vec![sea_orm::Value::from(query.project_id)],
+            2u32,
+        ),
+    };
+    if let Some(sev) = query.severity {
+        where_clauses.push(format!("severity = ${}", param_idx));
+        values.push(sev.to_string().into());
+        param_idx += 1;
+    }
+    if let Some(ref svc) = query.service_name {
+        where_clauses.push(format!("service_name = ${}", param_idx));
+        values.push(svc.clone().into());
+        param_idx += 1;
+    }
+    if let Some(ref search) = query.search {
+        where_clauses.push(format!("body ILIKE ${}", param_idx));
+        values.push(format!("%{}%", search).into());
+        param_idx += 1;
+    }
+    if let Some(ref tid) = query.trace_id {
+        where_clauses.push(format!("trace_id = ${}", param_idx));
+        values.push(tid.clone().into());
+        param_idx += 1;
+    }
+    if let Some(start) = query.start_time {
+        where_clauses.push(format!("timestamp >= ${}", param_idx));
+        values.push(start.into());
+        param_idx += 1;
+    }
+    if let Some(end) = query.end_time {
+        where_clauses.push(format!("timestamp <= ${}", param_idx));
+        values.push(end.into());
+        param_idx += 1;
+    }
+
+    if let Some(filter) = &query.attribute_filter {
+        filter.validate()?;
+        let key_param = param_idx;
+        values.push(filter.key.clone().into());
+        param_idx += 1;
+        if let Some(ty) = filter.ty {
+            where_clauses.push(format!(
+                "attribute_types->>${key_param}::text = ${param_idx}"
+            ));
+            values.push(ty.as_str().into());
+            param_idx += 1;
+        }
+        let operator = filter.operator.sql();
+        if filter.ty.is_some_and(LogAttributeType::is_numeric) {
+            where_clauses.push(format!("temps_log_numeric(attributes->>${key_param}::text) {operator} temps_log_numeric(${param_idx}::text)"));
+        } else {
+            where_clauses.push(format!(
+                "attributes->>${key_param}::text {operator} ${param_idx}::text"
+            ));
+        }
+        values.push(filter.value.clone().into());
+        param_idx += 1;
+    }
+
+    Ok((where_clauses.join(" AND "), values, param_idx))
+}
+
+/// The workload a stored record is about, when the platform observed it for
+/// one. A kind this build does not know reads as no workload.
+fn log_row_workload(row: &sea_orm::QueryResult) -> Option<temps_workload::WorkloadRef> {
+    let kind = row
+        .try_get::<Option<String>>("", "workload_kind")
+        .ok()
+        .flatten()?;
+    let id = row
+        .try_get::<Option<i64>>("", "workload_id")
+        .ok()
+        .flatten()?;
+    Some(temps_workload::WorkloadRef::new(kind.parse().ok()?, id))
+}
+
 fn parse_log_row(row: &sea_orm::QueryResult) -> Result<LogRecord, OtelError> {
     let attrs_json: serde_json::Value = row.try_get("", "attributes").unwrap_or_default();
     let attributes: std::collections::BTreeMap<String, String> =
@@ -4419,11 +4527,12 @@ fn parse_log_row(row: &sea_orm::QueryResult) -> Result<LogRecord, OtelError> {
 
     Ok(LogRecord {
         ingest_identity: None,
+        workload: log_row_workload(row),
         attribute_types: serde_json::from_value(
             row.try_get("", "attribute_types").unwrap_or_default(),
         )
         .unwrap_or_default(),
-        project_id: row.try_get("", "project_id").unwrap_or(0),
+        project_id: row.try_get::<Option<i32>>("", "project_id").ok().flatten(),
         deployment_id: row.try_get("", "deployment_id").ok(),
         resource: ResourceInfo {
             service_name: row.try_get("", "service_name").unwrap_or_default(),
@@ -4504,6 +4613,30 @@ fn parse_health_summary_row(row: &sea_orm::QueryResult) -> Result<HealthSummary,
     })
 }
 
+/// Records per log insert statement: PostgreSQL's 65,535 bind parameters
+/// over the 16 columns each row binds.
+pub(crate) const LOG_ROWS_PER_STATEMENT: usize = 65_535 / 16;
+const _: () = assert!(LOG_ROWS_PER_STATEMENT * 16 <= 65_535);
+
+/// `records` by project, the layout of the archive, and how many have no
+/// project: those the platform observed about a workload without one stay
+/// in the queryable store only, for its retention period, and are not
+/// counted as archived.
+fn archivable_logs(
+    records: Vec<LogRecord>,
+) -> (std::collections::HashMap<i32, Vec<LogRecord>>, u64) {
+    let mut by_project: std::collections::HashMap<i32, Vec<LogRecord>> =
+        std::collections::HashMap::new();
+    let mut unowned = 0u64;
+    for record in records {
+        match record.project_id {
+            Some(project_id) => by_project.entry(project_id).or_default().push(record),
+            None => unowned += 1,
+        }
+    }
+    (by_project, unowned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4513,8 +4646,85 @@ mod tests {
     use chrono::TimeZone;
     use std::collections::BTreeMap;
 
+    /// A workload filter reads that workload's records within the project,
+    /// whatever the project id; only a caller that authorized the workload
+    /// itself (`workload_in_any_project`) reads them by the workload alone.
+    #[test]
+    fn a_workload_filter_stays_inside_its_project() {
+        let workload = temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 42);
+        let (sql, values, next) = log_filter(&LogQuery {
+            project_id: 7,
+            workload: Some(workload),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            sql.starts_with("workload_kind = $1 AND workload_id = $2 AND project_id = $3"),
+            "{sql}"
+        );
+        assert_eq!(values.len(), 3);
+        assert_eq!(next, 4);
+
+        // A project id of 0 or below is a project like any other: nothing
+        // is lifted by naming it.
+        for project_id in [0, -1] {
+            let (sql, values, _) = log_filter(&LogQuery {
+                project_id,
+                workload: Some(workload),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(sql.contains("project_id = $3"), "{project_id}: {sql}");
+            assert_eq!(values.len(), 3);
+        }
+
+        // Only an explicit read of the workload in any project lifts it.
+        let (sql, values, _) = log_filter(&LogQuery {
+            workload: Some(workload),
+            workload_in_any_project: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!sql.contains("project_id"), "{sql}");
+        assert_eq!(values.len(), 2);
+    }
+
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
+    }
+
+    fn log_of(project_id: Option<i32>) -> LogRecord {
+        LogRecord {
+            workload: None,
+            ingest_identity: None,
+            attribute_types: Default::default(),
+            project_id,
+            deployment_id: None,
+            resource: ResourceInfo::default(),
+            timestamp: ts(0),
+            observed_timestamp: ts(0),
+            severity: crate::types::LogSeverity::Info,
+            severity_text: "INFO".into(),
+            body: "a line".into(),
+            trace_id: None,
+            span_id: None,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    /// Records without a project are not archived, so they are not counted
+    /// as archived either.
+    #[test]
+    fn records_without_a_project_are_left_out_of_the_archive_and_its_count() {
+        let (by_project, unowned) = archivable_logs(vec![
+            log_of(Some(1)),
+            log_of(None),
+            log_of(Some(2)),
+            log_of(Some(1)),
+        ]);
+        assert_eq!(unowned, 1);
+        assert_eq!(by_project[&1].len(), 2);
+        assert_eq!(by_project[&2].len(), 1);
     }
 
     /// Minimal span builder for fold tests.

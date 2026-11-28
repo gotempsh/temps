@@ -13,6 +13,11 @@
 //!   identifies the workload by source address and applies hostname and
 //!   CIDR rules plus the public-address check.
 //!
+//! With `recording` set, the proxy records the connections of workloads
+//! whose policy opts in and delivers them, batched, to the control plane's
+//! `POST /internal/nodes/{id}/egress-records` with the node token, exactly
+//! as a worker's agent would ([`HttpRecordSink`]).
+//!
 //! `sink` is the other end of the proofs: it accepts TCP on the given
 //! ports (answering a minimal HTTP response) and logs every UDP datagram
 //! with its source address, which is what the anti-spoofing proof reads.
@@ -31,9 +36,11 @@ use temps_node_dns::upstream::UpstreamResolver;
 use temps_node_dns::{ZoneAuthority, ZoneRecord, ZoneStore};
 use temps_workload::WorkloadRef;
 use temps_workload_netpol::dns::{Alias, NamedWorkload};
+use temps_workload_netpol::egress::record::RECORD_CHANNEL_CAPACITY;
 use temps_workload_netpol::{
-    DnsPolicy, EgressPolicy, EgressProxy, EgressProxyConfig, EgressTable, IdentityMap,
-    RelayUpstream, WorkloadPolicy,
+    recording_channel, DnsPolicy, EgressBatcher, EgressPolicy, EgressProxy, EgressProxyConfig,
+    EgressRecordBatch, EgressRecordSink, EgressTable, IdentityMap, RecordSinkError, RelayUpstream,
+    WorkloadPolicy,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -77,6 +84,152 @@ pub struct ServeConfig {
     /// Seconds between stats lines on stdout. `None`: never.
     #[serde(default)]
     pub stats_every_secs: Option<u64>,
+    /// Where connection records go. `None`: the proxy has no recorder and
+    /// records nothing, whatever the policies say.
+    #[serde(default)]
+    pub recording: Option<RecordingConfig>,
+}
+
+/// The control plane endpoint records are delivered to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingConfig {
+    /// `http://host:port/api/internal/nodes/{id}/egress-records`.
+    pub url: String,
+    /// The node token.
+    pub token: String,
+    /// The batch age flush, in milliseconds. Default: the production 5 s.
+    #[serde(default)]
+    pub max_batch_age_ms: Option<u64>,
+    /// Records queued between the proxy and the batcher. Default: the
+    /// production capacity.
+    #[serde(default)]
+    pub channel_capacity: Option<usize>,
+}
+
+/// Delivers batches with one plain-HTTP/1.1 `POST` each (the probe runs in a
+/// bare container, so it carries no TLS stack; the control plane is
+/// reached over the node network). A non-2xx answer is a failed delivery.
+pub struct HttpRecordSink {
+    authority: String,
+    path: String,
+    token: String,
+}
+
+impl HttpRecordSink {
+    pub fn new(url: &str, token: &str) -> Result<Self, ProbeError> {
+        let invalid = |reason: &str| ProbeError::Config {
+            path: url.to_string(),
+            reason: reason.to_string(),
+        };
+        let rest = url
+            .strip_prefix("http://")
+            .ok_or_else(|| invalid("recording url must be http://"))?;
+        let (authority, path) = rest
+            .split_once('/')
+            .ok_or_else(|| invalid("recording url has no path"))?;
+        Ok(Self {
+            authority: authority.to_string(),
+            path: format!("/{path}"),
+            token: token.to_string(),
+        })
+    }
+
+    async fn post(&self, body: &[u8]) -> Result<(u16, String), String> {
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&self.authority),
+        )
+        .await
+        .map_err(|_| "connect timed out".to_string())?
+        .map_err(|e| e.to_string())?;
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.path,
+            self.authority,
+            self.token,
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stream.write_all(body).await.map_err(|e| e.to_string())?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            .await
+            .map_err(|_| "response timed out".to_string())?
+            .map_err(|e| e.to_string())?;
+        let text = String::from_utf8_lossy(&response);
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .ok_or_else(|| format!("unreadable response: {}", text.lines().next().unwrap_or("")))?;
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or("")
+            .to_string();
+        if !(200..300).contains(&status) {
+            println!("records rejected {status} {}", body.trim());
+        }
+        Ok((status, body))
+    }
+}
+
+/// What the control plane's ingest says it did with a batch: how many it
+/// stored. Whatever it did not store (the workload stopped recording, is not
+/// placed on this node, its project is over its quota or the quota could
+/// not be checked) is discarded, whatever the reason.
+#[derive(Debug, serde::Deserialize)]
+struct IngestAnswer {
+    stored: u64,
+}
+
+/// The [`Delivered`](temps_workload_netpol::Delivered) of a batch of
+/// `records` ingest accepted with `answer`: only what it says it stored is
+/// delivered, the rest is discarded. An answer that does not say what was
+/// stored is an error, never a full delivery.
+fn delivered_from(
+    records: usize,
+    answer: &str,
+) -> Result<temps_workload_netpol::Delivered, String> {
+    let answer: IngestAnswer = serde_json::from_str(answer.trim())
+        .map_err(|e| format!("its answer does not say what was stored: {e}"))?;
+    let records = records as u64;
+    Ok(temps_workload_netpol::Delivered {
+        discarded: records - answer.stored.min(records),
+        ..Default::default()
+    })
+}
+
+#[async_trait::async_trait]
+impl EgressRecordSink for HttpRecordSink {
+    async fn deliver(
+        &self,
+        batch: EgressRecordBatch,
+    ) -> Result<temps_workload_netpol::Delivered, RecordSinkError> {
+        let records = batch.records.len();
+        let failed = |reason: String| RecordSinkError::Delivery {
+            destination: format!("http://{}{}", self.authority, self.path),
+            records,
+            reason,
+        };
+        let body = serde_json::to_vec(&batch).map_err(|e| failed(e.to_string()))?;
+        match self.post(&body).await {
+            Ok((status, answer)) if (200..300).contains(&status) => {
+                let delivered = delivered_from(records, &answer).map_err(failed)?;
+                println!(
+                    "records delivered {} discarded {}",
+                    records as u64 - delivered.discarded,
+                    delivered.discarded
+                );
+                Ok(delivered)
+            }
+            Ok((status, _)) => Err(failed(format!("answered {status}"))),
+            Err(reason) => Err(failed(reason)),
+        }
+    }
 }
 
 impl ServeConfig {
@@ -146,10 +299,32 @@ pub async fn serve(config: ServeConfig) -> Result<(), ProbeError> {
                     reason: e.to_string(),
                 })?);
         }
+        let (recorder, records) = match &config.recording {
+            Some(recording) => {
+                let (recorder, stream) = recording_channel(
+                    recording
+                        .channel_capacity
+                        .unwrap_or(RECORD_CHANNEL_CAPACITY),
+                );
+                (Some(recorder), Some((stream, recording.clone())))
+            }
+            None => (None, None),
+        };
         let proxy =
-            EgressProxy::new(proxy_config, table.clone()).map_err(|e| ProbeError::Egress {
-                reason: e.to_string(),
+            EgressProxy::with_recorder(proxy_config, table.clone(), recorder).map_err(|e| {
+                ProbeError::Egress {
+                    reason: e.to_string(),
+                }
             })?;
+        if let Some((stream, recording)) = records {
+            let sink = Arc::new(HttpRecordSink::new(&recording.url, &recording.token)?);
+            let mut batcher = EgressBatcher::default();
+            if let Some(ms) = recording.max_batch_age_ms {
+                batcher.max_age = Duration::from_millis(ms.max(1));
+            }
+            info!(url = %recording.url, "egress proxy records opted-in workloads");
+            tasks.spawn(batcher.run(stream, sink, proxy.stats().clone()));
+        }
         let listener = proxy.bind().await.map_err(|e| ProbeError::Bind {
             addr: addr.to_string(),
             reason: e.to_string(),
@@ -222,6 +397,127 @@ pub async fn sink(udp_port: Option<u16>, tcp_ports: Vec<u16>) -> Result<(), Prob
     Ok(())
 }
 
+/// How many requests the stand-in record sink reads at once; past it a
+/// connection is answered busy and closed.
+const RECORD_SINK_CONNECTIONS: usize = 16;
+/// How long one request may take to arrive whole.
+const RECORD_SINK_DEADLINE: Duration = Duration::from_secs(30);
+/// The largest request head the stand-in reads.
+const MAX_SINK_HEAD: usize = 16 * 1024;
+/// The largest batch body it reads: what the control plane's endpoint takes.
+const MAX_SINK_BODY: usize = 1024 * 1024;
+const SINK_BUSY: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// Reads one request's body, refusing (with the status to answer) a head
+/// or body over its bound before buffering it.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>, &'static str> {
+    let mut seen = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = stream.read(&mut buf).await.map_err(|_| "400 Bad Request")?;
+        if n == 0 {
+            return Err("400 Bad Request");
+        }
+        seen.extend_from_slice(&buf[..n]);
+        let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if seen.len() > MAX_SINK_HEAD {
+                return Err("431 Request Header Fields Too Large");
+            }
+            continue;
+        };
+        let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if length > MAX_SINK_BODY {
+            return Err("413 Content Too Large");
+        }
+        if seen.len() >= end + 4 + length {
+            return Ok(seen[end + 4..end + 4 + length].to_vec());
+        }
+    }
+}
+
+/// A stand-in for the control plane's record endpoint: accepts one batch
+/// per `POST`, answers `200`, and prints `records received <n> dropped <d>
+/// total <t>` for each, so the proofs can count what a recording proxy
+/// delivered without a control plane on the Docker network.
+pub async fn record_sink(port: u16) -> Result<(), ProbeError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let listener = TcpListener::bind(("0.0.0.0", port))
+        .await
+        .map_err(|e| ProbeError::Bind {
+            addr: format!("0.0.0.0:{port}"),
+            reason: e.to_string(),
+        })?;
+    let total = Arc::new(AtomicU64::new(0));
+    // Bounded like the endpoint it stands in for: a few requests at once,
+    // each at most a batch, each read whole within a deadline.
+    let slots = Arc::new(tokio::sync::Semaphore::new(RECORD_SINK_CONNECTIONS));
+    while let Ok((mut stream, _)) = listener.accept().await {
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            let _ = stream.write_all(SINK_BUSY).await;
+            continue;
+        };
+        let total = total.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let read = tokio::time::timeout(RECORD_SINK_DEADLINE, read_request(&mut stream)).await;
+            let body = match read {
+                Ok(Ok(body)) => body,
+                Ok(Err(status)) => {
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    return;
+                }
+                Err(_) => return,
+            };
+            let (status, line, answer) = match serde_json::from_slice::<EgressRecordBatch>(&body) {
+                Ok(batch) => {
+                    let n = batch.records.len() as u64;
+                    let t = total.fetch_add(n, Ordering::Relaxed) + n;
+                    let repeats: u64 = batch.records.iter().map(|r| u64::from(r.count)).sum();
+                    (
+                        "200 OK",
+                        format!(
+                            "records received {n} connections {repeats} dropped {} total {t}",
+                            batch.dropped
+                        ),
+                        // What ingest answers: what it stored (all of it),
+                        // which the recording proxy counts as delivered.
+                        format!("{{\"stored\":{n}}}"),
+                    )
+                }
+                Err(e) => (
+                    "400 Bad Request",
+                    format!("records unreadable: {e}"),
+                    String::new(),
+                ),
+            };
+            println!("{line}");
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    )
+                        .as_bytes(),
+                )
+                .await;
+        });
+    }
+    Ok(())
+}
+
 /// The address [`public_dns`] answers every `A` query with
 /// (TEST-NET-3, never routed).
 pub const PUBLIC_DNS_ANSWER: std::net::Ipv4Addr = std::net::Ipv4Addr::new(203, 0, 113, 80);
@@ -277,6 +573,28 @@ pub async fn public_dns(port: u16) -> Result<(), ProbeError> {
 mod tests {
     use super::*;
 
+    /// Only what ingest says it stored is delivered: records it dropped
+    /// for any reason (a quota it could not check included) are discarded,
+    /// and an answer that does not say what was stored is an error, never
+    /// a full delivery.
+    #[test]
+    fn records_ingest_did_not_store_are_discarded() {
+        let discarded = |records, answer| delivered_from(records, answer).map(|d| d.discarded);
+        assert_eq!(
+            discarded(3, r#"{"stored":0,"not_recording":3,"not_placed":0}"#),
+            Ok(3)
+        );
+        assert_eq!(
+            discarded(5, r#"{"stored":2,"not_recording":1,"not_placed":2}"#),
+            Ok(3)
+        );
+        assert_eq!(discarded(1, r#"{"stored":0,"quota_unchecked":1}"#), Ok(1));
+        assert_eq!(discarded(2, r#"{"stored":9}"#), Ok(0));
+        for unreadable in ["not json", "", r#"{"not_recording":9}"#] {
+            assert!(discarded(1, unreadable).is_err(), "{unreadable:?}");
+        }
+    }
+
     #[test]
     fn configs_round_trip() {
         let json = r#"{
@@ -292,5 +610,90 @@ mod tests {
         let table = EgressTable::build(&config.egress, &identities);
         assert_eq!(table.len(), 1);
         assert!(serde_json::from_str::<ServeConfig>(r#"{"egress": [{"subject": {"kind": "sandbox", "id": 1}, "rules": [{"id": 1, "target": {"host": "a b"}, "action": "allow"}]}]}"#).is_err());
+        assert!(config.recording.is_none(), "no recorder unless configured");
+        let recording: ServeConfig = serde_json::from_str(
+            r#"{"recording": {"url": "http://10.0.0.1:8080/api/internal/nodes/3/egress-records", "token": "t", "max_batch_age_ms": 500},
+                "egress": [{"subject": {"kind": "sandbox", "id": 1}, "rules": [], "record": true}]}"#,
+        )
+        .unwrap();
+        assert!(recording.egress[0].record);
+        assert_eq!(recording.recording.unwrap().max_batch_age_ms, Some(500));
+    }
+
+    #[test]
+    fn the_sink_takes_only_plain_http_urls_with_a_path() {
+        assert!(HttpRecordSink::new("https://cp.example.test/x", "t").is_err());
+        assert!(HttpRecordSink::new("http://cp.example.test", "t").is_err());
+        let sink = HttpRecordSink::new(
+            "http://10.0.0.1:8080/api/internal/nodes/3/egress-records",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(sink.authority, "10.0.0.1:8080");
+        assert_eq!(sink.path, "/api/internal/nodes/3/egress-records");
+    }
+
+    /// One delivery is one POST with the node token and the batch as JSON;
+    /// a non-2xx answer is a failed delivery.
+    #[tokio::test]
+    async fn the_sink_posts_the_batch_with_the_node_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for status in ["200 OK", "403 Forbidden"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    seen.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&seen).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("Content-Length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                }
+                // Ingest answers what it stored.
+                let answer = r#"{"stored":0}"#;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{answer}",
+                            answer.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                requests.push(String::from_utf8(seen).unwrap());
+            }
+            requests
+        });
+        let sink = HttpRecordSink::new(
+            &format!("http://{addr}/api/internal/nodes/3/egress-records"),
+            "node-token",
+        )
+        .unwrap();
+        let batch = EgressRecordBatch {
+            records: Vec::new(),
+            dropped: 2,
+        };
+        assert!(sink.deliver(batch.clone()).await.is_ok());
+        assert!(
+            sink.deliver(batch).await.is_err(),
+            "a 403 is a failed delivery"
+        );
+        let requests = server.await.unwrap();
+        assert!(requests[0].starts_with("POST /api/internal/nodes/3/egress-records HTTP/1.1\r\n"));
+        assert!(requests[0].contains("Authorization: Bearer node-token\r\n"));
+        assert!(requests[0].ends_with(r#"{"records":[],"dropped":2}"#));
     }
 }

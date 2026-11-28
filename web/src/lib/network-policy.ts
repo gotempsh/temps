@@ -45,7 +45,16 @@ export type Protocol = 'tcp' | 'udp' | 'any'
 export type RuleAction = 'allow' | 'deny'
 export type RuleOrigin = 'link' | 'operator' | 'system'
 export type Profile = 'open' | 'restricted' | 'none'
-export type NodeNetworkPolicyMode = 'legacy' | 'shadow' | 'enforce'
+/**
+ * A node's network policy mode. `off` was called `legacy`; a server of
+ * either age is read (`normalizeNodeNetworkPolicyMode`).
+ */
+export type NodeNetworkPolicyMode = 'off' | 'shadow' | 'enforce'
+
+/** The mode under its current name: `legacy` reads as `off`. */
+export function normalizeNodeNetworkPolicyMode(value: string): string {
+  return value === 'legacy' ? 'off' : value
+}
 
 /**
  * A rule, as the server returns it (enums arrive as plain strings). `link`
@@ -357,14 +366,14 @@ export function ruleNotEnforcedReason(rule: NetworkPolicyRule): string | null {
 }
 
 /**
- * Why `mode` cannot be selected on this node, or `null` when it can. Legacy
+ * Why `mode` cannot be selected on this node, or `null` when it can. Off
  * is always selectable, so a stale stored mode can be cleared.
  */
 export function networkPolicyModeUnavailableReason(
   entry: NodeNetworkPolicyModeEntry,
   mode: NodeNetworkPolicyMode
 ): string | null {
-  if (mode === 'legacy' || entry.supports_enforcement) return null
+  if (mode === 'off' || entry.supports_enforcement) return null
   return (
     entry.enforcement_unavailable_reason ??
     'This node cannot compute or apply network policies.'
@@ -382,7 +391,8 @@ export function nodeNetworkPolicyMode(
 export function isNodeNetworkPolicyMode(
   value: string
 ): value is NodeNetworkPolicyMode {
-  return value === 'legacy' || value === 'shadow' || value === 'enforce'
+  const mode = normalizeNodeNetworkPolicyMode(value)
+  return mode === 'off' || mode === 'shadow' || mode === 'enforce'
 }
 
 /** What enforcement status means for one subject's effective policy. */
@@ -390,7 +400,7 @@ export function effectivePolicyEnforcementText(
   policy: EffectivePolicy
 ): string {
   if (!policy.enforced) {
-    return 'Shown but not enforced anywhere yet: every node is in Legacy or Shadow mode.'
+    return 'Shown but not enforced anywhere yet: every node is in Off or Shadow mode.'
   }
   const nodes = policy.enforcing_nodes
     .map((id) => (id === 0 ? 'the control plane' : `node ${id}`))

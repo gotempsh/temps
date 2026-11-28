@@ -71,7 +71,7 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [049](./049-automatic-expiry-checks-for-structured-credentials.md) | Automatic expiry checks for structured credentials | Accepted |  |
 | [050](./050-microsandbox-sandbox-backend.md) | microsandbox (libkrun) MicroVM Sandbox Backend | Proposed |  |
 | [051](./051-public-ingress-surface.md) | Public Ingress Surface for Third-Party Callbacks | Accepted |  |
-| [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md) |
+| [052](./052-common-workload-model.md) | A common workload model for deployed containers and sandboxes | Proposed | superseded in part by [055](./055-workload-plane-and-runtime-drivers.md); amended by [118](./118-workload-capabilities-written-once.md) |
 | [053](./053-distributed-runtime-health-and-worker-uptime.md) | Distributed Runtime Health and Worker Uptime | Implemented for process/HTTP/TCP |  |
 | [054](./054-plugin-builds-on-worker-nodes.md) | Plugin builds run on a worker node when the control plane has no Docker | Proposed |  |
 | [055](./055-workload-plane-and-runtime-drivers.md) | A workload plane with pluggable runtime drivers | Proposed | supersedes in part [052](./052-common-workload-model.md); amended by [099](./099-worker-backups-run-the-local-engines.md) |
@@ -136,9 +136,10 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [115](./115-the-control-plane-serves-private-addresses.md) | The control plane serves private addresses | Proposed | amends [064](./064-making-a-project-reachable.md) |
 | [116](./116-agents-run-on-the-ai-gateway-only.md) | Agents run on the AI gateway only | Proposed | supersedes [037](./037-subscription-agent-cli-providers.md) |
 | [117](./117-ingress-provider-trait.md) | An ingress provider is one trait implementation | Proposed | supersedes [058](./058-ingress-modes-and-a-shared-app-domain.md) |
-| [118](./118-external-plugins-run-in-containers.md) | External plugins run in containers | Superseded | superseded in part by [119](./119-a-plugin-is-a-temps-service.md) |
-| [119](./119-a-plugin-is-a-temps-service.md) | A plugin is a Temps service | Proposed | supersedes in part [118](./118-external-plugins-run-in-containers.md) |
+| [118](./118-workload-capabilities-written-once.md) | A workload capability is written once; each kind keeps its own entities | Accepted | amends [052](./052-common-workload-model.md) |
+| [119](./119-a-plugin-is-a-temps-service.md) | A plugin is a Temps service | Proposed | supersedes in part [121](./121-external-plugins-run-in-containers.md) |
 | [120](./120-plugin-tiers-permissions-builds-and-controls.md) | Plugin tiers, permissions, builds and controls | Proposed |  |
+| [121](./121-external-plugins-run-in-containers.md) | External plugins run in containers | Superseded | superseded in part by [119](./119-a-plugin-is-a-temps-service.md) |
 
 ## Supporting documents
 

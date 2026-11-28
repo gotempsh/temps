@@ -320,6 +320,12 @@ impl TempsPlugin for DeploymentsPlugin {
             // Deliberately absent: `temps_blob::BlobService` is optional (see
             // `AppState::blob_service`) -- `BlobPlugin` skips registering it
             // when this process has no local Docker daemon.
+            //
+            // The recording service and recorder every workload kind shares
+            // (`WorkloadEgressPlugin`): environments register with them in
+            // phase two.
+            RequiredService::of::<temps_workload_egress::EgressRecordingService>(),
+            RequiredService::of::<temps_workload_egress::local::LocalEgressRecorder>(),
         ]
     }
 
@@ -1039,6 +1045,7 @@ impl TempsPlugin for DeploymentsPlugin {
             runtime_health
                 .set_alarm_service(context.require_service::<temps_monitoring::AlarmService>());
             runtime_health.start();
+            wire_egress_recording(context).await;
             // Runs after every plugin has registered its services, so this
             // is the first point at which an optional DeploymentGate (e.g.
             // from a plugin implementing manual approvals) can actually be
@@ -1629,7 +1636,20 @@ impl TempsPlugin for DeploymentsPlugin {
                     audit: context.require_service::<dyn temps_core::AuditLogger>(),
                 })),
             )
-            .merge(compose_placement_routes);
+            .merge(compose_placement_routes)
+            // The environment's own URLs and authorization over the
+            // recording service every workload kind shares.
+            .merge(handlers::egress_recording::routes().with_state(Arc::new(
+                handlers::egress_recording::EnvironmentEgressAppState {
+                    service: Arc::new(crate::services::egress_recording::EnvironmentEgress::new(
+                        context.require_service::<sea_orm::DatabaseConnection>(),
+                        context.require_service::<temps_workload_egress::EgressRecordingService>(),
+                    )),
+                    audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                    project_access_checker:
+                        context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+                },
+            )));
 
         Some(PluginRoutes::new(routes))
     }
@@ -1686,9 +1706,58 @@ impl TempsPlugin for DeploymentsPlugin {
                 <handlers::workload_placement::WorkloadPlacementApiDoc as UtoimaOpenApi>::openapi(),
                 <handlers::workload_volumes::WorkloadVolumesApiDoc as UtoimaOpenApi>::openapi(),
                 compose_placement_schema,
+                <handlers::egress_recording::EnvironmentEgressApiDoc as UtoimaOpenApi>::openapi(),
             ],
         ))
     }
+}
+
+/// Makes environments a recordable workload kind: registers the
+/// environment adapter with the shared recording service and, when this
+/// host runs deployments on its own Docker, tells the shared recorder how
+/// their traffic reaches it and gives the deploy path the recorder to send
+/// new replicas through.
+async fn wire_egress_recording(context: &PluginContext) {
+    use crate::services::egress_recording::traffic::DeploymentTraffic;
+    use crate::services::egress_recording::EnvironmentEgressAdapter;
+
+    let db = context.require_service::<sea_orm::DatabaseConnection>();
+    let recording = context.require_service::<temps_workload_egress::EgressRecordingService>();
+    let adapter = Arc::new(EnvironmentEgressAdapter::new(db.clone()));
+    recording.register(adapter.clone());
+
+    let local_workloads =
+        temps_core::policy_or_default(context.get_service::<temps_core::LocalWorkloadPolicy>())
+            .local_workloads_enabled();
+    if !local_workloads {
+        return;
+    }
+    let docker = match context
+        .require_service::<temps_core::DockerHandle>()
+        .require()
+    {
+        Ok(docker) => (*docker).clone(),
+        Err(error) => {
+            tracing::info!(%error, "egress recording: no local Docker, so this host records no deployment");
+            return;
+        }
+    };
+    let recorder = context.require_service::<temps_workload_egress::local::LocalEgressRecorder>();
+    adapter.set_recorder(&recorder);
+    context
+        .require_service::<WorkflowExecutionService>()
+        .set_egress_recorder(recorder.clone());
+    context
+        .require_service::<DeploymentService>()
+        .set_egress_recorder(recorder.clone());
+    recorder
+        .add_source(Arc::new(DeploymentTraffic::new(
+            db,
+            docker,
+            temps_core::NETWORK_NAME.to_string(),
+            recorder.installation(),
+        )))
+        .await;
 }
 
 #[cfg(test)]

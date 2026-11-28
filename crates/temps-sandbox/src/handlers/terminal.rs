@@ -301,6 +301,15 @@ fn terminal_unavailable_hint(backend: temps_sandbox_providers::SandboxBackend) -
     }
 }
 
+/// Where a Docker sandbox's original environment can be read from inside
+/// it: the container's PID 1, started by Docker with exactly the
+/// environment Temps gave the container.
+const CONTAINER_ENVIRON: &str = "/proc/1/environ";
+
+/// Variables the shell keeps as the terminal agent set them (`TERM`,
+/// `PATH`, `HOME`) or maintains itself, never taken from PID 1.
+const KEEP_SHELL_VARS: &str = "TERM|PATH|HOME|PWD|OLDPWD|SHLVL|_";
+
 /// Wrap the requested program so the PTY is in a sane line discipline before
 /// it starts.
 ///
@@ -333,11 +342,57 @@ fn terminal_unavailable_hint(backend: temps_sandbox_providers::SandboxBackend) -
 /// program), and `npm start` never ran. Nesting in an inner `sh -c` hands the
 /// original string to a shell verbatim, so it parses exactly as the caller
 /// wrote it.
-fn wrap_with_sane_termios(cmd: &str) -> String {
-    // Single-quote the whole command and escape any embedded single quote by
-    // the standard `'\''` dance: close, emit an escaped quote, reopen.
+///
+/// # The container's environment
+///
+/// With `environ` (a Docker sandbox), the shell first exports the
+/// container's environment read from it.
+///
+/// The PTY agent inside sandbox images built before it learned to pass on
+/// its own environment starts every shell with only `TERM`, `PATH` and
+/// `HOME`. That drops `HTTP(S)_PROXY`/`NO_PROXY` (and their lowercase
+/// forms): on a managed sandbox network the only way out is that proxy, so
+/// `curl`, `git` and package managers fail with "could not resolve host",
+/// and the variables the sandbox owner set are lost too. The agent ships in
+/// the image, so the server cannot rely on it; it brings the environment in
+/// itself. With a current agent the values are already there and the
+/// import changes nothing.
+fn wrap_shell(cmd: &str, environ: Option<&str>) -> String {
     let quoted = cmd.replace('\'', r"'\''");
-    format!("stty sane 2>/dev/null; exec /bin/sh -c '{quoted}'")
+    let import = match environ {
+        // Entries in `environ` end with NUL and a value may hold newlines
+        // (a PEM certificate), which a shell line cannot. Each entry is read
+        // twice, one line per entry: with its newlines as \001 (fd 3) and as
+        // \002 (fd 4). A value with no literal \001 is decoded from the
+        // first, one with a literal \001 but no \002 from the second, so
+        // every value arrives exactly as it was; one holding both is left
+        // out rather than imported changed. The trailing `x` keeps a value's
+        // own trailing newline through the command substitution.
+        Some(path) => format!(
+            "if [ -r {path} ]; then __temps_import_soh=$(printf '\\001'); \
+             __temps_import_stx=$(printf '\\002'); \
+             while IFS= read -r __temps_import_kv <&3 && IFS= read -r __temps_import_kvs <&4; do \
+             case \"${{__temps_import_kv%%=*}}\" in \
+             {KEEP_SHELL_VARS}|__temps_import_*|\"\"|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; \
+             eval \"__temps_import_set=\\${{${{__temps_import_kv%%=*}}+x}}\"; \
+             [ -n \"$__temps_import_set\" ] && continue; \
+             case \"$__temps_import_kvs\" in \
+             *\"$__temps_import_soh\"*) \
+             case \"$__temps_import_kv\" in *\"$__temps_import_stx\"*) continue ;; esac; \
+             __temps_import_kv=$(printf '%sx' \"$__temps_import_kvs\" | tr '\\002' '\\n'); \
+             __temps_import_kv=${{__temps_import_kv%x}} ;; \
+             *) case \"$__temps_import_kv\" in *\"$__temps_import_soh\"*) \
+             __temps_import_kv=$(printf '%sx' \"$__temps_import_kv\" | tr '\\001' '\\n'); \
+             __temps_import_kv=${{__temps_import_kv%x}} ;; esac ;; esac; \
+             export \"$__temps_import_kv\" 2>/dev/null; \
+             done 3<<TEMPS_ENVIRON 4<<TEMPS_ENVIRON_STX\n$(tr '\\n\\000' '\\001\\n' < {path})\nTEMPS_ENVIRON\n\
+             $(tr '\\n\\000' '\\002\\n' < {path})\nTEMPS_ENVIRON_STX\n\
+             unset __temps_import_kv __temps_import_kvs __temps_import_soh __temps_import_stx \
+             __temps_import_set; fi; "
+        ),
+        None => String::new(),
+    };
+    format!("{import}stty sane 2>/dev/null; exec /bin/sh -c '{quoted}'")
 }
 
 /// Attach an interactive terminal to a sandbox.
@@ -439,7 +494,13 @@ pub async fn terminal(
 
     let service = state.sandbox_service.clone();
     let timeout_secs = row.timeout_secs;
-    let cmd = wrap_with_sane_termios(&params.cmd.unwrap_or_else(default_shell_cmd));
+    // A Docker sandbox's shell gets the container's environment even from
+    // an image whose terminal agent predates passing it on (see
+    // `wrap_shell`). A microVM's PID 1 is its guest init, not the sandbox's
+    // entrypoint, so nothing is imported there.
+    let environ = (handle.backend == temps_sandbox_providers::SandboxBackend::Docker)
+        .then_some(CONTAINER_ENVIRON);
+    let cmd = wrap_shell(&params.cmd.unwrap_or_else(default_shell_cmd), environ);
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
     // Take the working directory from the provider handle, not the DB row.
@@ -1035,13 +1096,177 @@ mod tests {
         // off; without this wrapper the user types blind on every one of
         // them, and rebuilding the image is not something they can do from
         // inside a shell that does not work.
-        let wrapped = wrap_with_sane_termios(&default_shell_cmd());
+        let wrapped = wrap_shell(&default_shell_cmd(), None);
         assert!(wrapped.starts_with("stty sane"), "{wrapped}");
         assert!(wrapped.contains("exec bash -l"), "{wrapped}");
         assert!(wrapped.contains("exec sh -l"), "{wrapped}");
         // The default has no single quotes, so wrapping it leaves the inner
         // command in one piece for the nested `sh -c`.
         assert_eq!(wrapped.matches('\'').count(), 2, "{wrapped}");
+    }
+
+    /// What the shell sees: `script` from [`wrap_shell`] importing `environ`,
+    /// run as an old agent runs it (only TERM, PATH, HOME set).
+    fn shell_env_after_import(environ: &[(&str, &str)]) -> String {
+        shell_output_after_import(environ, "env", &[])
+    }
+
+    /// What `cmd` prints in that shell, started with `inherited` on top of
+    /// TERM, PATH and HOME (a newer agent passes the environment on).
+    fn shell_output_after_import(
+        environ: &[(&str, &str)],
+        cmd: &str,
+        inherited: &[(&str, &str)],
+    ) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("environ");
+        let mut bytes = Vec::new();
+        for (key, value) in environ {
+            bytes.extend_from_slice(format!("{key}={value}").as_bytes());
+            bytes.push(0);
+        }
+        std::fs::write(&path, bytes).expect("write environ");
+        let script = wrap_shell(cmd, Some(path.to_str().expect("utf-8 path")));
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("TERM", "xterm-256color")
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/home/temps")
+            .envs(inherited.iter().copied())
+            .output()
+            .expect("run the wrapped shell");
+        assert!(output.status.success(), "{script}: {output:?}");
+        String::from_utf8(output.stdout).expect("utf-8")
+    }
+
+    /// A value with newlines (a PEM certificate) arrives whole, whether the
+    /// shell had nothing or already had the right value from a newer agent,
+    /// and its neighbours are untouched. A line inside it that looks like an
+    /// assignment is not mistaken for one.
+    #[test]
+    fn multi_line_values_are_imported_whole() {
+        let cert = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nNOT_A_VAR=inside\n-----END CERTIFICATE-----\n";
+        let environ = [("BEFORE", "one"), ("CERT", cert), ("AFTER", "two")];
+        let cmd =
+            "printf '[%s][%s][%s][%s]' \"$BEFORE\" \"$CERT\" \"$AFTER\" \"${NOT_A_VAR-unset}\"";
+        let expected = format!("[one][{cert}][two][unset]");
+        assert_eq!(shell_output_after_import(&environ, cmd, &[]), expected);
+        assert_eq!(
+            shell_output_after_import(&environ, cmd, &[("CERT", cert)]),
+            expected,
+            "an inherited value is not cut to its first line"
+        );
+    }
+
+    /// A shell from an old terminal agent gets the container's proxy and
+    /// owner variables, keeps the agent's TERM, PATH and HOME, and values
+    /// with spaces, quotes and `=` survive.
+    #[test]
+    fn the_shell_imports_the_container_environment() {
+        let env = shell_env_after_import(&[
+            ("HTTP_PROXY", "http://temps-sandbox-egress-proxy:3128"),
+            ("http_proxy", "http://temps-sandbox-egress-proxy:3128"),
+            ("https_proxy", "http://temps-sandbox-egress-proxy:3128"),
+            ("no_proxy", "localhost,127.0.0.1,::1"),
+            ("OWNER_SETTING", "a value with spaces, 'quotes' and = signs"),
+            ("PATH", "/minimal"),
+            ("HOME", "/"),
+            ("TERM", "linux"),
+        ]);
+        for expected in [
+            "http_proxy=http://temps-sandbox-egress-proxy:3128",
+            "https_proxy=http://temps-sandbox-egress-proxy:3128",
+            "HTTP_PROXY=http://temps-sandbox-egress-proxy:3128",
+            "no_proxy=localhost,127.0.0.1,::1",
+            "OWNER_SETTING=a value with spaces, 'quotes' and = signs",
+            "PATH=/usr/bin:/bin",
+            "HOME=/home/temps",
+            "TERM=xterm-256color",
+        ] {
+            assert!(
+                env.lines().any(|l| l == expected),
+                "missing {expected} in:\n{env}"
+            );
+        }
+    }
+
+    /// The import's own working variables never touch the owner's: a
+    /// variable called `kv`, `temps_set` or `temps_soh`, inherited or
+    /// imported, reaches the shell as it was.
+    #[test]
+    fn the_import_leaves_the_owners_variables_alone() {
+        let out = shell_output_after_import(
+            &[("temps_soh", "imported-soh"), ("OTHER", "x")],
+            "printf '[%s][%s][%s]' \"$kv\" \"$temps_set\" \"$temps_soh\"",
+            &[("kv", "production"), ("temps_set", "kept")],
+        );
+        assert_eq!(out, "[production][kept][imported-soh]");
+    }
+
+    /// A variable the shell already has (a newer agent passes the
+    /// environment on) is left as it is: a value that arrived whole is
+    /// never replaced by one decoded from `environ`. One the shell lacks is
+    /// still imported.
+    #[test]
+    fn an_inherited_value_is_never_replaced() {
+        let value = "a\u{1}b";
+        let out = shell_output_after_import(
+            &[("SAMPLE", value), ("MISSING", "imported")],
+            "printf '[%s][%s]' \"$SAMPLE\" \"$MISSING\"",
+            &[("SAMPLE", value)],
+        );
+        assert_eq!(out, format!("[{value}][imported]"));
+    }
+
+    /// A value's own control bytes survive the import when the shell lacks
+    /// it: a literal SOH is never turned into a newline, with or without
+    /// real newlines beside it. A value holding both SOH and STX cannot be
+    /// told apart from its encodings and is left out, never imported
+    /// changed; its neighbours are untouched.
+    #[test]
+    fn literal_control_bytes_are_imported_exactly() {
+        let soh = "a\u{1}b";
+        let soh_and_newlines = "line one\n\u{1}tagged\nline three\n";
+        let ambiguous = "x\u{1}y\u{2}z\n";
+        let out = shell_output_after_import(
+            &[
+                ("SOH", soh),
+                ("MIXED", soh_and_newlines),
+                ("AMBIGUOUS", ambiguous),
+                ("AFTER", "kept"),
+            ],
+            "printf '[%s][%s][%s][%s]' \"$SOH\" \"$MIXED\" \"${AMBIGUOUS-unset}\" \"$AFTER\"",
+            &[],
+        );
+        assert_eq!(out, format!("[{soh}][{soh_and_newlines}][unset][kept]"));
+    }
+
+    /// A name a process environment can hold but a shell cannot export
+    /// (`2FA_ENABLED`, a leading digit) is skipped: exporting it would end
+    /// a POSIX shell before the terminal's command runs.
+    #[test]
+    fn a_name_the_shell_cannot_export_is_skipped() {
+        let out = shell_output_after_import(
+            &[("2FA_ENABLED", "true"), ("1HOST", "x"), ("KEPT", "yes")],
+            "echo \"ran:$KEPT\"",
+            &[],
+        );
+        assert_eq!(out, "ran:yes\n");
+    }
+
+    #[test]
+    fn a_missing_environ_still_gives_a_shell() {
+        let script = wrap_shell("echo ok", Some("/nonexistent/environ"));
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
     }
 
     /// Run `default_shell_cmd()` under `/bin/sh -c` with `PATH` restricted to
@@ -1084,7 +1309,7 @@ mod tests {
         // statement level bound the caller's operators to the *wrapper*:
         // `exec cd /app && npm start` ran `exec cd` (which fails — `cd` is a
         // builtin, not a program) and never reached `npm start`.
-        let wrapped = wrap_with_sane_termios("cd /app && npm start");
+        let wrapped = wrap_shell("cd /app && npm start", None);
         assert!(
             wrapped.contains("'cd /app && npm start'"),
             "the command must reach an inner shell intact: {wrapped}"
@@ -1099,7 +1324,7 @@ mod tests {
     fn wrapping_escapes_embedded_single_quotes() {
         // Otherwise a quote in the command closes our quoting early and the
         // rest is reinterpreted by the outer shell.
-        let wrapped = wrap_with_sane_termios("echo 'hi there'");
+        let wrapped = wrap_shell("echo 'hi there'", None);
         assert!(wrapped.contains(r"'\''hi there'\''"), "{wrapped}");
         // The wrapper's own quoting must still be balanced.
         assert_eq!(
@@ -1112,7 +1337,7 @@ mod tests {
     #[test]
     fn wrapping_preserves_a_custom_command_verbatim() {
         // `--cmd claude` must still start claude, arguments intact.
-        let wrapped = wrap_with_sane_termios("claude --resume");
+        let wrapped = wrap_shell("claude --resume", None);
         assert!(wrapped.ends_with("'claude --resume'"), "{wrapped}");
         // `exec` matters: the wrapper shell must be replaced, not left as a
         // parent, or signals and exit codes get an extra hop.
@@ -1124,7 +1349,7 @@ mod tests {
         // A minimal image with no `stty` must still get a shell, not a tab
         // that dies on the first command.
         assert!(
-            wrap_with_sane_termios("sh").contains("2>/dev/null"),
+            wrap_shell("sh", None).contains("2>/dev/null"),
             "stty failure must be swallowed"
         );
     }

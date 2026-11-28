@@ -23,6 +23,7 @@ temps-node-dns = { path = "../temps-node-dns", default-features = false }
 hickory-server = { workspace = true }
 hickory-proto = { workspace = true, features = ["std"] }
 arc-swap = { workspace = true }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -31,7 +32,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
-async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
 

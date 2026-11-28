@@ -26,6 +26,7 @@ import {
   resolveProjectIdBySlug,
 } from './workspace-source.js'
 import { shellAction } from './shell.js'
+import { registerSandboxRecordingCommands } from './recording.js'
 import {
   buildEgressPolicy,
   buildPreviewAccessBody,
@@ -667,6 +668,8 @@ export function registerSandboxCommands(program: Command): void {
     )
     .option('--json', 'Output as JSON')
     .action(egressAction)
+
+  registerSandboxRecordingCommands(sandbox)
 
   // ── Filesystem subgroup ──
   const fs = sandbox.command('fs').description('Filesystem operations inside a sandbox')

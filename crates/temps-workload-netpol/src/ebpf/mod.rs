@@ -161,7 +161,7 @@ pub trait CgroupDatapath: Send + Sync {
 }
 
 /// Opens the datapath the first time a pass needs it. Kept lazy so a node
-/// in `legacy` never loads a program.
+/// in `off` never loads a program.
 pub type DatapathOpener =
     Box<dyn Fn() -> Result<Box<dyn CgroupDatapath>, DatapathError> + Send + Sync>;
 

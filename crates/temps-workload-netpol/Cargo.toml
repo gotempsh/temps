@@ -42,6 +42,7 @@ temps-netpol-ebpf-common = { path = "../temps-netpol-ebpf-common", features = ["
 
 [dev-dependencies]
 rand = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

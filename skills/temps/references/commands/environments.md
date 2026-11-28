@@ -18,6 +18,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`environments isolation`](#environments-isolation)
 - [`environments volumes`](#environments-volumes)
 - [`environments ingress`](#environments-ingress)
+- [`environments recording`](#environments-recording)
+- [`environments outbound`](#environments-outbound)
 - [`environments crons`](#environments-crons)
 - [`environments reachability`](#environments-reachability)
 - [`environments create-ingress-login-grant`](#environments-create-ingress-login-grant)
@@ -44,6 +46,8 @@ Manage environments and environment variables
 - `isolation` - How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
 - `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
 - `ingress` - Whether visitors must sign in to Temps to open an environment
+- `recording` - Show or set whether the environment's deployments record their outbound connections (destination, outcome, bytes; never headers or bodies). Takes effect on the next deployment
+- `outbound` - List the outbound connections a recording environment's deployments made, newest first
 - `crons` - Manage cron jobs
 - `reachability` - Reachability commands
 - `create-ingress-login-grant` - Create ingress login grant
@@ -510,6 +514,37 @@ List the tunnel providers this control plane offers
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `environments recording`
+
+Show or set whether the environment's deployments record their outbound connections (destination, outcome, bytes; never headers or bodies). Takes effect on the next deployment
+
+**Usage:** `environments recording <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--on` | Record outbound connections | - | No |
+| `--off` | Stop recording | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments outbound`
+
+List the outbound connections a recording environment's deployments made, newest first
+
+**Usage:** `environments outbound <environment> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | Records per page (default 20, max 100) | - | No |
+| `--outcome <outcome>` | Only allowed, refused or failed connections | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
