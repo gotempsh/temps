@@ -293,12 +293,14 @@ pub enum UptimeMonitorIpAccessError {
     },
 }
 
-/// Evaluates the stored IP access policy against the monitor's addresses.
+/// Explains a check the proxy refused with the IP access policy behind it.
 #[async_trait]
 pub trait UptimeMonitorIpAccess: Send + Sync {
     /// The block on `environment_id`'s monitor from the policy that governs
-    /// it (its own list, else the project's), or `None` when every address
-    /// in `monitor_addresses` gets through.
+    /// it (its own list, else the project's), for the addresses in
+    /// `monitor_addresses` that the proxy refuses right now. `None` when the
+    /// proxy admits every one of them, so a 403 they got is not the policy's,
+    /// even while a saved change has not reached the proxy yet.
     async fn monitor_block(
         &self,
         project_id: i32,

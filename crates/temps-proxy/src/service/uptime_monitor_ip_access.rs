@@ -122,9 +122,22 @@ impl UptimeMonitorIpAccess for ProjectIpAccessService {
     ) -> Result<Option<UptimeMonitorIpBlock>, UptimeMonitorIpAccessError> {
         // Behind a plugin gate the saved lists are not what the proxy
         // enforces, so they cannot explain the 403.
-        if monitor_addresses.is_empty() || !self.saved_lists_enforced() {
+        let Some(gate) = self.enforcing_gate() else {
+            return Ok(None);
+        };
+        // A check result is explained only by what the proxy enforces now:
+        // a saved change reaches the gate within its poll interval, and in
+        // between the saved list and the enforced one disagree. An address
+        // the gate admits was not refused by it, whatever is saved.
+        let refused: Vec<IpAddr> = monitor_addresses
+            .iter()
+            .copied()
+            .filter(|ip| !gate.is_allowed(project_id, environment_id, *ip))
+            .collect();
+        if refused.is_empty() {
             return Ok(None);
         }
+        let monitor_addresses = refused.as_slice();
         let governing = self
             .governing_policy(project_id, Some(environment_id))
             .await
@@ -201,14 +214,15 @@ mod tests {
     }
 
     /// A gate that, like the proxy's built-in one, does or does not decide
-    /// from the saved lists.
+    /// from the saved lists, and currently refuses `refused`.
     struct Gate {
         reads_saved_lists: bool,
+        refused: Vec<IpAddr>,
     }
 
     impl temps_core::ProjectIpGate for Gate {
-        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
-            true
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, ip: IpAddr) -> bool {
+            !self.refused.contains(&ip)
         }
 
         fn reads_project_ip_access_rules(&self) -> bool {
@@ -216,14 +230,20 @@ mod tests {
         }
     }
 
-    /// The service as the proxy plugin builds it behind the built-in gate.
+    /// The service as the proxy plugin builds it behind the built-in gate,
+    /// whose enforced snapshot refuses the monitor's addresses.
     fn service(db: sea_orm::DatabaseConnection) -> ProjectIpAccessService {
-        ProjectIpAccessService::new(Arc::new(db)).with_monitor_addresses(
-            monitor(),
-            Arc::new(Gate {
+        service_behind(
+            db,
+            Gate {
                 reads_saved_lists: true,
-            }),
+                refused: monitor(),
+            },
         )
+    }
+
+    fn service_behind(db: sea_orm::DatabaseConnection, gate: Gate) -> ProjectIpAccessService {
+        ProjectIpAccessService::new(Arc::new(db)).with_monitor_addresses(monitor(), Arc::new(gate))
     }
 
     fn evaluate(mode: &str, cidrs: &[&str]) -> Option<UptimeMonitorIpBlock> {
@@ -427,6 +447,7 @@ mod tests {
         // plugin's gate instead, so a 403 is not this list's doing.
         let gate = Arc::new(Gate {
             reads_saved_lists: false,
+            refused: monitor(),
         });
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![id_row(5)]])
@@ -446,5 +467,48 @@ mod tests {
         let response = service.get(5, None).await.expect("get succeeds");
         assert!(response.uptime_monitor_block.is_none());
         assert!(response.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_saved_list_the_proxy_does_not_enforce_yet_explains_nothing() {
+        // The saved list refuses the monitor, but the gate's snapshot (from
+        // before the save) still admits it, so a 403 now came from the app.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = service_behind(
+            db,
+            Gate {
+                reads_saved_lists: true,
+                refused: Vec::new(),
+            },
+        );
+        // No rows in the mock: reading the saved list would fail the test.
+        let block = service
+            .monitor_block(5, 9, &monitor())
+            .await
+            .expect("nothing is read");
+        assert!(block.is_none());
+    }
+
+    #[tokio::test]
+    async fn only_the_addresses_the_proxy_refuses_are_explained() {
+        // The saved list refuses both addresses; the proxy has only started
+        // refusing the public one.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![row(Some(9), "allow", OPERATOR_AND_TAILNET)]])
+            .into_connection();
+        let service = service_behind(
+            db,
+            Gate {
+                reads_saved_lists: true,
+                refused: vec![ip("203.0.113.10")],
+            },
+        );
+        let block = service
+            .monitor_block(5, 9, &monitor())
+            .await
+            .expect("policy is readable")
+            .expect("blocked");
+        assert_eq!(block.blocked_addresses, vec!["203.0.113.10"]);
+        assert_eq!(block.suggested_cidrs, vec!["203.0.113.10/32"]);
     }
 }

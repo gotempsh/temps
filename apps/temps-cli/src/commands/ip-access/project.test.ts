@@ -86,6 +86,18 @@ describe('resolveSetInput', () => {
     expect(resolveSetInput({ project: '1', mode: 'deny' } as never).cidrs).toEqual([])
     expect(resolveSetInput({ project: '1', mode: 'disabled' } as never).mode).toBe('disabled')
   })
+
+  test('passes an expected revision on, and leaves it out when not given', () => {
+    expect(resolveSetInput({ mode: 'deny', expectedRevision: '42' }).expectedRevision).toBe(42)
+    expect(resolveSetInput({ mode: 'deny', expectedRevision: '0' }).expectedRevision).toBe(0)
+    expect(resolveSetInput({ mode: 'deny' })).not.toHaveProperty('expectedRevision')
+  })
+
+  test('throws on an expected revision that is not a whole number', () => {
+    for (const raw of ['-1', '4.5', 'latest', '']) {
+      expect(() => resolveSetInput({ mode: 'deny', expectedRevision: raw })).toThrow('Invalid --expected-revision')
+    }
+  })
 })
 
 describe('registration', () => {
@@ -123,6 +135,18 @@ describe('monitorBlockLines', () => {
       block.message,
       'To allow it: temps ip-access project set --project-id 4 --mode allow --cidr 198.51.100.7/32 --cidr 127.0.0.1/32 --cidr 203.0.113.10/32',
     ])
+  })
+
+  test('the set command names the revision it repeats, when known', () => {
+    const lines = monitorBlockLines(block, {
+      mode: 'allow',
+      cidrs: [{ cidr: '198.51.100.7/32' }],
+      isEnvironment: false,
+      revision: 17,
+    })
+    expect(lines[1]).toBe(
+      'To allow it: temps ip-access project set --project-id 4 --mode allow --cidr 198.51.100.7/32 --cidr 203.0.113.10/32 --expected-revision 17',
+    )
   })
 
   test('points an inheriting environment at the project list', () => {

@@ -504,9 +504,15 @@ impl ProjectIpAccessService {
     /// Whether the proxy enforces the saved lists, so they are what refuses
     /// (or admits) the monitor.
     pub(crate) fn saved_lists_enforced(&self) -> bool {
+        self.enforcing_gate().is_some()
+    }
+
+    /// The gate the proxy enforces the saved lists with, when it does.
+    pub(crate) fn enforcing_gate(&self) -> Option<&Arc<dyn ProjectIpGate>> {
         self.monitor
             .as_ref()
-            .is_some_and(|monitor| monitor.gate.reads_project_ip_access_rules())
+            .map(|monitor| &monitor.gate)
+            .filter(|gate| gate.reads_project_ip_access_rules())
     }
 
     /// The monitor addresses to check the saved lists against; empty when
