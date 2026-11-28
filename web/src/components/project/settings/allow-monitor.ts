@@ -36,6 +36,11 @@ export interface AllowMonitorTarget {
 
 export type AllowMonitorOutcome =
   | { kind: 'saved'; saved: ProjectIpAccessResponse }
+  /**
+   * The warning was about the project list an environment followed, but
+   * the environment has a list of its own now, which is what governs it.
+   */
+  | { kind: 'environment-list' }
   | Exclude<MonitorFixPlan, { kind: 'save' }>
 
 /** The list the warning is about: the environment's own, or the project's. */
@@ -113,7 +118,20 @@ export async function allowMonitor(
   io: PolicyIo = sdk
 ): Promise<AllowMonitorOutcome> {
   const target = allowMonitorTarget(warning)
+  // A warning about the project list, raised for one environment, applies
+  // only while that environment still follows the project list. Adding the
+  // monitor to the project list otherwise widens it for every environment
+  // that inherits it, and does nothing for the one that warned.
+  const inheritingEnvironment =
+    warning.policy_scope === 'project' ? (warning.environment_id ?? null) : null
   for (let attempt = 1; ; attempt++) {
+    if (inheritingEnvironment !== null) {
+      const own = await io.read({
+        projectId: warning.project_id,
+        environmentId: inheritingEnvironment,
+      })
+      if (own.configured) return { kind: 'environment-list' }
+    }
     const plan = planMonitorFix(warning, await io.read(target))
     if (plan.kind !== 'save') return plan
     try {
@@ -139,6 +157,8 @@ export function allowMonitorNotice(
   outcome: Exclude<AllowMonitorOutcome, { kind: 'saved' }>
 ): string {
   switch (outcome.kind) {
+    case 'environment-list':
+      return 'This environment has its own IP access list now, and that list governs the monitor. Review it before allowing the monitor.'
     case 'already-allowed':
       return 'The IP access list already lets the monitor through.'
     case 'changed':

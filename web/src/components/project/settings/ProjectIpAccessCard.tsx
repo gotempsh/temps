@@ -842,7 +842,13 @@ export function ProjectIpAccessCard({
         <div className="flex flex-wrap items-center gap-2">
           <Button
             type="submit"
-            disabled={!form.formState.isDirty || save.isPending}
+            disabled={
+              !form.formState.isDirty ||
+              save.isPending ||
+              // A save sent while "Allow monitor" runs would replace the
+              // list without the entry it is adding.
+              allowMonitorMutation.isPending
+            }
           >
             {save.isPending ? 'Saving…' : 'Save IP access list'}
           </Button>

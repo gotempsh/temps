@@ -15,9 +15,10 @@ import {
   type PolicyIo,
 } from './allow-monitor'
 
+/** The project list refuses the monitor (seen from the project's settings). */
 const warning: UptimeMonitorIpBlock = {
   project_id: 2,
-  environment_id: 7,
+  environment_id: null,
   policy_scope: 'project',
   mode: 'allow',
   reason: 'not_allow_listed',
@@ -171,12 +172,70 @@ describe('allowMonitor', () => {
   })
 
   test("reads and writes the environment's own list when that refuses it", async () => {
-    const own = { ...warning, policy_scope: 'environment' as const }
+    const own = {
+      ...warning,
+      environment_id: 7,
+      policy_scope: 'environment' as const,
+    }
     const { io, targets } = server([
       { ...stored(4, []), environment_id: 7, uptime_monitor_block: own },
     ])
     await allowMonitor(own, false, io)
     expect(targets).toEqual([{ projectId: 2, environmentId: 7 }])
+  })
+})
+
+describe('a project warning raised for one environment', () => {
+  // Environment 7's monitor, refused by the project list it follows.
+  const forEnvironment = { ...warning, environment_id: 7 }
+
+  function scopes(environmentHasOwnList: boolean) {
+    const reads: AllowMonitorTarget[] = []
+    const writes: AllowMonitorTarget[] = []
+    const io: PolicyIo = {
+      read: async (target) => {
+        reads.push(target)
+        if (target.environmentId === 7) {
+          return {
+            ...stored(environmentHasOwnList ? 9 : 0, []),
+            environment_id: 7,
+            configured: environmentHasOwnList,
+          }
+        }
+        return stored(4, ['198.51.100.7/32'])
+      },
+      write: async (target) => {
+        writes.push(target)
+        return stored(5, [])
+      },
+    }
+    return { io, reads, writes }
+  }
+
+  test('fixes the project list while the environment still follows it', async () => {
+    const { io, reads, writes } = scopes(false)
+    expect((await allowMonitor(forEnvironment, false, io)).kind).toBe('saved')
+    expect(reads).toEqual([
+      { projectId: 2, environmentId: 7 },
+      { projectId: 2, environmentId: null },
+    ])
+    expect(writes).toEqual([{ projectId: 2, environmentId: null }])
+  })
+
+  test('leaves the project list alone once the environment has its own', async () => {
+    const { io, writes } = scopes(true)
+    const outcome = await allowMonitor(forEnvironment, false, io)
+    expect(outcome).toEqual({ kind: 'environment-list' })
+    expect(writes).toHaveLength(0)
+    expect(allowMonitorNotice({ kind: 'environment-list' })).toContain(
+      'its own IP access list now'
+    )
+  })
+
+  test('a project-wide warning with no environment reads only the project list', async () => {
+    const { io, reads } = scopes(false)
+    await allowMonitor(warning, false, io)
+    expect(reads).toEqual([{ projectId: 2, environmentId: null }])
   })
 })
 

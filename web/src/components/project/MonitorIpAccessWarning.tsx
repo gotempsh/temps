@@ -86,6 +86,7 @@ export function MonitorIpAccessWarning({
           toast.success(allowMonitorNotice(outcome))
           return
         case 'changed':
+        case 'environment-list':
         case 'full':
           toast.error(allowMonitorNotice(outcome))
           return
