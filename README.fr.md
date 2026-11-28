@@ -263,6 +263,6 @@ Double licence [MIT](LICENSE-MIT) ou [Apache 2.0](LICENSE). Les forks et œuvres
 
 [temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_fr) | [Documentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_fr) | [GitHub](https://github.com/gotempsh/temps)
 
-[English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | Français | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | Français | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md) | [Türkçe](README.tr.md)
 
 </div>
