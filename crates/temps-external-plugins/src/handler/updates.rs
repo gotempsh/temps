@@ -212,6 +212,7 @@ mod tests {
     };
     use crate::manager::ServicePluginState;
     use axum::response::IntoResponse;
+    use sea_orm::ConnectionTrait;
     use temps_auth::permissions::Role;
     use tower::ServiceExt;
 
@@ -494,6 +495,77 @@ mod tests {
             .requested_permissions
             .contains(&PluginHostPermission::AiGenerate));
         assert!(grants.permissions.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approving_an_update_after_a_rollback_to_the_approved_build_approves_nothing() {
+        let Some(platform) = platform("approving an update that was rolled back").await else {
+            return;
+        };
+        let first = serve_plugin("reports", TOKEN);
+        let binding = platform.service("reports-service").await;
+        let first_deployment = platform.deploy(binding, first.port).await;
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = state_on(&platform, audit.clone()).await;
+        let admin = || user_auth(Role::PlatformAdmin);
+        let _added = add_service_plugin(admin(), State(state.clone()), metadata(), add(binding))
+            .await
+            .expect("a deployed plugin service is added");
+
+        let second = serve_plugin("reports", TOKEN);
+        platform.deploy(binding, second.port).await;
+        first.stop();
+        eventually("the update is listed as waiting", || async {
+            get_plugin_services(admin(), State(state.clone()))
+                .await
+                .is_ok_and(|Json(listed)| listed.plugins[0].pending_update.is_some())
+        })
+        .await;
+        let Json(listed) = get_plugin_services(admin(), State(state.clone()))
+            .await
+            .expect("list");
+        let review = listed.plugins[0]
+            .pending_update
+            .as_ref()
+            .expect("an update waits")
+            .review
+            .clone();
+
+        // The service goes back to the approved deployment before anyone
+        // approves the update.
+        let again = serve_plugin("reports", TOKEN);
+        platform
+            .db()
+            .execute_unprepared(&format!(
+                "UPDATE deployment_containers SET host_port={} WHERE deployment_id={first_deployment}; \
+                 UPDATE environments SET current_deployment_id={first_deployment} WHERE id={}",
+                again.port, binding.environment_id
+            ))
+            .await
+            .expect("roll back");
+
+        let refused = approve_plugin_update(
+            admin(),
+            State(state.clone()),
+            metadata(),
+            Path("reports".to_string()),
+            approve(&review),
+        )
+        .await
+        .expect_err("the update that was reviewed no longer runs");
+        let (status, problem) = problem_of(refused).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(problem["title"], "No Plugin Update Waits");
+        assert!(!operations(&audit).contains(&"EXTERNAL_PLUGIN_UPDATE_APPROVED".to_string()));
+
+        let Json(listed) = get_plugin_services(admin(), State(state.clone()))
+            .await
+            .expect("list");
+        assert_eq!(
+            listed.plugins[0].pinned_deployment_id,
+            Some(first_deployment)
+        );
+        assert!(listed.plugins[0].pending_update.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

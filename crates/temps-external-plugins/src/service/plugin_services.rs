@@ -166,11 +166,13 @@ impl ExternalPluginsService {
             .publish(self.ai_tools.snapshot().without_plugin(name));
         self.schedule_consent_recovery();
         // Revoke first: if that fails the plugin stays attached and listed,
-        // instead of disappearing while its grants survive.
-        crate::grants::PluginGrantService::new(self.db.clone())
-            .revoke_actor(name)
+        // instead of disappearing while its grants survive. Both happen
+        // without an attachment in between, so a request that starts the
+        // plugin again cannot create its actor anew after it was revoked.
+        let grants = crate::grants::PluginGrantService::new(self.db.clone());
+        self.manager
+            .detach_service_after(name, grants.revoke_actor(name))
             .await?;
-        self.manager.detach_service(name).await;
         info!(plugin = %name, "A service plugin was removed; its service keeps running");
         self.refresh_runtime_surfaces().await;
         Ok(())
@@ -286,6 +288,17 @@ impl ExternalPluginsService {
                 return Err(error.into());
             }
         };
+        // The service may have been rolled back to its approved build since
+        // the review was shown. Attaching then succeeds on that build, and
+        // the update that waited was not approved.
+        let pinned_now = PluginBuilds::new(self.db.clone())
+            .pin_of(name)
+            .await?
+            .and_then(|pin| pin.deployment_id);
+        if pinned_now != Some(pending.deployment_id) {
+            self.refresh_runtime_surfaces().await;
+            return Err(ExternalPluginsError::NoUpdateWaiting { name: name.into() });
+        }
         info!(
             plugin = %name,
             previous_deployment_id = ?pin.deployment_id,

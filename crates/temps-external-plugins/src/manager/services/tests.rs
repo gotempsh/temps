@@ -575,6 +575,40 @@ async fn a_deployed_service_becomes_a_plugin_and_answers_through_the_proxy() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// A router built from an earlier manifest may still call a path public. The
+/// manifest of the attachment that receives the request decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_path_the_attached_manifest_does_not_leave_public_needs_a_session() {
+    let Some(platform) = platform("checking public paths against the attachment").await else {
+        return;
+    };
+    let served = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    platform.deploy(binding, served.port).await;
+    let manager = platform.manager().await;
+    manager.attach_service(binding, None).await.expect("attach");
+
+    let stale = manager
+        .proxy_for("reports")
+        .await
+        .expect("the plugin has a route")
+        .with_public_paths(vec!["/items".to_string()]);
+    let response = crate::proxy::create_plugin_proxy_router(stale)
+        .oneshot(
+            Request::builder()
+                .uri("/items")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("proxy response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // With a session the same route answers.
+    let (status, body) = through_proxy(&manager, "reports", "/items", true).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "three items"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_service_that_cannot_be_a_plugin_is_refused_with_the_reason_and_nothing_is_recorded() {
     let Some(platform) = platform("refusing services that are not plugins").await else {
@@ -717,6 +751,57 @@ async fn a_service_never_takes_a_plugin_name_installed_from_somewhere_else() {
         Some(("container".to_string(), None, None, false, true)),
         "the installed plugin's row is untouched"
     );
+}
+
+/// A service that answers the hello and refuses the channel is not added,
+/// and does not keep the plugin's name: a working service takes it next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plugin_that_never_opened_its_channel_does_not_keep_its_name() {
+    let Some(platform) = platform("a first connection that fails").await else {
+        return;
+    };
+    // Answers the hello like a plugin; every other path, the channel
+    // included, is not found.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("a free local port");
+    let half_port = listener.local_addr().expect("local address").port();
+    let hello = temps_plugin_protocol::PluginServiceHello {
+        protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+        manifest: Box::new(PluginManifest::builder("reports", "1.0.0").build()),
+        has_ui: false,
+        openapi: None,
+    };
+    let app = axum::Router::new().route(
+        temps_plugin_protocol::PLUGIN_HELLO_PATH,
+        axum::routing::get(move || {
+            let hello = hello.clone();
+            async move { axum::Json(hello) }
+        }),
+    );
+    let half = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let broken = platform.service("broken-service").await;
+    platform.deploy(broken, half_port).await;
+    let manager = platform.manager().await;
+
+    let error = manager.attach_service(broken, None).await.unwrap_err();
+    assert!(
+        matches!(&error, ServiceAttachError::ChannelRefused { plugin } if plugin == "reports"),
+        "{error}"
+    );
+    half.abort();
+
+    let working = serve_plugin("reports", TOKEN);
+    let binding = platform.service("reports-service").await;
+    platform.deploy(binding, working.port).await;
+    manager
+        .attach_service(binding, None)
+        .await
+        .expect("the name is free for a service that works");
+    let status = status_of(&manager, "reports").await.expect("listed");
+    assert_eq!(status.state, ServicePluginState::Running);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

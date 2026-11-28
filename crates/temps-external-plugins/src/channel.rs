@@ -41,6 +41,10 @@ static AI_CONCURRENCY: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// plugin that does not drain its socket); events are dropped when full,
 /// see [`PluginChannel::send_event`].
 const OUTGOING_CHANNEL_CAPACITY: usize = 256;
+/// How long a plugin has to accept the channel connection, and then to
+/// answer its WebSocket upgrade. Attaching holds a lock shared by every
+/// plugin, so neither wait may be open-ended.
+const CHANNEL_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A live channel connection to a single plugin.
 pub struct PluginChannel {
@@ -113,7 +117,14 @@ impl PluginChannel {
             "Opening platform channel to plugin"
         );
 
-        let stream = match endpoint.connect().await {
+        let stream = match tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, endpoint.connect())
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the plugin did not accept the connection in time",
+                ))
+            }) {
             Ok(s) => {
                 debug!(
                     plugin = %plugin_name,
@@ -149,7 +160,22 @@ impl PluginChannel {
         request
             .headers_mut()
             .insert(temps_plugin_protocol::headers::AUTH_SIGNATURE, auth_header);
-        let ws_stream = match tokio_tungstenite::client_async(request, stream).await {
+        // A service that accepts the connection and never answers the upgrade
+        // would otherwise hold the attachment of every plugin behind it.
+        let upgrade = tokio::time::timeout(
+            CHANNEL_OPEN_TIMEOUT,
+            tokio_tungstenite::client_async(request, stream),
+        )
+        .await;
+        let Ok(upgrade) = upgrade else {
+            warn!(
+                plugin = %plugin_name,
+                "The plugin did not answer the channel handshake within {} seconds",
+                CHANNEL_OPEN_TIMEOUT.as_secs()
+            );
+            return None;
+        };
+        let ws_stream = match upgrade {
             Ok((ws, _resp)) => {
                 debug!(
                     plugin = %plugin_name,

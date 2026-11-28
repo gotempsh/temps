@@ -53,6 +53,14 @@ pub struct PluginProxy {
     pub service: Option<ServiceRoute>,
 }
 
+/// Where a plugin's service answers right now, and the paths its current
+/// manifest leaves open to anonymous callers.
+pub(crate) struct ServiceTarget {
+    pub(crate) endpoint: PluginEndpoint,
+    pub(crate) auth_secret: String,
+    pub(crate) public_paths: Vec<String>,
+}
+
 /// Looks up where a plugin's service answers right now, starting it again
 /// when it was stopped for being idle.
 #[derive(Clone)]
@@ -63,9 +71,10 @@ impl ServiceRoute {
         Self(manager)
     }
 
-    /// The address and secret to use for one request to `plugin_name`, or
-    /// why the plugin cannot serve it, in words a caller may be shown.
-    async fn target(&self, plugin_name: &str) -> Result<(PluginEndpoint, String), String> {
+    /// The address, secret and public paths of the attachment that receives
+    /// one request to `plugin_name`, or why the plugin cannot serve it, in
+    /// words a caller may be shown.
+    async fn target(&self, plugin_name: &str) -> Result<ServiceTarget, String> {
         let Some(manager) = self.0.upgrade() else {
             return Err("The plugin host is shutting down.".to_string());
         };
@@ -335,9 +344,10 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
     let proxy = match proxy.service.clone() {
         None => proxy,
         Some(route) => match route.target(&proxy.plugin_name).await {
-            Ok((endpoint, auth_secret)) => PluginProxy {
-                endpoint,
-                auth_secret,
+            Ok(target) => PluginProxy {
+                endpoint: target.endpoint,
+                auth_secret: target.auth_secret,
+                public_paths: target.public_paths,
                 ..proxy
             },
             Err(reason) => {
@@ -354,6 +364,26 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
             }
         },
     };
+
+    // The check above used the manifest the router was built from. Looking
+    // the service up may have attached a build whose manifest no longer
+    // leaves this path public, so an anonymous request is checked again
+    // against the attachment that would receive it.
+    if auth.is_none() && !proxy.is_public(path) {
+        warn!(
+            plugin = %proxy.plugin_name,
+            method = %method,
+            path = %path,
+            "Rejecting unauthenticated request: the path is no longer public in the plugin's current manifest"
+        );
+        return problemdetails::new(StatusCode::UNAUTHORIZED)
+            .with_title("Authentication Required")
+            .with_detail(format!(
+                "Plugin '{}' is only reachable by an authenticated caller",
+                proxy.plugin_name
+            ))
+            .into_response();
+    }
 
     match forward_to_unix_socket(&proxy, auth.as_ref(), request, &path_and_query).await {
         Ok(response) => response,

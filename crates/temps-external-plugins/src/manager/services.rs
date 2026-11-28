@@ -20,7 +20,7 @@ use utoipa::ToSchema;
 
 use super::*;
 use crate::grants::PluginGrantService;
-use crate::proxy::ServiceRoute;
+use crate::proxy::{ServiceRoute, ServiceTarget};
 use crate::service_runtime::{
     self, service_auth_secret, ServiceAttachError, ServiceBinding, ServiceRuntime,
 };
@@ -249,13 +249,14 @@ impl ExternalPluginManager {
     }
 
     /// Hold `update` unless it is the build this plugin is pinned to, asking
-    /// for nothing more, or the one an administrator just approved.
+    /// for nothing more, or the one an administrator just approved. Returns
+    /// whether the plugin is being added: it has no record yet.
     async fn hold_unapproved(
         &self,
         service: &str,
         update: PendingUpdate,
         approval: BuildApproval<'_>,
-    ) -> Result<(), ServiceAttachError> {
+    ) -> Result<bool, ServiceAttachError> {
         let plugin = update.manifest.name.clone();
         let record = |error: crate::updates::UpdateError| {
             error!(plugin = %plugin, %error, "Could not check a plugin's approved build");
@@ -268,12 +269,12 @@ impl ExternalPluginManager {
         let builds = PluginBuilds::new(self.db.clone());
         // A plugin that is being added has no row yet, and so no pin.
         let Some(pin) = builds.pin_of(&plugin).await.map_err(record)? else {
-            return Ok(());
+            return Ok(true);
         };
         if pin.allows(&update.build, &update.manifest)
             || approval == BuildApproval::Approved(update.review.as_str())
         {
-            return Ok(());
+            return Ok(false);
         }
         let deployment_id = update.deployment_id;
         let difference = AccessDifference::between(pin.approved.as_ref(), &update.manifest);
@@ -364,18 +365,19 @@ impl ExternalPluginManager {
                 reason: format!("its manifest cannot be stored for review: {error}"),
             }
         })?;
-        self.hold_unapproved(
-            &target.service,
-            PendingUpdate {
-                build: target.build.clone(),
-                deployment_id: target.deployment_id,
-                manifest: manifest.clone(),
-                review,
-                since: None,
-            },
-            approval,
-        )
-        .await?;
+        let being_added = self
+            .hold_unapproved(
+                &target.service,
+                PendingUpdate {
+                    build: target.build.clone(),
+                    deployment_id: target.deployment_id,
+                    manifest: manifest.clone(),
+                    review,
+                    since: None,
+                },
+                approval,
+            )
+            .await?;
 
         let openapi_schema = hello.openapi.and_then(|json| {
             serde_json::from_value::<OpenApi>(json)
@@ -400,10 +402,23 @@ impl ExternalPluginManager {
             self.audit_service.clone(),
             &auth_secret,
         )
-        .await
-        .ok_or_else(|| ServiceAttachError::ChannelRefused {
-            plugin: manifest.name.clone(),
-        })?;
+        .await;
+        let Some(channel) = channel else {
+            // Opening the channel recorded the plugin's actor. A plugin that
+            // was being added and never connected must not keep its name:
+            // nothing lists it, so nothing could remove it.
+            if being_added {
+                if let Err(error) = PluginGrantService::new(self.db.clone())
+                    .revoke_actor(&manifest.name)
+                    .await
+                {
+                    error!(plugin = %manifest.name, %error, "Could not release the name of a plugin that failed to connect");
+                }
+            }
+            return Err(ServiceAttachError::ChannelRefused {
+                plugin: manifest.name.clone(),
+            });
+        };
         PluginGrantService::new(self.db.clone())
             .bind_service(
                 &manifest.name,
@@ -803,8 +818,28 @@ impl ExternalPluginManager {
 
     /// Stop treating `plugin_name` as a plugin. Its service keeps running:
     /// the deployment owns it.
+    #[cfg(test)]
     pub(crate) async fn detach_service(&self, plugin_name: &str) -> bool {
         let _attaching = self.services.attach.lock().await;
+        self.forget_service(plugin_name).await
+    }
+
+    /// Run `revoke`, then stop treating `plugin_name` as a plugin, with no
+    /// attachment in between. A request that was starting the plugin again
+    /// has finished by the time `revoke` runs, and none can start until the
+    /// plugin is forgotten, so a revoked actor is never created again behind
+    /// a removal. When `revoke` fails the plugin stays attached and listed.
+    pub(crate) async fn detach_service_after<E>(
+        &self,
+        plugin_name: &str,
+        revoke: impl std::future::Future<Output = Result<(), E>>,
+    ) -> Result<bool, E> {
+        let _attaching = self.services.attach.lock().await;
+        revoke.await?;
+        Ok(self.forget_service(plugin_name).await)
+    }
+
+    async fn forget_service(&self, plugin_name: &str) -> bool {
         let was_dormant = self
             .services
             .dormant
@@ -928,7 +963,7 @@ impl ExternalPluginManager {
     pub(crate) async fn service_request_target(
         &self,
         plugin_name: &str,
-    ) -> Result<(PluginEndpoint, String), String> {
+    ) -> Result<ServiceTarget, String> {
         if let Some(target) = self.attached_target(plugin_name).await {
             return Ok(target);
         }
@@ -938,13 +973,17 @@ impl ExternalPluginManager {
             .ok_or_else(|| format!("Plugin '{plugin_name}' stopped while it was being started."))
     }
 
-    async fn attached_target(&self, plugin_name: &str) -> Option<(PluginEndpoint, String)> {
+    async fn attached_target(&self, plugin_name: &str) -> Option<ServiceTarget> {
         let (binding, target) = {
             let plugins = self.plugins.read().await;
             let process = plugins.get(plugin_name)?;
             (
                 process.service.binding,
-                (process.endpoint.clone(), process.auth_secret.clone()),
+                ServiceTarget {
+                    endpoint: process.endpoint.clone(),
+                    auth_secret: process.auth_secret.clone(),
+                    public_paths: process.manifest.public_paths.clone(),
+                },
             )
         };
         // A request that reaches the plugin through Temps is use of the
