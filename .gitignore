@@ -98,3 +98,6 @@ ci-build-cache/
 
 # Verified SDK release artifacts (never source files).
 /sdk-artifacts/
+
+# claude plugin eval output (transcripts, reports)
+evals/results/
