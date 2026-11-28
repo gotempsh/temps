@@ -106,6 +106,7 @@ pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
+pub mod uptime_monitor_ip_access;
 pub mod ways_in;
 pub mod websocket_origin;
 pub mod worker_ingress;

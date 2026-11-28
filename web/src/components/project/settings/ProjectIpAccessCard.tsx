@@ -52,6 +52,7 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   CircleAlert,
+  Loader2,
   Network,
   Plus,
   Search,
@@ -59,6 +60,7 @@ import {
   UserRound,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router'
 import { Controller, useFieldArray, useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import {
@@ -77,13 +79,23 @@ import {
   probeScope,
   showsEntries,
   entriesToSave,
+  fixesOwnList,
+  isLockoutError,
+  monitorBlockSettingsPath,
+  withMonitorEntries,
   type IpAccessFormValues,
   type IpAccessFormMode,
   type IpAccessMode,
 } from './ip-access'
+import { allowMonitor, allowMonitorNotice } from './allow-monitor'
 
 interface ProjectIpAccessCardProps {
   projectId: number
+  /**
+   * Slug of the project, for the link to the project list when that list,
+   * not this environment's, is what refuses the uptime monitor.
+   */
+  projectSlug?: string
   /** Set to manage one environment's list instead of the project-wide one. */
   environmentId?: number
   /**
@@ -107,20 +119,11 @@ const MODES: { value: IpAccessFormMode; hint: string }[] = [
   { value: 'deny', hint: 'Listed addresses get a 403, everyone else is fine.' },
 ]
 
-/**
- * The 409 for "this save would lock you out". Another 409 (a concurrent
- * update) must not offer the "Save anyway" override, so the title decides.
- */
-function isLockoutError(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null) return false
-  const problem = error as { status?: unknown; title?: unknown }
-  return problem.status === 409 && problem.title === 'Policy Would Lock You Out'
-}
-
 const IP_ACCESS_SECTION_ID = 'ip-access'
 
 export function ProjectIpAccessCard({
   projectId,
+  projectSlug,
   environmentId,
   scopeName,
 }: ProjectIpAccessCardProps) {
@@ -208,9 +211,11 @@ export function ProjectIpAccessCard({
   const mode = useWatch({ control: form.control, name: 'mode' })
   const currentCidrs = useWatch({ control: form.control, name: 'cidrs' })
 
+  // A save refused because it would lock the operator out, and how to
+  // send it again with the lockout acknowledged.
   const [lockout, setLockout] = useState<{
     detail: string
-    request: SetProjectIpAccessRequest
+    confirm: () => void
   } | null>(null)
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [probe, setProbe] = useState('')
@@ -258,7 +263,7 @@ export function ProjectIpAccessCard({
       if (isLockoutError(error)) {
         setLockout({
           detail: problemDetail(error, 'This change would lock you out.'),
-          request: body,
+          confirm: () => save.mutate({ ...body, acknowledge_lockout: true }),
         })
         return
       }
@@ -402,9 +407,65 @@ export function ProjectIpAccessCard({
     )
   }
 
+  // The saved list (for an environment that follows the project, the
+  // project's) refuses Temps' own uptime monitor. Allowing it here saves the
+  // saved list plus the monitor's entries, so it waits for a clean form.
+  const monitorBlock = policy?.uptime_monitor_block ?? null
+  const allowMonitorHere =
+    monitorBlock !== null &&
+    fixesOwnList(monitorBlock, isEnvironment) &&
+    monitorBlock.suggested_cidrs.length > 0
+  // Entries the list would need to drop before the monitor's fit.
+  const monitorOverflow =
+    policy && monitorBlock
+      ? Math.max(
+          0,
+          withMonitorEntries(policy.cidrs, monitorBlock).length -
+            policy.max_cidrs
+        )
+      : 0
+  const allowMonitorMutation = useMutation({
+    mutationFn: (acknowledgeLockout: boolean) => {
+      if (!monitorBlock) {
+        return Promise.reject(new Error('Nothing blocks the uptime monitor'))
+      }
+      return allowMonitor(monitorBlock, acknowledgeLockout)
+    },
+    onSuccess: (outcome) => {
+      setLockout(null)
+      if (outcome.kind === 'saved') {
+        queryClient.setQueryData(queryKey, outcome.saved)
+        form.reset(valuesFor(outcome.saved))
+        setChangedElsewhere(false)
+        setProbeResult(null)
+        toast.success('Monitor allowed. The next check will reach the app.')
+        return
+      }
+      queryClient.invalidateQueries({ queryKey })
+      if (outcome.kind === 'already-allowed') {
+        toast.success(allowMonitorNotice(outcome))
+      } else {
+        toast.error(allowMonitorNotice(outcome))
+      }
+    },
+    onError: (error) => {
+      if (isLockoutError(error)) {
+        setLockout({
+          detail: problemDetail(error, 'This change would lock you out.'),
+          confirm: () => allowMonitorMutation.mutate(true),
+        })
+        return
+      }
+      toast.error(
+        problemDetail(error, 'Could not add the monitor to the IP access list')
+      )
+    },
+  })
+
   const title = isEnvironment ? 'IP access for this environment' : 'IP access'
-  // The project list is what other sections link to (Shield entries).
-  const sectionId = isEnvironment ? undefined : IP_ACCESS_SECTION_ID
+  // Other sections and the uptime monitor link here (Shield entries, a
+  // monitor the list refuses). Each settings page shows one such card.
+  const sectionId = IP_ACCESS_SECTION_ID
   const description = isEnvironment
     ? 'Limit which client addresses can reach this environment. Overrides the project list.'
     : 'Allow only, or block, specific IP addresses and ranges for every environment of this project.'
@@ -490,248 +551,312 @@ export function ProjectIpAccessCard({
           </Alert>
         )}
 
-        <Controller
-          control={form.control}
-          name="mode"
-          render={({ field }) => (
-            <RadioGroup
-              value={field.value}
-              onValueChange={field.onChange}
-              className={
-                isEnvironment
-                  ? 'grid grid-cols-1 gap-2 md:grid-cols-2'
-                  : 'grid grid-cols-1 gap-2 md:grid-cols-3'
-              }
-              aria-label="IP access mode"
-            >
-              {(isEnvironment ? [INHERIT_MODE, ...MODES] : MODES).map(
-                (option) => (
-                  <Label
-                    key={option.value}
-                    htmlFor={`ip-access-mode-${option.value}`}
-                    className="flex cursor-pointer items-start gap-3 rounded-md border p-3 font-normal has-[[data-state=checked]]:border-primary"
+        {monitorBlock && (
+          <Alert>
+            <CircleAlert className="h-4 w-4" />
+            <AlertTitle>This list blocks the uptime monitor</AlertTitle>
+            <AlertDescription className="space-y-3">
+              <p className="[overflow-wrap:anywhere]">{monitorBlock.message}</p>
+              {allowMonitorHere ? (
+                <>
+                  {monitorOverflow > 0 && (
+                    <p>
+                      The list is full. Remove {monitorOverflow}{' '}
+                      {monitorOverflow === 1 ? 'entry' : 'entries'} to make room
+                      for the monitor.
+                    </p>
+                  )}
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => allowMonitorMutation.mutate(false)}
+                    disabled={
+                      isDirty ||
+                      monitorOverflow > 0 ||
+                      save.isPending ||
+                      allowMonitorMutation.isPending
+                    }
+                    title={
+                      isDirty
+                        ? 'Save or discard your changes first'
+                        : `Add ${monitorBlock.suggested_cidrs.join(', ')} as "${monitorBlock.suggested_description}"`
+                    }
                   >
-                    <RadioGroupItem
-                      id={`ip-access-mode-${option.value}`}
-                      value={option.value}
-                      className="mt-0.5"
-                    />
-                    <span className="space-y-0.5">
-                      <span className="block text-sm font-medium">
-                        {modeLabel(option.value)}
-                      </span>
-                      <span className="block text-sm text-muted-foreground">
-                        {option.hint}
-                      </span>
-                    </span>
-                  </Label>
-                )
-              )}
-            </RadioGroup>
-          )}
-        />
+                    {allowMonitorMutation.isPending && (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    )}
+                    Allow monitor
+                  </Button>
+                </>
+              ) : !fixesOwnList(monitorBlock, isEnvironment) && projectSlug ? (
+                <Button asChild type="button" size="sm" variant="outline">
+                  <Link
+                    to={monitorBlockSettingsPath(projectSlug, monitorBlock)}
+                  >
+                    Project list
+                  </Link>
+                </Button>
+              ) : null}
+            </AlertDescription>
+          </Alert>
+        )}
 
-        {showsEntries(mode) && (
-          <div className="space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <Label>
-                Addresses and ranges{' '}
-                <span className="font-normal text-muted-foreground">
-                  ({fields.length} / {MAX_CIDRS})
-                </span>
-              </Label>
-              <div className="flex flex-wrap gap-2">
-                {yourIp && !yourIpListed && (
+        {/* Locked while "Allow monitor" saves: its result replaces the form,
+            so an edit made meanwhile would be lost. */}
+        <fieldset
+          disabled={allowMonitorMutation.isPending}
+          className="m-0 min-w-0 space-y-5 border-0 p-0"
+        >
+          <Controller
+            control={form.control}
+            name="mode"
+            render={({ field }) => (
+              <RadioGroup
+                value={field.value}
+                onValueChange={field.onChange}
+                className={
+                  isEnvironment
+                    ? 'grid grid-cols-1 gap-2 md:grid-cols-2'
+                    : 'grid grid-cols-1 gap-2 md:grid-cols-3'
+                }
+                aria-label="IP access mode"
+              >
+                {(isEnvironment ? [INHERIT_MODE, ...MODES] : MODES).map(
+                  (option) => (
+                    <Label
+                      key={option.value}
+                      htmlFor={`ip-access-mode-${option.value}`}
+                      className="flex cursor-pointer items-start gap-3 rounded-md border p-3 font-normal has-[[data-state=checked]]:border-primary"
+                    >
+                      <RadioGroupItem
+                        id={`ip-access-mode-${option.value}`}
+                        value={option.value}
+                        className="mt-0.5"
+                      />
+                      <span className="space-y-0.5">
+                        <span className="block text-sm font-medium">
+                          {modeLabel(option.value)}
+                        </span>
+                        <span className="block text-sm text-muted-foreground">
+                          {option.hint}
+                        </span>
+                      </span>
+                    </Label>
+                  )
+                )}
+              </RadioGroup>
+            )}
+          />
+
+          {showsEntries(mode) && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <Label>
+                  Addresses and ranges{' '}
+                  <span className="font-normal text-muted-foreground">
+                    ({fields.length} / {MAX_CIDRS})
+                  </span>
+                </Label>
+                <div className="flex flex-wrap gap-2">
+                  {yourIp && !yourIpListed && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={atLimit}
+                      onClick={() =>
+                        append({
+                          cidr: hostCidr(yourIp),
+                          description: 'My current address',
+                        })
+                      }
+                    >
+                      <UserRound className="mr-2 h-4 w-4" />
+                      Add my IP ({yourIp})
+                    </Button>
+                  )}
+                  {canAddPresets && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={atLimit || !presetsHaveRoom}
+                      title={
+                        presetsHaveRoom
+                          ? undefined
+                          : `Not enough room: the Tailscale ranges need ${
+                              missingPresets(currentCidrs, TAILSCALE_PRESETS)
+                                .length
+                            } more entries and the list holds at most ${MAX_CIDRS}.`
+                      }
+                      onClick={addPresets}
+                    >
+                      <Network className="mr-2 h-4 w-4" />
+                      Add Tailscale ranges
+                    </Button>
+                  )}
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
                     disabled={atLimit}
-                    onClick={() =>
-                      append({
-                        cidr: hostCidr(yourIp),
-                        description: 'My current address',
-                      })
-                    }
+                    onClick={() => append({ cidr: '', description: '' })}
                   >
-                    <UserRound className="mr-2 h-4 w-4" />
-                    Add my IP ({yourIp})
+                    <Plus className="mr-2 h-4 w-4" />
+                    Add range
                   </Button>
-                )}
-                {canAddPresets && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    disabled={atLimit || !presetsHaveRoom}
-                    title={
-                      presetsHaveRoom
-                        ? undefined
-                        : `Not enough room: the Tailscale ranges need ${
-                            missingPresets(currentCidrs, TAILSCALE_PRESETS)
-                              .length
-                          } more entries and the list holds at most ${MAX_CIDRS}.`
-                    }
-                    onClick={addPresets}
+                </div>
+              </div>
+
+              {fields.length === 0 ? (
+                <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+                  {mode === 'allow'
+                    ? 'An allow list needs at least one entry, e.g. 203.0.113.0/24, or 2001:db8::/32 for IPv6. Use "Add Tailscale ranges" to admit your tailnet.'
+                    : 'No addresses yet. Enter a single address (203.0.113.9) or a range (203.0.113.0/24, 2001:db8::/32).'}
+                </p>
+              ) : (
+                <ul className="space-y-2">
+                  {fields.map((field, index) => {
+                    const rowErrors = form.formState.errors.cidrs?.[index]
+                    return (
+                      <li
+                        key={field.id}
+                        className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
+                      >
+                        <div className="space-y-1">
+                          <Input
+                            aria-label={`Address or range ${index + 1}`}
+                            aria-invalid={rowErrors?.cidr ? true : undefined}
+                            placeholder="203.0.113.0/24"
+                            className="font-mono"
+                            {...form.register(`cidrs.${index}.cidr` as const)}
+                          />
+                          {rowErrors?.cidr?.message && (
+                            <p className="text-sm text-destructive">
+                              {rowErrors.cidr.message}
+                            </p>
+                          )}
+                        </div>
+                        <div className="space-y-1">
+                          <Input
+                            aria-label={`Note for range ${index + 1}`}
+                            aria-invalid={
+                              rowErrors?.description ? true : undefined
+                            }
+                            placeholder="Note (optional)"
+                            maxLength={MAX_DESCRIPTION_LENGTH}
+                            {...form.register(
+                              `cidrs.${index}.description` as const
+                            )}
+                          />
+                          {rowErrors?.description?.message && (
+                            <p className="text-sm text-destructive">
+                              {rowErrors.description.message}
+                            </p>
+                          )}
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          aria-label={`Remove range ${index + 1}`}
+                          onClick={() => remove(index)}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+              {cidrsError && (
+                <p className="text-sm text-destructive" role="alert">
+                  {cidrsError}
+                </p>
+              )}
+            </div>
+          )}
+
+          {mode !== 'disabled' && mode !== 'inherit' && yourIp && (
+            <Alert>
+              <CircleAlert className="h-4 w-4" />
+              <AlertTitle>Your address: {yourIp}</AlertTitle>
+              <AlertDescription>
+                That is how the console sees you. The {scopeNoun} sees clients
+                the same way only when both are reached over the same network
+                path; test an address below before relying on a list. You are
+                asked to confirm if a save would lock this address out.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {/* Off lets every address through: there is nothing to try. */}
+          {mode !== 'disabled' && (
+            <>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                <div className="min-w-0 flex-1 space-y-1">
+                  <Label
+                    htmlFor={`ip-access-probe-${environmentId ?? 'project'}`}
                   >
-                    <Network className="mr-2 h-4 w-4" />
-                    Add Tailscale ranges
-                  </Button>
-                )}
+                    Try an address
+                  </Label>
+                  <Input
+                    id={`ip-access-probe-${environmentId ?? 'project'}`}
+                    value={probe}
+                    placeholder="100.101.102.103"
+                    className="font-mono"
+                    onChange={(event) => setProbe(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        runProbe()
+                      }
+                    }}
+                  />
+                </div>
                 <Button
                   type="button"
                   variant="outline"
-                  size="sm"
-                  disabled={atLimit}
-                  onClick={() => append({ cidr: '', description: '' })}
+                  disabled={probe.trim() === '' || probeMutation.isPending}
+                  onClick={runProbe}
                 >
-                  <Plus className="mr-2 h-4 w-4" />
-                  Add range
+                  <Search className="mr-2 h-4 w-4" />
+                  {probeMutation.isPending ? 'Checking…' : 'Check'}
                 </Button>
               </div>
-            </div>
-
-            {fields.length === 0 ? (
-              <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
-                {mode === 'allow'
-                  ? 'An allow list needs at least one entry, e.g. 203.0.113.0/24, or 2001:db8::/32 for IPv6. Use "Add Tailscale ranges" to admit your tailnet.'
-                  : 'No addresses yet. Enter a single address (203.0.113.9) or a range (203.0.113.0/24, 2001:db8::/32).'}
-              </p>
-            ) : (
-              <ul className="space-y-2">
-                {fields.map((field, index) => {
-                  const rowErrors = form.formState.errors.cidrs?.[index]
-                  return (
-                    <li
-                      key={field.id}
-                      className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
-                    >
-                      <div className="space-y-1">
-                        <Input
-                          aria-label={`Address or range ${index + 1}`}
-                          aria-invalid={rowErrors?.cidr ? true : undefined}
-                          placeholder="203.0.113.0/24"
-                          className="font-mono"
-                          {...form.register(`cidrs.${index}.cidr` as const)}
-                        />
-                        {rowErrors?.cidr?.message && (
-                          <p className="text-sm text-destructive">
-                            {rowErrors.cidr.message}
-                          </p>
-                        )}
-                      </div>
-                      <div className="space-y-1">
-                        <Input
-                          aria-label={`Note for range ${index + 1}`}
-                          aria-invalid={
-                            rowErrors?.description ? true : undefined
-                          }
-                          placeholder="Note (optional)"
-                          maxLength={MAX_DESCRIPTION_LENGTH}
-                          {...form.register(
-                            `cidrs.${index}.description` as const
-                          )}
-                        />
-                        {rowErrors?.description?.message && (
-                          <p className="text-sm text-destructive">
-                            {rowErrors.description.message}
-                          </p>
-                        )}
-                      </div>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        aria-label={`Remove range ${index + 1}`}
-                        onClick={() => remove(index)}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </li>
-                  )
-                })}
-              </ul>
-            )}
-            {cidrsError && (
-              <p className="text-sm text-destructive" role="alert">
-                {cidrsError}
-              </p>
-            )}
-          </div>
-        )}
-
-        {mode !== 'disabled' && mode !== 'inherit' && yourIp && (
-          <Alert>
-            <CircleAlert className="h-4 w-4" />
-            <AlertTitle>Your address: {yourIp}</AlertTitle>
-            <AlertDescription>
-              That is how the console sees you. The {scopeNoun} sees clients the
-              same way only when both are reached over the same network path;
-              test an address below before relying on a list. You are asked to
-              confirm if a save would lock this address out.
-            </AlertDescription>
-          </Alert>
-        )}
-
-        {/* Off lets every address through: there is nothing to try. */}
-        {mode !== 'disabled' && (
-          <>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-              <div className="min-w-0 flex-1 space-y-1">
-                <Label
-                  htmlFor={`ip-access-probe-${environmentId ?? 'project'}`}
+              {visibleProbeDraftError && (
+                <p className="text-sm text-destructive" role="alert">
+                  Fix the list before trying an address:{' '}
+                  {visibleProbeDraftError}
+                </p>
+              )}
+              {probeResult && (
+                <p
+                  className={
+                    probeResult.allowed
+                      ? 'text-sm text-foreground'
+                      : 'text-sm text-destructive'
+                  }
+                  role="status"
                 >
-                  Try an address
-                </Label>
-                <Input
-                  id={`ip-access-probe-${environmentId ?? 'project'}`}
-                  value={probe}
-                  placeholder="100.101.102.103"
-                  className="font-mono"
-                  onChange={(event) => setProbe(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault()
-                      runProbe()
-                    }
-                  }}
-                />
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={probe.trim() === '' || probeMutation.isPending}
-                onClick={runProbe}
-              >
-                <Search className="mr-2 h-4 w-4" />
-                {probeMutation.isPending ? 'Checking…' : 'Check'}
-              </Button>
-            </div>
-            {visibleProbeDraftError && (
-              <p className="text-sm text-destructive" role="alert">
-                Fix the list before trying an address: {visibleProbeDraftError}
-              </p>
-            )}
-            {probeResult && (
-              <p
-                className={
-                  probeResult.allowed
-                    ? 'text-sm text-foreground'
-                    : 'text-sm text-destructive'
-                }
-                role="status"
-              >
-                {probeResult.allowed ? 'Allowed' : 'Blocked'} —{' '}
-                {probeResult.reason}
-              </p>
-            )}
-          </>
-        )}
+                  {probeResult.allowed ? 'Allowed' : 'Blocked'} —{' '}
+                  {probeResult.reason}
+                </p>
+              )}
+            </>
+          )}
+        </fieldset>
 
         <div className="flex flex-wrap items-center gap-2">
           <Button
             type="submit"
-            disabled={!form.formState.isDirty || save.isPending}
+            disabled={
+              !form.formState.isDirty ||
+              save.isPending ||
+              // A save sent while "Allow monitor" runs would replace the
+              // list without the entry it is adding.
+              allowMonitorMutation.isPending
+            }
           >
             {save.isPending ? 'Saving…' : 'Save IP access list'}
           </Button>
@@ -777,9 +902,7 @@ export function ProjectIpAccessCard({
             <AlertDialogCancel>Keep editing</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                if (lockout) {
-                  save.mutate({ ...lockout.request, acknowledge_lockout: true })
-                }
+                lockout?.confirm()
               }}
             >
               Save anyway

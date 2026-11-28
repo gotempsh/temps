@@ -13786,6 +13786,7 @@ Replace the IP access list. A list that would lock out this machine needs --ackn
 | `--cidr <cidr>` | Address or CIDR range; repeat or comma-separate | `` | No |
 | `--tailscale` | Include the Tailscale ranges (100.64.0.0/10 and fd7a:115c:a1e0::/48) | - | No |
 | `--acknowledge-lockout` | Apply even if it would block the address you are calling from | - | No |
+| `--expected-revision <revision>` | Save only if the stored list is still at this revision (see show --json; 0 when nothing is stored) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `ip-access project clear`
