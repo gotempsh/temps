@@ -1,0 +1,13 @@
+{
+  "name": "@temps-sdk/mcpb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP bundle (.mcpb) that installs and connects Temps in Claude Desktop",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "test": "bun test",
+    "validate": "bunx @anthropic-ai/mcpb@2.1.2 validate manifest.json",
+    "pack": "bash pack.sh"
+  }
+}
