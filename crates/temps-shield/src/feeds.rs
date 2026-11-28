@@ -92,6 +92,19 @@ pub const FEEDS: &[Feed] = &[
         enabled_by_default: false,
         terms: "https://creativecommons.org/licenses/by-nc-sa/2.5/",
     },
+    Feed {
+        // Addresses that attacked NetAPI's honeypot sensors in the last 48
+        // hours, rebuilt hourly; how it is built: https://netapi.com/compromised-ips/
+        name: "netapi_attackers",
+        urls: &["https://netapi.com/api2/?method=compromised&dataset_type=ip"],
+        format: Format::Plain,
+        verdict: ListVerdict::Challenge,
+        max_age_secs: 3 * DAY,
+        dated: false,
+        // CC BY 4.0 allows any use with credit; off until an operator opts in.
+        enabled_by_default: false,
+        terms: "https://creativecommons.org/licenses/by/4.0/",
+    },
 ];
 
 pub fn feed(name: &str) -> Option<&'static Feed> {
@@ -267,6 +280,21 @@ not json
         assert_eq!(names(&parsed), ["0.0.0.0/8", "2001:db8::/32"]);
         assert_eq!(parsed.rejected, 1);
         assert_eq!(parsed.published_at, Some(1_792_976_101));
+    }
+
+    #[test]
+    fn netapi_attackers_list_with_its_comment_line() {
+        let netapi = feed("netapi_attackers").unwrap();
+        let text = "# NetAPI.com - currently compromised IPs (2026-11-13).\n\
+            1.0.166.69\n1.0.211.231\n";
+        let parsed = parse(netapi.format, text);
+        assert_eq!(names(&parsed), ["1.0.166.69/32", "1.0.211.231/32"]);
+        assert_eq!(parsed.rejected, 0);
+        // The comment line carries a date but no `last updated` stamp.
+        assert_eq!(parsed.published_at, None);
+        let list = assemble(netapi, &[text], 2000).unwrap();
+        assert_eq!(list.published_at, 2000);
+        assert_eq!(list.verdict, ListVerdict::Challenge);
     }
 
     #[test]
