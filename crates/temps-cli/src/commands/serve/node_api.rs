@@ -419,6 +419,7 @@ fn is_node_route(path: &str) -> bool {
                 | "public-ingress/key"
                 | "public-ingress/report"
                 | "network-policy"
+                | "egress-records"
                 | "dns/changes"
                 | "dns/ack"
                 | "state"
@@ -795,6 +796,7 @@ mod tests {
             "/api/internal/nodes/7/routes/ack",
             "/api/internal/nodes/7/acme-challenge",
             "/api/internal/nodes/7/network-policy",
+            "/api/internal/nodes/7/egress-records",
             "/api/internal/nodes/7/dns/changes",
             "/api/internal/nodes/7/dns/ack",
             // The node runtime's state sync (`HttpControlPlaneLink`), whose
@@ -815,6 +817,7 @@ mod tests {
             "/api/internal/nodes/7/containers",
             "/api/internal/nodes/abc/heartbeat",
             "/api/internal/nodes/7/network-policy/x",
+            "/api/internal/nodes/7/egress-records/x",
             "/api/internal/nodes/7/dns",
             "/api/internal/nodes/7/dns/changes/x",
             "/api/internal/nodes/abc/state",

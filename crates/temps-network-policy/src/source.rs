@@ -18,10 +18,10 @@ use tracing::info;
 
 use crate::service::{NetworkPolicyService, CONTROL_PLANE_NODE_ID};
 
-/// How often node 0 re-checks its mode and, outside `legacy`, its policy.
+/// How often node 0 re-checks its mode and, outside `off`, its policy.
 pub const PASS_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Reads one node's mode every pass and, outside `legacy`, rebuilds the
+/// Reads one node's mode every pass and, outside `off`, rebuilds the
 /// snapshot every pass too.
 ///
 /// It is not cached by `network_policy_state.revision`: that revision only
@@ -34,11 +34,22 @@ pub const PASS_INTERVAL: Duration = Duration::from_secs(15);
 pub struct DbPolicySource {
     service: Arc<NetworkPolicyService>,
     node_id: i32,
+    /// The mode and policy revision the last `mode` call read, for
+    /// `off_snapshot` and `observed` in the same pass.
+    last: std::sync::Mutex<(NodeMode, i64)>,
 }
 
 impl DbPolicySource {
     pub fn new(service: Arc<NetworkPolicyService>, node_id: i32) -> Self {
-        Self { service, node_id }
+        Self {
+            service,
+            node_id,
+            last: std::sync::Mutex::new((NodeMode::default(), 0)),
+        }
+    }
+
+    fn last(&self) -> (NodeMode, i64) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn node(&self) -> String {
@@ -48,21 +59,33 @@ impl DbPolicySource {
 
 #[async_trait]
 impl PolicySource for DbPolicySource {
+    /// One query: the mode and the policy revision.
     async fn mode(&self) -> Result<NodeMode, EnforcerError> {
-        let mode =
-            self.service
-                .node_mode(self.node_id)
-                .await
-                .map_err(|e| EnforcerError::Source {
-                    node: self.node(),
-                    reason: e.to_string(),
-                })?;
-        if mode == NodeMode::Legacy {
-            // Nothing is observed in `legacy`; stop advertising what was.
-            self.service
-                .record_observed(self.node_id, IdentityMap::new());
+        let (mode, revision) = self
+            .service
+            .mode_and_revision(self.node_id)
+            .await
+            .map_err(|e| EnforcerError::Source {
+                node: self.node(),
+                reason: e.to_string(),
+            })?;
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = (mode, revision);
+        if mode == NodeMode::Off {
+            // In `off` nothing is observed (`off_snapshot` is None), so what
+            // this node advertised in another mode is dropped now, however
+            // the mode changed, rather than left to its TTL.
+            self.service.forget_observed(self.node_id);
         }
         Ok(mode)
+    }
+
+    /// None: in `off` nothing on the control plane reads what this
+    /// enforcer would observe. Its egress table is its own, and the control
+    /// plane's own workloads are recorded by the local recorder, which keeps
+    /// a table of its own; other nodes never take an `off` node's workloads
+    /// as peers. So an idle pass lists no containers and clones no snapshot.
+    async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        Ok(None)
     }
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
@@ -78,7 +101,9 @@ impl PolicySource for DbPolicySource {
     /// Node 0's workloads, for the workers: the same record a worker's
     /// report makes.
     fn observed(&self, local: &IdentityMap) {
-        self.service.record_observed(self.node_id, local.clone());
+        let (mode, _) = self.last();
+        self.service
+            .record_observed(self.node_id, local.clone(), mode);
     }
 }
 
@@ -90,7 +115,7 @@ pub fn control_plane_table() -> Result<TableName, EnforcerError> {
     })
 }
 
-/// Starts node 0's enforcer. In `legacy` (the default) each pass reads the
+/// Starts node 0's enforcer. In `off` (the default) each pass reads the
 /// mode and does nothing else: no Docker call, no nftables.
 ///
 /// `dns` is the slot node 0's resolver answers restricted workloads from;

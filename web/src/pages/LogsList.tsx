@@ -8,6 +8,7 @@ import {
 } from '@/components/logs/LogAttributeFilter'
 import type { LogAttributeOperator, LogAttributeType } from '@/api/client'
 import { Callout } from '@temps-sdk/ds'
+import { workloadFilter } from '@/lib/log-workload-filter'
 import { readFailureServerDetail } from '@/lib/read-failure'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
@@ -96,6 +97,8 @@ export default function LogsList({ project }: LogsListProps) {
     | 'attribute_value'
     | 'attribute_type'
     | 'attribute_op'
+    | 'workload_kind'
+    | 'workload_id'
   >()
   const { state, patch } = urlState
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -114,6 +117,12 @@ export default function LogsList({ project }: LogsListProps) {
   const [search, setSearch] = useUrlSearchText('q', { urlState })
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
   const traceId = state.trace || ''
+  // A workload's recorded connections (the recording card links here):
+  // read by the columns only the platform fills, never by an attribute.
+  const workload = useMemo(
+    () => workloadFilter(state.workload_kind, state.workload_id),
+    [state.workload_kind, state.workload_id]
+  )
   const attributeFilter = useMemo<LogAttributePredicate | undefined>(() => {
     return state.attribute_key
       ? {
@@ -165,6 +174,7 @@ export default function LogsList({ project }: LogsListProps) {
     debouncedSearch,
     traceId,
     attributeFilter,
+    workload,
   ])
 
   const { startTime, endTime } = useMemo(() => {
@@ -184,6 +194,8 @@ export default function LogsList({ project }: LogsListProps) {
         service_name: debouncedService || undefined,
         search: debouncedSearch || undefined,
         trace_id: traceId || undefined,
+        workload_kind: workload?.kind,
+        workload_id: workload?.id,
         // When pinned to a trace, ignore the time window — a trace's logs may
         // predate the selected range, and the trace_id is already specific.
         start_time: traceId ? undefined : startTime,
@@ -197,12 +209,14 @@ export default function LogsList({ project }: LogsListProps) {
   const logs: LogRecord[] = data?.data ?? []
   const hasMore = logs.length === PAGE_SIZE
   const hasFilters =
-    severity !== ALL || !!service || !!search || !!attributeFilter
+    severity !== ALL || !!service || !!search || !!attributeFilter || !!workload
 
   // Tell the assistant the user is exploring logs (+ active filters).
   const assistantContext = useMemo(() => {
     const filters = [
       traceId && `trace ${traceId}`,
+      workload &&
+        `outbound connections recorded for ${workload.kind} ${workload.id}`,
       severity !== ALL && `severity ${severity}`,
       service && `service "${service}"`,
       search && `search "${search}"`,
@@ -213,7 +227,7 @@ export default function LogsList({ project }: LogsListProps) {
       `Time range: ${timeRange}.${filters.length ? ` Active filters: ${filters.join(', ')}.` : ''}`,
       'Fetch logs with the temps CLI: `telemetry-logs query_logs --severity/--service_name/--search/--trace_id`.',
     ].join('\n')
-  }, [project, timeRange, severity, service, search, traceId])
+  }, [project, timeRange, severity, service, search, traceId, workload])
   useAssistantPageContext(assistantContext, 'these logs')
 
   const toggleExpand = (i: number) => {
@@ -276,6 +290,27 @@ export default function LogsList({ project }: LogsListProps) {
             size="icon"
             className="h-7 w-7"
             onClick={clearTrace}
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      )}
+
+      {workload && (
+        <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+          <Network className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <span className="[overflow-wrap:anywhere]">
+            Showing outbound connections recorded for {workload.kind}{' '}
+            <code className="font-mono text-xs">{workload.id}</code>
+          </span>
+          <Button
+            aria-label="Clear workload filter"
+            variant="ghost"
+            size="icon"
+            className="ml-auto h-7 w-7"
+            onClick={() =>
+              patch({ workload_kind: undefined, workload_id: undefined })
+            }
           >
             <X className="h-3.5 w-3.5" />
           </Button>

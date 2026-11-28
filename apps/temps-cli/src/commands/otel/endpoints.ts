@@ -248,6 +248,8 @@ export function registerOtelEndpoints(program: Command): void {
       attribute_type: { kind: 'string', help: "Optional native declared type; older records without type metadata do not match", values: ["string","boolean","integer","double","array","object","bytes"] },
       attribute_op: { kind: 'string', help: "Default eq; numeric types also support lt/lte/gt/gte", values: ["eq","ne","lt","lte","gt","gte"] },
       trace_id: { kind: 'string', help: "Filter by correlated trace ID" },
+      workload_kind: { kind: 'string', help: "Only what the platform recorded about one workload of the project (sandbox, deployment, ...); pair with workload_id" },
+      workload_id: { kind: 'int', help: "The workload's numeric id; pair with workload_kind" },
       start_time: { kind: 'string', help: "Start time (RFC 3339)" },
       end_time: { kind: 'string', help: "End time (RFC 3339)" },
       limit: { kind: 'int', help: "Max logs to return (default: 100, max: 1000)" },

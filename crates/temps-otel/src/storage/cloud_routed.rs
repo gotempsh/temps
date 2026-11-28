@@ -494,6 +494,10 @@ impl OtelStorage for CloudRoutedOtelStorage {
         self.local.query_logs(query).await
     }
 
+    async fn count_logs(&self, query: LogQuery) -> StorageResult<u64> {
+        self.local.count_logs(query).await
+    }
+
     // ── Span reads: routed ───────────────────────────────────────────────
 
     async fn query_spans(&self, query: TraceQuery) -> StorageResult<Vec<SpanRecord>> {

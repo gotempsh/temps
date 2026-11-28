@@ -31,6 +31,7 @@ const sandbox = {
     preview_access: 'temps_login',
     preview_allowed_cidrs: [],
     egress_policy: { mode: 'internet', rules: [] },
+    egress_recording: false,
     region: 'local',
     requestedAt: 1_767_225_600_000,
     runtime: 'node22',

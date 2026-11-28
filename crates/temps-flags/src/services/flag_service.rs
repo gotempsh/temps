@@ -1307,6 +1307,7 @@ mod tests {
             last_activity_at: None,
             force_https: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         }
     }

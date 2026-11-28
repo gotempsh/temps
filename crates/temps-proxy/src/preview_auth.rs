@@ -1485,6 +1485,7 @@ mod tests {
             },
             preview_allowed_cidrs: Vec::new(),
             egress_policy: Default::default(),
+            egress_recording: false,
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,

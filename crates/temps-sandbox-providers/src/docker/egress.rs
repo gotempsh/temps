@@ -117,6 +117,220 @@ pub(super) fn container_has_internal_proxy(
     container_environment_value(container, SANDBOX_INTERNAL_PROXY_ENV).unwrap_or("") == expected
 }
 
+/// Where this host's per-node egress proxy takes the traffic of sandboxes
+/// that record their outbound connections, and which sandboxes (by
+/// container name) do. Published by the control plane's egress recorder;
+/// `None` while it is not serving. One per process, like the internal
+/// proxy's address; read when an egress proxy is created or checked for
+/// drift, never per request.
+struct EgressRecordingRoute {
+    address: std::net::SocketAddr,
+    installation: String,
+    sandboxes: std::collections::HashSet<String>,
+}
+
+/// Where this host's egress recorder takes recorded sandboxes' traffic.
+#[derive(Debug, Clone)]
+pub struct PublishedEgressRecording {
+    /// Where the recorder listens on the sidecars' network.
+    pub address: std::net::SocketAddr,
+    /// The installation the recorder belongs to, as it names itself in
+    /// [`SANDBOX_EGRESS_RECORDING_LABEL`]: two installations can share a
+    /// Docker daemon, and a recorder must never take the other's sidecars
+    /// for its own sandboxes, whose container names can be the same.
+    pub installation: String,
+    /// The recorded sandboxes, by container name.
+    pub sandboxes: std::collections::HashSet<String>,
+}
+
+/// What this process knows about the egress recorder.
+enum EgressRecordingState {
+    /// The recorder has not said yet: the process is starting. Sidecars
+    /// keep the hand-off they have, so recovering sandboxes at startup does
+    /// not replace a recorded sandbox's sidecar only for the recorder to
+    /// replace it again a moment later.
+    Unknown,
+    /// Nothing records on this host.
+    Off,
+    Serving(EgressRecordingRoute),
+}
+
+static EGRESS_RECORDING: std::sync::RwLock<EgressRecordingState> =
+    std::sync::RwLock::new(EgressRecordingState::Unknown);
+
+/// Record where the egress recorder listens and which sandboxes record, or
+/// that nothing records on this host (`None`). An egress proxy created or
+/// checked from now on hands the traffic of a recorded sandbox to
+/// `address`.
+pub fn publish_egress_recording(route: Option<PublishedEgressRecording>) {
+    let mut slot = match EGRESS_RECORDING.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = match route {
+        Some(PublishedEgressRecording {
+            address,
+            installation,
+            sandboxes,
+        }) => EgressRecordingState::Serving(EgressRecordingRoute {
+            address,
+            installation,
+            sandboxes,
+        }),
+        None => EgressRecordingState::Off,
+    };
+}
+
+/// The value `sandbox_container_name`'s egress proxy receives in
+/// [`SANDBOX_EGRESS_RECORDING_ENV`]: the recorder's address while that
+/// sandbox records, empty otherwise, and `None` while the recorder has not
+/// said whether anything records (the sidecar keeps what it has).
+pub(super) fn egress_recording_environment_value(sandbox_container_name: &str) -> Option<String> {
+    let slot = match EGRESS_RECORDING.read() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*slot {
+        EgressRecordingState::Unknown => None,
+        EgressRecordingState::Off => Some(String::new()),
+        EgressRecordingState::Serving(route) => {
+            Some(if route.sandboxes.contains(sandbox_container_name) {
+                route.address.to_string()
+            } else {
+                String::new()
+            })
+        }
+    }
+}
+
+/// The value `sandbox_container_name`'s egress proxy is labelled with in
+/// [`SANDBOX_EGRESS_RECORDING_LABEL`]: `<installation>@<address>` while that
+/// sandbox records, empty otherwise, and `None` while the recorder has not
+/// said (the sidecar keeps what it has).
+pub(super) fn egress_recording_label_value(sandbox_container_name: &str) -> Option<String> {
+    let slot = match EGRESS_RECORDING.read() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match &*slot {
+        EgressRecordingState::Unknown => None,
+        EgressRecordingState::Off => Some(String::new()),
+        EgressRecordingState::Serving(route) => {
+            Some(if route.sandboxes.contains(sandbox_container_name) {
+                format!("{}@{}", route.installation, route.address)
+            } else {
+                String::new()
+            })
+        }
+    }
+}
+
+/// The installation a [`SANDBOX_EGRESS_RECORDING_LABEL`] value names: what
+/// comes before its `@`. None for an empty label, and for one an earlier
+/// version wrote (the address alone), which names nobody.
+pub fn handed_off_to(label: &str) -> Option<&str> {
+    label
+        .split_once('@')
+        .map(|(installation, _)| installation)
+        .filter(|installation| !installation.is_empty())
+}
+
+/// The host's address on [`SANDBOX_EGRESS_NETWORK`] (its gateway), where a
+/// host service listens to be reached by sandbox egress proxies from their
+/// own address on that network. `None` while the network does not exist.
+pub async fn egress_network_gateway(
+    docker: &Docker,
+) -> Result<Option<std::net::IpAddr>, bollard::errors::Error> {
+    let network = match docker
+        .inspect_network(
+            SANDBOX_EGRESS_NETWORK,
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+    {
+        Ok(network) => network,
+        Err(error) if docker_error_is_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(network
+        .ipam
+        .and_then(|ipam| ipam.config)
+        .into_iter()
+        .flatten()
+        .filter_map(|config| config.gateway)
+        .find_map(|gateway| gateway.parse().ok()))
+}
+
+/// A running sandbox egress proxy, as Docker lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressProxyEndpoint {
+    /// The sandbox container it serves.
+    pub sandbox: String,
+    /// Its address on [`SANDBOX_EGRESS_NETWORK`].
+    pub address: std::net::IpAddr,
+    /// Whether it was started handing outbound traffic to the egress
+    /// recorder ([`SANDBOX_EGRESS_RECORDING_LABEL`]).
+    pub hands_off: bool,
+    /// The installation whose recorder it hands off to ([`handed_off_to`]),
+    /// when it hands off and its label names one.
+    pub installation: Option<String>,
+}
+
+/// Every running sandbox egress proxy on this host: the sandbox it serves
+/// (container name, as [`egress_proxy_sandbox`] establishes it from what
+/// only Docker records), its address on [`SANDBOX_EGRESS_NETWORK`], and
+/// whether it hands its traffic to the recorder.
+pub async fn egress_proxy_endpoints(
+    docker: &Docker,
+) -> Result<Vec<EgressProxyEndpoint>, bollard::errors::Error> {
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            filters: Some(HashMap::from([(
+                "name".to_string(),
+                vec![SANDBOX_EGRESS_PROXY_PREFIX.to_string()],
+            )])),
+            ..Default::default()
+        }))
+        .await?;
+    let mut endpoints = Vec::new();
+    for container in containers {
+        let Some(name) = container.names.as_ref().and_then(|names| names.first()) else {
+            continue;
+        };
+        let Some(networks) = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.networks.as_ref())
+        else {
+            continue;
+        };
+        let names: Vec<&str> = networks.keys().map(String::as_str).collect();
+        let Some(sandbox) = egress_proxy_sandbox(name, container.labels.as_ref(), &names) else {
+            continue;
+        };
+        let Some(address) = networks
+            .get(SANDBOX_EGRESS_NETWORK)
+            .and_then(|endpoint| endpoint.ip_address.as_deref())
+            .and_then(|address| address.parse().ok())
+        else {
+            continue;
+        };
+        let label = container
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
+            .map(String::as_str)
+            .unwrap_or("");
+        endpoints.push(EgressProxyEndpoint {
+            sandbox,
+            address,
+            hands_off: !label.is_empty(),
+            installation: handed_off_to(label).map(str::to_string),
+        });
+    }
+    Ok(endpoints)
+}
+
 pub(super) fn sandbox_egress_proxy_extra_hosts() -> Vec<String> {
     vec![SANDBOX_HOST_GATEWAY.to_string()]
 }
@@ -329,6 +543,14 @@ pub(super) const SANDBOX_NAME_ENV: &str = "TEMPS_SANDBOX_NAME";
 /// listens (ADR 105). Set by Temps from the internal routing supervisor's
 /// status; the Temps binary itself reads no such variable.
 pub(super) const SANDBOX_INTERNAL_PROXY_ENV: &str = "TEMPS_INTERNAL_PROXY_ADDRESS";
+/// Where the egress proxy of a sandbox that records its outbound
+/// connections hands that traffic; absent or empty when it does not.
+pub(super) const SANDBOX_EGRESS_RECORDING_ENV: &str = "TEMPS_EGRESS_RECORDING_PROXY_ADDRESS";
+/// The same address as a label, so a container list (which does not show
+/// the environment) tells which sidecars hand their traffic to the
+/// recorder: one still doing so after its sandbox stopped recording is
+/// let through unrecorded instead of refused as unknown.
+pub const SANDBOX_EGRESS_RECORDING_LABEL: &str = "sh.temps.sandbox-egress-recording";
 
 pub(super) const SANDBOX_MCP_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
@@ -364,13 +586,20 @@ const sandboxName = process.env.TEMPS_SANDBOX_NAME || "unknown";
 // Where this host's internal proxy listens (ADR 105), set by Temps when it
 // creates this sidecar; empty while internal routing is not serving here.
 const internalProxy = parseInternalProxy(process.env.TEMPS_INTERNAL_PROXY_ADDRESS || "");
+// Where this host's egress recorder listens, set by Temps only while this
+// sandbox records its outbound connections. Then every outbound request
+// (not the Temps relays, not internal names) goes through it: it applies
+// this sandbox's policy and records each connection. Unreachable, the
+// request fails: recording is never bypassed.
+const recordingProxy = parseInternalProxy(
+  process.env.TEMPS_EGRESS_RECORDING_PROXY_ADDRESS || "", "TEMPS_EGRESS_RECORDING_PROXY_ADDRESS");
 
-function parseInternalProxy(value) {
+function parseInternalProxy(value, name = "TEMPS_INTERNAL_PROXY_ADDRESS") {
   if (value === "") return null;
   const match = /^(?:\[([0-9A-Fa-f:.]+)\]|([0-9.]+)):([0-9]{1,5})$/.exec(value);
   const host = match && (match[1] || match[2]);
   if (!match || net.isIP(host) === 0 || Number(match[3]) < 1 || Number(match[3]) > 65535) {
-    throw new Error("TEMPS_INTERNAL_PROXY_ADDRESS must be an IP address and port");
+    throw new Error(`${name} must be an IP address and port`);
   }
   return { host, port: Number(match[3]), display: value };
 }
@@ -821,6 +1050,75 @@ function forwardInternal(request, response, target) {
   request.pipe(upstream);
 }
 
+// Hand a plain-http request this sandbox's policy admitted to the egress
+// recorder, as an absolute-form proxy request: it connects and records.
+// `address` is the one this sandbox's policy admitted: the recorder
+// connects there, never to whatever the name resolves to on its side.
+// A recorder that takes the request and never answers costs its socket for
+// at most a minute, and a client that leaves releases it at once.
+function forwardRecorded(request, response, target, address) {
+  const headers = { ...request.headers, host: target.host };
+  delete headers["proxy-authorization"];
+  delete headers["proxy-connection"];
+  delete headers["x-temps-egress-refused"];
+  headers["x-temps-egress-address"] = address;
+  const upstream = http.request({
+    host: recordingProxy.host,
+    port: recordingProxy.port,
+    method: request.method,
+    path: target.href,
+    headers,
+  }, (upstreamResponse) => {
+    upstreamResponse.on("error", () => response.destroy());
+    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+    upstreamResponse.pipe(response);
+  });
+  upstream.setTimeout(60_000, () => upstream.destroy(new Error("recorder did not answer")));
+  upstream.on("error", () => {
+    if (!response.headersSent) response.writeHead(502);
+    response.end();
+  });
+  response.on("close", () => upstream.destroy());
+  request.on("error", () => upstream.destroy());
+  request.pipe(upstream);
+}
+
+// The recorder's name for why this side refused: how it records it.
+function recordedReason(error) {
+  const reason = error instanceof Denied ? error.reason : "invalid";
+  if (reason === "private") return "private_address";
+  if (reason === "unresolvable" || reason === "lookup_timeout" || reason === "local_name") {
+    return "did_not_resolve";
+  }
+  return "no_allow_rule";
+}
+
+// Tell the recorder of a request this sandbox's policy refused, so it is
+// recorded like a refusal made there: the same request, marked refused,
+// which the recorder refuses and records without opening anything. The
+// client is answered here and never waits for it. At most
+// MAX_REFUSAL_NOTES are open at once, each for at most five seconds: past
+// that a refusal is still refused, only not recorded, so a burst of
+// refusals against a slow recorder cannot use up the descriptors the
+// sandbox's allowed traffic needs.
+const MAX_REFUSAL_NOTES = 16;
+let refusalNotes = 0;
+function noteRefusal(method, target, host, error) {
+  if (refusalNotes >= MAX_REFUSAL_NOTES) return;
+  refusalNotes += 1;
+  const socket = net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {
+    socket.end(
+      `${method} ${target} HTTP/1.1\r\nHost: ${host}\r\n` +
+      `X-Temps-Egress-Refused: ${recordedReason(error)}\r\nContent-Length: 0\r\n\r\n`
+    );
+  });
+  socket.setTimeout(5_000, () => socket.destroy());
+  socket.on("error", () => socket.destroy());
+  socket.on("data", () => {});
+  socket.on("end", () => socket.destroy());
+  socket.on("close", () => { refusalNotes -= 1; });
+}
+
 async function handleRequest(request, response) {
   try {
     const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);
@@ -849,6 +1147,21 @@ async function handleRequest(request, response) {
       forwardInternal(request, response, target);
       return;
     }
+    if (recordingProxy) {
+      // This sandbox's own policy decides first, whatever the recorder
+      // holds: a recorder whose table has not followed a policy change, or
+      // that still names another sandbox's sidecar by this address, must
+      // never let more out than this policy does.
+      let address;
+      try {
+        address = await admit(target.hostname, Number(target.port) || 80);
+      } catch (error) {
+        noteRefusal(request.method, target.href, target.host, error);
+        throw error;
+      }
+      forwardRecorded(request, response, target, address);
+      return;
+    }
     await forward(request, response, target, false);
   } catch (error) {
     refuseRequest(request, response, error);
@@ -871,6 +1184,36 @@ server.on("connect", async (request, client, head) => {
   try {
     const { hostname, port } = parseAuthority(request.url, 443);
     destination = formatDestination(hostname, port);
+    if (recordingProxy && !isInternalName(normalizeHost(hostname))) {
+      // This sandbox's own policy decides first (see handleRequest); then
+      // the recorder answers the CONNECT itself and carries the tunnel,
+      // and this side only pipes bytes.
+      let address;
+      try {
+        address = await admit(hostname, port);
+      } catch (error) {
+        noteRefusal("CONNECT", request.url, request.url, error);
+        throw error;
+      }
+      if (client.destroyed) return;
+      let connected = false;
+      upstream = net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {
+        connected = true;
+        upstream.write(
+          `CONNECT ${request.url} HTTP/1.1\r\nHost: ${request.url}\r\n` +
+          `X-Temps-Egress-Address: ${address}\r\n\r\n`
+        );
+        if (head.length) upstream.write(head);
+        client.pipe(upstream);
+        upstream.pipe(client);
+      });
+      upstream.setTimeout(60_000, () => upstream.destroy());
+      upstream.on("error", () => {
+        if (connected || client.destroyed) return client.destroy();
+        client.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      });
+      return;
+    }
     const address = await admit(hostname, port);
     if (client.destroyed) return;
     upstream = net.connect({ host: address, port }, () => {
@@ -945,6 +1288,28 @@ impl DockerSandboxProvider {
         };
         let egress = SidecarEgressPolicy::new(sandbox_container_name, &policy)?;
         let internal_proxy = internal_proxy_environment_value();
+        // While the recorder has not said, keep the sidecar's own hand-off.
+        let recording =
+            egress_recording_environment_value(sandbox_container_name).unwrap_or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|info| {
+                        container_environment_value(info, SANDBOX_EGRESS_RECORDING_ENV)
+                    })
+                    .unwrap_or("")
+                    .to_string()
+            });
+        let existing_label = || {
+            existing
+                .as_ref()
+                .and_then(|info| info.config.as_ref())
+                .and_then(|config| config.labels.as_ref())
+                .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let recording_label =
+            egress_recording_label_value(sandbox_container_name).unwrap_or_else(existing_label);
 
         if let Some(info) = &existing {
             let image_matches = info
@@ -981,6 +1346,19 @@ impl DockerSandboxProvider {
             );
             let host_gateway_matches = container_has_extra_host(info, SANDBOX_HOST_GATEWAY);
             let internal_proxy_matches = container_has_internal_proxy(info, &internal_proxy);
+            // The label says the same as the environment, so a list can
+            // tell a hand-off; one without it is recreated once to get it.
+            let recording_matches = container_environment_value(info, SANDBOX_EGRESS_RECORDING_ENV)
+                .unwrap_or("")
+                == recording
+                && info
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.labels.as_ref())
+                    .and_then(|labels| labels.get(SANDBOX_EGRESS_RECORDING_LABEL))
+                    .map_or(recording_label.is_empty(), |label| {
+                        *label == recording_label
+                    });
             let rules_match = egress.is_carried_by(info, sandbox_container_name);
             // A stopped proxy is always recreated rather than started: it
             // was parked with its sandbox, and its endpoint still names the
@@ -993,25 +1371,15 @@ impl DockerSandboxProvider {
                 && control_plane_matches
                 && host_gateway_matches
                 && internal_proxy_matches
+                && recording_matches
                 && rules_match
                 && running
             {
                 return Ok(false);
             }
 
-            self.docker
-                .remove_container(
-                    &proxy_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|source| AgentError::SandboxProviderUnavailable {
-                    provider: "docker".to_string(),
-                    reason: format!("replace drifted sandbox egress proxy: {source}"),
-                })?;
+            self.remove_egress_proxy_for_replacement(&proxy_name)
+                .await?;
         }
 
         self.create_egress_proxy_container(
@@ -1020,6 +1388,10 @@ impl DockerSandboxProvider {
             control_plane_url,
             &egress,
             &internal_proxy,
+            HandOff {
+                address: &recording,
+                label: &recording_label,
+            },
         )
         .await?;
 
@@ -1053,6 +1425,67 @@ impl DockerSandboxProvider {
         Ok(true)
     }
 
+    /// Force-removes the drifted sidecar `proxy_name` so its replacement can
+    /// take the name. When Docker answers that a removal is already in
+    /// progress (another caller, or the daemon, is removing it), waits for
+    /// that removal to finish instead of failing: failing here would leave
+    /// the sandbox with no sidecar at all, and so with no way out.
+    async fn remove_egress_proxy_for_replacement(
+        &self,
+        proxy_name: &str,
+    ) -> Result<(), AgentError> {
+        let unavailable = |reason: String| AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason,
+        };
+        match self
+            .docker
+            .remove_container(
+                proxy_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if docker_error_is_not_found(&error) => return Ok(()),
+            Err(error) if removal_in_progress(&error) => {}
+            Err(source) => {
+                return Err(unavailable(format!(
+                    "replace drifted sandbox egress proxy '{proxy_name}': {source}"
+                )))
+            }
+        }
+        let deadline = tokio::time::Instant::now() + SIDECAR_REMOVAL_WAIT;
+        loop {
+            match self
+                .docker
+                .inspect_container(
+                    proxy_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+            {
+                Err(error) if docker_error_is_not_found(&error) => return Ok(()),
+                Err(source) => {
+                    return Err(unavailable(format!(
+                        "wait for sandbox egress proxy '{proxy_name}' to be removed: {source}"
+                    )))
+                }
+                Ok(_) if tokio::time::Instant::now() >= deadline => {
+                    return Err(unavailable(format!(
+                        "sandbox egress proxy '{proxy_name}' was still being removed after {} \
+                         seconds; its replacement is created on the next attempt",
+                        SIDECAR_REMOVAL_WAIT.as_secs()
+                    )))
+                }
+                Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+            }
+        }
+    }
+
     /// Create (without starting) the egress proxy container `proxy_name` for
     /// `sandbox_container_name`, attached only to the outbound bridge.
     async fn create_egress_proxy_container(
@@ -1062,7 +1495,12 @@ impl DockerSandboxProvider {
         control_plane_url: &str,
         egress: &SidecarEgressPolicy,
         internal_proxy: &str,
+        hand_off: HandOff<'_>,
     ) -> Result<(), AgentError> {
+        let HandOff {
+            address: recording,
+            label: recording_label,
+        } = hand_off;
         let mut tmpfs = HashMap::new();
         tmpfs.insert("/tmp".to_string(), "size=16m,mode=1777".to_string());
         let body = bollard::models::ContainerCreateBody {
@@ -1078,6 +1516,7 @@ impl DockerSandboxProvider {
                 format!("{SANDBOX_EGRESS_RULES_ENV}={}", egress.json),
                 format!("{SANDBOX_NAME_ENV}={sandbox_container_name}"),
                 format!("{SANDBOX_INTERNAL_PROXY_ENV}={internal_proxy}"),
+                format!("{SANDBOX_EGRESS_RECORDING_ENV}={recording}"),
             ]),
             labels: Some(HashMap::from([
                 (
@@ -1091,6 +1530,10 @@ impl DockerSandboxProvider {
                 (
                     SANDBOX_EGRESS_RULES_LABEL.to_string(),
                     egress.digest.clone(),
+                ),
+                (
+                    SANDBOX_EGRESS_RECORDING_LABEL.to_string(),
+                    recording_label.to_string(),
                 ),
             ])),
             host_config: Some(bollard::models::HostConfig {
@@ -1178,14 +1621,183 @@ impl DockerSandboxProvider {
             // Never started: the proxy that runs is recreated on start,
             // with the address current then.
             &internal_proxy_environment_value(),
+            HandOff {
+                address: &egress_recording_environment_value(sandbox_container_name)
+                    .unwrap_or_default(),
+                label: &egress_recording_label_value(sandbox_container_name).unwrap_or_default(),
+            },
         )
         .await
     }
 }
 
+/// Where a sidecar hands recorded traffic: the recorder's address (its
+/// environment) and the [`SANDBOX_EGRESS_RECORDING_LABEL`] value naming the
+/// installation too. Both empty when it hands nothing off.
+#[derive(Debug, Clone, Copy)]
+struct HandOff<'a> {
+    address: &'a str,
+    label: &'a str,
+}
+
+/// How long a replacement waits for a removal already in progress.
+const SIDECAR_REMOVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Docker's 409 for a container another caller is already removing.
+fn removal_in_progress(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError { status_code: 409, message }
+            if message.contains("already in progress")
+    )
+}
+
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    /// Only a sandbox the recorder lists gets the hand-off address; every
+    /// other sidecar gets the empty value, which keeps today's behaviour.
+    #[test]
+    fn only_recorded_sandboxes_hand_their_traffic_to_the_recorder() {
+        let recorded = "temps-sandbox-recorded-only-test";
+        let address: std::net::SocketAddr = "172.30.0.1:41000".parse().unwrap();
+        publish_egress_recording(Some(PublishedEgressRecording {
+            address,
+            installation: "0102030405060708".to_string(),
+            sandboxes: std::collections::HashSet::from([recorded.to_string()]),
+        }));
+        assert_eq!(
+            egress_recording_environment_value(recorded).as_deref(),
+            Some("172.30.0.1:41000")
+        );
+        // The label names the installation as well, so a recorder sharing
+        // the daemon never takes this sidecar for one of its own.
+        let label = egress_recording_label_value(recorded);
+        assert_eq!(label.as_deref(), Some("0102030405060708@172.30.0.1:41000"));
+        assert_eq!(
+            label.as_deref().and_then(handed_off_to),
+            Some("0102030405060708")
+        );
+        assert_eq!(
+            handed_off_to("172.30.0.1:41000"),
+            None,
+            "an old label names nobody"
+        );
+        assert_eq!(handed_off_to(""), None);
+        assert_eq!(
+            egress_recording_environment_value("temps-sandbox-other-only-test").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            egress_recording_label_value("temps-sandbox-other-only-test").as_deref(),
+            Some("")
+        );
+        publish_egress_recording(None);
+        assert_eq!(
+            egress_recording_environment_value(recorded).as_deref(),
+            Some("")
+        );
+        assert_eq!(egress_recording_label_value(recorded).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn only_a_removal_already_in_progress_is_waited_out() {
+        let conflict = |message: &str| bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            message: message.to_string(),
+        };
+        assert!(removal_in_progress(&conflict(
+            "removal of container temps-sandbox-egress-proxy-v2-x is already in progress"
+        )));
+        assert!(!removal_in_progress(&conflict(
+            "container name is already in use"
+        )));
+        assert!(!removal_in_progress(
+            &bollard::errors::Error::DockerResponseServerError {
+                status_code: 500,
+                message: "removal is already in progress".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn the_sidecar_script_hands_recorded_traffic_to_the_recorder() {
+        assert!(SANDBOX_EGRESS_PROXY_SCRIPT.contains("TEMPS_EGRESS_RECORDING_PROXY_ADDRESS"));
+        assert!(SANDBOX_EGRESS_PROXY_SCRIPT
+            .contains("forwardRecorded(request, response, target, address)"));
+    }
+
+    /// With recording on, the sandbox's own policy still decides first:
+    /// both recorded paths admit before anything reaches the recorder, and
+    /// a refusal is sent to it marked as such (and never passed on with a
+    /// forwarded request). The recorder's table can lag a policy change or
+    /// still name another sandbox's sidecar by a reused address; neither
+    /// may widen what this sandbox can reach.
+    #[test]
+    fn the_sidecar_admits_under_its_own_policy_before_the_recorder() {
+        let script = SANDBOX_EGRESS_PROXY_SCRIPT;
+        let forward = script
+            .find("forwardRecorded(request, response, target, address);\n      return;")
+            .expect("the recorded forward");
+        let forward_admit = script[..forward]
+            .rfind("address = await admit(target.hostname")
+            .expect("a forward is admitted first");
+        assert!(
+            !script[forward_admit..forward].contains("forwardRecorded("),
+            "nothing is forwarded before the admission"
+        );
+        let tunnel = script
+            .find("net.connect({ host: recordingProxy.host, port: recordingProxy.port }, () => {\n        connected = true;")
+            .expect("the recorded tunnel");
+        let tunnel_admit = script[..tunnel]
+            .rfind("address = await admit(hostname, port)")
+            .expect("a tunnel is admitted first");
+        assert!(
+            tunnel_admit > forward,
+            "the tunnel's own admission, not the forward's"
+        );
+        assert!(script.contains("noteRefusal(request.method, target.href, target.host, error)"));
+        assert!(script.contains("noteRefusal(\"CONNECT\", request.url, request.url, error)"));
+        assert!(script.contains("delete headers[\"x-temps-egress-refused\"]"));
+        // Bounded: a burst of refusals opens a fixed number of sockets.
+        assert!(script.contains("if (refusalNotes >= MAX_REFUSAL_NOTES) return;"));
+        assert!(script.contains("socket.on(\"close\", () => { refusalNotes -= 1; });"));
+        // The admitted address travels with the hand-off, a client's own
+        // copy of the header never does, and a recorder that never answers
+        // is given up on.
+        assert!(script.contains("headers[\"x-temps-egress-address\"] = address;"));
+        assert!(script.contains("X-Temps-Egress-Address: ${address}"));
+        assert!(script.contains(
+            "upstream.setTimeout(60_000, () => upstream.destroy(new Error(\"recorder did not answer\")));"
+        ));
+        assert!(script.contains("response.on(\"close\", () => upstream.destroy());"));
+        assert_eq!(
+            temps_workload_netpol::egress::REFUSED_BY_SENDER,
+            "x-temps-egress-refused",
+            "the header the recorder reads"
+        );
+    }
+
+    /// The script parses, where Node is installed to check it.
+    #[test]
+    fn the_sidecar_script_is_valid_javascript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egress-proxy.js");
+        std::fs::write(&path, SANDBOX_EGRESS_PROXY_SCRIPT).expect("write the script");
+        match std::process::Command::new("node")
+            .arg("--check")
+            .arg(&path)
+            .output()
+        {
+            Ok(output) => assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+            Err(error) => eprintln!("node is not installed, skipping the syntax check: {error}"),
+        }
+    }
 
     const SANDBOX: &str = "temps-sandbox-alpha";
 

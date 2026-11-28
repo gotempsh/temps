@@ -310,6 +310,7 @@ mod tests {
             preview_access: SandboxPreviewAccess::TempsLogin,
             preview_allowed_cidrs: Vec::new(),
             egress_policy: Default::default(),
+            egress_recording: false,
         }
     }
 

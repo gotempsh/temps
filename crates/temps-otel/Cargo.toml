@@ -18,6 +18,7 @@ temps-clickhouse = { path = "../temps-clickhouse" }
 temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-entities = { path = "../temps-entities" }
+temps-workload = { path = "../temps-workload" }
 temps-authz = { path = "../temps-authz" }
 temps-metrics = { path = "../temps-metrics" }
 temps-alarms = { path = "../temps-alarms" }

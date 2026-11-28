@@ -987,6 +987,17 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // The internal hostnames and `curl` lines one of the caller's own
     // sandboxes may use (ADR 105), no credential; scoped to that user.
     "list_sandbox_internal_addresses",
+    // Outbound connection recording (ADR-118), for a sandbox the caller
+    // owns and for an environment of a project the caller can read: whether
+    // it is on and which nodes can record, and the recorded connections
+    // (destination host and port, outcome, bytes, duration; method and path
+    // without the query for plain HTTP). Never headers, bodies or query
+    // strings, and the same records `query_logs` already returns for a
+    // project. Turning recording on or off is withheld (see `EXCLUDED`).
+    "get_egress_recording",
+    "list_egress_records",
+    "get_environment_egress_recording",
+    "list_environment_egress_records",
     "get_ingress_settings",
     "get_rule",
     "get_workload_mode",

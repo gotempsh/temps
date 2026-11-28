@@ -30229,7 +30229,7 @@
             "type": "boolean"
           },
           "enforcing_nodes": {
-            "description": "Nodes whose mode is `enforce`. Empty: the policy is shown but not\nenforced anywhere yet (every node is `legacy` or `shadow`).",
+            "description": "Nodes whose mode is `enforce`. Empty: the policy is shown but not\nenforced anywhere yet (every node is `off` or `shadow`).",
             "items": {
               "format": "int32",
               "type": "integer"
@@ -30272,6 +30272,183 @@
         ],
         "type": "object"
       },
+      "EgressActivityPage": {
+        "description": "A page of a workload's recorded connections, newest first.",
+        "properties": {
+          "has_more": {
+            "description": "Another page follows.",
+            "type": "boolean"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "per_page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/EgressActivityRecord"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "How many records match, across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workload_id": {
+            "description": "The workload's id in its own API (`sbx_...`, an environment id).",
+            "type": "string"
+          },
+          "workload_kind": {
+            "description": "What the workload is: `sandbox`, or `deployment` for an\nenvironment's deployments.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workload_kind",
+          "workload_id",
+          "records",
+          "page",
+          "per_page",
+          "total",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "EgressActivityRecord": {
+        "description": "One recorded outbound connection (or several identical refusals,\ncollapsed: see `count`).",
+        "properties": {
+          "bytes_received": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes_sent": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "count": {
+            "description": "How many identical connections this record stands for. Repeated\nrefusals of the same destination are collapsed into one record.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host": {
+            "description": "The destination host the workload asked for (`server.address`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "`tunnel` (HTTPS `CONNECT`), `forward` (plain HTTP), `relay` (a Temps\nrelay) or `unknown`.",
+            "type": "string"
+          },
+          "last_started_at": {
+            "description": "When the last of the collapsed connections started.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "description": "Plain HTTP only: the method.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_name": {
+            "description": "The node whose proxy observed it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "`allowed`, `refused` or `failed`.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Plain HTTP only: the path, never the query string.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "peer_address": {
+            "description": "The address the proxy connected to (`network.peer.address`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "description": "The destination port (`server.port`).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why it was refused or failed, e.g. `no_allow_rule`, `private_address`,\n`port_not_allowed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relay": {
+            "description": "The Temps relay used, for `relay` connections.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "span_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "description": "When the connection started (the first, when collapsed).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "trace_id": {
+            "description": "Trace correlation, when the record carries it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "timestamp",
+          "outcome",
+          "kind",
+          "bytes_sent",
+          "bytes_received",
+          "duration_ms",
+          "count"
+        ],
+        "type": "object"
+      },
       "EgressMode": {
         "description": "How a sandbox may reach the outside world.",
         "enum": [
@@ -30279,6 +30456,131 @@
           "restricted"
         ],
         "type": "string"
+      },
+      "EgressOutcomeFilter": {
+        "description": "Only the connections that ended this way.",
+        "enum": [
+          "allowed",
+          "refused",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "EgressRecordingNode": {
+        "description": "Whether one node the workload runs on can record.",
+        "properties": {
+          "node_id": {
+            "description": "`0` is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "The same, in a sentence that names what is missing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason_code": {
+            "description": "Why it cannot, when `recording` is false: one of\n`unsupported_platform`, `proxy_not_serving`, `node_not_reporting`,\n`agent_predates_recording`, or `kind_not_served` when the node\nrecords but not this kind of workload.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recording": {
+            "description": "The node reports that it can record.",
+            "type": "boolean"
+          },
+          "setup_path": {
+            "description": "Console path that fixes it, when one does.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "recording"
+        ],
+        "type": "object"
+      },
+      "EgressRecordingStatus": {
+        "description": "Whether a workload records its outbound connections, and whether it can.",
+        "properties": {
+          "configured": {
+            "description": "Recording can work for this workload now: OTel storage is enabled\nand a node it runs on reports that it can record. When `enabled` is\ntrue and this is false, nothing is being recorded.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "description": "The owner turned recording on.",
+            "type": "boolean"
+          },
+          "logs_path": {
+            "description": "Console path of the project's logs, filtered to this workload's\nrecords. `None` without a project: the records are then read only\nfrom the workload itself.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nodes": {
+            "description": "The nodes the workload runs on, and whether each can record. Empty\nwhen nothing of it is running.",
+            "items": {
+              "$ref": "#/components/schemas/EgressRecordingNode"
+            },
+            "type": "array"
+          },
+          "project_id": {
+            "description": "The project that owns the workload, when one does.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "The same, in a sentence that names what is missing.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason_code": {
+            "description": "Why recording cannot work, when `configured` is false:\n`otel_unavailable`; `not_recordable` when nothing routes this\nworkload's traffic to a recorder (a backend or deployment kind it\nhas no route for); `not_applied` when it is on but the workload's\ntraffic could not be switched to the recorder yet (retried); or the\n`reason_code` of the node that cannot record.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Console path that fixes it, when one does.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workload_id": {
+            "description": "The workload's id in its own API (`sbx_...`, an environment id).",
+            "type": "string"
+          },
+          "workload_kind": {
+            "description": "What the workload is: `sandbox`, or `deployment` for an\nenvironment's deployments.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workload_kind",
+          "workload_id",
+          "enabled",
+          "configured",
+          "nodes"
+        ],
+        "type": "object"
       },
       "EgressRule": {
         "additionalProperties": false,
@@ -48647,8 +48949,12 @@
             "type": "string"
           },
           "project_id": {
+            "description": "The project that owns the record. `None` only for a record the\nplatform observed about a workload that belongs to no project (see\n`workload`); everything a workload sends about itself has a project.",
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "resource": {
             "$ref": "#/components/schemas/ResourceInfo"
@@ -48677,7 +48983,6 @@
           }
         },
         "required": [
-          "project_id",
           "resource",
           "timestamp",
           "observed_timestamp",
@@ -53610,8 +53915,8 @@
             ]
           },
           "mode": {
-            "description": "`legacy` (today's behaviour), `shadow` (computed and logged, not\napplied) or `enforce`.",
-            "example": "legacy",
+            "description": "`off` (nothing is filtered; the node still knows its workloads),\n`shadow` (computed and logged, not applied) or `enforce`.",
+            "example": "off",
             "type": "string"
           },
           "name": {
@@ -53629,7 +53934,7 @@
             "type": "string"
           },
           "supports_enforcement": {
-            "description": "Whether this node can run `shadow` or `enforce`: always on the\ncontrol plane, on a worker while its agent reports an enforcer. A\nstored non-legacy mode on a node without one is never counted as\nenforcing.",
+            "description": "Whether this node can run `shadow` or `enforce`: always on the\ncontrol plane, on a worker while its agent reports an enforcer. A\nstored mode other than `off` on a node without one is never counted as\nenforcing.",
             "type": "boolean"
           }
         },
@@ -72283,6 +72588,10 @@
             "$ref": "#/components/schemas/SandboxEgressPolicy",
             "description": "Which outside destinations the sandbox may reach (temps-native)."
           },
+          "egress_recording": {
+            "description": "Whether every outbound connection is recorded as an OpenTelemetry\nlog record of the sandbox's project. See\n`GET /v1/sandboxes/{id}/egress-recording` for whether it can be.",
+            "type": "boolean"
+          },
           "id": {
             "type": "string"
           },
@@ -72399,7 +72708,8 @@
           "preview_allowed_cidrs",
           "lifecycle",
           "node_name",
-          "egress_policy"
+          "egress_policy",
+          "egress_recording"
         ],
         "type": "object"
       },
@@ -77721,6 +78031,19 @@
         ],
         "type": "object"
       },
+      "SetEgressRecordingBody": {
+        "additionalProperties": false,
+        "description": "Turn recording of the workload's outbound connections on or off.",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "SetEnvironmentHostsRequest": {
         "description": "`PUT /ingress/connectors/{id}/environment-hosts`.",
         "properties": {
@@ -77965,6 +78288,7 @@
       "SetNodeNetworkPolicyModeRequest": {
         "properties": {
           "mode": {
+            "description": "`off`, `shadow` or `enforce`. `legacy`, the former name of `off`, is\nstill accepted (for at least two releases) and means `off`.",
             "example": "shadow",
             "type": "string"
           }
@@ -148360,6 +148684,25 @@
             }
           },
           {
+            "description": "Only what the platform recorded about one workload of the project (sandbox, deployment, ...); pair with workload_id. Its own logs never match",
+            "in": "query",
+            "name": "workload_kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The workload's numeric id; pair with workload_kind",
+            "in": "query",
+            "name": "workload_id",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
             "description": "Start time (RFC 3339)",
             "in": "query",
             "name": "start_time",
@@ -148419,7 +148762,7 @@
                 }
               }
             },
-            "description": "Invalid log attribute filter"
+            "description": "Invalid log attribute or workload filter"
           },
           "401": {
             "content": {
@@ -169640,6 +169983,362 @@
           "Deployments"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/egress-recording": {
+      "get": {
+        "description": "`configured: false` says recording cannot work for this environment\nnow, with `reason_code`, `reason` and, when the console can fix it,\n`setup_path`. `nodes` lists the nodes its containers run on and whether\neach can record. Records are OpenTelemetry log records of the\nenvironment's project (`logs_path` opens them, filtered to this\nenvironment).",
+        "operationId": "get_environment_egress_recording",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressRecordingStatus"
+                }
+              }
+            },
+            "description": "Recording status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the environment records its outbound connections, and whether\nit can.",
+        "tags": [
+          "Environments"
+        ]
+      },
+      "put": {
+        "description": "With recording on, containers of the environment's deployments are\nstarted with the per-node egress proxy as their HTTPS proxy, and every\nconnection they make through it produces one OpenTelemetry log record\nwhen it ends, allowed or refused: destination (`server.address`,\n`server.port`), outcome and refusal reason, bytes each way and duration.\nNever headers, bodies or query strings. Off by default.\n\nIt applies to containers started after it is turned on: redeploy the\nenvironment to start recording. Turning it off stops recording at once.\nOnly clients that honour the proxy variables are recorded, and only\nHTTPS to public destinations goes through the proxy: plain HTTP,\ninternal addresses and names stay direct, and a deployment (or image)\nthat sets its own `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` keeps it\nand is not recorded. While it is on, the environment's outbound HTTPS depends on\nthe node's egress proxy being up. Turning it on fails with 422 when\nno node the environment runs on can record, naming the environment, the\nnode and what is missing, or when it is a Docker Compose environment,\nwhose containers are never sent through the proxy (`reason_code` is then\n`not_recordable`).",
+        "operationId": "set_environment_egress_recording",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEgressRecordingBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressRecordingStatus"
+                }
+              }
+            },
+            "description": "Recording updated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recording cannot work for this environment: no node it runs on can record, or it is a Compose environment"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "OpenTelemetry storage is not enabled"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn recording of the environment's outbound connections on or off.",
+        "tags": [
+          "Environments"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/egress-records": {
+      "get": {
+        "description": "Each record is one connection (or identical refusals collapsed into\none, see `count`): destination host and port, method and path for plain\nHTTP (never the query string), outcome and refusal reason, bytes each\nway and duration, and the node whose proxy observed it. Records exist\nonly while recording is on. These are the same OpenTelemetry log\nrecords the project's logs show, read by environment.",
+        "operationId": "list_environment_egress_records",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page number, from 1. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Records per page. Default 20, at most 100.",
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only connections that ended this way.",
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/EgressOutcomeFilter"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressActivityPage"
+                }
+              }
+            },
+            "description": "A page of recorded connections"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "OpenTelemetry storage is not enabled or cannot be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The environment's recorded outbound connections, newest first.",
+        "tags": [
+          "Environments"
+        ]
       }
     },
     "/projects/{project_id}/environments/{environment_id}/ip-access": {
@@ -202822,6 +203521,332 @@
           }
         ],
         "summary": "Replace which outside destinations the sandbox may reach.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/{id}/egress-recording": {
+      "get": {
+        "description": "`configured: false` says recording cannot work for this sandbox now, with\n`reason_code`, `reason` and, when the console can fix it, `setup_path`.\nRecords are OpenTelemetry log records owned by the sandbox, and by its\nproject when it has one (`logs_path` then opens them in the project's\nlogs, filtered to this sandbox).",
+        "operationId": "get_egress_recording",
+        "parameters": [
+          {
+            "description": "Sandbox id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressRecordingStatus"
+                }
+              }
+            },
+            "description": "Recording status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the sandbox records its outbound connections, and whether it can.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "description": "With recording on, every outbound connection the sandbox makes through\nthe per-node egress proxy produces one OpenTelemetry log record when it\nends, allowed or refused: destination\n(`server.address`, `server.port`; method and path without the query for\nplain HTTP), outcome and refusal reason, bytes each way and duration.\nNever headers, bodies or query strings. Off by default. A sandbox needs\nno project to record. Turning it on fails with 422 when its node cannot\nrecord, naming the sandbox, the node and what is missing, or when the\nsandbox runs on a backend the recorder cannot see (only Docker sandboxes\nrecord; `reason_code` is then `not_recordable`).",
+        "operationId": "set_egress_recording",
+        "parameters": [
+          {
+            "description": "Sandbox id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEgressRecordingBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressRecordingStatus"
+                }
+              }
+            },
+            "description": "Recording updated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid body"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Recording cannot work for this sandbox: its node cannot record, or its backend has no route to the recorder"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "OpenTelemetry storage is not enabled"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn recording of the sandbox's outbound connections on or off.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/{id}/egress-records": {
+      "get": {
+        "description": "Each record is one connection (or identical refusals collapsed into\none, see `count`): destination host and port, method and path for plain\nHTTP (never the query string), outcome and refusal reason, bytes each\nway and duration. Records exist only while recording is on. These are\nthe same OpenTelemetry log records the project's logs show when the\nsandbox has a project, read by sandbox.",
+        "operationId": "list_egress_records",
+        "parameters": [
+          {
+            "description": "Sandbox id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number, from 1. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Records per page. Default 20, at most 100.",
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only connections that ended this way.",
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/EgressOutcomeFilter"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressActivityPage"
+                }
+              }
+            },
+            "description": "A page of recorded connections"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "OpenTelemetry storage is not enabled or cannot be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The sandbox's recorded outbound connections, newest first.",
         "tags": [
           "Sandboxes"
         ],

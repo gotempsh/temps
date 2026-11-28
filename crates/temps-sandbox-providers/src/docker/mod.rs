@@ -52,7 +52,9 @@ mod recover;
 mod snapshot;
 
 pub use egress::{
-    egress_proxy_sandbox, publish_internal_proxy_address, SANDBOX_EGRESS_NETWORK,
+    egress_network_gateway, egress_proxy_endpoints, egress_proxy_sandbox, handed_off_to,
+    publish_egress_recording, publish_internal_proxy_address, EgressProxyEndpoint,
+    PublishedEgressRecording, SANDBOX_EGRESS_NETWORK, SANDBOX_EGRESS_RECORDING_LABEL,
     SANDBOX_MODEL_RELAY_BASE_URL,
 };
 pub use files::{

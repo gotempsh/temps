@@ -3635,6 +3635,10 @@ impl OtelStorage for ClickHouseOtelStorage {
         self.inner.query_logs(query).await
     }
 
+    async fn count_logs(&self, query: LogQuery) -> StorageResult<u64> {
+        self.inner.count_logs(query).await
+    }
+
     // ── Cross-project trace refs — native ClickHouse (ADR-027) ──────────────
 
     /// Insert `(trace_id, project_id)` pairs into the ClickHouse

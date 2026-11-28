@@ -2275,6 +2275,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         };
         let mut fenced = environment.clone();
@@ -2354,6 +2355,7 @@ mod tests {
             "last_activity_at",
             "ingress_mode",
             "workload_mode",
+            "egress_recording",
         ]
         .map(|column| format!(r#""environments"."{column}""#))
         .join(", ");
@@ -2473,6 +2475,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         };
 
@@ -2640,6 +2643,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         };
         let updated_env = environments::Model {
@@ -3180,6 +3184,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         }
     }
@@ -3308,6 +3313,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         }
     }

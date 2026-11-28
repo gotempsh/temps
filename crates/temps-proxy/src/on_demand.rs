@@ -1888,6 +1888,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                egress_recording: false,
                 workload_mode: Default::default(),
             }]])
             // containers query
@@ -1975,6 +1976,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                egress_recording: false,
                 workload_mode: Default::default(),
             }]])
             // containers query
@@ -2153,6 +2155,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                egress_recording: false,
                 workload_mode: Default::default(),
             }]])
             // containers
@@ -2234,6 +2237,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                egress_recording: false,
                 workload_mode: Default::default(),
             }]])
             .into_connection();
@@ -2315,6 +2319,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                egress_recording: false,
                 workload_mode: Default::default(),
             }]])
             // containers (3 replicas)
@@ -2714,6 +2719,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         };
 
@@ -2828,6 +2834,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         };
 
@@ -2958,6 +2965,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         };
 
@@ -3067,6 +3075,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            egress_recording: false,
             workload_mode: Default::default(),
         }
     }

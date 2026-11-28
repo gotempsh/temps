@@ -19,6 +19,7 @@ import { problemDetail } from '@/lib/api-problem'
 import {
   networkPolicyKeys,
   isNodeNetworkPolicyMode,
+  normalizeNodeNetworkPolicyMode,
   listNodeNetworkPolicyModes,
   networkPolicyModeUnavailableReason,
   nodeNetworkPolicyMode,
@@ -63,9 +64,10 @@ const RESOURCE_POLICIES: ModeCard<NodeResourcePolicy>[] = [
 
 const NETWORK_MODES: ModeCard<NodeNetworkPolicyMode>[] = [
   {
-    value: 'legacy',
-    title: 'Legacy',
-    description: "Nothing is compiled or applied: today's networking.",
+    value: 'off',
+    title: 'Off',
+    description:
+      'Nothing is filtered. The node still knows its workloads, so the egress proxy can tell who is calling.',
   },
   {
     value: 'shadow',
@@ -359,7 +361,9 @@ function NetworkPolicyModeSection({
             : previous
       )
       void queryClient.invalidateQueries({ queryKey: networkPolicyKeys.all })
-      toast.success(`Network policy mode set to ${entry.mode}`)
+      toast.success(
+        `Network policy mode set to ${normalizeNodeNetworkPolicyMode(entry.mode)}`
+      )
     },
     onError: (error) => {
       toast.error('Could not change the network policy mode', {
@@ -395,7 +399,7 @@ function NetworkPolicyModeSection({
           <ModeCards
             label="Network policy mode"
             modes={NETWORK_MODES}
-            current={entry.mode}
+            current={normalizeNodeNetworkPolicyMode(entry.mode)}
             disabled={!canEdit || update.isPending}
             unavailable={(mode) =>
               networkPolicyModeUnavailableReason(entry, mode) !== null
@@ -409,9 +413,9 @@ function NetworkPolicyModeSection({
             <p className="text-sm text-muted-foreground">
               Shadow and Enforce are unavailable on this node.{' '}
               {networkPolicyModeUnavailableReason(entry, 'enforce')}
-              {entry.mode === 'legacy'
+              {normalizeNodeNetworkPolicyMode(entry.mode) === 'off'
                 ? null
-                : ` Its stored mode “${entry.mode}” is not applied; select Legacy to clear it.`}
+                : ` Its stored mode “${entry.mode}” is not applied; select Off to clear it.`}
             </p>
           )}
           {isNodeNetworkPolicyMode(entry.mode) ? null : (
@@ -427,7 +431,7 @@ function NetworkPolicyModeSection({
             >
               Settings → Network policy
             </Link>
-            . Legacy is the rollback.
+            . Off is the rollback.
           </p>
           {canEdit ? null : <ReadOnlyNote />}
         </div>
@@ -446,8 +450,8 @@ function NetworkPolicyModeSection({
             Rules and egress profiles start being applied to every workload on{' '}
             {nodeName}. Workloads with a restricted profile (sandboxes, by
             default) can no longer reach services they are not linked to, and
-            unlinked services become unreachable from them. Switch back to
-            Legacy to roll back.
+            unlinked services become unreachable from them. Switch back to Off
+            to roll back.
           </>
         }
         confirmLabel="Enforce"

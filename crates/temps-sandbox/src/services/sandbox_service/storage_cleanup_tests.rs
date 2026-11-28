@@ -459,6 +459,7 @@ fn row(public_id: &str, agent_run_id: Option<i32>) -> sandboxes::Model {
         preview_access: Default::default(),
         preview_allowed_cidrs: Vec::new(),
         egress_policy: Default::default(),
+        egress_recording: false,
         lifecycle: "ephemeral".to_string(),
         project_id: None,
         source_repo_url: None,
@@ -3311,6 +3312,64 @@ async fn an_egress_policy_is_applied_before_it_is_stored() {
         "an event is recorded: {sql}"
     );
     let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// Records the rows whose recorded policy change it was told about.
+#[derive(Default)]
+struct PolicyObserver(std::sync::Mutex<Vec<(String, bool)>>);
+
+#[async_trait::async_trait]
+impl super::EgressPolicyObserver for PolicyObserver {
+    async fn policy_changed(&self, row: &sandboxes::Model) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((row.public_id.clone(), row.egress_policy.0.is_restricted()));
+    }
+}
+
+/// A recorded sandbox's connections are decided by the egress recorder, so
+/// it is told the new policy before the update answers; one that does not
+/// record is not touched.
+#[tokio::test]
+async fn a_recorded_sandboxs_new_policy_reaches_the_recorder_before_the_update_answers() {
+    for recording in [true, false] {
+        let data_root = unique_data_root("egress-observed");
+        let policy = restricted_egress();
+        let recorded = |row: sandboxes::Model| sandboxes::Model {
+            egress_recording: recording,
+            ..row
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![recorded(row_with(PUBLIC_ID, "ephemeral", "running"))]])
+            .append_query_results([vec![recorded(with_egress(
+                row_with(PUBLIC_ID, "ephemeral", "running"),
+                &policy,
+            ))]])
+            .append_query_results([vec![egress_event()]])
+            .into_connection();
+        let (service, _) =
+            build_service_shared(Arc::new(db), FakeProvider::new(), data_root.clone());
+        let observer = Arc::new(PolicyObserver::default());
+        service.set_egress_observer(observer.clone());
+
+        service
+            .set_egress_policy(PUBLIC_ID, 1, policy.clone())
+            .await
+            .expect("applied and stored");
+
+        let expected = if recording {
+            vec![(PUBLIC_ID.to_string(), true)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            expected,
+            "recording: {recording}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
 }
 
 #[tokio::test]

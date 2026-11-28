@@ -37,6 +37,7 @@ pub mod error;
 pub mod handlers;
 pub mod ingest;
 pub mod memory;
+pub mod platform_logs;
 pub mod plugin;
 pub mod project_metrics_sink;
 pub mod proto;

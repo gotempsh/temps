@@ -83,7 +83,7 @@ fn enforcing(outcome: &PassOutcome) -> Option<bool> {
     match outcome {
         PassOutcome::Applied(_) => Some(true),
         PassOutcome::Unchanged { mode, .. } => Some(*mode == NodeMode::Enforce),
-        PassOutcome::Legacy | PassOutcome::Removed { .. } | PassOutcome::Shadowed(_) => Some(false),
+        PassOutcome::Off | PassOutcome::Removed { .. } | PassOutcome::Shadowed(_) => Some(false),
     }
 }
 
@@ -304,10 +304,10 @@ mod tests {
             Some(false)
         );
         assert_eq!(enforcing(&PassOutcome::Shadowed(summary)), Some(false));
-        assert_eq!(enforcing(&PassOutcome::Legacy), Some(false));
+        assert_eq!(enforcing(&PassOutcome::Off), Some(false));
         assert_eq!(
             enforcing(&PassOutcome::Removed {
-                mode: NodeMode::Legacy
+                mode: NodeMode::Off
             }),
             Some(false)
         );

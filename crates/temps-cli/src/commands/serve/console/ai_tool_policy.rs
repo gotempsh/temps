@@ -450,6 +450,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         &["reshuffle_flag"],
     ),
     (
+        "turns the record of a workload's outbound connections on or off; that record exists to catch a workload doing what it was told not to, so a prompt injection must not be able to switch it off",
+        &["set_egress_recording", "set_environment_egress_recording"],
+    ),
+    (
         "changes who can access the platform; a prompt injection could escalate privilege",
         &[
             "add_team_member",

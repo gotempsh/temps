@@ -313,6 +313,8 @@ pub struct SandboxSummary {
     pub node_name: String,
     /// The egress policy the sandbox enforces.
     pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
+    /// Whether the sandbox's outbound connections are recorded.
+    pub egress_recording: bool,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -351,6 +353,7 @@ impl From<&sandboxes::Model> for SandboxSummary {
                 Some(id) => format!("node-{id}"),
             },
             egress_policy: m.egress_policy.0.clone(),
+            egress_recording: m.egress_recording,
         }
     }
 }
@@ -468,6 +471,18 @@ pub struct SandboxService {
     /// refused with a typed error. `false` on every install that runs
     /// workloads.
     control_plane_runs_no_workloads: bool,
+    /// Told when a recorded sandbox's egress policy changed, so the egress
+    /// recorder enforces the new policy before the change is reported done.
+    /// Set once the local recorder runs.
+    egress_observer: std::sync::OnceLock<Arc<dyn EgressPolicyObserver>>,
+}
+
+/// What must follow a recorded sandbox's new egress policy at once: the
+/// egress recorder, which decides that sandbox's connections itself.
+#[async_trait::async_trait]
+pub trait EgressPolicyObserver: Send + Sync {
+    /// `row` was stored with a new policy, which its sandbox now enforces.
+    async fn policy_changed(&self, row: &sandboxes::Model);
 }
 
 /// Worker nodes with an eviction in progress in this process (ADR-048).
@@ -583,7 +598,13 @@ impl SandboxService {
             creates_in_progress: Arc::new(CreatesInProgress::default()),
             creations: Arc::default(),
             control_plane_runs_no_workloads: false,
+            egress_observer: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Wires what a recorded sandbox's policy change refreshes. Set once.
+    pub fn set_egress_observer(&self, observer: Arc<dyn EgressPolicyObserver>) {
+        let _ = self.egress_observer.set(observer);
     }
 
     /// Whether this server runs workloads itself (ADR 063). With `false`,

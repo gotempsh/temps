@@ -481,6 +481,7 @@ fn sandbox() -> sandboxes::Model {
         backend: Some("docker".into()),
         node_id: None,
         egress_policy: Default::default(),
+        egress_recording: false,
         created_at: Utc::now(),
         last_activity_at: Utc::now(),
         expires_at: Utc::now() + Duration::seconds(900),

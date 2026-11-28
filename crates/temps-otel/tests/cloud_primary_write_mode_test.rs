@@ -210,6 +210,10 @@ impl OtelStorage for LocalSpanStoreSpy {
         Ok(Vec::new())
     }
 
+    async fn count_logs(&self, _: LogQuery) -> StorageResult<u64> {
+        Ok(0)
+    }
+
     async fn record_trace_refs(&self, trace_ids: &[String], _: i32) -> StorageResult<u64> {
         Ok(trace_ids.len() as u64)
     }

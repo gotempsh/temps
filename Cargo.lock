@@ -12980,6 +12980,7 @@ dependencies = [
  "temps-workflows",
  "temps-workload",
  "temps-workload-activator",
+ "temps-workload-egress",
  "temps-workload-plane",
  "thiserror 2.0.21",
  "tikv-jemallocator",
@@ -13373,6 +13374,7 @@ dependencies = [
  "temps-metrics",
  "temps-migrations",
  "temps-monitoring",
+ "temps-network-policy",
  "temps-nodes",
  "temps-otel",
  "temps-plugin-protocol",
@@ -13386,7 +13388,9 @@ dependencies = [
  "temps-vulnerability-scanner",
  "temps-workload",
  "temps-workload-docker",
+ "temps-workload-egress",
  "temps-workload-env",
+ "temps-workload-netpol",
  "temps-workload-plane",
  "temps-workload-volumes",
  "thiserror 2.0.21",
@@ -14849,6 +14853,7 @@ dependencies = [
  "temps-metrics",
  "temps-schema",
  "temps-test-utils",
+ "temps-workload",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14861,7 +14866,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-protocol"
-version = "0.1.0-beta.64"
+version = "0.1.0-beta.65"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -14873,7 +14878,7 @@ dependencies = [
 
 [[package]]
 name = "temps-plugin-sdk"
-version = "0.1.0-beta.64"
+version = "0.1.0-beta.65"
 dependencies = [
  "axum",
  "chrono",
@@ -15510,6 +15515,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "bollard",
  "bytes",
  "chrono",
  "flate2",
@@ -15532,8 +15538,15 @@ dependencies = [
  "temps-core",
  "temps-entities",
  "temps-git",
+ "temps-netpol-probe",
+ "temps-network-policy",
+ "temps-otel",
  "temps-pty-agent",
  "temps-sandbox-providers",
+ "temps-test-utils",
+ "temps-workload",
+ "temps-workload-egress",
+ "temps-workload-netpol",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -16036,7 +16049,7 @@ dependencies = [
 
 [[package]]
 name = "temps-workflows-sdk"
-version = "0.1.0-beta.64"
+version = "0.1.0-beta.65"
 dependencies = [
  "async-trait",
  "axum",
@@ -16097,6 +16110,33 @@ dependencies = [
  "temps-workload-volumes",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "temps-workload-egress"
+version = "0.1.0-beta.63"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-entities",
+ "temps-network-policy",
+ "temps-otel",
+ "temps-routes",
+ "temps-test-utils",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]

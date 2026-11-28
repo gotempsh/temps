@@ -23,6 +23,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`sandbox password`](#sandbox-password)
 - [`sandbox preview-access`](#sandbox-preview-access)
 - [`sandbox egress`](#sandbox-egress)
+- [`sandbox recording`](#sandbox-recording)
+- [`sandbox outbound`](#sandbox-outbound)
 - [`sandbox fs`](#sandbox-fs)
 - [`sandbox snapshots`](#sandbox-snapshots)
 - [`sandbox snapshot`](#sandbox-snapshot)
@@ -73,6 +75,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
 - `preview-access` - Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
 - `egress` - Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
+- `recording` - Show or set whether the sandbox records its outbound connections (destination, outcome, bytes; never headers or bodies)
+- `outbound` - List the outbound connections a recording sandbox made, newest first
 - `fs` - Filesystem operations inside a sandbox
 - `snapshots` - Manage sandbox snapshots (ADR-037)
 - `snapshot` - Take a snapshot of a sandbox
@@ -427,6 +431,35 @@ Show or set where the sandbox may connect to: the internet, nothing, or only lis
 | `--internet` | Remove the restriction | - | No |
 | `--deny-all` | Allow no outbound traffic at all | - | No |
 | `--allow <host\|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox recording`
+
+Show or set whether the sandbox records its outbound connections (destination, outcome, bytes; never headers or bodies)
+
+**Usage:** `sandbox recording <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--on` | Record its outbound connections | - | No |
+| `--off` | Stop recording | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox outbound`
+
+List the outbound connections a recording sandbox made, newest first
+
+**Usage:** `sandbox outbound <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <n>` | Page number (default 1) | - | No |
+| `--per-page <n>` | Records per page (default 20, max 100) | - | No |
+| `--outcome <outcome>` | Only allowed, refused or failed connections | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox fs`

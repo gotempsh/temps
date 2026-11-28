@@ -36,17 +36,25 @@
 //!
 //! **Hot path.** No locks: the rule table is an `ArcSwap` snapshot,
 //! counters are atomics, buffers come from a lock-free queue.
+//!
+//! **Recording** ([`record`]), for workloads whose policy opts in: one
+//! [`ConnectionRecord`] per connection when it ends, handed to a bounded
+//! channel with `try_send`. A workload that has not opted in costs one
+//! branch per connection; a full channel drops the record and counts it,
+//! and never slows the connection.
+
+pub mod record;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
-use temps_workload::WorkloadRef;
+use temps_workload::{WorkloadKind, WorkloadRef};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -55,12 +63,27 @@ use tracing::{debug, info, warn};
 use crate::identity::IdentityMap;
 use crate::rule::{Action, Cidr, PortRange};
 
+pub use record::{
+    recording_channel, ConnectionKind, ConnectionOutcome, ConnectionRecord, Delivered,
+    EgressBatcher, EgressReason, EgressRecordBatch, EgressRecordSink, EgressRecordStream,
+    EgressRecorder, EgressRecordingCapability, RecordSinkError, RecordingUnavailable, RelayKind,
+};
+
 /// Ports a rule allows when it names none: today's sidecar allows exactly
 /// these two.
 pub const DEFAULT_PORTS: [u16; 2] = [80, 443];
 
-/// The longest request head the proxy reads.
-pub const MAX_HEAD: usize = 8 * 1024;
+/// The longest request head the proxy reads: 24 KiB. The Node sidecar a
+/// sandbox's direct traffic goes through accepts heads somewhat past its
+/// 16 KiB `maxHeaderSize` (it counts header bytes, not the whole head), and
+/// when recording it hands the request on in absolute form with one more
+/// header: the margin keeps turning recording on from refusing a head that
+/// worked with it off. A smaller `buffer_size` reads at most its own size.
+pub const MAX_HEAD: usize = 24 * 1024;
+
+/// The smallest `buffer_size` accepted: a buffer below it cannot hold an
+/// ordinary request head.
+pub const MIN_BUFFER: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EgressConfigError {
@@ -181,6 +204,16 @@ pub struct EgressPolicy {
     pub subject: WorkloadRef,
     #[serde(default)]
     pub rules: Vec<EgressRule>,
+    /// Record every outbound connection of this workload ([`record`]).
+    /// Set by the control plane from the workload's own opt-in; absent from
+    /// an older control plane, which means off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record: bool,
+    /// Never connect to a non-public address, even inside an allowed CIDR:
+    /// a sandbox's own egress policy refuses private, loopback, link-local
+    /// and metadata destinations whatever its rules name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public_only: bool,
 }
 
 /// Why a request was refused. Stable strings, for logs and metrics.
@@ -224,6 +257,10 @@ pub enum Admission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledRules {
     pub workload: WorkloadRef,
+    /// Whether this workload's connections are recorded.
+    pub record: bool,
+    /// See [`EgressPolicy::public_only`].
+    pub public_only: bool,
     deny: Vec<EgressRule>,
     allow: Vec<EgressRule>,
 }
@@ -235,6 +272,8 @@ impl CompiledRules {
         let (deny, allow) = rules.into_iter().partition(|r| r.action == Action::Deny);
         Self {
             workload: policy.subject,
+            record: policy.record,
+            public_only: policy.public_only,
             deny,
             allow,
         }
@@ -269,23 +308,66 @@ impl CompiledRules {
             return Ok(Admission::ByAddress);
         }
         if !allowed.iter().any(|r| r.port_matches(port)) {
+            // A rule names the host but not on this port. A CIDR rule that
+            // allows this port may still admit what the name resolves to,
+            // decided per address after resolution, as the sandbox sidecar
+            // decides it: recording a sandbox must not refuse what it allows.
+            let cidr_on_port = literal.is_none()
+                && self
+                    .allow
+                    .iter()
+                    .any(|r| matches!(r.target, EgressTarget::Cidr(_)) && r.port_matches(port));
+            if cidr_on_port {
+                return Ok(Admission::ByAddress);
+            }
             return Err(Refusal::Port);
         }
         Ok(Admission::ByRule)
     }
 
-    /// Whether every resolved address may be connected to.
+    /// Whether the resolved addresses may be connected to: `Ok` when
+    /// [`CompiledRules::admissible_addresses`] leaves at least one.
     pub fn check_addresses(
         &self,
         addrs: &[IpAddr],
         port: u16,
         admission: Admission,
     ) -> Result<(), Refusal> {
+        self.admissible_addresses(addrs, port, admission)
+            .map(|_| ())
+    }
+
+    /// The resolved addresses that may be connected to, in their order.
+    ///
+    /// - With `public_only`, one non-public answer refuses the whole name
+    ///   (the DNS-rebinding fallback), as does an answer inside a denied
+    ///   CIDR, whatever the admission.
+    /// - [`Admission::ByRule`]: an allow rule named the destination, so
+    ///   every answer must be public or inside an allowed CIDR, and all of
+    ///   them are admissible.
+    /// - [`Admission::ByAddress`]: no rule named the hostname, so only the
+    ///   answers inside an allowed CIDR on this port are admissible, and the
+    ///   name is refused only when none is. This is the sandbox sidecar's
+    ///   decision too: it connects to the first answer a CIDR rule allows,
+    ///   so recording a sandbox never changes what it may reach.
+    ///
+    /// The proxy connects to an address from this list, never to one it did
+    /// not check.
+    pub fn admissible_addresses(
+        &self,
+        addrs: &[IpAddr],
+        port: u16,
+        admission: Admission,
+    ) -> Result<Vec<IpAddr>, Refusal> {
         if addrs.is_empty() {
             return Err(Refusal::Unresolved);
         }
+        let mut admissible = Vec::with_capacity(addrs.len());
         for &addr in addrs {
             let addr = unmap(addr);
+            if self.public_only && !is_public(addr) {
+                return Err(Refusal::Private);
+            }
             let in_cidr = |r: &&EgressRule| {
                 matches!(&r.target, EgressTarget::Cidr(c) if c.contains(addr))
                     && r.port_matches(port)
@@ -294,16 +376,19 @@ impl CompiledRules {
                 return Err(Refusal::Denied);
             }
             if self.allow.iter().any(|r| in_cidr(&r)) {
+                admissible.push(addr);
                 continue;
             }
-            if admission == Admission::ByAddress {
-                return Err(Refusal::NotAllowed);
-            }
-            if !is_public(addr) {
-                return Err(Refusal::Private);
+            match admission {
+                Admission::ByAddress => {}
+                Admission::ByRule if is_public(addr) => admissible.push(addr),
+                Admission::ByRule => return Err(Refusal::Private),
             }
         }
-        Ok(())
+        if admissible.is_empty() {
+            return Err(Refusal::NotAllowed);
+        }
+        Ok(admissible)
     }
 }
 
@@ -437,13 +522,14 @@ pub struct EgressProxyConfig {
 }
 
 impl EgressProxyConfig {
-    /// Sized for the 1 vCPU / 2 GB target: 512 connections × 2 × 16 KiB =
-    /// 16 MiB of buffers at saturation.
+    /// Sized for the 1 vCPU / 2 GB target: 512 connections × 2 × 24 KiB =
+    /// 24 MiB of buffers at saturation, each big enough for the longest
+    /// head ([`MAX_HEAD`]).
     pub fn new(listen: SocketAddr) -> Self {
         Self {
             listen,
             max_connections: 512,
-            buffer_size: 16 * 1024,
+            buffer_size: MAX_HEAD,
             head_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(60),
@@ -460,10 +546,10 @@ impl EgressProxyConfig {
                 ),
             });
         }
-        if self.buffer_size < MAX_HEAD || self.buffer_size > 1024 * 1024 {
+        if self.buffer_size < MIN_BUFFER || self.buffer_size > 1024 * 1024 {
             return Err(EgressConfigError::InvalidLimits {
                 reason: format!(
-                    "buffer_size is {}; expected {MAX_HEAD}..=1048576",
+                    "buffer_size is {}; expected {MIN_BUFFER}..=1048576",
                     self.buffer_size
                 ),
             });
@@ -488,6 +574,18 @@ pub struct EgressStats {
     pub upstream_failed: AtomicU64,
     pub bytes_up: AtomicU64,
     pub bytes_down: AtomicU64,
+    /// Connection records queued for the control plane.
+    pub records_emitted: AtomicU64,
+    /// Connection records dropped because the recording channel was full.
+    pub records_dropped: AtomicU64,
+    /// Repeated refusals merged into an earlier record of the same batch.
+    pub records_collapsed: AtomicU64,
+    /// Records the sink accepted.
+    pub records_delivered: AtomicU64,
+    /// Records lost because their batch could not be delivered.
+    pub records_undelivered: AtomicU64,
+    /// Records the sink accepted but discarded ([`Delivered::discarded`]).
+    pub records_discarded: AtomicU64,
     last_saturation_log: AtomicU64,
 }
 
@@ -506,6 +604,12 @@ pub struct EgressStatsSnapshot {
     pub upstream_failed: u64,
     pub bytes_up: u64,
     pub bytes_down: u64,
+    pub records_emitted: u64,
+    pub records_dropped: u64,
+    pub records_collapsed: u64,
+    pub records_delivered: u64,
+    pub records_undelivered: u64,
+    pub records_discarded: u64,
 }
 
 impl EgressStats {
@@ -525,6 +629,12 @@ impl EgressStats {
             upstream_failed: get(&self.upstream_failed),
             bytes_up: get(&self.bytes_up),
             bytes_down: get(&self.bytes_down),
+            records_emitted: get(&self.records_emitted),
+            records_dropped: get(&self.records_dropped),
+            records_collapsed: get(&self.records_collapsed),
+            records_delivered: get(&self.records_delivered),
+            records_discarded: get(&self.records_discarded),
+            records_undelivered: get(&self.records_undelivered),
         }
     }
 }
@@ -618,6 +728,38 @@ pub struct EgressProxy {
     stats: Arc<EgressStats>,
     limit: Arc<Semaphore>,
     pool: Arc<BufferPool>,
+    /// Where records of opted-in workloads go; `None`: nothing is recorded,
+    /// whatever the policies say.
+    recorder: Option<EgressRecorder>,
+    /// Asked once before a caller the table does not know is refused.
+    unknown_source: std::sync::OnceLock<Arc<dyn UnknownSource>>,
+    /// How many unknown callers may wait for [`UnknownSource`] at once
+    /// ([`unknown_waits`]). A waiting caller holds a connection slot, so
+    /// past this the rest are refused at once, and a burst of unknown
+    /// callers can never take the slots known workloads need.
+    unknown_waits: Arc<Semaphore>,
+}
+
+/// The unknown callers that may wait at once out of `max_connections`: one
+/// in sixteen, at least one.
+pub fn unknown_waits(max_connections: usize) -> usize {
+    (max_connections / 16).max(1)
+}
+
+/// The longest a connection from a caller the table does not know waits for
+/// [`UnknownSource::unknown_source`] before it is refused.
+pub const UNKNOWN_SOURCE_WAIT: Duration = Duration::from_secs(3);
+
+/// What the proxy asks before refusing a caller its table does not hold: a
+/// workload that has just started may be reaching the proxy before the
+/// table that names it was rebuilt. The proxy looks the caller up again
+/// afterwards and refuses only if it is still unknown.
+#[async_trait::async_trait]
+pub trait UnknownSource: Send + Sync {
+    /// Brings the table up to date if a new workload may hold `source`.
+    /// Bounded by [`UNKNOWN_SOURCE_WAIT`]; an implementation must also bound
+    /// how often it does real work, since any caller can trigger it.
+    async fn unknown_source(&self, source: IpAddr);
 }
 
 impl EgressProxy {
@@ -625,14 +767,39 @@ impl EgressProxy {
         config: EgressProxyConfig,
         table: Arc<ArcSwap<EgressTable>>,
     ) -> Result<Arc<Self>, EgressConfigError> {
+        Self::with_recorder(config, table, None)
+    }
+
+    /// A proxy that records the connections of workloads whose policy opts
+    /// in, into `recorder` (see [`recording_channel`]). The caller runs an
+    /// [`EgressBatcher`] on the other end, with this proxy's
+    /// [`EgressProxy::stats`].
+    pub fn with_recorder(
+        config: EgressProxyConfig,
+        table: Arc<ArcSwap<EgressTable>>,
+        recorder: Option<EgressRecorder>,
+    ) -> Result<Arc<Self>, EgressConfigError> {
         config.validate()?;
         Ok(Arc::new(Self {
             limit: Arc::new(Semaphore::new(config.max_connections)),
             pool: BufferPool::new(config.max_connections * 2, config.buffer_size),
+            unknown_waits: Arc::new(Semaphore::new(unknown_waits(config.max_connections))),
             config,
             table,
             stats: Arc::new(EgressStats::default()),
+            recorder,
+            unknown_source: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Sets what is asked before an unknown caller is refused. Set once.
+    pub fn set_unknown_source(&self, handler: Arc<dyn UnknownSource>) {
+        let _ = self.unknown_source.set(handler);
+    }
+
+    /// Whether this proxy was built with a recorder.
+    pub fn records(&self) -> bool {
+        self.recorder.is_some()
     }
 
     pub fn stats(&self) -> &Arc<EgressStats> {
@@ -658,11 +825,18 @@ impl EgressProxy {
     }
 
     /// Accepts until the listener fails. Each connection runs on its own
-    /// task, bounded by the connection limit.
+    /// task, bounded by the connection limit. The connection tasks belong to
+    /// this future: when it ends or is aborted (its owner stopped serving)
+    /// they are aborted too, so no tunnel, socket or pooled buffer outlives
+    /// the proxy that served it.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<(), EgressError> {
         let addr = listener.local_addr().unwrap_or(self.config.listen);
         info!(%addr, max_connections = self.config.max_connections, "egress proxy listening");
+        // At most `max_connections` live tasks (each holds a permit), and
+        // finished ones are reaped on every accept.
+        let mut connections = tokio::task::JoinSet::new();
         loop {
+            while connections.try_join_next().is_some() {}
             let (stream, peer) = match listener.accept().await {
                 Ok(accepted) => accepted,
                 Err(e) if is_transient_accept_error(&e) => {
@@ -683,13 +857,29 @@ impl EgressProxy {
                 continue;
             };
             let proxy = self.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
+                // Counted down on every way out, an abort included.
+                struct Active(Arc<EgressStats>);
+                impl Drop for Active {
+                    fn drop(&mut self) {
+                        self.0.active.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
                 proxy.stats.active.fetch_add(1, Ordering::Relaxed);
-                proxy.handle(stream, peer).await;
-                proxy.stats.active.fetch_sub(1, Ordering::Relaxed);
-                drop(permit);
+                let _active = Active(proxy.stats.clone());
+                proxy.handle(stream, peer, permit).await;
             });
         }
+    }
+
+    /// No workload owns this source, so there is nobody to attribute a
+    /// record to and no opt-in to honour: counted, never recorded.
+    async fn refuse_unknown(&self, mut client: TcpStream, source: IpAddr) {
+        self.stats
+            .refused_unknown_source
+            .fetch_add(1, Ordering::Relaxed);
+        debug!(%source, reason = Refusal::UnknownSource.as_str(), "egress proxy refused");
+        let _ = client.write_all(FORBIDDEN).await;
     }
 
     fn refuse_saturated(&self, stream: TcpStream, peer: SocketAddr) {
@@ -714,6 +904,22 @@ impl EgressProxy {
                 "egress proxy at its connection limit: refusing new connections"
             );
         }
+        // Saturation is the one refusal taken before the connection has a
+        // task, so its record is taken here. Only on this already-refusing
+        // path, and lock-free: one snapshot load and one map lookup.
+        if let Some(recorder) = &self.recorder {
+            if let Some(rules) = self.table.load().lookup(peer.ip()) {
+                if rules.record {
+                    let now = record::unix_millis();
+                    recorder.record(
+                        Ended::refused(None, EgressReason::Saturated)
+                            .into_record(rules.workload, now, Duration::ZERO)
+                            .from_source(unmap(peer.ip())),
+                        &self.stats,
+                    );
+                }
+            }
+        }
         // Answered inline, without a task: a just-accepted socket has an
         // empty send buffer, so this ~100-byte write completes at once (the
         // timeout bounds it if it ever did not). Tokio's readiness is not
@@ -727,23 +933,81 @@ impl EgressProxy {
         }
     }
 
-    async fn handle(&self, mut client: TcpStream, peer: SocketAddr) {
+    /// Serves one accepted connection, holding `permit` (its connection
+    /// slot) for as long as it is served.
+    async fn handle(
+        &self,
+        client: TcpStream,
+        peer: SocketAddr,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let source = unmap(peer.ip());
-        let rules = self.table.load().lookup(source).cloned();
+        let mut rules = self.table.load().lookup(source).cloned();
+        // Held until the connection is served; given up while waiting.
+        let mut slot = Some(permit);
+        if rules.is_none() {
+            if let Some(handler) = self.unknown_source.get() {
+                // A workload that has just started can be here before the
+                // table naming it: ask once, briefly, then look again. The
+                // wait holds a discovery slot instead of a connection slot,
+                // so callers waiting can never take the slots known
+                // workloads need; with every discovery slot taken the caller
+                // is told to retry (503), as at the connection limit: it may
+                // well be a workload that discovery would have found.
+                let Ok(waiting) = self.unknown_waits.clone().try_acquire_owned() else {
+                    drop(slot);
+                    self.refuse_saturated(client, peer);
+                    return;
+                };
+                drop(slot.take());
+                let _ =
+                    tokio::time::timeout(UNKNOWN_SOURCE_WAIT, handler.unknown_source(source)).await;
+                drop(waiting);
+                rules = self.table.load().lookup(source).cloned();
+                if rules.is_none() {
+                    self.refuse_unknown(client, source).await;
+                    return;
+                }
+                let Ok(permit) = self.limit.clone().try_acquire_owned() else {
+                    self.refuse_saturated(client, peer);
+                    return;
+                };
+                slot = Some(permit);
+            }
+        }
+        let _slot = slot;
         let Some(rules) = rules else {
-            self.stats
-                .refused_unknown_source
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(%source, reason = Refusal::UnknownSource.as_str(), "egress proxy refused");
-            let _ = client.write_all(FORBIDDEN).await;
+            self.refuse_unknown(client, source).await;
             return;
         };
+        // The one branch recording costs a workload that has not opted in.
+        let Some(recorder) = self.recorder.as_ref().filter(|_| rules.record) else {
+            self.serve_connection(client, source, &rules).await;
+            return;
+        };
+        let started = Instant::now();
+        let started_at_ms = record::unix_millis();
+        let ended = self.serve_connection(client, source, &rules).await;
+        recorder.record(
+            ended
+                .into_record(rules.workload, started_at_ms, started.elapsed())
+                .from_source(source),
+            &self.stats,
+        );
+    }
+
+    async fn serve_connection(
+        &self,
+        mut client: TcpStream,
+        source: IpAddr,
+        rules: &CompiledRules,
+    ) -> Ended {
         let (Some(mut up_buf), Some(mut down_buf)) = (self.pool.get(), self.pool.get()) else {
             // Cannot happen while the semaphore holds (two buffers per
             // permit), but never allocate past the pool.
             self.stats.refused_saturated.fetch_add(1, Ordering::Relaxed);
             let _ = client.write_all(UNAVAILABLE).await;
-            return;
+            return Ended::refused(None, EgressReason::Saturated);
         };
         let read = tokio::time::timeout(
             self.config.head_timeout,
@@ -755,7 +1019,7 @@ impl EgressProxy {
             _ => {
                 self.stats.malformed.fetch_add(1, Ordering::Relaxed);
                 let _ = client.write_all(BAD_REQUEST).await;
-                return;
+                return Ended::refused(None, EgressReason::MalformedRequest);
             }
         };
         let request = match parse_request(&up_buf[..head_len]) {
@@ -763,69 +1027,90 @@ impl EgressProxy {
             None => {
                 self.stats.malformed.fetch_add(1, Ordering::Relaxed);
                 let _ = client.write_all(BAD_REQUEST).await;
-                return;
+                return Ended::refused(None, EgressReason::MalformedRequest);
             }
         };
+        // Body bytes that arrived with the head, sent on before the splice.
+        let early = filled.saturating_sub(head_len) as u64;
+        if let (Some(reason), RequestKind::Connect { .. } | RequestKind::Forward { .. }) =
+            (request.refused_by_sender, &request.kind)
+        {
+            self.stats.refused_policy.fetch_add(1, Ordering::Relaxed);
+            let _ = client.write_all(FORBIDDEN).await;
+            return Ended::refused(Some(request), reason);
+        }
         match request.kind {
             RequestKind::Connect { ref host, port } => {
-                let Some(upstream) = self.open(&rules, source, host, port).await else {
-                    let _ = client.write_all(FORBIDDEN).await;
-                    return;
-                };
-                let Ok(mut upstream) = upstream else {
-                    self.stats.upstream_failed.fetch_add(1, Ordering::Relaxed);
-                    let _ = client.write_all(BAD_GATEWAY).await;
-                    return;
+                let (mut upstream, peer) = match self
+                    .open(rules, source, host, port, request.admitted_address)
+                    .await
+                {
+                    Ok(opened) => opened,
+                    Err(OpenError::Refused(refusal)) => {
+                        let _ = client.write_all(FORBIDDEN).await;
+                        return Ended::refused(Some(request), refusal.into());
+                    }
+                    Err(OpenError::Unreachable) => {
+                        self.stats.upstream_failed.fetch_add(1, Ordering::Relaxed);
+                        let _ = client.write_all(BAD_GATEWAY).await;
+                        return Ended::failed(Some(request));
+                    }
                 };
                 if client.write_all(ESTABLISHED).await.is_err() {
-                    return;
+                    return Ended::allowed(request, Some(peer), 0, 0);
                 }
                 if filled > head_len && upstream.write_all(&up_buf[head_len..filled]).await.is_err()
                 {
-                    return;
+                    return Ended::allowed(request, Some(peer), 0, 0);
                 }
                 self.stats.tunnels.fetch_add(1, Ordering::Relaxed);
-                self.splice(client, upstream, up_buf, down_buf).await;
+                let (sent, received) = self.splice(client, upstream, up_buf, down_buf).await;
+                Ended::allowed(request, Some(peer), early + sent, received)
             }
             RequestKind::Forward {
                 ref host,
                 port,
                 ref path,
             } => {
-                let Some(upstream) = self.open(&rules, source, host, port).await else {
-                    let _ = client.write_all(FORBIDDEN).await;
-                    return;
+                let (mut upstream, peer) = match self
+                    .open(rules, source, host, port, request.admitted_address)
+                    .await
+                {
+                    Ok(opened) => opened,
+                    Err(OpenError::Refused(refusal)) => {
+                        let _ = client.write_all(FORBIDDEN).await;
+                        return Ended::refused(Some(request), refusal.into());
+                    }
+                    Err(OpenError::Unreachable) => {
+                        self.stats.upstream_failed.fetch_add(1, Ordering::Relaxed);
+                        let _ = client.write_all(BAD_GATEWAY).await;
+                        return Ended::failed(Some(request));
+                    }
                 };
-                let Ok(mut upstream) = upstream else {
-                    self.stats.upstream_failed.fetch_add(1, Ordering::Relaxed);
-                    let _ = client.write_all(BAD_GATEWAY).await;
-                    return;
-                };
-                let authority = if port == 80 {
-                    host.clone()
-                } else {
-                    format!("{host}:{port}")
-                };
+                let authority = host_authority(host, port);
                 let head = rewrite_head(&request, path, &authority, &mut down_buf);
                 let Some(head_len_out) = head else {
                     self.stats.malformed.fetch_add(1, Ordering::Relaxed);
                     let _ = client.write_all(BAD_REQUEST).await;
-                    return;
+                    return Ended::refused(Some(request), EgressReason::MalformedRequest);
                 };
                 if upstream.write_all(&down_buf[..head_len_out]).await.is_err()
                     || (filled > head_len
                         && upstream.write_all(&up_buf[head_len..filled]).await.is_err())
                 {
-                    return;
+                    return Ended::allowed(request, Some(peer), 0, 0);
                 }
                 self.stats.forwarded.fetch_add(1, Ordering::Relaxed);
-                self.splice(client, upstream, up_buf, down_buf).await;
+                let (sent, received) = self.splice(client, upstream, up_buf, down_buf).await;
+                // The request head the proxy forwarded counts as sent.
+                let head = head_len_out as u64;
+                Ended::allowed(request, Some(peer), head + early + sent, received)
             }
             RequestKind::Relay { ref target } => {
                 let Some(relay) = self.config.relay.as_ref() else {
                     self.stats.refused_policy.fetch_add(1, Ordering::Relaxed);
                     let _ = client.write_all(FORBIDDEN).await;
-                    return;
+                    return Ended::refused(Some(request), EgressReason::RelayUnavailable);
                 };
                 let connect = tokio::time::timeout(
                     self.config.connect_timeout,
@@ -835,7 +1120,7 @@ impl EgressProxy {
                 let Ok(Ok(mut upstream)) = connect else {
                     self.stats.upstream_failed.fetch_add(1, Ordering::Relaxed);
                     let _ = client.write_all(BAD_GATEWAY).await;
-                    return;
+                    return Ended::failed(Some(request));
                 };
                 let path = format!("{}{target}", relay.base_path);
                 let Some(head_len_out) =
@@ -843,33 +1128,42 @@ impl EgressProxy {
                 else {
                     self.stats.malformed.fetch_add(1, Ordering::Relaxed);
                     let _ = client.write_all(BAD_REQUEST).await;
-                    return;
+                    return Ended::refused(Some(request), EgressReason::MalformedRequest);
                 };
                 if upstream.write_all(&down_buf[..head_len_out]).await.is_err()
                     || (filled > head_len
                         && upstream.write_all(&up_buf[head_len..filled]).await.is_err())
                 {
-                    return;
+                    return Ended::allowed(request, None, 0, 0);
                 }
                 self.stats.relayed.fetch_add(1, Ordering::Relaxed);
-                self.splice(client, upstream, up_buf, down_buf).await;
+                let (sent, received) = self.splice(client, upstream, up_buf, down_buf).await;
+                let head = head_len_out as u64;
+                Ended::allowed(request, None, head + early + sent, received)
             }
-            RequestKind::Refused => {
+            RequestKind::Refused(reason) => {
                 self.stats.refused_policy.fetch_add(1, Ordering::Relaxed);
                 let _ = client.write_all(FORBIDDEN).await;
+                Ended::refused(Some(request), reason)
             }
         }
     }
 
-    /// Checks and connects. `None`: refused by policy (already counted
-    /// and logged). `Some(Err)`: the upstream did not answer.
+    /// Checks and connects, returning the stream and the address it
+    /// connected to. A refusal is already counted and logged.
+    /// Connects `source` to `host`:`port` under `rules`. With `pinned` (the
+    /// address the sender's own policy admitted, [`ADMITTED_ADDRESS`]) that
+    /// address is the only answer: checked against `rules` like any other,
+    /// and connected to without resolving the name again, which could give
+    /// an answer the sender never admitted.
     async fn open(
         &self,
         rules: &CompiledRules,
         source: IpAddr,
         host: &str,
         port: u16,
-    ) -> Option<Result<TcpStream, ()>> {
+        pinned: Option<IpAddr>,
+    ) -> Result<(TcpStream, IpAddr), OpenError> {
         let refuse = |refusal: Refusal| {
             match refusal {
                 Refusal::Private => self.stats.refused_private.fetch_add(1, Ordering::Relaxed),
@@ -883,17 +1177,19 @@ impl EgressProxy {
                 reason = refusal.as_str(),
                 "egress proxy refused"
             );
+            OpenError::Refused(refusal)
         };
-        let admission = match rules.check_host(host, port) {
-            Ok(admission) => admission,
-            Err(refusal) => {
-                refuse(refusal);
-                return None;
-            }
-        };
-        let addrs: Vec<IpAddr> = match host.parse::<IpAddr>() {
-            Ok(ip) => vec![ip],
-            Err(_) => {
+        let admission = rules.check_host(host, port).map_err(refuse)?;
+        // Only a sandbox has a proxy of its own in front of it (its
+        // sidecar), which sets this header on every request it sends on.
+        // Any other workload talks to this proxy directly, so its header is
+        // its own choice: under a rule admitting a name it could pick any
+        // address. It is ignored and the name resolved here.
+        let pinned = pinned.filter(|_| pins_admitted_address(rules.workload));
+        let addrs: Vec<IpAddr> = match (pinned, host.parse::<IpAddr>()) {
+            (Some(pinned), _) => vec![unmap(pinned)],
+            (None, Ok(ip)) => vec![ip],
+            (None, Err(_)) => {
                 let lookup = tokio::time::timeout(
                     self.config.connect_timeout,
                     tokio::net::lookup_host((host, port)),
@@ -905,41 +1201,195 @@ impl EgressProxy {
                 }
             }
         };
-        if let Err(refusal) = rules.check_addresses(&addrs, port, admission) {
-            refuse(refusal);
-            return None;
-        }
+        let addrs = rules
+            .admissible_addresses(&addrs, port, admission)
+            .map_err(refuse)?;
         let target = addrs
             .iter()
             .find(|a| a.is_ipv4())
             .or_else(|| addrs.first())
-            .copied()?;
+            .copied()
+            .ok_or_else(|| refuse(Refusal::Unresolved))?;
         let connect = tokio::time::timeout(
             self.config.connect_timeout,
             TcpStream::connect(SocketAddr::new(target, port)),
         )
         .await;
-        Some(match connect {
-            Ok(Ok(stream)) => Ok(stream),
-            _ => Err(()),
-        })
+        match connect {
+            Ok(Ok(stream)) => Ok((stream, unmap(target))),
+            _ => Err(OpenError::Unreachable),
+        }
     }
 
+    /// Copies both ways until both sides are done. Returns the bytes sent
+    /// (workload to destination) and received.
     async fn splice(
         &self,
         client: TcpStream,
         upstream: TcpStream,
         mut up_buf: PooledBuffer,
         mut down_buf: PooledBuffer,
-    ) {
+    ) -> (u64, u64) {
         let (mut client_read, mut client_write) = client.into_split();
         let (mut upstream_read, mut upstream_write) = upstream.into_split();
         let idle = self.config.idle_timeout;
-        let up = pump(&mut client_read, &mut upstream_write, &mut up_buf, idle);
-        let down = pump(&mut upstream_read, &mut client_write, &mut down_buf, idle);
+        // One clock for both directions: a connection is idle only when
+        // neither side moves, so a long upload to a server that answers
+        // only once it has the whole body keeps its response direction.
+        let activity = Activity::new();
+        let up = pump(
+            &mut client_read,
+            &mut upstream_write,
+            &mut up_buf,
+            idle,
+            &activity,
+        );
+        let down = pump(
+            &mut upstream_read,
+            &mut client_write,
+            &mut down_buf,
+            idle,
+            &activity,
+        );
         let (sent, received) = tokio::join!(up, down);
         self.stats.bytes_up.fetch_add(sent, Ordering::Relaxed);
         self.stats.bytes_down.fetch_add(received, Ordering::Relaxed);
+        (sent, received)
+    }
+}
+
+/// Why [`EgressProxy::open`] did not return a stream.
+enum OpenError {
+    Refused(Refusal),
+    Unreachable,
+}
+
+/// How a connection ended, from what `serve_connection` already holds.
+/// Building it moves values the connection was done with; only an opted-in
+/// workload's turns into a [`ConnectionRecord`].
+struct Ended {
+    request: Option<ParsedRequest>,
+    outcome: ConnectionOutcome,
+    reason: Option<EgressReason>,
+    peer: Option<IpAddr>,
+    bytes_sent: u64,
+    bytes_received: u64,
+}
+
+impl Ended {
+    fn refused(request: Option<ParsedRequest>, reason: EgressReason) -> Self {
+        Self {
+            request,
+            outcome: ConnectionOutcome::Refused,
+            reason: Some(reason),
+            peer: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+        }
+    }
+
+    fn failed(request: Option<ParsedRequest>) -> Self {
+        Self {
+            outcome: ConnectionOutcome::Failed,
+            reason: Some(EgressReason::UpstreamUnreachable),
+            ..Self::refused(request, EgressReason::UpstreamUnreachable)
+        }
+    }
+
+    fn allowed(
+        request: ParsedRequest,
+        peer: Option<IpAddr>,
+        bytes_sent: u64,
+        bytes_received: u64,
+    ) -> Self {
+        Self {
+            request: Some(request),
+            outcome: ConnectionOutcome::Allowed,
+            reason: None,
+            peer,
+            bytes_sent,
+            bytes_received,
+        }
+    }
+
+    fn into_record(
+        self,
+        workload: WorkloadRef,
+        started_at_ms: u64,
+        elapsed: Duration,
+    ) -> ConnectionRecord {
+        let mut kind = ConnectionKind::Unknown;
+        let (mut host, mut port, mut method, mut path, mut relay) = (None, None, None, None, None);
+        if let Some(request) = self.request {
+            match request.kind {
+                RequestKind::Connect { host: h, port: p } => {
+                    kind = ConnectionKind::Tunnel;
+                    host = Some(recorded_host(h));
+                    port = Some(p);
+                }
+                RequestKind::Forward {
+                    host: h,
+                    port: p,
+                    path: target,
+                } => {
+                    kind = ConnectionKind::Forward;
+                    host = Some(recorded_host(h));
+                    port = Some(p);
+                    method = Some(record::recorded_method(&request.method));
+                    path = Some(record::recorded_path(&target));
+                }
+                RequestKind::Relay { target } => {
+                    kind = ConnectionKind::Relay;
+                    relay = relay_kind(&target);
+                }
+                RequestKind::Refused(_) => {}
+            }
+        }
+        ConnectionRecord {
+            workload,
+            started_at_ms,
+            last_started_at_ms: started_at_ms,
+            duration_ms: elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            kind,
+            outcome: self.outcome,
+            reason: self.reason,
+            host,
+            port,
+            peer: self.peer,
+            method,
+            path,
+            relay,
+            bytes_sent: self.bytes_sent,
+            bytes_received: self.bytes_received,
+            count: 1,
+            source: None,
+            recorded_at: None,
+        }
+    }
+}
+
+/// A host as recorded: at most [`record::MAX_RECORDED_HOST`] bytes, in an
+/// allocation of that size. A cut host is copied rather than truncated in
+/// place, so a queued record never keeps a request-sized buffer alive.
+fn recorded_host(host: String) -> String {
+    if host.len() <= record::MAX_RECORDED_HOST {
+        return host;
+    }
+    let mut cut = record::MAX_RECORDED_HOST;
+    while !host.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    host[..cut].to_string()
+}
+
+/// Which relay a rewritten control-plane path goes to.
+fn relay_kind(target: &str) -> Option<RelayKind> {
+    if target.starts_with("/api/ai/sandbox-models/") {
+        Some(RelayKind::Model)
+    } else if target.starts_with("/api/ai/sandbox-tools/") {
+        Some(RelayKind::Mcp)
+    } else {
+        None
     }
 }
 
@@ -953,26 +1403,76 @@ fn is_transient_accept_error(e: &std::io::Error) -> bool {
     ) || e.raw_os_error() == Some(24) // EMFILE: back off instead of dying
 }
 
-/// Copies until EOF, an error or `idle` without traffic, then shuts the
-/// writer down so the other side sees the end. Returns bytes copied.
-async fn pump<R, W>(reader: &mut R, writer: &mut W, buf: &mut [u8], idle: Duration) -> u64
+/// When either direction of a spliced connection last moved data, shared
+/// by its two pumps.
+struct Activity {
+    start: Instant,
+    /// Milliseconds after `start`.
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let now = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// How long since either direction moved data.
+    fn idle_for(&self) -> Duration {
+        self.start
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.last_ms.load(Ordering::Relaxed)))
+    }
+}
+
+/// Copies until EOF, an error or `idle` without traffic in either
+/// direction of the connection (`activity`, shared with the other pump),
+/// then shuts the writer down so the other side sees the end. Returns
+/// bytes copied.
+async fn pump<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut [u8],
+    idle: Duration,
+    activity: &Activity,
+) -> u64
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut total = 0u64;
     loop {
-        let read = tokio::time::timeout(idle, reader.read(buf)).await;
+        let since = activity.idle_for();
+        if since >= idle {
+            break;
+        }
+        // Waits only for what is left of the idle window: on timeout the
+        // shared clock is read again, since the other direction may have
+        // moved meanwhile. A read is cancel-safe, so nothing is lost.
+        let read = tokio::time::timeout(idle - since, reader.read(buf)).await;
         let n = match read {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Err(_) => continue,
             Ok(Ok(n)) => n,
         };
-        if writer.write_all(&buf[..n]).await.is_err() {
-            break;
+        activity.touch();
+        // A side that stops reading would hold the write, and with it the
+        // connection's slot and buffers, for ever: it has the same idle
+        // deadline as a side that stops sending.
+        match tokio::time::timeout(idle, writer.write_all(&buf[..n])).await {
+            Ok(Ok(())) => activity.touch(),
+            Ok(Err(_)) | Err(_) => break,
         }
         total += n as u64;
     }
-    let _ = writer.shutdown().await;
+    let _ = tokio::time::timeout(idle, writer.shutdown()).await;
     total
 }
 
@@ -1021,7 +1521,8 @@ enum RequestKind {
     Relay {
         target: String,
     },
-    Refused,
+    /// Refused before it reaches a destination, for this reason.
+    Refused(EgressReason),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1030,11 +1531,81 @@ struct ParsedRequest {
     kind: RequestKind,
     /// Headers to pass on, without hop-by-hop and proxy headers.
     headers: Vec<(String, Vec<u8>)>,
+    /// Set when the sender already refused this request
+    /// ([`REFUSED_BY_SENDER`]): it is recorded as refused, for that reason,
+    /// and never opened.
+    refused_by_sender: Option<EgressReason>,
+    /// The address the sender's own policy admitted
+    /// ([`ADMITTED_ADDRESS`]), connected to instead of resolving the name.
+    admitted_address: Option<IpAddr>,
 }
 
+/// Whether [`ADMITTED_ADDRESS`] is honoured for `workload`: only for a
+/// sandbox, whose requests all come through its sidecar, which overwrites
+/// the header with the address it admitted.
+pub fn pins_admitted_address(workload: WorkloadRef) -> bool {
+    workload.kind == WorkloadKind::Sandbox
+}
+
+/// The header a workload's own egress proxy (a sandbox's sidecar) sends
+/// with a request it admitted: the address it admitted the destination at.
+/// The recorder checks that address against its own rules and connects
+/// there, so the two never disagree on where the request goes (split DNS,
+/// or an answer that changed between the two lookups). A sender can only
+/// choose among the addresses the recorder's rules admit anyway, it is
+/// honoured only from a sandbox ([`pins_admitted_address`]), and it is
+/// never passed on.
+pub const ADMITTED_ADDRESS: &str = "x-temps-egress-address";
+
+/// The header a workload's own egress proxy (a sandbox's sidecar) sends
+/// with a request it refused under its own policy, so the refusal is
+/// recorded like one made here: `no_allow_rule`, `private_address` or
+/// `did_not_resolve`. It can only ever refuse the sender's own request,
+/// so it needs no trust; it is never passed on.
+pub const REFUSED_BY_SENDER: &str = "x-temps-egress-refused";
+
+/// The reason a [`REFUSED_BY_SENDER`] header names; anything else is a
+/// refusal by the sender's policy.
+fn sender_refusal(value: &[u8]) -> EgressReason {
+    match value {
+        b"private_address" => EgressReason::PrivateAddress,
+        b"did_not_resolve" => EgressReason::DidNotResolve,
+        _ => EgressReason::NoAllowRule,
+    }
+}
+
+/// The most header fields a request head may carry: what the Node sidecar a
+/// sandbox's direct traffic goes through takes (its default
+/// `maxHeadersCount` of 2000), plus the one it adds when handing a request
+/// to the recorder, with room to spare. Turning recording on never refuses
+/// a request for its number of headers.
+pub const MAX_HEADERS: usize = 2048;
+
+/// Header slots parsed on the stack: an ordinary request fits, so only a
+/// request with more fields pays for a heap array.
+const STACK_HEADERS: usize = 64;
+
 fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut request = httparse::Request::new(&mut headers);
+    // Each field is one line; the request line and the blank line end are
+    // two more.
+    let lines = head.windows(2).filter(|pair| *pair == b"\r\n").count();
+    if lines <= STACK_HEADERS + 2 {
+        let mut headers = [httparse::EMPTY_HEADER; STACK_HEADERS];
+        parse_request_in(head, &mut headers)
+    } else {
+        // One slot per field line, never more than MAX_HEADERS: a request
+        // with more fields fails to parse.
+        let fields = lines.saturating_sub(2).min(MAX_HEADERS);
+        let mut headers = vec![httparse::EMPTY_HEADER; fields];
+        parse_request_in(head, &mut headers)
+    }
+}
+
+fn parse_request_in<'h>(
+    head: &'h [u8],
+    headers: &mut [httparse::Header<'h>],
+) -> Option<ParsedRequest> {
+    let mut request = httparse::Request::new(headers);
     match request.parse(head) {
         Ok(httparse::Status::Complete(_)) => {}
         _ => return None,
@@ -1045,28 +1616,45 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
         let (host, port) = split_authority(target, 443)?;
         RequestKind::Connect { host, port }
     } else if let Some(rest) = target.strip_prefix("http://") {
-        let (authority, path) = match rest.find('/') {
+        // The authority ends at the first `/`, `?` or `#` (RFC 3986 3.2), so
+        // a query on a host-only URL (`http://host?token=…`) is never read
+        // as part of the host, where it would be recorded as the
+        // destination. The fragment is never sent.
+        let (authority, rest) = match rest.find(['/', '?', '#']) {
             Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
+            None => (rest, ""),
+        };
+        let rest = rest.split('#').next().unwrap_or_default();
+        let path = if rest.starts_with('/') {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
         };
         if authority.contains('@') {
-            RequestKind::Refused
+            RequestKind::Refused(EgressReason::CredentialsInUrl)
         } else {
             let (host, port) = split_authority(authority, 80)?;
-            RequestKind::Forward {
-                host,
-                port,
-                path: path.to_string(),
-            }
+            RequestKind::Forward { host, port, path }
         }
     } else if target.starts_with("/.temps/") {
         match relay_target(&method, target) {
             Some(target) => RequestKind::Relay { target },
-            None => RequestKind::Refused,
+            None => RequestKind::Refused(EgressReason::RelayNotAllowed),
         }
     } else {
-        RequestKind::Refused
+        RequestKind::Refused(EgressReason::NotAProxyRequest)
     };
+    let refused_by_sender = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(REFUSED_BY_SENDER))
+        .map(|h| sender_refusal(h.value));
+    let admitted_address = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case(ADMITTED_ADDRESS))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
     let headers = request
         .headers
         .iter()
@@ -1075,7 +1663,8 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
             !matches!(
                 name.as_str(),
                 "proxy-authorization" | "proxy-connection" | "connection" | "keep-alive" | "host"
-            )
+            ) && name != REFUSED_BY_SENDER
+                && name != ADMITTED_ADDRESS
         })
         .map(|h| (h.name.to_string(), h.value.to_vec()))
         .collect();
@@ -1083,6 +1672,8 @@ fn parse_request(head: &[u8]) -> Option<ParsedRequest> {
         method,
         kind,
         headers,
+        refused_by_sender,
+        admitted_address,
     })
 }
 
@@ -1102,10 +1693,22 @@ fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> 
             None => (authority, default_port),
         }
     };
-    if host.is_empty() || port == 0 {
+    // A hostname or an address literal, nothing else: anything that would
+    // make a credential or a query part of the host is not a destination.
+    if host.is_empty()
+        || port == 0
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+    {
         return None;
     }
-    Some((host.trim_end_matches('.').to_ascii_lowercase(), port))
+    // A trailing dot names the same host; a name of dots alone names none.
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_ascii_lowercase(), port))
 }
 
 fn is_token(segment: &str) -> bool {
@@ -1165,6 +1768,21 @@ pub fn relay_target(method: &str, target: &str) -> Option<String> {
 
 /// Writes `METHOD path HTTP/1.1`, the kept headers, `Host` and
 /// `Connection: close` into `out`. `None` when it does not fit.
+/// The `Host` value for `host`:`port` (RFC 9110 §7.2): the port only when
+/// it is not 80, and an IPv6 literal in brackets, as the request named it
+/// before parsing took the brackets off.
+fn host_authority(host: &str, port: u16) -> String {
+    let host = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => format!("[{v6}]"),
+        _ => host.to_string(),
+    };
+    if port == 80 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 fn rewrite_head(request: &ParsedRequest, path: &str, host: &str, out: &mut [u8]) -> Option<usize> {
     let mut len = 0;
     let mut push = |bytes: &[u8]| -> Option<()> {
@@ -1204,543 +1822,4 @@ const UNAVAILABLE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use temps_workload::WorkloadKind;
-
-    fn sandbox(id: i64) -> WorkloadRef {
-        WorkloadRef::new(WorkloadKind::Sandbox, id)
-    }
-
-    fn host_rule(id: i64, pattern: &str, action: Action) -> EgressRule {
-        EgressRule {
-            id,
-            target: EgressTarget::Host(HostPattern::parse(pattern).unwrap()),
-            ports: None,
-            action,
-        }
-    }
-
-    fn cidr_rule(id: i64, cidr: &str, port: Option<u16>, action: Action) -> EgressRule {
-        EgressRule {
-            id,
-            target: EgressTarget::Cidr(cidr.parse().unwrap()),
-            ports: port.map(PortRange::single),
-            action,
-        }
-    }
-
-    #[test]
-    fn host_patterns_match_exact_names_subdomains_and_everything() {
-        let exact = HostPattern::parse("API.Example.com.").unwrap();
-        assert!(exact.matches("api.example.com"));
-        assert!(!exact.matches("x.api.example.com"));
-        let sub = HostPattern::parse("*.example.com").unwrap();
-        assert!(sub.matches("a.example.com"));
-        assert!(sub.matches("a.b.example.com"));
-        assert!(!sub.matches("example.com"), "not the apex");
-        assert!(!sub.matches("badexample.com"));
-        assert!(HostPattern::parse("*").unwrap().matches("anything.test"));
-        for bad in ["", "*.", "a..b", "exa mple.com", "*.*.com", "-a.com", "a/b"] {
-            assert!(HostPattern::parse(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn deny_beats_allow_and_ports_default_to_web() {
-        let rules = CompiledRules::new(&EgressPolicy {
-            subject: sandbox(1),
-            rules: vec![
-                host_rule(1, "*", Action::Allow),
-                host_rule(2, "*.blocked.test", Action::Deny),
-            ],
-        });
-        assert_eq!(
-            rules.check_host("registry.npmjs.org", 443),
-            Ok(Admission::ByRule)
-        );
-        assert_eq!(
-            rules.check_host("registry.npmjs.org", 80),
-            Ok(Admission::ByRule)
-        );
-        assert_eq!(
-            rules.check_host("registry.npmjs.org", 22),
-            Err(Refusal::Port)
-        );
-        assert_eq!(
-            rules.check_host("x.blocked.test", 443),
-            Err(Refusal::Denied)
-        );
-    }
-
-    #[test]
-    fn a_restricted_workload_without_rules_reaches_nothing() {
-        let rules = CompiledRules::new(&EgressPolicy {
-            subject: sandbox(1),
-            rules: vec![],
-        });
-        assert_eq!(
-            rules.check_host("example.com", 443),
-            Err(Refusal::NotAllowed)
-        );
-        assert_eq!(
-            rules.check_host("192.0.2.10", 443),
-            Err(Refusal::NotAllowed)
-        );
-    }
-
-    #[test]
-    fn private_answers_are_refused_unless_a_cidr_allows_them() {
-        let rules = CompiledRules::new(&EgressPolicy {
-            subject: sandbox(1),
-            rules: vec![
-                host_rule(1, "*", Action::Allow),
-                cidr_rule(2, "10.237.9.0/24", Some(8080), Action::Allow),
-            ],
-        });
-        let public: IpAddr = "93.184.216.34".parse().unwrap();
-        let private: IpAddr = "10.0.0.5".parse().unwrap();
-        assert_eq!(
-            rules.check_addresses(&[public], 443, Admission::ByRule),
-            Ok(())
-        );
-        assert_eq!(
-            rules.check_addresses(&[public, private], 443, Admission::ByRule),
-            Err(Refusal::Private),
-            "one private answer refuses the whole name (DNS rebinding)"
-        );
-        assert_eq!(
-            rules.check_addresses(&[], 443, Admission::ByRule),
-            Err(Refusal::Unresolved)
-        );
-        let allowed: IpAddr = "10.237.9.4".parse().unwrap();
-        assert_eq!(rules.check_host("10.237.9.4", 8080), Ok(Admission::ByRule));
-        assert_eq!(
-            rules.check_addresses(&[allowed], 8080, Admission::ByRule),
-            Ok(())
-        );
-        assert_eq!(
-            rules.check_addresses(&[allowed], 9090, Admission::ByRule),
-            Err(Refusal::Private),
-            "the CIDR allow names one port"
-        );
-    }
-
-    #[test]
-    fn an_unrelated_cidr_allow_does_not_open_public_literals() {
-        let rules = CompiledRules::new(&EgressPolicy {
-            subject: sandbox(1),
-            rules: vec![cidr_rule(1, "10.20.0.0/16", Some(443), Action::Allow)],
-        });
-        assert_eq!(
-            rules.check_host("93.184.216.34", 22),
-            Err(Refusal::NotAllowed),
-            "a literal outside every allowed CIDR is refused, whatever the port"
-        );
-        assert_eq!(
-            rules.check_host("93.184.216.34", 443),
-            Err(Refusal::NotAllowed)
-        );
-        assert_eq!(
-            rules.check_host("10.20.3.4", 22),
-            Err(Refusal::Port),
-            "the CIDR allow names one port"
-        );
-        assert_eq!(rules.check_host("10.20.3.4", 443), Ok(Admission::ByRule));
-
-        // A hostname with no host rule is decided by its addresses, and only
-        // an allowed CIDR admits them: a public answer is not enough.
-        assert_eq!(
-            rules.check_host("internal.example", 443),
-            Ok(Admission::ByAddress)
-        );
-        let public: IpAddr = "93.184.216.34".parse().unwrap();
-        let inside: IpAddr = "10.20.3.4".parse().unwrap();
-        assert_eq!(
-            rules.check_addresses(&[public], 443, Admission::ByAddress),
-            Err(Refusal::NotAllowed)
-        );
-        assert_eq!(
-            rules.check_addresses(&[inside], 443, Admission::ByAddress),
-            Ok(())
-        );
-        assert_eq!(
-            rules.check_addresses(&[inside], 22, Admission::ByAddress),
-            Err(Refusal::NotAllowed)
-        );
-        assert_eq!(
-            rules.check_addresses(&[inside, public], 443, Admission::ByAddress),
-            Err(Refusal::NotAllowed),
-            "one answer outside the allowed CIDRs refuses the whole name"
-        );
-    }
-
-    #[test]
-    fn a_cidr_deny_refuses_public_addresses_too() {
-        let rules = CompiledRules::new(&EgressPolicy {
-            subject: sandbox(1),
-            rules: vec![
-                host_rule(1, "*", Action::Allow),
-                cidr_rule(2, "93.184.216.0/24", None, Action::Deny),
-            ],
-        });
-        assert_eq!(
-            rules.check_addresses(&["93.184.216.34".parse().unwrap()], 443, Admission::ByRule),
-            Err(Refusal::Denied)
-        );
-    }
-
-    #[test]
-    fn the_public_check_matches_the_sidecar() {
-        for private in [
-            "0.1.2.3",
-            "10.1.1.1",
-            "127.0.0.1",
-            "100.64.0.1",
-            "169.254.169.254",
-            "172.16.0.1",
-            "172.31.255.255",
-            "192.0.0.1",
-            "192.0.2.1",
-            "192.88.99.1",
-            "192.168.1.1",
-            "198.18.0.1",
-            "198.51.100.1",
-            "203.0.113.1",
-            "224.0.0.1",
-            "255.255.255.255",
-            "::1",
-            "fe80::1",
-            "fd00::1",
-            "2001:db8::1",
-            "2001:2::1",
-            "::ffff:10.0.0.1",
-        ] {
-            assert!(!is_public(private.parse().unwrap()), "{private}");
-        }
-        for public in [
-            "1.1.1.1",
-            "172.32.0.1",
-            "100.128.0.1",
-            "2606:4700::1111",
-            "::ffff:1.1.1.1",
-        ] {
-            assert!(is_public(public.parse().unwrap()), "{public}");
-        }
-    }
-
-    #[test]
-    fn requests_parse_into_tunnels_forwards_and_relays() {
-        let connect =
-            parse_request(b"CONNECT Example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
-                .unwrap();
-        assert_eq!(
-            connect.kind,
-            RequestKind::Connect {
-                host: "example.com".into(),
-                port: 443
-            }
-        );
-        let forward = parse_request(
-            b"GET http://example.com/a?b=1 HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: x\r\nAccept: */*\r\n\r\n",
-        )
-        .unwrap();
-        assert_eq!(
-            forward.kind,
-            RequestKind::Forward {
-                host: "example.com".into(),
-                port: 80,
-                path: "/a?b=1".into()
-            }
-        );
-        assert_eq!(
-            forward.headers,
-            vec![("Accept".to_string(), b"*/*".to_vec())]
-        );
-        let v6 = parse_request(b"CONNECT [2606:4700::1111]:443 HTTP/1.1\r\n\r\n").unwrap();
-        assert_eq!(
-            v6.kind,
-            RequestKind::Connect {
-                host: "2606:4700::1111".into(),
-                port: 443
-            }
-        );
-        assert_eq!(
-            parse_request(b"GET http://user:pw@example.com/ HTTP/1.1\r\n\r\n")
-                .unwrap()
-                .kind,
-            RequestKind::Refused
-        );
-        assert_eq!(
-            parse_request(b"GET /etc/passwd HTTP/1.1\r\n\r\n")
-                .unwrap()
-                .kind,
-            RequestKind::Refused
-        );
-        assert!(parse_request(b"not http\r\n\r\n").is_none());
-    }
-
-    #[test]
-    fn relay_paths_match_the_sidecar() {
-        let token = "0123456789abcdef0123456789abcdef";
-        assert_eq!(
-            relay_target(
-                "POST",
-                &format!("/.temps/model-relay/{token}/v1/messages?beta=true")
-            ),
-            Some(format!(
-                "/api/ai/sandbox-models/{token}/v1/messages?beta=true"
-            ))
-        );
-        assert_eq!(
-            relay_target("POST", &format!("/.temps/model-relay/{token}/responses")),
-            Some(format!("/api/ai/sandbox-models/{token}/responses"))
-        );
-        assert_eq!(
-            relay_target(
-                "GET",
-                &format!("/.temps/model-relay/{token}/models?client_version=1.2.3")
-            ),
-            Some(format!(
-                "/api/ai/sandbox-models/{token}/models?client_version=1.2.3"
-            ))
-        );
-        assert_eq!(
-            relay_target("POST", &format!("/.temps/mcp/{token}")),
-            Some(format!("/api/ai/sandbox-tools/{token}/mcp"))
-        );
-        for refused in [
-            format!("/.temps/model-relay/{token}/responses?x=1"),
-            "/.temps/model-relay/short/responses".to_string(),
-            format!("/.temps/git/{token}/1/info/refs?service=git-upload-pack"),
-            format!("/.temps/mcp/{token}?x"),
-        ] {
-            assert_eq!(relay_target("POST", &refused), None, "{refused}");
-        }
-        assert_eq!(
-            relay_target("POST", &format!("/.temps/model-relay/{token}/models")),
-            None,
-            "the model list is GET only"
-        );
-        assert_eq!(
-            relay_target(
-                "GET",
-                &format!("/.temps/model-relay/{token}/models?client_version=a b")
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn relay_upstreams_are_plain_http_origins() {
-        assert_eq!(
-            RelayUpstream::parse("http://127.0.0.1:3000/").unwrap(),
-            RelayUpstream {
-                authority: "127.0.0.1:3000".into(),
-                base_path: String::new()
-            }
-        );
-        assert_eq!(
-            RelayUpstream::parse("http://console.internal/base").unwrap(),
-            RelayUpstream {
-                authority: "console.internal:80".into(),
-                base_path: "/base".into()
-            }
-        );
-        assert!(RelayUpstream::parse("https://cp.example.test").is_err());
-        assert!(RelayUpstream::parse("http://u:p@cp.example.test").is_err());
-    }
-
-    #[test]
-    fn the_pool_never_allocates_past_its_capacity() {
-        let pool = BufferPool::new(2, 16);
-        let a = pool.get().unwrap();
-        let b = pool.get().unwrap();
-        assert!(pool.get().is_none());
-        drop(a);
-        let c = pool.get().unwrap();
-        assert_eq!(c.len(), 16);
-        assert_eq!(pool.allocated(), 2);
-        drop((b, c));
-        assert_eq!(pool.allocated(), 2);
-    }
-
-    #[test]
-    fn heads_are_rewritten_to_origin_form_and_closed() {
-        let request = parse_request(b"POST http://example.com/x HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\n").unwrap();
-        let mut out = [0u8; 256];
-        let len = rewrite_head(&request, "/x", "example.com", &mut out).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out[..len]).unwrap(),
-            "POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
-        );
-        let mut tiny = [0u8; 8];
-        assert!(rewrite_head(&request, "/x", "example.com", &mut tiny).is_none());
-    }
-
-    #[test]
-    fn limits_are_validated() {
-        let mut config = EgressProxyConfig::new("127.0.0.1:0".parse().unwrap());
-        assert!(config.validate().is_ok());
-        config.max_connections = 0;
-        assert!(config.validate().is_err());
-        config.max_connections = 4;
-        config.buffer_size = 100;
-        assert!(config.validate().is_err());
-    }
-
-    async fn echo_server() -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 1024];
-                    while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-        addr
-    }
-
-    async fn start(
-        rules: Vec<EgressRule>,
-        max_connections: usize,
-    ) -> (Arc<EgressProxy>, SocketAddr) {
-        let identities = IdentityMap::new().with(sandbox(1), "127.0.0.1".parse().unwrap());
-        let table = EgressTable::build(
-            &[EgressPolicy {
-                subject: sandbox(1),
-                rules,
-            }],
-            &identities,
-        );
-        let mut config = EgressProxyConfig::new("127.0.0.1:0".parse().unwrap());
-        config.max_connections = max_connections;
-        config.head_timeout = Duration::from_secs(5);
-        let proxy = EgressProxy::new(config, Arc::new(ArcSwap::from_pointee(table))).unwrap();
-        let listener = proxy.bind().await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(proxy.clone().serve(listener));
-        (proxy, addr)
-    }
-
-    async fn status_line(stream: &mut TcpStream) -> String {
-        let mut buf = vec![0u8; 512];
-        let mut filled = 0;
-        loop {
-            let n = stream.read(&mut buf[filled..]).await.unwrap_or(0);
-            filled += n;
-            if n == 0 || find_head_end(&buf[..filled]).is_some() {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&buf[..filled])
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    #[tokio::test]
-    async fn a_cidr_allowed_tunnel_carries_bytes_both_ways() {
-        let echo = echo_server().await;
-        let (proxy, addr) = start(
-            vec![cidr_rule(
-                1,
-                "127.0.0.1/32",
-                Some(echo.port()),
-                Action::Allow,
-            )],
-            4,
-        )
-        .await;
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
-            .await
-            .unwrap();
-        assert_eq!(
-            status_line(&mut client).await,
-            "HTTP/1.1 200 Connection Established"
-        );
-        client.write_all(b"ping").await.unwrap();
-        let mut got = [0u8; 4];
-        client.read_exact(&mut got).await.unwrap();
-        assert_eq!(&got, b"ping");
-        assert_eq!(proxy.stats().snapshot().tunnels, 1);
-    }
-
-    #[tokio::test]
-    async fn names_resolving_to_private_addresses_are_refused() {
-        let echo = echo_server().await;
-        let (proxy, addr) = start(
-            vec![EgressRule {
-                id: 1,
-                target: EgressTarget::Host(HostPattern::parse("*").unwrap()),
-                ports: Some(PortRange::single(echo.port())),
-                action: Action::Allow,
-            }],
-            4,
-        )
-        .await;
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(format!("CONNECT localhost:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
-            .await
-            .unwrap();
-        assert_eq!(status_line(&mut client).await, "HTTP/1.1 403 Forbidden");
-        assert_eq!(proxy.stats().snapshot().refused_private, 1);
-    }
-
-    #[tokio::test]
-    async fn an_unknown_source_is_refused() {
-        let echo = echo_server().await;
-        let mut config = EgressProxyConfig::new("127.0.0.1:0".parse().unwrap());
-        config.max_connections = 2;
-        let proxy = EgressProxy::new(
-            config,
-            Arc::new(ArcSwap::from_pointee(EgressTable::default())),
-        )
-        .unwrap();
-        let listener = proxy.bind().await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(proxy.clone().serve(listener));
-        let mut client = TcpStream::connect(addr).await.unwrap();
-        client
-            .write_all(format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", echo.port()).as_bytes())
-            .await
-            .unwrap();
-        assert_eq!(status_line(&mut client).await, "HTTP/1.1 403 Forbidden");
-        assert_eq!(proxy.stats().snapshot().refused_unknown_source, 1);
-    }
-
-    #[tokio::test]
-    async fn at_the_connection_limit_new_connections_get_503_and_are_counted() {
-        let (proxy, addr) = start(vec![], 1).await;
-        // Holds the only permit: connected, head not sent yet.
-        let _held = TcpStream::connect(addr).await.unwrap();
-        for _ in 0..50 {
-            if proxy.stats().snapshot().active == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let mut refused = TcpStream::connect(addr).await.unwrap();
-        assert_eq!(
-            status_line(&mut refused).await,
-            "HTTP/1.1 503 Service Unavailable"
-        );
-        let stats = proxy.stats().snapshot();
-        assert_eq!(stats.refused_saturated, 1);
-        assert_eq!(stats.active, 1);
-        assert!(
-            proxy.buffers_allocated() <= 2,
-            "buffers stay within the pool"
-        );
-    }
-}
+mod tests;

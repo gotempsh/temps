@@ -26,6 +26,9 @@ import { EnvironmentIngressCard } from './EnvironmentIngressCard'
 import { EnvironmentVolumesCard } from './EnvironmentVolumesCard'
 import { PurgeAssetCacheCard } from './PurgeAssetCacheCard'
 import { InternalAccessCard } from '../InternalAccessCard'
+import { environmentEgress } from '@/components/workloads/egress-recording'
+import { OutboundActivityCard } from '@/components/workloads/OutboundActivityCard'
+import { OutboundRecordingCard } from '@/components/workloads/OutboundRecordingCard'
 import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
@@ -299,6 +302,15 @@ export function EnvironmentDetail({
         key={`ingress:${environment.id}`}
         projectId={project.id}
         environmentId={environment.id}
+      />
+
+      <OutboundRecordingCard
+        key={`egress-recording:${environment.id}`}
+        workload={environmentEgress(project.id, environment.id)}
+      />
+      <OutboundActivityCard
+        key={`egress-activity:${environment.id}`}
+        workload={environmentEgress(project.id, environment.id)}
       />
 
       <EnvironmentVolumesCard

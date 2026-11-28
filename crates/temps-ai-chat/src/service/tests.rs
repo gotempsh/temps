@@ -4892,6 +4892,7 @@ async fn every_chat_sharing_a_sandbox_lists_it() {
         preview_access: Default::default(),
         preview_allowed_cidrs: Vec::new(),
         egress_policy: Default::default(),
+        egress_recording: false,
     };
     let db = Arc::new(
         MockDatabase::new(DatabaseBackend::Postgres)

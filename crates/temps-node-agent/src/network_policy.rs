@@ -8,10 +8,12 @@
 //! `/api/internal/nodes/{id}/network-policy` with the node token and gets
 //! the node's mode and snapshot back. The report tells the control plane
 //! which datapath this node enforces with, which is what allows an
-//! operator to move the node out of `legacy`, and which workloads it
-//! observed on its previous pass, which is how every other node learns
-//! their addresses. In `legacy` nothing else happens: no Docker call, no
-//! program loaded.
+//! operator to move the node out of `off`, and which workloads it
+//! observed on its previous pass (in every mode), which is how every other
+//! node learns their addresses. In `off` the pass only observes the
+//! local workloads and publishes the egress-proxy table: no rule applied,
+//! no program loaded. The digest of the snapshot it holds rides along, so
+//! a pass in which nothing changed brings back no snapshot.
 //!
 //! A failed fetch fails the pass, and the kernel keeps what the last pass
 //! applied: a control plane outage never opens or closes anything.
@@ -25,8 +27,9 @@ use async_trait::async_trait;
 use bollard::Docker;
 use temps_workload_netpol::{
     available_datapath, choose_executor, choose_port_resolver, spawn_container_wake,
-    DatapathConfig, DockerInstanceSource, EgressTable, EnforcerError, IdentityMap, NodeEnforcer,
-    NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PolicySnapshot, PolicySource, TableName,
+    DatapathConfig, DockerInstanceSource, EgressRecordingCapability, EgressTable, EnforcerError,
+    IdentityMap, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PolicySnapshot,
+    PolicySource, TableName, POLICY_PROTOCOL,
 };
 use tracing::{info, warn};
 
@@ -58,6 +61,20 @@ pub struct AgentPolicySource {
     token: String,
     backend: &'static str,
     last: Mutex<Option<PolicySnapshot>>,
+    /// The control plane's digest of `last`, sent back so an unchanged
+    /// pass costs no snapshot.
+    last_digest: Mutex<Option<String>>,
+    /// The mode of the last answer, so an answer that changes neither the
+    /// snapshot nor the mode is taken without copying or re-encoding the
+    /// held snapshot.
+    last_mode: Mutex<Option<NodeMode>>,
+    /// Whether a policy in `last` records, worked out once when `last`
+    /// changes, so an idle `off` pass checks a flag, not every policy.
+    last_records: std::sync::atomic::AtomicBool,
+    /// Whether the cache holds the policy last taken: false after a write
+    /// failed, so the next answer is cached again (whether or not it
+    /// changed) until a write works.
+    cache_current: std::sync::atomic::AtomicBool,
     observed: Mutex<IdentityMap>,
     /// Where the last policy received is kept, so an agent that boots while
     /// the control plane is unreachable enforces it instead of nothing.
@@ -65,6 +82,24 @@ pub struct AgentPolicySource {
     /// The last policy written to `cache`, to skip identical writes.
     cached: Mutex<Option<String>>,
     guard: Option<BootGuard>,
+    /// What this node says about recording outbound connections, on every
+    /// report. See [`egress_recording_capability`].
+    egress_recording: EgressRecordingCapability,
+}
+
+/// Whether this agent can record the outbound connections of sandboxes that
+/// opt in. Records are taken by the per-node egress proxy, which this agent
+/// does not serve yet: sandboxes still egress through their own sidecar
+/// (ADR-055 phase 7 moves them onto the per-node proxy). So a Linux agent
+/// reports [`RecordingUnavailable::ProxyNotServing`] and any other platform
+/// [`RecordingUnavailable::UnsupportedPlatform`], and the control plane
+/// refuses to turn recording on for its sandboxes, saying why. When the
+/// agent serves the proxy with a recorder, this becomes `detect(true)`.
+///
+/// [`RecordingUnavailable::ProxyNotServing`]: temps_workload_netpol::RecordingUnavailable::ProxyNotServing
+/// [`RecordingUnavailable::UnsupportedPlatform`]: temps_workload_netpol::RecordingUnavailable::UnsupportedPlatform
+pub fn egress_recording_capability() -> EgressRecordingCapability {
+    EgressRecordingCapability::detect(false)
 }
 
 impl AgentPolicySource {
@@ -82,10 +117,15 @@ impl AgentPolicySource {
             token,
             backend,
             last: Mutex::new(None),
+            last_digest: Mutex::new(None),
+            last_mode: Mutex::new(None),
+            last_records: std::sync::atomic::AtomicBool::new(false),
+            cache_current: std::sync::atomic::AtomicBool::new(true),
             observed: Mutex::new(IdentityMap::new()),
             cache: None,
             cached: Mutex::new(None),
             guard: None,
+            egress_recording: egress_recording_capability(),
         }
     }
 
@@ -102,27 +142,40 @@ impl AgentPolicySource {
     }
 
     fn store_cache(&self, policy: &NodePolicy) {
-        let Some(path) = &self.cache else { return };
+        let current = self.write_cache(policy);
+        self.cache_current
+            .store(current, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Writes `policy` to the cache; whether the cache holds it now.
+    fn write_cache(&self, policy: &NodePolicy) -> bool {
+        let Some(path) = &self.cache else { return true };
         let encoded = match serde_json::to_string(policy) {
             Ok(encoded) => encoded,
             Err(error) => {
                 warn!(node = %self.node, %error, "could not encode the network policy for its cache");
-                return;
+                return false;
             }
         };
         let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
         if cached.as_deref() == Some(encoded.as_str()) {
-            return;
+            return true;
         }
         match write_private(path, &encoded) {
-            Ok(()) => *cached = Some(encoded),
-            Err(error) => warn!(
-                node = %self.node,
-                path = %path.display(),
-                %error,
-                "could not cache the network policy; a reboot during a control plane outage \
-                 would leave this node without it"
-            ),
+            Ok(()) => {
+                *cached = Some(encoded);
+                true
+            }
+            Err(error) => {
+                warn!(
+                    node = %self.node,
+                    path = %path.display(),
+                    %error,
+                    "could not cache the network policy; a reboot during a control plane outage \
+                     would leave this node without it. Retried on the next answer"
+                );
+                false
+            }
         }
     }
 
@@ -167,6 +220,11 @@ pub fn policy_url(control_plane_url: &str, node_id: i32) -> String {
 #[async_trait]
 impl PolicySource for AgentPolicySource {
     async fn mode(&self) -> Result<NodeMode, EnforcerError> {
+        let held_snapshot = {
+            let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+            let digest = self.last_digest.lock().unwrap_or_else(|e| e.into_inner());
+            last.as_ref().and(digest.clone())
+        };
         let report = NodePolicyReport {
             backend: self.backend.to_string(),
             identities: self
@@ -174,9 +232,19 @@ impl PolicySource for AgentPolicySource {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            egress_recording: Some(self.egress_recording.clone()),
+            protocol: POLICY_PROTOCOL,
+            held_snapshot,
         };
         let policy = match self.fetch(&report).await {
+            Ok(policy) if self.nothing_changed(&policy) => {
+                // The held snapshot, its digest, the mode and the cache are
+                // all current (a failed cache write is not: see
+                // `nothing_changed`): an idle node's pass copies nothing.
+                return Ok(policy.mode);
+            }
             Ok(policy) => {
+                let policy = self.resolve_unchanged(policy);
                 self.store_cache(&policy);
                 policy
             }
@@ -194,20 +262,39 @@ impl PolicySource for AgentPolicySource {
                 None => return Err(error),
             },
         };
-        if policy.mode == NodeMode::Legacy {
-            // Nothing is observed in `legacy`; stop reporting what was.
-            *self.observed.lock().unwrap_or_else(|e| e.into_inner()) = IdentityMap::new();
-        }
+        // Observations are reported in every mode: knowing its workloads
+        // does not depend on whether the node filters.
+        *self.last_digest.lock().unwrap_or_else(|e| e.into_inner()) = policy.snapshot_digest;
+        *self.last_mode.lock().unwrap_or_else(|e| e.into_inner()) = Some(policy.mode);
+        let records = policy
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.egress.iter().any(|policy| policy.record));
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         *last = policy.snapshot;
+        self.last_records
+            .store(records, std::sync::atomic::Ordering::Relaxed);
         Ok(policy.mode)
+    }
+
+    async fn off_recording_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        // A flag worked out when the snapshot changed: an idle `off` pass
+        // neither scans nor copies the snapshot.
+        if !self.last_records.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(self.last.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    async fn off_snapshot(&self) -> Result<Option<PolicySnapshot>, EnforcerError> {
+        Ok(self.last.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
         let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         last.clone().ok_or_else(|| {
             self.source_error(
-                "the control plane sent a mode outside legacy without a snapshot".to_string(),
+                "the control plane sent a mode outside off without a snapshot".to_string(),
             )
         })
     }
@@ -224,6 +311,36 @@ impl PolicySource for AgentPolicySource {
 }
 
 impl AgentPolicySource {
+    /// Whether `policy` says the held snapshot is current and the mode is
+    /// the one last taken: then nothing held needs to change.
+    fn nothing_changed(&self, policy: &NodePolicy) -> bool {
+        policy.unchanged
+            && self
+                .cache_current
+                .load(std::sync::atomic::Ordering::Relaxed)
+            && self
+                .last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            && *self.last_mode.lock().unwrap_or_else(|e| e.into_inner()) == Some(policy.mode)
+    }
+
+    /// An `unchanged` answer means "keep the snapshot you hold": it becomes
+    /// that snapshot, so the cache and the pass see a complete policy.
+    fn resolve_unchanged(&self, mut policy: NodePolicy) -> NodePolicy {
+        if policy.unchanged {
+            policy.snapshot = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if policy.snapshot.is_none() {
+                // Cannot happen (the digest is only sent while a snapshot
+                // is held); the next pass asks again with no digest.
+                policy.snapshot_digest = None;
+            }
+            policy.unchanged = false;
+        }
+        policy
+    }
+
     async fn fetch(&self, report: &NodePolicyReport) -> Result<NodePolicy, EnforcerError> {
         let response = self
             .http
@@ -348,5 +465,275 @@ mod tests {
             policy_url("https://cp.example:8081", 4),
             "https://cp.example:8081/api/internal/nodes/4/network-policy"
         );
+    }
+
+    #[test]
+    fn this_agent_reports_that_it_cannot_record_yet_and_why() {
+        let capability = egress_recording_capability();
+        assert!(!capability.is_available());
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            capability,
+            EgressRecordingCapability::Unavailable {
+                reason: temps_workload_netpol::RecordingUnavailable::ProxyNotServing
+            }
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(matches!(
+            capability,
+            EgressRecordingCapability::Unavailable {
+                reason: temps_workload_netpol::RecordingUnavailable::UnsupportedPlatform { .. }
+            }
+        ));
+    }
+
+    /// A scripted control plane: answers each POST with the next of
+    /// `answers` and returns the request bodies it received.
+    async fn scripted_control_plane(
+        answers: Vec<String>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for answer in answers {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                let body = loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break body.to_string();
+                        }
+                    }
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                            answer.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                bodies.push(body);
+            }
+            bodies
+        });
+        (addr, server)
+    }
+
+    fn source(addr: std::net::SocketAddr) -> AgentPolicySource {
+        AgentPolicySource::new(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            4,
+            "token".into(),
+            "nftables",
+        )
+    }
+
+    /// An `off` pass gets the held snapshot only when a policy in it
+    /// records; otherwise it is not copied. An answer that changes neither
+    /// the snapshot nor the mode is recognised as such.
+    #[tokio::test]
+    async fn an_idle_off_pass_copies_nothing() {
+        let source = source("127.0.0.1:9".parse().unwrap());
+        let subject = temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 1);
+        let mut snapshot = PolicySnapshot::default();
+        snapshot.egress.push(temps_workload_netpol::EgressPolicy {
+            subject,
+            rules: Vec::new(),
+            record: false,
+            public_only: false,
+        });
+        *source.last.lock().unwrap() = Some(snapshot.clone());
+        assert!(source.off_recording_snapshot().await.unwrap().is_none());
+        snapshot.egress[0].record = true;
+        *source.last.lock().unwrap() = Some(snapshot);
+        source
+            .last_records
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(source.off_recording_snapshot().await.unwrap().is_some());
+
+        *source.last_mode.lock().unwrap() = Some(NodeMode::Off);
+        let unchanged = |mode| NodePolicy {
+            mode,
+            snapshot: None,
+            snapshot_digest: Some("d1".into()),
+            unchanged: true,
+            protocol: temps_workload_netpol::POLICY_PROTOCOL,
+        };
+        assert!(source.nothing_changed(&unchanged(NodeMode::Off)));
+        assert!(
+            !source.nothing_changed(&unchanged(NodeMode::Enforce)),
+            "a new mode is taken the full way"
+        );
+
+        // A cache write that failed: the next answer is taken the full way,
+        // so the cache is written again even though nothing changed.
+        source
+            .cache_current
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!source.nothing_changed(&unchanged(NodeMode::Off)));
+    }
+
+    /// A cache write that fails leaves the cache stale until a write works:
+    /// an unchanged answer after it is written again, not skipped.
+    #[test]
+    fn a_failed_cache_write_is_retried_on_the_next_answer() {
+        let dir = std::env::temp_dir().join(format!(
+            "temps-netpol-cache-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A directory that does not exist: the write fails.
+        let source = source("127.0.0.1:9".parse().unwrap()).with_cache(dir.join("policy.json"));
+        let policy = NodePolicy {
+            mode: NodeMode::Off,
+            snapshot: Some(PolicySnapshot::default()),
+            snapshot_digest: Some("d1".into()),
+            unchanged: false,
+            protocol: temps_workload_netpol::POLICY_PROTOCOL,
+        };
+        source.store_cache(&policy);
+        assert!(!source
+            .cache_current
+            .load(std::sync::atomic::Ordering::Relaxed));
+        std::fs::create_dir_all(&dir).unwrap();
+        source.store_cache(&policy);
+        assert!(source
+            .cache_current
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(dir.join("policy.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new agent asks with its protocol, holds the snapshot it gets in
+    /// `off`, sends its digest back, and keeps it on `unchanged`.
+    #[tokio::test]
+    async fn a_off_snapshot_is_held_and_an_unchanged_answer_keeps_it() {
+        let mut snapshot = PolicySnapshot::default();
+        snapshot
+            .system_ingress
+            .push("10.201.0.0/16".parse().unwrap());
+        let full = serde_json::to_string(&NodePolicy {
+            mode: NodeMode::Off,
+            snapshot: Some(snapshot.clone()),
+            snapshot_digest: Some("d1".into()),
+            unchanged: false,
+            protocol: temps_workload_netpol::POLICY_PROTOCOL,
+        })
+        .unwrap();
+        let unchanged = r#"{"mode":"legacy","snapshot_digest":"d1","unchanged":true}"#.to_string();
+        let (addr, server) = scripted_control_plane(vec![full, unchanged]).await;
+        let source = source(addr);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert_eq!(
+            source.off_snapshot().await.unwrap().unwrap().system_ingress,
+            snapshot.system_ingress
+        );
+        source.observed(&IdentityMap::new().with(
+            temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 1),
+            "10.237.1.2".parse().unwrap(),
+        ));
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert_eq!(
+            source.off_snapshot().await.unwrap().unwrap().system_ingress,
+            snapshot.system_ingress,
+            "unchanged keeps the held snapshot"
+        );
+        let bodies = server.await.unwrap();
+        let first: NodePolicyReport = serde_json::from_str(&bodies[0]).unwrap();
+        let second: NodePolicyReport = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(first.protocol, POLICY_PROTOCOL);
+        assert_eq!(first.held_snapshot, None, "nothing held yet");
+        assert_eq!(second.held_snapshot.as_deref(), Some("d1"));
+        assert_eq!(
+            second.identities.workloads().count(),
+            1,
+            "observations are reported in off"
+        );
+    }
+
+    /// An older control plane answers `off` with the mode alone: the
+    /// agent then has no snapshot, so its pass observes nothing, as today.
+    #[tokio::test]
+    async fn an_old_control_planes_legacy_answer_leaves_nothing_to_observe() {
+        let (addr, server) = scripted_control_plane(vec![r#"{"mode":"legacy"}"#.into()]).await;
+        let source = source(addr);
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        assert!(source.off_snapshot().await.unwrap().is_none());
+        server.await.unwrap();
+    }
+
+    /// Every pass's report carries the capability, so the control plane can
+    /// answer for this node.
+    #[tokio::test]
+    async fn the_policy_report_carries_the_recording_capability() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+            }
+            let answer = r#"{"mode":"legacy"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let source = AgentPolicySource::new(
+            reqwest::Client::new(),
+            &format!("http://{addr}"),
+            4,
+            "token".into(),
+            "nftables",
+        );
+        assert_eq!(source.mode().await.unwrap(), NodeMode::Off);
+        let request = server.await.unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let report: NodePolicyReport = serde_json::from_str(body).unwrap();
+        assert_eq!(report.egress_recording, Some(egress_recording_capability()));
     }
 }

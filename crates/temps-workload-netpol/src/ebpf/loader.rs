@@ -250,7 +250,7 @@ impl EbpfDatapath {
 
     pub fn set_mode(&mut self, mode: NodeMode) -> Result<(), DatapathError> {
         let value = match mode {
-            NodeMode::Legacy => MODE_LEGACY,
+            NodeMode::Off => MODE_LEGACY,
             NodeMode::Shadow => MODE_SHADOW,
             NodeMode::Enforce => MODE_ENFORCE,
         };
@@ -267,7 +267,7 @@ impl EbpfDatapath {
         Ok(match value {
             MODE_SHADOW => NodeMode::Shadow,
             MODE_ENFORCE => NodeMode::Enforce,
-            _ => NodeMode::Legacy,
+            _ => NodeMode::Off,
         })
     }
 
@@ -465,7 +465,7 @@ impl EbpfDatapath {
     }
 
     /// Detaches every program and removes every pin under `pin_dir`: the
-    /// one-step rollback to `legacy` (§6, item 9).
+    /// one-step rollback to `off` (§6, item 9).
     pub fn remove(pin_dir: &Path) -> Result<(), DatapathError> {
         for program in PROGRAMS {
             let path = pin_dir.join(format!("link_{program}"));
@@ -1081,7 +1081,7 @@ while True:
         assert_eq!(counters.egress_deny, 0, "{counters:?}");
         assert!(dp.drain_samples(64).iter().any(|s| s.would_block == 1));
 
-        dp.set_mode(NodeMode::Legacy).unwrap();
+        dp.set_mode(NodeMode::Off).unwrap();
         assert_eq!(lab.connect("a", 1, 3, 28080, "tcp"), "ok");
         assert_eq!(lab.connect("c", 3, 2, 28080, "tcp"), "ok");
     }

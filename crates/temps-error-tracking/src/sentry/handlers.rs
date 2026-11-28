@@ -2004,6 +2004,8 @@ mod tests {
 
     fn native_log_query(project_id: i32) -> temps_otel::types::LogQuery {
         temps_otel::types::LogQuery {
+            workload: None,
+            workload_in_any_project: false,
             project_id,
             attribute_filter: None,
             severity: None,

@@ -186,11 +186,27 @@ impl TempsPlugin for SandboxPlugin {
         })
     }
 
+    /// The recording service and recorder every workload kind shares
+    /// (`WorkloadEgressPlugin`, registered after this plugin): sandboxes
+    /// register with them in phase two and serve their recording routes
+    /// through them.
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        vec![
+            temps_core::plugin::RequiredService::of::<temps_workload_egress::EgressRecordingService>(
+            ),
+            temps_core::plugin::RequiredService::of::<
+                temps_workload_egress::local::LocalEgressRecorder,
+            >(),
+        ]
+    }
+
     fn initialize_plugin_services<'a>(
         &'a self,
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            wire_egress_recording(context).await;
+
             // Recover live handles for any sandbox row still marked running.
             // Without this, a server restart leaves zombie DB rows whose
             // containers we can no longer reach until the user stops them,
@@ -459,18 +475,99 @@ impl TempsPlugin for SandboxPlugin {
             sensitive_action_authorizer,
             image_preparation,
         });
+        // The sandbox's own URLs and authorization over the recording
+        // service every workload kind shares.
+        let recording_state =
+            Arc::new(crate::handlers::egress_recording::EgressRecordingAppState {
+                service: Arc::new(crate::services::egress_recording::SandboxEgress::new(
+                    context.require_service::<sea_orm::DatabaseConnection>(),
+                    context.require_service::<temps_workload_egress::EgressRecordingService>(),
+                )),
+                audit_service: app_state.audit_service.clone(),
+            });
+        let recording_router = crate::handlers::egress_recording::routes()
+            .route_layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                crate::handlers::hide_managed_application_workspaces,
+            ))
+            .with_state(recording_state);
         let router = configure_routes()
             .route_layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
                 crate::handlers::hide_managed_application_workspaces,
             ))
-            .with_state(app_state);
+            .with_state(app_state)
+            .merge(recording_router);
         Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
         Some(SandboxApiDoc::openapi())
     }
+}
+
+/// Makes sandboxes a recordable workload kind: registers the sandbox
+/// adapter with the shared recording service and, when this host runs
+/// sandboxes on its own Docker, tells the shared recorder how their
+/// traffic reaches it.
+async fn wire_egress_recording(context: &PluginContext) {
+    use crate::services::egress_recording::local::{SandboxTraffic, SidecarRefresh};
+    use crate::services::egress_recording::{LocalSteering, SandboxEgressAdapter};
+    use temps_sandbox_providers::docker::publish_egress_recording;
+
+    let db = context.require_service::<sea_orm::DatabaseConnection>();
+    let recording = context.require_service::<temps_workload_egress::EgressRecordingService>();
+    let adapter = Arc::new(SandboxEgressAdapter::new(db.clone()));
+    recording.register(adapter.clone());
+
+    let runs_local_sandboxes = context
+        .get_service::<SandboxService>()
+        .is_some_and(|service| service.runs_local_sandboxes());
+    if !runs_local_sandboxes {
+        // Sidecars hand nothing to a recorder this host does not run.
+        publish_egress_recording(None);
+        return;
+    }
+    let docker = match context
+        .get_service::<temps_core::DockerHandle>()
+        .map(|handle| handle.require())
+    {
+        Some(Ok(docker)) => (*docker).clone(),
+        Some(Err(error)) => {
+            info!(%error, "egress recording: no local Docker, so this host records no sandbox");
+            publish_egress_recording(None);
+            return;
+        }
+        None => {
+            publish_egress_recording(None);
+            return;
+        }
+    };
+    let sidecars: Option<Arc<dyn SidecarRefresh>> = context
+        .get_service::<StandaloneSandboxRegistry>()
+        .map(|registry| registry as Arc<dyn SidecarRefresh>);
+    let recorder = context.require_service::<temps_workload_egress::local::LocalEgressRecorder>();
+    let traffic = Arc::new(SandboxTraffic::new(
+        db,
+        docker,
+        recorder.installation(),
+        sidecars,
+    ));
+    adapter.set_local(LocalSteering {
+        recorder: Arc::downgrade(&recorder),
+        traffic: traffic.clone(),
+    });
+    // A recorded sandbox's new policy reaches the recorder before the
+    // policy update answers.
+    if let Some(service) = context.get_service::<SandboxService>() {
+        service.set_egress_observer(Arc::new(
+            crate::services::egress_recording::RecorderPolicyRefresh {
+                recorder: Arc::downgrade(&recorder),
+                traffic: Arc::downgrade(&traffic),
+            },
+        ));
+    }
+    recorder.add_source(traffic).await;
 }
 
 #[cfg(test)]
