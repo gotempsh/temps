@@ -263,6 +263,6 @@ Doppelt lizenziert unter [MIT](LICENSE-MIT) oder [Apache 2.0](LICENSE). Forks un
 
 [temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_de) | [Dokumentation](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_de) | [GitHub](https://github.com/gotempsh/temps)
 
-[English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | Deutsch | [日本語](README.ja.md) | [Português](README.pt-BR.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | Deutsch | [日本語](README.ja.md) | [Português](README.pt-BR.md) | [Türkçe](README.tr.md)
 
 </div>
