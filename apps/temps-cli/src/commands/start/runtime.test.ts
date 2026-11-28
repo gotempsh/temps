@@ -6,6 +6,7 @@ import {
   StartError,
   consoleApiUrl,
   cosignVerifyArgs,
+  attestationBuiltFromTag,
   ghAttestationArgs,
   manualVerifyCommands,
   databaseUrl,
@@ -84,9 +85,40 @@ describe('release signature commands', () => {
       'attestation', 'verify', '/s/a.tar.gz',
       '--repo', 'gotempsh/temps',
       '--cert-identity', 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3',
-      '--source-ref', 'refs/tags/v1.2.3',
       '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
+      '--format', 'json',
     ])
+  })
+
+  test('gh args avoid --source-ref, which gh before 2.68.0 rejects with its usage text', () => {
+    expect(ghAttestationArgs('/s/a.tar.gz', 'v1.2.3')).not.toContain('--source-ref')
+  })
+})
+
+describe('attestationBuiltFromTag', () => {
+  const attested = (ref: unknown) =>
+    JSON.stringify([{ verificationResult: { signature: { certificate: { sourceRepositoryRef: ref } } } }])
+
+  test('accepts an attestation built from the release tag', () => {
+    expect(attestationBuiltFromTag(attested('refs/tags/v1.2.3'), 'v1.2.3')).toBe(true)
+    const mixed = JSON.stringify([
+      ...JSON.parse(attested('refs/heads/main')),
+      ...JSON.parse(attested('refs/tags/v1.2.3')),
+    ])
+    expect(attestationBuiltFromTag(mixed, 'v1.2.3')).toBe(true)
+  })
+
+  test('rejects another ref, a ref differing only in case, or a prefix', () => {
+    expect(attestationBuiltFromTag(attested('refs/heads/main'), 'v1.2.3')).toBe(false)
+    expect(attestationBuiltFromTag(attested('refs/tags/V1.2.3'), 'v1.2.3')).toBe(false)
+    expect(attestationBuiltFromTag(attested('refs/tags/v1.2.3-evil'), 'v1.2.3')).toBe(false)
+    expect(attestationBuiltFromTag(attested(['refs/tags/v1.2.3']), 'v1.2.3')).toBe(false)
+  })
+
+  test('treats anything but the expected JSON as no attestation', () => {
+    for (const output of ['', 'Usage: gh attestation verify', '{}', 'null', '[]', '[null]', '[{"verificationResult":{}}]']) {
+      expect(attestationBuiltFromTag(output, 'v1.2.3')).toBe(false)
+    }
   })
 })
 

@@ -165,6 +165,15 @@ with_deadline() {
     return "$status"
 }
 
+# Whether `gh attestation verify --format json` output ($1) contains an
+# attestation built from refs/tags/$2. Exact and case-sensitive (gh compared
+# --source-ref case-insensitively until 2.102.0). Whitespace is dropped first
+# so the match does not depend on how gh formats its JSON; a ref has none.
+attested_from_tag() {
+    printf '%s' "$1" | tr -d ' \t\r\n' |
+        grep -Fq "\"sourceRepositoryRef\":\"refs/tags/$2\""
+}
+
 verify_signature() {
     local file="$1" url="$2" tag="$3" asset="$4"
     local bundle="$file.sigstore.json" identity status output
@@ -217,10 +226,13 @@ $output
 
     if command -v gh >/dev/null 2>&1 && with_deadline gh auth status >/dev/null 2>&1; then
         info "Verifying build provenance with the GitHub CLI..."
+        # The source ref is checked by attested_from_tag on the JSON output, not
+        # with --source-ref: gh only gained that flag in 2.68.0, and an older gh
+        # rejects it with its usage text, which aborted genuine installs.
         if ! output=$(with_deadline gh attestation verify "$file" --repo gotempsh/temps \
                 --cert-identity "$identity" \
-                --source-ref "refs/tags/$tag" \
-                --cert-oidc-issuer "$oidc_issuer" 2>&1); then
+                --cert-oidc-issuer "$oidc_issuer" \
+                --format json 2>&1); then
             rm -f "$file"
             error "Build provenance verification FAILED: $asset has no attestation from the Temps
 release workflow at $tag. The download may have been tampered with. Aborting installation.
@@ -228,6 +240,14 @@ release workflow at $tag. The download may have been tampered with. Aborting ins
   expected issuer: $oidc_issuer
 gh said:
 $output"
+        fi
+        if ! attested_from_tag "$output" "$tag"; then
+            rm -f "$file"
+            error "Build provenance verification FAILED: $asset is attested by the Temps release
+workflow, but not as built from refs/tags/$tag. The download may have been tampered
+with. Aborting installation.
+  expected signer: $identity
+  expected source: refs/tags/$tag"
         fi
         success "Build provenance verified (gh): built by $identity"
         return 0
