@@ -13,6 +13,24 @@ pub enum FlagError {
     #[error("Feature flag '{key}' already exists in project {project_id}")]
     DuplicateKey { project_id: i32, key: String },
 
+    /// The key belongs to an archived flag: archiving keeps the key (and its
+    /// immutable `value_type`) reserved, so a create with it is refused. The
+    /// message says how to get it back or free it.
+    #[error(
+        "Feature flag '{key}' is archived in project {project_id}; restore it with \
+         POST /projects/{project_id}/flags/{key}/restore, free the key with \
+         DELETE /projects/{project_id}/flags/{key}?purge=true, or use another key"
+    )]
+    ArchivedKey { project_id: i32, key: String },
+
+    /// Purging deletes a flag for good, so only an archived flag (already
+    /// evaluating as not found everywhere) can be purged.
+    #[error(
+        "Feature flag '{key}' in project {project_id} is not archived; archive it with \
+         DELETE /projects/{project_id}/flags/{key} before purging it"
+    )]
+    PurgeRequiresArchive { project_id: i32, key: String },
+
     #[error("Project {project_id} not found")]
     ProjectNotFound { project_id: i32 },
 

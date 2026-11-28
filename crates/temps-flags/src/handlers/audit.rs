@@ -112,6 +112,16 @@ pub struct FeatureFlagEnvironmentValueSetAudit {
     pub new_value: Option<serde_json::Value>,
 }
 
+/// An archived flag deleted for good; its key is free again.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeatureFlagPurgedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub flag_id: i32,
+    pub key: String,
+    pub value_type: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FeatureFlagRestoredAudit {
     pub context: AuditContext,
@@ -126,6 +136,7 @@ impl_audit_operation!(FeatureFlagReshuffledAudit, "FEATURE_FLAG_RESHUFFLED");
 impl_audit_operation!(FeatureFlagRestoredAudit, "FEATURE_FLAG_RESTORED");
 impl_audit_operation!(FeatureFlagUpdatedAudit, "FEATURE_FLAG_UPDATED");
 impl_audit_operation!(FeatureFlagArchivedAudit, "FEATURE_FLAG_ARCHIVED");
+impl_audit_operation!(FeatureFlagPurgedAudit, "FEATURE_FLAG_PURGED");
 impl_audit_operation!(
     FeatureFlagEnvironmentValueSetAudit,
     "FEATURE_FLAG_ENVIRONMENT_VALUE_SET"
