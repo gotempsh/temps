@@ -355,6 +355,19 @@ describe('rotatedCredentials', () => {
     ).toEqual({ type: 'cloudflare', api_token: 't' })
   })
 
+  test('keeps the stored Namecheap API user, client IP and sandbox flag', () => {
+    expect(
+      rotatedCredentials(
+        'namecheap',
+        { type: 'namecheap', api_user: 'dns-admin', api_key: '***', client_ip: '203.0.113.7', sandbox: true },
+        'new-key',
+      ),
+    ).toEqual({ type: 'namecheap', api_user: 'dns-admin', api_key: 'new-key', client_ip: '203.0.113.7', sandbox: true })
+    expect(
+      rotatedCredentials('namecheap', { type: 'namecheap', api_user: 'dns-admin', api_key: '***', sandbox: false }, 'k'),
+    ).toEqual({ type: 'namecheap', api_user: 'dns-admin', api_key: 'k', sandbox: false })
+  })
+
   test('refuses to erase a Cloudflare account ID it cannot read back', () => {
     expect(() =>
       rotatedCredentials('cloudflare', { type: 'cloudflare', api_token: 'abc***', account_id: 'acc***' }, 't'),
@@ -362,7 +375,7 @@ describe('rotatedCredentials', () => {
   })
 
   test('refuses providers whose credentials it cannot rebuild', () => {
-    expect(() => rotatedCredentials('namecheap', { type: 'namecheap', api_key: '***' }, 'k')).toThrow('username')
+    expect(() => rotatedCredentials('namecheap', { type: 'namecheap', api_key: '***' }, 'k')).toThrow('API user')
     for (const type of ['route53', 'gcp', 'azure']) {
       expect(() => rotatedCredentials(type, { type }, 'k')).toThrow('more than one secret')
     }

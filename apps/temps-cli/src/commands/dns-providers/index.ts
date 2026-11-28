@@ -934,11 +934,18 @@ export function rotatedCredentials(
         ...(typeof stored.server_id === 'string' && present(stored.server_id) && { server_id: stored.server_id }),
       }
     }
-    case 'namecheap':
-      throw new Error(
-        'Namecheap credentials include a username the API does not return, so --api-key cannot rotate the key without erasing it. ' +
-          'Update the credentials from the provider page in the console instead.',
-      )
+    case 'namecheap': {
+      if (typeof stored.api_user !== 'string' || !present(stored.api_user)) {
+        throw new Error('The stored Namecheap credentials have no API user; update them from the console instead.')
+      }
+      return {
+        type: 'namecheap',
+        api_user: stored.api_user,
+        api_key: newKey,
+        ...(typeof stored.client_ip === 'string' && present(stored.client_ip) && { client_ip: stored.client_ip }),
+        sandbox: stored.sandbox === true,
+      }
+    }
     case 'route53':
     case 'gcp':
     case 'azure':
