@@ -14,7 +14,8 @@ pub struct CreateCronMonitor {
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateCronMonitor {
-    pub config: Option<MonitorConfig>,
+    /// Fields to change; the ones omitted keep their stored values.
+    pub config: Option<MonitorConfigPatch>,
     pub enabled: Option<bool>,
 }
 #[derive(Serialize, ToSchema)]
@@ -246,7 +247,7 @@ impl CronMonitorService {
         }
         let tx = self.management_lock(project).await?;
         Self::management_scope(&tx, project, input.environment_id).await?;
-        if tx.query_one(sql("SELECT id FROM cron_monitors WHERE project_id=$1 AND environment_id IS NOT DISTINCT FROM $2 AND slug=$3",vec![project.into(),input.environment_id.into(),input.slug.clone().into()])).await?.is_some() {return Err(CronMonitorError::Conflict);}
+        if tx.query_one(sql("SELECT id FROM cron_monitors WHERE project_id=$1 AND environment_id IS NOT DISTINCT FROM $2 AND slug=$3",vec![project.into(),input.environment_id.into(),input.slug.clone().into()])).await?.is_some() {return Err(CronMonitorError::Conflict { slug: input.slug, project_id: project, environment_id: input.environment_id });}
         let n = tx
             .query_one(sql(
                 "SELECT count(*) AS n FROM cron_monitors WHERE project_id=$1",
@@ -281,21 +282,27 @@ impl CronMonitorService {
         if input.config.is_none() && input.enabled.is_none() {
             return Err(CronMonitorError::Invalid { reason: "supply config or enabled".into() });
         }
-        if let Some(config) = &input.config {
-            config.validate(now)?;
-        }
         let tx = self.management_lock(project).await?;
         let monitor = Self::locked_monitor(&tx, project, id).await?;
         let old_enabled = monitor.enabled;
         let enabled = input.enabled.unwrap_or(old_enabled);
         let changed_config = input.config.is_some();
-        let config: Option<MonitorConfig> = match input.config {
-            Some(c) => Some(c),
-            None if monitor.config.is_null() => None,
-            None => Some(
+        let stored: Option<MonitorConfig> = if monitor.config.is_null() {
+            None
+        } else {
+            Some(
                 serde_json::from_value(monitor.config.clone())
                     .map_err(|_| CronMonitorError::StoredConfiguration { monitor_id: id })?,
-            ),
+            )
+        };
+        // A PATCH changes the fields it names and keeps the rest.
+        let config: Option<MonitorConfig> = match input.config {
+            Some(patch) => {
+                let merged = patch.apply(stored)?;
+                merged.validate(now)?;
+                Some(merged)
+            }
+            None => stored,
         };
         if enabled && config.is_none() {
             return Err(CronMonitorError::Invalid { reason: "configure a schedule before resuming".into() });
@@ -394,7 +401,7 @@ mod tests {
         assert_eq!(monitor.configuration_source, "temps");
         assert!(matches!(
             service.create_monitor(project.id, create()).await,
-            Err(CronMonitorError::Conflict)
+            Err(CronMonitorError::Conflict { .. })
         ));
         assert!(matches!(
             service
@@ -598,20 +605,73 @@ mod tests {
         assert_eq!(resumed.status, "unknown");
         assert_eq!(resumed.consecutive_failures, 0);
         assert!(resumed.next_expected_at.is_some());
-        let mut edited = cfg;
-        edited.max_runtime = 2;
         let edited = service
             .update_monitor(
                 project.id,
                 monitor.id,
                 UpdateCronMonitor {
-                    config: Some(edited),
+                    config: Some(MonitorConfigPatch {
+                        max_runtime: Some(2),
+                        ..Default::default()
+                    }),
                     enabled: None,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(edited.config.unwrap().max_runtime, 2);
+        let edited = edited.config.unwrap();
+        assert_eq!(edited.max_runtime, 2);
+        assert!(
+            matches!(edited.schedule, MonitorSchedule::Interval { value: 5, .. }),
+            "a PATCH without a schedule keeps the stored one"
+        );
+        // #2101: a PATCH of only the schedule keeps every other setting.
+        let rescheduled = service
+            .update_monitor(
+                project.id,
+                monitor.id,
+                UpdateCronMonitor {
+                    config: Some(
+                        serde_json::from_value(serde_json::json!({
+                            "schedule": {"type": "crontab", "value": "0 4 * * *"},
+                            "timezone": "Europe/Madrid",
+                            "checkin_margin": 5
+                        }))
+                        .unwrap(),
+                    ),
+                    enabled: None,
+                },
+            )
+            .await
+            .unwrap()
+            .config
+            .unwrap();
+        let rescheduled_again = service
+            .update_monitor(
+                project.id,
+                monitor.id,
+                UpdateCronMonitor {
+                    config: Some(
+                        serde_json::from_value(serde_json::json!({
+                            "schedule": {"type": "crontab", "value": "0 5 * * *"}
+                        }))
+                        .unwrap(),
+                    ),
+                    enabled: None,
+                },
+            )
+            .await
+            .unwrap()
+            .config
+            .unwrap();
+        assert_eq!(rescheduled.timezone, "Europe/Madrid");
+        assert_eq!(rescheduled_again.timezone, "Europe/Madrid");
+        assert_eq!(rescheduled_again.checkin_margin, 5);
+        assert_eq!(rescheduled_again.max_runtime, 2);
+        assert!(matches!(
+            rescheduled_again.schedule,
+            MonitorSchedule::Crontab { ref value } if value == "0 5 * * *"
+        ));
         service
             .delete_monitor(project.id, monitor.id, &alarms)
             .await

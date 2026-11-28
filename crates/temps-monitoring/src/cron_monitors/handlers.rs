@@ -27,7 +27,7 @@ impl From<CronMonitorError> for Problem {
             CronMonitorError::NotFound { .. } | CronMonitorError::ScopeNotFound { .. } => {
                 StatusCode::NOT_FOUND
             }
-            CronMonitorError::Conflict => StatusCode::CONFLICT,
+            CronMonitorError::Conflict { .. } => StatusCode::CONFLICT,
             CronMonitorError::Limit => StatusCode::TOO_MANY_REQUESTS,
             CronMonitorError::Database(_)
             | CronMonitorError::StoredConfiguration { .. }
@@ -43,7 +43,7 @@ impl From<CronMonitorError> for Problem {
             CronMonitorError::Invalid { .. }
             | CronMonitorError::Limit
             | CronMonitorError::NotFound { .. }
-            | CronMonitorError::Conflict
+            | CronMonitorError::Conflict { .. }
             | CronMonitorError::ScopeNotFound { .. }
             | CronMonitorError::StoredConfiguration { .. } => error.to_string(),
         };
@@ -104,6 +104,11 @@ async fn audit(
     }
 }
 
+/// List a project's cron monitors.
+///
+/// Cron monitors are governed by the environments permissions: reading needs
+/// `environments:read`, changing them `environments:write`. The `crons:*`
+/// permissions govern deployment cron jobs, not these monitors.
 #[utoipa::path(get,path="/projects/{project_id}/cron-monitors",tag="Cron Monitors",operation_id="listCronMonitors",params(("project_id"=i32,Path,description="Project ID"),CronMonitorQuery),
 responses((status=200,description="Success",body=CronMonitorList),(status=400,description="Invalid configuration"),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="Not found"),(status=409,description="Already exists"),(status=429,description="Monitor limit reached"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
 pub async fn list(
@@ -126,6 +131,7 @@ pub async fn list(
     Ok(Json(result))
 }
 
+/// Create a cron monitor. Requires `environments:write` (see `listCronMonitors`).
 #[utoipa::path(post,path="/projects/{project_id}/cron-monitors",tag="Cron Monitors",operation_id="createCronMonitor",params(("project_id"=i32,Path,description="Project ID")),
 request_body=CreateCronMonitor,
 responses((status=201,description="Success",body=CronMonitorView),(status=400,description="Invalid configuration"),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="Not found"),(status=409,description="Already exists"),(status=429,description="Monitor limit reached"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
@@ -152,6 +158,7 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(result)))
 }
 
+/// Get one cron monitor. Requires `environments:read` (see `listCronMonitors`).
 #[utoipa::path(get,path="/projects/{project_id}/cron-monitors/{monitor_id}",tag="Cron Monitors",operation_id="getCronMonitor",params(("project_id"=i32,Path,description="Project ID"),("monitor_id"=i32,Path,description="Monitor ID")),
 responses((status=200,description="Success",body=CronMonitorView),(status=400,description="Invalid configuration"),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="Not found"),(status=409,description="Already exists"),(status=429,description="Monitor limit reached"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
 pub async fn get_one(
@@ -166,6 +173,8 @@ pub async fn get_one(
     Ok(Json(result))
 }
 
+/// Change a cron monitor. The `config` fields given replace the stored ones and
+/// the omitted ones are kept. Requires `environments:write` (see `listCronMonitors`).
 #[utoipa::path(patch,path="/projects/{project_id}/cron-monitors/{monitor_id}",tag="Cron Monitors",operation_id="updateCronMonitor",params(("project_id"=i32,Path,description="Project ID"),("monitor_id"=i32,Path,description="Monitor ID")),
 request_body=UpdateCronMonitor,
 responses((status=200,description="Success",body=CronMonitorView),(status=400,description="Invalid configuration"),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="Not found"),(status=409,description="Already exists"),(status=429,description="Monitor limit reached"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
@@ -195,6 +204,7 @@ pub async fn update(
     Ok(Json(result))
 }
 
+/// Delete a cron monitor. Requires `environments:write` (see `listCronMonitors`).
 #[utoipa::path(delete,path="/projects/{project_id}/cron-monitors/{monitor_id}",tag="Cron Monitors",operation_id="deleteCronMonitor",params(("project_id"=i32,Path,description="Project ID"),("monitor_id"=i32,Path,description="Monitor ID")),
 responses((status=204,description="Success"),(status=400,description="Invalid configuration"),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="Not found"),(status=409,description="Already exists"),(status=429,description="Monitor limit reached"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
 pub async fn delete(
@@ -222,6 +232,7 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// List a cron monitor's runs. Requires `environments:read` (see `listCronMonitors`).
 #[utoipa::path(get,path="/projects/{project_id}/cron-monitors/{monitor_id}/runs",tag="Cron Monitors",operation_id="listCronMonitorRuns",params(("project_id"=i32,Path,description="Project ID"),("monitor_id"=i32,Path,description="Monitor ID"),CronMonitorQuery),
 responses((status=200,description="Success",body=CronMonitorRunList),(status=400,description="Invalid configuration"),(status=401,description="Unauthorized"),(status=403,description="Forbidden"),(status=404,description="Not found"),(status=409,description="Already exists"),(status=429,description="Monitor limit reached"),(status=500,description="Internal error")),security(("bearer_auth"=[])))]
 pub async fn runs(
@@ -271,6 +282,7 @@ pub fn routes() -> Router<Arc<CronMonitorsState>> {
         CronMonitorRunList,
         CronMonitorRun,
         MonitorConfig,
+        MonitorConfigPatch,
         MonitorSchedule
     ))
 )]
@@ -306,9 +318,22 @@ mod tests {
                 "Cron monitor 9 was not found in project 3",
             ),
             (
-                CronMonitorError::Conflict,
+                CronMonitorError::Conflict {
+                    slug: "nightly".into(),
+                    project_id: 3,
+                    environment_id: Some(5),
+                },
                 StatusCode::CONFLICT,
-                "Cron monitor already exists in this project and environment",
+                "Cron monitor 'nightly' already exists in project 3 for environment 5",
+            ),
+            (
+                CronMonitorError::Conflict {
+                    slug: "nightly".into(),
+                    project_id: 3,
+                    environment_id: None,
+                },
+                StatusCode::CONFLICT,
+                "Cron monitor 'nightly' already exists in project 3 with no environment",
             ),
             (
                 CronMonitorError::ScopeNotFound {
@@ -316,7 +341,15 @@ mod tests {
                     environment_id: Some(5),
                 },
                 StatusCode::NOT_FOUND,
-                "Cron monitoring scope was not found: project 3, environment Some(5)",
+                "Environment 5 not found in project 3",
+            ),
+            (
+                CronMonitorError::ScopeNotFound {
+                    project_id: 3,
+                    environment_id: None,
+                },
+                StatusCode::NOT_FOUND,
+                "Project 3 not found",
             ),
             (
                 CronMonitorError::StoredConfiguration { monitor_id: 9 },
