@@ -438,7 +438,11 @@ async fn execute_reassignment(
     Ok(updated_domain)
 }
 
-/// Update a custom domain. Omitted fields are kept; unknown fields are refused.
+/// Update a custom domain. Omitted fields are kept, with one exception: a
+/// request that sets only `domain` and/or `environment_id` (none of
+/// `redirect_to`, `status_code` or `branch`) turns the domain into a plain
+/// route, clearing its redirect, status code and branch. The console's domain
+/// form relies on this to remove a redirect. Unknown fields are refused.
 /// Requires `projects:write`.
 #[utoipa::path(
     put,
@@ -497,7 +501,8 @@ pub async fn update_custom_domain(
             )));
     }
 
-    // If only domain and/or environment_id are sent (no redirect fields), clear redirect settings
+    // If only domain and/or environment_id are sent (no redirect fields), clear
+    // redirect settings: the documented exception to "omitted fields are kept".
     let should_clear_redirect = request.redirect_to.is_none()
         && request.status_code.is_none()
         && request.branch.is_none()

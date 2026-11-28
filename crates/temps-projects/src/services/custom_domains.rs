@@ -2493,8 +2493,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_project_is_project_not_found_for_list_and_create() {
-        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
-            println!("Docker not available, skipping");
+        let Some(test_db) = test_database().await else {
             return;
         };
         let service = CustomDomainService::new(test_db.db.clone());
@@ -3186,8 +3185,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_javascript_redirect_is_refused_for_its_scheme() {
-        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
-            eprintln!("Skipping: no database container runtime");
+        let Some(test_db) = test_database().await else {
             return;
         };
         let service = CustomDomainService::new(test_db.db.clone());
@@ -3219,8 +3217,7 @@ mod tests {
     /// goes away with the redirect it belongs to.
     #[tokio::test]
     async fn a_status_code_needs_a_redirect_and_clears_with_null_or_with_it() {
-        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
-            eprintln!("Skipping: no database container runtime");
+        let Some(test_db) = test_database().await else {
             return;
         };
         let service = CustomDomainService::new(test_db.db.clone());
@@ -3298,8 +3295,7 @@ mod tests {
     /// none, so it is refused instead of stored and ignored.
     #[tokio::test]
     async fn a_service_name_is_only_accepted_on_a_compose_project() {
-        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
-            eprintln!("Skipping: no database container runtime");
+        let Some(test_db) = test_database().await else {
             return;
         };
         let service = CustomDomainService::new(test_db.db.clone());

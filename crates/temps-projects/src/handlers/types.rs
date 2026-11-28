@@ -1265,8 +1265,11 @@ pub struct ContainerLogsQuery {
     pub tail: Option<String>,
 }
 
-/// Changes to a custom domain; omitted fields are kept. Unknown fields are
-/// refused, so a misspelt one is an error instead of a silent no-op.
+/// Changes to a custom domain; omitted fields are kept, except that a
+/// request setting only `domain` and/or `environment_id` (no `redirect_to`,
+/// `status_code` or `branch`) clears the redirect, its status code and the
+/// branch. Unknown fields are refused, so a misspelt one is an error instead
+/// of a silent no-op.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateCustomDomainRequest {
