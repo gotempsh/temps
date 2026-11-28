@@ -540,27 +540,20 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                 name="error_level_filter"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Error level filter</FormLabel>
-                    <Select
-                      onValueChange={(v) =>
-                        field.onChange(v === 'all' ? null : v)
-                      }
-                      value={field.value ?? 'all'}
-                    >
-                      <FormControl>
-                        <SelectTrigger>
-                          <SelectValue placeholder="All levels" />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        <SelectItem value="all">All Levels</SelectItem>
-                        <SelectItem value="error">Error</SelectItem>
-                        <SelectItem value="warning">Warning</SelectItem>
-                        <SelectItem value="fatal">Fatal</SelectItem>
-                      </SelectContent>
-                    </Select>
+                    <FormLabel>Error type</FormLabel>
+                    <FormControl>
+                      <Input
+                        placeholder="All types, or e.g. TypeError"
+                        value={field.value ?? ''}
+                        onChange={(e) =>
+                          field.onChange(
+                            e.target.value.trim() === '' ? null : e.target.value
+                          )
+                        }
+                      />
+                    </FormControl>
                     <FormDescription>
-                      Only trigger for errors at this level
+                      Only trigger for errors of this exception type
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

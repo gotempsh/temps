@@ -3,12 +3,14 @@
 
 use chrono::{Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
+    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_entities::{error_alert_fires, error_alert_rules, error_events, error_groups};
+use temps_entities::{
+    environments, error_alert_fires, error_alert_rules, error_events, error_groups,
+};
 use tracing::{error, info, warn};
 
 use super::types::ErrorTrackingError;
@@ -67,6 +69,139 @@ impl AlertTriggerType {
     }
 }
 
+/// Longest alert rule name, in characters.
+pub const MAX_ALERT_RULE_NAME_CHARS: usize = 255;
+
+/// Longest error type a rule can filter on, in characters.
+pub const MAX_ERROR_TYPE_FILTER_CHARS: usize = 255;
+
+/// Notification priorities a rule may use.
+const VALID_PRIORITIES: [&str; 4] = ["Low", "Normal", "High", "Critical"];
+
+fn invalid_rule(field: &'static str, reason: impl Into<String>) -> ErrorTrackingError {
+    ErrorTrackingError::InvalidAlertRule {
+        field,
+        reason: reason.into(),
+    }
+}
+
+/// A rule name, trimmed: required and at most [`MAX_ALERT_RULE_NAME_CHARS`].
+fn normalize_rule_name(name: &str) -> Result<String, ErrorTrackingError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(invalid_rule("name", "must not be empty"));
+    }
+    let chars = name.chars().count();
+    if chars > MAX_ALERT_RULE_NAME_CHARS {
+        return Err(invalid_rule(
+            "name",
+            format!("must be at most {MAX_ALERT_RULE_NAME_CHARS} characters, got {chars}"),
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// The error type a rule filters on (`error_level_filter`), trimmed. An empty
+/// one means "no filter": stored as an empty string it matched no error, so
+/// a rule cleared that way never fired again.
+fn normalize_error_type_filter(
+    filter: Option<String>,
+) -> Result<Option<String>, ErrorTrackingError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return Ok(None);
+    }
+    let chars = filter.chars().count();
+    if chars > MAX_ERROR_TYPE_FILTER_CHARS {
+        return Err(invalid_rule(
+            "error_level_filter",
+            format!("must be at most {MAX_ERROR_TYPE_FILTER_CHARS} characters, got {chars}"),
+        ));
+    }
+    Ok(Some(filter.to_string()))
+}
+
+fn validate_priority(priority: &str) -> Result<(), ErrorTrackingError> {
+    if VALID_PRIORITIES.contains(&priority) {
+        return Ok(());
+    }
+    Err(invalid_rule(
+        "notification_priority",
+        format!("'{priority}' is not one of {}", VALID_PRIORITIES.join(", ")),
+    ))
+}
+
+fn validate_cooldown(cooldown_minutes: i32) -> Result<(), ErrorTrackingError> {
+    if cooldown_minutes < 0 {
+        return Err(invalid_rule(
+            "cooldown_minutes",
+            format!("must be zero or more, got {cooldown_minutes}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trigger_type(trigger_type: &str) -> Result<(), ErrorTrackingError> {
+    if AlertTriggerType::from_str(trigger_type).is_some() {
+        return Ok(());
+    }
+    Err(invalid_rule(
+        "trigger_type",
+        format!(
+            "'{trigger_type}' is not one of new_issue, regression, frequency, new_user, \
+             user_count, status_change"
+        ),
+    ))
+}
+
+/// Keys a trigger type reads from its config. A key outside these is a typo
+/// or a field meant for another type, and silently has no effect.
+fn trigger_config_keys(trigger_type: &str) -> &'static [&'static str] {
+    match AlertTriggerType::from_str(trigger_type) {
+        Some(AlertTriggerType::Frequency) => &["count", "window_minutes"],
+        // `threshold` is what consoles before #1749 saved.
+        Some(AlertTriggerType::UserCount) => &["count", "threshold"],
+        Some(AlertTriggerType::StatusChange) => &["statuses"],
+        _ => &[],
+    }
+}
+
+/// Refuses a supplied trigger config that is not an object or names a key
+/// its trigger type does not read.
+fn check_trigger_config_keys(
+    trigger_type: &str,
+    trigger_config: &serde_json::Value,
+) -> Result<(), ErrorTrackingError> {
+    let Some(object) = trigger_config.as_object() else {
+        return Err(invalid_rule("trigger_config", "must be a JSON object"));
+    };
+    let allowed = trigger_config_keys(trigger_type);
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !allowed.contains(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let accepted = if allowed.is_empty() {
+        "it takes no settings ({})".to_string()
+    } else {
+        format!("it accepts {}", allowed.join(", "))
+    };
+    Err(invalid_rule(
+        "trigger_config",
+        format!(
+            "unknown key(s) {} for trigger type '{trigger_type}'; {accepted}",
+            unknown.join(", ")
+        ),
+    ))
+}
+
 /// Longest window a frequency rule can count over (30 days).
 pub const MAX_FREQUENCY_WINDOW_MINUTES: i64 = 30 * 24 * 60;
 
@@ -84,23 +219,29 @@ fn validate_trigger_config(
     }
     let config: FrequencyConfig =
         serde_json::from_value(trigger_config.clone()).map_err(|error| {
-            ErrorTrackingError::Validation(format!(
-                "Invalid trigger config for '{trigger_type}': expected count and \
-                 window_minutes: {error}"
-            ))
+            invalid_rule(
+                "trigger_config",
+                format!("'{trigger_type}' expects count and window_minutes: {error}"),
+            )
         })?;
     if config.count < 1 {
-        return Err(ErrorTrackingError::Validation(format!(
-            "Frequency rule count must be at least 1, got {}",
-            config.count
-        )));
+        return Err(invalid_rule(
+            "trigger_config",
+            format!(
+                "frequency rule count must be at least 1, got {}",
+                config.count
+            ),
+        ));
     }
     if !(1..=MAX_FREQUENCY_WINDOW_MINUTES).contains(&config.window_minutes) {
-        return Err(ErrorTrackingError::Validation(format!(
-            "Frequency rule window_minutes must be between 1 and \
-             {MAX_FREQUENCY_WINDOW_MINUTES}, got {}",
-            config.window_minutes
-        )));
+        return Err(invalid_rule(
+            "trigger_config",
+            format!(
+                "frequency rule window_minutes must be between 1 and \
+                 {MAX_FREQUENCY_WINDOW_MINUTES}, got {}",
+                config.window_minutes
+            ),
+        ));
     }
     Ok(())
 }
@@ -112,15 +253,21 @@ fn validate_user_count_config(
 ) -> Result<(), ErrorTrackingError> {
     let config: UserCountConfig =
         serde_json::from_value(trigger_config.clone()).map_err(|error| {
-            ErrorTrackingError::Validation(format!(
-                "Invalid trigger config for 'user_count': expected count: {error}"
-            ))
+            invalid_rule(
+                "trigger_config",
+                format!("'user_count' expects a user threshold in count: {error}"),
+            )
         })?;
     if config.count < 1 {
-        return Err(ErrorTrackingError::Validation(format!(
-            "User count rule count must be at least 1, got {}",
-            config.count
-        )));
+        // The console calls this value the threshold; older clients sent it
+        // as `threshold`.
+        return Err(invalid_rule(
+            "trigger_config",
+            format!(
+                "user count rule threshold (count) must be at least 1, got {}",
+                config.count
+            ),
+        ));
     }
     Ok(())
 }
@@ -546,10 +693,77 @@ impl ErrorAlertService {
             .filter(error_alert_rules::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
             .await?
-            .ok_or(ErrorTrackingError::Validation(format!(
-                "Alert rule {} not found in project {}",
-                rule_id, project_id
-            )))
+            .ok_or(ErrorTrackingError::AlertRuleNotFound {
+                project_id,
+                rule_id,
+            })
+    }
+
+    /// Refuses an environment filter naming an environment the project does
+    /// not have (another project's, a deleted one, or none at all).
+    async fn ensure_environment_in_project<C: ConnectionTrait>(
+        conn: &C,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<(), ErrorTrackingError> {
+        let found = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .count(conn)
+            .await?;
+        if found == 0 {
+            return Err(ErrorTrackingError::AlertRuleEnvironmentNotFound {
+                project_id,
+                environment_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses a name another rule of the project already has (compared
+    /// case-insensitively). A project holds at most
+    /// [`MAX_ERROR_ALERT_RULES_PER_PROJECT`] rules, so this reads a bounded set.
+    async fn ensure_name_free<C: ConnectionTrait>(
+        conn: &C,
+        project_id: i32,
+        name: &str,
+        except_rule_id: Option<i32>,
+    ) -> Result<(), ErrorTrackingError> {
+        let names: Vec<(i32, String)> = error_alert_rules::Entity::find()
+            .select_only()
+            .column(error_alert_rules::Column::Id)
+            .column(error_alert_rules::Column::Name)
+            .filter(error_alert_rules::Column::ProjectId.eq(project_id))
+            .into_tuple()
+            .all(conn)
+            .await?;
+        let wanted = name.to_lowercase();
+        if let Some((rule_id, existing)) = names
+            .into_iter()
+            .find(|(id, existing)| Some(*id) != except_rule_id && existing.to_lowercase() == wanted)
+        {
+            return Err(ErrorTrackingError::AlertRuleNameTaken {
+                project_id,
+                name: existing,
+                rule_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// Locks the project row so concurrent writes to one project's rules
+    /// serialize (limit and name checks), or reports it missing.
+    async fn lock_project<C: ConnectionTrait>(
+        conn: &C,
+        project_id: i32,
+    ) -> Result<(), ErrorTrackingError> {
+        temps_entities::projects::Entity::find_by_id(project_id)
+            .filter(temps_entities::projects::Column::DeletedAt.is_null())
+            .lock_exclusive()
+            .one(conn)
+            .await?
+            .map(|_| ())
+            .ok_or(ErrorTrackingError::ProjectNotFound { project_id })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -565,35 +779,18 @@ impl ErrorAlertService {
         cooldown_minutes: i32,
         enabled: bool,
     ) -> Result<error_alert_rules::Model, ErrorTrackingError> {
-        // Validate trigger type
-        if AlertTriggerType::from_str(&trigger_type).is_none() {
-            return Err(ErrorTrackingError::Validation(format!(
-                "Invalid trigger type '{}'. Valid types: new_issue, regression, frequency, new_user, user_count, status_change",
-                trigger_type
-            )));
-        }
-
-        // Validate priority
-        let valid_priorities = ["Low", "Normal", "High", "Critical"];
-        if !valid_priorities.contains(&notification_priority.as_str()) {
-            return Err(ErrorTrackingError::Validation(format!(
-                "Invalid notification priority '{}'. Valid: Low, Normal, High, Critical",
-                notification_priority
-            )));
-        }
-
-        if cooldown_minutes < 0 {
-            return Err(ErrorTrackingError::Validation(
-                "Cooldown minutes must be non-negative".to_string(),
-            ));
-        }
-
+        let name = normalize_rule_name(&name)?;
+        validate_trigger_type(&trigger_type)?;
+        validate_priority(&notification_priority)?;
+        validate_cooldown(cooldown_minutes)?;
+        check_trigger_config_keys(&trigger_type, &trigger_config)?;
         validate_trigger_config(&trigger_type, &trigger_config)?;
+        let error_level_filter = normalize_error_type_filter(error_level_filter)?;
 
         let now = Utc::now();
         let rule = error_alert_rules::ActiveModel {
             project_id: Set(project_id),
-            name: Set(name),
+            name: Set(name.clone()),
             trigger_type: Set(trigger_type),
             trigger_config: Set(trigger_config),
             environment_filter: Set(environment_filter),
@@ -608,16 +805,13 @@ impl ErrorAlertService {
 
         // Count and insert under a lock on the project row so concurrent
         // creations for one project serialize and cannot overshoot the limit.
+        // Dropping the transaction on an early return rolls it back.
         let txn = self.db.begin().await?;
-        if temps_entities::projects::Entity::find_by_id(project_id)
-            .lock_exclusive()
-            .one(&txn)
-            .await?
-            .is_none()
-        {
-            txn.rollback().await?;
-            return Err(ErrorTrackingError::ProjectNotFound { project_id });
+        Self::lock_project(&txn, project_id).await?;
+        if let Some(environment_id) = environment_filter {
+            Self::ensure_environment_in_project(&txn, project_id, environment_id).await?;
         }
+        Self::ensure_name_free(&txn, project_id, &name, None).await?;
         let existing = error_alert_rules::Entity::find()
             .filter(error_alert_rules::Column::ProjectId.eq(project_id))
             .count(&txn)
@@ -649,14 +843,52 @@ impl ErrorAlertService {
         cooldown_minutes: Option<i32>,
         enabled: Option<bool>,
     ) -> Result<error_alert_rules::Model, ErrorTrackingError> {
-        let existing = self.get_rule(rule_id, project_id).await?;
+        let name = name.as_deref().map(normalize_rule_name).transpose()?;
+        if let Some(trigger_type) = trigger_type.as_deref() {
+            validate_trigger_type(trigger_type)?;
+        }
+        if let Some(priority) = notification_priority.as_deref() {
+            validate_priority(priority)?;
+        }
+        if let Some(cooldown) = cooldown_minutes {
+            validate_cooldown(cooldown)?;
+        }
+        let error_level_filter = error_level_filter
+            .map(normalize_error_type_filter)
+            .transpose()?;
+
+        // Dropping the transaction on an early return rolls it back.
+        let txn = self.db.begin().await?;
+        Self::lock_project(&txn, project_id).await?;
+        let existing = error_alert_rules::Entity::find_by_id(rule_id)
+            .filter(error_alert_rules::Column::ProjectId.eq(project_id))
+            .one(&txn)
+            .await?
+            .ok_or(ErrorTrackingError::AlertRuleNotFound {
+                project_id,
+                rule_id,
+            })?;
         // Judged on what the rule will hold after this update, so changing only
         // the type or only the config can't leave an invalid pair behind.
+        let next_type = trigger_type.as_deref().unwrap_or(&existing.trigger_type);
+        if let Some(config) = trigger_config.as_ref() {
+            check_trigger_config_keys(next_type, config)?;
+        }
         if trigger_type.is_some() || trigger_config.is_some() {
             validate_trigger_config(
-                trigger_type.as_deref().unwrap_or(&existing.trigger_type),
+                next_type,
                 trigger_config.as_ref().unwrap_or(&existing.trigger_config),
             )?;
+        }
+        // Only an environment the update changes the filter to is checked, so
+        // a rule whose environment was deleted can still be edited (#2111).
+        if let Some(Some(environment_id)) = environment_filter {
+            if existing.environment_filter != Some(environment_id) {
+                Self::ensure_environment_in_project(&txn, project_id, environment_id).await?;
+            }
+        }
+        if let Some(name) = name.as_deref() {
+            Self::ensure_name_free(&txn, project_id, name, Some(rule_id)).await?;
         }
         let mut rule: error_alert_rules::ActiveModel = existing.into();
 
@@ -664,17 +896,12 @@ impl ErrorAlertService {
             rule.name = Set(name);
         }
         if let Some(trigger_type) = trigger_type {
-            if AlertTriggerType::from_str(&trigger_type).is_none() {
-                return Err(ErrorTrackingError::Validation(format!(
-                    "Invalid trigger type '{}'",
-                    trigger_type
-                )));
-            }
             rule.trigger_type = Set(trigger_type);
         }
         if let Some(trigger_config) = trigger_config {
             rule.trigger_config = Set(trigger_config);
         }
+        // `Some(None)` (an explicit null) clears a filter; absent keeps it.
         if let Some(environment_filter) = environment_filter {
             rule.environment_filter = Set(environment_filter);
         }
@@ -682,21 +909,9 @@ impl ErrorAlertService {
             rule.error_level_filter = Set(error_level_filter);
         }
         if let Some(priority) = notification_priority {
-            let valid_priorities = ["Low", "Normal", "High", "Critical"];
-            if !valid_priorities.contains(&priority.as_str()) {
-                return Err(ErrorTrackingError::Validation(format!(
-                    "Invalid notification priority '{}'",
-                    priority
-                )));
-            }
             rule.notification_priority = Set(priority);
         }
         if let Some(cooldown) = cooldown_minutes {
-            if cooldown < 0 {
-                return Err(ErrorTrackingError::Validation(
-                    "Cooldown minutes must be non-negative".to_string(),
-                ));
-            }
             rule.cooldown_minutes = Set(cooldown);
         }
         if let Some(enabled) = enabled {
@@ -704,7 +919,8 @@ impl ErrorAlertService {
         }
 
         rule.updated_at = Set(Utc::now());
-        let result = rule.update(self.db.as_ref()).await?;
+        let result = rule.update(&txn).await?;
+        txn.commit().await?;
         Ok(result)
     }
 
@@ -720,16 +936,19 @@ impl ErrorAlertService {
             .await?;
 
         if result.rows_affected == 0 {
-            return Err(ErrorTrackingError::Validation(format!(
-                "Alert rule {} not found in project {}",
-                rule_id, project_id
-            )));
+            return Err(ErrorTrackingError::AlertRuleNotFound {
+                project_id,
+                rule_id,
+            });
         }
 
         Ok(())
     }
 
-    /// Create default alert rules for a project
+    /// Creates the two rules every new project starts with: "New issue
+    /// detected" (`new_issue`) and "Regression detected" (`regression`), both
+    /// High priority with a 30-minute cooldown. They are ordinary rules that
+    /// can be changed or deleted.
     pub async fn create_default_rules(
         &self,
         project_id: i32,
@@ -1070,7 +1289,10 @@ mod tests {
             assert!(
                 matches!(
                     validate_trigger_config("frequency", &bad),
-                    Err(ErrorTrackingError::Validation(_))
+                    Err(ErrorTrackingError::InvalidAlertRule {
+                        field: "trigger_config",
+                        ..
+                    })
                 ),
                 "{bad}"
             );
@@ -1144,10 +1366,13 @@ mod tests {
             serde_json::json!({"count": "ten"}),
         ] {
             match validate_trigger_config("user_count", &bad) {
-                Err(ErrorTrackingError::Validation(message)) => {
+                Err(ErrorTrackingError::InvalidAlertRule {
+                    field: "trigger_config",
+                    reason,
+                }) => {
                     assert!(
-                        message.contains("user_count") || message.contains("User count"),
-                        "{message}"
+                        reason.contains("user_count") || reason.contains("user count"),
+                        "{reason}"
                     );
                 }
                 other => panic!("{bad} must be refused, got {other:?}"),

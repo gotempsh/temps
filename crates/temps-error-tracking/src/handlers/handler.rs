@@ -635,15 +635,11 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                     .with_title("Validation Error")
                     .with_detail(err.to_string())
             }
-            ErrorTrackingError::AlertRuleLimitReached {
-                project_id, limit, ..
-            } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
-                .type_("https://temps.sh/probs/alert-rule-limit-reached")
-                .title("Alert Rule Limit Reached")
-                .detail(err.to_string())
-                .value("project_id", project_id)
-                .value("limit", limit)
-                .build(),
+            ErrorTrackingError::AlertRuleLimitReached { .. }
+            | ErrorTrackingError::AlertRuleNotFound { .. }
+            | ErrorTrackingError::AlertRuleEnvironmentNotFound { .. }
+            | ErrorTrackingError::AlertRuleNameTaken { .. }
+            | ErrorTrackingError::InvalidAlertRule { .. } => alert_rule_problem(err),
             ErrorTrackingError::PayloadTooLarge { .. } => {
                 problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
                     .with_title("Payload Too Large")
@@ -655,6 +651,63 @@ impl From<ErrorTrackingError> for temps_core::problemdetails::Problem {
                     .with_detail(err.to_string())
             }
         }
+    }
+}
+
+/// The problem for an error alert rule error. Every other error maps as
+/// [`From<ErrorTrackingError> for Problem`] maps it.
+fn alert_rule_problem(err: ErrorTrackingError) -> temps_core::problemdetails::Problem {
+    match err {
+        ErrorTrackingError::AlertRuleLimitReached {
+            project_id, limit, ..
+        } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+            .type_("https://temps.sh/probs/alert-rule-limit-reached")
+            .title("Alert Rule Limit Reached")
+            .detail(err.to_string())
+            .value("project_id", project_id)
+            .value("limit", limit)
+            .build(),
+        ErrorTrackingError::AlertRuleNotFound {
+            project_id,
+            rule_id,
+        } => temps_core::error_builder::ErrorBuilder::new(StatusCode::NOT_FOUND)
+            .type_("https://temps.sh/probs/alert-rule-not-found")
+            .title("Alert Rule Not Found")
+            .detail(err.to_string())
+            .value("project_id", project_id)
+            .value("rule_id", rule_id)
+            .build(),
+        ErrorTrackingError::AlertRuleEnvironmentNotFound {
+            project_id,
+            environment_id,
+        } => temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .type_("https://temps.sh/probs/invalid-alert-rule")
+            .title("Invalid Alert Rule")
+            .detail(err.to_string())
+            .value("project_id", project_id)
+            .value("environment_id", environment_id)
+            .value("field", "environment_filter")
+            .build(),
+        ErrorTrackingError::AlertRuleNameTaken {
+            project_id,
+            rule_id,
+            ..
+        } => temps_core::error_builder::ErrorBuilder::new(StatusCode::CONFLICT)
+            .type_("https://temps.sh/probs/alert-rule-name-taken")
+            .title("Alert Rule Name Taken")
+            .detail(err.to_string())
+            .value("project_id", project_id)
+            .value("rule_id", rule_id)
+            .build(),
+        ErrorTrackingError::InvalidAlertRule { field, .. } => {
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                .type_("https://temps.sh/probs/invalid-alert-rule")
+                .title("Invalid Alert Rule")
+                .detail(err.to_string())
+                .value("field", field)
+                .build()
+        }
+        other => temps_core::problemdetails::Problem::from(other),
     }
 }
 
@@ -729,8 +782,16 @@ impl axum::response::IntoResponse for ErrorTrackingError {
             ErrorTrackingError::ProjectNotFound { .. } => {
                 (StatusCode::NOT_FOUND, "Project not found".to_string())
             }
-            ErrorTrackingError::AlertRuleLimitReached { .. } => {
+            ErrorTrackingError::AlertRuleLimitReached { .. }
+            | ErrorTrackingError::AlertRuleNameTaken { .. } => {
                 (StatusCode::CONFLICT, self.to_string())
+            }
+            ErrorTrackingError::AlertRuleNotFound { .. } => {
+                (StatusCode::NOT_FOUND, self.to_string())
+            }
+            ErrorTrackingError::AlertRuleEnvironmentNotFound { .. }
+            | ErrorTrackingError::InvalidAlertRule { .. } => {
+                (StatusCode::BAD_REQUEST, self.to_string())
             }
             ErrorTrackingError::PayloadTooLarge {
                 field,
