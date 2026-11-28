@@ -22,11 +22,11 @@ import {
   getS3SourceOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ScheduleServicesSelector } from '@/components/backups/ScheduleServicesSelector'
+import { BackupCoverageOptions } from '@/components/backups/BackupCoverageOptions'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
-import { Switch } from '@/components/ui/switch'
 import {
   Select,
   SelectContent,
@@ -37,6 +37,11 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  type BackupCoverageMode,
+  coverageError,
+  coverageRequest,
+} from '@/lib/backup-coverage'
 import { scheduleOptions } from '@/lib/schedule-options'
 import { returnToFromSearch } from '@/lib/safe-return-to'
 import { preselectedServiceId } from '@/lib/service-backup-setup'
@@ -119,12 +124,13 @@ export function CreateBackupSchedule() {
     setFieldErrors((current) => ({ ...current, [field]: undefined }))
   // 'all' (default) means the schedule backs up every database — including
   // ones created after this schedule. 'specific' means it only backs up the
-  // services explicitly picked below. Default chosen to match what most
-  // operators want: "back up everything, even when I add a new DB later."
+  // services explicitly picked below. 'control_plane' backs up only Temps's
+  // own database. Default chosen to match what most operators want: "back
+  // up everything, even when I add a new DB later."
   //
   // Opened for one database (`?service_id=`), the form starts as a schedule
   // for just that database, without the control plane.
-  const [backupMode, setBackupMode] = useState<'all' | 'specific'>(
+  const [backupMode, setBackupMode] = useState<BackupCoverageMode>(
     preselectedService !== undefined ? 'specific' : 'all'
   )
   const [selectedServiceIds, setSelectedServiceIds] = useState<number[]>(
@@ -199,10 +205,13 @@ export function CreateBackupSchedule() {
       }
     }
 
-    if (backupMode === 'specific' && selectedServiceIds.length === 0) {
-      errors.services =
-        'Select at least one database, or switch back to "All databases."'
-    }
+    // Only a schedule that would back up nothing is refused: no databases
+    // and no control plane. Control plane alone is a valid schedule.
+    errors.services = coverageError(
+      backupMode,
+      selectedServiceIds,
+      includeControlPlane
+    )
 
     setFieldErrors(errors)
     const firstInvalid = FIELD_ORDER.find((field) => errors[field])
@@ -222,9 +231,7 @@ export function CreateBackupSchedule() {
         enabled: form.enabled ?? true,
         tags: [],
         max_runtime_secs,
-        target_all_services: backupMode === 'all',
-        include_control_plane: includeControlPlane,
-        service_ids: backupMode === 'specific' ? selectedServiceIds : [],
+        ...coverageRequest(backupMode, selectedServiceIds, includeControlPlane),
       },
     })
   }
@@ -401,102 +408,34 @@ export function CreateBackupSchedule() {
           <div>
             <h2 className="font-semibold">Backup coverage</h2>
             <p className="text-sm text-muted-foreground">
-              Select the databases included in every run.
+              Choose what every run backs up.
             </p>
           </div>
-          <div className="grid gap-2">
-            <Label>Backup targets</Label>
-            <RadioGroup
-              value={backupMode}
-              onValueChange={(v) => {
-                if (v === 'all') clearFieldError('services')
-                setBackupMode(v as 'all' | 'specific')
-              }}
-              className="gap-4"
-            >
-              <div className="flex items-start space-x-3 space-y-0">
-                <RadioGroupItem value="all" id="mode-all" />
-                <div className="grid gap-1 leading-none">
-                  <Label
-                    htmlFor="mode-all"
-                    className="text-sm font-medium leading-none"
-                  >
-                    All databases (recommended)
-                  </Label>
-                  <p className="text-sm text-muted-foreground">
-                    Back up every database currently on the host — and any new
-                    database you create later, automatically.
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-start space-x-3 space-y-0">
-                <RadioGroupItem value="specific" id="mode-specific" />
-                <div className="grid gap-1 leading-none">
-                  <Label
-                    htmlFor="mode-specific"
-                    className="text-sm font-medium leading-none"
-                  >
-                    Specific databases
-                  </Label>
-                  <p className="text-sm text-muted-foreground">
-                    Pick the databases this schedule should back up. New
-                    databases are not included unless you attach them.
-                  </p>
-                </div>
-              </div>
-            </RadioGroup>
-            {backupMode === 'specific' && (
-              <div
-                id="schedule-services"
-                role="group"
-                aria-label="Databases to back up"
-                aria-invalid={fieldErrors.services ? true : undefined}
-                aria-describedby={
-                  fieldErrors.services ? 'schedule-services-error' : undefined
-                }
-                tabIndex={-1}
-                className="mt-2 rounded-md border p-2 aria-invalid:border-destructive"
-              >
-                <ScheduleServicesSelector
-                  value={selectedServiceIds}
-                  onChange={(next) => {
-                    clearFieldError('services')
-                    setSelectedServiceIds(next)
-                  }}
-                  disabled={createMutation.isPending}
-                />
-              </div>
-            )}
-            {backupMode === 'specific' && fieldErrors.services && (
-              <p
-                id="schedule-services-error"
-                className="text-sm font-medium text-destructive"
-              >
-                {fieldErrors.services}
-              </p>
-            )}
-            <div className="mt-3 flex items-start justify-between gap-3 rounded-md border p-3">
-              <div className="grid gap-1 leading-tight">
-                <Label
-                  htmlFor="include-control-plane"
-                  className="text-sm font-medium"
-                >
-                  Also back up the Temps control plane
-                </Label>
-                <p className="text-xs text-muted-foreground">
-                  Includes Temps&apos;s own database (users, projects, service
-                  configs, audit logs, error groups). Recommended unless you use
-                  Temps purely as a backup orchestrator for external databases.
-                </p>
-              </div>
-              <Switch
-                id="include-control-plane"
-                checked={includeControlPlane}
-                onCheckedChange={setIncludeControlPlane}
+          <BackupCoverageOptions
+            idPrefix=""
+            mode={backupMode}
+            onModeChange={(mode) => {
+              clearFieldError('services')
+              setBackupMode(mode)
+            }}
+            includeControlPlane={includeControlPlane}
+            onIncludeControlPlaneChange={(include) => {
+              clearFieldError('services')
+              setIncludeControlPlane(include)
+            }}
+            error={fieldErrors.services}
+            disabled={createMutation.isPending}
+            servicesSelector={
+              <ScheduleServicesSelector
+                value={selectedServiceIds}
+                onChange={(next) => {
+                  clearFieldError('services')
+                  setSelectedServiceIds(next)
+                }}
                 disabled={createMutation.isPending}
               />
-            </div>
-          </div>
+            }
+          />
 
           <div className="grid gap-2">
             <Label htmlFor="max-runtime">Max runtime (hours)</Label>

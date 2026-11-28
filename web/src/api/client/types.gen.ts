@@ -57322,6 +57322,10 @@ export type DetachScheduleServiceData = {
 
 export type DetachScheduleServiceErrors = {
     /**
+     * Detaching would leave the schedule with nothing to back up
+     */
+    400: ProblemDetails;
+    /**
      * Unauthorized
      */
     401: ProblemDetails;

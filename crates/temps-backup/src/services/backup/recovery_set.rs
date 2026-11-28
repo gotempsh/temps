@@ -598,6 +598,45 @@ mod tests {
         );
     }
 
+    /// A control-plane-only run has no service backups and expects none: its
+    /// coverage matches, so publication goes on to the destination (here the
+    /// source row is missing, which stops it before any S3 call) instead of
+    /// treating the run as incomplete or empty.
+    #[tokio::test]
+    async fn recovery_set_accepts_a_run_with_only_the_control_plane() {
+        let mut control_plane = make_test_backup_model(140);
+        control_plane.schedule_id = Some(9);
+        control_plane.schedule_run_id = Some(90);
+        control_plane.s3_source_id = 33;
+        control_plane.metadata = serde_json::json!({
+            "engine": "control_plane",
+            "expected_service_ids": []
+        })
+        .to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![control_plane.clone()]])
+                .append_query_results(vec![vec![control_plane]])
+                .append_query_results(vec![Vec::<temps_entities::s3_sources::Model>::new()])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let error = service
+            .publish_recovery_set_if_complete(140)
+            .await
+            .expect_err("the mock has no S3 source to publish to");
+
+        match error {
+            BackupError::NotFound { resource, detail } => {
+                assert_eq!(resource, "S3Source");
+                assert!(detail.contains("33"), "{detail}");
+            }
+            other => panic!("expected the run to reach publication, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn recovery_set_publication_is_idempotent() {
         let mut control_plane = make_test_backup_model(130);

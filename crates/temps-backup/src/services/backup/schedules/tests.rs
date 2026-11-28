@@ -1029,19 +1029,39 @@ async fn integration_create_weekly_specific_schedule_without_control_plane() {
     assert_eq!(memberships[0].service_id, database.id);
 }
 
+/// A mock database for `detach_service_from_schedule`: the locked schedule
+/// row, then the membership delete affecting `rows_affected` rows.
+fn detach_mock(schedule: Option<backup_schedules::Model>, rows_affected: u64) -> MockDatabase {
+    MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results(vec![schedule.into_iter().collect::<Vec<_>>()])
+        .append_exec_results(vec![MockExecResult {
+            last_insert_id: 0,
+            rows_affected,
+        }])
+}
+
+fn specific_schedule(id: i32, include_control_plane: bool) -> backup_schedules::Model {
+    backup_schedules::Model {
+        target_all_services: false,
+        include_control_plane,
+        ..make_test_schedule(id, 1)
+    }
+}
+
+/// The SQL statements of the one transaction `db` ran.
+fn transaction_statements(db: Arc<sea_orm::DatabaseConnection>) -> Vec<String> {
+    let log = Arc::try_unwrap(db)
+        .expect("the service should release the mock database")
+        .into_transaction_log();
+    log.iter()
+        .flat_map(|txn| txn.statements().iter().map(|stmt| stmt.sql.clone()))
+        .collect()
+}
+
 #[tokio::test]
 async fn detach_service_returns_false_when_no_row() {
-    let db = Arc::new(
-        MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results(vec![MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 0,
-            }])
-            .into_connection(),
-    );
-    let Ok(svc) = build_service_for_mock(db) else {
-        return;
-    };
+    let db = Arc::new(detach_mock(Some(make_test_schedule(1, 1)), 0).into_connection());
+    let svc = make_scope_test_service(db);
 
     let removed = svc
         .detach_service_from_schedule(1, 2)
@@ -1052,22 +1072,118 @@ async fn detach_service_returns_false_when_no_row() {
 
 #[tokio::test]
 async fn detach_service_returns_true_when_removed() {
-    let db = Arc::new(
-        MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results(vec![MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
-            .into_connection(),
-    );
-    let Ok(svc) = build_service_for_mock(db) else {
-        return;
-    };
+    let db = Arc::new(detach_mock(Some(make_test_schedule(1, 1)), 1).into_connection());
+    let svc = make_scope_test_service(db);
 
     let removed = svc
         .detach_service_from_schedule(1, 2)
         .await
         .expect("detach should succeed");
+    assert!(removed);
+}
+
+#[tokio::test]
+async fn detach_from_unknown_schedule_is_not_found() {
+    let db = Arc::new(detach_mock(None, 0).into_connection());
+    let svc = make_scope_test_service(db);
+
+    let error = svc
+        .detach_service_from_schedule(404, 2)
+        .await
+        .expect_err("an unknown schedule must not report a silent no-op");
+    match error {
+        BackupError::NotFound { resource, detail } => {
+            assert_eq!(resource, "BackupSchedule");
+            assert!(
+                detail.contains("404") && detail.contains("service 2"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+/// Detaching the last database of a schedule that also backs up the control
+/// plane leaves a valid control-plane-only schedule; no count is needed.
+#[tokio::test]
+async fn detach_last_service_keeps_a_control_plane_only_schedule() {
+    let db = Arc::new(detach_mock(Some(specific_schedule(3, true)), 1).into_connection());
+    let svc = make_scope_test_service(db.clone());
+
+    let removed = svc
+        .detach_service_from_schedule(3, 7)
+        .await
+        .expect("the schedule still backs up the control plane");
+    assert!(removed);
+
+    drop(svc);
+    let statements = transaction_statements(db);
+    assert!(statements[1].contains("FOR UPDATE"), "{statements:?}");
+    assert_eq!(statements.last().map(String::as_str), Some("COMMIT"));
+}
+
+/// Without the control plane, detaching the last database would leave a
+/// schedule that backs up nothing: refused, and the delete rolled back.
+#[tokio::test]
+async fn detach_last_service_without_control_plane_is_refused() {
+    let no_memberships_left =
+        std::collections::BTreeMap::from([("num_items", sea_orm::Value::BigInt(Some(0)))]);
+    let db = Arc::new(
+        detach_mock(Some(specific_schedule(4, false)), 1)
+            .append_query_results(vec![vec![no_memberships_left]])
+            .into_connection(),
+    );
+    let svc = make_scope_test_service(db.clone());
+
+    let error = svc
+        .detach_service_from_schedule(4, 7)
+        .await
+        .expect_err("the schedule would back up nothing");
+    match &error {
+        BackupError::ScheduleHasNoTargets {
+            schedule,
+            operation,
+        } => {
+            assert_eq!(schedule, "id 4");
+            assert_eq!(operation, "detach service 7 from");
+        }
+        other => panic!("expected ScheduleHasNoTargets, got {other:?}"),
+    }
+    assert!(
+        error.to_string().contains("would back up nothing"),
+        "{error}"
+    );
+
+    drop(svc);
+    let statements = transaction_statements(db);
+    assert_eq!(
+        statements.last().map(String::as_str),
+        Some("ROLLBACK"),
+        "{statements:?}"
+    );
+    assert!(
+        statements.iter().all(|sql| sql != "COMMIT"),
+        "{statements:?}"
+    );
+}
+
+/// Detaching one of several databases from a schedule without the control
+/// plane still leaves something to back up.
+#[tokio::test]
+async fn detach_one_of_several_services_without_control_plane_is_allowed() {
+    let one_membership_left =
+        std::collections::BTreeMap::from([("num_items", sea_orm::Value::BigInt(Some(1)))]);
+    let db = Arc::new(
+        detach_mock(Some(specific_schedule(5, false)), 1)
+            .append_query_results(vec![vec![one_membership_left]])
+            .into_connection(),
+    );
+    let svc = make_scope_test_service(db);
+
+    let removed = svc
+        .detach_service_from_schedule(5, 7)
+        .await
+        .expect("another database is still attached");
     assert!(removed);
 }
 
@@ -1601,11 +1717,20 @@ async fn create_rejects_empty_fan_out() {
         .create_backup_schedule(request, temps_core::BackupScheduleAuthority::InstanceAdmin)
         .await
         .expect_err("empty fan-out must be rejected");
-    assert!(
-        matches!(err, BackupError::Validation(ref msg) if msg.contains("control plane")),
-        "expected Validation error mentioning control plane, got {:?}",
-        err
-    );
+    match err {
+        BackupError::ScheduleHasNoTargets {
+            ref schedule,
+            ref operation,
+        } => {
+            assert_eq!(schedule, "'bad'");
+            assert_eq!(operation, "create");
+            assert!(
+                err.to_string().contains("Turn on the control plane"),
+                "{err}"
+            );
+        }
+        other => panic!("expected ScheduleHasNoTargets, got {other:?}"),
+    }
 }
 
 /// The daily base-backup cron expression used by the auto-provisioner
@@ -1882,4 +2007,207 @@ async fn backups_of_a_schedule_are_listed_a_page_at_a_time() {
         service.list_backups_for_schedule(5, page).await,
         Err(BackupError::NotFound { .. })
     ));
+}
+
+// ── Control-plane-only schedules ────────────────────────────────────────
+
+fn control_plane_only_update(
+    target_all_services: Option<bool>,
+    include_control_plane: Option<bool>,
+    service_ids: Option<Vec<i32>>,
+) -> UpdateBackupScheduleRequest {
+    UpdateBackupScheduleRequest {
+        name: None,
+        description: None,
+        schedule_expression: None,
+        retention_period: None,
+        max_runtime_secs: None,
+        enabled: None,
+        tags: None,
+        target_all_services,
+        include_control_plane,
+        service_ids,
+    }
+}
+
+/// A schedule that backs up only the control plane (no databases) can be
+/// created, an existing schedule can be switched to it, and its last
+/// database can be detached; turning the control plane off on it is refused
+/// because the schedule would then back up nothing.
+#[tokio::test]
+async fn integration_control_plane_only_schedule_create_update_and_detach() {
+    if bollard::Docker::connect_with_local_defaults().is_err() {
+        println!("Docker not available, skipping test");
+        return;
+    }
+    use sea_orm::ActiveValue::Set;
+    use temps_test_utils::TestDatabase;
+
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(database) => database,
+        Err(error) => {
+            println!("TestDatabase unavailable, skipping: {error}");
+            return;
+        }
+    };
+    let db = test_db.db.clone();
+
+    let s3_source = temps_entities::s3_sources::ActiveModel {
+        name: Set("control-plane-only-source".to_string()),
+        bucket_name: Set("control-plane-only-bucket".to_string()),
+        bucket_path: Set("/".to_string()),
+        access_key_id: Set(String::new()),
+        secret_key: Set(String::new()),
+        region: Set("us-east-1".to_string()),
+        force_path_style: Set(Some(true)),
+        is_default: Set(true),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert S3 source");
+    let database = temps_entities::external_services::ActiveModel {
+        name: Set("app-database".to_string()),
+        service_type: Set("postgres".to_string()),
+        status: Set("running".to_string()),
+        topology: Set("standalone".to_string()),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .expect("insert database");
+
+    let service = BackupService::new(
+        db.clone(),
+        create_mock_external_service_manager(db.clone()),
+        create_mock_alarm_service(),
+        create_mock_config_service(),
+        Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+        Arc::new(NoopJobQueue),
+    );
+    let memberships = |schedule_id: i32| {
+        let db = db.clone();
+        async move {
+            temps_entities::backup_schedule_services::Entity::find()
+                .filter(
+                    temps_entities::backup_schedule_services::Column::ScheduleId.eq(schedule_id),
+                )
+                .count(db.as_ref())
+                .await
+                .expect("count schedule memberships")
+        }
+    };
+
+    // Create: no databases, control plane on.
+    let mut request = nv1_create_request(Some(false), Some(true), vec![]);
+    request.s3_source_id = Some(s3_source.id);
+    request.name = "Control plane every hour".to_string();
+    let control_plane_only = service
+        .create_backup_schedule(request, temps_core::BackupScheduleAuthority::InstanceAdmin)
+        .await
+        .expect("a control-plane-only schedule is valid");
+    assert!(!control_plane_only.target_all_services);
+    assert!(control_plane_only.include_control_plane);
+    assert_eq!(memberships(control_plane_only.id).await, 0);
+
+    // Turning the control plane off on it leaves nothing: refused, unchanged.
+    let error = service
+        .update_backup_schedule(
+            control_plane_only.id,
+            control_plane_only_update(None, Some(false), None),
+            temps_core::BackupScheduleAuthority::InstanceAdmin,
+        )
+        .await
+        .expect_err("a schedule that backs up nothing is refused");
+    assert!(
+        matches!(error, BackupError::ScheduleHasNoTargets { ref operation, .. } if operation == "update"),
+        "{error:?}"
+    );
+    let reloaded = service
+        .get_backup_schedule(control_plane_only.id)
+        .await
+        .expect("reload schedule");
+    assert!(reloaded.include_control_plane);
+
+    // Update: an "all databases" schedule switched to control plane only.
+    let mut request = nv1_create_request(Some(true), Some(true), vec![]);
+    request.s3_source_id = Some(s3_source.id);
+    request.name = "Everything nightly".to_string();
+    let everything = service
+        .create_backup_schedule(request, temps_core::BackupScheduleAuthority::InstanceAdmin)
+        .await
+        .expect("create all-databases schedule");
+    let switched = service
+        .update_backup_schedule(
+            everything.id,
+            control_plane_only_update(Some(false), Some(true), Some(vec![])),
+            temps_core::BackupScheduleAuthority::InstanceAdmin,
+        )
+        .await
+        .expect("switching to control plane only is valid");
+    assert!(!switched.target_all_services);
+    assert!(switched.include_control_plane);
+    assert_eq!(memberships(everything.id).await, 0);
+
+    // Update: a specific-database schedule with the control plane can drop
+    // its last database through PATCH ...
+    let mut request = nv1_create_request(Some(false), Some(true), vec![database.id]);
+    request.s3_source_id = Some(s3_source.id);
+    request.name = "Database and control plane".to_string();
+    let with_database = service
+        .create_backup_schedule(request, temps_core::BackupScheduleAuthority::InstanceAdmin)
+        .await
+        .expect("create specific schedule");
+    service
+        .update_backup_schedule(
+            with_database.id,
+            control_plane_only_update(None, None, Some(vec![])),
+            temps_core::BackupScheduleAuthority::InstanceAdmin,
+        )
+        .await
+        .expect("dropping the last database keeps the control plane");
+    assert_eq!(memberships(with_database.id).await, 0);
+
+    // ... and through the detach endpoint.
+    service
+        .attach_services_to_schedule(with_database.id, &[database.id])
+        .await
+        .expect("re-attach database");
+    let removed = service
+        .detach_service_from_schedule(with_database.id, database.id)
+        .await
+        .expect("detaching the last database keeps the control plane");
+    assert!(removed);
+    assert_eq!(memberships(with_database.id).await, 0);
+
+    // Without the control plane, the last database stays attached.
+    let mut request = nv1_create_request(Some(false), Some(false), vec![database.id]);
+    request.s3_source_id = Some(s3_source.id);
+    request.name = "Database only".to_string();
+    let database_only = service
+        .create_backup_schedule(request, temps_core::BackupScheduleAuthority::InstanceAdmin)
+        .await
+        .expect("create database-only schedule");
+    let error = service
+        .detach_service_from_schedule(database_only.id, database.id)
+        .await
+        .expect_err("detaching the only target is refused");
+    assert!(
+        matches!(error, BackupError::ScheduleHasNoTargets { .. }),
+        "{error:?}"
+    );
+    assert_eq!(memberships(database_only.id).await, 1);
+    let error = service
+        .update_backup_schedule(
+            database_only.id,
+            control_plane_only_update(None, None, Some(vec![])),
+            temps_core::BackupScheduleAuthority::InstanceAdmin,
+        )
+        .await
+        .expect_err("clearing the only target is refused");
+    assert!(
+        matches!(error, BackupError::ScheduleHasNoTargets { .. }),
+        "{error:?}"
+    );
+    assert_eq!(memberships(database_only.id).await, 1);
 }
