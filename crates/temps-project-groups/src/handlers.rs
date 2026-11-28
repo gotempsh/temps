@@ -22,7 +22,7 @@ use temps_core::{
     AuditContext, AuditLogger, AuditOperation, ProjectAccessChecker, RequestMetadata,
 };
 use temps_entities::{project_group_env_vars, project_group_routes, project_groups, projects};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::env_vars::{CreateGroupEnvVarRequest, GroupEnvVarService, UpdateGroupEnvVarRequest};
 use crate::error::ProjectGroupError;
@@ -34,8 +34,8 @@ use crate::routes::{
     CreateGroupRouteRequest, GroupRouteEnvironment, GroupRouteResponse, GroupRouteService,
 };
 use crate::service::{
-    CreateProjectGroupRequest, LateMemberAuthorizer, ProjectGroupService, ProjectGroupWithMembers,
-    UpdateProjectGroupRequest,
+    CreateProjectGroupRequest, ExistingMembership, LateMemberAuthorizer, ProjectGroupService,
+    ProjectGroupWithMembers, UpdateProjectGroupRequest,
 };
 
 #[derive(Clone)]
@@ -265,6 +265,28 @@ pub struct ProjectGroupListResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProjectGroupMembershipResponse {
     pub group: Option<ProjectGroupResponse>,
+}
+
+/// How to place a project that already belongs to another group.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct PlaceProjectQuery {
+    /// Move a project that already belongs to another group out of it (that
+    /// group's routes involving it are dropped). Without it, placing such a
+    /// project is refused with a 409 naming its group.
+    #[serde(default, rename = "move")]
+    #[param(rename = "move")]
+    pub move_existing: bool,
+}
+
+impl PlaceProjectQuery {
+    fn existing_membership(&self) -> ExistingMembership {
+        if self.move_existing {
+            ExistingMembership::Move
+        } else {
+            ExistingMembership::Refuse
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -764,13 +786,14 @@ pub async fn list_project_groups(
     tag = "Project Groups",
     post,
     path = "/project-groups",
+    params(PlaceProjectQuery),
     request_body = CreateProjectGroupRequest,
     responses(
         (status = 201, description = "Project group created", body = ProjectGroupResponse),
         (status = 400, description = "Validation error"),
         (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "A listed project does not exist, or a route dropped by moving a listed project involves a service the caller cannot see"),
-        (status = 409, description = "Slug already taken, or a listed project gained a route or changed group while the request was being authorized; retry"),
+        (status = 404, description = "A listed project does not exist, or (with move=true) a route dropped by moving a listed project involves a service the caller cannot see"),
+        (status = 409, description = "Slug already taken; a listed project already belongs to another group and move=true was not passed (the detail names the group); or a listed project gained a route or changed group while the request was being authorized; retry"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -778,6 +801,7 @@ pub async fn create_project_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<ProjectGroupsAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    Query(query): Query<PlaceProjectQuery>,
     Json(req): Json<CreateProjectGroupRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     reject_deployment_token(&auth)?;
@@ -791,20 +815,26 @@ pub async fn create_project_group(
         );
     }
 
-    // A listed project that is already in another group is moved out of it,
-    // and that group's routes involving it are dropped. Authorize those the
-    // way deleting them would be.
+    // With move=true, a listed project that is already in another group is
+    // moved out of it, and that group's routes involving it are dropped.
+    // Authorize those the way deleting them would be. Without it such a
+    // project is refused, so nothing is dropped.
     let hidden = hidden_projects(&state, &auth).await?;
-    let dropping = state
-        .service
-        .routes_dropped_by_leaving_group(&req.project_ids, None)
-        .await?;
-    let authorized =
-        authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
+    let existing = query.existing_membership();
+    let authorized = match existing {
+        ExistingMembership::Move => {
+            let dropping = state
+                .service
+                .routes_dropped_by_leaving_group(&req.project_ids, None)
+                .await?;
+            authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?
+        }
+        ExistingMembership::Refuse => HashSet::new(),
+    };
 
     let (created, dropped) = state
         .service
-        .create_group_checked(req, Some(&authorized))
+        .create_group_checked(req, Some(&authorized), existing)
         .await?;
     let mut audit = ProjectGroupAudit::new(
         "PROJECT_GROUP_CREATED",
@@ -1013,12 +1043,13 @@ pub async fn delete_project_group(
     params(
         ("group_id" = i32, Path, description = "Project group ID"),
         ("project_id" = i32, Path, description = "Project ID"),
+        PlaceProjectQuery,
     ),
     responses(
-        (status = 200, description = "Project placed in the group (moved out of any other group)", body = ProjectGroupResponse),
+        (status = 200, description = "Project placed in the group (or already in it); with move=true, moved out of any other group", body = ProjectGroupResponse),
         (status = 403, description = "Insufficient permissions on the project, or on the group's projects: joining gives it their shared variables, so it requires managing them; or no ProjectsWrite on a service whose route to or from the project is dropped by leaving its previous group"),
         (status = 404, description = "Project group or project not found, or a route that would be dropped involves a service the caller cannot see"),
-        (status = 409, description = "A route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict"),
+        (status = 409, description = "The project already belongs to another group and move=true was not passed (the detail names the group); or a route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1027,6 +1058,7 @@ pub async fn add_project_to_group(
     State(state): State<Arc<ProjectGroupsAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path((group_id, project_id)): Path<(i32, i32)>,
+    Query(query): Query<PlaceProjectQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     reject_deployment_token(&auth)?;
     project_permission_guard!(
@@ -1051,14 +1083,20 @@ pub async fn add_project_to_group(
     let authorized_members: HashSet<i32> = group.members.iter().map(|p| p.id).collect();
     let hidden = hidden_projects(&state, &auth).await?;
 
-    // Moving out of another group drops that group's routes involving the
-    // project; deleting those takes ProjectsWrite on both of their ends.
-    let dropping = state
-        .service
-        .routes_dropped_by_leaving_group(&[project_id], Some(group_id))
-        .await?;
-    let authorized =
-        authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?;
+    // Moving out of another group (move=true) drops that group's routes
+    // involving the project; deleting those takes ProjectsWrite on both of
+    // their ends. Without move=true such a placement is refused instead.
+    let existing = query.existing_membership();
+    let authorized = match existing {
+        ExistingMembership::Move => {
+            let dropping = state
+                .service
+                .routes_dropped_by_leaving_group(&[project_id], Some(group_id))
+                .await?;
+            authorize_route_drops(&auth, &state.project_access_checker, &hidden, &dropping).await?
+        }
+        ExistingMembership::Refuse => HashSet::new(),
+    };
 
     // A project that joined the group while this request was being authorized
     // (typically a concurrent placement) is checked again under the group
@@ -1075,6 +1113,7 @@ pub async fn add_project_to_group(
             &authorized,
             &authorized_members,
             &late_members,
+            existing,
         )
         .await?;
     let previous = placement.previous_group_id;

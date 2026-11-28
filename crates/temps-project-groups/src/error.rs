@@ -22,6 +22,27 @@ pub enum ProjectGroupError {
     #[error("Project group slug '{slug}' is already taken")]
     SlugConflict { slug: String },
 
+    /// A project belongs to at most one group. Placing one that is already in
+    /// another group moves it only when the caller asks (`move=true`), since
+    /// the move drops that group's routes and variables for it.
+    #[error(
+        "Project {project_id} already belongs to project group {group_id} ('{group_name}'); \
+         remove it from that group first, or pass move=true to move it"
+    )]
+    AlreadyInGroup {
+        project_id: i32,
+        group_id: i32,
+        group_name: String,
+    },
+
+    /// A group variable scoped to an environment no member project has.
+    #[error("No project in project group {group_id} has an environment '{slug}'; {available}")]
+    UnknownEnvironmentSlug {
+        group_id: i32,
+        slug: String,
+        available: String,
+    },
+
     #[error("Validation error: {message}")]
     Validation { message: String },
 
@@ -269,6 +290,18 @@ impl From<ProjectGroupError> for Problem {
             ProjectGroupError::SlugConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Slug Already Taken")
                 .with_detail(error.to_string()),
+
+            ProjectGroupError::AlreadyInGroup { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type("https://temps.sh/probs/project-already-in-group")
+                .with_title("Project Already In A Group")
+                .with_detail(error.to_string()),
+
+            ProjectGroupError::UnknownEnvironmentSlug { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_type("https://temps.sh/probs/unknown-environment-slug")
+                    .with_title("Unknown Environment")
+                    .with_detail(error.to_string())
+            }
 
             ProjectGroupError::RouteConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Route Already Exists")

@@ -14,11 +14,11 @@ use std::sync::Arc;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, Set, SqlErr, TransactionTrait,
+    QueryOrder, QuerySelect, Set, SqlErr, TransactionTrait,
 };
 use serde::Deserialize;
 use temps_core::EncryptionService;
-use temps_entities::{environments, project_group_env_vars};
+use temps_entities::{environments, project_group_env_vars, project_group_members};
 use utoipa::ToSchema;
 
 use crate::error::ProjectGroupError;
@@ -35,7 +35,9 @@ pub struct CreateGroupEnvVarRequest {
     #[serde(default)]
     pub is_secret: bool,
     /// Environment slug (e.g. `production`, `staging`) this applies to.
-    /// Omit to apply to every environment.
+    /// Omit to apply to every environment. When the group has projects, at
+    /// least one of them must have an environment with this slug (a 400
+    /// names the slugs they do have); an empty group accepts any valid slug.
     pub environment_slug: Option<String>,
     /// Whether an unscoped variable also reaches preview environments.
     /// Defaults to `false` — opt-in, matching the per-service variable default
@@ -92,6 +94,61 @@ fn normalize_scope(slug: Option<String>) -> Result<Option<String>, ProjectGroupE
         });
     }
     Ok(Some(slug))
+}
+
+/// Most environment slugs listed when a scope matches none of them.
+const MAX_LISTED_SLUGS: usize = 20;
+
+/// Refuses a scope no member of `group_id` can ever match. A group with no
+/// members accepts any slug: the projects that will join are not known yet.
+async fn ensure_scope_exists<C: ConnectionTrait>(
+    conn: &C,
+    group_id: i32,
+    slug: &str,
+) -> Result<(), ProjectGroupError> {
+    let members: Vec<i32> = project_group_members::Entity::find()
+        .select_only()
+        .column(project_group_members::Column::ProjectId)
+        .filter(project_group_members::Column::GroupId.eq(group_id))
+        .into_tuple()
+        .all(conn)
+        .await
+        .map_err(ProjectGroupError::db(format!(
+            "loading the projects of project group {group_id}"
+        )))?;
+    if members.is_empty() {
+        return Ok(());
+    }
+    let mut slugs: Vec<String> = environments::Entity::find()
+        .select_only()
+        .column(environments::Column::Slug)
+        .filter(environments::Column::ProjectId.is_in(members))
+        .filter(environments::Column::DeletedAt.is_null())
+        .distinct()
+        .into_tuple()
+        .all(conn)
+        .await
+        .map_err(ProjectGroupError::db(format!(
+            "loading the environments of the projects in project group {group_id}"
+        )))?;
+    if slugs.iter().any(|existing| existing == slug) {
+        return Ok(());
+    }
+    slugs.sort();
+    let available = match slugs.len() {
+        0 => "its projects have no environments yet".to_string(),
+        n if n > MAX_LISTED_SLUGS => format!(
+            "its projects have: {}, and {} more",
+            slugs[..MAX_LISTED_SLUGS].join(", "),
+            n - MAX_LISTED_SLUGS
+        ),
+        _ => format!("its projects have: {}", slugs.join(", ")),
+    };
+    Err(ProjectGroupError::UnknownEnvironmentSlug {
+        group_id,
+        slug: slug.to_string(),
+        available,
+    })
 }
 
 pub use temps_entities::project_group_env_vars::select_inherited;
@@ -243,6 +300,9 @@ impl GroupEnvVarService {
     ) -> Result<project_group_env_vars::Model, ProjectGroupError> {
         let key = validate_key(&req.key)?;
         let environment_slug = normalize_scope(req.environment_slug)?;
+        if let Some(slug) = environment_slug.as_deref() {
+            ensure_scope_exists(conn, group_id, slug).await?;
+        }
         let encrypted = self.encrypt(group_id, &key, &req.value)?;
         let now = Utc::now();
         let scope_label = environment_slug
@@ -576,6 +636,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(dup, ProjectGroupError::EnvVarConflict { .. }));
+
+        // #2105: a scope none of the group's projects has can never apply.
+        let unknown = svc
+            .create(group.group.id, add("REGION", "eu", Some("nope"), false))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&unknown, ProjectGroupError::UnknownEnvironmentSlug { slug, .. } if slug == "nope"),
+            "{unknown:?}"
+        );
+        let message = unknown.to_string();
+        assert!(message.contains("'nope'"), "{message}");
+        assert!(message.contains("pr-7, production"), "{message}");
+        // An empty group cannot know its future projects' environments.
+        let empty = groups
+            .create_group(CreateProjectGroupRequest {
+                name: "Empty".into(),
+                slug: None,
+                description: None,
+                project_ids: Vec::new(),
+            })
+            .await
+            .unwrap();
+        svc.create(empty.group.id, add("REGION", "eu", Some("nope"), false))
+            .await
+            .expect("an empty group accepts any valid scope");
 
         let on_prod = inherited_env_vars(&conn, &encryption, 9701, &prod)
             .await

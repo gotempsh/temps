@@ -94,6 +94,17 @@ pub(crate) struct LockedFollowers {
     pub(crate) followers: Vec<projects::Model>,
 }
 
+/// What to do with a project that is already in another group when it is
+/// placed in this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingMembership {
+    /// Move it, dropping the routes of its old group that involve it.
+    Move,
+    /// Refuse with [`ProjectGroupError::AlreadyInGroup`]; the API default, so
+    /// a client managing two groups is told instead of seeing one drift.
+    Refuse,
+}
+
 /// What a set of projects is in right now, and what leaving it would drop.
 struct LeavingState {
     /// `project_id -> group_id` for every listed project that has a
@@ -508,7 +519,10 @@ impl ProjectGroupService {
         &self,
         req: CreateProjectGroupRequest,
     ) -> Result<ProjectGroupWithMembers, ProjectGroupError> {
-        Ok(self.create_group_checked(req, None).await?.0)
+        Ok(self
+            .create_group_checked(req, None, ExistingMembership::Move)
+            .await?
+            .0)
     }
 
     /// Like [`Self::create_group`], for callers that authorized the routes a
@@ -523,6 +537,7 @@ impl ProjectGroupService {
         &self,
         req: CreateProjectGroupRequest,
         authorized_route_ids: Option<&HashSet<i32>>,
+        existing: ExistingMembership,
     ) -> Result<(ProjectGroupWithMembers, Vec<project_group_routes::Model>), ProjectGroupError>
     {
         let name = Self::validate_name(&req.name)?;
@@ -562,6 +577,14 @@ impl ProjectGroupService {
                 current_group,
                 dropped_routes,
             } = Self::leaving_state(&txn, &project_ids, None, true).await?;
+            if existing == ExistingMembership::Refuse {
+                if let Some((&project_id, &group_id)) = project_ids
+                    .iter()
+                    .find_map(|id| current_group.get_key_value(id))
+                {
+                    return Err(Self::already_in_group(&txn, project_id, group_id).await);
+                }
+            }
             Self::ensure_routes_authorized(&dropped_routes, authorized_route_ids)?;
             let now = Utc::now();
             let group = project_groups::ActiveModel {
@@ -1107,13 +1130,32 @@ impl ProjectGroupService {
     /// Moving a project out of a group deletes that group's routes involving
     /// it; callers that expose this to users must authorize those routes
     /// first and use [`Self::add_project_checked`].
+    /// [`ProjectGroupError::AlreadyInGroup`] for `project_id` in `group_id`,
+    /// with the group's name (or `?` when it cannot be read: the conflict is
+    /// the answer either way).
+    async fn already_in_group<C: ConnectionTrait>(
+        db: &C,
+        project_id: i32,
+        group_id: i32,
+    ) -> ProjectGroupError {
+        let group_name = match project_groups::Entity::find_by_id(group_id).one(db).await {
+            Ok(Some(group)) => group.name,
+            Ok(None) | Err(_) => "?".to_string(),
+        };
+        ProjectGroupError::AlreadyInGroup {
+            project_id,
+            group_id,
+            group_name,
+        }
+    }
+
     pub async fn add_project(
         &self,
         group_id: i32,
         project_id: i32,
     ) -> Result<Option<i32>, ProjectGroupError> {
         Ok(self
-            .place_project(group_id, project_id, None, None)
+            .place_project(group_id, project_id, None, None, ExistingMembership::Move)
             .await?
             .previous_group_id)
     }
@@ -1142,6 +1184,7 @@ impl ProjectGroupService {
             project_id,
             Some(authorized_route_ids),
             Some(authorized_member_ids),
+            ExistingMembership::Move,
         )
         .await
     }
@@ -1164,6 +1207,7 @@ impl ProjectGroupService {
         authorized_route_ids: &HashSet<i32>,
         authorized_member_ids: &HashSet<i32>,
         late_members: &dyn LateMemberAuthorizer,
+        existing: ExistingMembership,
     ) -> Result<ProjectPlacement, ProjectGroupError> {
         let mut authorized = authorized_member_ids.clone();
         let mut rechecks = 0;
@@ -1174,6 +1218,7 @@ impl ProjectGroupService {
                     project_id,
                     Some(authorized_route_ids),
                     Some(&authorized),
+                    existing,
                 )
                 .await
             {
@@ -1212,6 +1257,7 @@ impl ProjectGroupService {
         project_id: i32,
         authorized_route_ids: Option<&HashSet<i32>>,
         authorized_member_ids: Option<&HashSet<i32>>,
+        existing: ExistingMembership,
     ) -> Result<ProjectPlacement, ProjectGroupError> {
         let txn = self
             .db
@@ -1271,6 +1317,9 @@ impl ProjectGroupService {
                         dropped_routes: Vec::new(),
                     });
                 }
+            }
+            if let (Some(m), ExistingMembership::Refuse) = (&previous, existing) {
+                return Err(Self::already_in_group(&txn, project_id, m.group_id).await);
             }
             let dropped_routes = match previous {
                 Some(ref m) => Self::routes_of_member(&txn, m.group_id, project_id).await?,
@@ -1856,6 +1905,100 @@ mod tests {
         );
         let membership = svc.group_for_project(9201).await.unwrap().unwrap();
         assert_eq!(membership.group.id, b.group.id);
+    }
+
+    /// #2105: placing a project that is already in another group is refused,
+    /// naming that group, unless the caller opts into the move.
+    #[tokio::test]
+    async fn placing_a_project_of_another_group_is_refused_unless_moving() {
+        let Some(db) = try_test_db().await else {
+            return;
+        };
+        let conn = db.connection_arc();
+        insert_project(conn.as_ref(), 9261, "web").await;
+        let svc = ProjectGroupService::new(conn);
+        let a = svc
+            .create_group(create_req("Platform", vec![9261]))
+            .await
+            .unwrap();
+
+        let refused = svc
+            .create_group_checked(
+                create_req("Zeta", vec![9261]),
+                Some(&HashSet::new()),
+                ExistingMembership::Refuse,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                ProjectGroupError::AlreadyInGroup { project_id: 9261, group_id, group_name }
+                    if *group_id == a.group.id && group_name == "Platform"
+            ),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains("move=true"), "{refused}");
+        // Nothing was created and the project stayed put.
+        assert!(matches!(
+            svc.get_group_by_slug("zeta").await,
+            Err(ProjectGroupError::SlugNotFound { .. })
+        ));
+        assert_eq!(ids(&svc.get_group(a.group.id).await.unwrap()), vec![9261]);
+
+        let b = svc.create_group(create_req("Zeta", vec![])).await.unwrap();
+        let allow = FixedLateMembers::new(true);
+        let refused = svc
+            .add_project_reauthorizing(
+                b.group.id,
+                9261,
+                &HashSet::new(),
+                &HashSet::new(),
+                &allow,
+                ExistingMembership::Refuse,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                ProjectGroupError::AlreadyInGroup {
+                    project_id: 9261,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(ids(&svc.get_group(a.group.id).await.unwrap()), vec![9261]);
+
+        // Placing it where it already is stays a no-op, not a conflict.
+        let same = svc
+            .add_project_reauthorizing(
+                a.group.id,
+                9261,
+                &HashSet::new(),
+                &HashSet::from([9261]),
+                &allow,
+                ExistingMembership::Refuse,
+            )
+            .await
+            .unwrap();
+        assert_eq!(same.previous_group_id, Some(a.group.id));
+
+        // Opting in moves it.
+        let moved = svc
+            .add_project_reauthorizing(
+                b.group.id,
+                9261,
+                &HashSet::new(),
+                &HashSet::new(),
+                &allow,
+                ExistingMembership::Move,
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.previous_group_id, Some(a.group.id));
+        assert!(svc.get_group(a.group.id).await.unwrap().members.is_empty());
     }
 
     #[tokio::test]
@@ -2559,7 +2702,11 @@ mod tests {
         let (svc, conn, old, [a, _b, _c], [ab, ca]) = grouped_with_routes(&db, 9751).await;
 
         let err = svc
-            .create_group_checked(create_req("Fresh", vec![a]), Some(&HashSet::new()))
+            .create_group_checked(
+                create_req("Fresh", vec![a]),
+                Some(&HashSet::new()),
+                ExistingMembership::Move,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ProjectGroupError::RouteSetChanged { .. }));
@@ -2572,7 +2719,11 @@ mod tests {
 
         let authorized: HashSet<i32> = [ab, ca].into_iter().collect();
         let (created, dropped) = svc
-            .create_group_checked(create_req("Fresh", vec![a]), Some(&authorized))
+            .create_group_checked(
+                create_req("Fresh", vec![a]),
+                Some(&authorized),
+                ExistingMembership::Move,
+            )
             .await
             .unwrap();
         assert_eq!(ids(&created), vec![a]);
@@ -2744,9 +2895,16 @@ mod tests {
             db: conn.clone(),
             lock_was_free: std::sync::Mutex::new(Vec::new()),
         };
-        svc.add_project_reauthorizing(group, joining, &HashSet::new(), &HashSet::new(), &probe)
-            .await
-            .expect("a late member the caller may manage does not refuse the placement");
+        svc.add_project_reauthorizing(
+            group,
+            joining,
+            &HashSet::new(),
+            &HashSet::new(),
+            &probe,
+            ExistingMembership::Move,
+        )
+        .await
+        .expect("a late member the caller may manage does not refuse the placement");
         assert_eq!(
             *probe.lock_was_free.lock().unwrap(),
             vec![true],
@@ -2783,6 +2941,7 @@ mod tests {
                 &HashSet::new(),
                 &HashSet::new(),
                 &FailingLateMembers,
+                ExistingMembership::Move,
             )
             .await
             .unwrap_err();
@@ -2838,6 +2997,7 @@ mod tests {
                     &HashSet::new(),
                     &checked,
                     allow.as_ref(),
+                    ExistingMembership::Move,
                 )
                 .await
             })
@@ -2854,7 +3014,14 @@ mod tests {
         // Without access to the members that joined, nothing changes.
         let deny = FixedLateMembers::new(false);
         let err = svc
-            .add_project_reauthorizing(group, third, &HashSet::new(), &checked, &deny)
+            .add_project_reauthorizing(
+                group,
+                third,
+                &HashSet::new(),
+                &checked,
+                &deny,
+                ExistingMembership::Move,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2884,8 +3051,22 @@ mod tests {
         let (checked, routes) = (HashSet::new(), HashSet::new());
         let allow = FixedLateMembers::new(true);
         let (ra, rb) = tokio::join!(
-            svc.add_project_reauthorizing(group, a, &routes, &checked, &allow),
-            svc.add_project_reauthorizing(group, b, &routes, &checked, &allow),
+            svc.add_project_reauthorizing(
+                group,
+                a,
+                &routes,
+                &checked,
+                &allow,
+                ExistingMembership::Move
+            ),
+            svc.add_project_reauthorizing(
+                group,
+                b,
+                &routes,
+                &checked,
+                &allow,
+                ExistingMembership::Move
+            ),
         );
         ra.expect("placing a");
         rb.expect("placing b");
@@ -2983,9 +3164,13 @@ mod tests {
         let a = {
             let svc = svc.clone();
             spawn_expecting_block("creating a group from an ungrouped project", async move {
-                svc.create_group_checked(create_req("Fresh 9811", vec![p]), Some(&HashSet::new()))
-                    .await
-                    .map(|(group, _)| group.group.id)
+                svc.create_group_checked(
+                    create_req("Fresh 9811", vec![p]),
+                    Some(&HashSet::new()),
+                    ExistingMembership::Move,
+                )
+                .await
+                .map(|(group, _)| group.group.id)
             })
             .await
         };
