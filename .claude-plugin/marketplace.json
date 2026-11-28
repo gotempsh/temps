@@ -1,0 +1,36 @@
+{
+  "name": "temps",
+  "description": "Agent skills for installing, deploying to and operating Temps, the self-hosted deployment platform.",
+  "owner": {
+    "name": "Temps Contributors"
+  },
+  "plugins": [
+    {
+      "name": "temps",
+      "displayName": "Temps",
+      "source": "./",
+      "description": "Install Temps on this computer or a server, then deploy, operate and instrument apps on it with the pinned Temps CLI.",
+      "author": {
+        "name": "Temps Contributors",
+        "url": "https://temps.sh"
+      },
+      "homepage": "https://temps.sh",
+      "repository": "https://github.com/gotempsh/temps",
+      "license": "MIT OR Apache-2.0",
+      "keywords": ["temps", "deployment", "self-hosted", "paas", "observability"],
+      "skills": [
+        "./skills/temps",
+        "./skills/temps-platform-setup",
+        "./skills/temps-cli",
+        "./skills/temps-best-practices",
+        "./skills/deploy-to-temps",
+        "./skills/add-custom-domain",
+        "./skills/add-error-tracking",
+        "./skills/add-node-sdk",
+        "./skills/add-react-analytics",
+        "./skills/add-session-recording",
+        "./skills/estimate-temps-savings"
+      ]
+    }
+  ]
+}

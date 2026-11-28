@@ -7,7 +7,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Select, Set, TransactionTrait,
 };
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use temps_config::ConfigService;
@@ -15,6 +15,10 @@ use temps_core::environment_address::{
     https_url, AddressKind, EnvironmentAddress, EnvironmentAddressSlot, EnvironmentAddresses,
 };
 use temps_core::log_transitions::{FailureLog, KeyedFailureLatch};
+use temps_core::uptime_monitor_ip_access::{
+    local_probe_destination, monitor_source_address, UptimeMonitorIpAccess,
+    UptimeMonitorIpAccessSlot,
+};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError, StatusCheckCompletedJob};
 use temps_entities::{
     cloudflare_access_providers, deployment_containers, deployments, environment_domains,
@@ -152,19 +156,71 @@ fn probe_url(
 /// to. Wildcard addresses describe where a listener binds, but are not valid
 /// destinations, so retain the configured address family and use its loopback
 /// address instead.
+///
+/// The same resolution decides which address the proxy sees the probe come
+/// from (see [`temps_core::uptime_monitor_ip_access`]).
 fn local_proxy_destination(listener: &str) -> Result<SocketAddr, StatusPageError> {
-    let address = listener.parse::<SocketAddr>().map_err(|error| {
+    local_probe_destination(listener).map_err(|error| {
         StatusPageError::InvalidRequest(format!(
             "Configured proxy listener '{listener}' is not a socket address: {error}"
         ))
-    })?;
+    })
+}
 
-    let ip = match address.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ip => ip,
-    };
-    Ok(SocketAddr::new(ip, address.port()))
+/// What a check can look up beyond the database. Each part is empty in a
+/// binary without the plugin that provides it, and the check then behaves
+/// as it did before that plugin existed.
+#[derive(Clone, Default)]
+pub(crate) struct ProbeLookups {
+    /// ADR 068 D4: which address to probe.
+    addresses: Option<Arc<dyn EnvironmentAddresses>>,
+    /// Whether the project's own IP access policy refuses the monitor.
+    ip_access: Option<Arc<dyn UptimeMonitorIpAccess>>,
+    /// Roots the local HTTPS follow-up trusts besides the system's. Always
+    /// empty outside tests, which serve it with a self-signed certificate.
+    tls_roots: Vec<reqwest::Certificate>,
+}
+
+impl ProbeLookups {
+    #[cfg(test)]
+    fn with_addresses(addresses: Arc<dyn EnvironmentAddresses>) -> Self {
+        Self {
+            addresses: Some(addresses),
+            ..Self::default()
+        }
+    }
+}
+
+/// The explanation for a 403 a managed probe got through the local proxy,
+/// when the cause is the project's own IP access policy refusing the address
+/// the probe connected from (`listener`'s). `None` when the policy lets that
+/// address in, so the 403 came from the app (or from something this cannot
+/// see), and when the policy cannot be read: the bare status is reported then.
+async fn ip_access_refusal(
+    ip_access: Option<&Arc<dyn UptimeMonitorIpAccess>>,
+    monitor_id: i32,
+    project_id: i32,
+    environment_id: i32,
+    listener: &str,
+) -> Option<String> {
+    let ip_access = ip_access?;
+    let source = monitor_source_address(listener)?;
+    match ip_access
+        .monitor_block(project_id, environment_id, &[source])
+        .await
+    {
+        Ok(block) => block.map(|block| block.message),
+        Err(error) => {
+            warn!(
+                monitor_id,
+                project_id,
+                environment_id,
+                %error,
+                "Could not tell whether the IP access policy refused the monitor; reporting the bare status"
+            );
+            None
+        }
+    }
 }
 
 /// Build a client whose URL, Host header, and TLS identity remain the public
@@ -570,6 +626,9 @@ pub struct HealthCheckService {
     /// ADR 068 D4: which address to probe, if any. Empty without the
     /// ingress plugin, where every monitor probes as before.
     environment_addresses: Option<Arc<EnvironmentAddressSlot>>,
+    /// Explains a managed check the project's own IP access policy refuses.
+    /// Filled by the proxy plugin; empty without it.
+    monitor_ip_access: Option<Arc<UptimeMonitorIpAccessSlot>>,
     /// Probes of monitors for targets outside Temps (ADR 108 D3, D4).
     target_checks: Arc<TargetChecks>,
 }
@@ -629,6 +688,7 @@ impl HealthCheckService {
             config_service,
             job_queue,
             environment_addresses: None,
+            monitor_ip_access: None,
             target_checks,
         })
     }
@@ -639,8 +699,18 @@ impl HealthCheckService {
         self
     }
 
-    fn addresses(&self) -> Option<Arc<dyn EnvironmentAddresses>> {
-        self.environment_addresses.as_ref().and_then(|s| s.get())
+    /// Explain checks the project's own IP access policy refuses.
+    pub fn with_monitor_ip_access(mut self, slot: Arc<UptimeMonitorIpAccessSlot>) -> Self {
+        self.monitor_ip_access = Some(slot);
+        self
+    }
+
+    fn lookups(&self) -> ProbeLookups {
+        ProbeLookups {
+            addresses: self.environment_addresses.as_ref().and_then(|s| s.get()),
+            ip_access: self.monitor_ip_access.as_ref().and_then(|s| s.get()),
+            tls_roots: Vec::new(),
+        }
     }
 
     /// Resolve a monitor's configured interval into the value the scheduler
@@ -838,7 +908,7 @@ impl HealthCheckService {
             let db = self.db.clone();
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
-            let addresses = self.addresses();
+            let lookups = self.lookups();
             let target_checks = self.target_checks.clone();
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
@@ -859,7 +929,7 @@ impl HealthCheckService {
                     config_service,
                     monitor,
                     job_queue,
-                    addresses,
+                    lookups,
                     target_checks,
                 )
                 .await
@@ -919,7 +989,7 @@ impl HealthCheckService {
                 self.config_service.clone(),
                 monitor,
                 self.job_queue.clone(),
-                self.addresses(),
+                self.lookups(),
             )
             .await?;
         }
@@ -933,12 +1003,11 @@ impl HealthCheckService {
         config_service: Arc<ConfigService>,
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
-        addresses: Option<Arc<dyn EnvironmentAddresses>>,
+        lookups: ProbeLookups,
         target_checks: Arc<TargetChecks>,
     ) -> Result<(), StatusPageError> {
         if MonitorCheckKind::from_stored(&monitor.check_kind) == MonitorCheckKind::Environment {
-            return Self::check_monitor_with(db, config_service, monitor, job_queue, addresses)
-                .await;
+            return Self::check_monitor_with(db, config_service, monitor, job_queue, lookups).await;
         }
         Self::check_target_monitor(&db, &monitor, &job_queue, &target_checks).await
     }
@@ -1018,7 +1087,14 @@ impl HealthCheckService {
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
     ) -> Result<(), StatusPageError> {
-        Self::check_monitor_with(db, config_service, monitor, job_queue, None).await
+        Self::check_monitor_with(
+            db,
+            config_service,
+            monitor,
+            job_queue,
+            ProbeLookups::default(),
+        )
+        .await
     }
 
     /// Check a single monitor
@@ -1027,8 +1103,13 @@ impl HealthCheckService {
         config_service: Arc<ConfigService>,
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
-        addresses: Option<Arc<dyn EnvironmentAddresses>>,
+        lookups: ProbeLookups,
     ) -> Result<(), StatusPageError> {
+        let ProbeLookups {
+            addresses,
+            ip_access,
+            tls_roots,
+        } = lookups;
         // NOTE: the monitor's slot is claimed by the *caller*, before this is
         // dispatched — `run_all_checks` via `claim_due_monitor` (a CAS that
         // also decides who probes), the single-monitor paths via
@@ -1298,10 +1379,12 @@ impl HealthCheckService {
             }
         }
 
-        let (probe_client, is_local_probe, local_tls_listener) = if let Some(client) =
+        let (probe_client, is_local_probe, local_tls_listener, probe_listener) = if let Some(
+            client,
+        ) =
             pinned_public_client
         {
-            (client, false, None)
+            (client, false, None, None)
         } else {
             let server_config = config_service.get_server_config();
             let Some(listener) = local_listener_for_url(
@@ -1331,7 +1414,12 @@ impl HealthCheckService {
                         proxy_listener = %listener,
                         "Routing managed health check through the configured local proxy"
                     );
-                    (client, true, server_config.tls_address.clone())
+                    (
+                        client,
+                        true,
+                        server_config.tls_address.clone(),
+                        Some(listener.to_string()),
+                    )
                 }
                 Err(error) => {
                     error!(
@@ -1363,6 +1451,11 @@ impl HealthCheckService {
         let mut total_response_time_ms = 0i32;
 
         for attempt in 0..=MAX_RETRIES {
+            // The listener this attempt's answer comes through: the probe's
+            // own, until an HTTPS follow-up below answers through the TLS
+            // listener. Reset every attempt, since each one starts again
+            // through `probe_client`.
+            let mut local_listener = probe_listener.clone();
             if attempt > 0 {
                 // Exponential backoff: 100ms, 200ms, 400ms, 800ms (capped at 2000ms)
                 let delay =
@@ -1454,7 +1547,11 @@ impl HealthCheckService {
                             )
                             .await;
                         };
-                        let tls_client = match local_proxy_client(&https_url, tls_listener) {
+                        let tls_client = match local_proxy_client_with_roots(
+                            &https_url,
+                            tls_listener,
+                            &tls_roots,
+                        ) {
                             Ok(client) => client,
                             Err(error) => {
                                 return Self::record_check(
@@ -1485,6 +1582,9 @@ impl HealthCheckService {
                                     attempts = tls_attempts,
                                     "Local HTTPS proxy follow-up completed"
                                 );
+                                // The answer that counts came through the
+                                // TLS listener, from its address.
+                                local_listener = Some(tls_listener.to_string());
                                 response
                             }
                             Err(error) => {
@@ -1572,12 +1672,36 @@ impl HealthCheckService {
                         attempt + 1
                     );
 
+                    // The proxy refuses an address its IP access policy does
+                    // not admit with a bare 403 and must keep doing so for
+                    // outsiders. A managed probe knows where it connects
+                    // from, so it can tell when the refusal is the project's
+                    // own list. Only on a 403, so a healthy check costs
+                    // nothing extra.
+                    // `local_listener` is set only for a probe that went
+                    // through this server's proxy, the one the policy sees.
+                    let refusal = match (status_code, &local_listener) {
+                        (reqwest::StatusCode::FORBIDDEN, Some(listener)) => {
+                            ip_access_refusal(
+                                ip_access.as_ref(),
+                                monitor.id,
+                                environment.project_id,
+                                env_id,
+                                listener,
+                            )
+                            .await
+                        }
+                        _ => None,
+                    };
+
                     return Self::record_check(
                         &db,
                         probe.clone(),
                         status.to_string(),
                         Some(total_response_time_ms),
-                        if status != "operational" {
+                        if let Some(refusal) = refusal {
+                            Some(refusal)
+                        } else if status != "operational" {
                             Some(format!(
                                 "HTTP {} (after {} attempts)",
                                 status_code,
@@ -2014,7 +2138,7 @@ impl HealthCheckService {
                                     service.config_service.clone(),
                                     monitor,
                                     service.job_queue.clone(),
-                                    service.addresses(),
+                                    service.lookups(),
                                     service.target_checks.clone(),
                                 )
                                 .await
@@ -2277,23 +2401,7 @@ mod tests {
         hostname: &str,
         response: &'static [u8],
     ) -> (SocketAddr, reqwest::Certificate) {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let rcgen::CertifiedKey { cert, signing_key } =
-            rcgen::generate_simple_self_signed(vec![hostname.to_string()])
-                .expect("generate test TLS certificate");
-        let cert_pem = cert.pem();
-        let key_pem = signing_key.serialize_pem();
-        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("parse test certificate");
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-            .expect("parse test private key")
-            .expect("test private key is present");
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .expect("build test TLS server config");
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let (acceptor, root) = test_tls_acceptor(hostname);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test TLS listener");
@@ -2316,8 +2424,30 @@ mod tests {
                 .await
                 .expect("write HTTPS response");
         });
+        (address, root)
+    }
+
+    /// A TLS acceptor with a self-signed certificate for `hostname`, and the
+    /// root a client needs to trust it.
+    fn test_tls_acceptor(hostname: &str) -> (tokio_rustls::TlsAcceptor, reqwest::Certificate) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![hostname.to_string()])
+                .expect("generate test TLS certificate");
+        let cert_pem = cert.pem();
+        let key_pem = signing_key.serialize_pem();
+        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse test certificate");
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
+            .expect("parse test private key")
+            .expect("test private key is present");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .expect("build test TLS server config");
         (
-            address,
+            tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
             reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse reqwest test root"),
         )
     }
@@ -3342,6 +3472,267 @@ mod tests {
     /// A plain local install: the preview domain is `localho.st`, so nobody
     /// else can reach the app, but Temps' own proxy serves it. The monitor
     /// probes there and reports the app's health, as it did before ADR 068.
+    /// Keeps the check a monitor emits, so a test can read its message.
+    #[derive(Default)]
+    struct CaptureCheck(std::sync::Mutex<Option<StatusCheckCompletedJob>>);
+    #[async_trait::async_trait]
+    impl JobQueue for CaptureCheck {
+        async fn send(&self, job: Job) -> Result<(), QueueError> {
+            match job {
+                Job::StatusCheckCompleted(job) => {
+                    *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(job)
+                }
+                _ => panic!("only the check is emitted"),
+            }
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            panic!("not used")
+        }
+    }
+
+    /// Answers like the project's IP access policy, and records the
+    /// addresses it was asked about.
+    struct FixedIpAccess {
+        blocks: bool,
+        asked: std::sync::Mutex<Vec<std::net::IpAddr>>,
+    }
+    #[async_trait::async_trait]
+    impl UptimeMonitorIpAccess for FixedIpAccess {
+        async fn monitor_block(
+            &self,
+            project_id: i32,
+            environment_id: i32,
+            monitor_addresses: &[std::net::IpAddr],
+        ) -> Result<
+            Option<temps_core::uptime_monitor_ip_access::UptimeMonitorIpBlock>,
+            temps_core::uptime_monitor_ip_access::UptimeMonitorIpAccessError,
+        > {
+            use temps_core::uptime_monitor_ip_access::*;
+            self.asked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(monitor_addresses);
+            Ok(self.blocks.then(|| {
+                UptimeMonitorIpBlock::new(
+                    project_id,
+                    Some(environment_id),
+                    IpAccessPolicyScope::Project,
+                    IpAccessMode::Allow,
+                    UptimeMonitorBlockReason::NotAllowListed,
+                    monitor_addresses,
+                    monitor_addresses,
+                    Vec::new(),
+                )
+            }))
+        }
+    }
+
+    /// A managed check through a local proxy that answers 403, with the
+    /// project's IP access policy answering `blocks`. Returns the recorded
+    /// check and the addresses the policy was asked about.
+    async fn refused_local_probe(blocks: bool) -> (StatusCheckCompletedJob, Vec<std::net::IpAddr>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local proxy listener");
+        let proxy_address = listener.local_addr().expect("read proxy address");
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept the probe");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read the probe");
+            stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\nForbidden\n")
+                .await
+                .expect("answer the probe");
+        });
+        let outcome = run_local_probe(proxy_address, None, Vec::new(), blocks).await;
+        proxy.await.expect("the local proxy was probed");
+        outcome
+    }
+
+    /// Run one managed check of `proj-env-1.localho.st` through local proxy
+    /// listeners at `http_address` (and `tls_address`, trusted through
+    /// `tls_roots`), with the project's IP access policy answering `blocks`.
+    async fn run_local_probe(
+        http_address: SocketAddr,
+        tls_address: Option<SocketAddr>,
+        tls_roots: Vec<reqwest::Certificate>,
+        blocks: bool,
+    ) -> (StatusCheckCompletedJob, Vec<std::net::IpAddr>) {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let mut monitor = make_monitor(1, Some(1));
+        monitor.is_managed = true;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![make_env(1, false)]])
+            .append_query_results([vec![health_probe_deployment()]])
+            .append_query_results([Vec::<deployment_containers::Model>::new()])
+            .append_query_results([vec![health_probe_counts(1, 1)]])
+            .append_query_results([vec![settings_row(temps_config::AppSettings {
+                preview_domain: "localho.st".into(),
+                external_url: None,
+                ..temps_config::AppSettings::default()
+            })]]);
+        let db = Arc::new(persisted_check(db, &monitor, "degraded").into_connection());
+        let config = temps_config::ServerConfig::new(
+            http_address.to_string(),
+            "postgres://localhost/test".to_string(),
+            tls_address.map(|address| address.to_string()),
+            None,
+        )
+        .expect("build test ServerConfig");
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ));
+        let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
+            None,
+            Some("proj-env-1.localho.st only resolves to this computer"),
+        )));
+        let ip_access = Arc::new(FixedIpAccess {
+            blocks,
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let queue = Arc::new(CaptureCheck::default());
+        HealthCheckService::check_monitor_with(
+            db,
+            config_service,
+            monitor,
+            queue.clone(),
+            ProbeLookups {
+                addresses: Some(addresses),
+                ip_access: Some(ip_access.clone()),
+                tls_roots,
+            },
+        )
+        .await
+        .expect("the check is recorded");
+        let check = queue
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .expect("a check was emitted");
+        let asked = ip_access
+            .asked
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        (check, asked)
+    }
+
+    /// The first attempt is upgraded to HTTPS and answered with 503 through
+    /// the TLS listener; the retry goes out over HTTP again and gets 403.
+    /// That 403 came through the HTTP listener, so the policy is asked about
+    /// its address (IPv4 loopback), not the TLS listener's (IPv6 loopback).
+    #[tokio::test]
+    async fn a_retry_is_explained_by_the_listener_it_went_through() {
+        let hostname = "proj-env-1.localho.st";
+        let Ok(tls_listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            println!("IPv6 loopback is not available here, skipping");
+            return;
+        };
+        let tls_address = tls_listener
+            .local_addr()
+            .expect("read TLS listener address");
+        let (acceptor, root) = test_tls_acceptor(hostname);
+        let tls = tokio::spawn(async move {
+            let (stream, _) = tls_listener
+                .accept()
+                .await
+                .expect("accept the HTTPS follow-up");
+            let mut stream = acceptor.accept(stream).await.expect("TLS handshake");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read the follow-up");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("answer the follow-up");
+        });
+
+        let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP listener");
+        let http_address = http_listener
+            .local_addr()
+            .expect("read HTTP listener address");
+        let http = tokio::spawn(async move {
+            // First the proxy's own force-HTTPS redirect, then a refusal.
+            for answer in ["redirect", "refuse"] {
+                let (mut stream, _) = http_listener.accept().await.expect("accept the probe");
+                let mut request = [0_u8; 2048];
+                let size = stream.read(&mut request).await.expect("read the probe");
+                let request = String::from_utf8_lossy(&request[..size]).to_string();
+                let response = if answer == "redirect" {
+                    let path = request
+                        .split_whitespace()
+                        .nth(1)
+                        .expect("request line has a path");
+                    format!(
+                        "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{hostname}{path}\r\n\
+                         X-Temps-Proxy-Https-Redirect: 1\r\nX-Temps-Proxy-Probe-Capable: 1\r\n\
+                         Connection: close\r\nContent-Length: 0\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("answer the probe");
+            }
+        });
+
+        let (check, asked) =
+            run_local_probe(http_address, Some(tls_address), vec![root], true).await;
+        http.await.expect("both HTTP attempts were answered");
+        tls.await.expect("the HTTPS follow-up was answered");
+
+        assert_eq!(check.status, "degraded");
+        assert_eq!(
+            asked,
+            vec!["127.0.0.1".parse::<std::net::IpAddr>().expect("ip")],
+            "asked about the TLS listener's address instead of the HTTP one"
+        );
+        let message = check.error_message.expect("a reason is recorded");
+        assert!(message.contains("connects from 127.0.0.1"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_check_refused_by_the_projects_ip_list_says_so() {
+        let (check, asked) = refused_local_probe(true).await;
+        assert_eq!(check.status, "degraded");
+        // The policy is asked about the address the probe connected from:
+        // the listener's own address, here loopback.
+        assert_eq!(
+            asked,
+            vec!["127.0.0.1".parse::<std::net::IpAddr>().expect("ip")]
+        );
+        let message = check.error_message.expect("a reason is recorded");
+        assert!(
+            message.starts_with(
+                "Blocked by this project's IP access list: Temps' uptime monitor connects from \
+                 127.0.0.1, which the list does not allow"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("Add 127.0.0.1/32"), "{message}");
+        assert!(!message.contains("(after 1 attempts)"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_403_the_ip_list_does_not_explain_keeps_the_bare_status() {
+        let (check, asked) = refused_local_probe(false).await;
+        assert_eq!(check.status, "degraded");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            check.error_message.as_deref(),
+            Some("HTTP 403 Forbidden (after 1 attempts)")
+        );
+    }
+
     async fn probe_on_a_local_install(is_managed: bool) {
         use sea_orm::{DatabaseBackend, MockDatabase};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3392,7 +3783,7 @@ mod tests {
             config_service,
             monitor,
             Arc::new(ExpectStatus("operational")),
-            Some(addresses),
+            ProbeLookups::with_addresses(addresses),
         )
         .await
         .expect("the check is recorded");
@@ -3447,7 +3838,7 @@ mod tests {
                 test_config_service(&db, "postgres://localhost/test"),
                 monitor,
                 Arc::new(ExpectStatus(NO_ADDRESS_STATUS)),
-                Some(addresses),
+                ProbeLookups::with_addresses(addresses),
             )
             .await
             .expect("no_address is recorded");
@@ -3531,7 +3922,7 @@ mod tests {
             test_config_service(&db, "postgres://localhost/test"),
             monitor,
             Arc::new(ExpectOutage),
-            Some(addresses),
+            ProbeLookups::with_addresses(addresses),
         )
         .await
         .expect("the outage is recorded");

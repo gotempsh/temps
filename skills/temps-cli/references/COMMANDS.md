@@ -13735,6 +13735,7 @@ Replace the IP access list. A list that would lock out this machine needs --ackn
 | `--cidr <cidr>` | Address or CIDR range; repeat or comma-separate | `` | No |
 | `--tailscale` | Include the Tailscale ranges (100.64.0.0/10 and fd7a:115c:a1e0::/48) | - | No |
 | `--acknowledge-lockout` | Apply even if it would block the address you are calling from | - | No |
+| `--expected-revision <revision>` | Save only if the stored list is still at this revision (see show --json; 0 when nothing is stored) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `ip-access project clear`
@@ -24710,6 +24711,7 @@ Run Temps on this computer, sign in the CLI and add the Temps skill for your cod
 | `--allow-unsigned` | Run a release that publishes no Sigstore signature (only releases from before signing), trusting its checksum alone | - | No |
 | `--skills <scope>` | Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global) | - | No |
 | `--port <port>` | Port for your apps and the console on a fresh install (default: 8080 or the next free port) | - | No |
+| `--email <email>` | Email for the admin account of a fresh install (asked in a terminal; default: admin@localhost) | - | No |
 | `--make-default` | Make "local" the default CLI context even if another one is active | - | No |
 | `--json` | Print the result as JSON, for scripts and agents | - | No |
 

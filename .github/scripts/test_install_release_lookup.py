@@ -66,17 +66,29 @@ sys.exit(exit_codes[0] if exit_codes else 0)
 '''
 
 
-# A verifier stand-in: records its arguments, exits with FAKE_<NAME>_EXIT.
+# A verifier stand-in: records its arguments, exits with FAKE_<NAME>_EXIT. A
+# succeeding `gh attestation verify` prints, like gh's `--format json`, one
+# attestation built from FAKE_GH_SOURCE_REF (default: the ref named in
+# --cert-identity), pretty-printed as gh does.
 FAKE_VERIFIER = r'''#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 name = os.path.basename(sys.argv[0])
 with open(os.environ["FAKE_TOOL_CALLS"], "a") as calls:
     calls.write(name + "\t" + "\t".join(sys.argv[1:]) + "\n")
 if name == "gh" and sys.argv[1:3] == ["auth", "status"]:
     sys.exit(int(os.environ.get("FAKE_GH_AUTH_EXIT", "0")))
+if name == "gh" and "--source-ref" in sys.argv:
+    # gh before 2.68.0 has no --source-ref and prints its usage text.
+    sys.stderr.write("unknown flag: --source-ref\nUsage:  gh attestation verify\n")
+    sys.exit(1)
 code = int(os.environ.get("FAKE_" + name.upper() + "_EXIT", "0"))
 if code:
     sys.stderr.write(name + ": verification refused by test\n")
+elif name == "gh" and sys.argv[1:3] == ["attestation", "verify"]:
+    identity = sys.argv[sys.argv.index("--cert-identity") + 1]
+    ref = os.environ.get("FAKE_GH_SOURCE_REF", identity.split("@", 1)[1])
+    print(json.dumps([{"verificationResult": {"signature": {"certificate": {
+        "sourceRepositoryRef": ref}}}}], indent=2))
 sys.exit(code)
 '''
 
@@ -634,7 +646,18 @@ class SignatureVerificationTests(unittest.TestCase):
         # releases, which `release.yml-x.yml` would also satisfy).
         self.assertNotIn("--signer-workflow", verify)
         self.assertEqual(verify[verify.index("--cert-identity") + 1], RELEASE_IDENTITY)
-        self.assertEqual(verify[verify.index("--source-ref") + 1], "refs/tags/v0.1.0")
+        # The source ref is checked on gh's JSON output: --source-ref only exists
+        # in gh 2.68.0+, and an older gh rejected it, aborting genuine installs.
+        self.assertNotIn("--source-ref", verify)
+        self.assertEqual(verify[verify.index("--format") + 1], "json")
+
+    def test_gh_attestation_from_another_ref_aborts_the_install(self):
+        for ref in ("refs/heads/main", "refs/tags/V0.1.0", "refs/tags/v0.1.0-rc.1"):
+            with self.subTest(ref=ref):
+                result = run_install(tools=("gh",),
+                                     environment_extra={"FAKE_GH_SOURCE_REF": ref})
+                self.assert_aborted(result)
+                self.assertIn("not as built from refs/tags/v0.1.0", result.output)
 
     def test_gh_failure_aborts_the_install(self):
         result = run_install(tools=("gh",), environment_extra={"FAKE_GH_EXIT": "1"})

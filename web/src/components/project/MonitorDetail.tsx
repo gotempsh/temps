@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { DateRangePicker } from '@/components/ui/date-range-picker'
+import { MonitorIpAccessWarning } from './MonitorIpAccessWarning'
 import { MonitorLocations } from './MonitorLocations'
 import { MonitorPathForm } from './MonitorPathForm'
 
@@ -441,6 +442,14 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
           </Badge>
         </div>
       </div>
+
+      {currentMonitorStatus?.ip_access_block ? (
+        <MonitorIpAccessWarning
+          block={currentMonitorStatus.ip_access_block}
+          monitorId={monitor.id}
+          projectSlug={project.slug}
+        />
+      ) : null}
 
       {/* Date Range Filter */}
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-end gap-2">

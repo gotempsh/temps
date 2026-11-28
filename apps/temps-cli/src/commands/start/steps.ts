@@ -30,6 +30,7 @@ import {
   binaryPath,
   cosignVerifyArgs,
   databaseUrl,
+  attestationBuiltFromTag,
   ghAttestationArgs,
   manualVerifyCommands,
   isLocalServerCommand,
@@ -571,6 +572,14 @@ export async function verifyArchiveOrigin(
         'signature_failed',
         `The ${asset} archive for ${version} has no build attestation from ${identity}; it may have been ` +
           `tampered with. Nothing was installed. gh said: ${lastLines(gh?.stderr || gh?.stdout || '', 4)}`,
+      )
+    }
+    if (!attestationBuiltFromTag(gh.stdout, version)) {
+      throw new StartError(
+        'download',
+        'signature_failed',
+        `The ${asset} archive for ${version} is attested by ${identity}, but not as built from ` +
+          `refs/tags/${version}; it may have been tampered with. Nothing was installed.`,
       )
     }
     return { kind: 'gh', identity }

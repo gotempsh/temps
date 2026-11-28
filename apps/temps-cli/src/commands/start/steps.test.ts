@@ -542,8 +542,15 @@ describe('fetchSigstoreBundle', () => {
 describe('verifyArchiveOrigin', () => {
   const identity = 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3'
 
-  /** Fake network and tools: `tools` maps a command to its exit code; absent means not installed. */
-  function fakeDeps(bundle: string | null, tools: Record<string, number>, ghAuth = 0) {
+  /** What gh attestation verify --format json prints for an attestation built from `ref`. */
+  const ghJson = (ref: string) =>
+    JSON.stringify([{ verificationResult: { signature: { certificate: { sourceRepositoryRef: ref } } } }])
+
+  /**
+   * Fake network and tools: `tools` maps a command to its exit code; absent means not installed.
+   * A succeeding `gh attestation verify` prints an attestation built from `ghSourceRef`.
+   */
+  function fakeDeps(bundle: string | null, tools: Record<string, number>, ghAuth = 0, ghSourceRef = 'refs/tags/v1.2.3') {
     const calls: { command: string; args: readonly string[]; bundleOnDisk: boolean }[] = []
     const fetched: string[] = []
     const deps: OriginDeps = {
@@ -561,7 +568,8 @@ describe('verifyArchiveOrigin', () => {
         if (!(command in tools)) return null
         if (command === 'gh' && args[0] === 'auth') return { code: ghAuth, stdout: '', stderr: '' }
         const code = tools[command] as number
-        return { code, stdout: '', stderr: code ? `${command}: refused by test` : '' }
+        const stdout = command === 'gh' && args[0] === 'attestation' && code === 0 ? ghJson(ghSourceRef) : ''
+        return { code, stdout, stderr: code ? `${command}: refused by test` : '' }
       },
     }
     return { deps, calls, fetched }
@@ -621,7 +629,18 @@ describe('verifyArchiveOrigin', () => {
     const origin = await verifyArchiveOrigin(await archive(), 'v1.2.3', 'temps-linux-amd64', false, deps)
     expect(origin).toEqual({ kind: 'gh', identity })
     const verify = calls.find((c) => c.command === 'gh' && c.args[0] === 'attestation')
-    expect(verify?.args).toContain('refs/tags/v1.2.3')
+    expect(verify?.args).toContain(identity)
+    expect(verify?.args).toContain('json')
+    expect(verify?.args).not.toContain('--source-ref')
+  })
+
+  test('a gh attestation built from another ref is refused', async () => {
+    for (const ref of ['refs/heads/main', 'refs/tags/V1.2.3', 'refs/tags/v1.2.4']) {
+      const { deps } = fakeDeps('{}', { gh: 0 }, 0, ref)
+      const error = await verifyArchiveOrigin(await archive(), 'v1.2.3', 'temps-linux-amd64', false, deps).catch((e) => e)
+      expect(error.reason).toBe('signature_failed')
+      expect(error.message).toContain('refs/tags/v1.2.3')
+    }
   })
 
   test('a gh failure throws', async () => {

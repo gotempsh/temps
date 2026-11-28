@@ -22,7 +22,7 @@ import {
 } from '../../config/contexts.js'
 import { config, credentials } from '../../config/store.js'
 import { colors, icons } from '../../ui/output.js'
-import { promptConfirm } from '../../ui/prompts.js'
+import { promptConfirm, promptText } from '../../ui/prompts.js'
 import { isQuietMode, startSpinner } from '../../ui/spinner.js'
 import {
   BUNDLED_SKILL,
@@ -40,6 +40,7 @@ import {
   generateDbPassword,
   localPaths,
   localUrls,
+  parseAdminEmail,
   parseChannel,
   parsePort,
   proxyPortCandidates,
@@ -85,6 +86,7 @@ interface StartOptions {
   allowUnsigned?: boolean
   skills?: string
   port?: string
+  email?: string
   makeDefault?: boolean
   json?: boolean
 }
@@ -267,7 +269,30 @@ async function signInCli(
   return { minted, active: activate, previous }
 }
 
-async function freshState(options: StartOptions, target: string): Promise<LocalState> {
+/**
+ * Email for the administrator of a fresh install: `--email`, else asked in an
+ * interactive terminal, else `admin@localhost`. Agents and scripts pass
+ * `--email`; they get no prompt.
+ */
+async function adminEmailFor(options: StartOptions): Promise<string> {
+  if (options.email !== undefined) return parseAdminEmail(options.email)
+  if (options.json || isQuietMode() || !process.stdin.isTTY) return LOCAL_ADMIN_EMAIL
+  const answer = await promptText({
+    message: 'Email for your Temps admin account',
+    default: LOCAL_ADMIN_EMAIL,
+    validate: (value) => {
+      try {
+        parseAdminEmail(value)
+        return true
+      } catch (error) {
+        return error instanceof Error ? error.message.replace('--email', 'The email') : 'Enter an email address'
+      }
+    },
+  })
+  return parseAdminEmail(answer)
+}
+
+async function freshState(options: StartOptions, target: string, adminEmail: string): Promise<LocalState> {
   const preferred = options.port === undefined ? undefined : parsePort(options.port)
   const isRoot = typeof process.getuid === 'function' && process.getuid() === 0
   const proxyPort = await pickPort(proxyPortCandidates(preferred, process.platform, isRoot), [], 'apps and console')
@@ -280,7 +305,7 @@ async function freshState(options: StartOptions, target: string): Promise<LocalS
     dbPassword: generateDbPassword(),
     proxyPort,
     consolePort,
-    adminEmail: LOCAL_ADMIN_EMAIL,
+    adminEmail,
     adminPassword: generateAdminPassword(),
     setupComplete: false,
   }
@@ -298,6 +323,7 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
   const target = releaseTarget(process.platform, process.arch)
   parseChannel(options.channel)
   if (options.port !== undefined) parsePort(options.port)
+  if (options.email !== undefined) parseAdminEmail(options.email)
   const cwd = process.cwd()
   const scope: SkillsScope = resolveSkillsScope(options.skills, await readdir(cwd))
 
@@ -306,6 +332,13 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
 
     let state = await readState(paths)
     const running = Boolean(state && (await isLocalServer(state.pid, paths)) && (await serverHealthy(state.consolePort)))
+    if (state && options.email !== undefined && parseAdminEmail(options.email) !== state.adminEmail) {
+      console.error(
+        colors.warning(
+          `Temps is already set up here with the admin ${state.adminEmail}; --email only applies to a fresh install.`,
+        ),
+      )
+    }
 
     if (!state) {
       if ((await containerState(DB_CONTAINER)) !== 'missing') {
@@ -316,7 +349,8 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
             'Run `temps stop --delete-data` to remove it, then `temps start` again.',
         )
       }
-      state = await steps.time('Resolving version', () => freshState(options, target), (s) => `Using Temps ${s.version}`)
+      const adminEmail = await adminEmailFor(options)
+      state = await steps.time('Resolving version', () => freshState(options, target, adminEmail), (s) => `Using Temps ${s.version}`)
       await writeState(paths, state)
     } else if (options.runtimeVersion && options.runtimeVersion !== state.version) {
       if (running) {
@@ -577,6 +611,7 @@ export function registerStartCommands(program: Command): void {
     .option('--allow-unsigned', 'Run a release that publishes no Sigstore signature (only releases from before signing), trusting its checksum alone')
     .option('--skills <scope>', 'Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global)')
     .option('--port <port>', 'Port for your apps and the console on a fresh install (default: 8080 or the next free port)')
+    .option('--email <email>', 'Email for the admin account of a fresh install (asked in a terminal; default: admin@localhost)')
     .option('--make-default', 'Make "local" the default CLI context even if another one is active')
     .option('--json', 'Print the result as JSON, for scripts and agents')
     .addHelpText(

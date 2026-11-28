@@ -6,6 +6,7 @@ import {
   StartError,
   consoleApiUrl,
   cosignVerifyArgs,
+  attestationBuiltFromTag,
   ghAttestationArgs,
   manualVerifyCommands,
   databaseUrl,
@@ -14,6 +15,7 @@ import {
   isLocalState,
   localPaths,
   localUrls,
+  parseAdminEmail,
   parseChannel,
   parseChecksum,
   parseJsonOutput,
@@ -84,9 +86,40 @@ describe('release signature commands', () => {
       'attestation', 'verify', '/s/a.tar.gz',
       '--repo', 'gotempsh/temps',
       '--cert-identity', 'https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/v1.2.3',
-      '--source-ref', 'refs/tags/v1.2.3',
       '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
+      '--format', 'json',
     ])
+  })
+
+  test('gh args avoid --source-ref, which gh before 2.68.0 rejects with its usage text', () => {
+    expect(ghAttestationArgs('/s/a.tar.gz', 'v1.2.3')).not.toContain('--source-ref')
+  })
+})
+
+describe('attestationBuiltFromTag', () => {
+  const attested = (ref: unknown) =>
+    JSON.stringify([{ verificationResult: { signature: { certificate: { sourceRepositoryRef: ref } } } }])
+
+  test('accepts an attestation built from the release tag', () => {
+    expect(attestationBuiltFromTag(attested('refs/tags/v1.2.3'), 'v1.2.3')).toBe(true)
+    const mixed = JSON.stringify([
+      ...JSON.parse(attested('refs/heads/main')),
+      ...JSON.parse(attested('refs/tags/v1.2.3')),
+    ])
+    expect(attestationBuiltFromTag(mixed, 'v1.2.3')).toBe(true)
+  })
+
+  test('rejects another ref, a ref differing only in case, or a prefix', () => {
+    expect(attestationBuiltFromTag(attested('refs/heads/main'), 'v1.2.3')).toBe(false)
+    expect(attestationBuiltFromTag(attested('refs/tags/V1.2.3'), 'v1.2.3')).toBe(false)
+    expect(attestationBuiltFromTag(attested('refs/tags/v1.2.3-evil'), 'v1.2.3')).toBe(false)
+    expect(attestationBuiltFromTag(attested(['refs/tags/v1.2.3']), 'v1.2.3')).toBe(false)
+  })
+
+  test('treats anything but the expected JSON as no attestation', () => {
+    for (const output of ['', 'Usage: gh attestation verify', '{}', 'null', '[]', '[null]', '[{"verificationResult":{}}]']) {
+      expect(attestationBuiltFromTag(output, 'v1.2.3')).toBe(false)
+    }
   })
 })
 
@@ -237,6 +270,28 @@ describe('parseLocalServerPids', () => {
     ].join('\n')
     expect(parseLocalServerPids(listing, paths)).toEqual([812, 12345])
     expect(parseLocalServerPids('', paths)).toEqual([])
+  })
+})
+
+describe('parseAdminEmail', () => {
+  test('accepts the email the user gives, trimmed, including a local address', () => {
+    expect(parseAdminEmail('  me@example.com ')).toBe('me@example.com')
+    expect(parseAdminEmail('admin@localhost')).toBe('admin@localhost')
+  })
+
+  test('refuses something that is not an email, quoting it', () => {
+    for (const value of ['', 'me', 'me@', '@example.com', 'me @example.com', 'a@b@c']) {
+      const error = (() => {
+        try {
+          parseAdminEmail(value)
+        } catch (e) {
+          return e as { reason?: string; message: string }
+        }
+        return null
+      })()
+      expect(error?.reason).toBe('bad_email')
+      expect(error?.message).toContain(`"${value}"`)
+    }
   })
 })
 
