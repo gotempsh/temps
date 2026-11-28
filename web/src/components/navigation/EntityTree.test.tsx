@@ -498,6 +498,40 @@ describe('Projects', () => {
     expect(add.getAttribute('href')).toBe('/projects/new')
   })
 
+  test('with projects, it reads the services in none, as the Projects page does', async () => {
+    // A server whose first page of every service is all grouped ones: the
+    // standalone service would be missed unless only those in none are read.
+    const asked: (string | null)[] = []
+    const { view } = renderAt('/projects', {
+      ...projects,
+      'GET /projects': (request) => {
+        const ungrouped = new URL(request.url).searchParams.get('ungrouped')
+        asked.push(ungrouped)
+        return jsonResponse(
+          ungrouped === 'true'
+            ? { projects: [service(9, 'blog')], total: 1 }
+            : { projects: [service(4, 'web'), service(5, 'api')], total: 300 }
+        )
+      },
+    })
+    await view.findByRole('link', { name: /blog/ })
+    expect(asked).toEqual(['true'])
+  })
+
+  test('with no projects, it reads every service', async () => {
+    const asked: (string | null)[] = []
+    const { view } = renderAt('/projects', {
+      ...projects,
+      'GET /project-groups': () => jsonResponse({ groups: [], total: 0 }),
+      'GET /projects': (request) => {
+        asked.push(new URL(request.url).searchParams.get('ungrouped'))
+        return jsonResponse({ projects: [service(9, 'blog')], total: 1 })
+      },
+    })
+    await view.findByRole('link', { name: /blog/ })
+    expect(asked).toEqual([null])
+  })
+
   test('a service past the page of services read still lists its views', async () => {
     // A large server: the service open is not in the page the tree reads.
     const { view, api } = renderAt('/projects/late-service/deployments', {
