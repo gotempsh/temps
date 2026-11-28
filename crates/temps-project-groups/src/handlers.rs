@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Extension, Path, Query, State},
+    http::header,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, put},
@@ -89,6 +90,10 @@ pub fn router(state: Arc<ProjectGroupsAppState>) -> Router {
             get(get_group_env_var)
                 .patch(update_group_env_var)
                 .delete(delete_group_env_var),
+        )
+        .route(
+            "/project-groups/{group_id}/env-vars/{var_id}/value",
+            get(reveal_group_env_var),
         )
         .route(
             "/project-groups/{group_id}/routes",
@@ -1291,6 +1296,46 @@ impl GroupEnvVarResponse {
     }
 }
 
+/// The plaintext value of a non-secret group variable.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GroupEnvVarValueResponse {
+    pub value: String,
+}
+
+/// Audit record of a group variable value being read: the variable and who
+/// read it, never the value.
+#[derive(Debug, Clone, Serialize)]
+struct GroupEnvVarRevealAudit {
+    #[serde(flatten)]
+    context: AuditContext,
+    group_id: i32,
+    group_slug: String,
+    var_id: i32,
+    variable_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment_slug: Option<String>,
+}
+
+impl AuditOperation for GroupEnvVarRevealAudit {
+    fn operation_type(&self) -> String {
+        "PROJECT_GROUP_ENV_VAR_VALUE_REVEALED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize("PROJECT_GROUP_ENV_VAR_VALUE_REVEALED", source)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct InheritedGroupRef {
     pub id: i32,
@@ -1399,6 +1444,84 @@ pub async fn get_group_env_var(
     authorize_group_env(&state, &auth, group_id, false).await?;
     let var = state.env_vars.get(group_id, var_id).await?;
     Ok(Json(GroupEnvVarResponse::masked(var)))
+}
+
+/// Reveal the value of one non-secret group variable.
+///
+/// Follows the project reveal (`GET /projects/{project_id}/env-vars/{key}/value`):
+/// it takes what changing the variable takes (`environments:write` on every
+/// project in the group), a secret is refused with a 403 (secret values are
+/// write-only), and every reveal is audit-logged before the value is
+/// returned; when the audit record cannot be written the value is not
+/// returned.
+#[utoipa::path(
+    tag = "Project Groups",
+    get,
+    path = "/project-groups/{group_id}/env-vars/{var_id}/value",
+    operation_id = "reveal_group_env_var",
+    params(
+        ("group_id" = i32, Path, description = "Project group ID"),
+        ("var_id" = i32, Path, description = "Variable ID"),
+    ),
+    responses(
+        (status = 200, description = "The variable's plaintext value (sent with Cache-Control: no-store)", body = GroupEnvVarValueResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "The variable is secret (write-only), or insufficient permissions on a member project"),
+        (status = 404, description = "Project group or variable not found"),
+        (status = 500, description = "The value could not be decrypted, or the reveal could not be audit-logged"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reveal_group_env_var(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ProjectGroupsAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((group_id, var_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsWrite);
+    let group = authorize_group_env(&state, &auth, group_id, true).await?;
+    let (var, value) = state.env_vars.reveal(group_id, var_id).await?;
+
+    tracing::info!(
+        user_id = auth.user_id(),
+        group_id,
+        var_id,
+        env_var_key = %var.key,
+        "project group env_var.reveal"
+    );
+    let audit = GroupEnvVarRevealAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        group_id,
+        group_slug: group.group.slug.clone(),
+        var_id,
+        variable_key: var.key.clone(),
+        environment_slug: var.environment_slug.clone(),
+    };
+    if let Err(error) = state.audit.create_audit_log(&audit).await {
+        tracing::error!(
+            group_id,
+            var_id,
+            env_var_key = %var.key,
+            error = %error,
+            "project groups: failed to audit a variable reveal; not returning the value"
+        );
+        return Err(temps_core::error_builder::internal_server_error()
+            .title("Variable could not be revealed")
+            .detail(format!(
+                "The audit record for revealing variable {var_id} of project group {group_id} \
+                 could not be written"
+            ))
+            .build());
+    }
+
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(GroupEnvVarValueResponse { value }),
+    ))
 }
 
 #[utoipa::path(
@@ -2082,6 +2205,7 @@ pub async fn delete_group_route(
         get_project_group_membership,
         list_group_env_vars,
         get_group_env_var,
+        reveal_group_env_var,
         create_group_env_var,
         update_group_env_var,
         delete_group_env_var,
@@ -2105,6 +2229,7 @@ pub async fn delete_group_route(
         CreateProjectGroupRequest,
         UpdateProjectGroupRequest,
         GroupEnvVarResponse,
+        GroupEnvVarValueResponse,
         CreateGroupEnvVarRequest,
         UpdateGroupEnvVarRequest,
         InheritedGroupRef,
@@ -2557,6 +2682,112 @@ mod tests {
     }
 
     const ENV_WRITE: &str = "environments:write";
+
+    /// #2106: a non-secret group variable's value can be revealed by a
+    /// caller who may change it, with an audit record naming the variable
+    /// (never the value) and no caching; a secret is a 403, a reader is
+    /// refused and a missing variable is a 404 naming it.
+    #[tokio::test]
+    async fn a_group_variable_value_is_revealed_audited_and_secrets_stay_write_only() {
+        let base = 9851;
+        let Some(fixture) = delete_fixture(base, None).await else {
+            eprintln!("Docker/TimescaleDB unavailable, skipping group variable reveal test");
+            return;
+        };
+        let members: HashSet<i32> = [base, base + 1].into();
+        let create = |key: &str, is_secret: bool| crate::env_vars::CreateGroupEnvVarRequest {
+            key: key.to_string(),
+            value: format!("{key}-value"),
+            is_secret,
+            environment_slug: None,
+            include_in_preview: false,
+        };
+        let plain = fixture
+            .state
+            .env_vars
+            .create_checked(fixture.group_id, &members, create("REGION", false))
+            .await
+            .expect("create plain variable");
+        let secret = fixture
+            .state
+            .env_vars
+            .create_checked(fixture.group_id, &members, create("TOKEN", true))
+            .await
+            .expect("create secret variable");
+        let reveal = |auth: AuthContext, var_id: i32| {
+            reveal_group_env_var(
+                RequireAuth(auth),
+                State(fixture.state.clone()),
+                Extension(request_metadata()),
+                Path((fixture.group_id, var_id)),
+            )
+        };
+
+        let response = reveal(user_auth(Role::User), plain.id)
+            .await
+            .expect("a member's writer reveals a plain value")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(axum::http::header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["value"], "REGION-value");
+        let audits = fixture.audit.operations();
+        let (_, json) = audits
+            .iter()
+            .find(|(op, _)| op == "PROJECT_GROUP_ENV_VAR_VALUE_REVEALED")
+            .expect("the reveal is audited");
+        assert!(json.contains("\"variable_key\":\"REGION\""), "{json}");
+        assert!(
+            !json.contains("REGION-value"),
+            "the value is never audited: {json}"
+        );
+
+        let refused = reveal(user_auth(Role::User), secret.id)
+            .await
+            .map(|_| ())
+            .expect_err("secrets are write-only");
+        assert_eq!(refused.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            refused.body["type"],
+            "https://temps.sh/probs/secret-write-only"
+        );
+
+        let reader = reveal(user_auth(Role::Reader), plain.id)
+            .await
+            .map(|_| ())
+            .expect_err("a reader cannot reveal");
+        assert_eq!(reader.status_code, StatusCode::FORBIDDEN);
+
+        let missing = plain.id + 1000;
+        let not_found = reveal(user_auth(Role::User), missing)
+            .await
+            .map(|_| ())
+            .expect_err("missing variable");
+        assert_eq!(not_found.status_code, StatusCode::NOT_FOUND);
+        assert!(
+            not_found.body["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains(&missing.to_string())),
+            "{:?}",
+            not_found.body
+        );
+        assert_eq!(
+            fixture
+                .audit
+                .operations()
+                .iter()
+                .filter(|(op, _)| op == "PROJECT_GROUP_ENV_VAR_VALUE_REVEALED")
+                .count(),
+            1,
+            "only the successful reveal is audited"
+        );
+    }
 
     /// One group variable reads back masked to a reader of every member; a
     /// missing one is a 404 naming it; a caller without environment read on

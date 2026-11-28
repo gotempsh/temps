@@ -56,6 +56,17 @@ pub enum ProjectGroupError {
         scope: String,
     },
 
+    /// Secret group variables are write-only, like project secrets.
+    #[error(
+        "Variable '{key}' ({var_id}) of project group {group_id} is secret; secret values are \
+         write-only and cannot be revealed. Replace the value to rotate it"
+    )]
+    SecretNotRevealable {
+        group_id: i32,
+        var_id: i32,
+        key: String,
+    },
+
     #[error("Could not encrypt or decrypt variable '{key}' of project group {group_id}: {reason}")]
     Encryption {
         group_id: i32,
@@ -373,6 +384,13 @@ impl From<ProjectGroupError> for Problem {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail("A database error occurred; check server logs for details")
+            }
+
+            ProjectGroupError::SecretNotRevealable { .. } => {
+                problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_type("https://temps.sh/probs/secret-write-only")
+                    .with_title("Secret Variable Is Write-Only")
+                    .with_detail(error.to_string())
             }
 
             ProjectGroupError::Encryption { .. } | ProjectGroupError::Internal { .. } => {

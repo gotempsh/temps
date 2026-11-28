@@ -218,6 +218,31 @@ impl GroupEnvVarService {
         self.find(self.db.as_ref(), group_id, var_id).await
     }
 
+    /// The plaintext of a non-secret variable, for an audited reveal. A
+    /// secret is refused before its value is decrypted.
+    pub async fn reveal(
+        &self,
+        group_id: i32,
+        var_id: i32,
+    ) -> Result<(project_group_env_vars::Model, String), ProjectGroupError> {
+        let var = self.find(self.db.as_ref(), group_id, var_id).await?;
+        if var.is_secret {
+            return Err(ProjectGroupError::SecretNotRevealable {
+                group_id,
+                var_id,
+                key: var.key,
+            });
+        }
+        let value = self.encryption.decrypt_string(&var.value).map_err(|e| {
+            ProjectGroupError::Encryption {
+                group_id,
+                key: var.key.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        Ok((var, value))
+    }
+
     fn encrypt(&self, group_id: i32, key: &str, value: &str) -> Result<String, ProjectGroupError> {
         self.encryption
             .encrypt_string(value)
