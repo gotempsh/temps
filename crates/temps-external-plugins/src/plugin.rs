@@ -70,6 +70,14 @@ impl TempsPlugin for ExternalPluginsPlugin {
         "external-plugins"
     }
 
+    fn required_services(&self) -> Vec<temps_core::plugin::RequiredService> {
+        use temps_core::plugin::RequiredService;
+        vec![
+            RequiredService::of::<sea_orm::DatabaseConnection>(),
+            RequiredService::of::<temps_core::DockerHandle>(),
+        ]
+    }
+
     fn register_services<'a>(
         &'a self,
         context: &'a ServiceRegistrationContext,
@@ -86,17 +94,11 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // Discovery is deferred to a background task because the
             // per-plugin handshake timeout (default 30s) would otherwise
             // block the console API from coming up.
-            // A process with no Docker of its own (a hosted control plane)
-            // compiles plugins on a joined worker node. Registered by the
-            // deployments plugin, which runs earlier; absent where the node
-            // machinery is not part of the build.
-            let remote_builder =
-                context.get_service::<dyn temps_core::plugin_builder::RemotePluginBuilder>();
             let ai_tools = Arc::new(temps_ai_api_tools::PluginToolsRegistry::default());
             context.register_service(ai_tools.clone());
+            let config = self.config.clone();
             let service = Arc::new(
-                ExternalPluginsService::new_empty(self.config.clone(), queue, db)
-                    .with_remote_builder(remote_builder)
+                ExternalPluginsService::new_empty(config, queue, db)
                     .with_ai_tools_registry(ai_tools),
             );
             service
@@ -107,6 +109,31 @@ impl TempsPlugin for ExternalPluginsPlugin {
                 .manager()
                 .set_audit_service(context.require_service::<dyn temps_core::AuditLogger>())
                 .await;
+            // What attaching to a plugin that runs as a Temps service needs:
+            // the token its containers were deployed with (registered by the
+            // deployments plugin, which runs earlier) and where this process
+            // runs, to reach those containers. Absent in an embedding that
+            // deploys nothing; adding a service as a plugin then says so.
+            match (
+                context.get_service::<dyn temps_core::DeploymentTokenSource>(),
+                context.get_service::<temps_core::RuntimeContext>(),
+            ) {
+                (Some(tokens), Some(runtime)) => {
+                    let mut services = crate::service_runtime::ServiceRuntime::new(
+                        tokens,
+                        runtime.as_ref().clone(),
+                    );
+                    // Starts an environment that stopped for being idle. Only
+                    // a process that runs the proxy owns that lifecycle.
+                    if let Some(waker) = context.get_service::<dyn temps_core::OnDemandWaker>() {
+                        services = services.with_waker(waker);
+                    }
+                    service.manager().set_service_runtime(services).await;
+                }
+                _ => debug!(
+                    "No deployments in this process; plugins cannot be added from services here"
+                ),
+            }
             // Kick off discovery + start in the background. When it
             // completes, the shared proxy router is swapped in and
             // `/x/<plugin>/...` routes start working.
@@ -257,20 +284,14 @@ mod tests {
 
     #[test]
     fn test_plugin_name() {
-        let config = ExternalPluginConfig::new(
-            PathBuf::from("/tmp/test"),
-            "postgres://localhost/test".to_string(),
-        );
+        let config = ExternalPluginConfig::new(PathBuf::from("/tmp/test"));
         let plugin = ExternalPluginsPlugin::new(config);
         assert_eq!(plugin.name(), "external-plugins");
     }
 
     #[test]
     fn test_plugin_openapi_schema() {
-        let config = ExternalPluginConfig::new(
-            PathBuf::from("/tmp/test"),
-            "postgres://localhost/test".to_string(),
-        );
+        let config = ExternalPluginConfig::new(PathBuf::from("/tmp/test"));
         let plugin = ExternalPluginsPlugin::new(config);
         let schema = plugin.openapi_schema();
         assert!(schema.is_some());

@@ -59,6 +59,42 @@ export type AccessCapability = {
 
 export type AccessCapabilityState = 'available' | 'integration_unavailable';
 
+/**
+ * What a build asks for compared with what an administrator approved.
+ */
+export type AccessDifference = {
+    /**
+     * Classes of delegated API calls the update newly intends to make.
+     */
+    added_capabilities: Array<PluginCapability>;
+    /**
+     * Platform events the update newly subscribes to.
+     */
+    added_events: Array<string>;
+    /**
+     * Permissions the update asks for that the approved build did not.
+     * Approving the update does not allow them.
+     */
+    added_permissions: Array<PluginHostPermission>;
+    /**
+     * Routes the update newly serves without a Temps session.
+     */
+    added_public_paths: Array<string>;
+    /**
+     * Whether the update asks for anything the approved build did not.
+     */
+    asks_for_more: boolean;
+    /**
+     * Permissions the update no longer asks for.
+     */
+    removed_permissions: Array<PluginHostPermission>;
+    /**
+     * The approved version, when it is known.
+     */
+    version_from?: string | null;
+    version_to: string;
+};
+
 export type AccessMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 
 export type AccessPermission = 'apps_edit' | 'organizations_read';
@@ -753,6 +789,26 @@ export type AddProviderModelRequest = {
     model_id: string;
 };
 
+/**
+ * The deployed service to add as a plugin.
+ */
+export type AddServicePlugin = {
+    /**
+     * The deployment that was looked at. When given, the service is added
+     * only if this is the deployment it runs; another one is refused with
+     * 409 and nothing is added.
+     */
+    deployment_id?: number;
+    /**
+     * The environment of that service whose deployment is the plugin.
+     */
+    environment_id: number;
+    /**
+     * The service (project) the plugin runs as.
+     */
+    project_id: number;
+};
+
 export type AddStatusPageDomainRequest = {
     /**
      * Hostname to serve the page on, e.g. `status.example.com`. Unicode names
@@ -763,6 +819,17 @@ export type AddStatusPageDomainRequest = {
      * Defaults to `http-01`.
      */
     verification_method?: VerificationMethod;
+};
+
+/**
+ * The plugin a service was added as.
+ */
+export type AddedServicePluginResponse = {
+    display_name?: string | null;
+    environment_id: number;
+    name: string;
+    project_id: number;
+    version: string;
 };
 
 /**
@@ -3327,6 +3394,17 @@ export type ApplyServiceHealthcheckResponse = {
     service_id: number;
 };
 
+/**
+ * The update an administrator reviewed and approves.
+ */
+export type ApprovePluginUpdate = {
+    /**
+     * The `review` of the update that was shown. An update that changed
+     * since is not approved by it.
+     */
+    review: string;
+};
+
 export type ApproveSandboxService = {
     expected_version: number;
     /**
@@ -3345,6 +3423,23 @@ export type ApproveServiceGrant = {
     service_id: string;
     service_version: number;
     ttl_seconds: number;
+};
+
+/**
+ * The build a plugin now runs as.
+ */
+export type ApprovedPluginUpdateResponse = {
+    /**
+     * The deployment the plugin is pinned to now.
+     */
+    deployment_id: number;
+    /**
+     * What the update asked for beyond the build it replaced. Nothing in it
+     * was allowed by the approval: new permissions stay off until chosen.
+     */
+    difference: AccessDifference;
+    name: string;
+    version: string;
 };
 
 export type ArchiveFlagResponse = {
@@ -12254,6 +12349,13 @@ export type DeploymentMetadata = {
      */
     labels?: Array<string>;
     /**
+     * Docker image ID (sha256:...) a registry image resolved to when this
+     * deployment pulled it. A tag can be moved to other content later; this
+     * is the content this deployment's containers were created from. Absent
+     * when a worker node pulled the image itself.
+     */
+    pulledImageId?: string | null;
+    /**
      * ID of the deployment this was rolled back from (if applicable)
      */
     rolledBackFromId?: number | null;
@@ -17172,10 +17274,6 @@ export type FileObject = {
     purpose?: string;
 };
 
-export type FileUpload = {
-    file: Blob | File;
-};
-
 export type FillSecretRequest = {
     /**
      * The credential. Stored encrypted; never returned and never shown to the
@@ -21342,49 +21440,6 @@ export type InsightStatus = 'active' | 'resolved';
 export type InsightsResponse = {
     count: number;
     data: Array<Insight>;
-};
-
-export type InstallPluginRequest = {
-    grants?: PluginGrantConfig | null;
-    /**
-     * Validated registry name only. URLs, paths, versions, and hashes are not
-     * accepted from HTTP callers.
-     */
-    name: string;
-};
-
-export type InstallPluginResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    version: string;
-};
-
-export type InstallRepositoryRequest = {
-    grants?: PluginGrantConfig | null;
-    name?: string | null;
-    path?: string | null;
-    progressId?: string | null;
-    ref_name?: string | null;
-    repository_url: string;
-};
-
-export type InstallRepositoryResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    source_commit: string;
-    version: string;
-};
-
-export type InstallationReportingSettings = {
-    /**
-     * Opt in to sharing a plugin name and plugin-specific anonymous identifier
-     * with the official Temps registry after a verified install succeeds.
-     */
-    enabled: boolean;
 };
 
 /**
@@ -25724,13 +25779,6 @@ export type NotificationRouteTestResult = {
     severity: string;
 };
 
-export type NpmRelease = {
-    binary_path: string;
-    integrity: string;
-    name: string;
-    version: string;
-};
-
 export type NpsSummary = {
     /**
      * Answers of 0 to 6.
@@ -27660,6 +27708,39 @@ export type PendingChanges = {
 };
 
 /**
+ * A build of a plugin's service that waits for an administrator. Temps is
+ * not attached to it.
+ */
+export type PendingPluginUpdateResponse = {
+    /**
+     * The deployment that waits.
+     */
+    deployment_id: number;
+    /**
+     * What it asks for compared with the approved build.
+     */
+    difference: AccessDifference;
+    /**
+     * The image that waits, when the deployment was made from an image.
+     */
+    image?: string | null;
+    /**
+     * The Docker image ID the image that waits is, when Temps recorded it:
+     * what a registry image resolved to, or what an uploaded image was
+     * imported as (which has no `image`).
+     */
+    image_id?: string | null;
+    /**
+     * What an approval must quote: this build answering this manifest.
+     */
+    review: string;
+    /**
+     * Since when it waits.
+     */
+    since?: string | null;
+};
+
+/**
  * One detector and what it looks for.
  */
 export type PerformanceDetectorResponse = {
@@ -28315,10 +28396,6 @@ export type PlatformFeatures = {
      */
     docker: boolean;
     /**
-     * External plugin binaries and plugin-owned files may be installed.
-     */
-    external_plugins?: boolean;
-    /**
      * Container images can be built by this process. Requires a local Docker
      * daemon; always `false` when `docker` is `false`.
      */
@@ -28395,12 +28472,6 @@ export type PlatformInfo = {
     platforms: Array<string>;
 };
 
-export type PlatformRelease = {
-    npm?: NpmRelease | null;
-    sha256: string;
-    url: string;
-};
-
 export type PluginActorInfo = {
     active: boolean;
     id: string;
@@ -28436,24 +28507,49 @@ export type PluginAiToolsResponse = {
  */
 export type PluginCapability = 'api_read' | 'api_write';
 
-export type PluginCatalogResponse = {
-    available: boolean;
-    plugins: Array<RegistryPlugin>;
-    reason?: string | null;
-    source: string;
-};
-
 export type PluginGrantConfig = {
     ai_daily_call_limit: number;
     ai_max_output_tokens: number;
     permissions: Array<PluginHostPermission>;
+    /**
+     * What a plugin granted `api_write` may change. Empty: nothing.
+     */
+    write_areas?: Array<PluginWriteArea>;
+    /**
+     * The only projects those changes may touch. Absent: every project.
+     */
+    write_project_ids?: Array<number> | null;
 };
 
+/**
+ * Everything a plugin asks for and everything it was given, in one place:
+ * what an administrator reads before granting anything.
+ */
 export type PluginGrantsResponse = {
     actor: PluginActorInfo;
     ai: PluginAiCapability;
+    /**
+     * The platform events the plugin asks to receive.
+     */
+    events: Array<string>;
+    /**
+     * What the plugin's container may connect to.
+     */
+    outbound_network: PluginOutboundNetwork;
     permissions: Array<PluginHostPermission>;
+    /**
+     * Routes of the plugin that anyone can open without signing in.
+     */
+    public_paths: Array<string>;
     requested_permissions: Array<PluginHostPermission>;
+    /**
+     * What a plugin granted `api_write` may change. Empty: nothing.
+     */
+    write_areas: Array<PluginWriteArea>;
+    /**
+     * The only projects those changes may touch. Absent: every project.
+     */
+    write_project_ids?: Array<number> | null;
 };
 
 /**
@@ -28571,27 +28667,97 @@ export type PluginManifest = {
     version: string;
 };
 
-export type PluginSourceResponse = {
-    builder_image: string;
-    commit: string;
-    kind: 'github';
-    path?: string | null;
-    ref_name: string;
-    repository_url: string;
-    version: string;
-} | {
-    kind: 'local-file';
-    platform: string;
-    sha256: string;
-    version: string;
+/**
+ * What a plugin's container may connect to on the network.
+ */
+export type PluginOutboundNetwork = {
+    /**
+     * What that profile means, in words.
+     */
+    detail: string;
+    /**
+     * `open`, `restricted` or `none`.
+     */
+    profile: string;
+    /**
+     * Where an administrator changes it.
+     */
+    settings_path: string;
+};
+
+/**
+ * The limits a plugin's container runs with. They are the limits of its
+ * service, changed in the service's settings and applied by a deployment.
+ */
+export type PluginResourceLimitsResponse = {
+    /**
+     * Microcores of CPU: 1,000,000 is one core. Absent when not capped.
+     */
+    cpu_limit_microcores?: number | null;
+    /**
+     * The deployment these limits were applied to.
+     */
+    deployment_id: number;
+    /**
+     * Megabytes of memory. Absent when memory is not capped.
+     */
+    memory_limit_mb?: number | null;
+};
+
+/**
+ * Whether this server can run plugins as services, and the ones it runs.
+ */
+export type PluginServicesResponse = {
+    /**
+     * Whether a service can be added as a plugin on this server.
+     */
+    configured: boolean;
+    plugins: Array<ServicePluginResponse>;
+    /**
+     * Why not, when it cannot.
+     */
+    reason?: string | null;
+    /**
+     * Plugins installed as executables, which no longer run. Each stays
+     * listed, with the reason, until an administrator removes it.
+     */
+    retired: Array<RetiredPluginResponse>;
+    /**
+     * Where the console explains what is missing.
+     */
+    setup_path?: string | null;
 };
 
 export type PluginStatusResponse = {
     configured: boolean;
     reason?: string | null;
     setup_path: string;
-    source?: PluginSourceResponse | null;
 };
+
+/**
+ * Whether a plugin is switched off, after the call.
+ */
+export type PluginSwitchResponse = {
+    /**
+     * Whether Temps is cut off from the plugin.
+     */
+    disabled: boolean;
+    /**
+     * What happened, and what was left as it is.
+     */
+    message: string;
+    name: string;
+};
+
+/**
+ * Who stands behind a plugin, and so how much it may ask for.
+ */
+export type PluginTier = 'community' | 'verified';
+
+/**
+ * An area of the platform a plugin may be allowed to change.
+ */
+export type PluginWriteArea = 'projects' | 'environments' | 'deployments';
 
 /**
  * Which policy decided a test.
@@ -29232,22 +29398,6 @@ export type ProfileResponse = {
     ingress: string;
     ingress_source: string;
 };
-
-export type ProgressSnapshot = {
-    elapsed_ms: number;
-    id: string;
-    stages: Array<ProgressStage>;
-    status: ProgressStatus;
-};
-
-export type ProgressStage = {
-    elapsed_ms: number;
-    message: string;
-    stage: string;
-    status: ProgressStatus;
-};
-
-export type ProgressStatus = 'running' | 'completed' | 'failed';
 
 export type ProjectAccessResponse = {
     created_at: string;
@@ -32152,40 +32302,6 @@ export type RegisterWireguardMeshResponse = {
 };
 
 /**
- * The outer envelope signs the decoded bytes in `payload`. Encoding the
- * payload instead of reserializing a JSON object avoids ambiguous map order,
- * whitespace, and number representations.
- */
-export type RegistryEnvelope = {
-    key_id: string;
-    /**
-     * Standard-base64 encoded JSON [`RegistryDocument`].
-     */
-    payload: string;
-    /**
-     * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
-     */
-    signature: string;
-};
-
-export type RegistryPlugin = {
-    author: string;
-    category: string;
-    description: string;
-    docs_url?: string | null;
-    keywords?: Array<string>;
-    logo_url?: string | null;
-    name: string;
-    platforms: {
-        [key: string]: PlatformRelease;
-    };
-    repository?: string | null;
-    summary: string;
-    title: string;
-    version: string;
-};
-
-/**
  * Response for `POST /projects/{project_id}/github/reinstall-webhook`
  */
 export type ReinstallGithubWebhookResponse = {
@@ -32509,6 +32625,13 @@ export type RepositoryCatalogPlugin = {
     commit: string;
     description: string;
     docsUrl?: string | null;
+    /**
+     * The image the author publishes for this version, named by digest
+     * (`registry.example.com/acme/reports@sha256:...`), so what is deployed
+     * is the content the listing names. Absent when the plugin is published
+     * as source only.
+     */
+    image?: string;
     latestVersion: string;
     logoUrl?: string | null;
     name: string;
@@ -32530,7 +32653,6 @@ export type RepositoryCatalogPlugin = {
 
 export type RepositoryCatalogResponse = {
     available: boolean;
-    platform: string;
     plugins: Array<RepositoryCatalogPlugin>;
     reason?: string | null;
     source: string;
@@ -33418,6 +33540,22 @@ export type RetentionCleanupReport = {
      * Schedule scope, or `None` when every schedule was considered.
      */
     schedule_id?: number | null;
+};
+
+/**
+ * A plugin an earlier version installed as an executable. It does not run:
+ * a plugin runs only as a Temps service.
+ */
+export type RetiredPluginResponse = {
+    name: string;
+    /**
+     * Why it does not run and what to do about it.
+     */
+    reason: string;
+    /**
+     * The version that was installed, when its record still says.
+     */
+    version?: string | null;
 };
 
 /**
@@ -36141,6 +36279,85 @@ export type ServicePlan = {
      */
     version?: string | null;
 };
+
+/**
+ * One plugin that runs as a Temps service.
+ */
+export type ServicePluginResponse = {
+    /**
+     * The deployment Temps is attached to, while the plugin is running.
+     */
+    deployment_id?: number | null;
+    /**
+     * Why the plugin is not running, when it is not.
+     */
+    detail?: string | null;
+    /**
+     * Since when an administrator has the plugin switched off.
+     */
+    disabled_at?: string | null;
+    /**
+     * The user who switched it off, while that user exists.
+     */
+    disabled_by?: number | null;
+    environment_id?: number | null;
+    environment_name?: string | null;
+    /**
+     * The image the plugin runs, when its service was deployed from an
+     * image: the reference that was approved. Absent for a service built
+     * from a repository.
+     */
+    image?: string | null;
+    /**
+     * The Docker image ID the plugin's image is: what a registry image
+     * resolved to when it was deployed, or what an image uploaded from a
+     * client was imported as (such a plugin has no `image`). This is the
+     * content that was approved; a tag moved to other content later does
+     * not change it. Absent when Temps did not record it.
+     */
+    image_id?: string | null;
+    /**
+     * The plugin's name, as its manifest declares it.
+     */
+    name: string;
+    /**
+     * The managed databases and stores linked to the plugin's service,
+     * where it keeps its own data. Empty when it has none.
+     */
+    own_storage: Array<string>;
+    pending_update?: PendingPluginUpdateResponse | null;
+    /**
+     * The deployment whose build an administrator approved. The plugin is
+     * pinned to it: Temps attaches to no other build of the service.
+     */
+    pinned_deployment_id?: number | null;
+    /**
+     * The service the plugin runs as. Absent once the service was deleted.
+     */
+    project_id?: number | null;
+    resource_limits?: PluginResourceLimitsResponse | null;
+    service_name?: string | null;
+    service_slug?: string | null;
+    /**
+     * Whether Temps is attached to the service's running container.
+     */
+    state: ServicePluginState;
+    /**
+     * Whether the service stops when idle and starts on the next request,
+     * so an unused plugin holds no memory.
+     */
+    stops_when_idle: boolean;
+    /**
+     * Who stands behind the plugin. A community plugin runs in its own
+     * container and is never given Temps's database or data directory.
+     */
+    tier: PluginTier;
+};
+
+/**
+ * Whether a plugin that runs as a service can serve a request right now.
+ */
+export type ServicePluginState = 'running' | 'asleep' | 'update_waiting' | 'disabled' | 'unavailable';
 
 /**
  * A public URL of a compose service and the container port it routes to.
@@ -42859,10 +43076,6 @@ export type UpdatePublicIngressSettingsRequest = {
      * What DNS points at, or `None` for the listen address.
      */
     public_address?: string | null;
-};
-
-export type UpdateRepositoryRequest = {
-    ref_name?: string | null;
 };
 
 export type UpdateRouteRequest = {
@@ -112731,35 +112944,6 @@ export type ListExternalPluginsResponses = {
 
 export type ListExternalPluginsResponse = ListExternalPluginsResponses[keyof ListExternalPluginsResponses];
 
-export type ListPluginCatalogData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/catalog';
-};
-
-export type ListPluginCatalogErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-};
-
-export type ListPluginCatalogError = ListPluginCatalogErrors[keyof ListPluginCatalogErrors];
-
-export type ListPluginCatalogResponses = {
-    /**
-     * Signed plugin catalogue, or an unavailable state when registry trust is not configured
-     */
-    200: PluginCatalogResponse;
-};
-
-export type ListPluginCatalogResponse = ListPluginCatalogResponses[keyof ListPluginCatalogResponses];
-
 export type ListRepositoryPluginCatalogData = {
     body?: never;
     path?: never;
@@ -112772,193 +112956,6 @@ export type ListRepositoryPluginCatalogResponses = {
 };
 
 export type ListRepositoryPluginCatalogResponse = ListRepositoryPluginCatalogResponses[keyof ListRepositoryPluginCatalogResponses];
-
-export type InstallLocalFileData = {
-    body: FileUpload;
-    headers: {
-        /**
-         * Operator approval to execute the file with this SHA-256
-         */
-        'X-Temps-Trust-Sha256': string;
-    };
-    path?: never;
-    query: {
-        name: string;
-        version: string;
-    };
-    url: '/x/plugins/install/file';
-};
-
-export type InstallLocalFileErrors = {
-    /**
-     * Invalid plugin identity, digest header or multipart upload
-     */
-    400: unknown;
-    /**
-     * Authentication required
-     */
-    401: unknown;
-    /**
-     * Administrator permission or sensitive-action authorization required
-     */
-    403: unknown;
-    /**
-     * Upload timed out
-     */
-    408: unknown;
-    /**
-     * Persistent storage is required or the existing installation uses a different source
-     */
-    409: unknown;
-    /**
-     * Executable exceeds the upload limit
-     */
-    413: unknown;
-    /**
-     * Additional verification required for this sensitive action
-     */
-    428: unknown;
-    /**
-     * Another file upload is in progress
-     */
-    429: unknown;
-    /**
-     * Could not stage, activate or persist the installation
-     */
-    500: unknown;
-    /**
-     * Plugin verification or startup failed
-     */
-    502: unknown;
-    /**
-     * Plugin actor activation is unavailable or the service is shutting down
-     */
-    503: unknown;
-};
-
-export type InstallLocalFileResponses = {
-    /**
-     * Plugin verified, installed and started
-     */
-    200: InstallPluginResponse;
-};
-
-export type InstallLocalFileResponse = InstallLocalFileResponses[keyof InstallLocalFileResponses];
-
-export type GetRepositoryInstallProgressData = {
-    body?: never;
-    path: {
-        /**
-         * Client-generated installation UUID
-         */
-        id: string;
-    };
-    query?: never;
-    url: '/x/plugins/install/progress/{id}';
-};
-
-export type GetRepositoryInstallProgressErrors = {
-    404: ProblemDetails;
-};
-
-export type GetRepositoryInstallProgressError = GetRepositoryInstallProgressErrors[keyof GetRepositoryInstallProgressErrors];
-
-export type GetRepositoryInstallProgressResponses = {
-    200: ProgressSnapshot;
-};
-
-export type GetRepositoryInstallProgressResponse = GetRepositoryInstallProgressResponses[keyof GetRepositoryInstallProgressResponses];
-
-export type InstallRepositoryData = {
-    body: InstallRepositoryRequest;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/install/repository';
-};
-
-export type InstallRepositoryErrors = {
-    /**
-     * Invalid repository source
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Plugin source conflict
-     */
-    409: ProblemDetails;
-    /**
-     * Request body exceeds configured limit
-     */
-    413: ProblemDetails;
-    /**
-     * Request content type is not application/json
-     */
-    415: ProblemDetails;
-    /**
-     * Request JSON does not match install schema
-     */
-    422: ProblemDetails;
-    /**
-     * Recent sensitive-action verification required
-     */
-    428: ProblemDetails;
-    /**
-     * Local plugin installation failed
-     */
-    500: ProblemDetails;
-    /**
-     * Repository, build, or startup failed
-     */
-    502: ProblemDetails;
-    /**
-     * Plugin service or security audit unavailable
-     */
-    503: ProblemDetails;
-};
-
-export type InstallRepositoryError = InstallRepositoryErrors[keyof InstallRepositoryErrors];
-
-export type InstallRepositoryResponses = {
-    /**
-     * Repository commit built, verified, and activated
-     */
-    200: InstallRepositoryResponse;
-};
-
-export type InstallRepositoryResponse2 = InstallRepositoryResponses[keyof InstallRepositoryResponses];
-
-export type GetPluginInstallationReportingData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/installation-reporting';
-};
-
-export type GetPluginInstallationReportingResponses = {
-    200: InstallationReportingSettings;
-};
-
-export type GetPluginInstallationReportingResponse = GetPluginInstallationReportingResponses[keyof GetPluginInstallationReportingResponses];
-
-export type SetPluginInstallationReportingData = {
-    body: InstallationReportingSettings;
-    path?: never;
-    query?: never;
-    url: '/x/plugins/installation-reporting';
-};
-
-export type SetPluginInstallationReportingResponses = {
-    200: InstallationReportingSettings;
-};
-
-export type SetPluginInstallationReportingResponse = SetPluginInstallationReportingResponses[keyof SetPluginInstallationReportingResponses];
 
 export type ReloadPluginsData = {
     body?: never;
@@ -112996,6 +112993,104 @@ export type ReloadPluginsResponses = {
 };
 
 export type ReloadPluginsResponse = ReloadPluginsResponses[keyof ReloadPluginsResponses];
+
+export type GetPluginServicesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/services';
+};
+
+export type GetPluginServicesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The services plugins run as could not be read
+     */
+    500: ProblemDetails;
+};
+
+export type GetPluginServicesError = GetPluginServicesErrors[keyof GetPluginServicesErrors];
+
+export type GetPluginServicesResponses = {
+    /**
+     * Plugins that run as Temps services
+     */
+    200: PluginServicesResponse;
+};
+
+export type GetPluginServicesResponse = GetPluginServicesResponses[keyof GetPluginServicesResponses];
+
+export type AddServicePluginData = {
+    body: AddServicePlugin;
+    path?: never;
+    query?: never;
+    url: '/x/plugins/services';
+};
+
+export type AddServicePluginErrors = {
+    /**
+     * Invalid request body, or the service is not a plugin Temps accepts
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The service or environment does not exist
+     */
+    404: ProblemDetails;
+    /**
+     * The service is stopped or not deployed, its plugin name is already installed, or it runs another deployment than the one named
+     */
+    409: ProblemDetails;
+    /**
+     * Request body is not JSON
+     */
+    415: ProblemDetails;
+    /**
+     * Request body does not name a service and an environment
+     */
+    422: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * The plugin could not be recorded
+     */
+    500: ProblemDetails;
+    /**
+     * The service did not answer as a plugin
+     */
+    502: ProblemDetails;
+    /**
+     * Audit unavailable, or this server runs no services
+     */
+    503: ProblemDetails;
+};
+
+export type AddServicePluginError = AddServicePluginErrors[keyof AddServicePluginErrors];
+
+export type AddServicePluginResponses = {
+    /**
+     * The service is now a plugin
+     */
+    201: AddedServicePluginResponse;
+};
+
+export type AddServicePluginResponse = AddServicePluginResponses[keyof AddServicePluginResponses];
 
 export type GetPluginAiToolsData = {
     body?: never;
@@ -113055,16 +113150,147 @@ export type PutPluginAiToolsResponses = {
 
 export type PutPluginAiToolsResponse = PutPluginAiToolsResponses[keyof PutPluginAiToolsResponses];
 
+export type DisablePluginData = {
+    body?: never;
+    path: {
+        /**
+         * The plugin's name
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/disable';
+};
+
+export type DisablePluginErrors = {
+    /**
+     * Invalid plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
+     */
+    404: ProblemDetails;
+    /**
+     * The plugin is cut off, but that could not be saved
+     */
+    500: ProblemDetails;
+    /**
+     * The plugin host is shutting down
+     */
+    503: ProblemDetails;
+};
+
+export type DisablePluginError = DisablePluginErrors[keyof DisablePluginErrors];
+
+export type DisablePluginResponses = {
+    /**
+     * Temps is cut off from the plugin
+     */
+    200: PluginSwitchResponse;
+};
+
+export type DisablePluginResponse = DisablePluginResponses[keyof DisablePluginResponses];
+
+export type EnablePluginData = {
+    body?: never;
+    path: {
+        /**
+         * The plugin's name
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/x/plugins/{name}/enable';
+};
+
+export type EnablePluginErrors = {
+    /**
+     * Invalid plugin name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
+     */
+    404: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * The plugin could not be enabled
+     */
+    500: ProblemDetails;
+    /**
+     * Audit unavailable, or the plugin host is shutting down
+     */
+    503: ProblemDetails;
+};
+
+export type EnablePluginError = EnablePluginErrors[keyof EnablePluginErrors];
+
+export type EnablePluginResponses = {
+    /**
+     * The plugin may connect again
+     */
+    200: PluginSwitchResponse;
+};
+
+export type EnablePluginResponse = EnablePluginResponses[keyof EnablePluginResponses];
+
 export type GetPluginGrantsData = {
     body?: never;
     path: {
+        /**
+         * The plugin's name
+         */
         name: string;
     };
     query?: never;
     url: '/x/plugins/{name}/grants';
 };
 
+export type GetPluginGrantsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
+     */
+    404: ProblemDetails;
+    /**
+     * The plugin's permissions could not be read
+     */
+    500: ProblemDetails;
+};
+
+export type GetPluginGrantsError = GetPluginGrantsErrors[keyof GetPluginGrantsErrors];
+
 export type GetPluginGrantsResponses = {
+    /**
+     * What the plugin asks for and what it was given
+     */
     200: PluginGrantsResponse;
 };
 
@@ -113073,13 +113299,52 @@ export type GetPluginGrantsResponse = GetPluginGrantsResponses[keyof GetPluginGr
 export type PutPluginGrantsData = {
     body: PluginGrantConfig;
     path: {
+        /**
+         * The plugin's name
+         */
         name: string;
     };
     query?: never;
     url: '/x/plugins/{name}/grants';
 };
 
+export type PutPluginGrantsErrors = {
+    /**
+     * A permission the plugin did not ask for, or a scope that is not valid
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The plugin is not running or was never added
+     */
+    404: ProblemDetails;
+    /**
+     * The plugin was replaced while its permissions were being changed
+     */
+    409: ProblemDetails;
+    /**
+     * Recent verification is required
+     */
+    428: ProblemDetails;
+    /**
+     * The plugin's permissions could not be saved
+     */
+    500: ProblemDetails;
+};
+
+export type PutPluginGrantsError = PutPluginGrantsErrors[keyof PutPluginGrantsErrors];
+
 export type PutPluginGrantsResponses = {
+    /**
+     * The permissions now in effect
+     */
     200: PluginGrantsResponse;
 };
 
@@ -113113,7 +113378,7 @@ export type GetPluginStatusError = GetPluginStatusErrors[keyof GetPluginStatusEr
 
 export type GetPluginStatusResponses = {
     /**
-     * Verified active plugin status
+     * Whether Temps is connected to the plugin
      */
     200: PluginStatusResponse;
 };
@@ -113143,7 +113408,7 @@ export type UninstallPluginErrors = {
      */
     403: ProblemDetails;
     /**
-     * No active installation
+     * No plugin with this name
      */
     404: ProblemDetails;
     /**
@@ -113151,7 +113416,7 @@ export type UninstallPluginErrors = {
      */
     428: ProblemDetails;
     /**
-     * Local deactivation failed
+     * The plugin could not be removed
      */
     500: ProblemDetails;
     /**
@@ -113164,43 +113429,82 @@ export type UninstallPluginError = UninstallPluginErrors[keyof UninstallPluginEr
 
 export type UninstallPluginResponses = {
     /**
-     * Plugin deactivated; data and releases preserved
+     * Plugin removed; its service or stored files are kept
      */
     200: UninstallPluginResponse;
 };
 
 export type UninstallPluginResponse2 = UninstallPluginResponses[keyof UninstallPluginResponses];
 
-export type UpdateRepositoryData = {
-    body: UpdateRepositoryRequest;
+export type ApprovePluginUpdateData = {
+    body: ApprovePluginUpdate;
     path: {
+        /**
+         * The plugin's name
+         */
         name: string;
     };
     query?: never;
-    url: '/x/plugins/{name}/update';
+    url: '/x/plugins/{name}/update/approve';
 };
 
-export type UpdateRepositoryErrors = {
+export type ApprovePluginUpdateErrors = {
     /**
-     * No repository-backed active plugin
+     * Invalid request body or plugin name, or the build is not a plugin Temps accepts
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No plugin with that name was added
      */
     404: ProblemDetails;
     /**
-     * Build or startup failed; previous plugin preserved
+     * No update waits, or what waits is not what was reviewed
+     */
+    409: ProblemDetails;
+    /**
+     * Request body is not JSON
+     */
+    415: ProblemDetails;
+    /**
+     * Request body does not name the review
+     */
+    422: ProblemDetails;
+    /**
+     * Recent sensitive-action verification required
+     */
+    428: ProblemDetails;
+    /**
+     * The approved build could not be read or recorded
+     */
+    500: ProblemDetails;
+    /**
+     * The service did not answer as a plugin
      */
     502: ProblemDetails;
-};
-
-export type UpdateRepositoryError = UpdateRepositoryErrors[keyof UpdateRepositoryErrors];
-
-export type UpdateRepositoryResponses = {
     /**
-     * Repository plugin explicitly updated to a new pinned commit
+     * Audit unavailable, or the plugin host is shutting down
      */
-    200: InstallRepositoryResponse;
+    503: ProblemDetails;
 };
 
-export type UpdateRepositoryResponse = UpdateRepositoryResponses[keyof UpdateRepositoryResponses];
+export type ApprovePluginUpdateError = ApprovePluginUpdateErrors[keyof ApprovePluginUpdateErrors];
+
+export type ApprovePluginUpdateResponses = {
+    /**
+     * The plugin now runs as the approved build
+     */
+    200: ApprovedPluginUpdateResponse;
+};
+
+export type ApprovePluginUpdateResponse = ApprovePluginUpdateResponses[keyof ApprovePluginUpdateResponses];
 
 export type IngestSentryEnvelopeData = {
     /**

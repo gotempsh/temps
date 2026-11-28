@@ -1,15 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import type { ReloadFailureResponse } from '@/api/client/types.gen'
+import type {
+  ReloadFailureResponse,
+  ServicePluginResponse,
+} from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from '@/components/ui/dialog'
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -25,8 +21,10 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import {
+  useDisablePlugin,
+  useEnablePlugin,
+  usePluginServices,
   usePlugins,
   useReloadPlugins,
   useUninstallPlugin,
@@ -41,9 +39,11 @@ import {
   AlertCircle,
   ArrowUpRight,
   Compass,
-  GitPullRequest,
+  GitCompareArrows,
   MoreHorizontal,
   Plus,
+  Power,
+  PowerOff,
   Puzzle,
   RefreshCw,
   Shield,
@@ -52,34 +52,54 @@ import {
 } from 'lucide-react'
 import { createElement, useEffect, useState } from 'react'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
-import { Link, useNavigate } from 'react-router'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
-import { LocalFileInstall } from '@/components/plugins/LocalFileInstall'
+import type { PluginImageChoice } from '@/components/plugins/PluginImageForm'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
-import {
-  RepositoryUpdate,
-  RepositoryUpdateButton,
-} from '@/components/plugins/RepositoryUpdate'
 import { PluginNavigationHint } from '@/components/plugins/PluginNavigationHint'
 import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsDialog'
+import {
+  PluginDisabledNote,
+  PluginEnableButton,
+  PluginResourceLimits,
+} from '@/components/plugins/PluginControls'
+import {
+  PluginPinnedBuild,
+  PluginUpdateDialog,
+  PluginUpdateNotice,
+} from '@/components/plugins/PluginUpdates'
+import {
+  AddServicePluginDialog,
+  PluginOwnStorage,
+  PluginTierBadge,
+  RetiredPluginNotice,
+  ServicePluginNotice,
+  ServicePluginOrigin,
+  ServicePluginStatus,
+} from '@/components/plugins/ServicePlugins'
 
 export function PluginsPage() {
-  const navigate = useNavigate()
-  const platformFeatures = usePlatformFeatures()
-  const requiresPersistentStorage =
-    platformFeatures.data?.external_plugins === false
-
   const { setBreadcrumbs } = useBreadcrumbs()
   const { user } = useAuth()
   const canManagePlugins = canManageExternalPlugins(user?.role)
   const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
-  const [fileName, setFileName] = useState<string | null>(null)
+  const disablePlugin = useDisablePlugin()
+  const enablePlugin = useEnablePlugin()
+  // Plugins that run as Temps services, and how each is doing.
+  const services = usePluginServices(canManagePlugins)
+  const serviceOf = (name: string) =>
+    services.data?.plugins.find((plugin) => plugin.name === name)
+  const [addingService, setAddingService] = useState(false)
+  // The image a catalogue listing offers, to add the plugin from.
+  const [offeredImage, setOfferedImage] = useState<
+    PluginImageChoice | undefined
+  >()
   const [uninstallName, setUninstallName] = useState<string | null>(null)
-  const [updateName, setUpdateName] = useState<string | null>(null)
-  const [updatePending, setUpdatePending] = useState(false)
   const [permissionsName, setPermissionsName] = useState<string | null>(null)
+  // The plugin whose waiting update is being reviewed.
+  const [updateName, setUpdateName] = useState<string | null>(null)
   const [reloadFailures, setReloadFailures] = useState<ReloadFailureResponse[]>(
     []
   )
@@ -91,11 +111,18 @@ export function PluginsPage() {
   const setTab = (value: string) =>
     patchUrlState({ tab: value === 'browse' ? undefined : value })
   const managementPending =
-    requiresPersistentStorage ||
     reloadPlugins.isPending ||
-    uninstallPlugin.isPending
+    uninstallPlugin.isPending ||
+    disablePlugin.isPending ||
+    enablePlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
+  // An entry left by a plugin an earlier version installed as an executable.
+  const removesRetired =
+    uninstallName !== null &&
+    (services.data?.retired ?? []).some(
+      (plugin) => plugin.name === uninstallName
+    )
 
   useEffect(() => {
     setBreadcrumbs([{ label: 'Plugins' }])
@@ -133,41 +160,28 @@ export function PluginsPage() {
     }
   }
 
+  // One click: switching off takes access away, so it asks nothing first.
+  const handleDisable = async (name: string) => {
+    try {
+      const result = await disablePlugin.mutateAsync(name)
+      toast.success(result.message)
+    } catch {
+      // The toast comes from the app-wide mutation error handler.
+    }
+  }
+
+  const handleEnable = async (name: string) => {
+    try {
+      const result = await enablePlugin.mutateAsync(name)
+      toast.success(result.message)
+    } catch (error) {
+      // Any other failure is shown by the app-wide mutation error handler.
+      handleSensitiveActionError(error, () => void handleEnable(name))
+    }
+  }
+
   return (
     <div className="w-full min-w-0 space-y-6">
-      {requiresPersistentStorage && (
-        <Alert>
-          <AlertTitle>Plugins need persistent storage</AlertTitle>
-          <AlertDescription>
-            Browse available plugins here. Installing them requires a
-            full-profile instance that retains plugin binaries and data. This
-            stateless control plane replaces its local disk when it restarts.
-          </AlertDescription>
-        </Alert>
-      )}
-      <Dialog
-        open={updateName !== null}
-        onOpenChange={(open) => {
-          if (!open && !updatePending) setUpdateName(null)
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <GitPullRequest className="size-5" /> Update plugin
-            </DialogTitle>
-            <DialogDescription>
-              Choose the revision to build for {updateName}.
-            </DialogDescription>
-          </DialogHeader>
-          <RepositoryUpdate
-            name={updateName ?? ''}
-            disabled={managementPending}
-            onSensitiveError={handleSensitiveActionError}
-            onPendingChange={setUpdatePending}
-          />
-        </DialogContent>
-      </Dialog>
       <PluginPermissionsDialog
         name={permissionsName}
         open={canManagePlugins && permissionsName !== null}
@@ -176,11 +190,25 @@ export function PluginsPage() {
         }}
         onSensitiveError={handleSensitiveActionError}
       />
-      <LocalFileInstall
-        open={canManagePlugins && fileName !== null}
-        expectedName={fileName ?? ''}
-        onOpenChange={() => setFileName(null)}
+      <PluginUpdateDialog
+        plugin={updateName === null ? undefined : serviceOf(updateName)}
+        open={canManagePlugins && updateName !== null}
+        onOpenChange={(open) => {
+          if (!open) setUpdateName(null)
+        }}
         onSensitiveError={handleSensitiveActionError}
+        // What an update newly asks for is off until it is chosen.
+        onApproved={(name, asksForMore) => {
+          if (asksForMore) setPermissionsName(name)
+        }}
+      />
+      <AddServicePluginDialog
+        open={canManagePlugins && addingService}
+        onOpenChange={setAddingService}
+        services={services.data}
+        image={offeredImage}
+        onSensitiveError={handleSensitiveActionError}
+        onAdded={setPermissionsName}
       />
       {canManagePlugins && verificationDialog}
       <ConfirmDeleteDialog
@@ -188,11 +216,15 @@ export function PluginsPage() {
         onOpenChange={(open) => {
           if (!open) setUninstallName(null)
         }}
-        verb="Uninstall"
+        verb="Remove"
         resourceType="plugin"
         resourceName={uninstallName ?? ''}
         irreversible={false}
-        consequences="This stops the plugin and removes it from navigation. Its data is preserved so you can reinstall it later."
+        consequences={
+          removesRetired
+            ? 'This removes the entry and revokes the permissions the plugin had. The files it stored on this server are kept.'
+            : 'This removes the plugin from navigation and revokes its permissions. The service it runs as keeps running; stop or delete it from its own page.'
+        }
         isPending={uninstallPlugin.isPending}
         onConfirm={() => {
           if (uninstallName) void handleUninstall(uninstallName)
@@ -203,26 +235,32 @@ export function PluginsPage() {
         description="Extend Temps with tools for your deployments."
         actions={
           canManagePlugins && (
-            <div className="flex flex-wrap gap-2">
-              <Button
-                variant="outline"
-                disabled={managementPending}
-                onClick={() => setFileName('')}
-              >
-                Install from file
-              </Button>
-              <Button
-                onClick={() => {
-                  navigate('/settings/plugins/install')
-                }}
-                disabled={managementPending}
-              >
-                <Plus className="mr-2 size-4" /> Install from GitHub
-              </Button>
-            </div>
+            <Button
+              disabled={managementPending}
+              onClick={() => {
+                setOfferedImage(undefined)
+                setAddingService(true)
+              }}
+            >
+              <Plus className="mr-2 size-4" /> Add plugin
+            </Button>
           )
         }
       />
+      {canManagePlugins && (
+        <RetiredPluginNotice
+          retired={services.data?.retired}
+          disabled={managementPending}
+          onRemove={setUninstallName}
+        />
+      )}
+      {canManagePlugins && (
+        <PluginUpdateNotice
+          services={services.data}
+          disabled={managementPending}
+          onReview={setUpdateName}
+        />
+      )}
       <Tabs value={tab} onValueChange={setTab} className="space-y-6">
         <TabsList aria-label="Plugin views">
           <TabsTrigger value="browse" icon={Compass}>
@@ -257,14 +295,15 @@ export function PluginsPage() {
         )}
         <TabsContent value="browse" className="space-y-4">
           <RepositoryCatalog
-            canInstall={canManagePlugins && !requiresPersistentStorage}
-            disabled={managementPending}
-            installedNames={plugins.map((plugin) => plugin.name)}
-            onSelect={(plugin) => {
-              navigate(
-                `/settings/plugins/install?plugin=${encodeURIComponent(plugin.name)}&commit=${plugin.commit}`
-              )
-            }}
+            addedNames={plugins.map((plugin) => plugin.name)}
+            onAdd={
+              canManagePlugins
+                ? (choice) => {
+                    setOfferedImage(choice)
+                    setAddingService(true)
+                  }
+                : undefined
+            }
           />
         </TabsContent>
         <TabsContent value="running">
@@ -278,8 +317,8 @@ export function PluginsPage() {
                   Running
                 </h2>
                 <p className="text-sm text-muted-foreground">
-                  {plugins.length} verified{' '}
-                  {plugins.length === 1 ? 'plugin' : 'plugins'} running
+                  {plugins.length} {plugins.length === 1 ? 'plugin' : 'plugins'}{' '}
+                  added
                 </p>
               </div>
               {canManagePlugins && (
@@ -297,18 +336,25 @@ export function PluginsPage() {
               )}
             </div>
 
+            {canManagePlugins && (
+              <ServicePluginNotice
+                services={services.data}
+                unavailable={services.isError}
+                disabled={managementPending}
+                onRemove={setUninstallName}
+              />
+            )}
+
             {pluginsLoading ? (
               <RunningPluginsSkeleton />
             ) : plugins.length === 0 ? (
               <div className="rounded-lg border bg-card px-4 py-8 text-center">
                 <Puzzle className="mx-auto size-5 text-muted-foreground" />
-                <p className="mt-3 font-medium">
-                  No verified plugins are running.
-                </p>
+                <p className="mt-3 font-medium">No plugins are added.</p>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {canManagePlugins
-                    ? 'Choose a plugin from the catalog to get started.'
-                    : 'Ask a system administrator to install one.'}
+                    ? 'Add one from its image, or from a service that is already deployed.'
+                    : 'Ask a system administrator to add one.'}
                 </p>
                 <Button
                   variant="outline"
@@ -341,17 +387,33 @@ export function PluginsPage() {
                           <span className="flex items-center gap-1 text-xs text-muted-foreground">
                             <Tag className="size-3" /> v{plugin.version}
                           </span>
-                          <Status tone="ok" label="Running" />
+                          <PluginRunState service={serviceOf(plugin.name)} />
+                          <PluginTier service={serviceOf(plugin.name)} />
                         </div>
                         {plugin.description && (
                           <p className="mt-1 text-sm text-muted-foreground">
                             {plugin.description}
                           </p>
                         )}
+                        <PluginServiceOrigin
+                          service={serviceOf(plugin.name)}
+                          currentUserId={user?.id}
+                        />
                         <PluginNavigationHint nav={plugin.nav} />
                       </div>
                     </div>
                     <div className="flex min-w-0 flex-wrap items-center gap-2">
+                      {canManagePlugins && (
+                        <PluginEnableButton
+                          plugin={serviceOf(plugin.name)}
+                          pending={
+                            enablePlugin.isPending &&
+                            enablePlugin.variables === plugin.name
+                          }
+                          disabled={managementPending}
+                          onEnable={(name) => void handleEnable(name)}
+                        />
+                      )}
                       {plugin.nav.some(
                         (entry) => entry.section !== 'project'
                       ) && (
@@ -360,14 +422,6 @@ export function PluginsPage() {
                             Open <ArrowUpRight className="ml-1 size-4" />
                           </Link>
                         </Button>
-                      )}
-                      {canManagePlugins && (
-                        <RepositoryUpdateButton
-                          name={plugin.name}
-                          onClick={() => setUpdateName(plugin.name)}
-                          onFileUpdate={() => setFileName(plugin.name)}
-                          disabled={managementPending}
-                        />
                       )}
                       {canManagePlugins && (
                         <DropdownMenu>
@@ -387,12 +441,37 @@ export function PluginsPage() {
                             >
                               <Shield className="mr-2 size-4" /> Permissions
                             </DropdownMenuItem>
+                            {serviceOf(plugin.name)?.pending_update && (
+                              <DropdownMenuItem
+                                onSelect={() => setUpdateName(plugin.name)}
+                              >
+                                <GitCompareArrows className="mr-2 size-4" />{' '}
+                                Review update
+                              </DropdownMenuItem>
+                            )}
+                            {serviceOf(plugin.name)?.state === 'disabled' ? (
+                              <DropdownMenuItem
+                                onSelect={() => void handleEnable(plugin.name)}
+                              >
+                                <Power className="mr-2 size-4" /> Enable
+                              </DropdownMenuItem>
+                            ) : (
+                              serviceOf(plugin.name) && (
+                                <DropdownMenuItem
+                                  onSelect={() =>
+                                    void handleDisable(plugin.name)
+                                  }
+                                >
+                                  <PowerOff className="mr-2 size-4" /> Disable
+                                </DropdownMenuItem>
+                              )
+                            )}
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
                               className="text-destructive focus:text-destructive"
                               onSelect={() => setUninstallName(plugin.name)}
                             >
-                              <Trash2 className="mr-2 size-4" /> Uninstall
+                              <Trash2 className="mr-2 size-4" /> Remove
                             </DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>
@@ -407,6 +486,46 @@ export function PluginsPage() {
       </Tabs>
     </div>
   )
+}
+
+/** Running, unless the plugin's service is stopped or unreachable. */
+function PluginRunState({
+  service,
+}: {
+  service: ServicePluginResponse | undefined
+}) {
+  if (!service) return <Status tone="ok" label="Running" />
+  return <ServicePluginStatus plugin={service} />
+}
+
+/** The service a plugin runs as. */
+function PluginServiceOrigin({
+  service,
+  currentUserId,
+}: {
+  service: ServicePluginResponse | undefined
+  currentUserId?: number
+}) {
+  if (!service) return null
+  return (
+    <>
+      <PluginDisabledNote plugin={service} currentUserId={currentUserId} />
+      <ServicePluginOrigin plugin={service} />
+      <PluginPinnedBuild plugin={service} />
+      <PluginResourceLimits plugin={service} />
+      <PluginOwnStorage plugin={service} />
+    </>
+  )
+}
+
+/** The plugin's tier, once the administrator's view of it has loaded. */
+function PluginTier({
+  service,
+}: {
+  service: ServicePluginResponse | undefined
+}) {
+  if (!service) return null
+  return <PluginTierBadge plugin={service} />
 }
 
 function RunningPluginsSkeleton() {

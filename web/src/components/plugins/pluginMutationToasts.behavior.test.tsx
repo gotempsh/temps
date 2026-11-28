@@ -3,21 +3,13 @@
 
 import { afterEach, expect, spyOn, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  renderHook,
-  waitFor,
-} from '@testing-library/react'
+import { act, cleanup, renderHook } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { toast } from 'sonner'
 import { useReloadPlugins, useUninstallPlugin } from '@/hooks/usePlugins'
 import { announceMutationFailure } from '@/lib/mutation-error-toast'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { RepositoryUpdate } from './RepositoryUpdate'
 
 // The static check in pluginMutationToasts.test.ts only proves the catch
 // blocks stay silent. These run a rejected plugin mutation under the same
@@ -68,44 +60,6 @@ function expectOneToast(error: ReturnType<typeof spyOn>) {
     description: FAILURE.detail,
   })
 }
-
-test('a failed repository update shows exactly one toast with the title and detail', async () => {
-  const error = spyOn(toast, 'error').mockImplementation(() => 'id')
-  const api = mockApi({
-    'GET /x/plugins/demo/status': () =>
-      jsonResponse({
-        configured: true,
-        source: {
-          kind: 'github',
-          repository_url: 'https://github.com/example/plugins',
-          path: 'plugins/demo',
-          ref_name: 'main',
-          commit: 'a'.repeat(40),
-          version: '1.0.0',
-          builder_image: 'fixture',
-        },
-      }),
-    'POST /x/plugins/demo/update': () => jsonResponse(FAILURE, 502),
-  })
-  const view = render(
-    <QueryClientProvider client={appClient()}>
-      <RepositoryUpdate
-        name="demo"
-        disabled={false}
-        onSensitiveError={() => false}
-      />
-    </QueryClientProvider>
-  )
-
-  fireEvent.click(
-    await view.findByRole('button', { name: 'Update from GitHub' })
-  )
-
-  await waitFor(() => expect(error).toHaveBeenCalled())
-  await settle()
-  expectOneToast(error)
-  api.restore()
-})
 
 test('a failed uninstall shows exactly one toast with the title and detail', async () => {
   const error = spyOn(toast, 'error').mockImplementation(() => 'id')

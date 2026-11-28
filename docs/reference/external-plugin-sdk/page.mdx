@@ -27,7 +27,7 @@ Use `temps-plugin-sdk` to authenticate external plugin routes and call the Temps
 
 ## Security model {{ anchor: true, id: 'security-model' }}
 
-An external plugin runs as a separate process. Temps reaches it through a private Unix socket and mounts its routes at:
+An external plugin runs as an ordinary Temps service. The preferred way to add one is from its image: `temps plugin add --image <image>` creates the service, deploys the image the way `temps deploy:image` does and adds it as a plugin, and the same command with a new image deploys an update that waits for approval. `temps plugin add --build` and `temps plugin add --local-image <image>` do the same with an image built or kept on your machine, without a registry. In the console, **Settings → Plugins → Add plugin** takes an image and does it in one step, or adds a service that is already deployed, from an image or from a repository. Temps records the content each image resolved to and shows it with the image, so a tag moved to other content is visible, and it never changes a plugin that is already running. Temps never runs plugin code itself. It connects to the service's running deployment over the network and mounts its routes at:
 
 ```text
 /api/x/{plugin-name}/*
@@ -38,23 +38,32 @@ For every proxied request, Temps:
 1. Authenticates the browser session, API key, or CLI token.
 2. Resolves the caller's effective permissions.
 3. Removes the original `Cookie`, `Authorization`, `Proxy-Authorization`, and caller-supplied `x-temps-*` headers.
-4. Adds a signed caller assertion for the target plugin process.
+4. Adds a signed caller assertion for the target plugin.
 5. Lets the SDK verify that assertion before the plugin router runs.
 
-Temps also authenticates the internal WebSocket channel and event-delivery
-endpoint with the process-specific secret. Socket permissions limit access to
-the host process user, and an unauthenticated connection cannot consume the
-single accepted channel slot.
+Temps and the plugin recognise each other with a secret both derive from the
+service's deployment token (`TEMPS_API_TOKEN`, which every deployment already
+receives): the lowercase hex SHA-256 of `temps-plugin-service-auth-v1`, a NUL
+byte and the token. Nothing is exchanged and the token itself never travels to
+the plugin's port. Temps reads the manifest with an authenticated
+`GET /_temps/plugin/hello`, then opens the platform channel to the same
+address; the internal channel and event-delivery endpoint require the same
+secret.
 
 The result is an important request boundary: plugin handlers consume a
 verified caller object instead of parsing identity headers themselves.
 
-Installed plugins are nevertheless fully trusted host code. They currently
-run as the Temps operating-system user and are not sandboxed from the instance
-filesystem or sibling processes. Per-process secrets and manifest capabilities
-prevent accidental request-authority widening; they do not contain a malicious
-plugin binary. Untrusted plugins require a separate UID, container, or
-equivalent sandbox with plugin-scoped storage and credentials.
+What contains the plugin is the deployment it runs as: a hardened container
+with its own storage and limits, like any other service. A plugin is never
+given the control-plane database or the instance data directory. Its own files
+go in the service's volume (`TEMPS_PLUGIN_DATA_DIR`, `/data` by default) or a
+database linked to the service. Everything else goes through the platform API
+with the permissions an administrator granted; a newly added plugin has none.
+
+A plugin that an earlier version of Temps installed as an executable no longer
+runs. **Settings → Plugins** lists it with the reason until an administrator
+removes the entry; its files are kept. Deploy it as a service and add that
+service instead.
 
 ```mermaid
 sequenceDiagram
@@ -67,7 +76,7 @@ sequenceDiagram
     Client->>Temps: Request with session or API key
     Temps->>Temps: Authenticate and resolve permissions
     Temps->>SDK: Sanitized request + signed caller assertion
-    SDK->>SDK: Verify target process secret
+    SDK->>SDK: Verify the plugin's secret
     SDK->>Handler: AuthenticatedCaller
     Handler->>API: PlatformApi bound to caller
     API->>API: Run normal permission guard
@@ -90,9 +99,9 @@ After this boundary, Temps authenticates once and the SDK exposes the verified r
 | A role name could be mistaken for the caller's full authority | The resolved permission set preserves API-key narrowing |
 | Background work could look up a credential by user ID | Background work owns the exact initiating `PlatformApi` |
 | Platform mutations needed parallel integration code | Typed calls reuse existing platform HTTP handlers and permission guards |
-| One shared proxy secret covered every plugin process | Every plugin process has its own secret delivered outside argv and environment variables |
-| Plugins received database and host values by default | Privileged launch values are declared independently and disabled by default |
-| An old binary failed after partial startup | A versioned staged handshake returns an actionable incompatibility error |
+| One shared proxy secret covered every plugin | Every plugin has its own secret, derived from its service's deployment token and never sent over the network |
+| Plugins received database and host values by default | A plugin is never given the control-plane database or the instance data directory |
+| An old binary failed after partial startup | A versioned hello returns an actionable incompatibility error |
 | Plugins could guess public scheme, host, or port | `mount_url()` uses the host's configured public origin |
 
 ---
@@ -229,23 +238,18 @@ Capabilities describe the maximum class of calls a plugin intends to make. They 
 
 Declare only what the plugin needs. A plugin that only lists projects should request `ApiRead`, not `ApiWrite`.
 
-Database and host-data access are separate privileged launch disclosures, not
-ordinary API capabilities:
+A plugin is pinned to the build an administrator approved. Deploying a new build of the plugin's service does not update the plugin: Temps stays disconnected from the new build, shows the administrator what it asks for beyond the approved one, and attaches only after they approve exactly that deployment. Approving allows nothing new; permissions a new version asks for stay off until they are chosen. Plan releases accordingly: a new version reaches users when an administrator approves it, and a version that needs a new permission must work, or explain itself, without it.
 
-```rust
-let manifest = PluginManifest::builder("trusted-maintenance-plugin", "1.0.0")
-    .requires_db(true)
-    .requires_host_data_access(true)
-    .build();
-```
+An administrator can disable a plugin at any moment. Temps then closes the plugin's channel and sends it no request and no event until it is enabled again; the service keeps running, so the plugin sees its calls to Temps fail and should keep working on its own data, or wait, instead of exiting. The plugin's container runs with the memory and CPU limits of its service, which the administrator sets and sees next to the plugin. Every change a plugin makes through the platform API is recorded in the audit log with the plugin and the user it acted for.
 
-`requires_db(true)` exposes the control-plane database URL.
-`requires_host_data_access(true)` exposes the instance data root, which may
-contain encryption and authentication keys. The flags minimize supplied data
-and disclose intent; they are not sandbox enforcement under the current
-shared-UID runtime. Use caller-scoped API operations for normal plugins, and
-enable these settings only for audited binaries that cannot function through
-the SDK boundary.
+An administrator who allows a plugin to change things also chooses how far that reaches: which areas (services, environments, deployments) and, optionally, which services. Until an area is chosen, every change is refused. A call outside the chosen areas or services fails with a permission error that says what was outside; handle it as you handle a denied permission. A plugin limited to some services cannot create a service, and a call on a collection must name `project_id` in its body.
+
+A plugin cannot ask for the control-plane database or the instance data
+directory. A manifest that sets `requires_db(true)` or
+`requires_host_data_access(true)` is refused, by the SDK when the plugin
+starts and by Temps when the service is added, with an explanation. Keep the
+plugin's own data in the service's volume or in a database linked to the
+service, and use caller-scoped API operations for everything else.
 
 ---
 
@@ -324,14 +328,13 @@ Treat these errors separately when presenting them to an operator:
 
 SDK response types are projections of the platform's public OpenAPI models. Required fields are verified by the conformance test, while optional fields allow compatible additions across releases.
 
-External plugins are separate binaries and must be rebuilt when adopting a breaking SDK protocol change. Keep the plugin SDK revision aligned with the Temps version used to build and test the plugin.
+External plugins are separate services and must be rebuilt and redeployed when adopting a breaking SDK protocol change. Keep the plugin SDK revision aligned with the Temps version used to build and test the plugin.
 
-Temps uses a versioned, staged startup handshake. A single plugin process first
-publishes its manifest, then Temps sends typed launch configuration over the
-process's protected stdin. Database credentials and the request-assertion
-secret never appear in command-line arguments, and there is no second binary
-execution between inspection and startup. A legacy binary or protocol mismatch
-is rejected with an explicit rebuild instruction.
+The hello response carries a protocol version. A service that does not answer
+the hello is not a plugin and is refused with that reason; a protocol mismatch
+is rejected with an explicit rebuild instruction. A service started with
+another instance's deployment token refuses Temps, and the refusal says to
+redeploy.
 
 For a host-local image built by an explicitly trusted plugin, set
 `claim_local: true` through the typed deploy-image operation. Temps inspects the

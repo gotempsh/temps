@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS + 5;
 
 mod paused_sweep;
+mod read_at_switch;
 mod stop_grace;
 mod workflow_drain;
 mod workflow_warning;
@@ -828,25 +829,14 @@ impl MarkDeploymentCompleteJob {
         //
         // Write the routing-relevant fields to the deployment row FIRST so the
         // route table sees a consistent record the moment the NOTIFY fires.
+        self.persist_inputs_read_at_the_switch(&active_deployment)
+            .await?;
+        // What a registry image resolved to is read at the switch too: a
+        // plugin's pin names it. Its tag may move later; this is the content
+        // the deployment's containers were created from.
+        if let Ok(Some(image_id)) = context.get_output::<String>("pull_external_image", "image_id")
         {
-            let mut routing_inputs = deployments::ActiveModel {
-                id: sea_orm::ActiveValue::Unchanged(self.deployment_id),
-                ..Default::default()
-            };
-            if let sea_orm::ActiveValue::Set(image) = &active_deployment.image_name {
-                routing_inputs.image_name = Set(image.clone());
-            }
-            if let sea_orm::ActiveValue::Set(static_dir) = &active_deployment.static_dir_location {
-                routing_inputs.static_dir_location = Set(static_dir.clone());
-            }
-            if routing_inputs.is_changed() {
-                routing_inputs.update(self.db.as_ref()).await.map_err(|e| {
-                    WorkflowError::JobExecutionFailed(format!(
-                        "Failed to persist deployment routing inputs: {}",
-                        e
-                    ))
-                })?;
-            }
+            self.record_pulled_image(&image_id).await?;
         }
 
         // ── Phase 1: Switch route table to the new deployment ────────────
@@ -4158,6 +4148,98 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(newer.state, "pending");
+    }
+
+    #[tokio::test]
+    async fn the_content_an_image_resolved_to_is_stored_before_the_deployment_is_current() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = seed_project_env(&db).await;
+        let deployment =
+            insert_deployment(&db, project.id, environment.id, "from-image", "running").await;
+        let mut named: deployments::ActiveModel = deployment.clone().into();
+        named.metadata = Set(Some(deployments::DeploymentMetadata {
+            external_image_ref: Some("registry.example.com/acme/app:1.0.0".to_string()),
+            ..Default::default()
+        }));
+        named.update(db.as_ref()).await.unwrap();
+        let job = make_job(
+            db.clone(),
+            deployment.id,
+            Arc::new(RecordingDeployer::new()),
+        );
+        let stored = || async {
+            deployments::Entity::find_by_id(deployment.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let image_id = format!("sha256:{}", "c".repeat(64));
+
+        // A pull that reports no content (a worker node pulled the image
+        // itself) records nothing.
+        job.record_pulled_image("").await.expect("nothing to store");
+        job.record_pulled_image("external-7")
+            .await
+            .expect("nothing to store");
+        assert_eq!(
+            stored()
+                .await
+                .metadata
+                .and_then(|metadata| metadata.pulled_image_id),
+            None
+        );
+
+        // Something else changes the metadata after this job read the row.
+        use sea_orm::ConnectionTrait as _;
+        db.execute(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "UPDATE deployments SET metadata = (metadata::jsonb || \
+                 jsonb_build_object('healthCheckPath', '/health'))::json WHERE id = $1",
+            [deployment.id.into()],
+        ))
+        .await
+        .unwrap();
+
+        job.record_pulled_image(&image_id).await.expect("stored");
+        // Recording it again, as a retried job does, changes nothing.
+        job.record_pulled_image(&image_id).await.expect("stored");
+
+        let after = stored().await;
+        let metadata = after.metadata.expect("metadata");
+        assert_eq!(
+            metadata.pulled_image_id.as_deref(),
+            Some(image_id.as_str()),
+            "a reader acting on the switch must already find the content"
+        );
+        assert_eq!(
+            metadata.external_image_ref.as_deref(),
+            Some("registry.example.com/acme/app:1.0.0"),
+            "what the row already said is kept"
+        );
+        assert_eq!(
+            metadata.health_check_path.as_deref(),
+            Some("/health"),
+            "a change made after the job read the row is not overwritten"
+        );
+        assert_eq!(after.state, "running", "nothing else is written");
+        let environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            environment.current_deployment_id,
+            Some(deployment.id),
+            "the deployment is not current yet"
+        );
     }
 
     #[tokio::test]

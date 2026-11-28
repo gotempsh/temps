@@ -16,9 +16,9 @@
 //! Each plugin gets its own [`PluginChannel`] which tracks the WebSocket
 //! sender half and the background reader task.
 
-use std::path::Path;
 use std::sync::Arc;
 
+use crate::endpoint::PluginEndpoint;
 use crate::grants::{PluginGrantService, MAX_PROMPT_BYTES, MAX_SYSTEM_BYTES};
 use futures::stream::StreamExt;
 use futures::SinkExt;
@@ -41,6 +41,10 @@ static AI_CONCURRENCY: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// plugin that does not drain its socket); events are dropped when full,
 /// see [`PluginChannel::send_event`].
 const OUTGOING_CHANNEL_CAPACITY: usize = 256;
+/// How long a plugin has to accept the channel connection, and then to
+/// answer its WebSocket upgrade. Attaching holds a lock shared by every
+/// plugin, so neither wait may be open-ended.
+const CHANNEL_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A live channel connection to a single plugin.
 pub struct PluginChannel {
@@ -52,20 +56,21 @@ pub struct PluginChannel {
     tx: mpsc::Sender<ChannelMessage>,
     /// Background task reading from the WebSocket.
     reader_task: JoinHandle<()>,
+    /// Becomes `true` when the plugin's side of the channel is gone.
+    closed: tokio::sync::watch::Receiver<bool>,
     grant_service: PluginGrantService,
     actor_id: String,
-    source_identity: String,
     host_permissions: Vec<PluginHostPermission>,
 }
 
 impl PluginChannel {
-    /// Open a WebSocket channel to a plugin's Unix socket.
+    /// Open a WebSocket channel to a plugin, on its socket or service address.
     ///
     /// Returns `None` if the connection fails (the plugin may not support
     /// the channel yet — this is not fatal).
     #[allow(clippy::too_many_arguments)] // Explicit security dependencies stay visible at the process boundary.
     pub async fn connect(
-        socket_path: &Path,
+        endpoint: &PluginEndpoint,
         plugin_name: String,
         db: Arc<DatabaseConnection>,
         host_api: Arc<HostApiSlot>,
@@ -80,7 +85,7 @@ impl PluginChannel {
         audit_service: Arc<tokio::sync::RwLock<Option<Arc<dyn temps_core::AuditLogger>>>>,
         auth_secret: &str,
     ) -> Option<Self> {
-        let socket_path_str = socket_path.to_string_lossy().to_string();
+        let endpoint_text = endpoint.to_string();
         let grant_service = PluginGrantService::new(db.clone());
         let actor_result = if defer_actor_commit {
             grant_service
@@ -103,34 +108,41 @@ impl PluginChannel {
         let channel_grants = grant_service.clone();
         let channel_permissions = host_permissions.clone();
 
-        // Connect to the plugin's Unix socket and upgrade to WebSocket.
-        // tokio-tungstenite doesn't support Unix sockets directly, so we
-        // perform the WebSocket handshake over a raw UnixStream.
+        // Connect to the plugin and upgrade to WebSocket. tokio-tungstenite
+        // only dials TCP itself, so the handshake runs over the stream this
+        // host opened, whichever kind it is.
         info!(
             plugin = %plugin_name,
-            socket = %socket_path_str,
+            endpoint = %endpoint_text,
             "Opening platform channel to plugin"
         );
 
-        let stream = match tokio::net::UnixStream::connect(socket_path).await {
+        let stream = match tokio::time::timeout(CHANNEL_OPEN_TIMEOUT, endpoint.connect())
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the plugin did not accept the connection in time",
+                ))
+            }) {
             Ok(s) => {
                 debug!(
                     plugin = %plugin_name,
-                    "Unix socket connected for channel"
+                    "Connected to plugin for channel"
                 );
                 s
             }
             Err(e) => {
                 warn!(
                     plugin = %plugin_name,
-                    "Cannot connect to plugin socket for channel: {} ({})",
-                    socket_path_str, e
+                    "Cannot connect to plugin for channel: {} ({})",
+                    endpoint_text, e
                 );
                 return None;
             }
         };
 
-        let uri = format!("ws://localhost{}", PLUGIN_CHANNEL_PATH);
+        let uri = format!("ws://{}{}", endpoint.host_header(), PLUGIN_CHANNEL_PATH);
         let mut request = match uri.into_client_request() {
             Ok(request) => request,
             Err(error) => {
@@ -148,7 +160,22 @@ impl PluginChannel {
         request
             .headers_mut()
             .insert(temps_plugin_protocol::headers::AUTH_SIGNATURE, auth_header);
-        let ws_stream = match tokio_tungstenite::client_async(request, stream).await {
+        // A service that accepts the connection and never answers the upgrade
+        // would otherwise hold the attachment of every plugin behind it.
+        let upgrade = tokio::time::timeout(
+            CHANNEL_OPEN_TIMEOUT,
+            tokio_tungstenite::client_async(request, stream),
+        )
+        .await;
+        let Ok(upgrade) = upgrade else {
+            warn!(
+                plugin = %plugin_name,
+                "The plugin did not answer the channel handshake within {} seconds",
+                CHANNEL_OPEN_TIMEOUT.as_secs()
+            );
+            return None;
+        };
+        let ws_stream = match upgrade {
             Ok((ws, _resp)) => {
                 debug!(
                     plugin = %plugin_name,
@@ -160,7 +187,7 @@ impl PluginChannel {
                 warn!(
                     plugin = %plugin_name,
                     "WebSocket handshake failed for channel: {} ({})",
-                    socket_path_str, e
+                    endpoint_text, e
                 );
                 return None;
             }
@@ -200,6 +227,7 @@ impl PluginChannel {
         // them, and sends responses through msg_tx.
         let reader_tx = msg_tx.clone();
         let reader_plugin_name = plugin_name.clone();
+        let (closed_tx, closed) = tokio::sync::watch::channel(false);
         let reader_task = tokio::spawn(async move {
             while let Some(frame) = ws_rx.next().await {
                 let text = match frame {
@@ -284,6 +312,7 @@ impl PluginChannel {
             }
 
             debug!(plugin = %reader_plugin_name, "Channel reader task exiting");
+            let _ = closed_tx.send(true);
         });
 
         info!(
@@ -295,15 +324,17 @@ impl PluginChannel {
             plugin_name,
             tx: msg_tx,
             reader_task,
+            closed,
             grant_service: channel_grants,
             actor_id: channel_actor_id,
-            source_identity,
             host_permissions: channel_permissions,
         })
     }
 
-    pub(crate) fn actor_binding(&self) -> (&str, &str) {
-        (&self.actor_id, &self.source_identity)
+    /// A signal that turns `true` once the plugin's side of the channel is
+    /// gone: its process exited, or the container of its service stopped.
+    pub(crate) fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.closed.clone()
     }
 
     /// Push a platform event to the plugin over the channel.
@@ -378,7 +409,19 @@ fn peek_request_id(text: &str) -> Option<u64> {
 pub trait HostApiBridge: Send + Sync {
     /// Dispatch `call` as `plugin`, resolving the acting user from the
     /// call's actor token.
-    async fn call(&self, plugin: &str, call: ApiCall) -> Result<ApiCallResult, ChannelError>;
+    ///
+    /// The answer names that user, so a change the plugin makes can be
+    /// recorded against both of them.
+    async fn call(&self, plugin: &str, call: ApiCall) -> Result<DelegatedCall, ChannelError>;
+}
+
+/// What the platform answered to a delegated call, and whom it was made as.
+#[derive(Debug)]
+pub struct DelegatedCall {
+    /// The response of the platform's own handler.
+    pub result: ApiCallResult,
+    /// The user whose actor token authorised the call.
+    pub acting_user_id: i32,
 }
 
 /// Late-bound holder for the [`HostApiBridge`].
@@ -462,7 +505,18 @@ async fn dispatch_request(
             None
         }
     };
-    let allowed = required_permission.is_none_or(effective);
+    // A change must also fall inside what an administrator allowed the plugin
+    // to change. Decided before the audit entry, so a call outside that scope
+    // is recorded as denied and never reaches the router.
+    let scope_denial = match &req.call {
+        PlatformCallRequest::ApiCall(call)
+            if call.method.is_mutating() && effective(PluginHostPermission::ApiWrite) =>
+        {
+            write_denial(plugin_name, db, &current.config, call).await
+        }
+        _ => None,
+    };
+    let allowed = required_permission.is_none_or(effective) && scope_denial.is_none();
     let Some(auditor) = audit_service.read().await.clone() else {
         return ChannelResponse::err(
             req.id,
@@ -497,6 +551,9 @@ async fn dispatch_request(
             ),
         ))
     };
+    // Set once a delegated call reached the platform's handler: the user it
+    // was made as and the status the handler answered.
+    let mut delegated: Option<(i32, u16)> = None;
     let outcome = match &req.call {
         PlatformCallRequest::GetProject(p) => {
             if effective(PluginHostPermission::ProjectsRead) {
@@ -553,8 +610,15 @@ async fn dispatch_request(
             } else {
                 PluginHostPermission::ApiRead
             };
-            if effective(permission) {
-                handle_api_call(plugin_name, host_api, capabilities, call.clone()).await
+            if let Some(denial) = scope_denial {
+                Err(denial)
+            } else if effective(permission) {
+                handle_api_call(plugin_name, host_api, capabilities, call.clone())
+                    .await
+                    .map(|answer| {
+                        delegated = Some((answer.acting_user_id, answer.result.status));
+                        PlatformCallResponse::ApiCall(answer.result)
+                    })
             } else {
                 denied(permission)
             }
@@ -634,12 +698,81 @@ async fn dispatch_request(
         }
     }
 
+    // A change is recorded once more, against the user it was made as. The
+    // handler's own entry names that user but not the plugin, and the entries
+    // above name the plugin but no user; this one ties the two together.
+    if let (PlatformCallRequest::ApiCall(call), Some((acting_user_id, status))) =
+        (&req.call, delegated)
+    {
+        if call.method.is_mutating() {
+            let change = PluginChangeAudit {
+                actor: PluginAuditActor {
+                    id: current.actor.id.clone(),
+                    name: plugin_name.to_string(),
+                    kind: "plugin",
+                },
+                acting_user_id,
+                method: call.method.as_str(),
+                path: call.path.clone(),
+                status,
+                request_id: req.id,
+            };
+            if auditor.create_audit_log(&change).await.is_err() {
+                error!(plugin_actor_id = %current.actor.id, plugin = %plugin_name, acting_user_id, method = call.method.as_str(), path = %call.path, status, request_id = req.id, "A change made through a plugin could not be recorded against its user");
+            }
+        }
+    }
+
     match outcome {
         Ok(result) => ChannelResponse::ok(req.id, result),
         Err(err) => ChannelResponse {
             id: req.id,
             outcome: CallOutcome::Err(err),
         },
+    }
+}
+
+/// A change a plugin made, or tried to make, on behalf of a user.
+///
+/// Written after the platform's handler answered, so `status` is what that
+/// handler decided: the entry says who asked (the user), through what (the
+/// plugin) and whether it went through.
+#[derive(serde::Serialize)]
+struct PluginChangeAudit {
+    actor: PluginAuditActor,
+    acting_user_id: i32,
+    method: &'static str,
+    path: String,
+    status: u16,
+    request_id: u64,
+}
+
+impl PluginChangeAudit {
+    fn made(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+impl temps_core::audit::AuditOperation for PluginChangeAudit {
+    fn operation_type(&self) -> String {
+        if self.made() {
+            "EXTERNAL_PLUGIN_CHANGE_MADE"
+        } else {
+            "EXTERNAL_PLUGIN_CHANGE_REFUSED"
+        }
+        .to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.acting_user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        None
+    }
+    fn user_agent(&self) -> &str {
+        "external-plugin-channel"
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -684,13 +817,89 @@ impl temps_core::audit::AuditOperation for PluginHostOperationAudit {
     }
 }
 
+/// Why a changing call falls outside what the plugin may change, if it does.
+///
+/// A path a plugin cannot delegate at all is left to [`handle_api_call`],
+/// which refuses it as it always did.
+async fn write_denial(
+    plugin_name: &str,
+    db: &DatabaseConnection,
+    config: &crate::grants::PluginGrantConfig,
+    call: &ApiCall,
+) -> Option<ChannelError> {
+    use crate::scope::{WriteScope, WriteTarget};
+    let target = WriteTarget::of_path(&call.path)?;
+    let scope = WriteScope {
+        areas: &config.write_areas,
+        projects: config.write_project_ids.as_deref(),
+    };
+    let denied = |denial: crate::scope::WriteDenied| {
+        ChannelError::new(ChannelErrorCode::PermissionDenied, denial.to_string())
+    };
+    if let Err(denial) = scope.allows_area(plugin_name, target) {
+        return Some(denied(denial));
+    }
+    if !scope.limits_projects() {
+        return None;
+    }
+    let project = match target_project(db, target, call).await {
+        Ok(project) => project,
+        Err(error) => {
+            error!(plugin = %plugin_name, path = %call.path, %error, "Could not find the project a plugin call changes");
+            return Some(ChannelError::new(
+                ChannelErrorCode::Internal,
+                format!(
+                    "Temps could not check which project the call to {} changes, so plugin '{plugin_name}' was not allowed to make it; see the server log",
+                    call.path
+                ),
+            ));
+        }
+    };
+    scope.allows_project(plugin_name, project).err().map(denied)
+}
+
+/// The project a changing call belongs to.
+async fn target_project(
+    db: &DatabaseConnection,
+    target: crate::scope::WriteTarget,
+    call: &ApiCall,
+) -> Result<crate::scope::TargetProject, sea_orm::DbErr> {
+    use crate::scope::{PluginWriteArea, TargetProject, WriteTarget};
+    use sea_orm::EntityTrait;
+    let known =
+        |project_id: Option<i32>| project_id.map_or(TargetProject::Unknown, TargetProject::Known);
+    Ok(match target {
+        WriteTarget::Record(PluginWriteArea::Projects, id) => TargetProject::Known(id),
+        WriteTarget::Record(PluginWriteArea::Environments, id) => known(
+            temps_entities::environments::Entity::find_by_id(id)
+                .one(db)
+                .await?
+                .map(|environment| environment.project_id),
+        ),
+        WriteTarget::Record(PluginWriteArea::Deployments, id) => known(
+            temps_entities::deployments::Entity::find_by_id(id)
+                .one(db)
+                .await?
+                .map(|deployment| deployment.project_id),
+        ),
+        WriteTarget::Collection(PluginWriteArea::Projects) => TargetProject::New,
+        WriteTarget::Collection(_) => known(match &call.body {
+            Some(CallBody::Json(body)) => body
+                .decode::<crate::scope::NamedProject>()
+                .ok()
+                .and_then(|named| named.id()),
+            _ => None,
+        }),
+    })
+}
+
 /// Serve an [`ApiCall`] through the platform's own router.
 async fn handle_api_call(
     plugin_name: &str,
     host_api: &HostApiSlot,
     capabilities: &[PluginCapability],
     call: ApiCall,
-) -> Result<PlatformCallResponse, ChannelError> {
+) -> Result<DelegatedCall, ChannelError> {
     // Generic delegation is intentionally a narrow compatibility surface.
     // Privileged namespaces use dedicated brokers with their own limits.
     let segments = call.path.split('/').collect::<Vec<_>>();
@@ -740,9 +949,7 @@ async fn handle_api_call(
             ),
         ));
     };
-    api.call(plugin_name, call)
-        .await
-        .map(PlatformCallResponse::ApiCall)
+    api.call(plugin_name, call).await
 }
 
 async fn handle_generate_ai(
@@ -1205,6 +1412,7 @@ mod tests {
                     permissions: vec![PluginHostPermission::AiGenerate],
                     ai_daily_call_limit: daily_limit,
                     ai_max_output_tokens: 128,
+                    ..Default::default()
                 },
             )
             .await
@@ -1313,6 +1521,375 @@ mod tests {
         assert_eq!(unavailable.message, "Host AI service is unavailable");
     }
 
+    fn change(method: HttpMethod, path: &str, body: Option<serde_json::Value>) -> ApiCall {
+        ApiCall {
+            method,
+            path: path.to_string(),
+            query: None,
+            body: body.map(|value| CallBody::json(&value).expect("json body")),
+            actor: ActorToken::new("unused: the scope is decided before the actor is"),
+        }
+    }
+
+    fn scoped(
+        areas: &[crate::scope::PluginWriteArea],
+        projects: Option<Vec<i32>>,
+    ) -> crate::grants::PluginGrantConfig {
+        crate::grants::PluginGrantConfig {
+            permissions: vec![PluginHostPermission::ApiWrite],
+            write_areas: areas.to_vec(),
+            write_project_ids: projects,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_must_fall_inside_the_areas_and_projects_an_administrator_allowed() {
+        use crate::manager::services::tests::platform;
+        use crate::scope::PluginWriteArea::{Deployments, Environments, Projects};
+        let Some(platform) = platform("scoping what a plugin may change").await else {
+            return;
+        };
+        let db = platform.db();
+        let allowed = platform.service("allowed").await;
+        let other = platform.service("other").await;
+        let allowed_deployment = platform.deploy(allowed, 1).await;
+        let other_deployment = platform.deploy(other, 1).await;
+        let reason = |config: &crate::grants::PluginGrantConfig, call: ApiCall| {
+            let db = db.clone();
+            let config = config.clone();
+            async move {
+                write_denial("reports", db.as_ref(), &config, &call)
+                    .await
+                    .map(|denial| {
+                        assert_eq!(denial.code, ChannelErrorCode::PermissionDenied);
+                        denial.message
+                    })
+            }
+        };
+
+        // Write permission with no area chosen changes nothing.
+        let nothing = scoped(&[], None);
+        let denial = reason(&nothing, change(HttpMethod::Post, "/projects", None))
+            .await
+            .expect("no area was allowed");
+        assert!(denial.contains("may not change projects"), "{denial}");
+        assert!(denial.contains("Allowed: nothing"), "{denial}");
+
+        // Only the chosen area may be changed, in any project.
+        let deployments = scoped(&[Deployments], None);
+        assert_eq!(
+            reason(
+                &deployments,
+                change(
+                    HttpMethod::Delete,
+                    &format!("/deployments/{other_deployment}"),
+                    None
+                )
+            )
+            .await,
+            None
+        );
+        let denial = reason(
+            &deployments,
+            change(
+                HttpMethod::Patch,
+                &format!("/environments/{}", allowed.environment_id),
+                None,
+            ),
+        )
+        .await
+        .expect("environments were not allowed");
+        assert!(denial.contains("may not change environments"), "{denial}");
+
+        // Limited to one project: its records may change, others may not.
+        let limited = scoped(
+            &[Projects, Environments, Deployments],
+            Some(vec![allowed.project_id]),
+        );
+        for path in [
+            format!("/projects/{}", allowed.project_id),
+            format!("/environments/{}", allowed.environment_id),
+            format!("/deployments/{allowed_deployment}"),
+        ] {
+            assert_eq!(
+                reason(&limited, change(HttpMethod::Put, &path, None)).await,
+                None,
+                "{path}"
+            );
+        }
+        for path in [
+            format!("/projects/{}", other.project_id),
+            format!("/environments/{}", other.environment_id),
+            format!("/deployments/{other_deployment}"),
+        ] {
+            let denial = reason(&limited, change(HttpMethod::Put, &path, None))
+                .await
+                .unwrap_or_else(|| panic!("{path} is outside the limit"));
+            assert!(
+                denial.contains(&format!("not project {}", other.project_id)),
+                "{denial}"
+            );
+        }
+        // A limited plugin cannot create a project, and a new environment or
+        // deployment must name a project inside the limit.
+        let denial = reason(&limited, change(HttpMethod::Post, "/projects", None))
+            .await
+            .expect("a new project is outside every limit");
+        assert!(denial.contains("cannot create a project"), "{denial}");
+        assert_eq!(
+            reason(
+                &limited,
+                change(
+                    HttpMethod::Post,
+                    "/deployments",
+                    Some(serde_json::json!({ "project_id": allowed.project_id }))
+                )
+            )
+            .await,
+            None
+        );
+        let denial = reason(
+            &limited,
+            change(
+                HttpMethod::Post,
+                "/deployments",
+                Some(serde_json::json!({ "project_id": other.project_id })),
+            ),
+        )
+        .await
+        .expect("the named project is outside the limit");
+        assert!(denial.contains("not project"), "{denial}");
+        let denial = reason(&limited, change(HttpMethod::Post, "/environments", None))
+            .await
+            .expect("no project is named");
+        assert!(denial.contains("does not say which project"), "{denial}");
+        // A record that does not exist belongs to no allowed project.
+        let denial = reason(
+            &limited,
+            change(HttpMethod::Delete, "/deployments/2147483600", None),
+        )
+        .await
+        .expect("an unknown deployment is not inside the limit");
+        assert!(denial.contains("does not say which project"), "{denial}");
+
+        // A path a plugin cannot delegate at all is refused elsewhere, as before.
+        assert_eq!(
+            reason(&nothing, change(HttpMethod::Post, "/settings", None)).await,
+            None
+        );
+    }
+
+    /// Answers every delegated call as one user with one status, and counts
+    /// the calls that reached it.
+    struct AnsweringApi {
+        acting_user_id: i32,
+        status: u16,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HostApiBridge for AnsweringApi {
+        async fn call(&self, _plugin: &str, _call: ApiCall) -> Result<DelegatedCall, ChannelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DelegatedCall {
+                result: ApiCallResult {
+                    status: self.status,
+                    body: JsonBody::from_raw("{}"),
+                },
+                acting_user_id: self.acting_user_id,
+            })
+        }
+    }
+
+    /// Keeps what the dispatcher records: operation, user and the entry.
+    #[derive(Default)]
+    struct RecordedAudit {
+        entries: std::sync::Mutex<Vec<(String, Option<i32>, serde_json::Value)>>,
+    }
+
+    impl RecordedAudit {
+        fn of(&self, operation: &str) -> Vec<(Option<i32>, serde_json::Value)> {
+            self.entries
+                .lock()
+                .expect("audit lock")
+                .iter()
+                .filter(|(recorded, _, _)| recorded == operation)
+                .map(|(_, user, entry)| (*user, entry.clone()))
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl temps_core::AuditLogger for RecordedAudit {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            let entry = serde_json::from_str(&operation.serialize()?).expect("audit entry is JSON");
+            self.entries.lock().expect("audit lock").push((
+                operation.operation_type(),
+                operation.user_id(),
+                entry,
+            ));
+            Ok(())
+        }
+    }
+
+    /// The plugin `reports` as the channel reader sees it, so a call can be
+    /// sent through the dispatcher the way the reader does.
+    struct Reports {
+        db: Arc<DatabaseConnection>,
+        grants: PluginGrantService,
+        actor_id: String,
+        audit: Arc<RecordedAudit>,
+    }
+
+    impl Reports {
+        async fn send(&self, api: Arc<AnsweringApi>, id: u64, call: ApiCall) -> ChannelResponse {
+            let bridge: Arc<dyn HostApiBridge> = api;
+            let host_api: HostApiSlot = tokio::sync::RwLock::new(Some(bridge));
+            let auditor: Arc<dyn temps_core::AuditLogger> = self.audit.clone();
+            let ai: tokio::sync::RwLock<Option<Arc<dyn AiService>>> =
+                tokio::sync::RwLock::new(None);
+            dispatch_request(
+                "reports",
+                self.db.as_ref(),
+                &host_api,
+                &[PluginCapability::ApiRead, PluginCapability::ApiWrite],
+                &[
+                    PluginHostPermission::ApiRead,
+                    PluginHostPermission::ApiWrite,
+                ],
+                &[],
+                &tokio::sync::Notify::new(),
+                &self.grants,
+                &self.actor_id,
+                "sha256:test",
+                &ai,
+                &tokio::sync::RwLock::new(Some(auditor)),
+                &ChannelRequest {
+                    id,
+                    call: PlatformCallRequest::ApiCall(call),
+                },
+            )
+            .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_made_through_a_plugin_is_recorded_with_the_plugin_and_the_user() {
+        use crate::manager::services::tests::platform;
+        let Some(platform) = platform("recording who changed what through a plugin").await else {
+            return;
+        };
+        let db = platform.db();
+        let grants = PluginGrantService::new(db.clone());
+        let actor = grants
+            .ensure_actor("reports", "sha256:test", "service:reports")
+            .await
+            .expect("create plugin actor")
+            .actor
+            .id;
+        grants
+            .update(
+                "reports",
+                crate::grants::PluginGrantConfig {
+                    permissions: vec![
+                        PluginHostPermission::ApiRead,
+                        PluginHostPermission::ApiWrite,
+                    ],
+                    write_areas: vec![crate::scope::PluginWriteArea::Projects],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("allow the plugin to change projects");
+        let audit = Arc::new(RecordedAudit::default());
+        let reports = Reports {
+            db: db.clone(),
+            grants,
+            actor_id: actor.clone(),
+            audit: audit.clone(),
+        };
+        let api = |status| {
+            Arc::new(AnsweringApi {
+                acting_user_id: 7,
+                status,
+                calls: AtomicUsize::new(0),
+            })
+        };
+
+        // A change the platform accepted names the plugin and the user.
+        let accepted = api(200);
+        let response = reports
+            .send(
+                accepted.clone(),
+                41,
+                change(HttpMethod::Patch, "/projects/3", None),
+            )
+            .await;
+        assert!(matches!(response.outcome, CallOutcome::Ok(_)));
+        assert_eq!(accepted.calls.load(Ordering::SeqCst), 1);
+        let made = audit.of("EXTERNAL_PLUGIN_CHANGE_MADE");
+        assert_eq!(made.len(), 1, "{made:?}");
+        let (user, entry) = &made[0];
+        assert_eq!(*user, Some(7), "the entry belongs to the acting user");
+        assert_eq!(
+            entry,
+            &serde_json::json!({
+                "actor": { "id": actor, "name": "reports", "kind": "plugin" },
+                "acting_user_id": 7,
+                "method": "PATCH",
+                "path": "/projects/3",
+                "status": 200,
+                "request_id": 41,
+            })
+        );
+
+        // A change the platform's own handler refused is recorded as refused,
+        // against the same two.
+        let refused = api(403);
+        reports
+            .send(refused, 42, change(HttpMethod::Delete, "/projects/3", None))
+            .await;
+        let refusals = audit.of("EXTERNAL_PLUGIN_CHANGE_REFUSED");
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0].0, Some(7));
+        assert_eq!(refusals[0].1["actor"]["name"], "reports");
+        assert_eq!(refusals[0].1["status"], 403);
+        assert_eq!(refusals[0].1["method"], "DELETE");
+
+        // Reading changes nothing, so it leaves no change entry.
+        let read = api(200);
+        reports
+            .send(
+                read.clone(),
+                43,
+                change(HttpMethod::Get, "/projects/3", None),
+            )
+            .await;
+        assert_eq!(read.calls.load(Ordering::SeqCst), 1);
+
+        // A change outside what the plugin may change never reaches the
+        // platform, so no user made it: it is recorded as denied to the plugin.
+        let outside = api(200);
+        let response = reports
+            .send(
+                outside.clone(),
+                44,
+                change(HttpMethod::Delete, "/deployments/9", None),
+            )
+            .await;
+        assert!(
+            matches!(&response.outcome, CallOutcome::Err(error) if error.code == ChannelErrorCode::PermissionDenied)
+        );
+        assert_eq!(outside.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(audit.of("EXTERNAL_PLUGIN_HOST_OPERATION_DENIED").len(), 1);
+        assert_eq!(audit.of("EXTERNAL_PLUGIN_CHANGE_MADE").len(), 1);
+        assert_eq!(audit.of("EXTERNAL_PLUGIN_CHANGE_REFUSED").len(), 1);
+    }
+
     /// A channel to `plugin_name` over `tx`, with no live socket behind it:
     /// `send_event` only touches the outgoing queue.
     fn channel_over(plugin_name: &str, tx: mpsc::Sender<ChannelMessage>) -> PluginChannel {
@@ -1325,8 +1902,8 @@ mod tests {
             reader_task: tokio::spawn(async {}),
             grant_service: PluginGrantService::new(db),
             actor_id: "actor".to_string(),
-            source_identity: "sha256:test".to_string(),
             host_permissions: vec![PluginHostPermission::EventsRead],
+            closed: tokio::sync::watch::channel(false).1,
         }
     }
 

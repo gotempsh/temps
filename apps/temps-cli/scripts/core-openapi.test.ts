@@ -47,7 +47,13 @@ test('recognizes only the external plugin namespace', () => {
   expect(['/x', '/x/plugins', '/x/plugins/a/grants'].every(isPluginPath)).toBe(
     true
   )
-  expect(['/xray', '/api/x', '/projects', '/x/plugins/install/file'].some(isPluginPath)).toBe(false)
+  expect(
+    ['/xray', '/api/x', '/projects', '/x/plugins/{name}/ai-tools'].some(
+      isPluginPath
+    )
+  ).toBe(false)
+  // Nothing installs an executable any more, so no such path is kept.
+  expect(isPluginPath('/x/plugins/install/file')).toBe(true)
 })
 
 test('retains core AI consent operations and their schemas without importing plugin APIs', () => {

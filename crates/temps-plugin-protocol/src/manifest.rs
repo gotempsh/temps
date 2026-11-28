@@ -367,6 +367,37 @@ pub struct PluginLaunchConfig {
     pub host_data_dir: Option<String>,
 }
 
+/// What a plugin that runs as a Temps service answers on
+/// [`PLUGIN_HELLO_PATH`].
+///
+/// It carries what the staged process handshake splits into a hello and a
+/// ready message. A service receives no launch configuration: its secret is
+/// derived from the deployment token already in its environment (see
+/// [`SERVICE_AUTH_CONTEXT`]), and it is never given the control-plane database
+/// or the instance data directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginServiceHello {
+    pub protocol_version: u32,
+    pub manifest: Box<PluginManifest>,
+    pub has_ui: bool,
+    /// Optional OpenAPI schema (serialized JSON) for the plugin's endpoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openapi: Option<serde_json::Value>,
+}
+
+/// Path a plugin that runs as a Temps service answers its
+/// [`PluginServiceHello`] on. Temps sends the request-assertion secret with
+/// the request; the plugin answers nothing without it.
+pub const PLUGIN_HELLO_PATH: &str = "/_temps/plugin/hello";
+
+/// Domain-separation label for the request-assertion secret of a plugin that
+/// runs as a Temps service.
+///
+/// The secret is the lowercase hex SHA-256 of this label, a NUL byte and the
+/// service's deployment token (`TEMPS_API_TOKEN`). Both sides can compute it,
+/// and the token itself never travels between Temps and the plugin.
+pub const SERVICE_AUTH_CONTEXT: &str = "temps-plugin-service-auth-v1";
+
 /// Current process-launch and internal-channel protocol version.
 pub const EXTERNAL_PLUGIN_PROTOCOL_VERSION: u32 = 2;
 

@@ -36,9 +36,6 @@ pub struct PlatformFeatures {
     /// AI editing workspaces and chat attachments have durable local storage.
     #[serde(default)]
     pub persistent_workspaces: bool,
-    /// External plugin binaries and plugin-owned files may be installed.
-    #[serde(default)]
-    pub external_plugins: bool,
     /// Serve profile this process was started with: `"full"` or
     /// `"control-plane"`.
     pub profile: String,
@@ -92,7 +89,6 @@ impl PlatformFeatures {
     pub fn with_stateless_mode(mut self, stateless: bool) -> Self {
         self.stateless = stateless;
         self.persistent_workspaces = !stateless;
-        self.external_plugins = !stateless;
         self
     }
 
@@ -104,7 +100,6 @@ impl PlatformFeatures {
         Self {
             stateless: false,
             persistent_workspaces: true,
-            external_plugins: true,
             profile: temps_core::PROFILE_FULL.to_string(),
             docker,
             deployments_local: true,
@@ -143,7 +138,6 @@ impl PlatformFeatures {
         Self {
             stateless: false,
             persistent_workspaces: true,
-            external_plugins: true,
             profile: temps_core::PROFILE_CONTROL_PLANE.to_string(),
             docker,
             // Local workloads are definitionally absent in this profile.
@@ -299,7 +293,6 @@ mod tests {
         let expected_fields = [
             "stateless",
             "persistent_workspaces",
-            "external_plugins",
             "profile",
             "docker",
             "deployments_local",

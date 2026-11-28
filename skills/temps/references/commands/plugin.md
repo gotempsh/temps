@@ -4,66 +4,65 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
+## Contents
+
+- [`plugin add`](#plugin-add)
+- [`plugin grants`](#plugin-grants)
+- [`plugin services`](#plugin-services)
+- [`plugin add-service`](#plugin-add-service)
+- [`plugin remove`](#plugin-remove)
+- [`plugin update`](#plugin-update)
+- [`plugin approve-update`](#plugin-approve-update)
+- [`plugin disable`](#plugin-disable)
+- [`plugin enable`](#plugin-enable)
+- [`plugin limits`](#plugin-limits)
+- [`plugin dev`](#plugin-dev)
+- [`plugin init`](#plugin-init)
+- [`plugin build`](#plugin-build)
+- [`plugin publish`](#plugin-publish)
+- [`plugin api`](#plugin-api)
+
 ## `plugin`
 
-Create and build TypeScript plugins, or install and manage external plugins
+Add a plugin from its image, approve its updates and manage its permissions; create TypeScript plugins
 
 **Subcommands:**
 
-- `install` - Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
-- `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
-- `install-local` - Upload and activate a trusted native plugin on the configured Temps host
+- `add` - Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval. The image comes from a registry (--image), from your Docker (--local-image) or from a Dockerfile built here (--build)
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
+- `services` - List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason
+- `add-service` - Make a deployed service a plugin; it starts with no permissions
+- `remove` - Remove a plugin and revoke its permissions; its service and the files it stored are kept
+- `update` - Show the build a plugin is pinned to and the update that waits for approval, with what it asks for
+- `approve-update` - Approve the update of a plugin that waits; an update is never applied without this, and it allows no new permissions
+- `disable` - Cut a plugin off from Temps at once: no requests, no events, no calls from it; its service, permissions and approved build are kept
+- `enable` - Let a disabled plugin connect again, with the permissions it had
+- `limits` - Show the memory and CPU a plugin's container is limited to: the limits of its service
 - `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 - `init` - Create a TypeScript plugin project
 - `build` - Build every platform selected in package.json; --all selects all six supported targets
 - `publish` - Build, publish native npm packages, verify ownership and submit for review; resumes interrupted releases
 - `api` - Api commands
 
-### `plugin install`
+### `plugin add`
 
-Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
-
-**Usage:** `plugin install <repository> [options]`
+Deploy a plugin's image as a service and add it as a plugin, in one step; for a plugin that is already added, deploy the image as an update that waits for approval. The image comes from a registry (--image), from your Docker (--local-image) or from a Dockerfile built here (--build)
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--path <path>` | Plugin subdirectory containing package.json and bun.lock (default: repository root) | - | No |
-| `--name <name>` | Advanced: require this plugin name (otherwise auto-detected) | - | No |
-| `--ref <ref>` | Advanced: branch, tag, or commit (otherwise repository default branch) | - | No |
-| `-y, --yes` | Trust the repository and allow installation without prompting | - | No |
-| `--grant <permissions...>` | Explicitly approve declared host permissions (default: none); e.g. ai_generate projects_read | - | No |
-| `--ai-daily-calls <count>` | Maximum AI attempts per day (0 pauses usage; default: 100) | - | No |
-| `--ai-max-tokens <count>` | Maximum output tokens per AI call (1–4096; default: 1024) | - | No |
-
-### `plugin update`
-
-Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
-
-**Usage:** `plugin update <name> [options]`
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--ref <ref>` | Use a different branch, tag, or commit | - | No |
-| `-y, --yes` | Trust the update without prompting | - | No |
-
-### `plugin install-local`
-
-Upload and activate a trusted native plugin on the configured Temps host
-
-**Usage:** `plugin install-local <file> [options]`
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--name <name>` | Expected plugin manifest name | - | Yes |
-| `--plugin-version <version>` | Expected plugin manifest version | - | Yes |
-| `-y, --yes` | Approve execution of this file without prompting | - | No |
+| `--image <image>` | Image of the plugin in a registry the server pulls from, by digest or tag (e.g. registry.example.com/acme/reports:1.2.0) | - | No |
+| `--local-image <image>` | Image of the plugin in your Docker; it is uploaded to the server, no registry needed | - | No |
+| `--build` | Build the plugin's Dockerfile here, then upload the image to the server | - | No |
+| `--dockerfile <path>` | Dockerfile that --build builds (default: Dockerfile in the context) | - | No |
+| `--context <path>` | Directory that --build builds from (default: the current directory) | - | No |
+| `-p, --project <project>` | Slug or id of an existing service to deploy the image to; without it a new service is created | - | No |
+| `--name <name>` | Name of the service to create (default: taken from the image, or from the directory that is built) | - | No |
+| `-e, --environment <env>` | Environment name | `production` | No |
+| `--port <port>` | Port the plugin listens on, for a service that is created | `8080` | No |
+| `--health-check-path <path>` | Path the deployment is checked on; a plugin answers /health unless its manifest says otherwise | `/health` | No |
+| `--timeout <seconds>` | Seconds to wait for the deployment to be live | `300` | No |
 
 ### `plugin grants`
 
@@ -71,12 +70,12 @@ Inspect or replace a plugin's host API permissions and AI limits
 
 **Subcommands:**
 
-- `get` - Show current grants, actor identity, and AI availability
+- `get` - Show what a plugin asks for, what it is allowed, and what it can reach
 - `set` - Replace all host grants; --clear revokes all permissions immediately
 
 #### `plugin grants get`
 
-Show current grants, actor identity, and AI availability
+Show what a plugin asks for, what it is allowed, and what it can reach
 
 **Usage:** `plugin grants get <name>`
 
@@ -93,7 +92,73 @@ Replace all host grants; --clear revokes all permissions immediately
 | `--grant <permissions...>` | Complete list of permissions to grant | - | No |
 | `--ai-daily-calls <count>` | Daily AI call limit (0–10000) | - | No |
 | `--ai-max-tokens <count>` | Maximum AI output tokens per call (1–4096) | - | No |
+| `--write <areas...>` | With api_write: what may change (projects, environments, deployments). Omitted: nothing | - | No |
+| `--write-project <ids...>` | With api_write: the only services that may change. Omitted: every service | - | No |
 | `--clear` | Revoke all host permissions | - | No |
+
+### `plugin services`
+
+List the plugins, the service each runs as and whether it is running; also lists plugins that no longer run, with the reason
+
+### `plugin add-service`
+
+Make a deployed service a plugin; it starts with no permissions
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project <id>` | Id of the service the plugin runs as | - | Yes |
+| `--environment <id>` | Id of the environment whose deployment is the plugin | - | Yes |
+
+### `plugin remove`
+
+Remove a plugin and revoke its permissions; its service and the files it stored are kept
+
+**Usage:** `plugin remove <name>`
+
+### `plugin update`
+
+Show the build a plugin is pinned to and the update that waits for approval, with what it asks for
+
+**Usage:** `plugin update <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as JSON | - | No |
+
+### `plugin approve-update`
+
+Approve the update of a plugin that waits; an update is never applied without this, and it allows no new permissions
+
+**Usage:** `plugin approve-update <name> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--deployment <id>` | Id of the deployment you reviewed, as shown by temps plugin update | - | Yes |
+| `--review <review>` | The review you were shown by temps plugin update: it names the build and what it asks for | - | Yes |
+
+### `plugin disable`
+
+Cut a plugin off from Temps at once: no requests, no events, no calls from it; its service, permissions and approved build are kept
+
+**Usage:** `plugin disable <name>`
+
+### `plugin enable`
+
+Let a disabled plugin connect again, with the permissions it had
+
+**Usage:** `plugin enable <name>`
+
+### `plugin limits`
+
+Show the memory and CPU a plugin's container is limited to: the limits of its service
+
+**Usage:** `plugin limits <name>`
 
 ### `plugin dev`
 

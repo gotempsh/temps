@@ -2,17 +2,23 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
-  getPluginInstallationReporting,
+  addServicePlugin,
+  approvePluginUpdate,
+  disablePlugin,
+  enablePlugin,
+  getPluginServices,
   listExternalPlugins,
-  listPluginCatalog,
   reloadPlugins,
-  setPluginInstallationReporting,
   uninstallPlugin,
 } from '@/api/client/sdk.gen'
-import type {
-  PluginCatalogResponse,
-  ReloadResponse,
-} from '@/api/client/types.gen'
+import type { AddServicePlugin, ReloadResponse } from '@/api/client/types.gen'
+import { getProjectsQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  addPluginFromImage,
+  type PluginImageProgress,
+  type PluginImageStep,
+  type PluginImageValues,
+} from '@/lib/plugin-image'
 import type { PluginManifest } from '@/types/plugins'
 import {
   queryOptions,
@@ -20,40 +26,74 @@ import {
   useQuery,
   useQueryClient,
 } from '@tanstack/react-query'
+import { useCallback, useRef, useState } from 'react'
 
 export const PLUGINS_QUERY_KEY = ['external-plugins']
-export const PLUGIN_CATALOG_QUERY_KEY = ['external-plugins', 'catalog']
-export const PLUGIN_REPORTING_QUERY_KEY = [
-  'external-plugins',
-  'installation-reporting',
-]
+export const PLUGIN_SERVICES_QUERY_KEY = ['external-plugins', 'services']
 
-export function usePluginInstallationReporting(enabled = true) {
+/**
+ * The plugins that run as Temps services, how each is doing, and whether a
+ * service can be added as a plugin on this server. Administrators only: pass
+ * `enabled` from the caller's permission.
+ */
+export function usePluginServices(enabled = true) {
   return useQuery({
-    queryKey: PLUGIN_REPORTING_QUERY_KEY,
-    queryFn: async () =>
-      (await getPluginInstallationReporting({ throwOnError: true })).data,
+    queryKey: PLUGIN_SERVICES_QUERY_KEY,
+    queryFn: async () => (await getPluginServices({ throwOnError: true })).data,
     enabled,
     retry: false,
+    refetchOnWindowFocus: 'always',
   })
 }
 
-export function useSetPluginInstallationReporting() {
+/** Make a deployed service a plugin. It starts with no permissions. */
+export function useAddServicePlugin() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: async (enabled: boolean) =>
-      (
-        await setPluginInstallationReporting({
-          body: { enabled },
-          throwOnError: true,
-        })
-      ).data,
+    mutationFn: async (body: AddServicePlugin) =>
+      (await addServicePlugin({ body, throwOnError: true })).data,
+    retry: false,
+    // The plugin list, its navigation and each plugin's state all change.
     onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: PLUGIN_REPORTING_QUERY_KEY,
-      })
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },
   })
+}
+
+/**
+ * Add a plugin from its image in one go: create the service, deploy the
+ * image, wait until it is live and add it. `at` says which step runs or
+ * failed and what exists so far. Running it again after a failure continues
+ * from there; `reset` forgets a run.
+ */
+export function useAddPluginFromImage() {
+  const queryClient = useQueryClient()
+  const progress = useRef<PluginImageProgress>({})
+  const [at, setAt] = useState<{
+    step: PluginImageStep
+    progress: PluginImageProgress
+  } | null>(null)
+  const mutation = useMutation({
+    mutationFn: (values: PluginImageValues) =>
+      addPluginFromImage(values, progress.current, (step, done) =>
+        setAt({ step, progress: done })
+      ),
+    retry: false,
+    // A service may have been created and deployed also when it failed.
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY }),
+        queryClient.invalidateQueries({ queryKey: getProjectsQueryKey() }),
+      ])
+    },
+  })
+  const resetMutation = mutation.reset
+  const reset = useCallback(() => {
+    progress.current = {}
+    setAt(null)
+    resetMutation()
+  }, [resetMutation])
+  return { ...mutation, at, reset }
 }
 
 /**
@@ -80,8 +120,8 @@ export function pluginManifestQueryOptions() {
     queryFn: fetchPluginManifests,
     staleTime: 5 * 60 * 1000,
     gcTime: 10 * 60 * 1000,
-    // CLI installs happen outside this tab. Refresh local manifests when the
-    // user returns to the console, without polling the public registry.
+    // Plugins are also added from the CLI and follow their service's
+    // deployments. Refresh the list when the user returns to the console.
     refetchOnWindowFocus: 'always',
     retry: false,
   })
@@ -91,21 +131,10 @@ export function usePlugins() {
   return useQuery(pluginManifestQueryOptions())
 }
 
-/** Fetch the signed registry catalog exposed by the backend. */
-export function usePluginCatalog(enabled = true) {
-  return useQuery({
-    queryKey: PLUGIN_CATALOG_QUERY_KEY,
-    queryFn: async (): Promise<PluginCatalogResponse> => {
-      const response = await listPluginCatalog({ throwOnError: true })
-      return response.data
-    },
-    staleTime: 5 * 60 * 1000,
-    retry: false,
-    enabled,
-  })
-}
-
-/** Stop and uninstall the selected plugin, retaining its application data. */
+/**
+ * Remove a plugin: revoke its permissions and stop routing to it. The service
+ * it runs as, and the files it stored, are kept.
+ */
 export function useUninstallPlugin() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -122,7 +151,61 @@ export function useUninstallPlugin() {
   })
 }
 
-/** Reload all verified plugin installations from disk. */
+/**
+ * Approve the update of a plugin that waits. `review` names the build and
+ * manifest that were shown; anything else is refused. Nothing the update
+ * newly asks for is allowed by approving it.
+ */
+export function useApprovePluginUpdate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ name, review }: { name: string; review: string }) =>
+      (
+        await approvePluginUpdate({
+          path: { name },
+          body: { review },
+          throwOnError: true,
+        })
+      ).data,
+    retry: false,
+    // Approved or refused, what waits may have changed.
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
+
+/**
+ * Cut a plugin off from Temps at once. Its service, its permissions and its
+ * approved build are kept for when it is enabled.
+ */
+export function useDisablePlugin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) =>
+      (await disablePlugin({ path: { name }, throwOnError: true })).data,
+    retry: false,
+    // Also when it failed: the plugin may be cut off without that being saved.
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
+
+/** Let a disabled plugin connect again, with the permissions it had. */
+export function useEnablePlugin() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: async (name: string) =>
+      (await enablePlugin({ path: { name }, throwOnError: true })).data,
+    retry: false,
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
+    },
+  })
+}
+
+/** Connect again to every plugin's service. */
 export function useReloadPlugins() {
   const queryClient = useQueryClient()
 
@@ -131,12 +214,10 @@ export function useReloadPlugins() {
       const response = await reloadPlugins({ throwOnError: true })
       return response.data
     },
-    // A 502 reload can stop every plugin; refresh navigation even on failure.
+    // Every plugin is connected again, so the list, its navigation and each
+    // plugin's state may have changed, also when the reload failed.
     onSettled: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: PLUGINS_QUERY_KEY,
-        exact: true,
-      })
+      await queryClient.invalidateQueries({ queryKey: PLUGINS_QUERY_KEY })
     },
   })
 }

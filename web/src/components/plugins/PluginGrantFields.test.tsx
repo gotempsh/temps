@@ -29,18 +29,69 @@ test('AI approval exposes limits and distinguishes call limits from a money budg
   expect(markup).toContain('not a currency budget')
 })
 
-test('undeclared permissions are explained and unavailable', () => {
+test('like an app permission screen, only what the plugin asks for is listed', () => {
   const markup = renderToStaticMarkup(
     <PluginGrantFields
       value={emptyPluginGrants()}
+      requested={['ai_generate', 'api_write']}
+      onChange={() => {}}
+    />
+  )
+  expect(markup.match(/role="checkbox"/g)).toHaveLength(2)
+  expect(markup).toContain('Use AI')
+  expect(markup).toContain('Change things in Temps')
+  expect(markup).not.toContain('Read deployments')
+  expect(markup).toContain('This plugin asks for the access listed here')
+  expect(markup).toContain('Nothing is granted by default')
+})
+
+test('a permission the plugin stopped asking for stays listed so it can be taken away', () => {
+  const markup = renderToStaticMarkup(
+    <PluginGrantFields
+      value={{ ...emptyPluginGrants(), permissions: ['deployments_read'] }}
       requested={['ai_generate']}
       onChange={() => {}}
     />
   )
-  expect(markup.match(/Not requested by this plugin/g)).toHaveLength(
-    pluginPermissionValues.length - 1
+  expect(markup.match(/role="checkbox"/g)).toHaveLength(2)
+  expect(markup).toContain('Read deployments')
+  expect(markup).toContain('No longer requested by this plugin')
+  // It can be unchecked, not checked again.
+  expect(markup).toContain('aria-checked="true"')
+})
+
+test('a plugin that asks for nothing has nothing to allow', () => {
+  const markup = renderToStaticMarkup(
+    <PluginGrantFields
+      value={emptyPluginGrants()}
+      requested={[]}
+      onChange={() => {}}
+    />
   )
-  expect(markup).toContain('disabled')
+  expect(markup).toContain('No host API permissions requested')
+  expect(markup).not.toContain('role="checkbox"')
+})
+
+test('allowing changes asks what may change and where; without it nothing is asked', () => {
+  const without = renderToStaticMarkup(
+    <PluginGrantFields
+      value={emptyPluginGrants()}
+      requested={['api_write']}
+      onChange={() => {}}
+    />
+  )
+  expect(without).not.toContain('What it may change')
+
+  const allowed = renderToStaticMarkup(
+    <PluginGrantFields
+      value={{ ...emptyPluginGrants(), permissions: ['api_write'] }}
+      requested={['api_write']}
+      onChange={() => {}}
+    />
+  )
+  expect(allowed).toContain('What it may change')
+  expect(allowed).toContain('every change this plugin attempts is refused')
+  expect(allowed).toContain('Every service')
 })
 
 test('known requirements show only requested access with explicit required and optional labels', () => {

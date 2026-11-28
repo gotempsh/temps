@@ -12254,6 +12254,13 @@ export type DeploymentMetadata = {
      */
     labels?: Array<string>;
     /**
+     * Docker image ID (sha256:...) a registry image resolved to when this
+     * deployment pulled it. A tag can be moved to other content later; this
+     * is the content this deployment's containers were created from. Absent
+     * when a worker node pulled the image itself.
+     */
+    pulledImageId?: string | null;
+    /**
      * ID of the deployment this was rolled back from (if applicable)
      */
     rolledBackFromId?: number | null;
@@ -17172,10 +17179,6 @@ export type FileObject = {
     purpose?: string;
 };
 
-export type FileUpload = {
-    file: Blob | File;
-};
-
 export type FillSecretRequest = {
     /**
      * The credential. Stored encrypted; never returned and never shown to the
@@ -21342,23 +21345,6 @@ export type InsightStatus = 'active' | 'resolved';
 export type InsightsResponse = {
     count: number;
     data: Array<Insight>;
-};
-
-export type InstallPluginRequest = {
-    grants?: PluginGrantConfig | null;
-    /**
-     * Validated registry name only. URLs, paths, versions, and hashes are not
-     * accepted from HTTP callers.
-     */
-    name: string;
-};
-
-export type InstallPluginResponse = {
-    message: string;
-    name: string;
-    platform: string;
-    sha256: string;
-    version: string;
 };
 
 /**
@@ -28251,10 +28237,6 @@ export type PlatformFeatures = {
      */
     docker: boolean;
     /**
-     * External plugin binaries and plugin-owned files may be installed.
-     */
-    external_plugins?: boolean;
-    /**
      * Container images can be built by this process. Requires a local Docker
      * daemon; always `false` when `docker` is `false`.
      */
@@ -28340,17 +28322,6 @@ export type PluginAiToolsResponse = {
     installation_revision: string;
     tools: Array<AiToolInfo>;
 };
-
-export type PluginGrantConfig = {
-    ai_daily_call_limit: number;
-    ai_max_output_tokens: number;
-    permissions: Array<PluginHostPermission>;
-};
-
-/**
- * Host-owned permissions granted to one durable external-plugin actor.
- */
-export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
 
 /**
  * Which policy decided a test.
@@ -31892,23 +31863,6 @@ export type RegisterWireguardMeshResponse = {
     address: string;
     listen_port: number;
     prefix_len: number;
-};
-
-/**
- * The outer envelope signs the decoded bytes in `payload`. Encoding the
- * payload instead of reserializing a JSON object avoids ambiguous map order,
- * whitespace, and number representations.
- */
-export type RegistryEnvelope = {
-    key_id: string;
-    /**
-     * Standard-base64 encoded JSON [`RegistryDocument`].
-     */
-    payload: string;
-    /**
-     * Standard-base64 encoded 64-byte Ed25519 signature over payload bytes.
-     */
-    signature: string;
 };
 
 /**
@@ -112383,78 +112337,6 @@ export type AppGetWorkflowRunResponses = {
 };
 
 export type AppGetWorkflowRunResponse = AppGetWorkflowRunResponses[keyof AppGetWorkflowRunResponses];
-
-export type InstallLocalFileData = {
-    body: FileUpload;
-    headers: {
-        /**
-         * Operator approval to execute the file with this SHA-256
-         */
-        'X-Temps-Trust-Sha256': string;
-    };
-    path?: never;
-    query: {
-        name: string;
-        version: string;
-    };
-    url: '/x/plugins/install/file';
-};
-
-export type InstallLocalFileErrors = {
-    /**
-     * Invalid plugin identity, digest header or multipart upload
-     */
-    400: unknown;
-    /**
-     * Authentication required
-     */
-    401: unknown;
-    /**
-     * Administrator permission or sensitive-action authorization required
-     */
-    403: unknown;
-    /**
-     * Upload timed out
-     */
-    408: unknown;
-    /**
-     * Persistent storage is required or the existing installation uses a different source
-     */
-    409: unknown;
-    /**
-     * Executable exceeds the upload limit
-     */
-    413: unknown;
-    /**
-     * Additional verification required for this sensitive action
-     */
-    428: unknown;
-    /**
-     * Another file upload is in progress
-     */
-    429: unknown;
-    /**
-     * Could not stage, activate or persist the installation
-     */
-    500: unknown;
-    /**
-     * Plugin verification or startup failed
-     */
-    502: unknown;
-    /**
-     * Plugin actor activation is unavailable or the service is shutting down
-     */
-    503: unknown;
-};
-
-export type InstallLocalFileResponses = {
-    /**
-     * Plugin verified, installed and started
-     */
-    200: InstallPluginResponse;
-};
-
-export type InstallLocalFileResponse = InstallLocalFileResponses[keyof InstallLocalFileResponses];
 
 export type GetPluginAiToolsData = {
     body?: never;

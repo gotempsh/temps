@@ -16,19 +16,45 @@
 
 ---
 
-## Install a native plugin on a self-hosted Temps server
+## Add a plugin to a self-hosted Temps server
 
-Sign in as a system administrator and build the plugin for the server's OS and architecture. Use the name and version declared in its Temps plugin manifest.
+A plugin runs as an ordinary Temps service. The preferred way to add one is from its image. Sign in as a system administrator and run:
 
 ```bash
-bunx --bun @temps-sdk/cli plugin install-local ./my-plugin --name my-plugin --plugin-version 1.0.0
+bunx --bun @temps-sdk/cli plugin add --image registry.example.com/acme/my-plugin:1.0.0
 ```
 
-Review the destination and SHA-256 before confirming. For unattended installs, pass `--yes`. In the console, open **Settings → Plugins → Install from file**, choose the executable, enter its manifest identity and confirm trust. Changing the file or the destination in the console requires fresh approval. Uploads require persistent plugin storage and accept one executable up to 256 MiB. Use HTTPS or localhost in the browser.
+This creates a service named after the image, deploys the image the way `temps deploy:image` does, waits for it to be live and adds it as a plugin, pinned to that deployment. Name the image by digest (`repository@sha256:...`) to deploy exactly what you reviewed. To release a new version, run the command again with `--project <service>` and the new image: it is deployed and then waits for approval. Use `--name` to choose the service's name, `--port` for the port the plugin listens on and `--health-check-path` when its manifest does not use `/health`.
 
-Approval allows native code to run on the server under its configured plugin execution account. Only install code you trust. Temps records the approval, verifies the digest and checks the plugin handshake before switching the active release. Restart discovery verifies the installed receipt and binary again. An upgrade uses the same command with the replacement file. A failed handshake leaves the previous release active. Plugin-owned data persists across upgrades and restarts. If the host reports that activation could not be confirmed, it retains the verified release. Once the database is available, choose **Settings → Plugins → Reload plugins** to reconcile it.
+No registry is needed for an image on your machine. Both upload it to the server the way `temps deploy:local-image` does:
 
-Review declared host permissions in the running plugin's **Permissions** dialog or with `temps plugin grants get my-plugin`. Use `temps plugin grants set` to approve specific permissions. A changed file digest requires fresh grants. For plugins serving MCP at `/mcp`, connect the client to `/api/x/my-plugin/mcp` with its own Temps credentials. The plugin receives the authenticated caller through the usual proxy.
+```bash
+# build the Dockerfile in the current directory, then upload and add it
+bunx --bun @temps-sdk/cli plugin add --build
+
+# upload an image your Docker already has
+bunx --bun @temps-sdk/cli plugin add --local-image my-plugin:dev
+```
+
+`--build` takes `--dockerfile` and `--context`, and names the service after the directory it builds. Pass exactly one of `--image`, `--local-image` and `--build`.
+
+Temps records the content each image resolved to and shows it next to the image, for the build a plugin is pinned to and for one that waits. A tag that was moved to other content is therefore visible as the same reference with another content ID, and it never changes a plugin that is already running: restarting or waking it starts the approved container again.
+
+A service that is already deployed, from an image or from a repository, is added by its ids:
+
+```bash
+bunx --bun @temps-sdk/cli plugin add-service --project 7 --environment 9
+```
+
+Use the numeric ids shown by `temps projects list` and `temps environments list`. In the console, **Settings → Plugins → Add plugin** does both: enter an image and it creates the service, deploys the image and adds it in one step, or pick a service that is already deployed. Temps connects to the service's running deployment; it does not run the plugin's code itself. A newly added plugin has no permissions.
+
+`temps plugin services` lists each plugin, the service it runs as and whether it is running, stopped while idle or unavailable, with the reason. It also lists plugins an earlier version of Temps installed as executables: those no longer run. Deploy such a plugin as a service, remove its entry with `temps plugin remove my-plugin`, then add the service. Removing a plugin revokes its permissions; its service and the files it stored are kept.
+
+A plugin is pinned to the build you approved when you added it. When its service is redeployed, the new build does not run as the plugin: `temps plugin update my-plugin` shows what waits and what it asks for beyond the approved build, and prints the command that approves it: `temps plugin approve-update my-plugin --deployment <id> --review <review>` approves exactly the build that was shown, and nothing if it changed since. Nothing is applied on its own, and approving allows no new permissions. To keep the approved build, roll the service back to it.
+
+`temps plugin disable my-plugin` cuts a plugin off at once: Temps sends it no request and no event and takes no call from it, while its service, its permissions and its approved build are kept. `temps plugin enable my-plugin` connects it again. A plugin's container runs with the memory and CPU limits of its service; `temps plugin limits my-plugin` shows them. Every change a plugin makes through the API is recorded in the audit log with both the plugin and the user it acted for.
+
+Review declared host permissions in the plugin's **Permissions** dialog or with `temps plugin grants get my-plugin`. Use `temps plugin grants set` to approve specific permissions. A permission to change things reaches nothing until you name what may change, and it can be limited to some services: `temps plugin grants set my-plugin --grant api_write --write deployments --write-project 42`. For plugins serving MCP at `/mcp`, connect the client to `/api/x/my-plugin/mcp` with its own Temps credentials. The plugin receives the authenticated caller through the usual proxy.
 
 ## Develop and test a plugin locally
 

@@ -65,6 +65,12 @@ export class TempsClient {
       this.handleMessage(data);
     });
 
+    // A channel the platform can connect again says so; requests made while
+    // it was closed have already failed, new ones go over the new connection.
+    this.ws.on("open", () => {
+      this.closed = false;
+    });
+
     this.ws.on("close", () => {
       this.closed = true;
       // Reject all pending requests

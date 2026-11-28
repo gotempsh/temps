@@ -1,76 +1,62 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! External plugin process manager.
+//! External plugin manager.
 //!
-//! Handles discovering, spawning, handshaking, health-checking, and
-//! shutting down external plugin binaries.
+//! A plugin runs as an ordinary Temps service. This module attaches to the
+//! running container of that service, keeps the plugins it is attached to,
+//! and lists the ones it is not. It starts no executable and no container.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use temps_plugin_protocol::{
-    HandshakeMessage, PluginLaunchConfig, PluginManifest, EXTERNAL_PLUGIN_PROTOCOL_VERSION,
-};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use temps_plugin_protocol::PluginManifest;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use sea_orm::DatabaseConnection;
 use utoipa::openapi::OpenApi;
 
 use crate::channel::PluginChannel;
-use crate::install::open_verified_executable;
+use crate::endpoint::PluginEndpoint;
 use crate::proxy::PluginProxy;
 
-pub(crate) fn repository_actor_source(repository: &str, path: Option<&str>) -> String {
-    match path {
-        Some(path) => format!("repository:{repository}/tree/{path}"),
-        None => format!("repository:{repository}"),
-    }
-}
-
-pub(crate) fn registry_actor_source(registry_url: &str) -> String {
-    format!("registry:{registry_url}")
-}
-
-/// State of a single external plugin process.
+/// A plugin Temps is attached to.
 pub struct ExternalPluginProcess {
-    /// The parsed manifest from the handshake
+    /// The manifest the plugin answered with.
     pub manifest: PluginManifest,
-    /// Path to the plugin binary
-    pub binary_path: PathBuf,
-    /// Signed digest verified against the descriptor used for execution.
-    pub sha256: String,
-    /// Unix socket path for communication
-    pub socket_path: PathBuf,
-    /// Per-process secret used to bind internal requests to this staged
-    /// plugin launch. This is protocol integrity, not shared-UID isolation.
+    /// What identifies the build that is running: it changes with every
+    /// deployment of the plugin's service.
+    pub build: String,
+    /// The address of the Temps service the plugin runs as.
+    pub endpoint: PluginEndpoint,
+    /// The secret this instance and the plugin both derive from the
+    /// service's deployment token.
     auth_secret: String,
-    /// Path to the PID file for this process
-    pid_file_path: PathBuf,
-    /// The child process handle
-    child: Child,
-    /// The launcher that started the plugin as another user, which is then
-    /// also the only way to stop it.
-    launcher: Option<crate::launcher::PluginLauncher>,
+    /// The service the plugin runs as. The deployment owns its container:
+    /// this host starts, stops and removes nothing.
+    service: services::AttachedService,
     /// Whether the plugin has UI assets
     pub has_ui: bool,
     /// Bidirectional channel for platform queries and event delivery
     pub channel: Option<PluginChannel>,
-    /// OpenAPI schema for the plugin's API endpoints (if provided during handshake)
+    /// OpenAPI schema for the plugin's API endpoints (if it provided one)
     pub openapi_schema: Option<OpenApi>,
 }
 
-/// A candidate that completed the complete protocol handshake but has not yet
-/// replaced the healthy active process.
-pub(crate) struct PendingPlugin {
-    expected_name: String,
-    process: ExternalPluginProcess,
+/// What `manifest` asks for that a plugin is never given, in words an
+/// administrator reads.
+pub(crate) fn privileged_access(manifest: &PluginManifest) -> Option<&'static str> {
+    if manifest.requires_db {
+        Some("the control-plane database")
+    } else if manifest.requires_host_data_access {
+        Some("the instance data directory")
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,294 +71,35 @@ pub struct PluginReloadResult {
     pub failures: Vec<PluginLoadFailure>,
 }
 
-impl ExternalPluginProcess {
-    /// Send SIGKILL to the plugin process (non-blocking).
-    ///
-    /// Does NOT wait for exit — call `wait_for_exit()` for that.
-    /// This is used by the `Drop` impl where we can't await.
-    pub fn kill(&mut self) {
-        if let Some(id) = self.child.id() {
-            debug!(plugin = %self.manifest.name, pid = id, "Killing plugin process");
-            if let Some(launcher) = &self.launcher {
-                // Another user's process: only the launcher can signal it. The
-                // pid can't have been reused, because the plugin is our direct
-                // child and is not reaped until `child` is waited on.
-                if let Err(e) = launcher.kill(id) {
-                    warn!(plugin = %self.manifest.name, "Failed to stop plugin process: {e}");
-                }
-                return;
-            }
-            if let Err(e) = self.child.start_kill() {
-                warn!(
-                    plugin = %self.manifest.name,
-                    "Failed to kill plugin process: {}", e
-                );
-            }
-        }
-    }
-
-    /// Kill the process and wait (async) for it to exit.
-    ///
-    /// Used during reload/shutdown from async context.
-    pub async fn shutdown(&mut self) {
-        self.kill();
-        // Wait up to 5 seconds for the process to actually exit.
-        // This prevents zombie processes and ensures the socket is released.
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
-    }
-
-    /// Clean up socket and PID files on disk.
-    fn cleanup_files(&self) {
-        let _ = std::fs::remove_file(&self.socket_path);
-        let _ = std::fs::remove_file(&self.pid_file_path);
-    }
-}
-
-impl Drop for ExternalPluginProcess {
-    fn drop(&mut self) {
-        self.kill();
-        self.cleanup_files();
-    }
-}
-
-/// Stops a plugin started through a launcher unless it was handed over.
-struct LaunchedPlugin<'a> {
-    launcher: Option<&'a crate::launcher::PluginLauncher>,
-    pid: Option<u32>,
-}
-
-impl Drop for LaunchedPlugin<'_> {
-    fn drop(&mut self) {
-        if let (Some(launcher), Some(pid)) = (self.launcher, self.pid) {
-            if let Err(error) = launcher.kill(pid) {
-                warn!("Failed to stop a plugin that did not finish starting: {error}");
-            }
-        }
-    }
-}
-
 /// Configuration for the external plugin manager.
 #[derive(Debug, Clone)]
 pub struct ExternalPluginConfig {
-    /// Installed plugin binaries and plugin-owned files require durable local storage.
+    /// Whether this process has durable local storage. Only the record of
+    /// plugins an earlier version installed as executables needs it.
     pub persistent_installations: bool,
-    /// Directory to scan for plugin binaries
+    /// Where earlier versions installed plugin executables, and where the
+    /// signed registry's trust state is kept.
     pub plugins_dir: PathBuf,
-    /// Directory for plugin Unix sockets
-    pub sockets_dir: PathBuf,
-    /// Directory for plugin data files
-    pub data_dir: PathBuf,
-    /// The instance's own data root — the parent of all the directories
-    /// above. Disclosed in the typed launch configuration only when a trusted
-    /// plugin declares that privileged requirement.
-    pub host_data_dir: PathBuf,
-    /// Base URL at which this instance's API answers, passed to plugins as
-    /// `--host-api-url`. `None` when the caller did not supply one, in which
-    /// case plugins are told nothing rather than guessing.
+    /// Base URL at which this instance's API answers. `None` when the caller
+    /// did not supply one.
     pub host_api_url: Option<String>,
-    /// Directory to extract plugin UI assets into
-    pub ui_assets_dir: PathBuf,
-    /// Directory for PID files (one per running plugin process)
-    pub pids_dir: PathBuf,
-    /// Database URL disclosed in typed launch configuration to plugins that
-    /// declare direct database access.
-    pub database_url: String,
-    /// Timeout for plugin handshake (default: 30s)
-    pub handshake_timeout: Duration,
-    /// Timeout for health check (default: 5s)
-    pub health_check_timeout: Duration,
-    /// Signed registry trust and network policy used for installed receipts.
+    /// Signed registry trust and network policy.
     pub registry: crate::catalog::RegistryConfig,
-    /// When set, plugins run as another user through this launcher, and
-    /// Temps refuses to start them unless that user provably can't read its
-    /// secrets. See [`crate::launcher`].
-    pub launcher: Option<crate::launcher::PluginLauncher>,
-}
-
-/// Maximum length of a Unix socket path on this platform.
-/// macOS: 104 bytes, Linux: 108 bytes.
-#[cfg(target_os = "macos")]
-const SUN_PATH_MAX: usize = 104;
-#[cfg(not(target_os = "macos"))]
-const SUN_PATH_MAX: usize = 108;
-const MAX_HANDSHAKE_FRAME_BYTES: usize = 2 * 1024 * 1024;
-
-fn generate_plugin_auth_secret() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-fn legacy_startup_eof_error(binary_name: &str) -> String {
-    format!(
-        "Plugin {binary_name} closed stdout before sending the staged protocol v{EXTERNAL_PLUGIN_PROTOCOL_VERSION} hello. The binary is incompatible or uses a legacy temps-plugin-sdk; rebuild it with protocol v{EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
-    )
-}
-
-fn scrub_plugin_environment(command: &mut Command) {
-    command.env_clear();
-    drop_ambient_capabilities(command);
-}
-
-/// A plugin is third-party code, so it must not inherit capabilities the host
-/// process was granted ambiently. A hosted control plane runs as a non-root
-/// user with `CAP_NET_ADMIN` ambient so it can set up its own WireGuard mesh;
-/// without this every plugin it executes would carry the same capability.
-#[cfg(target_os = "linux")]
-fn drop_ambient_capabilities(command: &mut Command) {
-    // SAFETY: the closure runs in the forked child before exec and makes one
-    // `prctl` call with integer arguments: async-signal-safe, no allocation.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::prctl(
-                libc::PR_CAP_AMBIENT,
-                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
-                0,
-                0,
-                0,
-            ) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn drop_ambient_capabilities(_command: &mut Command) {}
-
-fn plugin_stderr_context(observed_bytes: usize) -> String {
-    if observed_bytes == 0 {
-        String::new()
-    } else {
-        format!(
-            "\nPlugin emitted diagnostic output ({observed_bytes} bytes withheld to prevent secret disclosure)"
-        )
-    }
-}
-
-async fn read_handshake_frame<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    binary_name: &str,
-    phase: &str,
-) -> Result<Option<String>, String> {
-    let mut bytes = Vec::new();
-    loop {
-        let available = reader
-            .fill_buf()
-            .await
-            .map_err(|error| format!("Failed to read {phase} from {binary_name}: {error}"))?;
-        if available.is_empty() {
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            break;
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let consumed = newline.map_or(available.len(), |index| index + 1);
-        if bytes.len().saturating_add(consumed) > MAX_HANDSHAKE_FRAME_BYTES {
-            return Err(format!(
-                "Plugin {binary_name} {phase} exceeded the {MAX_HANDSHAKE_FRAME_BYTES}-byte limit"
-            ));
-        }
-        bytes.extend_from_slice(&available[..consumed]);
-        reader.consume(consumed);
-        if newline.is_some() {
-            break;
-        }
-    }
-    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
-        bytes.pop();
-    }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|error| format!("Plugin {binary_name} sent non-UTF-8 {phase}: {error}"))
-}
-
-#[cfg(unix)]
-fn secure_socket_directory(path: &Path, mode: u32) -> Result<(), std::io::Error> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::DirBuilderExt;
-
-    match std::fs::DirBuilder::new().mode(mode).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "plugin socket directory contains a NUL byte",
-        )
-    })?;
-    // SAFETY: `path` is a valid C string. O_NOFOLLOW rejects a malicious
-    // symlink at the deterministic /tmp path, and OwnedFd closes the result.
-    let raw_fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        )
-    };
-    if raw_fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `raw_fd` was returned by open above and ownership is transferred
-    // exactly once to OwnedFd.
-    let directory = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    // SAFETY: fchmod operates on the live directory descriptor and does not
-    // dereference the path again, closing the symlink-swap race.
-    if unsafe { libc::fchmod(directory.as_raw_fd(), mode as libc::mode_t) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 impl ExternalPluginConfig {
     /// Create a config with default settings for a given data directory.
-    ///
-    /// Socket paths are placed under `/tmp/tp-<hash>/` to avoid exceeding
-    /// the Unix `SUN_LEN` limit (104 bytes on macOS, 108 on Linux). We use
-    /// `/tmp` directly instead of `std::env::temp_dir()` because macOS
-    /// returns a long per-user path like `/var/folders/.../T/` that eats
-    /// most of the budget. The directory name includes a hash of `data_dir`
-    /// so multiple Temps instances use separate namespaces.
-    pub fn new(data_dir: PathBuf, database_url: String) -> Self {
-        // Build a short, deterministic socket directory.
-        // Format: /tmp/tp-<8-char-hash>/  (15 bytes for the dir component)
-        // Leaves ~85 bytes for the socket filename on macOS.
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        data_dir.hash(&mut hasher);
-        let hash = format!("{:x}", hasher.finish());
-        let short_hash = &hash[..8.min(hash.len())];
-        let sockets_dir = PathBuf::from(format!("/tmp/tp-{}", short_hash));
-
+    pub fn new(data_dir: PathBuf) -> Self {
         Self {
             persistent_installations: true,
             plugins_dir: data_dir.join("plugins"),
-            sockets_dir,
-            pids_dir: data_dir.join("run").join("plugin-pids"),
-            data_dir: data_dir.join("plugin-data"),
-            ui_assets_dir: data_dir.join("plugin-ui"),
-            host_data_dir: data_dir,
             host_api_url: None,
-            database_url,
-            handshake_timeout: Duration::from_secs(30),
-            health_check_timeout: Duration::from_secs(5),
             registry: crate::catalog::RegistryConfig::default(),
-            launcher: None,
         }
     }
 
-    /// Run plugins as another user through `launcher` (see [`crate::launcher`]).
-    pub fn with_launcher(mut self, launcher: crate::launcher::PluginLauncher) -> Self {
-        self.launcher = Some(launcher);
-        self
-    }
-
     /// Inject an authenticated registry configuration. The default has no
-    /// trust anchors and therefore refuses registry installs and startup.
+    /// trust anchors and therefore accepts no registry document.
     pub fn with_registry(mut self, registry: crate::catalog::RegistryConfig) -> Self {
         self.registry = registry;
         self
@@ -401,19 +128,17 @@ impl ExternalPluginConfig {
     }
 }
 
-/// Manages the lifecycle of external plugin processes.
+/// The plugins this instance is attached to.
 ///
 /// This runs inside the main Temps process and handles:
-/// - Scanning the plugins directory for binaries
-/// - Spawning each binary as a child process
-/// - Reading the handshake manifest from stdout
-/// - Verifying health checks
+/// - Attaching to the Temps service each plugin runs as
+/// - Following its deployments, restarts and idle stops
 /// - Providing proxy targets for the axum router
-/// - Graceful shutdown
+/// - Listing plugins an earlier version installed as executables
 pub struct ExternalPluginManager {
     pub(crate) watch_ready: Arc<tokio::sync::Notify>,
     config: ExternalPluginConfig,
-    /// Running plugin processes, keyed by plugin name
+    /// Plugins this instance is attached to, keyed by plugin name
     plugins: Arc<RwLock<HashMap<String, ExternalPluginProcess>>>,
     /// Database connection for serving channel requests
     db: Arc<DatabaseConnection>,
@@ -427,10 +152,15 @@ pub struct ExternalPluginManager {
     actor_crypto: crate::proxy::ActorCryptoSlot,
     ai_service: Arc<RwLock<Option<Arc<dyn temps_ai::AiService>>>>,
     audit_service: Arc<RwLock<Option<Arc<dyn temps_core::AuditLogger>>>>,
-    /// The launcher's isolation probe, once it has passed. Until then it runs
-    /// before every plugin start, and a failure keeps the plugin from
-    /// starting, so fixing the host and reloading plugins is enough.
-    isolation: tokio::sync::OnceCell<crate::launcher::IsolationReport>,
+    /// Why each plugin Temps is not attached to failed its last attempt, in
+    /// words an administrator can be shown. Cleared when it attaches.
+    start_failures: Arc<RwLock<HashMap<String, String>>>,
+    /// Plugins that run as Temps services: what attaching needs, and the
+    /// ones this host is not attached to right now.
+    services: services::ServicePlugins,
+    /// Plugins installed as executables by an earlier version. Listed with
+    /// the reason they do not run; never started.
+    retired: Arc<RwLock<Vec<crate::retired::RetiredPlugin>>>,
 }
 
 impl ExternalPluginManager {
@@ -444,83 +174,10 @@ impl ExternalPluginManager {
             ai_service: Arc::new(RwLock::new(None)),
             watch_ready: Default::default(),
             audit_service: Arc::new(RwLock::new(None)),
-            isolation: tokio::sync::OnceCell::new(),
+            start_failures: Arc::new(RwLock::new(HashMap::new())),
+            services: services::ServicePlugins::default(),
+            retired: Arc::new(RwLock::new(Vec::new())),
         }
-    }
-
-    /// Paths a plugin must never be able to open: this process's environment
-    /// and memory, and the installation's secret files. The launcher adds
-    /// whatever its host keeps besides.
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "bootstrap: the secret-file path variables are read only to deny plugins access to those files, never to decide runtime behaviour"
-    )]
-    fn protected_paths(&self) -> Vec<PathBuf> {
-        let pid = std::process::id();
-        let mut paths = vec![
-            PathBuf::from(format!("/proc/{pid}/environ")),
-            PathBuf::from(format!("/proc/{pid}/mem")),
-        ];
-        let data = &self.config.host_data_dir;
-        for (variable, default) in [
-            ("TEMPS_ENCRYPTION_KEY_FILE", "encryption_key"),
-            ("TEMPS_AUTH_SECRET_FILE", "auth_secret"),
-        ] {
-            paths.push(data.join(default));
-            if let Some(file) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
-                paths.push(PathBuf::from(file));
-            }
-        }
-        if let Some(file) =
-            std::env::var_os("TEMPS_ADMIN_PASSWORD_FILE").filter(|value| !value.is_empty())
-        {
-            paths.push(PathBuf::from(file));
-        }
-        paths.push(data.join("cloud-link").join("state.json"));
-        paths.dedup();
-        paths
-    }
-
-    /// What a plugin running as the launcher's user needs of Temps' files:
-    /// to reach and execute its binary, and to own its data. The sockets
-    /// directory is shared when it is created.
-    #[cfg(unix)]
-    fn share_with_plugin_user(
-        &self,
-        binary_path: &Path,
-        plugin_data_dir: &Path,
-    ) -> std::io::Result<()> {
-        use crate::launcher::access;
-        let binary_dir = binary_path.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "plugin binary has no directory",
-            )
-        })?;
-        access::grant_traverse(&self.config.host_data_dir, binary_dir)?;
-        access::grant_exec(binary_path)?;
-        access::grant_traverse(&self.config.host_data_dir, &self.config.data_dir)?;
-        access::share_dir(plugin_data_dir)
-    }
-
-    /// The launcher's isolation probe, once. `Ok(None)` without a launcher.
-    async fn verified_isolation(&self) -> Result<Option<&crate::launcher::PluginLauncher>, String> {
-        let Some(launcher) = self.config.launcher.as_ref() else {
-            return Ok(None);
-        };
-        self.isolation
-            .get_or_try_init(|| async {
-                let report = launcher.probe(&self.protected_paths()).await?;
-                report.verify(crate::launcher::temps_uid())?;
-                info!("Plugin isolation verified: {}", report.summary());
-                Ok::<_, String>(report)
-            })
-            .await
-            .map_err(|error| {
-                error!("Plugin isolation check failed: {error}");
-                error
-            })?;
-        Ok(Some(launcher))
     }
 
     /// Install the bridge plugins use to call the platform's own HTTP API.
@@ -554,755 +211,75 @@ impl ExternalPluginManager {
         *self.audit_service.write().await = Some(service);
     }
 
-    /// Discover and start all plugins in the plugins directory.
+    /// Attach to every plugin this instance has.
     ///
-    /// Returns the list of successfully started plugin manifests.
+    /// Returns the manifests of the plugins it attached to.
     pub async fn discover_and_start(&self) -> Vec<PluginManifest> {
         self.discover_and_start_report().await.manifests
     }
 
+    /// Attach to every plugin this instance has. A plugin runs as a Temps
+    /// service; one installed as an executable is listed, never started.
     async fn discover_and_start_report(&self) -> PluginReloadResult {
-        if !self.config.persistent_installations {
-            return PluginReloadResult {
-                manifests: Vec::new(),
-                failures: Vec::new(),
-            };
-        }
-
-        #[cfg(unix)]
-        // Under a launcher the plugin user (Temps' group) creates its socket
-        // here and Temps connects to it: group read-write, still no other.
-        let socket_mode = if self.config.launcher.is_some() {
-            0o770
-        } else {
-            0o700
-        };
-        if let Err(error) = secure_socket_directory(&self.config.sockets_dir, socket_mode) {
-            error!(
-                directory = %self.config.sockets_dir.display(),
-                "Failed to create a secure 0700 plugin socket directory: {error}"
-            );
-            return PluginReloadResult {
-                manifests: Vec::new(),
-                failures: vec![PluginLoadFailure {
-                    plugin: None,
-                    reason: "Plugin socket directory could not be prepared".to_string(),
-                }],
-            };
-        }
-        #[cfg(not(unix))]
-        if let Err(error) = tokio::fs::create_dir_all(&self.config.sockets_dir).await {
-            error!(
-                directory = %self.config.sockets_dir.display(),
-                "Failed to create plugin socket directory: {error}"
-            );
-            return PluginReloadResult {
-                manifests: Vec::new(),
-                failures: vec![PluginLoadFailure {
-                    plugin: None,
-                    reason: "Plugin socket directory could not be prepared".to_string(),
-                }],
-            };
-        }
-
-        for dir in [
-            &self.config.plugins_dir,
-            &self.config.data_dir,
-            &self.config.ui_assets_dir,
-            &self.config.pids_dir,
-        ] {
-            if let Err(e) = tokio::fs::create_dir_all(dir).await {
-                error!("Failed to create directory {}: {}", dir.display(), e);
-                return PluginReloadResult {
-                    manifests: Vec::new(),
-                    failures: vec![PluginLoadFailure {
-                        plugin: None,
-                        reason: "A required plugin runtime directory could not be prepared"
-                            .to_string(),
-                    }],
-                };
-            }
-        }
-        // Kill any stale plugin processes left over from a previous run
-        // (e.g. if the server was killed without graceful shutdown).
-        self.kill_stale_processes().await;
-
-        // Under a launcher, prove the isolation at every start, plugins or
-        // not, so the log says whether it holds before anything is installed.
-        // A failure is logged here and stops each plugin from starting below.
-        if self.config.launcher.is_some() {
-            let _ = self.verified_isolation().await;
-        }
-
-        let (binaries, mut failures) = self.scan_plugins_dir().await;
-
-        if binaries.is_empty() {
-            debug!(
-                "No external plugins found in {}",
-                self.config.plugins_dir.display()
-            );
-            return PluginReloadResult {
-                manifests: Vec::new(),
-                failures,
-            };
-        }
-
-        info!(
-            "Found {} external plugin binary(ies) in {}",
-            binaries.len(),
-            self.config.plugins_dir.display()
-        );
-
-        let mut manifests = Vec::new();
-
-        for installation in binaries {
-            match self.start_plugin(&installation).await {
-                Ok(manifest) => {
-                    info!(
-                        plugin = %manifest.name,
-                        version = %manifest.version,
-                        "External plugin started successfully"
-                    );
-                    manifests.push(manifest);
-                }
-                Err(e) => {
-                    error!(
-                        binary = %installation.binary_path.display(),
-                        "Failed to start external plugin: {}", e
-                    );
-                    failures.push(PluginLoadFailure {
-                        plugin: Some(installation.name),
-                        reason: "Plugin failed startup verification".to_string(),
-                    });
-                }
-            }
-        }
-
-        PluginReloadResult {
-            manifests,
-            failures,
-        }
+        self.retire_installed_executables().await;
+        // A plugin that runs as a service needs nothing on this host's disk,
+        // so it also runs on a control plane without persistent storage.
+        self.start_service_plugins().await
     }
 
-    /// Discover only activated binaries whose local receipt still verifies
-    /// against a trusted signed registry document. Flat executable files are
-    /// intentionally ignored: dropping a file into this directory must never
-    /// turn it into code executed by the Temps server.
-    async fn scan_plugins_dir(
-        &self,
-    ) -> (
-        Vec<crate::install::ActiveInstallation>,
-        Vec<PluginLoadFailure>,
-    ) {
-        let mut binaries = Vec::new();
-        let mut failures = Vec::new();
-        for result in
-            crate::install::discover_active(&self.config.plugins_dir, &self.config.registry).await
-        {
-            match result {
-                Ok(installation) => binaries.push(installation),
-                Err(error) => {
-                    warn!(error = %error, "Ignoring unverified external plugin install");
-                    failures.push(PluginLoadFailure {
-                        plugin: None,
-                        reason: "Activated plugin installation failed verification".to_string(),
-                    });
-                }
-            }
-        }
-        binaries.sort_by(|left, right| left.name.cmp(&right.name));
-        (binaries, failures)
-    }
-
-    /// Remove stale plugin bookkeeping left over from a previous run.
+    /// Record the plugins an earlier version installed as executables.
     ///
-    /// A persisted numeric PID is not process identity: it may have been
-    /// reused by the operating system. Therefore startup never signals a
-    /// process based on this file alone; it only removes the stale record and
-    /// socket pathname.
-    async fn kill_stale_processes(&self) {
-        let mut entries = match tokio::fs::read_dir(&self.config.pids_dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                // Directory might not exist yet on first run — that's fine.
-                debug!(
-                    "Cannot read PID directory {}: {}",
-                    self.config.pids_dir.display(),
-                    e
-                );
-                return;
-            }
-        };
-
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let filename = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) if n.ends_with(".pid") => n.to_string(),
-                _ => continue,
-            };
-
-            let plugin_name = filename.trim_end_matches(".pid");
-
-            // Remove stale PID file
-            let _ = tokio::fs::remove_file(&path).await;
-
-            // Also remove the corresponding stale socket
-            let socket_path = self
-                .config
-                .sockets_dir
-                .join(format!("{}.sock", plugin_name));
-            if socket_path.exists() {
-                debug!(
-                    plugin = %plugin_name,
-                    "Removing stale socket file {}",
-                    socket_path.display()
-                );
-                let _ = tokio::fs::remove_file(&socket_path).await;
-            }
+    /// A plugin runs only as a Temps service. An installed executable is
+    /// never started: it is listed with the reason until an administrator
+    /// removes it. Its installation and its data are left where they are.
+    async fn retire_installed_executables(&self) {
+        if !self.config.persistent_installations {
+            self.retired.write().await.clear();
+            return;
         }
-    }
-
-    /// Spawn a single plugin binary and complete the handshake without adding
-    /// it to the active process table.
-    #[allow(clippy::too_many_arguments)] // Keep verified identity inputs explicit at the process security boundary.
-    async fn spawn_plugin(
-        &self,
-        binary_path: &Path,
-        expected_sha256: &str,
-        expected_name: &str,
-        expected_version: &str,
-        instance_name: &str,
-        data_name: &str,
-        source_identity: String,
-        defer_actor_commit: bool,
-    ) -> Result<ExternalPluginProcess, String> {
-        let binary_name = binary_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown");
-
-        let socket_path = self
-            .config
-            .sockets_dir
-            .join(format!("{}.sock", instance_name));
-        let plugin_data_dir = self.config.data_dir.join(data_name);
-        // This authenticates traffic as belonging to the staged child process.
-        // Installed plugins are trusted host code under the current shared-UID
-        // architecture; this is protocol integrity, not a sandbox boundary.
-        let auth_secret = generate_plugin_auth_secret();
-
-        // Validate that the socket path fits within the OS limit.
-        let socket_path_len = socket_path.as_os_str().len();
-        if socket_path_len >= SUN_PATH_MAX {
-            return Err(format!(
-                "Socket path for {} is {} bytes, exceeds OS limit of {} bytes: {}. \
-                 Move your data directory to a shorter path.",
-                binary_name,
-                socket_path_len,
-                SUN_PATH_MAX,
-                socket_path.display(),
-            ));
-        }
-
-        // Remove stale socket
-        let _ = tokio::fs::remove_file(&socket_path).await;
-
-        debug!(binary = %binary_name, "Spawning external plugin");
-
-        let pid_file_path = self.config.pids_dir.join(format!("{}.pid", instance_name));
-
-        // Under a launcher, nothing starts until the plugin user is proven
-        // unable to read this process's secrets.
-        let launcher = self.verified_isolation().await?.cloned();
-        #[cfg(unix)]
-        if launcher.is_some() {
-            self.share_with_plugin_user(binary_path, &plugin_data_dir)
-                .map_err(|error| {
-                    format!(
-                        "Could not give the plugin account access to {binary_name}'s files: \
-                         {error}"
-                    )
-                })?;
-        }
-
-        let executable = open_verified_executable(
-            binary_name,
-            &self.config.plugins_dir,
-            binary_path,
-            expected_sha256,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let mut command = match &launcher {
-            // The launcher checks the digest again as the plugin user and
-            // execs the binary by path: descriptors above 2 don't survive the
-            // change of user, and the plugin user can't write the binary.
-            Some(launcher) => launcher.exec_command(binary_path, expected_sha256),
-            None => Command::new(
-                executable
-                    .command_path(binary_name)
-                    .map_err(|error| error.to_string())?,
-            ),
-        };
-        scrub_plugin_environment(&mut command);
-        command
-            // Registry plugins are host code, but they do not need the Temps
-            // process's secrets. Required non-secret paths and URLs are
-            // passed explicitly below. Another user's process can't be
-            // signalled from here: `ExternalPluginProcess::kill` asks the
-            // launcher instead.
-            .kill_on_drop(launcher.is_none())
-            .arg("--socket-path")
-            .arg(socket_path.to_str().unwrap_or_default())
-            .arg("--data-dir")
-            .arg(plugin_data_dir.to_str().unwrap_or_default())
-            .args(
-                self.config
-                    .host_api_url
-                    .iter()
-                    .flat_map(|url| ["--host-api-url", url.as_str()]),
-            );
-        let mut child = command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| match &launcher {
-                Some(launcher) => format!(
-                    "Failed to start {binary_name} through the plugin launcher {}: {e}",
-                    launcher.program().display()
-                ),
-                None => format!("Failed to spawn {}: {}", binary_name, e),
-            })?;
-        // `kill_on_drop` can't signal another user's process, so every early
-        // return below stops a launched plugin through this guard instead.
-        // Declared after `child`, it drops first: the pid is still unreaped.
-        let mut launched = LaunchedPlugin {
-            launcher: launcher.as_ref(),
-            pid: child.id(),
-        };
-        // Keep the verified executable descriptor alive until spawn has
-        // completed and the child has inherited it.
-        drop(executable);
-
-        let mut child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("Failed to open the launch-config pipe for {binary_name}"))?;
-
-        // Write PID file so we can clean up stale processes on restart
-        if let Some(pid) = child.id() {
-            let pid_write = async {
-                let mut file = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&pid_file_path)
-                    .await?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                        .await?;
-                }
-                file.write_all(pid.to_string().as_bytes()).await?;
-                file.sync_all().await
-            }
-            .await;
-            if let Err(e) = pid_write {
-                warn!(
-                    binary = %binary_name,
-                    "Failed to write PID file {}: {}",
-                    pid_file_path.display(),
-                    e
-                );
-            }
-        }
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("No stdout from {}", binary_name))?;
-
-        // Drain stderr so a noisy child cannot block, but never place
-        // plugin-controlled output in logs or HTTP errors. The process may
-        // receive database credentials after its identity handshake, so even
-        // apparently harmless diagnostics must be treated as secret-bearing.
-        let stderr_bytes = Arc::new(AtomicUsize::new(0));
-        let stderr_task = if let Some(mut stderr) = child.stderr.take() {
-            let observed = stderr_bytes.clone();
-            Some(tokio::spawn(async move {
-                let mut buffer = [0u8; 4096];
-                loop {
-                    match stderr.read(&mut buffer).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => {
-                            let _ = observed.try_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| Some(current.saturating_add(read)),
-                            );
-                        }
-                    }
-                }
-            }))
-        } else {
-            None
-        };
-
-        let mut reader = BufReader::new(stdout);
-
-        // Stage 1: the already-running child identifies its protocol and
-        // declares which host values it needs. Nothing sensitive or privileged
-        // has been passed to it in argv.
-        let manifest = match tokio::time::timeout(self.config.handshake_timeout, async {
-            let line = read_handshake_frame(&mut reader, binary_name, "startup hello")
-                .await?
-                .ok_or_else(|| legacy_startup_eof_error(binary_name))?;
-
-            let msg: HandshakeMessage = serde_json::from_str(&line)
-                .map_err(|e| format!("Invalid manifest JSON from {}: {}", binary_name, e))?;
-
-            match msg {
-                HandshakeMessage::Hello(hello)
-                    if hello.protocol_version == EXTERNAL_PLUGIN_PROTOCOL_VERSION =>
-                {
-                    temps_plugin_protocol::watch::PublishedEvent::validate_declarations(&hello.manifest.published_events)
-                        .map_err(|reason| format!("Plugin {binary_name}: {reason}"))?;
-                    Ok(*hello.manifest)
-                }
-                HandshakeMessage::Hello(hello) => Err(format!(
-                    "Plugin {binary_name} uses external-plugin protocol {}, but this Temps build requires {}; rebuild the plugin with the current temps-plugin-sdk",
-                    hello.protocol_version, EXTERNAL_PLUGIN_PROTOCOL_VERSION
-                )),
-                HandshakeMessage::Manifest(_) => Err(format!(
-                    "Plugin {binary_name} uses the legacy startup handshake; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
-                )),
-                _ => Err(format!(
-                    "Plugin {binary_name} sent an unexpected startup message; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
-                )),
-            }
-        })
-        .await
-        {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => {
-                // Give stderr a moment to flush
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let stderr_context = plugin_stderr_context(stderr_bytes.load(Ordering::Relaxed));
-                if let Some(task) = stderr_task {
-                    task.abort();
-                }
-                return Err(format!("{}{}", e, stderr_context));
-            }
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let stderr_context = plugin_stderr_context(stderr_bytes.load(Ordering::Relaxed));
-                if let Some(task) = stderr_task {
-                    task.abort();
-                }
-                return Err(format!(
-                    "Plugin {binary_name} did not emit the staged startup hello; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}{stderr_context}"
-                ));
-            }
-        };
-
-        // Verify signed identity before disclosing the database URL or host
-        // data directory through the second handshake frame.
-        if manifest.name != expected_name || manifest.version != expected_version {
-            let declared_name = manifest.name.clone();
-            let declared_version = manifest.version.clone();
-            let _ = child.start_kill();
-            if let Some(task) = stderr_task {
-                task.abort();
-            }
-            return Err(format!(
-                "Plugin binary {} declares {declared_name} v{declared_version}, but signed installation expects {expected_name} v{expected_version}",
-                binary_path.display()
-            ));
-        }
-
-        debug!(plugin = %manifest.name, "Received manifest from plugin");
-
-        // The plugin is running its own code by now. Before it is sent the
-        // launch configuration, confirm it really is another user.
-        if launcher.is_some() {
-            let verified = match child.id() {
-                Some(pid) => {
-                    crate::launcher::verify_plugin_process(pid, crate::launcher::temps_uid())
-                }
-                None => Err(format!("{binary_name} exited during its handshake")),
-            };
-            if let Err(error) = verified {
-                if let Some(task) = stderr_task {
-                    task.abort();
-                }
-                return Err(format!("Plugin {binary_name} was not started: {error}"));
-            }
-        }
-
-        // Stage 2: send one typed line to this same child. The manifest flags
-        // control disclosure/routing for trusted installed code; they do not
-        // turn a shared-UID plugin process into a security sandbox.
-        if manifest.requires_host_data_access {
+        let retired = crate::retired::installed_executables(&self.config.plugins_dir).await;
+        for plugin in &retired {
             warn!(
-                plugin = %manifest.name,
-                "Plugin declares privileged access to the platform host data root"
+                plugin = %plugin.name,
+                version = plugin.version.as_deref().unwrap_or("unknown"),
+                "Not starting a plugin installed as an executable: plugins run only as Temps services"
             );
         }
-        let launch_config = PluginLaunchConfig {
-            protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
-            auth_secret: auth_secret.clone(),
-            database_url: manifest
-                .requires_db
-                .then(|| self.config.database_url.clone()),
-            host_data_dir: manifest
-                .requires_host_data_access
-                .then(|| self.config.host_data_dir.to_string_lossy().into_owned()),
-        };
-        let launch_json = serde_json::to_string(&launch_config).map_err(|error| {
-            format!("Failed to encode launch configuration for {binary_name}: {error}")
-        })?;
-        if let Err(error) = child_stdin
-            .write_all(format!("{launch_json}\n").as_bytes())
-            .await
-        {
-            let _ = child.start_kill();
-            return Err(format!(
-                "Failed to deliver typed launch configuration to {binary_name}: {error}"
-            ));
-        }
-        if let Err(error) = child_stdin.shutdown().await {
-            let _ = child.start_kill();
-            return Err(format!(
-                "Failed to close the launch-config pipe for {binary_name}: {error}"
-            ));
-        }
-
-        // Read ready signal (handshake phase 2)
-        let (has_ui, openapi_schema) = match tokio::time::timeout(self.config.handshake_timeout, async {
-            let line = read_handshake_frame(&mut reader, binary_name, "ready signal")
-                .await?
-                .ok_or_else(|| {
-                    format!(
-                        "Plugin {} closed stdout before sending ready signal",
-                        binary_name
-                    )
-                })?;
-
-            let msg: HandshakeMessage = serde_json::from_str(&line)
-                .map_err(|e| format!("Invalid ready JSON from {}: {}", binary_name, e))?;
-
-            match msg {
-                HandshakeMessage::Ready(r) => {
-                    if r.protocol_version != EXTERNAL_PLUGIN_PROTOCOL_VERSION {
-                        return Err(format!(
-                            "Plugin {binary_name} uses external-plugin protocol {}, but this Temps build requires {}; rebuild the plugin with the current temps-plugin-sdk",
-                            r.protocol_version, EXTERNAL_PLUGIN_PROTOCOL_VERSION
-                        ));
-                    }
-                    if r.ready {
-                        // Parse the OpenAPI schema if provided
-                        let openapi = match r.openapi {
-                            Some(json) => match serde_json::from_value::<OpenApi>(json) {
-                                Ok(schema) => {
-                                    debug!(plugin = %manifest.name, "Received OpenAPI schema from plugin");
-                                    Some(schema)
-                                }
-                                Err(e) => {
-                                    warn!(plugin = %manifest.name, "Failed to parse OpenAPI schema: {}", e);
-                                    None
-                                }
-                            },
-                            None => None,
-                        };
-                        Ok((r.has_ui, openapi))
-                    } else {
-                        Err(format!("Plugin {} reported not ready", binary_name))
-                    }
-                }
-                _ => Err(format!(
-                    "Expected ready message from {}, got something else",
-                    binary_name
-                )),
-            }
-        })
-        .await
-        {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let stderr_context = plugin_stderr_context(stderr_bytes.load(Ordering::Relaxed));
-                if let Some(task) = stderr_task {
-                    task.abort();
-                }
-                return Err(format!("{}{}", e, stderr_context));
-            }
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let stderr_context = plugin_stderr_context(stderr_bytes.load(Ordering::Relaxed));
-                if let Some(task) = stderr_task {
-                    task.abort();
-                }
-                return Err(format!(
-                    "Ready signal timeout for {}{}",
-                    binary_name, stderr_context
-                ));
-            }
-        };
-
-        debug!(plugin = %manifest.name, has_ui = has_ui, "Plugin is ready");
-
-        if has_ui {
-            let ui_dir = self.config.ui_assets_dir.join(&manifest.name);
-            debug!(
-                plugin = %manifest.name,
-                dir = %ui_dir.display(),
-                "Plugin has UI assets (will be served via /x/<plugin>/ui/* route)"
-            );
-        }
-
-        // Open the platform channel (WebSocket to plugin for queries + events).
-        // This is non-fatal: older plugins that don't serve /_temps/channel
-        // will simply not get a channel (they can still use POST /_events).
-        let channel = PluginChannel::connect(
-            &socket_path,
-            manifest.name.clone(),
-            self.db.clone(),
-            self.host_api.clone(),
-            manifest.capabilities.clone(),
-            manifest.host_permissions.clone(),
-            manifest.published_events.clone(),
-            self.watch_ready.clone(),
-            expected_sha256.to_string(),
-            source_identity,
-            defer_actor_commit,
-            self.ai_service.clone(),
-            self.audit_service.clone(),
-            &auth_secret,
-        )
-        .await;
-        let channel = match channel {
-            Some(channel) => channel,
-            None => {
-                let _ = child.start_kill();
-                return Err(format!(
-                    "Plugin {binary_name} did not establish an authenticated platform channel; rebuild it with temps-plugin-sdk protocol {EXTERNAL_PLUGIN_PROTOCOL_VERSION}"
-                ));
-            }
-        };
-
-        // Handed over: from here `ExternalPluginProcess` stops it.
-        launched.pid = None;
-        Ok(ExternalPluginProcess {
-            launcher: launcher.clone(),
-            manifest,
-            binary_path: binary_path.to_path_buf(),
-            sha256: expected_sha256.to_string(),
-            socket_path,
-            auth_secret,
-            pid_file_path,
-            child,
-            has_ui,
-            channel: Some(channel),
-            openapi_schema,
-        })
+        *self.retired.write().await = retired;
     }
 
-    /// Start a verified active install and register it under its signed name.
-    async fn start_plugin(
-        &self,
-        installation: &crate::install::ActiveInstallation,
-    ) -> Result<PluginManifest, String> {
-        let expected_name = &installation.name;
-        let process = self
-            .spawn_plugin(
-                &installation.binary_path,
-                &installation.sha256,
-                expected_name,
-                &installation.version,
-                expected_name,
-                expected_name,
-                installation.source_identity.clone(),
-                false,
-            )
-            .await?;
-        let manifest = process.manifest.clone();
-        if let Some(mut replaced) = self
-            .plugins
+    /// Plugins installed as executables, which are not started any more.
+    pub async fn retired_plugins(&self) -> Vec<crate::retired::RetiredPlugin> {
+        self.retired.read().await.clone()
+    }
+
+    /// Stop listing `plugin_name` as an installed executable.
+    pub(crate) async fn forget_retired(&self, plugin_name: &str) {
+        self.retired
             .write()
             .await
-            .insert(expected_name.to_string(), process)
-        {
-            replaced.shutdown().await;
-        }
-        Ok(manifest)
+            .retain(|plugin| plugin.name != plugin_name);
     }
 
-    /// Run a candidate through the full startup protocol while leaving the
-    /// current active process untouched.
-    pub(crate) async fn prepare_candidate(
-        &self,
-        expected_name: &str,
-        expected_version: &str,
-        expected_sha256: &str,
-        binary_path: &Path,
-        source_identity: String,
-    ) -> Result<PendingPlugin, String> {
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let instance_name = format!("candidate-{}", &suffix[..16]);
-        let process = self
-            .spawn_plugin(
-                binary_path,
-                expected_sha256,
-                expected_name,
-                expected_version,
-                &instance_name,
-                expected_name,
-                source_identity,
-                true,
-            )
-            .await?;
-        Ok(PendingPlugin {
-            expected_name: expected_name.to_string(),
-            process,
-        })
-    }
-
-    pub(crate) fn candidate_actor_binding(pending: &PendingPlugin) -> Result<(&str, &str), String> {
-        pending
-            .process
-            .channel
-            .as_ref()
-            .map(PluginChannel::actor_binding)
-            .ok_or_else(|| "Candidate has no authenticated plugin channel".to_string())
-    }
-
-    /// Atomically swap the process table entry, then stop the old process.
-    pub(crate) async fn promote_candidate(&self, pending: PendingPlugin) -> PluginManifest {
-        let manifest = pending.process.manifest.clone();
-        let old = self
-            .plugins
-            .write()
-            .await
-            .insert(pending.expected_name, pending.process);
-        if let Some(mut old) = old {
-            old.shutdown().await;
-        }
-        manifest
-    }
-
-    pub(crate) async fn discard_candidate(&self, mut pending: PendingPlugin) {
-        pending.process.shutdown().await;
-    }
-
-    /// Get all running plugin manifests.
+    /// Get the manifests of every plugin that can serve a request: the
+    /// running ones, and the ones whose service is stopped or reconnecting
+    /// and is attached to again by the next request.
     pub async fn manifests(&self) -> Vec<PluginManifest> {
-        self.plugins
+        let mut manifests: Vec<PluginManifest> = self
+            .plugins
             .read()
             .await
             .values()
             .map(|p| p.manifest.clone())
-            .collect()
+            .collect();
+        // A plugin whose channel closed between the two reads is in both;
+        // mounting its routes twice would panic.
+        for dormant in self.services.dormant_manifests().await {
+            if !manifests.iter().any(|known| known.name == dormant.name) {
+                manifests.push(dormant);
+            }
+        }
+        manifests
     }
 
     /// Get OpenAPI schemas from all running plugins.
@@ -1316,7 +293,7 @@ impl ExternalPluginManager {
             .collect()
     }
 
-    /// Read each schema and its verified executable's digest from the same running process.
+    /// Read each schema and the identity of its build from the same attached plugin.
     pub(crate) async fn runtime_openapi_schemas(&self) -> Vec<(String, String, OpenApi)> {
         self.plugins
             .read()
@@ -1326,7 +303,7 @@ impl ExternalPluginManager {
                 process
                     .openapi_schema
                     .as_ref()
-                    .map(|schema| (name.clone(), process.sha256.clone(), schema.clone()))
+                    .map(|schema| (name.clone(), process.build.clone(), schema.clone()))
             })
             .collect()
     }
@@ -1345,7 +322,7 @@ impl ExternalPluginManager {
                     plugin: name.clone(),
                     id: event.event_type.clone(),
                     label: event.title.clone(),
-                    digest: process.sha256.clone(),
+                    digest: process.build.clone(),
                     declaration: event.clone(),
                 });
             }
@@ -1355,31 +332,19 @@ impl ExternalPluginManager {
 
     /// Create a PluginProxy for a given plugin name.
     pub async fn proxy_for(&self, plugin_name: &str) -> Option<PluginProxy> {
-        let plugins = self.plugins.read().await;
-        plugins.get(plugin_name).map(|process| {
-            PluginProxy::new(
-                process.socket_path.clone(),
-                process.manifest.name.clone(),
-                process.auth_secret.clone(),
-            )
-            .with_public_paths(process.manifest.public_paths.clone())
-            .with_actor_minting(
-                self.actor_crypto.clone(),
-                !process.manifest.capabilities.is_empty(),
-            )
-        })
+        self.service_proxy_for(plugin_name).await
     }
 
-    /// Get the socket path for a plugin.
-    pub async fn socket_path_for(&self, plugin_name: &str) -> Option<PathBuf> {
+    /// Where a running plugin answers.
+    pub async fn endpoint_for(&self, plugin_name: &str) -> Option<PluginEndpoint> {
         self.plugins
             .read()
             .await
             .get(plugin_name)
-            .map(|p| p.socket_path.clone())
+            .map(|p| p.endpoint.clone())
     }
 
-    /// Per-process assertion secret for internal event delivery.
+    /// The assertion secret for internal event delivery.
     pub(crate) async fn auth_secret_for(&self, plugin_name: &str) -> Option<String> {
         self.plugins
             .read()
@@ -1424,90 +389,56 @@ impl ExternalPluginManager {
         self.plugins.read().await.contains_key(plugin_name)
     }
 
-    /// Shut down all plugins gracefully.
+    /// Why Temps is not attached to a plugin, if its last attempt failed.
+    pub async fn start_failure(&self, plugin_name: &str) -> Option<String> {
+        self.start_failures.read().await.get(plugin_name).cloned()
+    }
+
+    /// Every plugin whose last attempt to attach failed, with the reason.
+    pub async fn start_failures(&self) -> HashMap<String, String> {
+        self.start_failures.read().await.clone()
+    }
+
+    /// Detach from every plugin. Their services keep running.
     pub async fn shutdown_all(&self) {
+        self.services.forget_all().await;
         let mut plugins = self.plugins.write().await;
-        for (name, mut process) in plugins.drain() {
-            info!(plugin = %name, "Shutting down external plugin");
-            process.shutdown().await;
-            process.cleanup_files();
+        for (name, _process) in plugins.drain() {
+            info!(plugin = %name, "Detaching from external plugin");
         }
     }
 
-    /// Shut down a specific plugin.
+    /// Detach from a specific plugin. Its service keeps running.
     pub async fn shutdown_plugin(&self, plugin_name: &str) {
-        let mut plugins = self.plugins.write().await;
-        if let Some(mut process) = plugins.remove(plugin_name) {
-            info!(plugin = %plugin_name, "Shutting down external plugin");
-            process.shutdown().await;
-            process.cleanup_files();
+        self.start_failures.write().await.remove(plugin_name);
+        self.services.forget(plugin_name).await;
+        if self.plugins.write().await.remove(plugin_name).is_some() {
+            info!(plugin = %plugin_name, "Detached from external plugin");
         } else {
-            warn!(plugin = %plugin_name, "Plugin not found for shutdown");
+            debug!(plugin = %plugin_name, "Plugin was not attached");
         }
     }
 
-    /// Reload all plugins: shut down running ones, re-scan the directory,
-    /// and start everything fresh.
-    ///
-    /// Returns the manifests of all successfully started plugins.
+    /// Detach from every plugin and attach again, to whatever each service
+    /// runs now.
     pub async fn reload_all(&self) -> PluginReloadResult {
         info!("Reloading all external plugins");
-
-        // Phase 1: Shut down all running plugins
         self.shutdown_all().await;
-
-        // Phase 2: Re-discover and start
         self.discover_and_start_report().await
     }
 
-    /// Reload a single plugin by name: shut it down (if running), then
-    /// re-start its binary.
+    /// Attach again to a single plugin by name.
     ///
-    /// Returns the new manifest on success, or an error string on failure.
+    /// Returns the new manifest on success, or the reason on failure.
     pub async fn reload_plugin(&self, plugin_name: &str) -> Result<PluginManifest, String> {
-        if !self.plugins.read().await.contains_key(plugin_name) {
+        let Some(binding) = self.service_binding_of(plugin_name).await else {
             return Err(format!(
-                "Plugin '{plugin_name}' is not running; cannot reload"
+                "Plugin '{plugin_name}' is not added from a service; cannot reload"
             ));
-        }
-        let active = crate::install::verified_active_installation(
-            plugin_name,
-            &self.config.plugins_dir,
-            &self.config.registry,
-        )
-        .await
-        .map_err(|error| {
-            format!("Cannot verify the active release of plugin '{plugin_name}': {error}")
-        })?;
-        // Check the same table entry that we remove. A divergent selector must
-        // not stop the healthy process or rebind its actor to another release.
-        let mut old = {
-            let mut plugins = self.plugins.write().await;
-            let entry = match plugins.entry(plugin_name.to_owned()) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry,
-                std::collections::hash_map::Entry::Vacant(_) => {
-                    return Err(format!("Plugin '{plugin_name}' stopped during reload"))
-                }
-            };
-            let process = entry.get();
-            if process.sha256 != active.sha256
-                || process.binary_path != active.binary_path
-                || process.manifest.version != active.version
-                || process
-                    .channel
-                    .as_ref()
-                    .map(|channel| channel.actor_binding().1)
-                    != Some(active.source_identity.as_str())
-            {
-                return Err(format!("Plugin '{plugin_name}' is running a different release than its verified active receipt. Reload all plugins to reconcile the installation."));
-            }
-            entry.remove()
         };
-        info!(plugin = %plugin_name, "Reloading external plugin");
-        old.shutdown().await;
-        // Drop owns socket and PID cleanup. Finish it before reusing either path.
-        drop(old);
-        self.start_plugin(&active).await
+        self.attach_service(binding, Some(plugin_name))
+            .await
+            .map_err(|error| error.public_reason())
     }
 
     /// Get the config.
@@ -1516,738 +447,104 @@ impl ExternalPluginManager {
     }
 }
 
+pub(crate) mod services;
+pub use services::ServicePluginState;
+
 #[cfg(test)]
 mod tests {
-
-    /// Raises `CAP_NET_ADMIN` as an ambient capability on the calling thread, or
-    /// returns false when the test process may not (not root, no capability).
-    #[cfg(target_os = "linux")]
-    fn raise_ambient_net_admin() -> bool {
-        #[repr(C)]
-        struct Header {
-            version: u32,
-            pid: i32,
-        }
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct Data {
-            effective: u32,
-            permitted: u32,
-            inheritable: u32,
-        }
-        const NET_ADMIN: u32 = 12;
-        let header = Header {
-            version: 0x2008_0522,
-            pid: 0,
-        };
-        let mut data = [Data {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        }; 2];
-        // SAFETY: valid, correctly sized buffers for capability version 3.
-        unsafe {
-            if libc::syscall(
-                libc::SYS_capget,
-                &header as *const Header,
-                data.as_mut_ptr(),
-            ) != 0
-            {
-                return false;
-            }
-            data[0].inheritable |= 1 << NET_ADMIN;
-            if libc::syscall(libc::SYS_capset, &header as *const Header, data.as_ptr()) != 0 {
-                return false;
-            }
-            libc::prctl(
-                libc::PR_CAP_AMBIENT,
-                libc::PR_CAP_AMBIENT_RAISE as libc::c_ulong,
-                NET_ADMIN as libc::c_ulong,
-                0,
-                0,
-            ) == 0
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_plugin_does_not_inherit_ambient_capabilities() {
-        if !raise_ambient_net_admin() {
-            eprintln!("skipped: this process cannot raise an ambient capability");
-            return;
-        }
-        // Builtins only, so it works with the scrubbed (empty) environment.
-        const SCRIPT: &str =
-            "while read key value; do case $key in CapAmb:) echo $value;; esac; done < /proc/self/status";
-        let ambient = |mut command: Command| async move {
-            let output = command
-                .arg("-c")
-                .arg(SCRIPT)
-                .output()
-                .await
-                .expect("spawn sh");
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        };
-        // The control: an ordinary child does inherit it, so the assertion below
-        // is not vacuously true.
-        assert_eq!(ambient(Command::new("/bin/sh")).await, "0000000000001000");
-
-        let mut plugin = Command::new("/bin/sh");
-        scrub_plugin_environment(&mut plugin);
-        assert_eq!(ambient(plugin).await, "0000000000000000");
-    }
     use super::*;
-    use base64::Engine as _;
-    use ed25519_dalek::SigningKey;
-    use sha2::{Digest as _, Sha256};
+    use sea_orm::{DatabaseBackend, MockDatabase};
 
-    /// Create a mock database connection for tests.
     fn mock_db() -> Arc<DatabaseConnection> {
-        Arc::new(sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection())
+        Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
     }
 
-    #[cfg(unix)]
-    fn sleeping_process(root: &Path, name: &str, version: &str) -> (ExternalPluginProcess, u32) {
-        let child = tokio::process::Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("spawn fixture process");
-        let pid = child.id().expect("fixture process ID");
-        (
-            ExternalPluginProcess {
-                manifest: PluginManifest::builder(name, version).build(),
-                binary_path: root.join(format!("{name}-{version}")),
-                sha256: "00".repeat(32),
-                socket_path: root.join(format!("{name}-{version}.sock")),
-                auth_secret: "fixture-auth".to_string(),
-                pid_file_path: root.join(format!("{name}-{version}.pid")),
-                child,
-                launcher: None,
-                has_ui: false,
-                channel: None,
-                openapi_schema: None,
-            },
-            pid,
+    fn install_executable(plugins_dir: &std::path::Path, name: &str, version: &str) {
+        let directory = plugins_dir.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("active.json"),
+            format!(r#"{{"version":"{version}","directory":"{version}-0000"}}"#),
         )
-    }
-
-    #[cfg(unix)]
-    fn process_is_alive(pid: u32) -> bool {
-        // SAFETY: signal 0 only checks whether this PID is visible; it does
-        // not signal or otherwise modify the process.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_manager_creation() {
-        let config = ExternalPluginConfig::new(
-            PathBuf::from("/tmp/temps-test"),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config, mock_db());
+        let root = tempfile::tempdir().unwrap();
+        let manager =
+            ExternalPluginManager::new(ExternalPluginConfig::new(root.path().into()), mock_db());
 
         assert!(manager.manifests().await.is_empty());
+        assert!(manager.retired_plugins().await.is_empty());
+        assert_eq!(manager.config().plugins_dir, root.path().join("plugins"));
     }
 
-    #[test]
-    fn repository_candidate_and_restart_use_the_same_actor_source_identity() {
-        let verified_repository = "https://github.com/example/plugin";
+    #[tokio::test]
+    async fn an_installed_executable_is_listed_and_never_started() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ExternalPluginConfig::new(root.path().into());
+        install_executable(&config.plugins_dir, "reports", "1.4.0");
+        let manager = ExternalPluginManager::new(config, mock_db());
 
-        let candidate_identity = repository_actor_source(verified_repository, None);
-        let restart_receipt_identity = repository_actor_source(verified_repository, None);
+        let started = manager.discover_and_start().await;
 
-        assert_eq!(candidate_identity, restart_receipt_identity);
+        assert!(started.is_empty());
+        assert!(!manager.is_running("reports").await);
+        assert!(manager.proxy_for("reports").await.is_none());
         assert_eq!(
-            candidate_identity,
-            "repository:https://github.com/example/plugin"
+            manager.retired_plugins().await,
+            vec![crate::retired::RetiredPlugin {
+                name: "reports".into(),
+                version: Some("1.4.0".into()),
+            }]
         );
-        let first = repository_actor_source(verified_repository, Some("plugins/first"));
-        let sibling = repository_actor_source(verified_repository, Some("plugins/sibling"));
-        assert_ne!(first, sibling);
-        assert_ne!(first, candidate_identity);
-    }
-
-    #[test]
-    fn plugin_processes_receive_distinct_auth_secrets() {
-        let first = generate_plugin_auth_secret();
-        let second = generate_plugin_auth_secret();
-
-        assert_ne!(first, second);
-        assert!(!first.is_empty());
-        assert!(!second.is_empty());
     }
 
     #[tokio::test]
-    async fn test_read_handshake_frame_partial_eof_returns_complete_frame() {
-        // Arrange
-        let mut reader = BufReader::new(&b"{\"type\":\"hello\"}"[..]);
-
-        // Act
-        let frame = read_handshake_frame(&mut reader, "fixture", "startup hello")
-            .await
-            .expect("partial final frame should be readable");
-
-        // Assert
-        assert_eq!(frame.as_deref(), Some("{\"type\":\"hello\"}"));
-    }
-
-    #[tokio::test]
-    async fn test_read_handshake_frame_crlf_strips_line_terminator() {
-        // Arrange
-        let mut reader = BufReader::new(&b"{\"type\":\"ready\"}\r\nsecond\n"[..]);
-
-        // Act
-        let first = read_handshake_frame(&mut reader, "fixture", "ready signal")
-            .await
-            .expect("CRLF frame should be readable");
-        let second = read_handshake_frame(&mut reader, "fixture", "next frame")
-            .await
-            .expect("reader must retain bytes after the first newline");
-
-        // Assert
-        assert_eq!(first.as_deref(), Some("{\"type\":\"ready\"}"));
-        assert_eq!(second.as_deref(), Some("second"));
-    }
-
-    #[tokio::test]
-    async fn test_read_handshake_frame_over_limit_returns_bounded_error() {
-        // Arrange: the newline itself counts toward the protocol frame limit.
-        let mut bytes = vec![b'a'; MAX_HANDSHAKE_FRAME_BYTES];
-        bytes.push(b'\n');
-        let mut reader = BufReader::new(bytes.as_slice());
-
-        // Act
-        let error = read_handshake_frame(&mut reader, "oversized-plugin", "startup hello")
-            .await
-            .expect_err("an oversized frame must be rejected before allocation grows further");
-
-        // Assert
-        assert!(error.contains("oversized-plugin"), "{error}");
-        assert!(error.contains("startup hello"), "{error}");
-        assert!(error.contains("byte limit"), "{error}");
-    }
-
-    #[test]
-    fn legacy_startup_eof_is_actionable_without_exposing_stderr() {
-        let secret = "postgres://admin:secret@example.test/temps";
-        let error = format!(
-            "{}{}",
-            legacy_startup_eof_error("plugin-v0.0.8"),
-            plugin_stderr_context(secret.len())
-        );
-
-        assert!(error.contains("incompatible or uses a legacy temps-plugin-sdk"));
-        assert!(error.contains("rebuild it with protocol v2"));
-        assert!(error.contains("diagnostic output"));
-        assert!(error.contains("withheld to prevent secret disclosure"));
-        assert!(!error.contains(secret));
-    }
-
-    #[tokio::test]
-    async fn plugin_command_environment_is_scrubbed() {
-        let mut command = Command::new("sh");
-        command.env("TEMPS_TEST_SECRET", "must-not-leak");
-        scrub_plugin_environment(&mut command);
-        let status = command
-            .arg("-c")
-            .arg("test -z \"$TEMPS_TEST_SECRET\"")
-            .status()
-            .await
-            .expect("run environment probe");
-        assert!(status.success());
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_prepare_candidate_wrong_identity_receives_no_launch_configuration() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        // Arrange: the child identifies itself, then records stdin only if the
-        // host sends the second (secret-bearing) handshake frame.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://admin:must-not-leak@example.test/temps".to_string(),
-        );
-        config.handshake_timeout = Duration::from_secs(2);
-        std::fs::create_dir_all(&config.plugins_dir).expect("plugins directory");
-        let marker = temp.path().join("launch-config-received");
-        let manifest = PluginManifest::builder("wrong-plugin", "1.0.0")
-            .requires_db(true)
-            .requires_host_data_access(true)
-            .build();
-        let hello = serde_json::to_string(&HandshakeMessage::Hello(
-            temps_plugin_protocol::PluginHello {
-                protocol_version: EXTERNAL_PLUGIN_PROTOCOL_VERSION,
-                manifest: Box::new(manifest),
-            },
-        ))
-        .expect("serialize hello");
-        let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' '{}'\nif IFS= read -r launch; then printf '%s' \"$launch\" > '{}'; fi\n",
-            hello.replace('\'', "'\\''"),
-            marker.display()
-        );
-        let binary = config.plugins_dir.join("wrong-identity-fixture");
-        std::fs::write(&binary, script.as_bytes()).expect("fixture script");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o500))
-            .expect("fixture permissions");
-        let digest = hex::encode(Sha256::digest(script.as_bytes()));
+    async fn reloading_reports_no_failure_for_an_installed_executable_and_forgets_a_removed_one() {
+        let root = tempfile::tempdir().unwrap();
+        let config = ExternalPluginConfig::new(root.path().into());
+        install_executable(&config.plugins_dir, "reports", "1.4.0");
+        let active = config.plugins_dir.join("reports").join("active.json");
         let manager = ExternalPluginManager::new(config, mock_db());
 
-        // Act
-        let error = match manager
-            .prepare_candidate(
-                "expected-plugin",
-                "1.0.0",
-                &digest,
-                &binary,
-                "registry:https://registry.invalid".to_string(),
-            )
-            .await
-        {
-            Ok(_) => panic!("signed and declared identities must match"),
-            Err(error) => error,
-        };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Not running is what an installed executable is now, not a failure
+        // an administrator could fix by reloading.
+        let first = manager.reload_all().await;
+        assert!(first.manifests.is_empty());
+        assert!(first.failures.is_empty());
+        assert_eq!(manager.retired_plugins().await.len(), 1);
 
-        // Assert
-        assert!(error.contains("wrong-plugin"), "{error}");
-        assert!(error.contains("expected-plugin"), "{error}");
-        assert!(!error.contains("must-not-leak"), "{error}");
-        assert!(
-            !marker.exists(),
-            "identity rejection must happen before the launch secret is written"
-        );
+        std::fs::remove_file(active).unwrap();
+        manager.reload_all().await;
+        assert!(manager.retired_plugins().await.is_empty());
     }
 
     #[tokio::test]
-    #[cfg(unix)]
-    async fn test_promote_candidate_swaps_then_stops_previous_process() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
+    async fn a_process_without_durable_storage_lists_no_installed_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = ExternalPluginConfig::new(root.path().into());
+        config.persistent_installations = false;
+        install_executable(&config.plugins_dir, "reports", "1.4.0");
         let manager = ExternalPluginManager::new(config, mock_db());
-        let (old, old_pid) = sleeping_process(temp.path(), "example", "1.0.0");
-        let (candidate, candidate_pid) = sleeping_process(temp.path(), "example", "2.0.0");
-        manager
-            .plugins
-            .write()
-            .await
-            .insert("example".to_string(), old);
 
-        let manifest = manager
-            .promote_candidate(PendingPlugin {
-                expected_name: "example".to_string(),
-                process: candidate,
-            })
-            .await;
+        manager.discover_and_start().await;
 
-        assert_eq!(manifest.version, "2.0.0");
-        assert!(
-            !process_is_alive(old_pid),
-            "previous process must be reaped"
-        );
-        assert!(
-            process_is_alive(candidate_pid),
-            "candidate must remain active"
-        );
-        assert_eq!(manager.manifests().await[0].version, "2.0.0");
-
-        manager.shutdown_all().await;
-        assert!(
-            !process_is_alive(candidate_pid),
-            "active process must be reaped"
-        );
+        assert!(manager.retired_plugins().await.is_empty());
     }
 
     #[tokio::test]
-    #[cfg(unix)]
-    async fn test_discard_candidate_stops_process_without_activating_it() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config, mock_db());
-        let (candidate, candidate_pid) = sleeping_process(temp.path(), "example", "2.0.0");
+    async fn reloading_a_plugin_that_was_not_added_from_a_service_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let manager =
+            ExternalPluginManager::new(ExternalPluginConfig::new(root.path().into()), mock_db());
 
-        manager
-            .discard_candidate(PendingPlugin {
-                expected_name: "example".to_string(),
-                process: candidate,
-            })
-            .await;
+        let reason = manager.reload_plugin("reports").await.unwrap_err();
 
-        assert!(
-            !process_is_alive(candidate_pid),
-            "discarded process must be reaped"
-        );
-        assert!(manager.manifests().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_empty_plugins_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config, mock_db());
-
-        let manifests = manager.discover_and_start().await;
-        assert!(manifests.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_reload_all_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config, mock_db());
-
-        // Initial discover
-        let manifests = manager.discover_and_start().await;
-        assert!(manifests.is_empty());
-
-        // Reload — should also be empty with no plugins
-        let result = manager.reload_all().await;
-        assert!(result.manifests.is_empty());
-        assert!(result.failures.is_empty());
-        assert!(manager.manifests().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_discovery_and_reload_never_fetch_registry_keyset() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[73; 32]);
-        let fetches = Arc::new(AtomicUsize::new(0));
-        let registry_config = crate::catalog::RegistryConfig::local_counted(
-            "http://127.0.0.1:9/api/plugins".to_string(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-            fetches.clone(),
-        );
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry_config.clone());
-        let document = crate::catalog::RegistryDocument {
-            schema_version: 1,
-            revision: 1,
-            issued_at: chrono::Utc::now() - chrono::Duration::minutes(1),
-            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            plugins: Vec::new(),
-        };
-        let payload = serde_json::to_vec(&document).expect("serialize registry fixture");
-        let verified = crate::catalog::VerifiedRegistry {
-            keyset: crate::trust::VerifiedKeyset::test_fixture(
-                "fixture-key",
-                signing.verifying_key().to_bytes(),
-            )
-            .1,
-            envelope: crate::catalog::RegistryEnvelope {
-                key_id: "fixture-key".to_string(),
-                payload: base64::engine::general_purpose::STANDARD.encode(&payload),
-                signature: String::new(),
-            },
-            document,
-        };
-        crate::install::PluginInstaller::new(registry_config)
-            .expect("create fixture installer")
-            .accept_registry_revision(&config.plugins_dir, &verified)
-            .await
-            .expect("seed accepted registry state");
-        let manager = ExternalPluginManager::new(config, mock_db());
-
-        let manifests = manager.discover_and_start().await;
-        let reload = manager.reload_all().await;
-
-        assert!(manifests.is_empty());
-        assert!(reload.manifests.is_empty());
         assert_eq!(
-            fetches.load(Ordering::SeqCst),
-            0,
-            "local discovery and reload must not contact the registry"
+            reason,
+            "Plugin 'reports' is not added from a service; cannot reload"
         );
-    }
-
-    #[tokio::test]
-    async fn test_reload_all_invalid_active_install_reports_typed_failure() {
-        // Arrange
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        std::fs::create_dir_all(config.plugins_dir.join("broken-plugin"))
-            .expect("broken plugin directory");
-        std::fs::write(
-            config.plugins_dir.join("broken-plugin/active.json"),
-            b"invalid",
-        )
-        .expect("malformed active record");
-        let manager = ExternalPluginManager::new(config, mock_db());
-
-        // Act
-        let result = manager.reload_all().await;
-
-        // Assert
-        assert!(result.manifests.is_empty());
-        assert_eq!(result.failures.len(), 1);
-        assert_eq!(
-            result.failures[0].reason,
-            "Activated plugin installation failed verification"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reload_plugin_not_running() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config, mock_db());
-
-        let result = manager.reload_plugin("nonexistent").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not running"));
-    }
-
-    #[tokio::test]
-    async fn test_kill_stale_processes_removes_pid_files_for_dead_process() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config.clone(), mock_db());
-
-        // Create PID directory and a PID file for a non-existent process
-        tokio::fs::create_dir_all(&config.pids_dir).await.unwrap();
-        let pid_file = config.pids_dir.join("some-plugin.pid");
-        // PID 99999999 almost certainly doesn't exist
-        tokio::fs::write(&pid_file, "99999999").await.unwrap();
-
-        // Also create a stale socket for the same plugin
-        tokio::fs::create_dir_all(&config.sockets_dir)
-            .await
-            .unwrap();
-        let socket_file = config.sockets_dir.join("some-plugin.sock");
-        tokio::fs::write(&socket_file, "").await.unwrap();
-
-        manager.kill_stale_processes().await;
-
-        // PID file should be removed
-        assert!(
-            !pid_file.exists(),
-            "PID file should be removed after cleanup"
-        );
-        // Stale socket should also be removed
-        assert!(
-            !socket_file.exists(),
-            "Stale socket file should be removed after cleanup"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_kill_stale_processes_handles_invalid_pid_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config.clone(), mock_db());
-
-        // Create PID directory and a PID file with invalid content
-        tokio::fs::create_dir_all(&config.pids_dir).await.unwrap();
-        let pid_file = config.pids_dir.join("bad-plugin.pid");
-        tokio::fs::write(&pid_file, "not-a-number").await.unwrap();
-
-        // Should not panic
-        manager.kill_stale_processes().await;
-
-        // PID file should be removed even with invalid content
-        assert!(
-            !pid_file.exists(),
-            "Invalid PID file should be removed after cleanup"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_kill_stale_processes_empty_pids_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config.clone(), mock_db());
-
-        // Create empty PID directory
-        tokio::fs::create_dir_all(&config.pids_dir).await.unwrap();
-
-        // Should not panic
-        manager.kill_stale_processes().await;
-    }
-
-    #[tokio::test]
-    async fn test_kill_stale_processes_no_pids_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config, mock_db());
-
-        // PID directory doesn't exist yet — should handle gracefully
-        manager.kill_stale_processes().await;
-    }
-
-    #[tokio::test]
-    async fn test_kill_stale_processes_skips_non_pid_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config.clone(), mock_db());
-
-        // Create PID directory with a non-.pid file
-        tokio::fs::create_dir_all(&config.pids_dir).await.unwrap();
-        let other_file = config.pids_dir.join("readme.txt");
-        tokio::fs::write(&other_file, "not a pid file")
-            .await
-            .unwrap();
-
-        manager.kill_stale_processes().await;
-
-        // Non-.pid file should NOT be removed
-        assert!(other_file.exists(), "Non-.pid files should not be removed");
-    }
-
-    #[tokio::test]
-    async fn test_config_has_pids_dir() {
-        let config = ExternalPluginConfig::new(
-            PathBuf::from("/data"),
-            "postgres://localhost/test".to_string(),
-        );
-        assert_eq!(config.pids_dir, PathBuf::from("/data/run/plugin-pids"));
-        assert_eq!(config.plugins_dir, PathBuf::from("/data/plugins"));
-        assert_eq!(config.data_dir, PathBuf::from("/data/plugin-data"));
-        // Sockets dir is under /tmp, not under data_dir,
-        // to keep Unix socket paths short (macOS has a 104-byte limit).
-        let sockets_dir_str = config.sockets_dir.to_string_lossy();
-        assert!(
-            sockets_dir_str.starts_with("/tmp/tp-"),
-            "Sockets dir should be under /tmp/tp-*: {}",
-            sockets_dir_str
-        );
-    }
-
-    #[test]
-    fn test_socket_path_fits_sun_len() {
-        // Verify that even long plugin names produce socket paths under the limit.
-        let config = ExternalPluginConfig::new(
-            PathBuf::from("/some/very/deeply/nested/data/directory"),
-            "postgres://localhost/test".to_string(),
-        );
-        let socket = config
-            .sockets_dir
-            .join("temps-very-long-plugin-name-that-would-break-things.sock");
-        assert!(
-            socket.as_os_str().len() < SUN_PATH_MAX,
-            "Socket path {} ({} bytes) exceeds SUN_PATH_MAX ({})",
-            socket.display(),
-            socket.as_os_str().len(),
-            SUN_PATH_MAX,
-        );
-    }
-
-    #[test]
-    fn test_different_data_dirs_get_different_socket_dirs() {
-        let config_a = ExternalPluginConfig::new(
-            PathBuf::from("/data/a"),
-            "postgres://localhost/test".to_string(),
-        );
-        let config_b = ExternalPluginConfig::new(
-            PathBuf::from("/data/b"),
-            "postgres://localhost/test".to_string(),
-        );
-        assert_ne!(
-            config_a.sockets_dir, config_b.sockets_dir,
-            "Different data dirs must produce different socket dirs"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn secure_socket_directory_uses_private_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_dir = tmp.path().join("sockets");
-        secure_socket_directory(&socket_dir, 0o700).expect("secure socket directory");
-
-        let mode = std::fs::metadata(socket_dir)
-            .expect("socket directory metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn stale_pid_cleanup_never_kills_a_reused_process_id() {
-        use tokio::process::Command;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            tmp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let manager = ExternalPluginManager::new(config.clone(), mock_db());
-
-        // Spawn a real process (sleep) that we can kill.
-        // We keep the Child handle so we can waitpid on it later —
-        // without waitpid the kernel won't reap the zombie and
-        // kill(pid, 0) will keep returning success.
-        let mut child = Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("Failed to spawn sleep process");
-        let pid = child.id().expect("No PID for spawned process");
-
-        // Create PID directory and write the real PID
-        tokio::fs::create_dir_all(&config.pids_dir).await.unwrap();
-        tokio::fs::create_dir_all(&config.sockets_dir)
-            .await
-            .unwrap();
-        let pid_file = config.pids_dir.join("sleeper.pid");
-        tokio::fs::write(&pid_file, pid.to_string()).await.unwrap();
-
-        // Verify the process is alive
-        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-        assert!(alive, "Spawned sleep process should be alive");
-
-        // Clean stale bookkeeping. A numeric PID alone is deliberately not
-        // sufficient authority to signal a process because the OS may have
-        // reused it.
-        manager.kill_stale_processes().await;
-
-        let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
-        assert!(still_alive, "PID-file cleanup must not kill a process");
-
-        // PID file should be cleaned up
-        assert!(!pid_file.exists(), "PID file should be removed");
-
-        child.start_kill().expect("terminate test process");
-        child.wait().await.expect("reap test process");
     }
 }

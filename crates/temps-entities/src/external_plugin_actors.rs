@@ -15,6 +15,44 @@ pub struct Model {
     pub active: bool,
     /// Administrator consent for marked AI tools; false for existing and new actors.
     pub ai_tools_enabled: bool,
+    /// How the plugin is isolated: `service` when it runs as a Temps service,
+    /// `container` (the default for a new actor installed as an executable)
+    /// or `process`. Actors that existed before the column keep `process`.
+    pub isolation: String,
+    /// The service a `service` plugin runs as. NULL for other plugins, and
+    /// once that service has been deleted.
+    pub project_id: Option<i32>,
+    /// The environment of that service the plugin runs in.
+    pub environment_id: Option<i32>,
+    /// The manifest a `service` plugin last answered with, so it can be
+    /// listed and routed to while its service is stopped.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub manifest: Option<Json>,
+    /// Who stands behind the plugin: `community` (anyone; the least access)
+    /// or `verified` (reviewed, from the signed registry).
+    pub tier: String,
+    /// Identifies the exact build an administrator approved. Temps attaches
+    /// to no other build of the plugin's service. NULL until the plugin is
+    /// first attached to.
+    pub pinned_build: Option<String>,
+    /// The deployment that build came from, for display.
+    pub pinned_deployment_id: Option<i32>,
+    /// A build the service runs that is not the approved one and waits for
+    /// an administrator. NULL when no update is waiting.
+    pub pending_build: Option<String>,
+    pub pending_deployment_id: Option<i32>,
+    /// The manifest the waiting build answered with.
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub pending_manifest: Option<Json>,
+    /// What an approval must quote: the waiting build and its manifest.
+    pub pending_review: Option<String>,
+    pub pending_since: Option<DBDateTime>,
+    /// An administrator switched the plugin off. Temps is cut off from it;
+    /// its grants, pinned build and service are kept.
+    pub disabled: bool,
+    pub disabled_at: Option<DBDateTime>,
+    /// The user who switched it off; NULL once that user is deleted.
+    pub disabled_by: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

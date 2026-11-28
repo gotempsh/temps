@@ -304,7 +304,6 @@ mod tests {
         let features = state.platform_info_service().features();
         assert!(features.stateless);
         assert!(!features.persistent_workspaces);
-        assert!(!features.external_plugins);
         assert!(features.backups_remote);
         assert!(features.log_aggregation);
     }
@@ -364,7 +363,6 @@ mod tests {
         assert_eq!(features.profile, temps_core::PROFILE_CONTROL_PLANE);
         assert!(!features.stateless);
         assert!(features.persistent_workspaces);
-        assert!(features.external_plugins);
         assert!(
             features.backups_remote,
             "BackupPlugin runs in every profile; backups_remote must not be reported as unavailable"

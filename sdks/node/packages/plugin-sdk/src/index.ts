@@ -36,6 +36,17 @@
 // Runtime
 export { runPlugin } from "./runtime.js";
 
+// Running as a Temps service
+export {
+  serviceAuthSecret,
+  serviceEnvironment,
+  PLUGIN_HELLO_PATH,
+  SERVICE_AUTH_CONTEXT,
+  DEFAULT_SERVICE_PORT,
+  DEFAULT_SERVICE_DATA_DIR,
+} from "./service.js";
+export type { ServiceEnvironment } from "./service.js";
+
 // Manifest builder
 export { ManifestBuilder, createManifest } from "./manifest-builder.js";
 

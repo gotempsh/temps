@@ -87,44 +87,66 @@ Run the normal tests/typecheck/build and CI as well. Do not introduce install-ti
 requiring secrets or network access during compilation. Building a repository executes
 its code/dependencies and still requires source review.
 
-## 3. Install and test in Temps
+## 3. Deploy and test in Temps
 
-Choose **Plugins → Install from GitHub**, paste the repository URL, review trust and
-requested permissions, then install. The server needs Git and a working Docker daemon;
-it builds the native executable. A public repository needs no GitHub credential. Private
-repository access must be configured on the **host**, not just the author's workstation.
-Do not embed credentials in the repository URL.
+A plugin runs as an ordinary Temps service; Temps never builds or runs a plugin
+executable itself. Prefer publishing an image and adding the plugin from it in one step:
+
+```sh
+bunx --bun @temps-sdk/cli plugin add --image <registry>/<repository>@sha256:<digest>
+```
+
+It creates the service, deploys the image like `temps deploy:image`, waits for it to be
+live and adds it. A tag works too, but only a digest is exactly what was reviewed. To
+release a new version run the same command with `--project <service>` and the new image:
+it waits for an administrator's approval. The console's **Settings → Plugins → Add
+plugin** takes an image and does the same in one step.
+
+While developing, no registry is needed: `plugin add --build` builds the Dockerfile in
+the current directory and uploads the image, and `plugin add --local-image <image>`
+uploads one the local Docker already has.
+
+Temps records the content each image resolved to and lists it with the image, so a tag
+that was moved shows as the same reference with other content. A running plugin never
+follows a moved tag; deploying it again is an update that waits.
+
+Alternatively deploy the repository like any app (a public repository needs no
+GitHub credential; for a nested plugin set the service's root directory to the plugin
+directory), wait for the deployment to be live, then choose **Settings → Plugins → Add
+plugin** and pick that service and environment. Do not embed credentials in the
+repository URL.
 
 If the configured CLI supports these commands:
 
 ```sh
-bunx --bun @temps-sdk/cli plugin install https://github.com/your-org/route-checker --ref <commit-sha> --grant events_read
-bunx --bun @temps-sdk/cli plugin update route-checker --ref <new-commit-sha>
+bunx --bun @temps-sdk/cli plugin add-service --project <service-id> --environment <environment-id>
+bunx --bun @temps-sdk/cli plugin services
+bunx --bun @temps-sdk/cli plugin grants set route-checker --grant events_read
 ```
 
-To select a nested plugin and track a custom branch or tag:
+The SDK reads what every deployment receives (`PORT`, `TEMPS_API_TOKEN`); the plugin needs
+no configuration to be reachable. It keeps its files in `TEMPS_PLUGIN_DATA_DIR` (`/data`
+by default): mount the service's volume there, or link a database to the service. A
+manifest that asks for the control-plane database or the instance data directory is
+refused.
 
-```sh
-bunx --bun @temps-sdk/cli plugin install https://github.com/your-org/plugins --path plugins/route-checker --ref release/v1 --grant events_read
-bunx --bun @temps-sdk/cli plugin update route-checker --ref v1.1.0
-```
-
-Omitting `--ref` on update keeps the stored ref and directory; an install without a
-ref resolves the repository default branch. Every operation records the resolved
-commit. Updates cannot change directory. Installing the same name from another
-repository or path is rejected; uninstall/reinstall is a new source identity with
-fresh grants. Changing only the ref preserves the actor and grants.
-
-Use actual immutable SHAs, not the literal placeholders. Grant only permissions declared
-and used by the plugin. Omit `--grant` for a plugin that needs none. Inspect `--help` for
-AI quota options when needed. Avoid `--yes` unless source trust has already been authorized.
-A declaration does not self-approve a grant. Installation/update refreshes the plugin;
-restarting the entire Temps server is not normally required. After CLI installation,
-return to the console tab to refresh its plugin list.
+A newly added plugin has no permissions. Grant only permissions declared and used by the
+plugin. A declaration does not self-approve a grant. An update is a new deployment of the
+service. Temps does not follow it: the plugin is pinned to the build an administrator
+approved, the new build waits with what it asks for beyond the approved one, and it runs
+as the plugin only once an administrator approves that deployment. Approving allows no
+new permission, and consent to the plugin's AI tools is asked for again.
+An administrator can disable a plugin in one step (`temps plugin disable <name>`): Temps
+closes its channel and sends it nothing until `temps plugin enable <name>`, while the
+service keeps running with its grants and approved build kept. The container runs with
+the memory and CPU limits of its service (`temps plugin limits <name>`), and each change
+the plugin makes through the API is audited with the plugin and the acting user.
+Removing a plugin revokes its permissions and leaves its service and files in place;
+adding the service again is a new identity with fresh grants.
 
 Verify sidebar entry, real host API behavior, denied/revoked permissions, persisted data,
-intended deployment events and same-source upgrade. Uninstall/reinstall or a different
-source can rotate actor identity and approvals; do not use that as an update shortcut.
+intended deployment events, and a redeploy of the same service followed by approving the
+update that waits.
 
 ## 4. Submit to the discovery catalog
 
@@ -151,6 +173,13 @@ screenshots relative to the plugin directory at a pinned source commit. Catalogs
 with subdirectories require schema version 2; older hosts reject them. Catalog
 installation pins the reviewed commit even when the listing tracks a moving branch. Run the catalog repository's documented validation
 and include install/runtime evidence in the PR.
+
+A generated catalog entry may also carry `image`: the image published for the listed
+version, named by digest (`<registry>/<repository>@sha256:<digest>`, an optional tag
+before the `@`). A host that supports it adds the plugin from that image in one step and
+keeps the link to the source; an image named only by a tag makes the catalog invalid.
+It requires schema version 2. Check the catalog repository's contribution guide for how
+its generator takes the image; do not hand-edit the generated file.
 
 Catalog validation installs dependencies without lifecycle scripts and compiles in a capped
 offline container after dependency resolution. A build-validation pass is not a runtime

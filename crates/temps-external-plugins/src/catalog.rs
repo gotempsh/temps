@@ -101,24 +101,6 @@ impl RegistryConfig {
             test_keyset_fetches: None,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn local_counted(
-        url: String,
-        key_id: &str,
-        key: [u8; 32],
-        fetches: Arc<AtomicUsize>,
-    ) -> Self {
-        let mut config = Self::local(url, key_id, key);
-        config.test_keyset_fetches = Some(fetches);
-        config
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_test_keyset(mut self, keyset: VerifiedKeyset) -> Self {
-        self.test_keyset = Some(keyset);
-        self
-    }
 }
 
 /// The outer envelope signs the decoded bytes in `payload`. Encoding the

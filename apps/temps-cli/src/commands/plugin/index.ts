@@ -8,15 +8,24 @@ import { resolve, join } from "node:path";
 import { promptConfirm } from "../../ui/prompts.js";
 import { TARGETS, validName, PluginPublishError } from "./model.js";
 import { buildPlugin, loadConfig, publishPlugin } from "./workflow.js";
-import { registerPluginInstallCommands } from "./install.js";
 import { registerPluginGrantCommands } from "./grants.js";
+import { registerPluginServiceCommands } from "./services.js";
+import { registerPluginUpdateCommands } from "./updates.js";
+import { registerPluginControlCommands } from "./controls.js";
+import { registerPluginImageCommands } from "./image.js";
 
 export function registerPluginCommands(program: Command) {
   const plugin = program
     .command("plugin")
-    .description("Create and build TypeScript plugins, or install and manage external plugins");
-  registerPluginInstallCommands(plugin);
+    .description(
+      "Add a plugin from its image, approve its updates and manage its permissions; create TypeScript plugins",
+    );
+  // First: deploying an image is the way to add a plugin.
+  registerPluginImageCommands(plugin);
   registerPluginGrantCommands(plugin);
+  registerPluginServiceCommands(plugin);
+  registerPluginUpdateCommands(plugin);
+  registerPluginControlCommands(plugin);
   registerPluginDevCommands(plugin);
   plugin.hook("preAction", async (_command, action) => {
     let current: Command | null = action;

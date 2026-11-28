@@ -446,29 +446,16 @@ fn external_plugins_plugin(
     registry: temps_external_plugins::catalog::RegistryConfig,
     persistent_installations: bool,
 ) -> temps_external_plugins::ExternalPluginsPlugin {
-    let mut external_plugin_config = temps_external_plugins::manager::ExternalPluginConfig::new(
-        config.data_dir.clone(),
-        config.database_url.clone(),
-    )
-    // Where this instance answers HTTP. A plugin's routes are only reachable
-    // through the proxy, so a plugin that has to hand out a URL to something
-    // outside the request (a sandboxed agent, a webhook receiver) cannot
-    // construct one without being told the address the proxy listens on.
-    .with_proxy_address(&config.address)
-    .with_registry(registry);
+    let mut external_plugin_config =
+        temps_external_plugins::manager::ExternalPluginConfig::new(config.data_dir.clone())
+            // Where this instance answers HTTP. A plugin's routes are only
+            // reachable through the proxy, so a plugin that has to hand out a
+            // URL to something outside the request (a sandboxed agent, a
+            // webhook receiver) cannot construct one without being told the
+            // address the proxy listens on.
+            .with_proxy_address(&config.address)
+            .with_registry(registry);
     external_plugin_config.persistent_installations = persistent_installations;
-    // `--plugin-launcher`, bridged into the environment by `serve`.
-    if let Some(launcher) =
-        std::env::var_os("TEMPS_PLUGIN_LAUNCHER").filter(|value| !value.is_empty())
-    {
-        tracing::info!(
-            launcher = %std::path::Path::new(&launcher).display(),
-            "External plugins run as a separate user through the plugin launcher"
-        );
-        external_plugin_config = external_plugin_config.with_launcher(
-            temps_external_plugins::launcher::PluginLauncher::new(launcher),
-        );
-    }
     temps_external_plugins::ExternalPluginsPlugin::new(external_plugin_config)
 }
 

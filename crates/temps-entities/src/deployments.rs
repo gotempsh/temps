@@ -122,6 +122,13 @@ pub struct DeploymentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploaded_image_id: Option<String>,
 
+    /// Docker image ID (sha256:...) a registry image resolved to when this
+    /// deployment pulled it. A tag can be moved to other content later; this
+    /// is the content this deployment's containers were created from. Absent
+    /// when a worker node pulled the image itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pulled_image_id: Option<String>,
+
     /// Explicit deploy-time HTTP health-check path override.
     /// Image/static deploys can't read `.temps.yaml`, so this lets the deploy
     /// request set a custom path (e.g. "/api/healthz"). When present it takes

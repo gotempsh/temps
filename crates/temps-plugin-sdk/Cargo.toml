@@ -48,6 +48,9 @@ utoipa = { workspace = true }
 # Constant-time comparison of the platform's proxy secret.
 subtle = { workspace = true }
 
+# Derives a plugin service's request-assertion secret from its deployment token.
+sha2 = { workspace = true }
+
 # Wire protocol shared with the platform
 temps-plugin-protocol = { path = "../temps-plugin-protocol", version = "=0.1.0-beta.65" }
 

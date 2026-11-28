@@ -27,6 +27,16 @@ pub struct RepositoryCatalogPlugin {
     pub author: String,
     pub category: String,
     pub repository: String,
+    /// The image the author publishes for this version, named by digest
+    /// (`registry.example.com/acme/reports@sha256:...`), so what is deployed
+    /// is the content the listing names. Absent when the plugin is published
+    /// as source only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(
+        nullable = false,
+        example = "registry.example.com/acme/reports@sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    )]
+    pub image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
@@ -108,19 +118,13 @@ pub struct SourceCatalog {
 }
 
 impl SourceCatalog {
-    pub async fn list(
-        &self,
-        platform: &str,
-    ) -> Result<Vec<RepositoryCatalogPlugin>, SourceCatalogError> {
+    pub async fn list(&self) -> Result<Vec<RepositoryCatalogPlugin>, SourceCatalogError> {
         let mut cache = self.cache.lock().await;
         if let Some(cached) = cache
             .as_ref()
             .filter(|entry| entry.expires > Instant::now())
         {
-            return cached
-                .result
-                .clone()
-                .map(|plugins| filter_platform(&plugins, platform));
+            return cached.result.clone();
         }
         #[cfg(test)]
         let source = self.test_source.as_deref().unwrap_or(SOURCE);
@@ -137,7 +141,7 @@ impl SourceCatalog {
             expires,
             result: result.clone(),
         });
-        result.map(|plugins| filter_platform(&plugins, platform))
+        result
     }
 
     async fn fetch(source: &str) -> Result<Vec<RepositoryCatalogPlugin>, SourceCatalogError> {
@@ -187,17 +191,6 @@ impl SourceCatalog {
     }
 }
 
-fn filter_platform(
-    plugins: &[RepositoryCatalogPlugin],
-    platform: &str,
-) -> Vec<RepositoryCatalogPlugin> {
-    plugins
-        .iter()
-        .filter(|plugin| plugin.platforms.iter().any(|entry| entry == platform))
-        .cloned()
-        .collect()
-}
-
 fn valid_https_url(value: &str) -> bool {
     url::Url::parse(value).is_ok_and(|url| {
         url.scheme() == "https"
@@ -226,9 +219,11 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
     let mut names = HashSet::new();
     let mut repositories = HashSet::new();
     for plugin in &document.plugins {
-        let valid = crate::install::validate_plugin_name(&plugin.name).is_ok()
+        let valid = crate::naming::valid_plugin_name(&plugin.name)
             && crate::repository::parse_repository(&plugin.repository).is_ok()
             && (document.schema_version == 2 || plugin.path.is_none())
+            && (document.schema_version == 2 || plugin.image.is_none())
+            && plugin.image.as_deref().is_none_or(valid_pinned_image)
             && matches!(crate::repository::normalize_path(plugin.path.as_deref(), &plugin.repository), Ok(path) if path == plugin.path)
             && plugin
                 .ref_name
@@ -241,7 +236,7 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
             && bounded_text(&plugin.description, 4000)
             && bounded_text(&plugin.author, 160)
             && bounded_text(&plugin.category, 80)
-            && crate::install::validate_version(&plugin.name, &plugin.latest_version).is_ok()
+            && crate::naming::valid_version(&plugin.latest_version)
             && plugin.platforms.len() <= 6
             && plugin.platforms.iter().all(|platform| {
                 matches!(
@@ -290,6 +285,52 @@ fn parse_document(body: &[u8]) -> Result<Vec<RepositoryCatalogPlugin>, SourceCat
     Ok(document.plugins)
 }
 
+/// Whether a listing's image names exact content: a repository, an optional
+/// tag, and a sha256 digest. A listing is unsigned discovery data, so an
+/// image a tag alone names (content that can change under the listing) is
+/// refused, as a repository listing must name a commit.
+fn valid_pinned_image(value: &str) -> bool {
+    let Some((named, digest)) = value.split_once("@sha256:") else {
+        return false;
+    };
+    let digest_names_content = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    // The last part may carry a tag; a colon before it is a registry port.
+    let (repository, tag) = match named.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => (repository, Some(tag)),
+        _ => (named, None),
+    };
+    let part = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 128
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            && part
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    };
+    let mut parts = repository.split('/');
+    // Only the registry, the first part, may name a port.
+    let registry = parts
+        .next()
+        .is_some_and(|first| match first.split_once(':') {
+            Some((host, port)) => {
+                part(host) && !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+            }
+            None => part(first),
+        });
+    value.len() <= 400
+        && digest_names_content
+        && registry
+        && parts.all(part)
+        && !repository.contains("..")
+        && tag.is_none_or(part)
+}
+
 fn bounded_text(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max
 }
@@ -324,8 +365,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({"schema_version":1,"plugins":[entry.clone()]}))
                 .unwrap();
         let plugins = parse_document(&body).unwrap();
-        assert_eq!(filter_platform(&plugins, "darwin-arm64").len(), 0);
-        assert_eq!(filter_platform(&plugins, "linux-amd64-gnu").len(), 1);
+        assert_eq!(plugins.len(), 1);
         let duplicates = serde_json::to_vec(
             &serde_json::json!({"schema_version":1,"plugins":[entry.clone(),entry]}),
         )
@@ -340,6 +380,79 @@ mod tests {
         let unsafe_body = serde_json::to_vec(&unsafe_entry).unwrap();
         assert!(matches!(
             parse_document(&unsafe_body),
+            Err(SourceCatalogError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn a_listing_may_offer_an_image_only_by_digest() {
+        let digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let listed = |version: u32, image: Option<String>| {
+            let mut entry = serde_json::json!({"name":"demo","title":"Demo","summary":"Summary","description":"Description","author":"Team","category":"Development","repository":"https://github.com/example/demo","docsUrl":null,"logoUrl":null,"screenshots":[],"latestVersion":"1.0.0","platforms":["linux-amd64-gnu"],"commit":"a".repeat(40),"readmeUrl":null,"validation":{"metadata":"passed","build":"not_run"}});
+            if let Some(image) = image {
+                entry["image"] = serde_json::json!(image);
+            }
+            parse_document(
+                &serde_json::to_vec(
+                    &serde_json::json!({"schema_version":version,"plugins":[entry]}),
+                )
+                .unwrap(),
+            )
+        };
+
+        // A listing without an image is published as source only.
+        let source_only = listed(2, None).unwrap();
+        assert!(source_only[0].image.is_none());
+        assert!(serde_json::to_value(&source_only[0])
+            .unwrap()
+            .get("image")
+            .is_none());
+
+        for image in [
+            format!("registry.example.com/acme/reports@sha256:{digest}"),
+            format!("registry.example.com:5000/acme/reports:1.2.0@sha256:{digest}"),
+            format!("acme/reports@sha256:{digest}"),
+        ] {
+            let plugins = listed(2, Some(image.clone())).unwrap();
+            assert_eq!(plugins[0].image.as_deref(), Some(image.as_str()));
+            assert_eq!(serde_json::to_value(&plugins[0]).unwrap()["image"], image);
+        }
+
+        for image in [
+            // A tag alone can be moved to other content.
+            "registry.example.com/acme/reports:1.2.0".to_string(),
+            "registry.example.com/acme/reports".to_string(),
+            format!("registry.example.com/acme/reports@sha256:{}", &digest[..63]),
+            format!(
+                "registry.example.com/acme/reports@sha256:{}",
+                digest.to_uppercase()
+            ),
+            format!("registry.example.com/acme/reports@sha512:{digest}"),
+            format!("https://registry.example.com/acme/reports@sha256:{digest}"),
+            format!("user:secret@registry.example.com/acme/reports@sha256:{digest}"),
+            format!("registry.example.com/acme/../reports@sha256:{digest}"),
+            format!("registry.example.com//reports@sha256:{digest}"),
+            format!("-registry.example.com/reports@sha256:{digest}"),
+            format!("registry.example.com/acme/reports --privileged@sha256:{digest}"),
+            format!("registry.example.com/acme/reports:1:2@sha256:{digest}"),
+            format!("@sha256:{digest}"),
+            String::new(),
+        ] {
+            assert!(
+                matches!(
+                    listed(2, Some(image.clone())),
+                    Err(SourceCatalogError::Invalid { .. })
+                ),
+                "{image:?} must be refused"
+            );
+        }
+
+        // The first format never carried an image.
+        assert!(matches!(
+            listed(
+                1,
+                Some(format!("registry.example.com/acme/reports@sha256:{digest}"))
+            ),
             Err(SourceCatalogError::Invalid { .. })
         ));
     }
@@ -444,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_catalog_filters_platform_without_a_network_request() {
+    async fn a_cached_catalog_is_served_without_a_network_request() {
         let catalog = SourceCatalog::default();
         let plugin: RepositoryCatalogPlugin = serde_json::from_value(serde_json::json!({
             "name":"demo", "title":"Demo", "summary":"Summary", "description":"Description",
@@ -458,8 +571,9 @@ mod tests {
             expires: Instant::now() + TTL,
             result: Ok(vec![plugin]),
         });
-        assert_eq!(catalog.list("linux-amd64-gnu").await.unwrap().len(), 1);
-        assert!(catalog.list("darwin-arm64").await.unwrap().is_empty());
+        // No test source is set: a fetch would go to the network and fail.
+        assert_eq!(catalog.list().await.unwrap().len(), 1);
+        assert_eq!(catalog.list().await.unwrap()[0].name, "demo");
     }
 
     #[tokio::test]
@@ -469,12 +583,12 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
         server.await.unwrap();
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
     }
@@ -488,7 +602,7 @@ mod tests {
         ];
         for response in responses {
             let (catalog, server) = mock_catalog(response).await;
-            assert!(catalog.list("linux-amd64-gnu").await.is_err());
+            assert!(catalog.list().await.is_err());
             server.await.unwrap();
         }
     }
@@ -497,10 +611,7 @@ mod tests {
     async fn concurrent_misses_share_one_fetch() {
         let (catalog, server) = mock_catalog(b"HTTP/1.1 200 OK\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"schema_version\":1,\"plugins\":[]}").await;
         let catalog = std::sync::Arc::new(catalog);
-        let (first, second) = tokio::join!(
-            catalog.list("linux-amd64-gnu"),
-            catalog.list("darwin-arm64")
-        );
+        let (first, second) = tokio::join!(catalog.list(), catalog.list());
         assert!(first.is_ok());
         assert!(second.is_ok());
         server.await.unwrap();
@@ -522,11 +633,11 @@ mod tests {
             test_source: Some(format!("http://{address}/catalog.json")),
         };
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
         assert!(matches!(
-            catalog.list("linux-amd64-gnu").await,
+            catalog.list().await,
             Err(SourceCatalogError::Fetch { .. })
         ));
         server.await.unwrap();

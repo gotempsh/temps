@@ -16,18 +16,9 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-use crate::catalog::{CatalogError, RegistryClient, RegistryPlugin, VerifiedRegistry};
 use crate::event_listener::PluginEventListener;
-use crate::install::{
-    normalize_digest, platform_target, validate_plugin_name, validate_release_for_install,
-    validate_version, InstallError, PluginInstaller, RepositoryReceipt,
-};
-use crate::install_progress::{
-    InstallProgressStore, ProgressError, ProgressHandle, ProgressSnapshot, Stage,
-};
 use crate::manager::{ExternalPluginConfig, ExternalPluginManager, PluginReloadResult};
 use crate::proxy;
-use crate::repository::{self, RepositoryError};
 
 /// Service that manages the external plugin lifecycle and provides data
 /// to the handler layer.
@@ -44,171 +35,63 @@ pub struct ExternalPluginsService {
     /// Swappable proxy router — rebuilt on reload so new/removed plugins
     /// are reflected without restarting the server.
     proxy_router: Arc<RwLock<Router>>,
-    /// Serializes discovery, reload, and install/promotion lifecycles.
+    /// Serializes discovery, reload, adding and removing plugins.
     pub(crate) lifecycle: Arc<tokio::sync::Mutex<()>>,
     pub(crate) ai_recovery: crate::ai_tools::ConsentRecovery,
-    /// Serializes every read/compare/write mutation of the persisted registry
-    /// trust state. Catalogue requests can overlap on the network, but they
-    /// must be committed in a single monotonic order with installations.
-    registry_state: tokio::sync::Mutex<()>,
     source_catalog: crate::source_catalog::SourceCatalog,
-    install_progress: Arc<InstallProgressStore>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
     pub(crate) watch_host: std::sync::OnceLock<crate::watches::WatchHost>,
     pub(crate) closing: Arc<AtomicBool>,
-    /// Compiles plugins on a worker node when this process has no Docker.
-    remote_builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
 }
 
 #[derive(Debug, Error)]
 pub enum ExternalPluginsError {
-    #[error("External plugins require durable local binary and plugin-data storage and cannot be installed on a stateless control plane. Use a full-profile instance for external plugins.")]
-    PersistentStorageRequired,
-    #[error(transparent)]
-    Catalog(#[from] CatalogError),
-    #[error(transparent)]
-    Install(#[from] InstallError),
-    #[error(transparent)]
-    Repository(#[from] RepositoryError),
     #[error(transparent)]
     Grant(#[from] crate::grants::GrantError),
-    #[error("Plugin '{name}' is not present in the authenticated registry document")]
-    NotInRegistry { name: String },
-    #[error("Authenticated registry document contains duplicate entries for plugin '{name}'")]
-    DuplicateRegistryEntry { name: String },
-    #[error("Plugin '{name}' v{version} failed protocol identity/ready verification; previous active version was preserved: {reason}")]
-    CandidateRejected {
-        name: String,
-        version: String,
-        reason: String,
-    },
+    #[error("'{name}' is not a plugin name: a plugin name is lowercase letters, digits and inner hyphens, at most 64 characters")]
+    InvalidPluginName { name: String },
     #[error("External plugin service is shutting down and cannot accept lifecycle changes")]
     ShuttingDown,
-    #[error("Plugin '{name}' has no active installation to uninstall")]
+    #[error("Plugin '{name}' is not installed")]
     NotInstalled { name: String },
-}
-
-#[derive(Debug, Clone)]
-pub struct InstallOutcome {
-    pub name: String,
-    pub version: String,
-    pub platform: String,
-    pub sha256: String,
-    pub signer_key_id: String,
-    pub registry_source: String,
-    pub actor_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReleaseIdentity {
-    pub name: String,
-    pub version: String,
-    pub platform: String,
-    pub sha256: String,
-    pub signer_key_id: String,
-    pub registry_source: String,
-}
-
-pub struct SelectedPlugin {
-    registry: VerifiedRegistry,
-    plugin: RegistryPlugin,
-    pub identity: ReleaseIdentity,
-}
-
-pub struct SelectedRepository {
-    source: repository::RepositorySource,
-    _temporary: tempfile::TempDir,
-    pub name: String,
-}
-
-impl SelectedRepository {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    pub fn repository(&self) -> &str {
-        &self.source.repository
-    }
-    pub fn path(&self) -> Option<&str> {
-        self.source.path.as_deref()
-    }
-    pub fn source_commit(&self) -> &str {
-        &self.source.commit
-    }
-    pub fn version(&self) -> &str {
-        &self.source.version
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RepositoryInstallOutcome {
-    pub name: String,
-    pub version: String,
-    pub platform: String,
-    pub sha256: String,
-    pub source_commit: String,
-    pub actor_id: String,
-}
-
-pub struct RepositoryInstallPreparation {
-    pub progress: Option<ProgressHandle>,
-    pub requested_source: Option<String>,
-}
-
-#[derive(Debug, Error)]
-pub enum RepositoryInstallPreparationError {
-    #[error("Install progress ID must be a UUID")]
-    InvalidProgressId,
+    /// The record of a plugin an earlier version installed as an executable
+    /// could not be removed, so the plugin is still listed.
+    #[error("The installation record of plugin '{name}' at {path} could not be removed: {reason}")]
+    RetiredRecord {
+        name: String,
+        path: String,
+        reason: String,
+    },
+    /// Attaching to the service a plugin runs as failed.
     #[error(transparent)]
-    Repository(#[from] RepositoryError),
+    Service(#[from] crate::service_runtime::ServiceAttachError),
+    #[error("Could not read the services plugins run as: {source}")]
+    ServiceLookup { source: sea_orm::DbErr },
+    #[error(
+        "No update of plugin '{name}' waits for approval: it runs the build that was approved"
+    )]
+    NoUpdateWaiting { name: String },
+    /// What waits is not what the administrator reviewed.
+    #[error("The update of plugin '{name}' that waits is now deployment {deployment_id}, which is not the one that was reviewed. Review it again before approving")]
+    UpdateChanged { name: String, deployment_id: i32 },
+    /// The approved build of a plugin could not be read or recorded.
     #[error(transparent)]
-    Progress(#[from] ProgressError),
+    Update(#[from] crate::updates::UpdateError),
+    /// The plugin is cut off for now, but the switch was not saved.
+    #[error("Plugin '{name}' is disconnected, but that could not be saved, so it connects again when Temps restarts: {source}")]
+    DisableNotRecorded {
+        name: String,
+        source: crate::grants::GrantError,
+    },
+    #[error("Plugin '{name}' could not be enabled, so it stays disabled: {source}")]
+    EnableNotRecorded {
+        name: String,
+        source: crate::grants::GrantError,
+    },
 }
 
 impl ExternalPluginsService {
-    pub async fn prepare_repository_install(
-        &self,
-        repository_url: &str,
-        path: Option<&str>,
-        progress_id: Option<&str>,
-    ) -> Result<RepositoryInstallPreparation, RepositoryInstallPreparationError> {
-        let id = progress_id
-            .map(|raw| {
-                uuid::Uuid::parse_str(raw)
-                    .map(|id| id.to_string())
-                    .map_err(|_| RepositoryInstallPreparationError::InvalidProgressId)
-            })
-            .transpose()?;
-        let source = (|| {
-            let (owner, repo) = repository::parse_repository(repository_url)?;
-            let canonical = format!("https://github.com/{owner}/{repo}");
-            let path = repository::normalize_path(path, &canonical)?;
-            Ok::<_, RepositoryError>(crate::manager::repository_actor_source(
-                &canonical,
-                path.as_deref(),
-            ))
-        })();
-        // Calls without a progress ID keep the existing sync install behavior:
-        // selection reports source errors after the requested audit is recorded.
-        let requested_source = if id.is_some() {
-            Some(source?)
-        } else {
-            source.ok()
-        };
-        let progress = match id {
-            Some(id) => Some(self.install_progress.register(id).await?),
-            None => None,
-        };
-        Ok(RepositoryInstallPreparation {
-            progress,
-            requested_source,
-        })
-    }
-
-    pub async fn repository_install_progress(&self, id: &str) -> Option<ProgressSnapshot> {
-        self.install_progress.snapshot(id).await
-    }
-
     pub async fn plugin_grants(
         &self,
         name: &str,
@@ -238,365 +121,26 @@ impl ExternalPluginsService {
             .update_for_actor(name, actor_id, config)
             .await
     }
-    pub async fn installation_reporting_consent(
-        &self,
-    ) -> Result<bool, crate::reporting::ReportingError> {
-        crate::reporting::consent(&self.db).await
-    }
 
-    pub async fn set_installation_reporting_consent(
-        &self,
-        enabled: bool,
-    ) -> Result<(), crate::reporting::ReportingError> {
-        crate::reporting::set_consent(&self.db, enabled).await
-    }
-
-    async fn ensure_repository_identity(
+    /// What the plugin's container may connect to: the outbound profile of
+    /// the environment it runs in. `None` when the plugin names no service,
+    /// or when the environment keeps the default, which is open.
+    pub async fn plugin_outbound_profile(
         &self,
         name: &str,
-        repository_url: &str,
-        path: Option<&str>,
-    ) -> Result<(), ExternalPluginsError> {
-        let (owner, repo) = repository::parse_repository(repository_url)?;
-        let canonical = format!("https://github.com/{owner}/{repo}");
-        let plugins_dir = &self.manager.config().plugins_dir;
-        let existing = crate::install::repository_source(plugins_dir, name).await?;
-        let active_exists = tokio::fs::symlink_metadata(plugins_dir.join(name).join("active.json"))
-            .await
-            .is_ok();
-        if active_exists
-            && existing.as_ref().is_none_or(|source| {
-                source.repository != canonical || source.path.as_deref() != path
-            })
-        {
-            return Err(repository::RepositoryError::SourceConflict {
-                name: name.to_string(),
-                repository: format!("{canonical} (path '{}')", path.unwrap_or("/")),
-            }
-            .into());
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn active_source(
-        &self,
-        name: &str,
-    ) -> Result<Option<crate::install::ActiveSource>, ExternalPluginsError> {
-        Ok(crate::install::active_source(&self.manager.config().plugins_dir, name).await?)
-    }
-
-    pub(crate) async fn repository_source(
-        &self,
-        name: &str,
-    ) -> Result<Option<RepositoryReceipt>, ExternalPluginsError> {
-        Ok(crate::install::repository_source(&self.manager.config().plugins_dir, name).await?)
-    }
-
-    /// Resolve the source commit before the required execution audit.
-    pub async fn select_repository(
-        &self,
-        requested_name: Option<&str>,
-        repository_url: &str,
-        reference: Option<&str>,
-        path: Option<&str>,
-    ) -> Result<SelectedRepository, ExternalPluginsError> {
-        self.select_repository_with_progress(requested_name, repository_url, reference, path, None)
-            .await
-    }
-
-    pub async fn select_repository_with_progress(
-        &self,
-        requested_name: Option<&str>,
-        repository_url: &str,
-        reference: Option<&str>,
-        path: Option<&str>,
-        progress: Option<&ProgressHandle>,
-    ) -> Result<SelectedRepository, ExternalPluginsError> {
-        if let Some(name) = requested_name {
-            validate_plugin_name(name)?;
-        }
-        if self.closing.load(Ordering::Acquire) {
-            return Err(ExternalPluginsError::ShuttingDown);
-        }
-        if repository::bun_target().is_none() {
-            return Err(InstallError::UnsupportedPlatform {
-                os: std::env::consts::OS.to_string(),
-                arch: std::env::consts::ARCH.to_string(),
-                target_env: "Bun repository builds support Linux and macOS x64/arm64".to_string(),
-            }
-            .into());
-        }
-        let staging = self.manager.config().plugins_dir.join(".staging");
-        crate::install::ensure_directory("repository", &staging).await?;
-        let temporary = tempfile::Builder::new()
-            .prefix("repository-")
-            .tempdir_in(&staging)
-            .map_err(|error| InstallError::Io {
-                plugin: requested_name.unwrap_or("repository").to_string(),
-                path: staging.display().to_string(),
-                reason: error.to_string(),
-            })?;
-        if let Some(progress) = progress {
-            progress.advance(Stage::FetchingSource).await;
-        }
-        let source = repository::fetch_source_with_progress(
-            repository_url,
-            reference,
-            path,
-            temporary.path().join("source"),
-            requested_name,
-            progress,
-        )
-        .await?;
-        validate_plugin_name(&source.name)?;
-        self.ensure_repository_identity(&source.name, repository_url, source.path.as_deref())
-            .await?;
-        if let Some(progress) = progress {
-            progress.complete_current().await;
-        }
-        Ok(SelectedRepository {
-            name: source.name.clone(),
-            source,
-            _temporary: temporary,
-        })
-    }
-
-    pub async fn install_repository(
-        &self,
-        selected: SelectedRepository,
-    ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
-        self.install_repository_with_progress(selected, None).await
-    }
-
-    pub async fn install_repository_with_progress(
-        &self,
-        selected: SelectedRepository,
-        progress: Option<&ProgressHandle>,
-    ) -> Result<RepositoryInstallOutcome, ExternalPluginsError> {
-        if !self.manager.config().persistent_installations {
-            return Err(ExternalPluginsError::PersistentStorageRequired);
-        }
-
-        if let Some(progress) = progress {
-            progress.advance(Stage::WaitingForLifecycle).await;
-        }
-        let _lifecycle = self.lifecycle.lock().await;
-        if let Some(progress) = progress {
-            progress.complete_current().await;
-        }
-        if self.closing.load(Ordering::Acquire) {
-            return Err(ExternalPluginsError::ShuttingDown);
-        }
-        self.ensure_repository_identity(
-            &selected.name,
-            &selected.source.repository,
-            selected.source.path.as_deref(),
-        )
-        .await?;
-        let output = selected._temporary.path().join("plugin");
-        repository::build_with_progress(
-            &selected.source,
-            &output,
-            progress,
-            self.remote_builder.as_deref(),
-        )
-        .await?;
-        if let Some(progress) = progress {
-            progress.complete_current().await;
-        }
-        let sha256 = crate::install::hash_regular_file_capped(
-            &selected.name,
-            &output,
-            crate::install::MAX_BINARY_BYTES,
-        )
-        .await?;
-        let platform = platform_target()?;
-        let receipt = RepositoryReceipt {
-            source: "github".to_string(),
-            repository: selected.source.repository.clone(),
-            ref_name: selected.source.ref_name.clone(),
-            path: selected.source.path.clone(),
-            commit: selected.source.commit.clone(),
-            builder: repository::BUILDER_IMAGE.to_string(),
-            plugin_name: selected.name.clone(),
-            version: selected.source.version.clone(),
-            platform: platform.clone(),
-            sha256: sha256.clone(),
+    ) -> Result<Option<String>, ExternalPluginsError> {
+        use sea_orm::EntityTrait;
+        let Some(binding) = self.manager.service_binding_of(name).await else {
+            return Ok(None);
         };
-        let candidate = PluginInstaller::prepare_repository(
-            &self.manager.config().plugins_dir,
-            receipt,
-            &output,
-        )
-        .await?;
-        let actor_id = self
-            .promote_operator_candidate(
-                &candidate,
-                crate::manager::repository_actor_source(
-                    &selected.source.repository,
-                    selected.source.path.as_deref(),
-                ),
-                progress,
-            )
-            .await?;
-        Ok(RepositoryInstallOutcome {
-            name: candidate.name,
-            version: candidate.version,
-            platform,
-            sha256,
-            source_commit: selected.source.commit,
-            actor_id,
-        })
-    }
-    pub(crate) async fn install_file(
-        &self,
-        receipt: &crate::install::LocalFileReceipt,
-        path: &std::path::Path,
-    ) -> Result<(), ExternalPluginsError> {
-        if !self.manager.config().persistent_installations {
-            return Err(ExternalPluginsError::PersistentStorageRequired);
-        }
-        let _lifecycle = self.lifecycle.lock().await;
-        if self.closing.load(Ordering::Acquire) {
-            return Err(ExternalPluginsError::ShuttingDown);
-        }
-        validate_plugin_name(&receipt.plugin_name)?;
-        let dir = &self.manager.config().plugins_dir;
-        let source = crate::install::active_source(dir, &receipt.plugin_name).await?;
-        if !matches!(source, None | Some(crate::install::ActiveSource::File(_))) {
-            return Err(repository::RepositoryError::SourceConflict {
-                name: receipt.plugin_name.clone(),
-                repository: "local file".into(),
-            }
-            .into());
-        }
-        let candidate = PluginInstaller::prepare_file(dir, receipt, path).await?;
-        self.promote_operator_candidate(&candidate, receipt.actor_source(), None)
-            .await?;
-        Ok(())
-    }
-
-    async fn promote_operator_candidate(
-        &self,
-        candidate: &crate::install::InstallCandidate,
-        source_identity: String,
-        progress: Option<&ProgressHandle>,
-    ) -> Result<String, ExternalPluginsError> {
-        if let Some(progress) = progress {
-            progress.advance(Stage::StartingPlugin).await;
-        }
-        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-        let pending = match self
-            .manager
-            .prepare_candidate(
-                &candidate.name,
-                &candidate.version,
-                &candidate.sha256,
-                &candidate.binary_path,
-                source_identity,
-            )
-            .await
-        {
-            Ok(pending) => pending,
-            Err(reason) => {
-                tracing::warn!(
-                    plugin = %candidate.name,
-                    version = %candidate.version,
-                    reason = %reason,
-                    "Plugin candidate failed startup verification"
-                );
-                if let Err(error) = installer.discard(candidate).await {
-                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected plugin candidate");
-                }
-                return Err(ExternalPluginsError::CandidateRejected {
-                    name: candidate.name.clone(),
-                    version: candidate.version.clone(),
-                    reason,
-                });
-            }
-        };
-        let (candidate_actor_id, candidate_source_identity) =
-            match ExternalPluginManager::candidate_actor_binding(&pending) {
-                Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
-                Err(reason) => {
-                    self.manager.discard_candidate(pending).await;
-                    let _ = installer.discard(candidate).await;
-                    return Err(ExternalPluginsError::CandidateRejected {
-                        name: candidate.name.clone(),
-                        version: candidate.version.clone(),
-                        reason,
-                    });
-                }
-            };
-        if let Some(progress) = progress {
-            progress.advance(Stage::PromotingPlugin).await;
-        }
-        let activation_rollback = match installer.capture_activation(candidate).await {
-            Ok(rollback) => rollback,
-            Err(error) => {
-                self.manager.discard_candidate(pending).await;
-                let _ = installer.discard(candidate).await;
-                return Err(error.into());
-            }
-        };
-        if let Err(error) = installer.activate(candidate).await {
-            self.manager.discard_candidate(pending).await;
-            let _ = installer.discard(candidate).await;
-            return Err(error.into());
-        }
-        if let Err(error) = self
-            .commit_candidate_actor(
-                &installer,
-                candidate,
-                &candidate_actor_id,
-                &candidate_source_identity,
-                activation_rollback,
-            )
-            .await
-        {
-            self.manager.discard_candidate(pending).await;
-            return Err(error.into());
-        }
-        self.ai_tools
-            .publish(temps_ai_api_tools::PluginToolsIndex::default());
-        self.manager.promote_candidate(pending).await;
-        self.refresh_runtime_surfaces().await;
-        Ok(candidate_actor_id)
-    }
-
-    async fn commit_candidate_actor(
-        &self,
-        installer: &PluginInstaller,
-        candidate: &crate::install::InstallCandidate,
-        actor_id: &str,
-        source_identity: &str,
-        rollback: crate::install::ActivationRollback,
-    ) -> Result<(), crate::grants::GrantError> {
-        let grants = crate::grants::PluginGrantService::new(self.db.clone());
-        let result = grants
-            .commit_actor(
-                &candidate.name,
-                actor_id,
-                &candidate.sha256,
-                source_identity,
-            )
-            .await;
-        match &result {
-            Ok(()) => {}
-            Err(crate::grants::GrantError::ActivationUnconfirmed { .. }) => {
-                // Keep the verified receipt and release for reconciliation on reload.
-                self.ai_tools
-                    .publish(self.ai_tools.snapshot().without_plugin(&candidate.name));
-            }
-            Err(_) => {
-                // Preparation is provisional. A rolled-back transaction leaves the
-                // previous actor and its grants intact, including on first install.
-                if let Err(error) = installer.rollback_candidate(candidate, rollback).await {
-                    tracing::error!(plugin = %candidate.name, %error, "Failed to restore the previous plugin activation");
-                }
-            }
-        }
-        result
+        let profile = temps_entities::network_policy_profiles::Entity::find_by_id((
+            "deployment".to_string(),
+            i64::from(binding.environment_id),
+        ))
+        .one(self.db.as_ref())
+        .await
+        .map_err(|source| ExternalPluginsError::ServiceLookup { source })?;
+        Ok(profile.and_then(|profile| profile.egress))
     }
 
     /// Install the bridge plugins use to call the platform's own HTTP API.
@@ -627,7 +171,7 @@ impl ExternalPluginsService {
         queue: Option<Arc<dyn JobQueue>>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
-        let manager = Arc::new(ExternalPluginManager::new(config, db.clone()));
+        let manager = ExternalPluginManager::new(config, db.clone()).shared();
         Self {
             manager,
             db,
@@ -637,29 +181,18 @@ impl ExternalPluginsService {
             proxy_router: Arc::new(RwLock::new(Self::empty_proxy_router())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             ai_recovery: crate::ai_tools::ConsentRecovery::default(),
-            registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
-            install_progress: Arc::new(InstallProgressStore::default()),
             watch_host: Default::default(),
             closing: Arc::new(AtomicBool::new(false)),
-            remote_builder: None,
             ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
         }
-    }
-
-    /// Let installs compile on a worker node when this process has no Docker.
-    pub fn with_remote_builder(
-        mut self,
-        builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
-    ) -> Self {
-        self.remote_builder = builder;
-        self
     }
 
     /// Spawn a background task that runs initial plugin discovery + start,
     /// then swaps the resulting proxy router in. Safe to call once on a
     /// freshly-constructed shell from [`new_empty`](Self::new_empty).
     pub fn start_background_discovery(self: Arc<Self>) {
+        self.follow_service_plugins();
         tokio::spawn(async move {
             let _lifecycle = self.lifecycle.lock().await;
             if self.closing.load(Ordering::Acquire) {
@@ -710,7 +243,7 @@ impl ExternalPluginsService {
         queue: Option<Arc<dyn JobQueue>>,
         db: Arc<sea_orm::DatabaseConnection>,
     ) -> Self {
-        let manager = Arc::new(ExternalPluginManager::new(config, db.clone()));
+        let manager = ExternalPluginManager::new(config, db.clone()).shared();
         let manifests = manager.discover_and_start().await;
 
         if !manifests.is_empty() {
@@ -742,12 +275,9 @@ impl ExternalPluginsService {
             proxy_router: Arc::new(RwLock::new(proxy_router)),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             ai_recovery: crate::ai_tools::ConsentRecovery::default(),
-            registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
-            install_progress: Arc::new(InstallProgressStore::default()),
             watch_host: Default::default(),
             closing: Arc::new(AtomicBool::new(false)),
-            remote_builder: None,
             ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
         };
         service.rebuild_ai_tools().await;
@@ -761,12 +291,11 @@ impl ExternalPluginsService {
 
     pub async fn repository_catalog(
         &self,
-        platform: &str,
     ) -> Result<
         Vec<crate::source_catalog::RepositoryCatalogPlugin>,
         crate::source_catalog::SourceCatalogError,
     > {
-        self.source_catalog.list(platform).await
+        self.source_catalog.list().await
     }
 
     /// Get the swappable proxy router reference.
@@ -794,10 +323,6 @@ impl ExternalPluginsService {
     ///
     /// Returns every successful manifest and every verification/start failure.
     pub async fn reload_plugins(&self) -> Result<PluginReloadResult, ExternalPluginsError> {
-        if !self.manager.config().persistent_installations {
-            return Err(ExternalPluginsError::PersistentStorageRequired);
-        }
-
         let _lifecycle = self.lifecycle.lock().await;
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
@@ -812,7 +337,7 @@ impl ExternalPluginsService {
 
         self.ai_tools
             .publish(temps_ai_api_tools::PluginToolsIndex::default());
-        // Reload all plugins via manager (shutdown + re-discover + re-start)
+        // Detach from every plugin and attach again
         let result = self.manager.reload_all().await;
         let new_manifests = &result.manifests;
 
@@ -851,295 +376,57 @@ impl ExternalPluginsService {
         Ok(result)
     }
 
-    /// Fetch and authenticate the remote catalogue, then show only plugins
-    /// with a release for this exact server target.
-    pub async fn catalog(&self) -> Result<VerifiedRegistry, ExternalPluginsError> {
-        let mut registry = self.authenticated_catalog().await?;
-        let platform = platform_target()?;
-        retain_platform_plugins(&mut registry, &platform);
-        Ok(registry)
-    }
-
-    /// Keep the complete signed document for installation and trust checks.
-    async fn authenticated_catalog(&self) -> Result<VerifiedRegistry, ExternalPluginsError> {
-        let registry_config = self.manager.config().registry.clone();
-        let client = RegistryClient::new(registry_config.clone())?;
-        let keyset = client.fetch_keyset().await?;
-        self.accept_catalog_keyset(registry_config.clone(), &keyset)
-            .await?;
-        let registry = client.fetch_with_keyset(keyset).await?;
-        // Catalogue access is the explicit network refresh boundary. Record
-        // both the keyset generation and catalogue revision on first view and
-        // every later view so discovery and reload remain fully local without
-        // sacrificing rollback protection.
-        self.accept_catalog_state(registry_config, &registry)
-            .await?;
-        Ok(registry)
-    }
-
-    /// Resolve the exact signed release identity without downloading or
-    /// executing it. Handlers use this boundary to durably audit which bytes
-    /// are about to run before candidate execution starts.
-    pub async fn select_plugin(&self, name: &str) -> Result<SelectedPlugin, ExternalPluginsError> {
-        validate_plugin_name(name)?;
-        if self.closing.load(Ordering::Acquire) {
-            return Err(ExternalPluginsError::ShuttingDown);
-        }
-        let registry = self.authenticated_catalog().await?;
-        self.select_from_registry(name, registry)
-    }
-
-    fn select_from_registry(
-        &self,
-        name: &str,
-        registry: VerifiedRegistry,
-    ) -> Result<SelectedPlugin, ExternalPluginsError> {
-        let mut matches = registry
-            .document
-            .plugins
-            .iter()
-            .filter(|plugin| plugin.name == name);
-        let plugin = matches
-            .next()
-            .ok_or_else(|| ExternalPluginsError::NotInRegistry {
-                name: name.to_string(),
-            })?;
-        if matches.next().is_some() {
-            return Err(ExternalPluginsError::DuplicateRegistryEntry {
-                name: name.to_string(),
-            });
-        }
-        let plugin = plugin.clone();
-        validate_version(&plugin.name, &plugin.version)?;
-        let platform = platform_target()?;
-        let release = plugin
-            .platforms
-            .get(&platform)
-            .ok_or_else(|| InstallError::NoRelease {
-                plugin: plugin.name.clone(),
-                version: plugin.version.clone(),
-                platform: platform.clone(),
-            })?;
-        let sha256 = normalize_digest(&plugin.name, &plugin.version, &release.sha256)?;
-        validate_release_for_install(&plugin, release, &self.manager.config().registry)?;
-        let identity = ReleaseIdentity {
-            name: plugin.name.clone(),
-            version: plugin.version.clone(),
-            platform,
-            sha256,
-            signer_key_id: registry.envelope.key_id.clone(),
-            registry_source: self.manager.config().registry.url.clone(),
-        };
-        Ok(SelectedPlugin {
-            registry,
-            plugin,
-            identity,
-        })
-    }
-
-    /// Install and activate one preselected signed release without disrupting
-    /// its healthy process until the candidate completes its handshake.
-    pub async fn install_selected(
-        &self,
-        selected: SelectedPlugin,
-    ) -> Result<InstallOutcome, ExternalPluginsError> {
-        if !self.manager.config().persistent_installations {
-            return Err(ExternalPluginsError::PersistentStorageRequired);
-        }
-
-        let _lifecycle = self.lifecycle.lock().await;
-        if self.closing.load(Ordering::Acquire) {
-            return Err(ExternalPluginsError::ShuttingDown);
-        }
-
-        // Source identity is bidirectional: signed registry installs must not
-        // silently replace an administrator-selected repository release.
-        if !matches!(
-            crate::install::active_source(
-                &self.manager.config().plugins_dir,
-                &selected.identity.name
-            )
-            .await?,
-            None | Some(crate::install::ActiveSource::Registry)
-        ) {
-            return Err(repository::RepositoryError::SourceConflict {
-                name: selected.identity.name.clone(),
-                repository: "signed registry".to_string(),
-            }
-            .into());
-        }
-
-        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-        {
-            let _registry_state = self.registry_state.lock().await;
-            installer
-                .accept_registry_revision(&self.manager.config().plugins_dir, &selected.registry)
-                .await?;
-        }
-        let candidate = installer
-            .prepare(
-                &self.manager.config().plugins_dir,
-                &selected.registry,
-                &selected.plugin,
-            )
-            .await?;
-        let pending = match self
-            .manager
-            .prepare_candidate(
-                &candidate.name,
-                &candidate.version,
-                &candidate.sha256,
-                &candidate.binary_path,
-                crate::manager::registry_actor_source(&self.manager.config().registry.url),
-            )
-            .await
-        {
-            Ok(pending) => pending,
-            Err(reason) => {
-                if let Err(cleanup_error) = installer.discard(&candidate).await {
-                    tracing::warn!(
-                        plugin = %candidate.name,
-                        error = %cleanup_error,
-                        "Failed to remove rejected plugin candidate"
-                    );
-                }
-                return Err(ExternalPluginsError::CandidateRejected {
-                    name: candidate.name.clone(),
-                    version: candidate.version.clone(),
-                    reason,
-                });
-            }
-        };
-
-        let (candidate_actor_id, candidate_source_identity) =
-            match ExternalPluginManager::candidate_actor_binding(&pending) {
-                Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
-                Err(reason) => {
-                    self.manager.discard_candidate(pending).await;
-                    return Err(ExternalPluginsError::CandidateRejected {
-                        name: candidate.name.clone(),
-                        version: candidate.version.clone(),
-                        reason,
-                    });
-                }
-            };
-        let activation_rollback = match installer.capture_activation(&candidate).await {
-            Ok(rollback) => rollback,
-            Err(error) => {
-                self.manager.discard_candidate(pending).await;
-                return Err(error.into());
-            }
-        };
-        if let Err(error) = installer.activate(&candidate).await {
-            self.manager.discard_candidate(pending).await;
-            if let Err(cleanup_error) = installer.discard(&candidate).await {
-                tracing::warn!(
-                    plugin = %candidate.name,
-                    error = %cleanup_error,
-                    "Failed to remove uncommitted plugin candidate"
-                );
-            }
-            return Err(error.into());
-        }
-        if let Err(error) = self
-            .commit_candidate_actor(
-                &installer,
-                &candidate,
-                &candidate_actor_id,
-                &candidate_source_identity,
-                activation_rollback,
-            )
-            .await
-        {
-            self.manager.discard_candidate(pending).await;
-            return Err(error.into());
-        }
-        self.ai_tools
-            .publish(temps_ai_api_tools::PluginToolsIndex::default());
-        self.manager.promote_candidate(pending).await;
-        self.refresh_runtime_surfaces().await;
-        let actor_id = candidate_actor_id;
-
-        if let Err(error) = crate::reporting::report_if_enabled(
-            &self.db,
-            &self.manager.config().plugins_dir,
-            &self.manager.config().registry.url,
-            &candidate.name,
-        )
-        .await
-        {
-            tracing::warn!(plugin = %candidate.name, error = %error, "Optional installation report failed");
-        }
-
-        Ok(InstallOutcome {
-            name: candidate.name,
-            version: candidate.version,
-            platform: candidate.platform,
-            sha256: candidate.sha256,
-            signer_key_id: selected.identity.signer_key_id,
-            registry_source: selected.identity.registry_source,
-            actor_id,
-        })
-    }
-
-    /// Deactivate only the named plugin, preserving all releases and data.
+    /// Remove a plugin.
+    ///
+    /// A plugin that runs as a service is detached and its actor revoked; the
+    /// service keeps running. A plugin an earlier version installed as an
+    /// executable is taken off the list and its actor revoked; its releases
+    /// and the files it stored are kept.
     pub async fn uninstall_plugin(&self, name: &str) -> Result<(), ExternalPluginsError> {
-        validate_plugin_name(name)?;
+        if !crate::naming::valid_plugin_name(name) {
+            return Err(ExternalPluginsError::InvalidPluginName { name: name.into() });
+        }
         let _lifecycle = self.lifecycle.lock().await;
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        let active_path = self
-            .manager
-            .config()
-            .plugins_dir
-            .join(name)
-            .join("active.json");
-        match tokio::fs::symlink_metadata(&active_path).await {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ExternalPluginsError::NotInstalled { name: name.into() });
-            }
-            Err(error) => {
-                return Err(ExternalPluginsError::Install(InstallError::Io {
-                    plugin: name.into(),
-                    path: active_path.display().to_string(),
-                    reason: error.to_string(),
-                }))
-            }
+        if self.manager.is_service_plugin(name).await {
+            return self.remove_service_plugin(name).await;
+        }
+        let plugins_dir = &self.manager.config().plugins_dir;
+        let record = |error: std::io::Error| ExternalPluginsError::RetiredRecord {
+            name: name.into(),
+            path: plugins_dir.join(name).display().to_string(),
+            reason: error.to_string(),
+        };
+        if !crate::retired::is_installed(plugins_dir, name)
+            .await
+            .map_err(record)?
+        {
+            return Err(ExternalPluginsError::NotInstalled { name: name.into() });
         }
         // Invalidate before the cancellable write: a lost acknowledgement can
         // mean revocation committed. Recovery reloads authoritative consent.
         self.ai_tools
             .publish(self.ai_tools.snapshot().without_plugin(name));
         self.schedule_consent_recovery();
-        // Persist revocation before removing the installation. A database failure
-        // leaves the installation intact so reinstall cannot inherit stale consent.
+        // Revoke before removing the record. A database failure leaves the
+        // plugin listed, so a plugin added later under this name cannot
+        // inherit what this one was granted.
         crate::grants::PluginGrantService::new(self.db.clone())
             .revoke_actor(name)
+            .await?;
+        crate::retired::remove(plugins_dir, name)
             .await
-            .map_err(|error| {
-                ExternalPluginsError::Install(InstallError::Io {
-                    plugin: name.to_string(),
-                    path: "external_plugin_actors".to_string(),
-                    reason: error.to_string(),
-                })
-            })?;
-
-        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
-            return Err(ExternalPluginsError::NotInstalled {
-                name: name.to_string(),
-            });
-        }
-        self.manager.shutdown_plugin(name).await;
-
-        self.refresh_runtime_surfaces().await;
+            .map_err(record)?;
+        self.manager.forget_retired(name).await;
         Ok(())
     }
 
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         self.closing.store(true, Ordering::Release);
+        self.manager.stop_supervising_services();
         self.manager.watch_ready.notify_one();
         self.ai_recovery.cancel();
         self.ai_tools
@@ -1165,49 +452,6 @@ impl ExternalPluginsService {
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
-
-    async fn accept_catalog_state(
-        &self,
-        registry_config: crate::catalog::RegistryConfig,
-        registry: &VerifiedRegistry,
-    ) -> Result<(), ExternalPluginsError> {
-        // Match installation's lock order. This prevents a newly learned
-        // revocation from committing halfway through launch of a binary that
-        // was selected under the preceding keyset.
-        let _lifecycle = self.lifecycle.lock().await;
-        if self.closing.load(Ordering::Acquire) {
-            return Err(ExternalPluginsError::ShuttingDown);
-        }
-        self.accept_registry_state(registry_config, registry).await
-    }
-
-    async fn accept_catalog_keyset(
-        &self,
-        registry_config: crate::catalog::RegistryConfig,
-        keyset: &crate::trust::VerifiedKeyset,
-    ) -> Result<(), ExternalPluginsError> {
-        let _lifecycle = self.lifecycle.lock().await;
-        if self.closing.load(Ordering::Acquire) {
-            return Err(ExternalPluginsError::ShuttingDown);
-        }
-        let _registry_state = self.registry_state.lock().await;
-        PluginInstaller::new(registry_config)?
-            .refresh_keyset(&self.manager.config().plugins_dir, keyset)
-            .await?;
-        Ok(())
-    }
-
-    async fn accept_registry_state(
-        &self,
-        registry_config: crate::catalog::RegistryConfig,
-        registry: &VerifiedRegistry,
-    ) -> Result<(), ExternalPluginsError> {
-        let _registry_state = self.registry_state.lock().await;
-        PluginInstaller::new(registry_config)?
-            .accept_registry_revision(&self.manager.config().plugins_dir, registry)
-            .await?;
-        Ok(())
-    }
 
     /// Build a proxy router from a set of manifests.
     /// The proxy router with no plugin mounted.
@@ -1294,1660 +538,126 @@ impl ExternalPluginsService {
     }
 }
 
-fn retain_platform_plugins(registry: &mut VerifiedRegistry, platform: &str) {
-    registry
-        .document
-        .plugins
-        .retain(|plugin| plugin.platforms.contains_key(platform));
-}
+mod plugin_services;
+pub use plugin_services::{
+    ApprovedUpdate, PendingUpdateView, PluginResourceLimits, ServicePluginView,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
-    use ed25519_dalek::{Signer as _, SigningKey};
-    use sha2::{Digest as _, Sha256};
-    use std::collections::BTreeMap;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
+
+    /// A server an earlier version installed `reports` 1.4.0 on as an
+    /// executable, with one release and a file the plugin stored.
+    fn upgraded_server(database: MockDatabase) -> (tempfile::TempDir, ExternalPluginsService) {
+        let root = tempfile::tempdir().unwrap();
+        let config = ExternalPluginConfig::new(root.path().to_path_buf());
+        let installation = config.plugins_dir.join("reports");
+        std::fs::create_dir_all(installation.join("1.4.0-abc")).unwrap();
+        std::fs::write(installation.join("1.4.0-abc").join("plugin"), "binary").unwrap();
+        std::fs::write(
+            installation.join("active.json"),
+            r#"{"version":"1.4.0","directory":"1.4.0-abc"}"#,
+        )
+        .unwrap();
+        let service =
+            ExternalPluginsService::new_empty(config, None, Arc::new(database.into_connection()));
+        (root, service)
+    }
 
     #[tokio::test]
-    async fn stateless_plugins_refuse_local_lifecycle_changes() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut config = ExternalPluginConfig::new(
-            directory.path().to_path_buf(),
-            "postgres://localhost/test".into(),
+    async fn removing_an_installed_executable_revokes_it_and_keeps_its_files() {
+        let (root, service) = upgraded_server(
+            MockDatabase::new(DatabaseBackend::Postgres).append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }]),
         );
+        service.manager.discover_and_start().await;
+        assert_eq!(service.manager.retired_plugins().await.len(), 1);
+        assert!(service.manifests().await.is_empty());
+
+        service.uninstall_plugin("reports").await.unwrap();
+
+        assert!(service.manager.retired_plugins().await.is_empty());
+        let installation = root.path().join("plugins").join("reports");
+        assert!(!installation.join("active.json").exists());
+        assert!(installation.join("1.4.0-abc").join("plugin").is_file());
+        // It is gone: removing it again says so.
+        assert!(matches!(
+            service.uninstall_plugin("reports").await,
+            Err(ExternalPluginsError::NotInstalled { name }) if name == "reports"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_plugin_whose_permissions_cannot_be_revoked_stays_listed() {
+        let (root, service) = upgraded_server(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_errors([DbErr::Custom("revocation unavailable".into())]),
+        );
+        service.manager.discover_and_start().await;
+
+        let error = service.uninstall_plugin("reports").await.unwrap_err();
+
+        assert!(matches!(error, ExternalPluginsError::Grant(_)), "{error}");
+        assert!(root
+            .path()
+            .join("plugins")
+            .join("reports")
+            .join("active.json")
+            .is_file());
+        assert_eq!(service.manager.retired_plugins().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn removing_a_plugin_that_is_not_there_or_not_a_name_is_refused_without_a_write() {
+        // No database result is queued: a write would fail the test.
+        let (_root, service) = upgraded_server(MockDatabase::new(DatabaseBackend::Postgres));
+
+        assert!(matches!(
+            service.uninstall_plugin("exports").await,
+            Err(ExternalPluginsError::NotInstalled { name }) if name == "exports"
+        ));
+        assert!(matches!(
+            service.uninstall_plugin("../reports").await,
+            Err(ExternalPluginsError::InvalidPluginName { name }) if name == "../reports"
+        ));
+    }
+
+    #[tokio::test]
+    async fn plugins_reload_on_a_server_without_durable_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = ExternalPluginConfig::new(root.path().to_path_buf());
+        // A plugin is a service, so nothing of it lives on this server's disk.
         config.persistent_installations = false;
         let service = ExternalPluginsService::new_empty(
             config,
             None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
         );
-        assert!(matches!(
-            service.reload_plugins().await,
-            Err(ExternalPluginsError::PersistentStorageRequired)
-        ));
-        assert!(!directory.path().join("plugins").exists());
+
+        let result = service.reload_plugins().await.unwrap();
+
+        assert!(result.manifests.is_empty());
+        assert!(result.failures.is_empty());
     }
 
     #[tokio::test]
-    async fn repository_install_preparation_validates_before_reserving_progress() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let service = ExternalPluginsService::new_empty(
-            ExternalPluginConfig::new(
-                temp.path().to_path_buf(),
-                "postgres://localhost/test".into(),
-            ),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
-        let source = "https://github.com/example/plugin";
-        let id = uuid::Uuid::from_u128(1).to_string();
-        assert!(matches!(
-            service
-                .prepare_repository_install(source, Some("../escape"), Some(&id))
-                .await,
-            Err(RepositoryInstallPreparationError::Repository(
-                RepositoryError::UnsafePath { .. }
-            ))
-        ));
-        assert!(matches!(
-            service
-                .prepare_repository_install("https://evil.example/plugin", None, Some(&id))
-                .await,
-            Err(RepositoryInstallPreparationError::Repository(
-                RepositoryError::UnsafeUrl
-            ))
-        ));
-        assert!(service.repository_install_progress(&id).await.is_none());
-        assert!(matches!(
-            service
-                .prepare_repository_install(source, None, Some("not-a-uuid"))
-                .await,
-            Err(RepositoryInstallPreparationError::InvalidProgressId)
-        ));
-        let legacy = service
-            .prepare_repository_install("https://evil.example/plugin", None, None)
-            .await
-            .expect("legacy request proceeds to selection");
-        assert!(legacy.progress.is_none());
-        assert!(legacy.requested_source.is_none());
-        let prepared = service
-            .prepare_repository_install(source, Some("plugins/first"), Some(&id))
-            .await
-            .expect("valid reservation");
-        assert_eq!(
-            prepared.requested_source.as_deref(),
-            Some("repository:https://github.com/example/plugin/tree/plugins/first")
-        );
-        assert!(prepared.progress.is_some());
-        assert!(matches!(
-            service
-                .prepare_repository_install(source, None, Some(&id))
-                .await,
-            Err(RepositoryInstallPreparationError::Progress(
-                ProgressError::Duplicate { .. }
-            ))
-        ));
-        for index in 2..=64 {
-            let id = uuid::Uuid::from_u128(index).to_string();
-            service
-                .prepare_repository_install(source, None, Some(&id))
-                .await
-                .expect("fill active slots");
-        }
-        let overflow = uuid::Uuid::from_u128(65).to_string();
-        assert!(matches!(
-            service
-                .prepare_repository_install(source, None, Some(&overflow))
-                .await,
-            Err(RepositoryInstallPreparationError::Progress(
-                ProgressError::Full
-            ))
-        ));
-    }
+    async fn nothing_is_removed_once_the_service_is_shutting_down() {
+        let (root, service) = upgraded_server(MockDatabase::new(DatabaseBackend::Postgres));
+        service.shutdown_all().await;
 
-    #[tokio::test]
-    async fn repository_install_reports_actual_lifecycle_wait() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".into(),
-        );
-        let service = Arc::new(ExternalPluginsService::new_empty(
-            config,
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        ));
-        let progress = service
-            .install_progress
-            .register("queued-install".into())
-            .await
-            .expect("register progress");
-        progress.advance(Stage::FetchingSource).await;
-        progress.complete_current().await;
-        let gate = service.lifecycle.lock().await;
-        let selected = SelectedRepository {
-            source: repository::RepositorySource {
-                repository: "https://github.com/example/plugin".into(),
-                name: "fixture-plugin".into(),
-                ref_name: "main".into(),
-                path: None,
-                commit: "a".repeat(40),
-                version: "1.0.0".into(),
-                source_dir: temp.path().to_path_buf(),
-            },
-            _temporary: tempfile::tempdir().expect("staging dir"),
-            name: "fixture-plugin".into(),
-        };
-        let installing_service = service.clone();
-        let installing_progress = progress.clone();
-        let install = tokio::spawn(async move {
-            installing_service
-                .install_repository_with_progress(selected, Some(&installing_progress))
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let snapshot = service
-                    .repository_install_progress("queued-install")
-                    .await
-                    .expect("progress exists");
-                if snapshot.stages.len() == 2 {
-                    assert_eq!(
-                        snapshot.stages[0].status,
-                        crate::install_progress::ProgressStatus::Completed
-                    );
-                    assert_eq!(snapshot.stages[1].stage, "waiting_for_lifecycle");
-                    assert_eq!(
-                        snapshot.stages[1].status,
-                        crate::install_progress::ProgressStatus::Running
-                    );
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("waiting stage visible before lock acquisition");
-        service.closing.store(true, Ordering::Release);
-        drop(gate);
         assert!(matches!(
-            install.await.expect("install task"),
+            service.uninstall_plugin("reports").await,
             Err(ExternalPluginsError::ShuttingDown)
         ));
-        let snapshot = service
-            .repository_install_progress("queued-install")
-            .await
-            .expect("progress remains");
-        assert_eq!(
-            snapshot.stages[1].status,
-            crate::install_progress::ProgressStatus::Completed
-        );
-    }
-
-    #[tokio::test]
-    async fn registry_install_cannot_replace_repository_source() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[42; 32]);
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".into(),
-        );
-        let plugins_dir = config.plugins_dir.clone();
-        let service = ExternalPluginsService::new_empty(
-            config,
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
-        let binary = temp.path().join("built-plugin");
-        tokio::fs::write(&binary, b"fixture")
-            .await
-            .expect("write binary");
-        let receipt = RepositoryReceipt {
-            source: "github".into(),
-            repository: "https://github.com/example/plugin".into(),
-            ref_name: "main".into(),
-            path: Some("plugins/first".into()),
-            commit: "a".repeat(40),
-            builder: repository::BUILDER_IMAGE.into(),
-            plugin_name: "fixture-plugin".into(),
-            version: "1.0.0".into(),
-            platform: platform_target().expect("platform"),
-            sha256: hex::encode(Sha256::digest(b"fixture")),
-        };
-        let candidate = PluginInstaller::prepare_repository(&plugins_dir, receipt, &binary)
-            .await
-            .expect("prepare repo");
-        PluginInstaller::new(service.manager.config().registry.clone())
-            .expect("installer")
-            .activate(&candidate)
-            .await
-            .expect("activate repo");
-        assert!(service
-            .ensure_repository_identity(
-                "fixture-plugin",
-                "https://github.com/example/plugin",
-                Some("plugins/first")
-            )
-            .await
-            .is_ok());
-        assert!(matches!(
-            service
-                .ensure_repository_identity(
-                    "fixture-plugin",
-                    "https://github.com/example/plugin",
-                    Some("plugins/sibling")
-                )
-                .await,
-            Err(ExternalPluginsError::Repository(
-                RepositoryError::SourceConflict { .. }
-            ))
-        ));
-        assert!(matches!(
-            service
-                .ensure_repository_identity(
-                    "fixture-plugin",
-                    "https://github.com/example/plugin",
-                    None
-                )
-                .await,
-            Err(ExternalPluginsError::Repository(
-                RepositoryError::SourceConflict { .. }
-            ))
-        ));
-        let selected = selected_plugin(
-            "http://127.0.0.1/artifact".into(),
-            b"fixture",
-            "fixture-plugin",
-            "2.0.0",
-            1,
-            &signing,
-        );
-        assert!(matches!(
-            service.install_selected(selected).await,
-            Err(ExternalPluginsError::Repository(
-                RepositoryError::SourceConflict { .. }
-            ))
-        ));
-        let source = service
-            .repository_source("fixture-plugin")
-            .await
-            .expect("read active source")
-            .expect("repo source");
-        assert_eq!(source.commit, "a".repeat(40));
-    }
-
-    async fn serve_artifact_once(body: Vec<u8>) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind artifact fixture");
-        let address = listener.local_addr().expect("artifact fixture address");
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept artifact request");
-            let mut request = [0u8; 2048];
-            let _ = stream
-                .read(&mut request)
-                .await
-                .expect("read artifact request");
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(headers.as_bytes())
-                .await
-                .expect("write artifact headers");
-            stream.write_all(&body).await.expect("write artifact body");
-        });
-        format!("http://{address}/plugin")
-    }
-
-    async fn serve_json_once(body: Vec<u8>) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind catalogue fixture");
-        let address = listener.local_addr().expect("catalogue fixture address");
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept catalogue request");
-            let mut request = [0u8; 2048];
-            let _ = stream
-                .read(&mut request)
-                .await
-                .expect("read catalogue request");
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(headers.as_bytes())
-                .await
-                .expect("write catalogue headers");
-            stream.write_all(&body).await.expect("write catalogue body");
-        });
-        format!("http://{address}/plugins")
-    }
-
-    #[cfg(unix)]
-    mod watch_pool;
-
-    #[cfg(unix)]
-    fn protocol_v2_fixture(name: &str, version: &str) -> Vec<u8> {
-        protocol_fixture_manifest(PluginManifest::builder(name, version).build())
-    }
-
-    #[cfg(unix)]
-    fn protocol_fixture_manifest(manifest: PluginManifest) -> Vec<u8> {
-        let hello = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Hello(
-            temps_plugin_protocol::PluginHello {
-                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
-                manifest: Box::new(manifest),
-            },
-        ))
-        .expect("serialize fixture hello");
-        let ready = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Ready(
-            temps_plugin_protocol::PluginReady {
-                ready: true,
-                has_ui: false,
-                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
-                openapi: None,
-            },
-        ))
-        .expect("serialize fixture ready");
-        let hello_literal = serde_json::to_string(&hello).expect("quote fixture hello");
-        let ready_literal = serde_json::to_string(&ready).expect("quote fixture ready");
-        format!(
-            r#"#!/usr/bin/python3
-import base64
-import hashlib
-import json
-import socket
-import sys
-
-HELLO = {hello_literal}
-READY = {ready_literal}
-args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
-print(HELLO, flush=True)
-launch = json.loads(sys.stdin.readline())
-server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-server.bind(args["--socket-path"])
-server.listen(1)
-print(READY, flush=True)
-connection, _ = server.accept()
-request = b""
-while b"\r\n\r\n" not in request:
-    request += connection.recv(4096)
-lines = request.decode("latin1").split("\r\n")
-headers = {{}}
-for line in lines[1:]:
-    if ":" in line:
-        key, value = line.split(":", 1)
-        headers[key.lower()] = value.strip()
-if headers.get("x-temps-auth-signature") != launch["auth_secret"]:
-    sys.exit(7)
-websocket_key = headers["sec-websocket-key"]
-accept = base64.b64encode(hashlib.sha1((websocket_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-connection.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
-try:
-    while connection.recv(4096):
-        pass
-except Exception:
-    pass
-"#
-        )
-        .into_bytes()
-    }
-
-    fn selected_plugin(
-        url: String,
-        bytes: &[u8],
-        name: &str,
-        version: &str,
-        revision: u64,
-        signing: &SigningKey,
-    ) -> SelectedPlugin {
-        let platform = platform_target().expect("supported test platform");
-        let sha256 = hex::encode(Sha256::digest(bytes));
-        let plugin = RegistryPlugin {
-            name: name.to_string(),
-            title: "Fixture plugin".to_string(),
-            summary: "fixture".to_string(),
-            description: "fixture".to_string(),
-            author: "Temps Contributors".to_string(),
-            category: "test".to_string(),
-            keywords: vec!["test".to_string()],
-            logo_url: None,
-            repository: None,
-            docs_url: None,
-            version: version.to_string(),
-            platforms: BTreeMap::from([(
-                platform.clone(),
-                crate::catalog::PlatformRelease {
-                    url,
-                    sha256: sha256.clone(),
-                    npm: None,
-                },
-            )]),
-        };
-        let document = crate::catalog::RegistryDocument {
-            schema_version: 1,
-            revision,
-            issued_at: chrono::Utc::now() - chrono::Duration::minutes(1),
-            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-            plugins: vec![plugin.clone()],
-        };
-        let payload = serde_json::to_vec(&document).expect("serialize fixture registry");
-        let envelope = crate::catalog::RegistryEnvelope {
-            key_id: "fixture-key".to_string(),
-            payload: base64::engine::general_purpose::STANDARD.encode(&payload),
-            signature: base64::engine::general_purpose::STANDARD.encode(
-                signing
-                    .sign(&crate::trust::signature_message(
-                        crate::trust::CATALOG_SIGNATURE_DOMAIN,
-                        &payload,
-                    ))
-                    .to_bytes(),
-            ),
-        };
-        let keyset = crate::trust::VerifiedKeyset::test_fixture(
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        )
-        .1;
-        SelectedPlugin {
-            registry: VerifiedRegistry {
-                keyset,
-                envelope,
-                document,
-            },
-            plugin,
-            identity: ReleaseIdentity {
-                name: name.to_string(),
-                version: version.to_string(),
-                platform,
-                sha256,
-                signer_key_id: "fixture-key".to_string(),
-                registry_source: "http://127.0.0.1/fixture".to_string(),
-            },
-        }
-    }
-
-    fn registry_revision(
-        revision: u64,
-        keyset_generation: u64,
-        signing: &SigningKey,
-    ) -> VerifiedRegistry {
-        let mut selected = selected_plugin(
-            "http://127.0.0.1/plugin".to_string(),
-            b"fixture",
-            "fixture-plugin",
-            "1.0.0",
-            revision,
-            signing,
-        );
-        selected.registry.keyset = crate::trust::VerifiedKeyset::test_fixture_with_keys(
-            vec![(
-                "fixture-key".to_string(),
-                signing.verifying_key().to_bytes(),
-                crate::trust::CatalogKeyStatus::Active,
-            )],
-            keyset_generation,
-        )
-        .1;
-        selected.registry
-    }
-
-    #[test]
-    fn catalog_filters_to_exact_os_arch_and_libc_release() {
-        let signing = SigningKey::from_bytes(&[83; 32]);
-        let mut registry = registry_revision(1, 1, &signing);
-        let original = registry.document.plugins[0].clone();
-        let mut gnu_amd64 = original.clone();
-        gnu_amd64.name = "gnu-amd64".to_string();
-        gnu_amd64.platforms = BTreeMap::from([(
-            "linux-amd64-gnu".to_string(),
-            original
-                .platforms
-                .values()
-                .next()
-                .expect("fixture release")
-                .clone(),
-        )]);
-        let mut musl_amd64 = gnu_amd64.clone();
-        musl_amd64.name = "musl-amd64".to_string();
-        musl_amd64.platforms = BTreeMap::from([(
-            "linux-amd64-musl".to_string(),
-            original
-                .platforms
-                .values()
-                .next()
-                .expect("fixture release")
-                .clone(),
-        )]);
-        let mut gnu_arm64 = gnu_amd64.clone();
-        gnu_arm64.name = "gnu-arm64".to_string();
-        gnu_arm64.platforms = BTreeMap::from([(
-            "linux-arm64-gnu".to_string(),
-            original
-                .platforms
-                .values()
-                .next()
-                .expect("fixture release")
-                .clone(),
-        )]);
-        let mut mac_arm64 = gnu_amd64.clone();
-        mac_arm64.name = "mac-arm64".to_string();
-        mac_arm64.platforms = BTreeMap::from([(
-            "darwin-arm64".to_string(),
-            original
-                .platforms
-                .values()
-                .next()
-                .expect("fixture release")
-                .clone(),
-        )]);
-        registry.document.plugins = vec![gnu_amd64, musl_amd64, gnu_arm64, mac_arm64];
-
-        let mut gnu_view = registry.clone();
-        retain_platform_plugins(&mut gnu_view, "linux-amd64-gnu");
-        assert_eq!(gnu_view.document.plugins.len(), 1);
-        assert_eq!(gnu_view.document.plugins[0].name, "gnu-amd64");
-
-        let mut musl_view = registry.clone();
-        retain_platform_plugins(&mut musl_view, "linux-amd64-musl");
-        assert_eq!(musl_view.document.plugins.len(), 1);
-        assert_eq!(musl_view.document.plugins[0].name, "musl-amd64");
-
-        let mut arm_view = registry.clone();
-        retain_platform_plugins(&mut arm_view, "linux-arm64-gnu");
-        assert_eq!(arm_view.document.plugins.len(), 1);
-        assert_eq!(arm_view.document.plugins[0].name, "gnu-arm64");
-
-        retain_platform_plugins(&mut registry, "darwin-amd64");
-        assert!(registry.document.plugins.is_empty());
-
-        let mut empty = registry_revision(2, 1, &signing);
-        empty.document.plugins.clear();
-        retain_platform_plugins(&mut empty, "linux-amd64-gnu");
-        assert!(empty.document.plugins.is_empty());
-    }
-    fn service() -> ExternalPluginsService {
-        let database = Arc::new(
-            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-        );
-        ExternalPluginsService::new_empty(
-            ExternalPluginConfig::new(
-                std::env::temp_dir().join("temps-external-plugin-service-tests"),
-                "postgres://localhost/test".to_string(),
-            ),
-            None,
-            database,
-        )
-    }
-
-    #[test]
-    fn production_registry_has_embedded_offline_root_threshold() {
-        let service = service();
-        let registry = &service.manager().config().registry;
-        assert_eq!(registry.root_trust.threshold, 2);
-        assert_eq!(registry.root_trust.keys.len(), 3);
-    }
-
-    #[test]
-    fn selection_accepts_canonical_npm_release() {
-        let signing = SigningKey::from_bytes(&[71; 32]);
-        let mut registry = registry_revision(1, 1, &signing);
-        let release = registry.document.plugins[0]
-            .platforms
-            .values_mut()
-            .next()
-            .expect("platform release");
-        release.url = "https://registry.npmjs.org/@temps/fixture-plugin/-/fixture-plugin-1.0.0.tgz"
-            .to_string();
-        release.npm = Some(crate::catalog::NpmRelease {
-            name: "@temps/fixture-plugin".to_string(),
-            version: "1.0.0".to_string(),
-            integrity: format!(
-                "sha512-{}",
-                base64::engine::general_purpose::STANDARD.encode([0u8; 64])
-            ),
-            binary_path: "package/plugin".to_string(),
-        });
-        let selected = service()
-            .select_from_registry("fixture-plugin", registry)
-            .expect("canonical npm release selected");
-        assert_eq!(selected.identity.version, "1.0.0");
-    }
-
-    #[test]
-    fn selection_rejects_unsafe_npm_url_and_direct_only_release() {
-        let signing = SigningKey::from_bytes(&[72; 32]);
-        let mut registry = registry_revision(1, 1, &signing);
-        assert!(matches!(
-            service().select_from_registry("fixture-plugin", registry.clone()),
-            Err(ExternalPluginsError::Install(
-                InstallError::InvalidNpmRelease { .. }
-            ))
-        ));
-        let release = registry.document.plugins[0]
-            .platforms
-            .values_mut()
-            .next()
-            .expect("platform release");
-        release.url =
-            "https://registry.npmjs.org/@temps/fixture-plugin/-/fixture-plugin-1.0.0.tgz?token=x"
-                .to_string();
-        release.npm = Some(crate::catalog::NpmRelease {
-            name: "@temps/fixture-plugin".to_string(),
-            version: "1.0.0".to_string(),
-            integrity: format!(
-                "sha512-{}",
-                base64::engine::general_purpose::STANDARD.encode([0u8; 64])
-            ),
-            binary_path: "package/plugin".to_string(),
-        });
-        assert!(matches!(
-            service().select_from_registry("fixture-plugin", registry),
-            Err(ExternalPluginsError::Install(
-                InstallError::UnsafeArtifactUrl { .. }
-            ))
-        ));
-    }
-
-    #[tokio::test]
-    async fn install_rejects_path_traversal_before_network_access() {
-        let error = match service().select_plugin("../../escape").await {
-            Ok(_) => panic!("path traversal must be rejected"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            ExternalPluginsError::Install(InstallError::UnsafePluginName { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn shutdown_rejects_later_installs_before_registry_access() {
-        let service = service();
-        service.shutdown_all().await;
-        let error = match service.select_plugin("safe").await {
-            Ok(_) => panic!("closed service must reject installs"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, ExternalPluginsError::ShuttingDown));
-    }
-
-    #[tokio::test]
-    async fn catalog_view_persists_first_trust_state_and_rejects_rollbacks() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[63; 32]);
-        let mut registry = registry_revision(7, 2, &signing);
-        let mut unsupported = registry.document.plugins[0].clone();
-        unsupported.name = "other-platform-plugin".to_string();
-        let release = unsupported
-            .platforms
-            .values()
-            .next()
-            .expect("fixture release")
-            .clone();
-        let other_platform =
-            if platform_target().expect("supported test platform") == "darwin-arm64" {
-                "linux-amd64-gnu"
-            } else {
-                "darwin-arm64"
-            };
-        unsupported.platforms = BTreeMap::from([(other_platform.to_string(), release)]);
-        registry.document.plugins.push(unsupported);
-        let payload = serde_json::to_vec(&registry.document).expect("serialize full registry");
-        registry.envelope.payload = base64::engine::general_purpose::STANDARD.encode(&payload);
-        registry.envelope.signature = base64::engine::general_purpose::STANDARD.encode(
-            signing
-                .sign(&crate::trust::signature_message(
-                    crate::trust::CATALOG_SIGNATURE_DOMAIN,
-                    &payload,
-                ))
-                .to_bytes(),
-        );
-        let url = serve_json_once(
-            serde_json::to_vec(&registry.envelope).expect("serialize catalogue envelope"),
-        )
-        .await;
-        let registry_config = crate::catalog::RegistryConfig::local_with_generation(
-            url,
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-            2,
-        );
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry_config.clone());
-        let service = ExternalPluginsService::new_empty(
-            config.clone(),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
-
-        let visible = service
-            .catalog()
-            .await
-            .expect("first catalogue view must persist authenticated trust state");
-        assert_eq!(visible.document.plugins.len(), 1);
-        assert_eq!(visible.document.plugins[0].name, "fixture-plugin");
-        assert_eq!(registry.document.plugins.len(), 2);
-        assert!(config.plugins_dir.join("registry-state.json").is_file());
-
-        let revision_error = service
-            .accept_registry_state(registry_config.clone(), &registry_revision(6, 2, &signing))
-            .await
-            .expect_err("an older catalogue revision must be rejected after viewing");
-        assert!(matches!(
-            revision_error,
-            ExternalPluginsError::Install(InstallError::RegistryRollback {
-                received: 6,
-                highest: 7
-            })
-        ));
-
-        let keyset_error = service
-            .accept_registry_state(registry_config, &registry_revision(8, 1, &signing))
-            .await
-            .expect_err("an older keyset generation must be rejected after viewing");
-        assert!(matches!(
-            keyset_error,
-            ExternalPluginsError::Install(InstallError::KeysetRollback {
-                received: 1,
-                highest: 2
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn failed_catalog_still_persists_fresh_revocation() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[66; 32]);
-        let url = "http://127.0.0.1:1/invalid-catalogue".to_string();
-        let mut registry_config = crate::catalog::RegistryConfig::local(
-            url,
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        );
-        let replacement = SigningKey::from_bytes(&[67; 32]);
-        let (_, revoked) = crate::trust::VerifiedKeyset::test_fixture_with_keys(
-            vec![
-                (
-                    "fixture-key".to_string(),
-                    signing.verifying_key().to_bytes(),
-                    crate::trust::CatalogKeyStatus::Revoked,
-                ),
-                (
-                    "replacement-key".to_string(),
-                    replacement.verifying_key().to_bytes(),
-                    crate::trust::CatalogKeyStatus::Active,
-                ),
-            ],
-            2,
-        );
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry_config.clone());
-        let service = ExternalPluginsService::new_empty(
-            config.clone(),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
-        let binary = b"fixture binary";
-        let artifact_url = serve_artifact_once(binary.to_vec()).await;
-        let old =
-            selected_plugin(artifact_url, binary, "fixture-plugin", "1.0.0", 7, &signing).registry;
-        service
-            .accept_registry_state(registry_config.clone(), &old)
-            .await
-            .expect("seed old catalogue");
-        let installer = PluginInstaller::new(registry_config.clone()).expect("installer");
-        let candidate = installer
-            .prepare(&config.plugins_dir, &old, &old.document.plugins[0])
-            .await
-            .expect("prepare active fixture");
-        installer
-            .activate(&candidate)
-            .await
-            .expect("activate fixture");
-        registry_config = registry_config.with_test_keyset(revoked.clone());
-        let refreshed = ExternalPluginsService::new_empty(
-            config.clone().with_registry(registry_config.clone()),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
-        assert!(matches!(
-            refreshed.catalog().await,
-            Err(ExternalPluginsError::Catalog(_))
-        ));
-        let state: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(config.plugins_dir.join("registry-state.json")).expect("state"),
-        )
-        .expect("valid state");
-        assert_eq!(state["highest_revision"], 7);
-        assert_eq!(state["highest_keyset_generation"], 2);
-        assert!(matches!(
-            &crate::install::discover_active(&config.plugins_dir, &registry_config).await[..],
-            [Err(InstallError::InvalidReceipt { reason, .. })]
-                if reason.contains("key status is Revoked")
-        ));
-        assert!(matches!(
-            crate::catalog::verify_envelope(
-                old.envelope,
-                revoked,
-                &registry_config.url,
-                crate::trust::KeysetUse::FreshCatalog
-            ),
-            Err(crate::catalog::CatalogError::Trust(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn unauthenticated_keyset_cannot_replace_persisted_trust() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[68; 32]);
-        let registry_config = crate::catalog::RegistryConfig::local(
-            "http://127.0.0.1:1/catalog".to_string(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        );
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry_config.clone());
-        let service = ExternalPluginsService::new_empty(
-            config.clone(),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
-        service
-            .accept_registry_state(registry_config.clone(), &registry_revision(7, 1, &signing))
-            .await
-            .expect("seed state");
-        let state_path = config.plugins_dir.join("registry-state.json");
-        let before = std::fs::read(&state_path).expect("read state");
-        let mut invalid = crate::trust::VerifiedKeyset::test_fixture_with_keys(
-            vec![(
-                "fixture-key".to_string(),
-                signing.verifying_key().to_bytes(),
-                crate::trust::CatalogKeyStatus::Active,
-            )],
-            2,
-        )
-        .1
-        .envelope;
-        invalid.payload.push('x');
-        assert!(crate::trust::VerifiedKeyset::verify(
-            invalid,
-            &registry_config.root_trust,
-            chrono::Utc::now(),
-            crate::trust::KeysetUse::FreshCatalog,
-        )
-        .is_err());
-        assert_eq!(
-            std::fs::read(state_path).expect("read unchanged state"),
-            before
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_first_catalogue_keeps_keyset_generation_floor() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[69; 32]);
-        let config = crate::catalog::RegistryConfig::local_with_generation(
-            "http://127.0.0.1:1/unavailable".to_string(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-            2,
-        );
-        let service = ExternalPluginsService::new_empty(
-            ExternalPluginConfig::new(
-                temp.path().to_path_buf(),
-                "postgres://localhost/test".to_string(),
-            )
-            .with_registry(config.clone()),
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        );
-        assert!(matches!(
-            service.catalog().await,
-            Err(ExternalPluginsError::Catalog(_))
-        ));
-        let stale = crate::trust::VerifiedKeyset::test_fixture(
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        )
-        .1;
-        assert!(matches!(
-            service.accept_catalog_keyset(config, &stale).await,
-            Err(ExternalPluginsError::Install(
-                InstallError::KeysetRollback {
-                    received: 1,
-                    highest: 2
-                }
-            ))
-        ));
-    }
-
-    #[tokio::test]
-    async fn concurrent_out_of_order_registry_updates_cannot_roll_back_state() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[64; 32]);
-        let registry_config = crate::catalog::RegistryConfig::local(
-            "http://127.0.0.1/plugins".to_string(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        );
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry_config.clone());
-        let service = Arc::new(ExternalPluginsService::new_empty(
-            config,
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        ));
-        service
-            .accept_registry_state(registry_config.clone(), &registry_revision(1, 1, &signing))
-            .await
-            .expect("seed registry state");
-
-        // Queue generation 3 first and generation 2 second while holding the
-        // state lock. Tokio's mutex is FIFO, so this deterministically models
-        // the dangerous response order where the stale response finishes last.
-        let gate = service.registry_state.lock().await;
-        let newest_service = service.clone();
-        let newest_config = registry_config.clone();
-        let newest_registry = registry_revision(3, 3, &signing);
-        let newest = tokio::spawn(async move {
-            newest_service
-                .accept_registry_state(newest_config, &newest_registry)
-                .await
-        });
-        tokio::task::yield_now().await;
-        let stale_service = service.clone();
-        let stale_registry = registry_revision(2, 2, &signing);
-        let stale = tokio::spawn(async move {
-            stale_service
-                .accept_registry_state(registry_config, &stale_registry)
-                .await
-        });
-        tokio::task::yield_now().await;
-        drop(gate);
-
-        newest
-            .await
-            .expect("newest update task")
-            .expect("newest update must be accepted");
-        let error = stale
-            .await
-            .expect("stale update task")
-            .expect_err("stale response must not overwrite the newer state");
-        assert!(matches!(
-            error,
-            ExternalPluginsError::Install(InstallError::KeysetRollback {
-                received: 2,
-                highest: 3
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn catalog_trust_commit_waits_for_in_progress_install_lifecycle() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[65; 32]);
-        let registry_config = crate::catalog::RegistryConfig::local(
-            "http://127.0.0.1/plugins".to_string(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        );
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry_config.clone());
-        let service = Arc::new(ExternalPluginsService::new_empty(
-            config,
-            None,
-            Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-            ),
-        ));
-        service
-            .accept_registry_state(registry_config.clone(), &registry_revision(1, 1, &signing))
-            .await
-            .expect("seed registry state");
-
-        // install_selected owns this guard from trust acceptance through
-        // candidate activation and promotion. A catalogue response learned in
-        // parallel must not commit until that complete lifecycle ends.
-        let install_lifecycle = service.lifecycle.lock().await;
-        let catalogue_service = service.clone();
-        let newer_keyset = registry_revision(2, 2, &signing).keyset;
-        let mut catalogue_commit = tokio::spawn(async move {
-            catalogue_service
-                .accept_catalog_keyset(registry_config, &newer_keyset)
-                .await
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut catalogue_commit)
-                .await
-                .is_err(),
-            "catalogue trust update must wait for the active install lifecycle"
-        );
-
-        drop(install_lifecycle);
-        catalogue_commit
-            .await
-            .expect("catalogue update task")
-            .expect("catalogue update must commit after installation finishes");
-    }
-
-    #[tokio::test]
-    async fn failed_uninstall_revocation_preserves_installation_until_retry() {
-        use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
-        let temp = tempfile::tempdir().unwrap();
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".into(),
-        );
-        let active = config.plugins_dir.join("reports/active.json");
-        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
-        std::fs::write(&active, b"fixture active selection").unwrap();
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_errors([DbErr::Custom("revocation unavailable".into())])
-            .append_exec_results([MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
-            .append_query_results([Vec::<temps_entities::external_plugin_actors::Model>::new()])
-            .into_connection();
-        let service = ExternalPluginsService::new_empty(config, None, Arc::new(db));
-        let before = service.ai_tools.snapshot();
-        assert!(service.uninstall_plugin("reports").await.is_err());
-        assert!(
-            active.is_file(),
-            "a failed revocation must not remove the active installation"
-        );
-        assert!(
-            !Arc::ptr_eq(&before, &service.ai_tools.snapshot()),
-            "an uncertain revocation must invalidate the prior AI snapshot"
-        );
-        service.uninstall_plugin("reports").await.unwrap();
-        assert!(
-            !active.exists(),
-            "deactivation follows durable revocation on retry"
-        );
-        assert!(!Arc::ptr_eq(&before, &service.ai_tools.snapshot()));
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn protocol_v2_install_activates_and_promotes_verified_binary() {
-        if !std::path::Path::new("/usr/bin/python3").exists() {
-            eprintln!("skipping protocol fixture: /usr/bin/python3 is unavailable");
-            return;
-        }
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[61; 32]);
-        let binary = protocol_v2_fixture("fixture-plugin", "1.0.0");
-        let url = serve_artifact_once(binary.clone()).await;
-        let registry = crate::catalog::RegistryConfig::local(
-            url.clone(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        );
-        let mut config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry);
-        config.sockets_dir = temp.path().join("sockets");
-        std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_test_utils::TestDatabase::with_migrations().await {
-            Ok(database) => database,
-            Err(error)
-                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-            {
-                eprintln!("skipping protocol fixture: Docker unavailable: {error}");
-                return;
-            }
-            Err(error) => panic!("prepare protocol fixture database: {error}"),
-        };
-        let service =
-            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
-
-        let outcome = service
-            .install_selected(selected_plugin(
-                url,
-                &binary,
-                "fixture-plugin",
-                "1.0.0",
-                1,
-                &signing,
-            ))
-            .await
-            .expect("protocol-v2 fixture must install");
-
-        assert_eq!(outcome.name, "fixture-plugin");
-        assert_eq!(service.manifests().await[0].version, "1.0.0");
-        assert!(config
-            .plugins_dir
-            .join("fixture-plugin/active.json")
+        assert!(root
+            .path()
+            .join("plugins")
+            .join("reports")
+            .join("active.json")
             .is_file());
-        let plugin_root = config.plugins_dir.join("fixture-plugin");
-        let release_count_before = std::fs::read_dir(&plugin_root)
-            .expect("plugin root")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .count();
-        service
-            .uninstall_plugin("fixture-plugin")
-            .await
-            .expect("uninstall");
-        assert!(!plugin_root.join("active.json").exists());
-        assert!(service.manifests().await.is_empty());
-        assert!(!service.manager().is_running("fixture-plugin").await);
-        assert_eq!(
-            std::fs::read_dir(&plugin_root)
-                .expect("preserved plugin root")
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                .count(),
-            release_count_before,
-            "all release and plugin data directories remain intact"
-        );
-        let reload = service.reload_plugins().await.expect("reload");
-        assert!(
-            reload.manifests.is_empty(),
-            "uninstalled plugin must not resurrect"
-        );
-        assert!(
-            reload.failures.is_empty(),
-            "retained releases are not broken active installs"
-        );
-        service.shutdown_all().await;
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn rejected_upgrade_preserves_active_record_and_running_process() {
-        if !std::path::Path::new("/usr/bin/python3").exists() {
-            eprintln!("skipping protocol fixture: /usr/bin/python3 is unavailable");
-            return;
-        }
-        let temp = tempfile::tempdir().expect("tempdir");
-        let signing = SigningKey::from_bytes(&[62; 32]);
-        let first_binary = protocol_v2_fixture("fixture-plugin", "1.0.0");
-        let first_url = serve_artifact_once(first_binary.clone()).await;
-        let registry = crate::catalog::RegistryConfig::local(
-            first_url.clone(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        );
-        let mut config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        )
-        .with_registry(registry);
-        config.sockets_dir = temp.path().join("sockets");
-        std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_test_utils::TestDatabase::with_migrations().await {
-            Ok(database) => database,
-            Err(error)
-                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-            {
-                eprintln!("skipping protocol fixture: Docker unavailable: {error}");
-                return;
-            }
-            Err(error) => panic!("prepare protocol fixture database: {error}"),
-        };
-        let service =
-            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
-        service
-            .install_selected(selected_plugin(
-                first_url,
-                &first_binary,
-                "fixture-plugin",
-                "1.0.0",
-                1,
-                &signing,
-            ))
-            .await
-            .expect("initial plugin must install");
-        let active_path = config.plugins_dir.join("fixture-plugin/active.json");
-        let active_before = std::fs::read(&active_path).expect("initial active record");
-
-        let rejected_binary = protocol_v2_fixture("different-plugin", "2.0.0");
-        let rejected_url = serve_artifact_once(rejected_binary.clone()).await;
-        let error = service
-            .install_selected(selected_plugin(
-                rejected_url,
-                &rejected_binary,
-                "fixture-plugin",
-                "2.0.0",
-                2,
-                &signing,
-            ))
-            .await
-            .expect_err("signed and declared identities must match");
-
-        assert!(matches!(
-            error,
-            ExternalPluginsError::CandidateRejected { .. }
-        ));
-        assert_eq!(
-            std::fs::read(&active_path).expect("preserved active record"),
-            active_before
-        );
-        assert_eq!(service.manifests().await[0].version, "1.0.0");
-        let install_directories = std::fs::read_dir(config.plugins_dir.join("fixture-plugin"))
-            .expect("plugin root")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .count();
-        assert_eq!(install_directories, 1, "rejected candidate must be removed");
-        service.shutdown_all().await;
-    }
-
-    #[tokio::test]
-    async fn test_install_selected_queued_during_shutdown_is_rejected_without_writes() {
-        // Arrange: hold the lifecycle lock so shutdown and install both queue,
-        // then wait until shutdown has atomically closed admission.
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = ExternalPluginConfig::new(
-            temp.path().to_path_buf(),
-            "postgres://localhost/test".to_string(),
-        );
-        let plugins_dir = config.plugins_dir.clone();
-        let database = Arc::new(
-            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-        );
-        let service = Arc::new(ExternalPluginsService::new_empty(config, None, database));
-        let lifecycle = service.lifecycle.lock().await;
-        let shutdown_service = service.clone();
-        let shutdown = tokio::spawn(async move { shutdown_service.shutdown_all().await });
-        while !service.closing.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        let platform = platform_target().expect("supported test platform");
-        let plugin = RegistryPlugin {
-            name: "safe-plugin".to_string(),
-            title: "Safe plugin".to_string(),
-            summary: "test".to_string(),
-            description: "test".to_string(),
-            author: "Temps Contributors".to_string(),
-            category: "test".to_string(),
-            keywords: vec!["test".to_string()],
-            logo_url: None,
-            repository: None,
-            docs_url: None,
-            version: "1.0.0".to_string(),
-            platforms: BTreeMap::from([(
-                platform.clone(),
-                crate::catalog::PlatformRelease {
-                    url: "https://registry.temps.sh/safe-plugin".to_string(),
-                    sha256: "00".repeat(32),
-                    npm: None,
-                },
-            )]),
-        };
-        let selected = SelectedPlugin {
-            registry: VerifiedRegistry {
-                keyset: crate::trust::VerifiedKeyset::test_fixture(
-                    "test-key",
-                    SigningKey::from_bytes(&[42; 32]).verifying_key().to_bytes(),
-                )
-                .1,
-                envelope: crate::catalog::RegistryEnvelope {
-                    key_id: "test-key".to_string(),
-                    payload: String::new(),
-                    signature: String::new(),
-                },
-                document: crate::catalog::RegistryDocument {
-                    schema_version: 1,
-                    revision: 1,
-                    issued_at: chrono::Utc::now(),
-                    expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
-                    plugins: vec![plugin.clone()],
-                },
-            },
-            identity: ReleaseIdentity {
-                name: plugin.name.clone(),
-                version: plugin.version.clone(),
-                platform,
-                sha256: "00".repeat(32),
-                signer_key_id: "test-key".to_string(),
-                registry_source: "https://registry.temps.sh/api/plugins".to_string(),
-            },
-            plugin,
-        };
-        let install_service = service.clone();
-        let install = tokio::spawn(async move { install_service.install_selected(selected).await });
-
-        // Act
-        drop(lifecycle);
-        shutdown.await.expect("shutdown task");
-        let error = install
-            .await
-            .expect("install task")
-            .expect_err("shutdown must reject queued installation");
-
-        // Assert
-        assert!(matches!(error, ExternalPluginsError::ShuttingDown));
-        assert!(
-            !plugins_dir.exists(),
-            "a rejected queued install must not create plugin state"
-        );
-    }
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn single_reload_preserves_the_process_and_actor_when_a_different_file_is_active() {
-        use crate::install::{LocalFileReceipt, LocalFileSource};
-        if !std::path::Path::new("/usr/bin/python3").exists() {
-            return;
-        }
-        let database = match temps_test_utils::TestDatabase::with_migrations().await {
-            Ok(db) => db,
-            Err(error)
-                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-            {
-                eprintln!("Skipping single plugin reload fixture: Docker unavailable");
-                return;
-            }
-            Err(error) => panic!("fixture database: {error}"),
-        };
-        let root = tempfile::tempdir_in("/tmp").unwrap();
-        let name = "reload-fixture";
-        let version = "1.0.0";
-        let mut config =
-            ExternalPluginConfig::new(root.path().into(), "postgres://localhost/test".into());
-        config.sockets_dir = root.path().join("sockets");
-        std::fs::create_dir_all(&config.sockets_dir).unwrap();
-        let service =
-            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
-        let binary = root.path().join("upload");
-        let mut bytes = protocol_v2_fixture(name, version);
-        std::fs::write(&binary, &bytes).unwrap();
-        let mut receipt = LocalFileReceipt {
-            source: LocalFileSource::File,
-            plugin_name: name.into(),
-            version: version.into(),
-            platform: platform_target().unwrap(),
-            sha256: hex::encode(Sha256::digest(&bytes)),
-        };
-        service.install_file(&receipt, &binary).await.unwrap();
-        let original = service.manager.socket_path_for(name).await.unwrap();
-
-        // The new receipt and actor have committed, while the original process remains live.
-        bytes.extend_from_slice(b"\n# replacement release\n");
-        std::fs::write(&binary, &bytes).unwrap();
-        receipt.sha256 = hex::encode(Sha256::digest(&bytes));
-        let candidate = PluginInstaller::prepare_file(&config.plugins_dir, &receipt, &binary)
-            .await
-            .unwrap();
-        PluginInstaller::new(config.registry.clone())
-            .unwrap()
-            .activate(&candidate)
-            .await
-            .unwrap();
-        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
-        let source = receipt.actor_source();
-        let actor = grants.prepare_actor(name, &source).await.unwrap().actor.id;
-        grants
-            .commit_actor(name, &actor, &receipt.sha256, &source)
-            .await
-            .unwrap();
-
-        let error = service.manager.reload_plugin(name).await.unwrap_err();
-        assert!(error.contains("different release"), "{error}");
-        assert_eq!(
-            service.manager.socket_path_for(name).await.as_ref(),
-            Some(&original)
-        );
-        assert!(original.exists());
-        let settings = service.plugin_ai_tools(name).await.unwrap();
-        assert_eq!(settings.actor_id, actor);
-        assert_eq!(settings.installation_revision, receipt.sha256);
-
-        service.reload_plugins().await.unwrap();
-        service.manager.reload_plugin(name).await.unwrap();
-        let socket = service.manager.socket_path_for(name).await.unwrap();
-        tokio::net::UnixStream::connect(socket)
-            .await
-            .expect("replacement socket accepts connections");
-        let pid = std::fs::read_to_string(config.pids_dir.join(format!("{name}.pid")))
-            .expect("replacement PID file");
-        assert!(pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0));
-        let reloaded = service.plugin_ai_tools(name).await.unwrap();
-        assert_eq!(reloaded.actor_id, actor);
-        assert_eq!(reloaded.installation_revision, receipt.sha256);
-        service.shutdown_all().await;
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn installed_plugin_tools_are_discoverable_gated_and_callable_over_http() {
-        use temps_ai_api_tools::{
-            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsRegistry,
-            ProjectSelectorScope,
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let signing = SigningKey::from_bytes(&[63; 32]);
-        let spec = serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{"description":"List reports"},"responses":{"200":{"description":"ok"}}}}}});
-        let original = String::from_utf8(protocol_v2_fixture("reports", "1.0.0")).unwrap();
-        let (setup, worker) = original
-            .split_once("connection, _ = server.accept()\n")
-            .unwrap();
-        let setup = setup.replace(
-            "args = dict",
-            &format!(
-                "READY = json.dumps(dict(json.loads(READY), openapi=json.loads({})))\nargs = dict",
-                serde_json::to_string(&spec.to_string()).unwrap()
-            ),
-        );
-        let worker = worker.replace("websocket_key = headers[\"sec-websocket-key\"]", r#"if "sec-websocket-key" not in headers:
-    body = json.dumps({"reports": [], "user_id": headers.get("x-temps-user-id")}).encode()
-    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
-    connection.close()
-    return
-websocket_key = headers["sec-websocket-key"]"#);
-        let worker = worker
-            .lines()
-            .map(|line| format!("    {line}\n"))
-            .collect::<String>();
-        let binary = format!("{setup}import threading\ndef respond(connection):\n{worker}\nwhile True:\n    connection, _ = server.accept()\n    threading.Thread(target=respond, args=(connection,), daemon=True).start()\n").into_bytes();
-        let url = serve_artifact_once(binary.clone()).await;
-        let registry_config = crate::catalog::RegistryConfig::local(
-            url.clone(),
-            "fixture-key",
-            signing.verifying_key().to_bytes(),
-        );
-        let mut config =
-            ExternalPluginConfig::new(temp.path().into(), "postgres://localhost/test".into())
-                .with_registry(registry_config);
-        // Keep Unix sockets short on every platform.
-        let sockets = tempfile::tempdir_in("/tmp").unwrap();
-        config.sockets_dir = sockets.path().into();
-        let database = match temps_test_utils::TestDatabase::with_migrations().await {
-            Ok(database) => database,
-            Err(error)
-                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-            {
-                eprintln!("Skipping installed plugin AI tools test: Docker unavailable");
-                return;
-            }
-            Err(error) => panic!("fixture database: {error}"),
-        };
-        let service = ExternalPluginsService::new_empty(config, None, database.connection_arc());
-        service
-            .install_selected(selected_plugin(
-                url, &binary, "reports", "1.0.0", 1, &signing,
-            ))
-            .await
-            .unwrap();
-        let settings = service.plugin_ai_tools("reports").await.unwrap();
-        assert!(!settings.enabled);
-        assert_eq!(settings.tools.len(), 1);
-        let registry: Arc<PluginToolsRegistry> = service.ai_tools.clone();
-        let handle = ApiToolsHandle::new();
-        let target = handle.clone();
-        let spec = serde_json::from_value(spec).unwrap();
-        registry.bind(
-            InternalApiCaller::new_allowlisted(
-                crate::plugin::DynamicPluginRouter {
-                    inner: service.proxy_router(),
-                }
-                .router(),
-                &spec,
-                vec![],
-            ),
-            PluginToolAccess::Read,
-            Arc::new(temps_core::audit::NoopAuditLogger),
-            move |caller| target.set(caller),
-        );
-        let user = serde_json::from_value(serde_json::json!({"id":42,"name":"Reader","email":"reader@example.test","email_verified":true,"must_change_password":false,"mfa_enabled":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now()})).unwrap();
-        let scope = ApiCallScope {
-            auth: temps_auth::context::AuthContext::new_session(
-                user,
-                temps_auth::permissions::Role::Admin,
-            ),
-            project_scope: ProjectSelectorScope::Unrestricted,
-            origin: None,
-            secrets: None,
-        };
-        assert!(!handle.get().unwrap().search("plugin.reports", &scope)[0].enabled);
-        assert!(handle
-            .get()
-            .unwrap()
-            .call("plugin.reports.list", serde_json::json!({}), &scope)
-            .await
-            .is_err());
-        service
-            .update_plugin_ai_tools(
-                "reports",
-                crate::ai_tools::UpdatePluginAiTools {
-                    actor_id: settings.actor_id.clone(),
-                    installation_revision: settings.installation_revision.clone(),
-                    enabled: true,
-                },
-            )
-            .await
-            .unwrap();
-        // The actor commit can be durable while the previous verified process
-        // still serves requests. Consent for B must never expose A's schema.
-        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
-        let other_digest = "ab".repeat(32);
-        grants
-            .commit_binary_hash("reports", &other_digest)
-            .await
-            .unwrap();
-        let other = service
-            .update_plugin_ai_tools(
-                "reports",
-                crate::ai_tools::UpdatePluginAiTools {
-                    actor_id: settings.actor_id.clone(),
-                    installation_revision: other_digest,
-                    enabled: true,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(other.enabled);
-        assert!(other.tools.is_empty());
-        service.rebuild_ai_tools().await;
-        assert!(handle
-            .get()
-            .unwrap()
-            .search("plugin.reports", &scope)
-            .is_empty());
-        assert!(handle
-            .get()
-            .unwrap()
-            .call("plugin.reports.list", serde_json::json!({}), &scope)
-            .await
-            .is_err());
-
-        // Reload reconciles the installed binary and requires its own approval.
-        service.reload_plugins().await.unwrap();
-        let reloaded = service.plugin_ai_tools("reports").await.unwrap();
-        assert_eq!(
-            reloaded.installation_revision,
-            settings.installation_revision
-        );
-        assert!(!reloaded.enabled);
-        assert_eq!(reloaded.tools.len(), 1);
-        service
-            .update_plugin_ai_tools(
-                "reports",
-                crate::ai_tools::UpdatePluginAiTools {
-                    actor_id: reloaded.actor_id,
-                    installation_revision: reloaded.installation_revision,
-                    enabled: true,
-                },
-            )
-            .await
-            .unwrap();
-        let result = handle
-            .get()
-            .unwrap()
-            .call("plugin.reports.list", serde_json::json!({}), &scope)
-            .await
-            .unwrap();
-        assert_eq!(result.body["user_id"], "42");
-        service.reload_plugins().await.unwrap();
-        assert!(service.plugin_ai_tools("reports").await.unwrap().enabled);
-        service
-            .update_plugin_ai_tools(
-                "reports",
-                crate::ai_tools::UpdatePluginAiTools {
-                    actor_id: settings.actor_id,
-                    installation_revision: settings.installation_revision,
-                    enabled: false,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(handle
-            .get()
-            .unwrap()
-            .call("plugin.reports.list", serde_json::json!({}), &scope)
-            .await
-            .is_err());
-        service.uninstall_plugin("reports").await.unwrap();
-        assert!(handle
-            .get()
-            .unwrap()
-            .search("plugin.reports", &scope)
-            .is_empty());
-        service.shutdown_all().await;
     }
 }

@@ -137,6 +137,9 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [116](./116-agents-run-on-the-ai-gateway-only.md) | Agents run on the AI gateway only | Proposed | supersedes [037](./037-subscription-agent-cli-providers.md) |
 | [117](./117-ingress-provider-trait.md) | An ingress provider is one trait implementation | Proposed | supersedes [058](./058-ingress-modes-and-a-shared-app-domain.md) |
 | [118](./118-workload-capabilities-written-once.md) | A workload capability is written once; each kind keeps its own entities | Accepted | amends [052](./052-common-workload-model.md) |
+| [119](./119-a-plugin-is-a-temps-service.md) | A plugin is a Temps service | Proposed | supersedes in part [121](./121-external-plugins-run-in-containers.md) |
+| [120](./120-plugin-tiers-permissions-builds-and-controls.md) | Plugin tiers, permissions, builds and controls | Proposed |  |
+| [121](./121-external-plugins-run-in-containers.md) | External plugins run in containers | Superseded | superseded in part by [119](./119-a-plugin-is-a-temps-service.md) |
 
 ## Supporting documents
 

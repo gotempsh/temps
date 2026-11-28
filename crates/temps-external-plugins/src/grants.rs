@@ -7,6 +7,9 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_plugin_protocol::channel::{PluginActorInfo, PluginHostPermission};
+
+use crate::scope::{PluginWriteArea, MAX_WRITE_PROJECTS};
+use crate::service_runtime::ServiceBinding;
 use thiserror::Error;
 
 pub const MAX_PROMPT_BYTES: u32 = 65_536;
@@ -18,6 +21,12 @@ pub struct PluginGrantConfig {
     pub permissions: Vec<PluginHostPermission>,
     pub ai_daily_call_limit: u32,
     pub ai_max_output_tokens: u32,
+    /// What a plugin granted `api_write` may change. Empty: nothing.
+    #[serde(default)]
+    pub write_areas: Vec<PluginWriteArea>,
+    /// The only projects those changes may touch. Absent: every project.
+    #[serde(default)]
+    pub write_project_ids: Option<Vec<i32>>,
 }
 
 impl Default for PluginGrantConfig {
@@ -26,6 +35,8 @@ impl Default for PluginGrantConfig {
             permissions: Vec::new(),
             ai_daily_call_limit: 100,
             ai_max_output_tokens: 1_024,
+            write_areas: Vec::new(),
+            write_project_ids: None,
         }
     }
 }
@@ -34,6 +45,26 @@ impl Default for PluginGrantConfig {
 pub struct PluginGrants {
     pub actor: PluginActorInfo,
     pub config: PluginGrantConfig,
+}
+
+/// A plugin that runs as a Temps service, as its actor row records it.
+#[derive(Debug, Clone)]
+pub struct StoredServicePlugin {
+    pub name: String,
+    /// The service and environment it runs as; `None` once either has been
+    /// deleted.
+    pub binding: Option<ServiceBinding>,
+    /// The manifest it last answered with.
+    pub manifest: Option<temps_plugin_protocol::PluginManifest>,
+    /// Who stands behind the plugin.
+    pub tier: crate::tier::PluginTier,
+    /// The build it is pinned to, and the update that waits, if any.
+    pub pin: crate::updates::BuildPin,
+    /// An administrator switched it off: Temps attaches to nothing.
+    pub disabled: bool,
+    pub disabled_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The user who switched it off, while that user exists.
+    pub disabled_by: Option<i32>,
 }
 
 #[derive(Debug, Error)]
@@ -48,8 +79,6 @@ pub enum GrantError {
     Invalid { plugin_name: String, reason: String },
     #[error("Plugin actor for '{plugin_name}' changed while grants were being approved")]
     ActorChanged { plugin_name: String },
-    #[error("Could not confirm the activation of plugin '{plugin_name}' after losing its commit acknowledgement: {source}")]
-    ActivationUnconfirmed { plugin_name: String, source: DbErr },
     #[error("Database operation '{operation}' failed for plugin '{plugin_name}': {source}")]
     Database {
         plugin_name: String,
@@ -188,24 +217,68 @@ impl PluginGrantService {
         Ok(grants)
     }
 
-    /// Commit the binary identity only after the candidate has passed startup
-    /// verification and its installation has been activated.
-    pub async fn commit_binary_hash(
+    /// Where the active actor of `plugin_name` was installed from, or `None`
+    /// when the plugin has no active actor.
+    pub async fn active_source(&self, plugin_name: &str) -> Result<Option<String>, GrantError> {
+        let database = |operation| {
+            move |source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation,
+                source,
+            }
+        };
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT source_identity FROM external_plugin_actors WHERE plugin_name=$1 AND active=TRUE",
+                [plugin_name.into()],
+            ))
+            .await
+            .map_err(database("read actor source"))?;
+        match row {
+            None => Ok(None),
+            Some(row) => row
+                .try_get("", "source_identity")
+                .map(Some)
+                .map_err(database("decode actor source")),
+        }
+    }
+
+    /// Record that the active actor of `plugin_name` runs as a Temps service,
+    /// the manifest it answered with, and the build Temps attached to: that
+    /// build becomes the approved one, and no update waits any more.
+    pub async fn bind_service(
         &self,
         plugin_name: &str,
-        sha256: &str,
+        binding: ServiceBinding,
+        manifest: &temps_plugin_protocol::PluginManifest,
+        build: &str,
+        deployment_id: i32,
     ) -> Result<(), GrantError> {
+        let manifest = serde_json::to_value(manifest).map_err(|error| GrantError::Invalid {
+            plugin_name: plugin_name.into(),
+            reason: format!("its manifest cannot be stored: {error}"),
+        })?;
         let result = self
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE external_plugin_actors SET ai_tools_enabled=CASE WHEN binary_sha256 IS DISTINCT FROM $2 THEN FALSE ELSE ai_tools_enabled END,binary_sha256=$2,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
-                [plugin_name.into(), sha256.into()],
+                "UPDATE external_plugin_actors SET isolation='service',project_id=$2,environment_id=$3,manifest=$4,tier=$5,pinned_build=$6,pinned_deployment_id=$7,pending_build=NULL,pending_deployment_id=NULL,pending_manifest=NULL,pending_review=NULL,pending_since=NULL,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
+                [
+                    plugin_name.into(),
+                    binding.project_id.into(),
+                    binding.environment_id.into(),
+                    manifest.into(),
+                    crate::tier::PluginTier::of_added_service().as_str().into(),
+                    build.into(),
+                    deployment_id.into(),
+                ],
             ))
             .await
             .map_err(|source| GrantError::Database {
                 plugin_name: plugin_name.into(),
-                operation: "commit activated binary identity",
+                operation: "bind service",
                 source,
             })?;
         if result.rows_affected() != 1 {
@@ -216,113 +289,91 @@ impl PluginGrantService {
         Ok(())
     }
 
-    pub async fn commit_actor(
+    /// Record that an administrator switched the active plugin `plugin_name`
+    /// off (`by` is who) or on again.
+    pub async fn set_disabled(
         &self,
         plugin_name: &str,
-        actor_id: &str,
-        sha256: &str,
-        source_identity: &str,
+        disabled: Option<i32>,
     ) -> Result<(), GrantError> {
-        let transaction = self
+        let result = self
             .db
-            .begin()
-            .await
-            .map_err(|source| GrantError::Database {
-                plugin_name: plugin_name.into(),
-                operation: "begin actor activation",
-                source,
-            })?;
-        transaction
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                [plugin_name.into()],
+                "UPDATE external_plugin_actors SET disabled=$2, \
+                 disabled_at=CASE WHEN $2 THEN NOW() ELSE NULL END, disabled_by=$3, \
+                 updated_at=NOW() \
+                 WHERE plugin_name=$1 AND active=TRUE",
+                [
+                    plugin_name.into(),
+                    disabled.is_some().into(),
+                    disabled.into(),
+                ],
             ))
             .await
             .map_err(|source| GrantError::Database {
                 plugin_name: plugin_name.into(),
-                operation: "lock actor activation",
+                operation: "record whether the plugin is disabled",
                 source,
             })?;
-        transaction.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "DELETE FROM external_plugin_actors WHERE plugin_name=$1 AND (active=FALSE OR source_identity<>$2)",
-            [plugin_name.into(), source_identity.into()],
-        )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "rotate activated actor", source })?;
-        let result = transaction.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES($1::uuid,$2,$3,$4,TRUE) ON CONFLICT(plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
-            [actor_id.into(), plugin_name.into(), sha256.into(), source_identity.into()],
-        )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "commit activated actor", source })?;
         if result.rows_affected() != 1 {
-            return Err(GrantError::ActorChanged {
+            return Err(GrantError::NotFound {
                 plugin_name: plugin_name.into(),
             });
         }
-        match transaction.commit().await {
-            Ok(()) => Ok(()),
-            Err(source) => {
-                self.reconcile_actor_commit(plugin_name, actor_id, sha256, source_identity, source)
-                    .await
-            }
-        }
+        Ok(())
     }
 
-    /// A lost COMMIT reply can mean that the write is already durable. Take the
-    /// writer's advisory lock on a fresh connection before inspecting its result.
-    async fn reconcile_actor_commit(
-        &self,
-        plugin_name: &str,
-        actor_id: &str,
-        sha256: &str,
-        source_identity: &str,
-        commit_error: DbErr,
-    ) -> Result<(), GrantError> {
-        tracing::warn!(plugin = plugin_name, error = %commit_error, "Checking plugin identity after an unacknowledged commit");
-        let readback = async {
-            let txn = self
-                .db
-                .begin_with_config(Some(sea_orm::IsolationLevel::ReadCommitted), None)
-                .await?;
-            txn.execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                [plugin_name.into()],
-            ))
-            .await?;
-            let row = txn.query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT 1 FROM external_plugin_actors WHERE plugin_name=$1 AND id=$2::uuid AND binary_sha256=$3 AND source_identity=$4 AND active=TRUE",
-                [plugin_name.into(), actor_id.into(), sha256.into(), source_identity.into()],
-            )).await?;
-            txn.rollback().await?;
-            Ok::<bool, DbErr>(row.is_some())
+    /// Every active plugin that runs as a Temps service, in one query.
+    pub async fn service_plugins(&self) -> Result<Vec<StoredServicePlugin>, GrantError> {
+        let database = |source| GrantError::Database {
+            plugin_name: "*".into(),
+            operation: "list service plugins",
+            source,
         };
-        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(10), readback)
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT plugin_name, project_id, environment_id, tier, disabled, disabled_at, disabled_by, {} FROM external_plugin_actors WHERE active=TRUE AND isolation='service' ORDER BY plugin_name",
+                    crate::updates::BuildPin::COLUMNS
+                ),
+            ))
             .await
-            .unwrap_or_else(|_| {
-                Err(DbErr::Custom(
-                    "timed out reading the committed actor identity".into(),
-                ))
-            })
-            .map_err(|source| GrantError::ActivationUnconfirmed {
-                plugin_name: plugin_name.into(),
-                source,
-            })?;
-        if confirmed {
-            Ok(())
-        } else {
-            Err(GrantError::Database {
-                plugin_name: plugin_name.into(),
-                operation: "commit actor activation",
-                source: commit_error,
-            })
+            .map_err(database)?;
+        let mut plugins = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("", "plugin_name").map_err(database)?;
+            let project_id: Option<i32> = row.try_get("", "project_id").map_err(database)?;
+            let environment_id: Option<i32> =
+                row.try_get("", "environment_id").map_err(database)?;
+            let tier: String = row.try_get("", "tier").map_err(database)?;
+            let pin = crate::updates::BuildPin::from_row(&row).map_err(database)?;
+            plugins.push(StoredServicePlugin {
+                disabled: row.try_get("", "disabled").map_err(database)?,
+                disabled_at: row.try_get("", "disabled_at").map_err(database)?,
+                disabled_by: row.try_get("", "disabled_by").map_err(database)?,
+                tier: crate::tier::PluginTier::from_stored(&tier),
+                binding: project_id
+                    .zip(environment_id)
+                    .map(|(project_id, environment_id)| ServiceBinding {
+                        project_id,
+                        environment_id,
+                    }),
+                // A manifest this build cannot read is the same as none: the
+                // plugin answers a current one when it is next attached to.
+                manifest: pin.approved.clone(),
+                pin,
+                name,
+            });
         }
+        Ok(plugins)
     }
 
     pub async fn get(&self, plugin_name: &str) -> Result<PluginGrants, GrantError> {
         let row = self.db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "SELECT a.id::text AS id,a.plugin_name,a.active,COALESCE(g.permissions,ARRAY[]::text[]) AS permissions,COALESCE(g.ai_daily_call_limit,100) AS ai_daily_call_limit,COALESCE(g.ai_max_output_tokens,1024) AS ai_max_output_tokens FROM external_plugin_actors a LEFT JOIN external_plugin_grants g ON g.actor_id=a.id WHERE a.plugin_name=$1 AND a.active=TRUE",
+            "SELECT a.id::text AS id,a.plugin_name,a.active,COALESCE(g.permissions,ARRAY[]::text[]) AS permissions,COALESCE(g.ai_daily_call_limit,100) AS ai_daily_call_limit,COALESCE(g.ai_max_output_tokens,1024) AS ai_max_output_tokens,COALESCE(g.write_areas,ARRAY[]::text[]) AS write_areas,g.write_project_ids FROM external_plugin_actors a LEFT JOIN external_plugin_grants g ON g.actor_id=a.id WHERE a.plugin_name=$1 AND a.active=TRUE",
             [plugin_name.into()])).await
             .map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "read grants", source })?
             .ok_or_else(|| GrantError::NotFound { plugin_name: plugin_name.into() })?;
@@ -356,6 +407,25 @@ impl PluginGrantService {
                     operation: "decode AI token limit",
                     source,
                 })?;
+        let decode = |operation: &'static str| {
+            move |source| GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation,
+                source,
+            }
+        };
+        let stored_areas: Vec<String> = row
+            .try_get("", "write_areas")
+            .map_err(decode("decode write areas"))?;
+        // An area this build does not know grants nothing.
+        let mut write_areas: Vec<PluginWriteArea> = stored_areas
+            .iter()
+            .filter_map(|value| PluginWriteArea::from_stored(value))
+            .collect();
+        write_areas.sort();
+        let write_project_ids: Option<Vec<i32>> = row
+            .try_get("", "write_project_ids")
+            .map_err(decode("decode write projects"))?;
         Ok(PluginGrants {
             actor: PluginActorInfo {
                 id: row
@@ -372,6 +442,8 @@ impl PluginGrantService {
                 permissions,
                 ai_daily_call_limit: daily.max(0) as u32,
                 ai_max_output_tokens: output.max(0) as u32,
+                write_areas,
+                write_project_ids,
             },
         })
     }
@@ -394,14 +466,20 @@ impl PluginGrantService {
         config: PluginGrantConfig,
     ) -> Result<PluginGrants, GrantError> {
         validate(plugin_name, &config)?;
+        self.ensure_projects_exist(plugin_name, &config).await?;
         let values = config
             .permissions
             .iter()
             .map(|p| p.as_str().to_string())
             .collect::<Vec<_>>();
+        let areas = config
+            .write_areas
+            .iter()
+            .map(|area| area.as_str().to_string())
+            .collect::<Vec<_>>();
         let result = self.db.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_grants(actor_id,permissions,ai_daily_call_limit,ai_max_output_tokens) SELECT id,$3,$4,$5 FROM external_plugin_actors WHERE plugin_name=$1 AND id=$2::uuid AND active=TRUE ON CONFLICT(actor_id) DO UPDATE SET permissions=EXCLUDED.permissions,ai_daily_call_limit=EXCLUDED.ai_daily_call_limit,ai_max_output_tokens=EXCLUDED.ai_max_output_tokens,updated_at=NOW()",
-            [plugin_name.into(), actor_id.into(), values.into(), (config.ai_daily_call_limit as i32).into(), (config.ai_max_output_tokens as i32).into()])).await
+            "INSERT INTO external_plugin_grants(actor_id,permissions,ai_daily_call_limit,ai_max_output_tokens,write_areas,write_project_ids) SELECT id,$3,$4,$5,$6,$7 FROM external_plugin_actors WHERE plugin_name=$1 AND id=$2::uuid AND active=TRUE ON CONFLICT(actor_id) DO UPDATE SET permissions=EXCLUDED.permissions,ai_daily_call_limit=EXCLUDED.ai_daily_call_limit,ai_max_output_tokens=EXCLUDED.ai_max_output_tokens,write_areas=EXCLUDED.write_areas,write_project_ids=EXCLUDED.write_project_ids,updated_at=NOW()",
+            [plugin_name.into(), actor_id.into(), values.into(), (config.ai_daily_call_limit as i32).into(), (config.ai_max_output_tokens as i32).into(), areas.into(), config.write_project_ids.clone().into()])).await
             .map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "update grants", source })?;
         if result.rows_affected() != 1 {
             return Err(GrantError::ActorChanged {
@@ -409,6 +487,46 @@ impl PluginGrantService {
             });
         }
         self.get(plugin_name).await
+    }
+
+    /// A limit to some projects may only name projects that exist: a limit
+    /// to a project that was deleted, or mistyped, would look like a limit
+    /// and allow nothing.
+    async fn ensure_projects_exist(
+        &self,
+        plugin_name: &str,
+        config: &PluginGrantConfig,
+    ) -> Result<(), GrantError> {
+        let Some(projects) = &config.write_project_ids else {
+            return Ok(());
+        };
+        let database = |source| GrantError::Database {
+            plugin_name: plugin_name.into(),
+            operation: "check the projects a plugin is limited to",
+            source,
+        };
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM projects WHERE id = ANY($1)",
+                [projects.clone().into()],
+            ))
+            .await
+            .map_err(database)?;
+        let mut existing = Vec::with_capacity(rows.len());
+        for row in rows {
+            existing.push(row.try_get::<i32>("", "id").map_err(database)?);
+        }
+        match projects.iter().find(|id| !existing.contains(id)) {
+            None => Ok(()),
+            Some(missing) => Err(GrantError::Invalid {
+                plugin_name: plugin_name.into(),
+                reason: format!(
+                    "project {missing} does not exist, so changes cannot be limited to it"
+                ),
+            }),
+        }
     }
 
     pub async fn revoke_actor(&self, plugin_name: &str) -> Result<(), GrantError> {
@@ -443,6 +561,44 @@ fn validate(plugin_name: &str, config: &PluginGrantConfig) -> Result<(), GrantEr
             ),
         });
     }
+    let invalid = |reason: String| GrantError::Invalid {
+        plugin_name: plugin_name.into(),
+        reason,
+    };
+    let may_write = config.permissions.contains(&PluginHostPermission::ApiWrite);
+    if !may_write && (!config.write_areas.is_empty() || config.write_project_ids.is_some()) {
+        return Err(invalid(
+            "what a plugin may change can only be chosen together with the api_write permission"
+                .to_string(),
+        ));
+    }
+    let mut areas = config.write_areas.clone();
+    areas.sort();
+    areas.dedup();
+    if areas.len() != config.write_areas.len() {
+        return Err(invalid("an area to change is listed twice".to_string()));
+    }
+    if let Some(projects) = &config.write_project_ids {
+        if projects.is_empty() {
+            return Err(invalid(
+                "a limit to some projects must list at least one; omit it to allow every project"
+                    .to_string(),
+            ));
+        }
+        if projects.len() > MAX_WRITE_PROJECTS {
+            return Err(invalid(format!(
+                "changes can be limited to at most {MAX_WRITE_PROJECTS} projects"
+            )));
+        }
+        let mut unique = projects.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != projects.len() || projects.iter().any(|id| *id <= 0) {
+            return Err(invalid(
+                "the projects to limit changes to must be distinct positive ids".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -463,258 +619,6 @@ fn parse_permission(value: &str) -> Option<PluginHostPermission> {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
-
-    #[tokio::test]
-    async fn changed_binary_resets_only_ai_consent_and_stale_forms_cannot_enable_it() {
-        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
-        use temps_entities::external_plugin_actors as actors;
-        let database = match temps_test_utils::TestDatabase::with_migrations().await {
-            Ok(database) => database,
-            Err(error)
-                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-            {
-                eprintln!("Skipping binary consent test: Docker unavailable");
-                return;
-            }
-            Err(error) => panic!("fixture database: {error}"),
-        };
-        let db = database.connection_arc();
-        let grants = PluginGrantService::new(db.clone());
-        let candidate = grants
-            .prepare_actor("reports", "fixture-source")
-            .await
-            .unwrap();
-        let id = candidate.actor.id.clone();
-        grants
-            .commit_actor("reports", &id, "binary-one", "fixture-source")
-            .await
-            .unwrap();
-        let actor_id = uuid::Uuid::parse_str(&id).unwrap();
-        for activation in ["binary", "actor", "startup"] {
-            let actor = actors::Entity::find_by_id(actor_id)
-                .one(db.as_ref())
-                .await
-                .unwrap()
-                .unwrap();
-            let old_hash = actor.binary_sha256.clone();
-            let mut active: actors::ActiveModel = actor.into();
-            active.ai_tools_enabled = Set(true);
-            active.update(db.as_ref()).await.unwrap();
-            grants
-                .commit_binary_hash("reports", &old_hash)
-                .await
-                .unwrap();
-            assert!(
-                actors::Entity::find_by_id(actor_id)
-                    .one(db.as_ref())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .ai_tools_enabled
-            );
-            // Same-binary restart preserves consent and actor identity.
-            let rebound = grants
-                .ensure_actor("reports", &old_hash, "fixture-source")
-                .await
-                .unwrap();
-            assert_eq!(rebound.actor.id, id);
-            assert!(
-                actors::Entity::find_by_id(actor_id)
-                    .one(db.as_ref())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .ai_tools_enabled
-            );
-            let next_hash = match activation {
-                "actor" => "binary-three",
-                "startup" => "binary-four",
-                _ => "binary-two",
-            };
-            if activation == "startup" {
-                // The installation already selects the new verified binary,
-                // but the previous actor commit did not run before restart.
-                let rebound = grants
-                    .ensure_actor("reports", next_hash, "fixture-source")
-                    .await
-                    .unwrap();
-                assert_eq!(rebound.actor.id, id);
-            } else if activation == "actor" {
-                grants
-                    .commit_actor("reports", &id, next_hash, "fixture-source")
-                    .await
-                    .unwrap();
-            } else {
-                grants
-                    .commit_binary_hash("reports", next_hash)
-                    .await
-                    .unwrap();
-            }
-            let changed = actors::Entity::find_by_id(actor_id)
-                .one(db.as_ref())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(!changed.ai_tools_enabled);
-            assert_eq!(changed.binary_sha256, next_hash);
-            let service = crate::service::ExternalPluginsService::new_empty(
-                crate::manager::ExternalPluginConfig::new(
-                    std::env::temp_dir().join("binary-consent-test"),
-                    "postgres://localhost/test".into(),
-                ),
-                None,
-                db.clone(),
-            );
-            let error = service
-                .update_plugin_ai_tools(
-                    "reports",
-                    crate::ai_tools::UpdatePluginAiTools {
-                        actor_id: id.clone(),
-                        installation_revision: old_hash,
-                        enabled: true,
-                    },
-                )
-                .await
-                .unwrap_err();
-            assert!(matches!(error, GrantError::ActorChanged { .. }));
-        }
-    }
-
-    #[tokio::test]
-    async fn lost_commit_acknowledgement_uses_the_final_active_identity() {
-        let database = match temps_test_utils::TestDatabase::with_migrations().await {
-            Ok(database) => database,
-            Err(error)
-                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-            {
-                eprintln!("Skipping commit reconciliation test: Docker unavailable");
-                return;
-            }
-            Err(error) => panic!("fixture database: {error}"),
-        };
-        let db = database.connection_arc();
-        let service = PluginGrantService::new(db.clone());
-        let name = "reports";
-        let actor = uuid::Uuid::new_v4().to_string();
-        service
-            .commit_actor(name, &actor, "previous", "fixture-source")
-            .await
-            .unwrap();
-
-        let writer = db.begin().await.unwrap();
-        writer
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                [name.into()],
-            ))
-            .await
-            .unwrap();
-        writer
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "UPDATE external_plugin_actors SET binary_sha256='candidate' WHERE plugin_name=$1",
-                [name.into()],
-            ))
-            .await
-            .unwrap();
-
-        let reconcile = |id, digest, source| {
-            service.reconcile_actor_commit(
-                name,
-                id,
-                digest,
-                source,
-                DbErr::Custom("lost commit acknowledgement".into()),
-            )
-        };
-        let mut pending = Box::pin(reconcile(&actor, "candidate", "fixture-source"));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
-                .await
-                .is_err()
-        );
-        writer.commit().await.unwrap();
-        pending
-            .await
-            .expect("keep the committed candidate after losing its reply");
-
-        let different = uuid::Uuid::new_v4().to_string();
-        for (id, digest, source) in [
-            (actor.as_str(), "previous", "fixture-source"),
-            (actor.as_str(), "candidate", "different-source"),
-            (different.as_str(), "candidate", "fixture-source"),
-        ] {
-            assert!(matches!(
-                reconcile(id, digest, source).await,
-                Err(GrantError::Database { .. })
-            ));
-        }
-        service.revoke_actor(name).await.unwrap();
-        assert!(matches!(
-            reconcile(&actor, "candidate", "fixture-source").await,
-            Err(GrantError::Database { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn unreadable_actor_after_commit_has_an_unknown_outcome() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_errors([DbErr::Custom("unavailable".into())])
-            .into_connection();
-        let result = PluginGrantService::new(Arc::new(db))
-            .reconcile_actor_commit(
-                "reports",
-                &uuid::Uuid::new_v4().to_string(),
-                "candidate",
-                "fixture-source",
-                DbErr::Custom("lost commit acknowledgement".into()),
-            )
-            .await;
-        assert!(
-            matches!(result, Err(GrantError::ActivationUnconfirmed { plugin_name, .. }) if plugin_name=="reports")
-        );
-    }
-
-    #[tokio::test]
-    async fn commit_binary_hash_requires_one_active_actor() {
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 0,
-                }])
-                .into_connection(),
-        );
-        let service = PluginGrantService::new(db);
-
-        let result = service
-            .commit_binary_hash("missing-plugin", "sha256:verified")
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(GrantError::NotFound { plugin_name }) if plugin_name == "missing-plugin"
-        ));
-    }
-
-    #[tokio::test]
-    async fn commit_binary_hash_accepts_exactly_one_active_actor() {
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_exec_results([MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 1,
-                }])
-                .into_connection(),
-        );
-        let service = PluginGrantService::new(db);
-
-        service
-            .commit_binary_hash("active-plugin", "sha256:verified")
-            .await
-            .expect("the activated actor hash should commit");
-    }
 
     #[tokio::test]
     async fn update_for_actor_rejects_a_rotated_actor_without_granting_replacement() {

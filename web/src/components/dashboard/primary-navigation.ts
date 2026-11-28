@@ -47,7 +47,7 @@ function isPathOrChild(pathname: string, base: string): boolean {
   return pathname === base || pathname.startsWith(`${base}/`)
 }
 
-/** `/settings/plugins` and `/settings/plugins/install`. */
+/** `/settings/plugins` and any page under it. */
 export function isPluginsManagementRoute(pathname: string): boolean {
   return isPathOrChild(pathname, PLUGINS_MANAGEMENT_URL)
 }

@@ -5,6 +5,7 @@ import { useForm, Controller } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getPluginGrants, putPluginGrants } from '@/api/client/sdk.gen'
+import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
   Dialog,
   DialogContent,
@@ -16,8 +17,12 @@ import {
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PluginGrantFields } from './PluginGrantFields'
+import { PluginReach } from './PluginWriteScope'
 import {
   emptyPluginGrants,
+  MAX_WRITE_SERVICES,
+  pluginGrantErrors,
+  pluginGrantsBody,
   pluginGrantsSchema,
   type PluginGrantsValues,
 } from '@/lib/plugin-grants'
@@ -52,6 +57,13 @@ export function PluginPermissionsDialog({
     staleTime: 0,
     refetchOnWindowFocus: false,
   })
+  // The services a permission to change can be limited to.
+  const services = useQuery({
+    ...getProjectsOptions({
+      query: { page: 1, per_page: MAX_WRITE_SERVICES },
+    }),
+    enabled: open && name !== null,
+  })
   const form = useForm<{ grants: PluginGrantsValues }>({
     resolver: zodResolver(schema),
     defaultValues: { grants: emptyPluginGrants() },
@@ -64,6 +76,8 @@ export function PluginPermissionsDialog({
           permissions: grants.data.permissions,
           ai_daily_call_limit: grants.data.ai.daily_call_limit,
           ai_max_output_tokens: grants.data.ai.max_output_tokens,
+          write_areas: grants.data.write_areas,
+          write_project_ids: grants.data.write_project_ids ?? null,
         },
       })
     else reset({ grants: emptyPluginGrants() })
@@ -74,7 +88,7 @@ export function PluginPermissionsDialog({
       return (
         await putPluginGrants({
           path: { name },
-          body: values,
+          body: pluginGrantsBody(values),
           throwOnError: true,
         })
       ).data
@@ -106,8 +120,8 @@ export function PluginPermissionsDialog({
         <DialogHeader>
           <DialogTitle>Permissions for {name}</DialogTitle>
           <DialogDescription>
-            Control this plugin’s access to Temps. Changes apply to subsequent
-            calls without a restart.
+            This plugin can do only what is allowed here. Changes apply to its
+            next call, without a restart.
           </DialogDescription>
         </DialogHeader>
         {grants.isPending ? (
@@ -144,9 +158,17 @@ export function PluginPermissionsDialog({
                   onChange={field.onChange}
                   disabled={save.isPending || grants.isFetching}
                   requested={grants.data.requested_permissions}
+                  services={(services.data?.projects ?? []).map((service) => ({
+                    id: service.id,
+                    name: service.name,
+                  }))}
+                  servicesLoading={services.isPending}
+                  servicesFailed={services.isError}
+                  servicesTotal={services.data?.total}
                 />
               )}
             />
+            <PluginReach reach={grants.data} />
             {!grants.data.ai.configured && (
               <p className="text-sm text-muted-foreground">
                 {grants.data.ai.reason || 'No AI provider is configured.'}{' '}
@@ -155,11 +177,15 @@ export function PluginPermissionsDialog({
                 </Link>
               </p>
             )}
-            {form.formState.errors.grants && (
-              <p role="alert" className="text-sm text-destructive">
-                Choose 0–10,000 daily AI calls and 1–4,096 output tokens.
+            {pluginGrantErrors(form.formState.errors.grants).map((message) => (
+              <p
+                key={message}
+                role="alert"
+                className="text-sm text-destructive"
+              >
+                {message}
               </p>
-            )}
+            ))}
             <p className="break-all text-xs text-muted-foreground">
               Audit actor: {grants.data.actor.id}
             </p>

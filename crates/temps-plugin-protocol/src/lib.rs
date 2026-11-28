@@ -27,6 +27,7 @@ pub use channel::{
 };
 pub use manifest::{
     HandshakeMessage, NavEntry, NavSection, PluginCapability, PluginEvent, PluginHello,
-    PluginLaunchConfig, PluginManifest, PluginManifestBuilder, PluginReady, UiManifest, UiRoute,
-    EXTERNAL_PLUGIN_PROTOCOL_VERSION, PLUGIN_EVENTS_PATH,
+    PluginLaunchConfig, PluginManifest, PluginManifestBuilder, PluginReady, PluginServiceHello,
+    UiManifest, UiRoute, EXTERNAL_PLUGIN_PROTOCOL_VERSION, PLUGIN_EVENTS_PATH, PLUGIN_HELLO_PATH,
+    SERVICE_AUTH_CONTEXT,
 };
