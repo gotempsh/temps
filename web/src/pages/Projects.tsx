@@ -185,9 +185,9 @@ export function Projects() {
   const itemTotal = pageGroups.length + standaloneTotal
   const totalPages = projectPageCount(itemTotal, pageSize)
   // Only known once the services have answered: before, the projects alone
-  // would put a later page out of range.
-  const isPageOutOfRange =
-    projectsData !== undefined && itemTotal > 0 && page > totalPages
+  // would put a later page out of range. With nothing listed, any page past
+  // the first is out of range too.
+  const isPageOutOfRange = projectsData !== undefined && page > totalPages
 
   const setPagination = useCallback(
     (nextPage: number, nextPageSize = pageSize, replace = false) => {

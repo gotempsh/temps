@@ -57,17 +57,22 @@ const SERVICES = [
   service(8, 'docs-site', null),
 ]
 
-function renderProjects(path: string) {
+function renderProjects(
+  path: string,
+  { groups = GROUPS, services = SERVICES } = {}
+) {
+  /** The page of services each request asked for. */
+  const servicePages: number[] = []
   const api = mockApi({
-    'GET /project-groups': () =>
-      jsonResponse({ groups: GROUPS, total: GROUPS.length }),
+    'GET /project-groups': () => jsonResponse({ groups, total: groups.length }),
     'GET /projects': (request) => {
       const query = new URL(request.url).searchParams
       const page = Number(query.get('page') ?? 1)
       const perPage = Number(query.get('per_page') ?? 20)
+      servicePages.push(page)
       return jsonResponse({
-        projects: SERVICES.slice((page - 1) * perPage, page * perPage),
-        total: SERVICES.length,
+        projects: services.slice((page - 1) * perPage, page * perPage),
+        total: services.length,
         page,
         per_page: perPage,
       })
@@ -97,7 +102,7 @@ function renderProjects(path: string) {
       </AuthContext.Provider>
     </QueryClientProvider>
   )
-  return { view, api }
+  return { view, api, servicePages }
 }
 
 /** The cards on the page, by name, in order. */
@@ -134,6 +139,20 @@ describe('the Projects page pages projects and services together', () => {
     const { api } = renderProjects('/projects?page=2&page_size=9')
     await waitFor(() => expect(cardNames()).toContain('docs-site'))
     expect(cardNames()).toEqual(['docs-site'])
+    api.restore()
+  })
+
+  test('a page past an empty list goes back to the first', async () => {
+    // A filter matching nothing leaves no page 3: the page is page 1 again,
+    // not "3 of 1".
+    const { api, view, servicePages } = renderProjects(
+      '/projects?page=3&page_size=9',
+      { groups: [], services: [] }
+    )
+    await waitFor(() => expect(servicePages).toContain(1))
+    await waitFor(() =>
+      expect(view.queryByLabelText(/^Page \d+ of \d+$/)).toBeNull()
+    )
     api.restore()
   })
 })
