@@ -3350,6 +3350,11 @@ export type ApproveServiceGrant = {
 export type ArchiveFlagResponse = {
     archived_at?: string | null;
     key: string;
+    /**
+     * True when the flag was deleted for good (`purge=true`) and its key is
+     * free again; false when it was archived and can be restored.
+     */
+    purged: boolean;
 };
 
 export type ArchiveMode = 'off' | 'on' | 'always' | 'unknown';
@@ -8679,20 +8684,30 @@ export type CreateAlertRuleRequest = {
     cooldown_minutes?: number;
     enabled?: boolean;
     /**
-     * Optional environment ID to filter alerts
+     * Only alert on errors in this environment of the project. It must be one
+     * of the project's environments; omit or `null` for every environment.
      */
     environment_filter?: number | null;
     /**
-     * Optional error type/level filter
+     * Only alert on errors of this exception type (for example `TypeError`),
+     * compared case-insensitively with the error group's type. Despite the
+     * name it does not match a severity level. Omit, `null` or `""` for
+     * every type.
      */
     error_level_filter?: string | null;
+    /**
+     * Unique within the project (case-insensitive), trimmed, 1-255 characters.
+     */
     name: string;
     /**
      * Notification priority: Low, Normal, High, Critical
      */
     notification_priority?: string;
     /**
-     * Trigger-specific configuration (e.g., {"count": 100, "window_minutes": 60} for frequency)
+     * Trigger-specific configuration. `frequency`: `{"count": 100,
+     * "window_minutes": 60}`; `user_count`: `{"count": 10}` (the user
+     * threshold); `status_change`: `{"statuses": ["resolved"]}`; the other
+     * types take `{}`. Unknown keys are refused.
      */
     trigger_config?: unknown;
     /**
@@ -9391,7 +9406,9 @@ export type CreateGlobalConversationRequest = {
 export type CreateGroupEnvVarRequest = {
     /**
      * Environment slug (e.g. `production`, `staging`) this applies to.
-     * Omit to apply to every environment.
+     * Omit to apply to every environment. When the group has projects, at
+     * least one of them must have an environment with this slug (a 400
+     * names the slugs they do have); an empty group accepts any valid slug.
      */
     environment_slug?: string | null;
     /**
@@ -9791,9 +9808,21 @@ export type CreateNotificationEmailProviderRequest = {
 
 export type CreateNotificationRouteRequest = {
     enabled?: boolean | null;
+    /**
+     * Highest severity the route matches, same values as `min_severity`.
+     * Case-insensitive; stored lower-case.
+     */
     max_severity: string;
+    /**
+     * Lowest severity the route matches: debug, info, warning, error,
+     * critical or emergency. Case-insensitive; stored lower-case.
+     */
     min_severity: string;
     name: string;
+    /**
+     * Providers that receive the matching notifications; at least one.
+     * Duplicates are ignored and the stored list is sorted.
+     */
     provider_ids: Array<number>;
 };
 
@@ -10642,12 +10671,17 @@ export type CreateWebhookRequestBody = {
      */
     enabled?: boolean | null;
     /**
-     * Event types to subscribe to
+     * Event types to subscribe to. Duplicates are stored once.
      */
     events: Array<string>;
-    secret?: SecretString | null;
     /**
-     * Target URL for webhook delivery
+     * Secret for HMAC signature verification (optional). Must not be empty;
+     * omit it for an unsigned webhook.
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery: http(s), at most 2048 characters, and
+     * not a loopback, private, link-local or cloud-metadata address.
      */
     url: string;
 };
@@ -11007,15 +11041,32 @@ export type CustomDomainLookupResponse = {
     custom_domain?: CustomDomainResponse | null;
 };
 
+/**
+ * A custom domain to add. Unknown fields are refused, so a misspelt one is
+ * an error instead of being ignored.
+ */
 export type CustomDomainRequest = {
     branch?: string | null;
+    /**
+     * Hostname. Stored lower-cased and without a trailing dot
+     * (`Shop.Example.COM.` is stored as `shop.example.com`).
+     */
     domain: string;
     environment_id: number;
+    /**
+     * Redirect every request to this URL instead of serving the environment.
+     * `http://` or `https://`; a bare host gets `https://`.
+     */
     redirect_to?: string | null;
     /**
-     * Docker Compose service name this domain routes to (only for docker-compose projects)
+     * Docker Compose service this domain routes to. Only for Docker Compose
+     * projects; refused on others.
      */
     service_name?: string | null;
+    /**
+     * Status of the redirect: 301, 302, 303, 307 or 308. Requires
+     * `redirect_to`.
+     */
     status_code?: number | null;
 };
 
@@ -19077,6 +19128,13 @@ export type GroupEnvVarResponse = {
 };
 
 /**
+ * The plaintext value of a non-secret group variable.
+ */
+export type GroupEnvVarValueResponse = {
+    value: string;
+};
+
+/**
  * The ignore conditions of an ignored group and how far along they are.
  */
 export type GroupIgnoreState = {
@@ -20072,19 +20130,43 @@ export type HttpCheckSpec = {
     url: string;
 };
 
+/**
+ * An HTTP recipe as returned. Header values may hold secrets and are
+ * write-only, so only their names are listed; resend them on update.
+ */
+export type HttpCheckSpecView = {
+    accepted_statuses: Array<number>;
+    credential_header?: string | null;
+    credential_prefix: string;
+    expiration?: ExpirationRule | null;
+    /**
+     * Names of the headers the recipe sends (values are write-only).
+     */
+    header_names: Array<string>;
+    method: HttpCheckMethod;
+    numeric_rules: Array<NumericRule>;
+    url: string;
+};
+
 export type HttpCheckView = {
     automatic_provider?: string | null;
     enabled: boolean;
     env_var_id?: number | null;
+    /**
+     * Whether an inline credential is stored (it is never returned).
+     */
+    has_credential: boolean;
     id: number;
     interval_seconds: number;
     kind: CheckKind;
     last_checked_at?: string | null;
+    local?: LocalCheckSpec | null;
     name: string;
     next_check_at: string;
     project_id: number;
     result?: VerificationResult | null;
     secret_id?: number | null;
+    spec?: HttpCheckSpecView | null;
 };
 
 export type HttpChecksCapabilities = {
@@ -24310,13 +24392,54 @@ export type MonitorCheckView = {
     target: string;
 };
 
+/**
+ * Settings of a cron monitor. Every field but `schedule` has a default; on
+ * `PATCH` the fields given are merged into the stored ones.
+ */
 export type MonitorConfig = {
+    /**
+     * Minutes a check-in may be late before the run counts as missed,
+     * 1–40320. Defaults to 1.
+     */
     checkin_margin?: number;
+    /**
+     * Consecutive failures that open an issue, 1–100. Defaults to 1.
+     */
     failure_issue_threshold?: number;
+    /**
+     * Minutes a run may stay in progress before it counts as failed,
+     * 1–40320. Defaults to 30.
+     */
     max_runtime?: number;
+    /**
+     * Consecutive successes that resolve it, 1–100. Defaults to 1.
+     */
     recovery_threshold?: number;
+    /**
+     * A five-field crontab (`minute hour day-of-month month day-of-week`),
+     * or an interval of `minute`, `hour`, `day` or `week` units, at most one
+     * year long.
+     */
     schedule: MonitorSchedule;
+    /**
+     * IANA time zone the crontab is read in, e.g. `UTC` or `Europe/Madrid`.
+     * Defaults to `UTC`.
+     */
     timezone?: string;
+};
+
+/**
+ * The `config` of a `PATCH`: the fields given replace the stored ones, the
+ * others are kept. `schedule` is required only when the monitor has no
+ * configuration yet (one created by an SDK check-in without a schedule).
+ */
+export type MonitorConfigPatch = {
+    checkin_margin?: number | null;
+    failure_issue_threshold?: number | null;
+    max_runtime?: number | null;
+    recovery_threshold?: number | null;
+    schedule?: MonitorSchedule | null;
+    timezone?: string | null;
 };
 
 /**
@@ -34257,18 +34380,39 @@ export type SaveCredentialResponse = {
 /**
  * Credentials and recipe headers are write-only and encrypted at rest.
  * A check reads at most one of `env_var_id`, `secret_id` and `credential`.
+ *
+ * On update (`PUT`) the recipe, kind and credential source are replaced as
+ * sent, while an omitted `enabled` or `interval_seconds` keeps its current
+ * value. A change to the recipe, kind or credential runs the check again; a
+ * change to anything else keeps its last result.
  */
 export type SaveHttpCheck = {
+    /**
+     * Inline credential, write-only. On update: omit to keep the stored one
+     * (for the same kind of check), `null` to remove it, or a value to
+     * replace it. `has_credential` in the view says whether one is stored.
+     */
     credential?: string | null;
-    enabled?: boolean;
+    /**
+     * Defaults to `true` on create; an update that omits it keeps the
+     * current state.
+     */
+    enabled?: boolean | null;
     env_var_id?: number | null;
-    interval_seconds?: number;
+    /**
+     * Seconds between checks, 300-604800. Defaults to 86400 on create; an
+     * update that omits it keeps the current interval.
+     */
+    interval_seconds?: number | null;
     /**
      * `http` (default) calls an endpoint; `local` reads expiring items
      * (certificates, SSH certificates, OpenPGP keys, kubeconfigs, JWTs) on this host.
      */
     kind?: CheckKind;
     local?: LocalCheckSpec | null;
+    /**
+     * 1-120 characters (counted as characters, not bytes), trimmed.
+     */
     name: string;
     /**
      * Project secret to check. HTTP checks may only send a secret to the
@@ -41003,13 +41147,30 @@ export type UpdateAiSummaryPreferenceRequest = {
     thinking_level?: string | null;
 };
 
+/**
+ * A partial update: an omitted field keeps its value.
+ */
 export type UpdateAlertRuleRequest = {
     cooldown_minutes?: number | null;
     enabled?: boolean | null;
+    /**
+     * One of the project's environments, or `null` to alert on every
+     * environment again. Omit to keep the current filter.
+     */
     environment_filter?: number | null;
+    /**
+     * Exception type to match (for example `TypeError`), or `null` / `""` to
+     * alert on every type again. Omit to keep the current filter.
+     */
     error_level_filter?: string | null;
+    /**
+     * Unique within the project (case-insensitive), trimmed, 1-255 characters.
+     */
     name?: string | null;
     notification_priority?: string | null;
+    /**
+     * See `CreateAlertRuleRequest.trigger_config`; unknown keys are refused.
+     */
     trigger_config?: unknown;
     trigger_type?: string | null;
 };
@@ -41300,8 +41461,11 @@ export type UpdateChatSuggestionModeRequest = {
 };
 
 export type UpdateCloudflareProviderRequest = {
-    config: CloudflareConfig;
+    config?: CloudflareConfig | null;
     enabled?: boolean | null;
+    /**
+     * New name; must not be empty or only whitespace.
+     */
     name?: string | null;
 };
 
@@ -41367,19 +41531,38 @@ export type UpdateContainerSecurityRequest = {
 };
 
 export type UpdateCronMonitor = {
-    config?: MonitorConfig | null;
+    config?: MonitorConfigPatch | null;
     enabled?: boolean | null;
 };
 
+/**
+ * Changes to a custom domain; omitted fields are kept. Unknown fields are
+ * refused, so a misspelt one is an error instead of a silent no-op.
+ */
 export type UpdateCustomDomainRequest = {
+    /**
+     * Branch; an empty string clears it.
+     */
     branch?: string | null;
+    /**
+     * New hostname, normalised like on create (lower-cased, no trailing dot).
+     */
     domain?: string | null;
     environment_id?: number | null;
+    /**
+     * Redirect target; an empty string clears the redirect, and its
+     * `status_code` with it.
+     */
     redirect_to?: string | null;
     /**
-     * Docker Compose service name this domain routes to (empty string clears it)
+     * Docker Compose service this domain routes to (Compose projects only);
+     * an empty string clears it.
      */
     service_name?: string | null;
+    /**
+     * Redirect status (301, 302, 303, 307 or 308); `null` (or `0`) clears
+     * it. Only valid while the domain has a `redirect_to`.
+     */
     status_code?: number | null;
 };
 
@@ -41502,7 +41685,9 @@ export type UpdateEdgeRuleRequest = {
     action?: EdgeRuleAction | null;
     enabled?: boolean | null;
     /**
-     * `null` applies the rule to every environment.
+     * `null` applies the rule to every environment; omit to keep the current
+     * one. A new environment must be one of the project's; the current one
+     * is kept as is, even if it has since been deleted.
      */
     environment_id?: number | null;
     expression?: EdgeRuleGroup | null;
@@ -42105,16 +42290,31 @@ export type UpdateMonitorRequest = {
 };
 
 export type UpdateNotificationEmailProviderRequest = {
-    config: EmailConfig;
+    config?: EmailConfig | null;
     enabled?: boolean | null;
+    /**
+     * New name; must not be empty or only whitespace.
+     */
     name?: string | null;
 };
 
 export type UpdateNotificationRouteRequest = {
     enabled?: boolean | null;
+    /**
+     * Highest severity the route matches, same values as `min_severity`.
+     * Case-insensitive; stored lower-case.
+     */
     max_severity?: string | null;
+    /**
+     * Lowest severity the route matches: debug, info, warning, error,
+     * critical or emergency. Case-insensitive; stored lower-case.
+     */
     min_severity?: string | null;
     name?: string | null;
+    /**
+     * Replacement provider list; at least one when given. Duplicates are
+     * ignored and the stored list is sorted.
+     */
     provider_ids?: Array<number> | null;
 };
 
@@ -42176,6 +42376,13 @@ export type UpdatePreviewAccessBody = {
      * its network address. Empty = any client address.
      */
     allowed_cidrs: Array<string>;
+};
+
+/**
+ * The new role of an existing project grant.
+ */
+export type UpdateProjectAccessRequest = {
+    role: TeamRole;
 };
 
 /**
@@ -42623,8 +42830,11 @@ export type UpdateSkillRequest = {
 };
 
 export type UpdateSlackProviderRequest = {
-    config: SlackConfig;
+    config?: SlackConfig | null;
     enabled?: boolean | null;
+    /**
+     * New name; must not be empty or only whitespace.
+     */
     name?: string | null;
 };
 
@@ -42767,14 +42977,25 @@ export type UpdateTargetMonitorRequest = {
     target?: string | null;
 };
 
+/**
+ * Changes to a team; omitted fields are kept. Unknown fields (a team's slug
+ * cannot change) are refused rather than ignored.
+ */
 export type UpdateTeamRequest = {
+    /**
+     * New description; `null` (or an empty string) clears it. Omit it to
+     * keep the current one.
+     */
     description?: string | null;
     name?: string | null;
 };
 
 export type UpdateTelegramProviderRequest = {
-    config: TelegramConfig;
+    config?: TelegramConfig | null;
     enabled?: boolean | null;
+    /**
+     * New name; must not be empty or only whitespace.
+     */
     name?: string | null;
 };
 
@@ -42827,8 +43048,11 @@ export type UpdateUserRequest = {
 };
 
 export type UpdateWebhookProviderRequest = {
-    config: WebhookConfig;
+    config?: WebhookConfig | null;
     enabled?: boolean | null;
+    /**
+     * New name; must not be empty or only whitespace.
+     */
     name?: string | null;
 };
 
@@ -42838,12 +43062,17 @@ export type UpdateWebhookRequestBody = {
      */
     enabled?: boolean | null;
     /**
-     * Event types to subscribe to
+     * Event types to subscribe to. Duplicates are stored once.
      */
     events?: Array<string> | null;
-    secret?: SecretString | null;
     /**
-     * Target URL for webhook delivery
+     * Secret for HMAC signature verification. Omit to keep the current one,
+     * send `null` to remove it (deliveries are then unsigned), or a
+     * non-empty string to replace it.
+     */
+    secret?: string | null;
+    /**
+     * Target URL for webhook delivery (same rules as on create)
      */
     url?: string | null;
 };
@@ -43964,7 +44193,7 @@ export type WebhookConfig = {
      */
     method?: string;
     /**
-     * Request timeout in seconds. Defaults to 30.
+     * Request timeout in seconds, from 1 to 120. Defaults to 30.
      */
     timeout_secs?: number;
     /**
@@ -73753,6 +73982,10 @@ export type UpdateCloudflareProviderErrors = {
      */
     404: unknown;
     /**
+     * The provider is of another type; nothing was changed
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -73816,6 +74049,10 @@ export type UpdateNotificationEmailProviderErrors = {
      */
     404: unknown;
     /**
+     * The provider is of another type; nothing was changed
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -73878,6 +74115,10 @@ export type UpdateSlackProviderErrors = {
      * Provider not found
      */
     404: unknown;
+    /**
+     * The provider is of another type; nothing was changed
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -73958,6 +74199,10 @@ export type UpdateTelegramProviderErrors = {
      */
     404: unknown;
     /**
+     * The provider is of another type; nothing was changed
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -74021,6 +74266,10 @@ export type UpdateWebhookProviderErrors = {
      */
     404: unknown;
     /**
+     * The provider is of another type; nothing was changed
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -74052,6 +74301,10 @@ export type DeleteNotificationProviderErrors = {
      * Provider not found
      */
     404: unknown;
+    /**
+     * A route lists only this provider; deleting it would leave the route with none
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -78173,7 +78426,14 @@ export type ListProjectGroupsResponse = ListProjectGroupsResponses[keyof ListPro
 export type CreateProjectGroupData = {
     body: CreateProjectGroupRequest;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Move a project that already belongs to another group out of it (that
+         * group's routes involving it are dropped). Without it, placing such a
+         * project is refused with a 409 naming its group.
+         */
+        move?: boolean;
+    };
     url: '/project-groups';
 };
 
@@ -78187,11 +78447,11 @@ export type CreateProjectGroupErrors = {
      */
     403: unknown;
     /**
-     * A listed project does not exist, or a route dropped by moving a listed project involves a service the caller cannot see
+     * A listed project does not exist, or (with move=true) a route dropped by moving a listed project involves a service the caller cannot see
      */
     404: unknown;
     /**
-     * Slug already taken, or a listed project gained a route or changed group while the request was being authorized; retry
+     * Slug already taken; a listed project already belongs to another group and move=true was not passed (the detail names the group); or a listed project gained a route or changed group while the request was being authorized; retry
      */
     409: unknown;
 };
@@ -78545,6 +78805,50 @@ export type UpdateGroupEnvVarResponses = {
 
 export type UpdateGroupEnvVarResponse = UpdateGroupEnvVarResponses[keyof UpdateGroupEnvVarResponses];
 
+export type RevealGroupEnvVarData = {
+    body?: never;
+    path: {
+        /**
+         * Project group ID
+         */
+        group_id: number;
+        /**
+         * Variable ID
+         */
+        var_id: number;
+    };
+    query?: never;
+    url: '/project-groups/{group_id}/env-vars/{var_id}/value';
+};
+
+export type RevealGroupEnvVarErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * The variable is secret (write-only), or insufficient permissions on a member project
+     */
+    403: unknown;
+    /**
+     * Project group or variable not found
+     */
+    404: unknown;
+    /**
+     * The value could not be decrypted, or the reveal could not be audit-logged
+     */
+    500: unknown;
+};
+
+export type RevealGroupEnvVarResponses = {
+    /**
+     * The variable's plaintext value (sent with Cache-Control: no-store)
+     */
+    200: GroupEnvVarValueResponse;
+};
+
+export type RevealGroupEnvVarResponse = RevealGroupEnvVarResponses[keyof RevealGroupEnvVarResponses];
+
 export type ImportProjectServicesData = {
     body: ImportServicesRequest;
     path: {
@@ -78641,7 +78945,14 @@ export type AddProjectToGroupData = {
          */
         project_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Move a project that already belongs to another group out of it (that
+         * group's routes involving it are dropped). Without it, placing such a
+         * project is refused with a 409 naming its group.
+         */
+        move?: boolean;
+    };
     url: '/project-groups/{group_id}/projects/{project_id}';
 };
 
@@ -78655,14 +78966,14 @@ export type AddProjectToGroupErrors = {
      */
     404: unknown;
     /**
-     * A route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict
+     * The project already belongs to another group and move=true was not passed (the detail names the group); or a route involving the project appeared, the project changed group, or a project the caller cannot manage joined the destination group, while the request was being authorized; retry. Projects placed concurrently by a caller that may manage them do not conflict
      */
     409: unknown;
 };
 
 export type AddProjectToGroupResponses = {
     /**
-     * Project placed in the group (moved out of any other group)
+     * Project placed in the group (or already in it); with move=true, moved out of any other group
      */
     200: ProjectGroupResponse;
 };
@@ -79798,14 +80109,18 @@ export type GrantProjectAccessErrors = {
      */
     403: unknown;
     /**
-     * Team not found
+     * Project or team not found
      */
     404: unknown;
+    /**
+     * The team already has a grant on this project; change its role with PATCH /projects/{project_id}/access/{team_id}
+     */
+    409: unknown;
 };
 
 export type GrantProjectAccessResponses = {
     /**
-     * Access granted (idempotent upsert)
+     * Access granted
      */
     201: ProjectAccessResponse;
 };
@@ -80570,6 +80885,66 @@ export type RevokeProjectAccessResponses = {
 };
 
 export type RevokeProjectAccessResponse = RevokeProjectAccessResponses[keyof RevokeProjectAccessResponses];
+
+export type GetProjectAccessData = {
+    body?: never;
+    path: {
+        project_id: number;
+        team_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access/{team_id}';
+};
+
+export type GetProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+    /**
+     * Project not found, or the team has no grant on it
+     */
+    404: unknown;
+};
+
+export type GetProjectAccessResponses = {
+    /**
+     * The grant
+     */
+    200: ProjectAccessResponse;
+};
+
+export type GetProjectAccessResponse = GetProjectAccessResponses[keyof GetProjectAccessResponses];
+
+export type UpdateProjectAccessData = {
+    body: UpdateProjectAccessRequest;
+    path: {
+        project_id: number;
+        team_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/access/{team_id}';
+};
+
+export type UpdateProjectAccessErrors = {
+    /**
+     * Insufficient permissions or no access to this project
+     */
+    403: unknown;
+    /**
+     * Project not found, or the team has no grant on it
+     */
+    404: unknown;
+};
+
+export type UpdateProjectAccessResponses = {
+    /**
+     * Grant updated
+     */
+    200: ProjectAccessResponse;
+};
+
+export type UpdateProjectAccessResponse = UpdateProjectAccessResponses[keyof UpdateProjectAccessResponses];
 
 export type GetActiveVisitorsData = {
     body?: never;
@@ -91543,6 +91918,10 @@ export type ListAlertRulesData = {
 
 export type ListAlertRulesErrors = {
     /**
+     * Project not found
+     */
+    404: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -91550,7 +91929,7 @@ export type ListAlertRulesErrors = {
 
 export type ListAlertRulesResponses = {
     /**
-     * List of alert rules
+     * List of alert rules, including the two default rules every project starts with
      */
     200: Array<AlertRuleResponse>;
 };
@@ -91571,7 +91950,7 @@ export type CreateAlertRuleData = {
 
 export type CreateAlertRuleErrors = {
     /**
-     * Validation error
+     * Invalid field (the problem names it), including an environment_filter that is not one of the project's environments
      */
     400: unknown;
     /**
@@ -91579,7 +91958,7 @@ export type CreateAlertRuleErrors = {
      */
     404: unknown;
     /**
-     * Project already holds the maximum number of error alert rules
+     * Another rule of the project has this name, or the project already holds the maximum number of error alert rules
      */
     409: unknown;
     /**
@@ -91687,13 +92066,17 @@ export type UpdateAlertRuleData = {
 
 export type UpdateAlertRuleErrors = {
     /**
-     * Validation error
+     * Invalid field (the problem names it), including an environment_filter that is not one of the project's environments
      */
     400: unknown;
     /**
-     * Alert rule not found
+     * Project not found, or the rule is not one of the project's
      */
     404: unknown;
+    /**
+     * Another rule of the project has this name
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -94479,7 +94862,14 @@ export type ArchiveFlagData = {
          */
         key: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Delete an already archived flag for good, with its per-environment
+         * values, freeing its key for a new flag of any `value_type`. Refused
+         * (409) for a flag that is not archived. Defaults to false (archive).
+         */
+        purge?: boolean;
+    };
     url: '/projects/{project_id}/flags/{key}';
 };
 
@@ -94497,6 +94887,10 @@ export type ArchiveFlagErrors = {
      */
     404: unknown;
     /**
+     * `purge=true` on a flag that is not archived, or one restored concurrently
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -94504,7 +94898,7 @@ export type ArchiveFlagErrors = {
 
 export type ArchiveFlagResponses = {
     /**
-     * Flag archived
+     * Flag archived, or purged with `purge=true`
      */
     200: ArchiveFlagResponse;
 };

@@ -37,7 +37,7 @@ export function registerNotificationsEndpoints(program: Command): void {
     description: "Update a Cloudflare Email Sending notification provider",
     path: { id: 'int' },
     body: {
-      config: { kind: 'json!', help: "Configuration for a Cloudflare Email Sending notification provider" },
+      config: { kind: 'json', help: "Replacement configuration; omit to keep the stored one" },
       enabled: 'bool',
       name: 'string',
     },
@@ -68,7 +68,7 @@ export function registerNotificationsEndpoints(program: Command): void {
     description: "Update a Webhook notification provider",
     path: { id: 'int' },
     body: {
-      config: { kind: 'json!', help: "Configuration for a generic webhook notification provider" },
+      config: { kind: 'json', help: "Replacement configuration; omit to keep the stored one" },
       enabled: 'bool',
       name: 'string',
     },

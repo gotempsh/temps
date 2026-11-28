@@ -57,6 +57,7 @@ for (const width of [1440, 390]) {
             next_check_at: '2026-09-22T00:00:00Z',
             last_checked_at: null,
             result: null,
+            has_credential: false,
           }
           checks = [check]
           body = check
